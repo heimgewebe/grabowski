@@ -401,6 +401,16 @@ def _tool_attributes(
 ) -> dict[str, Any]:
     safe_reason = _redact_sensitive_text(reason)
     safe_user_intent = _redact_sensitive_text(user_intent)
+    request_id_text = _nonempty_text(str(request_id), maximum=512)
+    safe_request_id = (
+        _redact_sensitive_text(request_id_text)
+        if request_id_text is not None
+        else "<invalid>"
+    )
+    safe_identity = {
+        key: _redact_sensitive_text(value)
+        for key, value in identity.items()
+    }
     attributes: dict[str, Any] = {
         "gen_ai.operation.name": "execute_tool",
         "gen_ai.tool.name": tool_name,
@@ -410,8 +420,8 @@ def _tool_attributes(
         "mcp.method.name": "tools/call",
         "mcp.server.name": server_name,
         "gen_ai.tool.call.id": uuid.uuid4().hex,
-        "mcp.request.id": str(request_id),
-        **identity,
+        "mcp.request.id": safe_request_id,
+        **safe_identity,
     }
     description = _description_attribute(getattr(tool, "description", None))
     if description is not None:

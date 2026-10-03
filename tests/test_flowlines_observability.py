@@ -233,6 +233,41 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(public_arguments["value"], "<redacted>")
 
+    async def test_identifier_attributes_scrub_credential_patterns(self) -> None:
+        provider_key = "s" + "k-proj-" + ("I" * 24)
+        bearer_token = "synthetic-identifier-bearer-value"
+        mcp = self.server()
+        result = await self.call(
+            mcp,
+            arguments={
+                "value": "hello",
+                "reason": "Verify identifier telemetry",
+                "user_intent": "Keep client identifiers safe",
+            },
+            meta=self.meta(
+                **{
+                    "user.id": provider_key,
+                    "session.id": f"session-{provider_key}",
+                }
+            ),
+            request_id=f"Authorization: Bearer {bearer_token}",
+        )
+
+        self.assertFalse(result.root.isError)
+        attrs = self.exporter.get_finished_spans()[0].attributes
+        serialized = json.dumps(dict(attrs), sort_keys=True)
+        self.assertNotIn(provider_key, serialized)
+        self.assertNotIn(bearer_token, serialized)
+        self.assertEqual(attrs["user.id"], "<REDACTED_OPENAI_KEY>")
+        self.assertEqual(
+            attrs["session.id"],
+            "session-<REDACTED_OPENAI_KEY>",
+        )
+        self.assertEqual(
+            attrs["mcp.request.id"],
+            "Authorization: <REDACTED>",
+        )
+
     async def test_report_outcome_scrubs_sensitive_free_text_recursively(self) -> None:
         provider_key = "s" + "k-ant-" + ("x" * 24)
         password = "synthetic-password-value"
