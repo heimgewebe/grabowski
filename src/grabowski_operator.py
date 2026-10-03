@@ -3610,7 +3610,7 @@ async def deployment_admission_status(_request: Any) -> Any:
     )
 
 
-def _configure_http_runtime() -> None:
+def _configure_http_runtime(*, admission_gate_preinstalled: bool = False) -> None:
     if not callable(getattr(mcp, "custom_route", None)):
         raise RuntimeError("FastMCP custom_route support is required")
     mcp.settings.stateless_http = HTTP_STATELESS_MODE
@@ -3628,7 +3628,13 @@ def _configure_http_runtime() -> None:
         raise RuntimeError("FastMCP session creation lock is unavailable")
     if getattr(manager, "stateless", None) is not HTTP_STATELESS_MODE:
         raise RuntimeError("FastMCP stateless HTTP mode is unavailable")
-    _install_deployment_admission_gate()
+    if admission_gate_preinstalled:
+        if not _DEPLOYMENT_ADMISSION_GATE_INSTALLED:
+            raise RuntimeError(
+                "Grabowski deployment admission gate was not preinstalled"
+            )
+    else:
+        _install_deployment_admission_gate()
     if manager.session_idle_timeout is not None:
         raise RuntimeError("FastMCP stateless HTTP mode retained an idle timeout")
     if manager.max_sessions is not None:
@@ -10447,14 +10453,19 @@ def main() -> None:
             raise SystemExit("port must be between 1024 and 65535")
         mcp.settings.host = args.host
         mcp.settings.port = args.port
+        # Install the authority/execution gate before PostHog wraps call_tool.
+        # Sync tools then offload only FastMCP's base call into their short-lived
+        # asyncio.run() worker loops; PostHog's server-wide asyncio state remains
+        # on the stable HTTP event loop instead of crossing worker loops.
+        _install_deployment_admission_gate()
     _configure_posthog_mcp_analytics()
     try:
         if args.transport == "streamable-http":
             # Instrument before building the Streamable HTTP app. PostHog's
-            # FastMCP adapter installs middleware while the app is built; the
-            # Grabowski HTTP setup then installs the deployment/authority gate
-            # as the outer call boundary around the instrumented manager.
-            _configure_http_runtime()
+            # FastMCP adapter installs middleware while the app is built. The
+            # admission gate is already inside that wrapper so its sync worker
+            # never executes PostHog's server-wide asyncio locks.
+            _configure_http_runtime(admission_gate_preinstalled=True)
         mcp.run(transport=args.transport)
     finally:
         _shutdown_posthog_mcp_analytics()
