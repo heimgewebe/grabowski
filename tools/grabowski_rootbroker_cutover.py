@@ -49,6 +49,9 @@ AUTOMATIC_STAGING_ROOT = Path("/var/lib/grabowski/rootbroker-cutover-staging")
 AUTOMATIC_HELPER_SOURCE = "tools/grabowski_rootbroker_cutover.py"
 BROKER_SERVICE_TARGET = Path("/etc/systemd/system/grabowski-privileged-broker@.service")
 OPERATOR_SERVICE_TARGET = Path("/etc/systemd/system/grabowski-operator.service")
+OPERATOR_FLOWLINES_DROPIN_TARGET = Path(
+    "/etc/systemd/system/grabowski-operator.service.d/80-flowlines.conf"
+)
 RECOVERY_SOURCE_DROPIN_TARGET = Path(
     "/etc/systemd/system/grabowski-privileged-broker@.service.d/recovery-source.conf"
 )
@@ -262,6 +265,11 @@ ARTIFACTS = (
     Artifact(
         "systemd/grabowski-operator.service.example",
         OPERATOR_SERVICE_TARGET,
+        0o644,
+    ),
+    Artifact(
+        "systemd/grabowski-operator.service.d/80-flowlines.conf.example",
+        OPERATOR_FLOWLINES_DROPIN_TARGET,
         0o644,
     ),
     Artifact(
@@ -2363,6 +2371,7 @@ def _operator_authority_attestation(
         "platform_connector_capture": PLATFORM_CONNECTOR_CAPTURE_TARGET,
         "cutover_helper": CUTOVER_HELPER_TARGET,
         "operator_service": OPERATOR_SERVICE_TARGET,
+        "operator_flowlines_dropin": OPERATOR_FLOWLINES_DROPIN_TARGET,
     }
     artifact_sha256: dict[str, str] = {}
     for label, target in required_artifacts.items():

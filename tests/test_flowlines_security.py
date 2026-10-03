@@ -45,74 +45,24 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
         self.assertNotIn(token, serialized)
         self.assertIn("<REDACTED_POSTHOG_TOKEN>", serialized)
 
-    def test_process_nondumpable_contract_requires_set_and_readback(self) -> None:
-        with mock.patch.object(
-            flowlines,
-            "_linux_prctl",
-            side_effect=[0, 0],
-            create=True,
-        ) as prctl:
-            self.assertTrue(flowlines._ensure_process_nondumpable())
-        self.assertEqual(
-            prctl.call_args_list,
-            [mock.call(4, 0), mock.call(3, 0)],
+    def test_flowlines_does_not_make_operator_nondumpable(self) -> None:
+        source = (SRC / "grabowski_flowlines.py").read_text(encoding="utf-8")
+        self.assertNotIn("PR_SET_DUMPABLE", source)
+        self.assertNotIn("_ensure_process_nondumpable", source)
+
+    def test_secure_credential_loader_accepts_only_exact_rootbroker_header(self) -> None:
+        cases = (
+            (None, None),
+            ("", None),
+            ("not-a-flowlines-header", None),
+            ("x-flowlines-api-key=", None),
+            ("x-flowlines-api-key=one,x-flowlines-api-key=two", None),
+            ("x-flowlines-api-key=one,authorization=two", None),
+            ("x-flowlines-api-key=fixture-flowlines-key", "fixture-flowlines-key"),
         )
-
-        with mock.patch.object(
-            flowlines,
-            "_linux_prctl",
-            side_effect=[0, 1],
-            create=True,
-        ):
-            self.assertFalse(flowlines._ensure_process_nondumpable())
-
-    def test_secure_credential_loader_requires_hardening_and_rootbroker(self) -> None:
-        with mock.patch.object(
-            flowlines,
-            "_ensure_process_nondumpable",
-            return_value=False,
-            create=True,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "nondumpable"):
-                flowlines._load_flowlines_api_key()
-
-        with (
-            mock.patch.object(
-                flowlines,
-                "_ensure_process_nondumpable",
-                return_value=True,
-                create=True,
-            ),
-            mock.patch.object(
-                flowlines,
-                "_read_flowlines_headers_from_rootbroker",
-                return_value="x-flowlines-api-key=fixture-flowlines-key",
-                create=True,
-            ) as read_secret,
-        ):
-            self.assertEqual(
-                flowlines._load_flowlines_api_key(),
-                "fixture-flowlines-key",
-            )
-        read_secret.assert_called_once_with()
-
-    def test_secure_credential_loader_rejects_missing_or_malformed_broker_data(self) -> None:
-        for returned in (
-            None,
-            "",
-            "not-a-flowlines-header",
-            "x-flowlines-api-key=",
-            "x-flowlines-api-key=one,x-flowlines-api-key=two",
-            "x-flowlines-api-key=one,authorization=two",
-        ):
+        for returned, expected in cases:
             with (
                 self.subTest(returned=returned),
-                mock.patch.object(
-                    flowlines,
-                    "_ensure_process_nondumpable",
-                    return_value=True,
-                    create=True,
-                ),
                 mock.patch.object(
                     flowlines,
                     "_read_flowlines_headers_from_rootbroker",
@@ -120,7 +70,7 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
                     create=True,
                 ),
             ):
-                self.assertIsNone(flowlines._load_flowlines_api_key())
+                self.assertEqual(flowlines._load_flowlines_api_key(), expected)
 
     def test_environment_header_is_discarded_not_used_as_flowlines_credential(self) -> None:
         header = "x-flowlines-api-key=fixture-environment-secret"
@@ -133,12 +83,6 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
                     "OTEL_EXPORTER_OTLP_HEADERS": header,
                 },
                 clear=True,
-            ),
-            mock.patch.object(
-                flowlines,
-                "_ensure_process_nondumpable",
-                return_value=True,
-                create=True,
             ),
             mock.patch.object(
                 flowlines,
@@ -308,15 +252,16 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
         service = (
             ROOT / "systemd" / "grabowski-operator.service.example"
         ).read_text(encoding="utf-8")
-        self.assertNotIn(
-            "EnvironmentFile=-/home/alex/.config/grabowski/flowlines.env",
-            service,
-        )
+        dropin = (
+            ROOT
+            / "systemd"
+            / "grabowski-operator.service.d"
+            / "80-flowlines.conf.example"
+        ).read_text(encoding="utf-8")
+
+        self.assertNotIn("flowlines.env", service)
+        self.assertNotIn("flowlines-enabled.env", service)
         self.assertNotIn("Environment=GRABOWSKI_FLOWLINES_ENABLED=1", service)
-        self.assertIn(
-            "EnvironmentFile=-/home/alex/.config/grabowski/flowlines-enabled.env",
-            service,
-        )
         self.assertNotIn("Environment=OTEL_EXPORTER_OTLP_ENDPOINT=", service)
         self.assertNotIn("Environment=OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=", service)
         self.assertIn(
@@ -327,6 +272,12 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
         )
         self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS=", service)
         self.assertNotIn("OTEL_EXPORTER_OTLP_TRACES_HEADERS=", service)
+
+        self.assertIn("Environment=GRABOWSKI_FLOWLINES_ENABLED=1", dropin)
+        self.assertIn("/etc/grabowski/flowlines-headers", dropin)
+        self.assertNotIn("EnvironmentFile=", dropin)
+        self.assertNotIn("OTEL_EXPORTER_OTLP_ENDPOINT=", dropin)
+        self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS=", dropin)
 
 
 if __name__ == "__main__":

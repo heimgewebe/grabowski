@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import atexit
 import copy
-import ctypes
 import hashlib
 import json
 import logging
@@ -55,8 +54,6 @@ _FLOWLINES_CREDENTIAL_MAX_BYTES = 4 * 1024
 _FLOWLINES_BROKER_RESPONSE_MAX_BYTES = 16 * 1024
 _FLOWLINES_BROKER_TIMEOUT_SECONDS = 10.0
 _FLOWLINES_PRIVILEGED_REFERENCE_TTL_SECONDS = 60
-_PR_GET_DUMPABLE = 3
-_PR_SET_DUMPABLE = 4
 _FLOWLINES_SECRET_READ_SCRIPT = f"""import os
 import stat
 import sys
@@ -509,32 +506,6 @@ def _tool_attributes(
     return attributes
 
 
-def _linux_prctl(option: int, argument: int) -> int:
-    try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        prctl = libc.prctl
-    except (AttributeError, OSError):
-        return -1
-    prctl.argtypes = [
-        ctypes.c_int,
-        ctypes.c_ulong,
-        ctypes.c_ulong,
-        ctypes.c_ulong,
-        ctypes.c_ulong,
-    ]
-    prctl.restype = ctypes.c_int
-    try:
-        return int(prctl(option, argument, 0, 0, 0))
-    except (TypeError, ValueError):
-        return -1
-
-
-def _ensure_process_nondumpable() -> bool:
-    if _linux_prctl(_PR_SET_DUMPABLE, 0) != 0:
-        return False
-    return _linux_prctl(_PR_GET_DUMPABLE, 0) == 0
-
-
 def _flowlines_rootbroker_reference() -> dict[str, Any]:
     target = _canonical_json(
         {
@@ -620,8 +591,6 @@ def _read_flowlines_headers_from_rootbroker() -> str | None:
 
 
 def _load_flowlines_api_key() -> str | None:
-    if not _ensure_process_nondumpable():
-        raise RuntimeError("Flowlines API key requires a nondumpable process")
     header = _read_flowlines_headers_from_rootbroker()
     return _flowlines_api_key(header) if header is not None else None
 
@@ -708,11 +677,7 @@ def _build_environment_tracer() -> tuple[Any | None, Any | None]:
             "Flowlines telemetry disabled: exact endpoint/override contract is not configured"
         )
         return None, None
-    try:
-        api_key = _load_flowlines_api_key()
-    except RuntimeError as exc:
-        LOGGER.warning("Flowlines telemetry disabled: %s", exc)
-        return None, None
+    api_key = _load_flowlines_api_key()
     if api_key is None:
         LOGGER.warning(
             "Flowlines telemetry disabled: secure startup credential is unavailable or malformed"

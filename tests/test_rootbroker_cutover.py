@@ -878,6 +878,17 @@ class RootbrokerCutoverTests(unittest.TestCase):
         self.assertEqual(artifact.mode, 0o644)
         self.assertTrue(artifact.python_source)
 
+    def test_cutover_artifacts_include_flowlines_operator_dropin(self) -> None:
+        artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
+
+        artifact = artifacts[cutover.OPERATOR_FLOWLINES_DROPIN_TARGET]
+        self.assertEqual(
+            artifact.source_relative,
+            "systemd/grabowski-operator.service.d/80-flowlines.conf.example",
+        )
+        self.assertEqual(artifact.mode, 0o644)
+        self.assertFalse(artifact.python_source)
+
     def test_cutover_artifacts_include_runtime_bootstrap_recovery_helper(self) -> None:
         artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
 
@@ -918,6 +929,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
             "critical_user_data_inventory": cutover.CRITICAL_USER_DATA_INVENTORY_TARGET,
             "cutover_helper": cutover.CUTOVER_HELPER_TARGET,
             "operator_service": cutover.OPERATOR_SERVICE_TARGET,
+            "operator_flowlines_dropin": cutover.OPERATOR_FLOWLINES_DROPIN_TARGET,
         }.items():
             data = (label + "\n").encode("utf-8")
             source_artifacts[target] = (data, 0o644, hashlib.sha256(data).hexdigest())
@@ -938,6 +950,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
         self.assertEqual(
             attestation["artifact_sha256"]["operator_service"],
             source_artifacts[cutover.OPERATOR_SERVICE_TARGET][2],
+        )
+        self.assertEqual(
+            attestation["artifact_sha256"]["operator_flowlines_dropin"],
+            source_artifacts[cutover.OPERATOR_FLOWLINES_DROPIN_TARGET][2],
         )
         self.assertIn(
             cutover.LOCAL_BACKUP_NTFS_CHECK_ACTION, attestation["action_sha256"]
@@ -1002,6 +1018,7 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover.CRITICAL_USER_DATA_INVENTORY_TARGET,
             cutover.CUTOVER_HELPER_TARGET,
             cutover.OPERATOR_SERVICE_TARGET,
+            cutover.OPERATOR_FLOWLINES_DROPIN_TARGET,
         ):
             data = (str(target) + "\n").encode("utf-8")
             source_artifacts[target] = (data, 0o644, hashlib.sha256(data).hexdigest())
