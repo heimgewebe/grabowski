@@ -445,6 +445,8 @@ def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
     environment = dict(os.environ if base is None else base)
     # Flowlines exporter authentication is server-only and must never cross
     # into agent, workspace, reviewer, or writer child processes.
+    environment.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+    environment.pop("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", None)
     environment.pop("OTEL_EXPORTER_OTLP_HEADERS", None)
     environment.pop("OTEL_EXPORTER_OTLP_TRACES_HEADERS", None)
     environment.update(

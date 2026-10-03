@@ -320,6 +320,8 @@ SENSITIVE_ENV_PARTS = (
 )
 SENSITIVE_ENV_KEYS = frozenset(
     {
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
         "OTEL_EXPORTER_OTLP_HEADERS",
         "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
     }
@@ -464,7 +466,7 @@ REDACTIONS = (
     (_ANTHROPIC_SECRET_PATTERN, "<REDACTED_ANTHROPIC_KEY>"),
     (
         re.compile(
-            r"(?im)^(\s*OTEL_EXPORTER_OTLP(?:_TRACES)?_HEADERS\s*[:=]\s*).+$"
+            r"(?im)^(\s*OTEL_EXPORTER_OTLP(?:_TRACES)?_(?:HEADERS|ENDPOINT)\s*[:=]\s*).+$"
         ),
         r"\1<REDACTED>",
     ),

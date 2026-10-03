@@ -283,6 +283,10 @@ class OperatorContractTests(unittest.TestCase):
         headers = {
             "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
             "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "x-flowlines-api-key=trace-secret",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai?a=b",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": (
+                "https://api.flowlines.ai/v1/traces?a=b"
+            ),
         }
         for trusted in (False, True):
             with (

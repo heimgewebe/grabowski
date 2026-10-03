@@ -663,7 +663,9 @@ def _endpoint_is_flowlines() -> bool:
     traces_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
     candidate = traces_endpoint or endpoint
     if not candidate:
-        return False
+        # Production uses the internally pinned Flowlines origin. Ambient OTLP
+        # endpoint variables are optional overrides and never carry authority.
+        return True
     try:
         parsed = urlsplit(candidate)
         port = parsed.port
@@ -672,6 +674,10 @@ def _endpoint_is_flowlines() -> bool:
     return (
         parsed.scheme == "https"
         and parsed.hostname == "api.flowlines.ai"
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
         and port in (None, 443)
         and (not traces_endpoint or parsed.path in ("", "/", "/v1/traces", "/traces"))
     )
@@ -683,11 +689,14 @@ def _build_environment_tracer() -> tuple[Any | None, Any | None]:
     # variables. Neither generic nor trace-specific OTLP authentication may
     # remain available to later child processes.
     unsafe_overrides = _unsafe_flowlines_export_overrides()
+    endpoint_is_flowlines = _endpoint_is_flowlines()
+    os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
+    os.environ.pop("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", None)
     os.environ.pop("OTEL_EXPORTER_OTLP_HEADERS", None)
     os.environ.pop("OTEL_EXPORTER_OTLP_TRACES_HEADERS", None)
     if enabled not in {"1", "true", "yes", "on"}:
         return None, None
-    if not _endpoint_is_flowlines() or unsafe_overrides:
+    if not endpoint_is_flowlines or unsafe_overrides:
         LOGGER.warning(
             "Flowlines telemetry disabled: exact endpoint/override contract is not configured"
         )

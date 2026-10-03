@@ -152,6 +152,59 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
             self.assertIsNone(provider)
             self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS", os.environ)
 
+    def test_flowlines_endpoint_defaults_to_internal_pinned_origin(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(flowlines._endpoint_is_flowlines())
+
+    def test_flowlines_endpoint_rejects_userinfo_query_and_fragment(self) -> None:
+        cases = (
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://u:p@api.flowlines.ai"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://api.flowlines.ai?a=b"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://api.flowlines.ai#x"),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "https://u:p@api.flowlines.ai/v1/traces",
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "https://api.flowlines.ai/v1/traces?a=b",
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "https://api.flowlines.ai/v1/traces#x",
+            ),
+        )
+        for name, value in cases:
+            environment = {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
+                name: value,
+            }
+            with self.subTest(name=name, value=value), mock.patch.dict(
+                os.environ,
+                environment,
+                clear=True,
+            ):
+                self.assertFalse(flowlines._endpoint_is_flowlines())
+
+    def test_flowlines_endpoint_variables_are_consumed_when_export_is_rejected(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_FLOWLINES_ENABLED": "1",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": (
+                    "https://api.flowlines.ai/v1/traces?a=b"
+                ),
+            },
+            clear=True,
+        ):
+            tracer, provider = flowlines._build_environment_tracer()
+            self.assertNotIn("OTEL_EXPORTER_OTLP_ENDPOINT", os.environ)
+            self.assertNotIn("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", os.environ)
+
+        self.assertIsNone(tracer)
+        self.assertIsNone(provider)
+
     def test_rootbroker_reader_uses_fixed_secret_free_mainpid_power_request(self) -> None:
         secret = "fixture-flowlines-key"
         header = f"x-flowlines-api-key={secret}"
@@ -248,8 +301,12 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
             "EnvironmentFile=-/home/alex/.config/grabowski/flowlines-enabled.env",
             service,
         )
+        self.assertNotIn("Environment=OTEL_EXPORTER_OTLP_ENDPOINT=", service)
+        self.assertNotIn("Environment=OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=", service)
         self.assertIn(
-            "UnsetEnvironment=OTEL_EXPORTER_OTLP_HEADERS OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+            "UnsetEnvironment=OTEL_EXPORTER_OTLP_ENDPOINT "
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT "
+            "OTEL_EXPORTER_OTLP_HEADERS OTEL_EXPORTER_OTLP_TRACES_HEADERS",
             service,
         )
         self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS=", service)

@@ -1081,7 +1081,6 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
     def test_exporter_is_bound_to_flowlines_and_bounded_processor(self) -> None:
         base = {
             "GRABOWSKI_FLOWLINES_ENABLED": "1",
-            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
             "OTEL_SERVICE_NAME": "ambient-service-name-must-not-win",
             "OTEL_RESOURCE_ATTRIBUTES": "secret.env=must-not-export-resource",
         }
@@ -1162,7 +1161,6 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 os.environ,
                 {
                     "GRABOWSKI_FLOWLINES_ENABLED": "1",
-                    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
                 },
                 clear=True,
             ),
