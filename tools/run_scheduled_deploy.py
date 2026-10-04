@@ -934,6 +934,71 @@ def wait_for_deployment_window(
     raise AssertionError("unreachable deployment contention retry state")
 
 
+def _validation_environment(validation_root: Path) -> dict[str, str]:
+    environment = deploy_core.pip_env()
+    for name in FINALIZATION_ENV.values():
+        environment.pop(name, None)
+    environment.update(
+        {name: str(validation_root) for name in ("TMPDIR", "TMP", "TEMP")}
+    )
+    return environment
+
+
+def _verify_validation_distributions(
+    python: Path,
+    lock_path: Path,
+    environment: dict[str, str],
+) -> None:
+    result = deploy_core.run(
+        [
+            str(python),
+            "-c",
+            (
+                "import importlib.metadata,json; "
+                "print(json.dumps({d.metadata['Name']: d.version "
+                "for d in importlib.metadata.distributions() "
+                "if d.metadata.get('Name')}, sort_keys=True))"
+            ),
+        ],
+        capture=True,
+        timeout=deploy_core.TIMEOUTS["python"],
+        env=environment,
+    )
+    try:
+        installed_raw = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("validation interpreter returned invalid distribution JSON") from exc
+    if not isinstance(installed_raw, dict) or not all(
+        isinstance(name, str) and isinstance(version, str)
+        for name, version in installed_raw.items()
+    ):
+        raise RuntimeError("validation interpreter returned invalid distribution inventory")
+
+    locked = deploy_core.parse_runtime_lock(lock_path)
+    installed = {
+        deploy_core.normalize_package_name(name): version
+        for name, version in installed_raw.items()
+    }
+    allowed = set(locked) | deploy_core.ALLOWED_VENV_BASE_DISTS
+    unexpected = sorted(set(installed) - allowed)
+    if unexpected:
+        deploy_core.fail(
+            "Unerwartete installierte Distributionen: " + ", ".join(unexpected)
+        )
+    missing = sorted(set(locked) - set(installed))
+    if missing:
+        deploy_core.fail("Runtime-Lockpakete fehlen in der Venv: " + ", ".join(missing))
+    mismatched = sorted(
+        f"{name}=={installed[name]} != {locked[name]}"
+        for name in locked
+        if installed.get(name) != locked[name]
+    )
+    if mismatched:
+        deploy_core.fail(
+            "Installierte Versionen weichen vom Lock ab: " + ", ".join(mismatched)
+        )
+
+
 def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
     """Build an isolated validation interpreter from the exact target runtime lock."""
     lock_path = repo / deploy_core.RUNTIME_LOCK_RELATIVE
@@ -947,10 +1012,7 @@ def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
         raise RuntimeError("target runtime lock is unsafe")
 
     venv = validation_root / "target-runtime"
-    environment = deploy_core.pip_env()
-    environment.update(
-        {name: str(validation_root) for name in ("TMPDIR", "TMP", "TEMP")}
-    )
+    environment = _validation_environment(validation_root)
     deploy_core.run(
         [str(deploy_core.runtime_venv_builder_python()), "-m", "venv", str(venv)],
         timeout=deploy_core.TIMEOUTS["python"],
@@ -982,7 +1044,7 @@ def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
         timeout=deploy_core.TIMEOUTS["python"],
         env=environment,
     )
-    deploy_core.verify_installed_distributions(python, lock_path)
+    _verify_validation_distributions(python, lock_path, environment)
     return python
 
 
