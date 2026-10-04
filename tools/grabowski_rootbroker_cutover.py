@@ -338,6 +338,134 @@ def _ensure_private_directory(
         os.close(directory_fd)
 
 
+def _directory_physical_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _remove_created_install_directory(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int],
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    parent = path.parent
+    parent_before = _validate_directory(
+        parent,
+        expected_uid=expected_uid,
+        label="created install directory parent",
+    )
+    metadata = _validate_directory(
+        path,
+        expected_uid=expected_uid,
+        label="created install directory",
+    )
+    if (
+        metadata.st_gid != expected_gid
+        or _directory_physical_identity(metadata) != expected_identity
+    ):
+        raise CutoverError(f"created install directory identity drifted: {path}")
+    try:
+        os.rmdir(path)
+    except OSError as exc:
+        raise CutoverError(
+            f"created install directory is not safely removable: {path}"
+        ) from exc
+    if path.exists() or path.is_symlink():
+        raise CutoverError(f"created install directory still exists: {path}")
+    parent_after = _validate_directory(
+        parent,
+        expected_uid=expected_uid,
+        label="created install directory parent",
+    )
+    if _directory_physical_identity(parent_after) != _directory_physical_identity(
+        parent_before
+    ):
+        raise CutoverError(
+            f"created install directory parent changed during cleanup: {parent}"
+        )
+    directory_fd = os.open(parent, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _ensure_install_directory(
+    path: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    mode: int = 0o755,
+) -> tuple[int, int] | None:
+    parent = path.parent
+    parent_before = _validate_directory(
+        parent,
+        expected_uid=expected_uid,
+        label="install directory parent",
+    )
+    created = False
+    created_identity: tuple[int, int] | None = None
+    try:
+        try:
+            os.mkdir(path, mode)
+            created = True
+        except FileExistsError:
+            pass
+        metadata = _validate_directory(
+            path,
+            expected_uid=expected_uid,
+            label="install directory",
+        )
+        if created:
+            created_identity = _directory_physical_identity(metadata)
+            os.chown(path, expected_uid, expected_gid)
+            os.chmod(path, mode)
+            secured = _validate_directory(
+                path,
+                expected_uid=expected_uid,
+                label="install directory",
+            )
+            if _directory_physical_identity(secured) != created_identity:
+                raise CutoverError(
+                    f"created install directory identity drifted: {path}"
+                )
+            metadata = secured
+        if metadata.st_gid != expected_gid:
+            raise CutoverError(f"install directory group is unsafe: {path}")
+        parent_after = _validate_directory(
+            parent,
+            expected_uid=expected_uid,
+            label="install directory parent",
+        )
+        if _directory_physical_identity(parent_after) != _directory_physical_identity(
+            parent_before
+        ):
+            raise CutoverError(
+                f"install directory parent changed during creation: {parent}"
+            )
+        directory_fd = os.open(parent, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return created_identity if created else None
+    except Exception as exc:
+        if created and created_identity is not None:
+            try:
+                _remove_created_install_directory(
+                    path,
+                    expected_identity=created_identity,
+                    expected_uid=expected_uid,
+                    expected_gid=expected_gid,
+                )
+            except Exception as cleanup_exc:
+                raise CutoverError(
+                    f"{exc}; created install directory cleanup failed: {cleanup_exc}"
+                ) from exc
+        raise
+
+
 @contextmanager
 def _exclusive_cutover_lock(
     path: Path,
@@ -3151,6 +3279,7 @@ def _apply_cutover_locked(
     )
     preimage_by_target = {preimage.target: preimage for preimage in preimages}
     attempted_targets: list[str] = []
+    created_install_directories: list[tuple[Path, tuple[int, int]]] = []
     try:
         for preimage in preimages:
             _assert_preimage_unchanged(
@@ -3169,6 +3298,16 @@ def _apply_cutover_locked(
         )
         if automatic:
             _automatic_kill_switch_clear()
+        if OPERATOR_FLOWLINES_DROPIN_TARGET in desired:
+            created_identity = _ensure_install_directory(
+                OPERATOR_FLOWLINES_DROPIN_TARGET.parent,
+                expected_uid=install_uid,
+                expected_gid=install_gid,
+            )
+            if created_identity is not None:
+                created_install_directories.append(
+                    (OPERATOR_FLOWLINES_DROPIN_TARGET.parent, created_identity)
+                )
         for target, (data, mode, _digest) in desired.items():
             _assert_preimage_unchanged(
                 preimage_by_target[target],
@@ -3241,6 +3380,9 @@ def _apply_cutover_locked(
                 "system_operator_after": system_operator_state_after,
             },
             "rollback_performed": False,
+            "created_install_directories": [
+                str(path) for path, _identity in created_install_directories
+            ],
         }
         _ensure_private_directory(
             receipt_root,
@@ -3313,6 +3455,18 @@ def _apply_cutover_locked(
                 expected_parent_uid=install_uid,
             ),
         )
+        for directory, identity in reversed(created_install_directories):
+            attempt(
+                f"remove created install directory {directory}",
+                lambda directory=directory, identity=identity: (
+                    _remove_created_install_directory(
+                        directory,
+                        expected_identity=identity,
+                        expected_uid=install_uid,
+                        expected_gid=install_gid,
+                    )
+                ),
+            )
         attempt(
             "reload restored systemd units",
             lambda: _checked_run(runner, ["/usr/bin/systemctl", "daemon-reload"]),
@@ -3354,6 +3508,9 @@ def _apply_cutover_locked(
             "backup_directory": str(backup_directory),
             "attempted_targets": attempted_targets,
             "rollback_performed": True,
+            "created_install_directories": [
+                str(path) for path, _identity in created_install_directories
+            ],
             "rollback_complete": not rollback_errors,
             "rollback_errors": rollback_errors,
             "socket_was_active": was_active,

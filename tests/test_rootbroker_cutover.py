@@ -2001,6 +2001,96 @@ class RootbrokerCutoverTests(unittest.TestCase):
             backup_manifests = list(Path(layout["backup_root"]).rglob("manifest.json"))
             self.assertEqual(len(backup_manifests), 1)
 
+    def test_apply_creates_missing_flowlines_dropin_parent_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            layout = self._layout(root)
+            systemd_system = root / "installed" / "etc" / "systemd" / "system"
+            systemd_system.mkdir(parents=True)
+            systemd_system.chmod(0o700)
+            dropin_parent = systemd_system / "grabowski-operator.service.d"
+            dropin_target = dropin_parent / "80-flowlines.conf"
+            dropin_data = b"FLOWLINES_ENABLED = True\n"
+            artifacts = dict(layout["artifacts"])
+            artifacts[dropin_target] = (
+                dropin_data,
+                0o644,
+                hashlib.sha256(dropin_data).hexdigest(),
+            )
+
+            with patch.object(
+                cutover,
+                "OPERATOR_FLOWLINES_DROPIN_TARGET",
+                dropin_target,
+            ):
+                receipt = cutover.apply_cutover(
+                    repository=layout["repository"],
+                    expected_head=HEAD,
+                    backup_root=layout["backup_root"],
+                    receipt_root=layout["receipt_root"],
+                    config_target=layout["config_target"],
+                    artifact_targets=artifacts,
+                    lock_path=layout["lock_path"],
+                    runner=FakeRunner(active=True),
+                    require_root=False,
+                )
+
+            self.assertEqual(dropin_target.read_bytes(), dropin_data)
+            self.assertEqual(dropin_target.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(dropin_parent.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(
+                receipt["created_install_directories"],
+                [str(dropin_parent)],
+            )
+
+    def test_failure_removes_flowlines_dropin_parent_created_by_cutover(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            layout = self._layout(root)
+            systemd_system = root / "installed" / "etc" / "systemd" / "system"
+            systemd_system.mkdir(parents=True)
+            systemd_system.chmod(0o700)
+            dropin_parent = systemd_system / "grabowski-operator.service.d"
+            dropin_target = dropin_parent / "80-flowlines.conf"
+            dropin_data = b"FLOWLINES_ENABLED = True\n"
+            artifacts = dict(layout["artifacts"])
+            artifacts[dropin_target] = (
+                dropin_data,
+                0o644,
+                hashlib.sha256(dropin_data).hexdigest(),
+            )
+
+            with (
+                patch.object(
+                    cutover,
+                    "OPERATOR_FLOWLINES_DROPIN_TARGET",
+                    dropin_target,
+                ),
+                self.assertRaisesRegex(cutover.CutoverError, "injected start failure"),
+            ):
+                cutover.apply_cutover(
+                    repository=layout["repository"],
+                    expected_head=HEAD,
+                    backup_root=layout["backup_root"],
+                    receipt_root=layout["receipt_root"],
+                    config_target=layout["config_target"],
+                    artifact_targets=artifacts,
+                    lock_path=layout["lock_path"],
+                    runner=FakeRunner(active=True, fail_first_start=True),
+                    require_root=False,
+                )
+
+            self.assertFalse(dropin_target.exists())
+            self.assertFalse(dropin_parent.exists())
+            receipts = list(Path(layout["receipt_root"]).glob("*.json"))
+            self.assertEqual(len(receipts), 1)
+            failure = json.loads(receipts[0].read_text())
+            self.assertTrue(failure["rollback_complete"])
+            self.assertEqual(
+                failure["created_install_directories"],
+                [str(dropin_parent)],
+            )
+
     def test_failure_restores_every_preimage_and_records_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             layout = self._layout(Path(raw))
