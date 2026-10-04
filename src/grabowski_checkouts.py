@@ -1641,9 +1641,9 @@ def _persist_checkout_operation_uncertainty(
 ) -> dict[str, Any]:
     checkout_identity = _validate_sha256(checkout_key, "checkout_key")
     owner = _owner(owner_id)
-    if operation not in {"archive", "cleanup", "materialize"}:
+    if operation not in {"archive", "cleanup", "materialize", "auto-source-cleanup"}:
         raise ValueError(
-            "Checkout uncertainty operation must be archive, cleanup or materialize"
+            "Checkout uncertainty operation must be archive, cleanup, materialize or auto-source-cleanup"
         )
     if (
         not isinstance(operation_id, str)
@@ -3395,6 +3395,80 @@ def _resolve_materialize_recovery_obligation(
     }
 
 
+def _completed_materialize_uncertainty_readback(
+    fence: dict[str, Any],
+    readback: dict[str, Any],
+) -> dict[str, Any] | None:
+    if readback.get("state") != "recoverable_created":
+        return None
+    evidence = fence["evidence"]
+    try:
+        retention = _materialize_uncertainty_retention(fence)
+    except Exception as exc:
+        return {
+            "state": "still_fenced",
+            "reason": (
+                "materialize-retention-readback-failed:"
+                f"{type(exc).__name__}"
+            ),
+            "readback": readback,
+        }
+
+    import grabowski_operator_obligation as obligations
+
+    try:
+        obligation_status = obligations.status_obligation(
+            str(evidence["obligation_id"])
+        )
+    except FileNotFoundError:
+        return None
+    if obligation_status.get("state") != "completed":
+        return None
+    if obligation_status.get("continuation_required") is not False:
+        return {
+            "state": "still_fenced",
+            "reason": "materialize-completed-obligation-still-requires-continuation",
+            "readback": readback,
+        }
+    if retention is None:
+        return {
+            "state": "still_fenced",
+            "reason": "materialize-completed-retention-missing",
+            "readback": readback,
+        }
+    retention_until = retention.get("retention_until_unix")
+    if (
+        not isinstance(retention_until, int)
+        or isinstance(retention_until, bool)
+    ):
+        return {
+            "state": "still_fenced",
+            "reason": "materialize-completed-retention-deadline-malformed",
+            "readback": readback,
+        }
+    if retention_until <= _now():
+        return None
+    if not _materialize_completed_obligation_matches_fence(
+        fence, obligation_status
+    ):
+        return {
+            "state": "still_fenced",
+            "reason": "materialize-completed-obligation-evidence-mismatch",
+            "readback": readback,
+        }
+    return {
+        "state": "confirmed_success",
+        "checkout_key": evidence["checkout_key"],
+        "expected_head": evidence["expected_head"],
+        "completed_obligation": {
+            "obligation_id": obligation_status.get("obligation_id"),
+            "state": obligation_status.get("state"),
+            "close_file_sha256": obligation_status.get("close_file_sha256"),
+        },
+        "retention": retention,
+    }
+
+
 def _reconcile_materialize_uncertainty(
     fence: dict[str, Any],
 ) -> dict[str, Any]:
@@ -3636,212 +3710,216 @@ def _reconcile_materialize_uncertainty(
         )
 
 
-def _auto_source_cleanup_binding_matches(
-    current: dict[str, Any],
-    expected: dict[str, Any],
-    *,
-    kind: str,
-) -> bool:
-    keys = (
-        (
-            "checkout_key",
-            "repo_common_dir",
-            "repo_path",
-            "checkout_path",
-            "owner_id",
-            "expected_head",
-            "expected_branch",
-            "created_at_unix",
-            "updated_at_unix",
-        )
-        if kind == "retention"
-        else (
-            "checkout_key",
-            "repo_common_dir",
-            "repo_path",
-            "checkout_path",
-            "owner_id",
-            "artifact_class",
-            "phase",
-            "expected_head",
-            "expected_branch",
-            "created_at_unix",
-            "updated_at_unix",
-        )
+def _auto_source_cleanup_path_lease_readback(
+    fence: dict[str, Any],
+) -> dict[str, Any]:
+    evidence = fence["evidence"]
+    path_key = resources.normalize_resource_key(
+        str(evidence["path_resource_key"])
     )
-    return all(current.get(key) == expected.get(key) for key in keys)
+    expected = evidence.get("path_lease")
+    if not isinstance(expected, dict):
+        return {
+            "state": "still_fenced",
+            "reason": "auto-source-cleanup-path-lease-evidence-missing",
+        }
+    fields = (
+        "resource_key",
+        "owner_id",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
+    )
+    expected_snapshot = {field: expected.get(field) for field in fields}
+    if (
+        expected_snapshot["resource_key"] != path_key
+        or expected_snapshot["owner_id"] != evidence.get("owner_id")
+        or any(expected_snapshot[field] is None for field in fields)
+    ):
+        return {
+            "state": "still_fenced",
+            "reason": "auto-source-cleanup-path-lease-evidence-mismatch",
+        }
+    current = resources.inspect_resource(path_key)
+    if current is None:
+        return {
+            "state": "absent",
+            "resource_key": path_key,
+            "expected_lease": expected_snapshot,
+        }
+    current_snapshot = {field: current.get(field) for field in fields}
+    if current_snapshot != expected_snapshot:
+        return {
+            "state": "still_fenced",
+            "reason": "auto-source-cleanup-path-lease-drift",
+            "resource_key": path_key,
+            "expected_lease": expected_snapshot,
+            "observed_lease": current_snapshot,
+        }
+    return {
+        "state": "expected",
+        "resource_key": path_key,
+        "expected_lease": expected_snapshot,
+        "observed_lease": current_snapshot,
+    }
+
+
+def _auto_source_cleanup_uncertainty_readback(
+    fence: dict[str, Any],
+) -> dict[str, Any]:
+    materialize = _materialize_uncertainty_readback(fence)
+    state = materialize.get("state")
+    if state == "confirmed_no_effect":
+        return {
+            "state": "confirmed_success",
+            "checkout_key": materialize["checkout_key"],
+            "expected_head": materialize["expected_head"],
+            "source_absent": True,
+            "materialize_readback": materialize,
+        }
+    if state == "recoverable_created":
+        return {
+            "state": "confirmed_no_effect",
+            "checkout_key": materialize["checkout_key"],
+            "expected_head": materialize["expected_head"],
+            "source_absent": False,
+            "materialize_readback": materialize,
+        }
+    return materialize
 
 
 def _reconcile_auto_source_cleanup_uncertainty(
     fence: dict[str, Any],
+    *,
+    effect_leases_live: bool,
 ) -> dict[str, Any]:
-    evidence = fence["evidence"]
-    if evidence.get("kind") != "grabowski_auto_runtime_deploy_source_cleanup_uncertainty":
-        return {"state": "still_fenced", "reason": "auto-source-cleanup-kind-mismatch"}
-    recovery = _acquire_uncertainty_recovery_resources(fence)
+    recovery: dict[str, Any] | None = None
+    if not effect_leases_live:
+        recovery = _acquire_uncertainty_recovery_resources(fence)
     try:
-        repo = _resolve_repo(str(evidence["repo"]))
-        checkout = Path(str(evidence["checkout_path"]))
-        expected_head = _validate_git_object_id(
-            str(evidence["expected_head"]), "expected_head"
-        )
-        if evidence.get("expected_branch") is not None:
+        readback = _auto_source_cleanup_uncertainty_readback(fence)
+        if readback.get("state") != "confirmed_success":
+            return readback
+
+        path_lease_state = _auto_source_cleanup_path_lease_readback(fence)
+        if path_lease_state.get("state") == "still_fenced":
             return {
                 "state": "still_fenced",
-                "reason": "auto-source-cleanup-expected-branch-must-be-detached",
+                "reason": path_lease_state["reason"],
+                "readback": readback,
+                "path_lease": path_lease_state,
             }
-        _, common_dir, records = _worktree_records(repo)
-        if str(common_dir) != str(evidence["git_common_dir"]):
+
+        try:
+            retention = _materialize_uncertainty_retention(fence)
+        except Exception as exc:
             return {
                 "state": "still_fenced",
-                "reason": "auto-source-cleanup-common-dir-mismatch",
+                "reason": (
+                    "auto-source-cleanup-retention-readback-failed:"
+                    f"{type(exc).__name__}"
+                ),
+                "readback": readback,
             }
-        matching = [record for record in records if record.get("path") == str(checkout)]
-        removed = False
-        git_returncode: int | None = None
-        if matching or os.path.lexists(checkout):
-            if len(matching) != 1 or not os.path.lexists(checkout):
-                return {
-                    "state": "still_fenced",
-                    "reason": "auto-source-cleanup-outcome-remains-ambiguous",
-                    "matching_worktrees": len(matching),
-                    "path_present": os.path.lexists(checkout),
-                }
+        if retention is not None:
             try:
-                _require_expected(matching[0], expected_head, None)
-                status = _worktree_status(matching[0])
+                if not _release_retention_exact(retention):
+                    return {
+                        "state": "still_fenced",
+                        "reason": "auto-source-cleanup-retention-release-failed",
+                        "readback": readback,
+                    }
             except Exception as exc:
                 return {
                     "state": "still_fenced",
-                    "reason": f"auto-source-cleanup-readback-mismatch:{type(exc).__name__}",
+                    "reason": (
+                        "auto-source-cleanup-retention-release-failed:"
+                        f"{type(exc).__name__}"
+                    ),
+                    "readback": readback,
                 }
-            if (
-                not matching[0].get("detached")
-                or status.get("dirty") is not False
-                or status.get("error") is not None
-            ):
+            if _materialize_uncertainty_retention(fence) is not None:
                 return {
                     "state": "still_fenced",
-                    "reason": "auto-source-cleanup-source-is-not-exact-and-clean",
-                }
-            lifecycle = _strict_lifecycle_binding(str(evidence["checkout_key"]))
-            expected_lifecycle = evidence.get("lifecycle")
-            if (
-                lifecycle is None
-                or not isinstance(expected_lifecycle, dict)
-                or not _auto_source_cleanup_binding_matches(
-                    lifecycle, expected_lifecycle, kind="lifecycle"
-                )
-            ):
-                return {
-                    "state": "still_fenced",
-                    "reason": "auto-source-cleanup-lifecycle-binding-mismatch",
-                }
-            retention_before = _retention_records(
-                [str(evidence["checkout_key"])]
-            ).get(str(evidence["checkout_key"]))
-            expected_retention = evidence.get("retention")
-            if retention_before is not None and (
-                not isinstance(expected_retention, dict)
-                or not _auto_source_cleanup_binding_matches(
-                    retention_before, expected_retention, kind="retention"
-                )
-                or retention_before.get("purpose")
-                != expected_retention.get("purpose")
-            ):
-                return {
-                    "state": "still_fenced",
-                    "reason": "auto-source-cleanup-retention-binding-mismatch",
-                }
-            physical_identity = physical_checkout.capture_physical_checkout_identity(
-                checkout
-            )
-            result = _git_mutate(
-                repo,
-                ["worktree", "remove", str(checkout)],
-                timeout_seconds=120,
-                expected_physical_identity=physical_identity,
-                expected_physical_checkout=checkout,
-            )
-            git_returncode = result.get("returncode")
-            _, _, after_records = _worktree_records(repo)
-            if (
-                any(record.get("path") == str(checkout) for record in after_records)
-                or os.path.lexists(checkout)
-            ):
-                return {
-                    "state": "still_fenced",
-                    "reason": "auto-source-cleanup-postcondition-failed",
-                }
-            removed = True
-
-        retention = _retention_records([str(evidence["checkout_key"])]).get(
-            str(evidence["checkout_key"])
-        )
-        expected_retention = evidence.get("retention")
-        if retention is not None:
-            if (
-                not isinstance(expected_retention, dict)
-                or not _auto_source_cleanup_binding_matches(
-                    retention, expected_retention, kind="retention"
-                )
-                or retention.get("purpose") != expected_retention.get("purpose")
-            ):
-                return {
-                    "state": "still_fenced",
-                    "reason": "auto-source-cleanup-retention-binding-mismatch",
-                }
-            if not _release_retention_exact(retention):
-                return {
-                    "state": "still_fenced",
-                    "reason": "auto-source-cleanup-retention-release-failed",
+                    "reason": "auto-source-cleanup-retention-still-present",
+                    "readback": readback,
                 }
 
-        lifecycle = _strict_lifecycle_binding(str(evidence["checkout_key"]))
-        expected_lifecycle = evidence.get("lifecycle")
+        try:
+            lifecycle = _materialize_uncertainty_lifecycle(fence)
+        except Exception as exc:
+            return {
+                "state": "still_fenced",
+                "reason": (
+                    "auto-source-cleanup-lifecycle-readback-failed:"
+                    f"{type(exc).__name__}"
+                ),
+                "readback": readback,
+            }
         if lifecycle is not None:
-            if (
-                not isinstance(expected_lifecycle, dict)
-                or not _auto_source_cleanup_binding_matches(
-                    lifecycle, expected_lifecycle, kind="lifecycle"
-                )
-            ):
+            try:
+                if not _release_checkout_lifecycle_exact(lifecycle):
+                    return {
+                        "state": "still_fenced",
+                        "reason": "auto-source-cleanup-lifecycle-release-failed",
+                        "readback": readback,
+                    }
+            except Exception as exc:
                 return {
                     "state": "still_fenced",
-                    "reason": "auto-source-cleanup-lifecycle-binding-mismatch",
+                    "reason": (
+                        "auto-source-cleanup-lifecycle-release-failed:"
+                        f"{type(exc).__name__}"
+                    ),
+                    "readback": readback,
                 }
-            if not _release_checkout_lifecycle_exact(lifecycle):
+            if _materialize_uncertainty_lifecycle(fence) is not None:
                 return {
                     "state": "still_fenced",
-                    "reason": "auto-source-cleanup-lifecycle-release-failed",
+                    "reason": "auto-source-cleanup-lifecycle-still-present",
+                    "readback": readback,
                 }
 
-        if _retention_records([str(evidence["checkout_key"])]).get(
-            str(evidence["checkout_key"])
-        ) is not None:
-            return {
-                "state": "still_fenced",
-                "reason": "auto-source-cleanup-retention-still-present",
-            }
-        if _strict_lifecycle_binding(str(evidence["checkout_key"])) is not None:
-            return {
-                "state": "still_fenced",
-                "reason": "auto-source-cleanup-lifecycle-still-present",
-            }
+        if path_lease_state["state"] == "expected":
+            expected_lease = path_lease_state["expected_lease"]
+            try:
+                resources.release_resources(
+                    str(fence["evidence"]["owner_id"]),
+                    [path_lease_state["resource_key"]],
+                    expected_leases=[expected_lease],
+                )
+            except Exception as exc:
+                return {
+                    "state": "still_fenced",
+                    "reason": (
+                        "auto-source-cleanup-path-lease-release-failed:"
+                        f"{type(exc).__name__}"
+                    ),
+                    "readback": readback,
+                }
+            if resources.inspect_resource(path_lease_state["resource_key"]) is not None:
+                return {
+                    "state": "still_fenced",
+                    "reason": "auto-source-cleanup-path-lease-still-present",
+                    "readback": readback,
+                }
+
         return {
-            "state": "reconciled_success",
-            "checkout_key": evidence["checkout_key"],
-            "expected_head": expected_head,
-            "removed_recovery_worktree": removed,
-            "git_returncode": git_returncode,
-            "auto_source_cleanup": True,
+            **readback,
+            "cleanup_state": {
+                "retention_released": retention is not None,
+                "lifecycle_released": lifecycle is not None,
+                "path_lease_state": path_lease_state["state"],
+            },
         }
     finally:
-        resources.release_resources(
-            str(recovery["owner_id"]),
-            [item["resource_key"] for item in recovery["leases"]],
-            expected_leases=list(recovery["leases"]),
-        )
+        if recovery is not None:
+            resources.release_resources(
+                str(recovery["owner_id"]),
+                [item["resource_key"] for item in recovery["leases"]],
+                expected_leases=list(recovery["leases"]),
+            )
 
 
 def _cleanup_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
@@ -3986,7 +4064,84 @@ def grabowski_checkout_uncertainty_reconcile(
         if item.get("owner_id") == fence["lease_owner_id"]
         and item.get("resource_key") in wanted
     ]
-    if live:
+    if live and fence["operation"] != "auto-source-cleanup":
+        if fence["operation"] == "materialize":
+            evidence = fence["evidence"]
+            path_key = resources.normalize_resource_key(
+                f"path:{evidence['checkout_path']}"
+            )
+            common_dir_key = resources.normalize_resource_key(
+                f"path:{evidence['git_common_dir']}"
+            )
+            fence_keys = {
+                resources.normalize_resource_key(str(item))
+                for item in fence["resource_keys"]
+            }
+            live_keys = {
+                resources.normalize_resource_key(str(item["resource_key"]))
+                for item in live
+            }
+            if (
+                fence_keys == {path_key, common_dir_key}
+                and live_keys == {path_key}
+                and len(live) == 1
+            ):
+                readback = _materialize_uncertainty_readback(fence)
+                completed = _completed_materialize_uncertainty_readback(
+                    fence, readback
+                )
+                if completed is not None:
+                    if completed.get("state") == "still_fenced":
+                        return {
+                            "state": "still_fenced",
+                            "fence": fence,
+                            "readback": completed,
+                        }
+                    lease_preparation = _prepare_uncertainty_fence_release(fence)
+                    if lease_preparation["state"] != "ready":
+                        return {
+                            "state": "still_fenced",
+                            "reason": lease_preparation["reason"],
+                            "fence": fence,
+                            "readback": completed,
+                            "lease_preparation": lease_preparation,
+                        }
+                    preserved_path_lease = dict(live[0])
+                    audit = {
+                        "timestamp_unix": _now(),
+                        "operation": "checkout-operation-uncertainty-reconcile",
+                        "fence_id": fence["fence_id"],
+                        "checkout_key": fence["checkout_key"],
+                        "owner_id": fence["owner_id"],
+                        "effect_operation": fence["operation"],
+                        "effect_operation_id": fence["operation_id"],
+                        "outcome": "confirmed_success",
+                        "readback": completed,
+                        "lease_preparation": lease_preparation,
+                        "source_path_lease_preserved": True,
+                    }
+                    base._append_audit(audit)
+                    cleared = _clear_checkout_operation_uncertainty(
+                        fence["fence_id"],
+                        outcome="confirmed_success",
+                        evidence={
+                            "readback": completed,
+                            "audit_timestamp_unix": audit["timestamp_unix"],
+                            "preserved_path_lease": preserved_path_lease,
+                        },
+                    )
+                    return {
+                        "state": "reconciled",
+                        "outcome": "confirmed_success",
+                        "fence": cleared,
+                        "lease_release": {
+                            "released": [],
+                            "preserved": [preserved_path_lease],
+                        },
+                        "lease_preparation": lease_preparation,
+                        "readback": completed,
+                        "audit": audit,
+                    }
         return {
             "state": "still_fenced",
             "reason": "operation-lease-still-live",
@@ -3996,15 +4151,14 @@ def grabowski_checkout_uncertainty_reconcile(
     if fence["operation"] == "archive":
         readback = _archive_uncertainty_readback(fence)
     elif fence["operation"] == "cleanup":
-        if (
-            fence.get("evidence", {}).get("kind")
-            == "grabowski_auto_runtime_deploy_source_cleanup_uncertainty"
-        ):
-            readback = _reconcile_auto_source_cleanup_uncertainty(fence)
-        else:
-            readback = _cleanup_uncertainty_readback(fence)
+        readback = _cleanup_uncertainty_readback(fence)
     elif fence["operation"] == "materialize":
         readback = _reconcile_materialize_uncertainty(fence)
+    elif fence["operation"] == "auto-source-cleanup":
+        readback = _reconcile_auto_source_cleanup_uncertainty(
+            fence,
+            effect_leases_live=bool(live),
+        )
     else:
         raise RuntimeError("Checkout uncertainty operation is unsupported")
     outcome = str(readback.get("state"))

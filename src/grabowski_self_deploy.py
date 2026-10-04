@@ -4172,15 +4172,19 @@ def _cleanup_auto_deploy_source_before_dispatch(
                 "by checkout coordination"
             ) from exc
         checkout_key = checkouts._checkout_key(common_dir, repository)
+        if checkout_key != str(lifecycle["checkout_key"]):
+            raise RuntimeError(
+                "automatic deployment source cleanup lifecycle checkout key drift"
+            )
         uncertainty_fence = checkouts._persist_checkout_operation_uncertainty(
             lease={
                 "owner_id": owner_id,
-                "leases": [cleanup_lease, common_dir_lease, path_lease],
+                "leases": [cleanup_lease, common_dir_lease],
             },
             checkout_key=checkout_key,
             owner_id=owner_id,
-            operation="cleanup",
-            operation_id=f"auto-source-cleanup:{repository.name}",
+            operation="auto-source-cleanup",
+            operation_id=source_identity_sha256,
             evidence={
                 "kind": "grabowski_auto_runtime_deploy_source_cleanup_uncertainty",
                 "repo": str(canonical),
@@ -4194,6 +4198,7 @@ def _cleanup_auto_deploy_source_before_dispatch(
                 "lifecycle": lifecycle,
                 "retention": retention,
                 "path_resource_key": path_key,
+                "path_lease": dict(path_lease),
             },
         )
         mutation_attempted = True

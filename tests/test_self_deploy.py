@@ -4539,6 +4539,20 @@ class SelfDeployToolTests(unittest.TestCase):
 
         self.assertEqual(events, ["fence", "mutate"])
         checkouts._persist_checkout_operation_uncertainty.assert_called_once()
+        persist_call = checkouts._persist_checkout_operation_uncertainty.call_args
+        self.assertEqual(
+            persist_call.kwargs["lease"]["leases"],
+            [cleanup_lease, common_dir_lease],
+        )
+        self.assertEqual(persist_call.kwargs["operation"], "auto-source-cleanup")
+        self.assertEqual(
+            persist_call.kwargs["evidence"]["path_lease"],
+            f["path_lease"],
+        )
+        self.assertNotIn(
+            f["path_lease"],
+            persist_call.kwargs["lease"]["leases"],
+        )
         checkouts._clear_checkout_operation_uncertainty.assert_not_called()
         release_resources.assert_not_called()
 
