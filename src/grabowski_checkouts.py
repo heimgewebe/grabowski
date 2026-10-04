@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import subprocess
 import time
 import urllib.parse
@@ -51,6 +52,9 @@ CHECKOUT_LOCK = Path(
     )
 ).expanduser()
 CHECKOUT_OPERATION_LOCK_POLL_SECONDS = 0.05
+AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK = (
+    Path.home() / ".local/state/grabowski/runtime-deploy-schedule.lock"
+)
 DRY_RUN_TTL_SECONDS = 15 * 60
 OPERATION_LEASE_TTL_SECONDS = 10 * 60
 OWNER_HANDOFF_PREVIEW_TTL_SECONDS = 5 * 60
@@ -1831,9 +1835,164 @@ def _release_checkout_resources(lease: dict[str, Any]) -> dict[str, Any]:
     return resources.release_resources(lease["owner_id"], keys)
 
 
+def _auto_source_cleanup_effect_lease_snapshots(
+    fence: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    evidence = fence.get("evidence")
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("kind")
+        != "grabowski_auto_runtime_deploy_source_cleanup_uncertainty"
+    ):
+        raise RuntimeError("auto-source-cleanup evidence contract is invalid")
+    raw = evidence.get("effect_leases")
+    if not isinstance(raw, list) or not raw:
+        raise RuntimeError("auto-source-cleanup effect lease evidence is missing")
+    fields = (
+        "resource_key",
+        "owner_id",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
+    )
+    owner = str(fence["lease_owner_id"])
+    snapshots: dict[str, dict[str, Any]] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            raise RuntimeError("auto-source-cleanup effect lease evidence is malformed")
+        snapshot = {field: item.get(field) for field in fields}
+        key = snapshot["resource_key"]
+        if (
+            not isinstance(key, str)
+            or resources.normalize_resource_key(key) != key
+            or snapshot["owner_id"] != owner
+            or any(snapshot[field] is None for field in fields)
+            or key in snapshots
+        ):
+            raise RuntimeError("auto-source-cleanup effect lease evidence is malformed")
+        snapshots[key] = snapshot
+    expected_keys = {
+        resources.normalize_resource_key(str(key))
+        for key in fence["resource_keys"]
+    }
+    if set(snapshots) != expected_keys:
+        raise RuntimeError("auto-source-cleanup effect lease evidence is incomplete")
+    return snapshots
+
+
+def _auto_source_cleanup_effect_leases_readback(
+    fence: dict[str, Any],
+) -> dict[str, Any]:
+    expected = _auto_source_cleanup_effect_lease_snapshots(fence)
+    fields = (
+        "resource_key",
+        "owner_id",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
+    )
+    owner = str(fence["lease_owner_id"])
+    observed = {
+        str(item["lease"]["resource_key"]): {
+            field: item["lease"].get(field) for field in fields
+        }
+        for item in _uncertainty_resource_lease_rows(fence)
+        if item["lease"].get("owner_id") == owner
+    }
+    if set(observed) != set(expected):
+        return {
+            "state": "still_fenced",
+            "reason": "auto-source-cleanup-effect-lease-set-drift",
+        }
+    for key, snapshot in expected.items():
+        if observed[key] != snapshot:
+            return {
+                "state": "still_fenced",
+                "reason": "auto-source-cleanup-effect-lease-snapshot-drift",
+                "resource_key": key,
+            }
+    return {"state": "expected", "leases": [expected[key] for key in sorted(expected)]}
+
+
+@contextmanager
+def _auto_source_cleanup_activity_guard(
+    fence: dict[str, Any],
+):
+    evidence = fence.get("evidence")
+    if (
+        not isinstance(evidence, dict)
+        or evidence.get("kind")
+        != "grabowski_auto_runtime_deploy_source_cleanup_uncertainty"
+    ):
+        raise RuntimeError("auto-source-cleanup evidence contract is invalid")
+    path = AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK
+    parent = path.parent
+    if parent.is_symlink() or path.is_symlink():
+        raise PermissionError("runtime deploy schedule lock path is unsafe")
+    flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeError("runtime deploy schedule lock is unavailable") from exc
+    locked = False
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != os.getuid()
+        ):
+            raise PermissionError(
+                "runtime deploy schedule lock must be one owner-controlled regular file"
+            )
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _release_uncertainty_fence_resources(fence: dict[str, Any]) -> dict[str, Any]:
+    owner = str(fence["lease_owner_id"])
+    keys = list(fence["resource_keys"])
+    if fence.get("operation") != "auto-source-cleanup":
+        return resources.release_resources(owner, keys)
+    expected = _auto_source_cleanup_effect_lease_snapshots(fence)
+    fields = (
+        "resource_key",
+        "owner_id",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
+    )
+    observed = {
+        str(item["lease"]["resource_key"]): {
+            field: item["lease"].get(field) for field in fields
+        }
+        for item in _uncertainty_resource_lease_rows(fence)
+        if item["lease"].get("owner_id") == owner
+    }
+    if not observed:
+        return {"released": []}
+    if set(observed) != set(expected):
+        raise RuntimeError("auto-source-cleanup effect lease set drifted")
+    for key, snapshot in expected.items():
+        if observed[key] != snapshot:
+            raise RuntimeError("auto-source-cleanup effect lease snapshot drifted")
+    release_keys = sorted(expected)
     return resources.release_resources(
-        str(fence["lease_owner_id"]), list(fence["resource_keys"])
+        owner,
+        release_keys,
+        expected_leases=[expected[key] for key in release_keys],
     )
 
 
@@ -3790,6 +3949,40 @@ def _auto_source_cleanup_uncertainty_readback(
 
 
 def _reconcile_auto_source_cleanup_uncertainty(
+    fence: dict[str, Any],
+    *,
+    effect_leases_live: bool,
+) -> dict[str, Any]:
+    if effect_leases_live:
+        try:
+            with _auto_source_cleanup_activity_guard(fence) as inactive:
+                if not inactive:
+                    return {
+                        "state": "still_fenced",
+                        "reason": "auto-source-cleanup-owner-still-active",
+                    }
+                lease_state = _auto_source_cleanup_effect_leases_readback(fence)
+                if lease_state["state"] != "expected":
+                    return lease_state
+                return _reconcile_auto_source_cleanup_uncertainty_guarded(
+                    fence,
+                    effect_leases_live=True,
+                )
+        except (OSError, PermissionError, RuntimeError) as exc:
+            return {
+                "state": "still_fenced",
+                "reason": (
+                    "auto-source-cleanup-activity-readback-failed:"
+                    f"{type(exc).__name__}"
+                ),
+            }
+    return _reconcile_auto_source_cleanup_uncertainty_guarded(
+        fence,
+        effect_leases_live=False,
+    )
+
+
+def _reconcile_auto_source_cleanup_uncertainty_guarded(
     fence: dict[str, Any],
     *,
     effect_leases_live: bool,

@@ -75,6 +75,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
             patch.object(checkouts, "CHECKOUT_DB", self.checkout_db),
             patch.object(checkouts, "ARCHIVE_ROOT", self.archive_root),
             patch.object(checkouts, "CHECKOUT_LOCK", self.root / "state" / "checkouts.lock"),
+            patch.object(
+                checkouts,
+                "AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK",
+                self.root / "state" / "runtime-deploy-schedule.lock",
+            ),
             patch.object(checkouts.resources, "RESOURCE_DB", self.resource_db),
             patch.object(checkouts.tasks, "TASK_DB", self.task_db),
             patch.object(checkouts.operator, "_safe_environment", return_value=os.environ.copy()),
@@ -2875,6 +2880,10 @@ class CheckoutLifecycleTests(unittest.TestCase):
             purpose="test auto source cleanup uncertainty",
             ttl_seconds=7200,
         )
+        checkouts.AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK.parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        checkouts.AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK.touch(exist_ok=True)
         cleanup_fence = checkouts._persist_checkout_operation_uncertainty(
             lease=acquisition,
             checkout_key=str(lifecycle["checkout_key"]),
@@ -2882,6 +2891,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
             operation="auto-source-cleanup",
             operation_id="9" * 64,
             evidence={
+                "kind": "grabowski_auto_runtime_deploy_source_cleanup_uncertainty",
                 "repo": str(self.repo.resolve()),
                 "git_common_dir": str(checkouts._git_common_dir(self.repo)),
                 "checkout_path": str(target),
@@ -2891,6 +2901,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 "expected_branch": None,
                 "path_resource_key": path_key,
                 "path_lease": path_lease,
+                "effect_leases": [dict(item) for item in acquisition["leases"]],
                 "source_identity_sha256": "9" * 64,
             },
         )
@@ -2922,6 +2933,43 @@ class CheckoutLifecycleTests(unittest.TestCase):
             checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
         )
         self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_auto_source_cleanup_uncertainty_stays_fenced_while_owner_active(self) -> None:
+        target, fence, lifecycle, retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=False)
+        )
+        path_lease_before = checkouts.resources.inspect_resource(path_key)
+        descriptor = os.open(
+            checkouts.AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK,
+            os.O_RDWR | os.O_CLOEXEC,
+        )
+        try:
+            checkouts.fcntl.flock(descriptor, checkouts.fcntl.LOCK_EX)
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        finally:
+            checkouts.fcntl.flock(descriptor, checkouts.fcntl.LOCK_UN)
+            os.close(descriptor)
+        self.assertEqual(result["state"], "still_fenced")
+        self.assertEqual(
+            result["readback"]["reason"],
+            "auto-source-cleanup-owner-still-active",
+        )
+        self.assertTrue(target.exists())
+        self.assertEqual(
+            checkouts.resources.inspect_resource(path_key),
+            path_lease_before,
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
 
     def test_auto_source_cleanup_uncertainty_reconciles_success_under_live_leases(self) -> None:
         target, fence, lifecycle, _retention, path_key = (

@@ -4199,6 +4199,10 @@ def _cleanup_auto_deploy_source_before_dispatch(
                 "retention": retention,
                 "path_resource_key": path_key,
                 "path_lease": dict(path_lease),
+                "effect_leases": [
+                    dict(cleanup_lease),
+                    dict(common_dir_lease),
+                ],
             },
         )
         mutation_attempted = True
@@ -4438,6 +4442,40 @@ def _source_identity_sha256(identity: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _require_target_deploy_runner(
+    repository: Path,
+    expected_head: str,
+) -> None:
+    if OBJECT_ID_RE.fullmatch(expected_head) is None:
+        raise RuntimeError("target deployment runner binding is invalid")
+    relative = RUNNER_RELATIVE_PATH.as_posix()
+    listing = _required_stdout(
+        _git_result(
+            repository,
+            "ls-tree",
+            "--full-tree",
+            expected_head,
+            "--",
+            relative,
+        ),
+        "target deployment runner lookup",
+    )
+    lines = [line for line in listing.splitlines() if line]
+    if len(lines) != 1:
+        raise RuntimeError("scheduled deployment runner is unavailable in target commit")
+    metadata, separator, path = lines[0].partition("\t")
+    fields = metadata.split()
+    if (
+        separator != "\t"
+        or path != relative
+        or len(fields) != 3
+        or fields[0] not in {"100644", "100755"}
+        or fields[1] != "blob"
+        or OBJECT_ID_RE.fullmatch(fields[2]) is None
+    ):
+        raise RuntimeError("scheduled deployment runner is unavailable in target commit")
+
+
 def _deployment_source_preflight(
     expected_head: str,
     source_repository: str | None,
@@ -4621,6 +4659,14 @@ def _deployment_schedule_preflight(
                 if resolved_root != root or not resolved_root.is_dir():
                     raise RuntimeError(
                         "automatic deployment source root must be an exact real directory"
+                    )
+                if (
+                    canonical_state["current_head"] == expected_head
+                    or canonical_state["origin_main"] == expected_head
+                ):
+                    _require_target_deploy_runner(
+                        Path(str(canonical_state["canonical_repository"])),
+                        expected_head,
                     )
             except Exception as fallback_error:
                 raise canonical_error from fallback_error
@@ -4998,6 +5044,13 @@ def _grabowski_runtime_deploy_schedule_impl(
                 effective_source_repository = None
                 effective_source_lease_owner_id = None
         if automatic_source_needed:
+            _require_target_deploy_runner(
+                _validated_repository_path(
+                    CANONICAL_REPOSITORY,
+                    label="canonical repository",
+                ),
+                expected_head,
+            )
             (
                 repository,
                 runner,

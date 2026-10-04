@@ -1262,6 +1262,94 @@ class SelfDeployToolTests(unittest.TestCase):
             ):
                 SELF_DEPLOY._deployment_schedule_preflight(expected, None, None)
 
+    def test_target_deploy_runner_accepts_regular_blob(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "d" * 40
+        blob = "e" * 40
+        with patch.object(
+            SELF_DEPLOY,
+            "_git_result",
+            return_value=_result(
+                f"100755 blob {blob}\t{SELF_DEPLOY.RUNNER_RELATIVE_PATH.as_posix()}\n"
+            ),
+        ) as git_result:
+            SELF_DEPLOY._require_target_deploy_runner(repo, expected)
+        git_result.assert_called_once_with(
+            repo,
+            "ls-tree",
+            "--full-tree",
+            expected,
+            "--",
+            SELF_DEPLOY.RUNNER_RELATIVE_PATH.as_posix(),
+        )
+
+    def test_target_deploy_runner_rejects_missing_or_symlink(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "d" * 40
+        with patch.object(SELF_DEPLOY, "_git_result", return_value=_result("")):
+            with self.assertRaisesRegex(RuntimeError, "unavailable in target commit"):
+                SELF_DEPLOY._require_target_deploy_runner(repo, expected)
+        with patch.object(
+            SELF_DEPLOY,
+            "_git_result",
+            return_value=_result(
+                f"120000 blob {'e' * 40}\t{SELF_DEPLOY.RUNNER_RELATIVE_PATH.as_posix()}\n"
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unavailable in target commit"):
+                SELF_DEPLOY._require_target_deploy_runner(repo, expected)
+
+    def test_schedule_preflight_rejects_invalid_target_runner_before_materialization(self) -> None:
+        expected = "d" * 40
+        canonical = Path("/home/alex/repos/grabowski")
+        canonical_state = {
+            "canonical_repository": str(canonical),
+            "current_head": expected,
+            "current_branch": "feature/active-work",
+            "target_head": expected,
+            "origin_main": expected,
+            "clean": True,
+            "shallow": False,
+            "lease_evidence": {
+                "resource_key": f"path:{canonical}",
+                "lease": None,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            with patch.object(
+                SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+            ), patch.object(
+                SELF_DEPLOY,
+                "_deployment_source_preflight",
+                side_effect=RuntimeError(
+                    "canonical-main source has invalid branch state"
+                ),
+            ), patch.object(
+                SELF_DEPLOY,
+                "_canonical_main_refresh_candidate",
+                return_value=canonical_state,
+            ), patch.object(
+                SELF_DEPLOY, "AUTO_DEPLOY_SOURCE_ROOT", root
+            ), patch.object(
+                SELF_DEPLOY,
+                "_require_target_deploy_runner",
+                side_effect=RuntimeError(
+                    "scheduled deployment runner is unavailable in target commit"
+                ),
+            ) as target_runner:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "canonical-main source has invalid branch state",
+                ) as blocked:
+                    SELF_DEPLOY._deployment_schedule_preflight(expected, None, None)
+        self.assertIsNotNone(blocked.exception.__cause__)
+        self.assertIn(
+            "scheduled deployment runner is unavailable in target commit",
+            str(blocked.exception.__cause__),
+        )
+        target_runner.assert_called_once_with(canonical, expected)
+
     def test_schedule_preflight_materialization_still_requires_auto_source_root(self) -> None:
         expected = "d" * 40
         canonical_state = {
@@ -1375,6 +1463,8 @@ class SelfDeployToolTests(unittest.TestCase):
                 return_value=canonical_state,
             ), patch.object(
                 SELF_DEPLOY, "AUTO_DEPLOY_SOURCE_ROOT", root
+            ), patch.object(
+                SELF_DEPLOY, "_require_target_deploy_runner"
             ), patch.object(
                 SELF_DEPLOY, "_git_result", return_value=_result()
             ) as git_result:
@@ -1969,6 +2059,9 @@ class SelfDeployToolTests(unittest.TestCase):
             side_effect=lambda *_args: sequence.append("authority")
             or {"success": True, "outcome": "refreshed"},
         ) as authority, patch.object(
+            SELF_DEPLOY,
+            "_require_target_deploy_runner",
+        ), patch.object(
             SELF_DEPLOY,
             "_materialize_auto_deploy_source",
             side_effect=lambda *_args: sequence.append("materialize")
@@ -3789,6 +3882,9 @@ class SelfDeployToolTests(unittest.TestCase):
             return_value={"current_head": "a" * 40, "target_head": expected},
         ), patch.object(
             SELF_DEPLOY,
+            "_require_target_deploy_runner",
+        ) as target_runner, patch.object(
+            SELF_DEPLOY,
             "_materialize_auto_deploy_source",
             return_value=(source, runner, identity, materialization),
         ) as materialize, patch.object(
@@ -3818,6 +3914,7 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertTrue(result["already_scheduled"])
         self.assertEqual(public_main.call_count, 3)
         SELF_DEPLOY.privileged.ensure_rootbroker_authority.assert_called_once_with(expected)
+        target_runner.assert_called_once_with(canonical, expected)
         materialize.assert_called_once_with(expected)
         self.assertEqual(
             preflight.call_args_list[-1].args,
@@ -4027,6 +4124,9 @@ class SelfDeployToolTests(unittest.TestCase):
             return_value={"current_head": "a" * 40, "target_head": expected},
         ), patch.object(
             SELF_DEPLOY,
+            "_require_target_deploy_runner",
+        ), patch.object(
+            SELF_DEPLOY,
             "_materialize_auto_deploy_source",
             return_value=(source, runner, identity, materialization),
         ), patch.object(
@@ -4197,6 +4297,9 @@ class SelfDeployToolTests(unittest.TestCase):
             return_value={"current_head": "a" * 40, "target_head": expected},
         ), patch.object(
             SELF_DEPLOY,
+            "_require_target_deploy_runner",
+        ), patch.object(
+            SELF_DEPLOY,
             "_materialize_auto_deploy_source",
             return_value=(source, runner, identity, materialization),
         ), patch.object(
@@ -4344,6 +4447,9 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY,
             "_canonical_stale_main_snapshot",
             return_value={"current_head": "a" * 40, "target_head": expected},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_require_target_deploy_runner",
         ), patch.object(
             SELF_DEPLOY,
             "_materialize_auto_deploy_source",
@@ -4545,6 +4651,10 @@ class SelfDeployToolTests(unittest.TestCase):
             [cleanup_lease, common_dir_lease],
         )
         self.assertEqual(persist_call.kwargs["operation"], "auto-source-cleanup")
+        self.assertEqual(
+            persist_call.kwargs["evidence"]["effect_leases"],
+            [cleanup_lease, common_dir_lease],
+        )
         self.assertEqual(
             persist_call.kwargs["evidence"]["path_lease"],
             f["path_lease"],
@@ -4905,6 +5015,8 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY, "_canonical_stale_main_snapshot",
             return_value={"current_head": "a" * 40, "target_head": expected},
         ), patch.object(
+            SELF_DEPLOY, "_require_target_deploy_runner"
+        ), patch.object(
             SELF_DEPLOY, "_materialize_auto_deploy_source",
             return_value=(source, runner, identity, materialization),
         ), patch.object(
@@ -4961,6 +5073,8 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY, "_canonical_stale_main_snapshot",
             return_value={"current_head": "a" * 40, "target_head": expected},
         ), patch.object(
+            SELF_DEPLOY, "_require_target_deploy_runner"
+        ), patch.object(
             SELF_DEPLOY, "_materialize_auto_deploy_source",
             return_value=(source, runner, identity, materialization),
         ), patch.object(
@@ -5016,6 +5130,8 @@ class SelfDeployToolTests(unittest.TestCase):
         ), patch.object(
             SELF_DEPLOY, "_canonical_stale_main_snapshot",
             return_value={"current_head": "a" * 40, "target_head": expected},
+        ), patch.object(
+            SELF_DEPLOY, "_require_target_deploy_runner"
         ), patch.object(
             SELF_DEPLOY, "_materialize_auto_deploy_source",
             return_value=(source, runner, identity, materialization),
