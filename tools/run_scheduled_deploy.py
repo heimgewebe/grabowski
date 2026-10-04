@@ -276,6 +276,7 @@ def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
+        process.wait()
         return
     try:
         process.wait(timeout=5)
@@ -1177,6 +1178,7 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
     environment = child_environment()
     effective_argv = list(argv)
     validation_tmp = None
+    process: subprocess.Popen[bytes] | None = None
     previous_sigterm: Any = None
     try:
         if phase == "validate":
@@ -1224,6 +1226,12 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
             raise RuntimeError(f"{phase} failed with return code {returncode}")
     finally:
         try:
+            if (
+                validation_tmp is not None
+                and process is not None
+                and process.poll() is None
+            ):
+                terminate_process_group(process)
             if validation_tmp is not None:
                 validation_tmp.cleanup()
         finally:

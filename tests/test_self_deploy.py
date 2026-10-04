@@ -5217,10 +5217,12 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             popen.assert_not_called()
             self.assertEqual(list(Path(temporary_parent).iterdir()), [])
 
-    def test_validate_sigterm_runs_cleanup_and_restores_handler(self) -> None:
+    def test_validate_sigterm_terminates_child_before_cleanup_and_restores_handler(self) -> None:
         process = Mock()
         process.wait.side_effect = lambda timeout: signal.raise_signal(signal.SIGTERM)
+        process.poll.return_value = None
         previous = signal.getsignal(signal.SIGTERM)
+        termination_observations: list[tuple[bool, bool]] = []
         with tempfile.TemporaryDirectory() as temporary_parent, patch.object(
             RUNNER, "_validation_temp_parent", return_value=Path(temporary_parent)
         ), patch.object(
@@ -5232,15 +5234,37 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             "Popen",
             return_value=process,
         ):
-            with self.assertRaisesRegex(RuntimeError, "SIGTERM"):
-                RUNNER.run_streamed(
-                    ["make", "validate"],
-                    cwd=Path("/tmp"),
-                    timeout_seconds=30,
-                    phase="validate",
+
+            def terminate(child: Mock) -> None:
+                termination_observations.append(
+                    (child is process, any(Path(temporary_parent).iterdir()))
                 )
-            self.assertEqual(list(Path(temporary_parent).iterdir()), [])
+                child.returncode = -signal.SIGTERM
+                child.poll.return_value = -signal.SIGTERM
+
+            with patch.object(
+                RUNNER, "terminate_process_group", side_effect=terminate
+            ) as terminate_group:
+                with self.assertRaisesRegex(RuntimeError, "SIGTERM"):
+                    RUNNER.run_streamed(
+                        ["make", "validate"],
+                        cwd=Path("/tmp"),
+                        timeout_seconds=30,
+                        phase="validate",
+                    )
+                terminate_group.assert_called_once_with(process)
+                self.assertEqual(termination_observations, [(True, True)])
+                self.assertEqual(process.poll(), -signal.SIGTERM)
+                self.assertEqual(list(Path(temporary_parent).iterdir()), [])
         self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+
+    def test_terminate_process_group_reaps_after_process_group_race(self) -> None:
+        process = Mock()
+        process.poll.return_value = None
+        process.pid = 12345
+        with patch.object(RUNNER.os, "killpg", side_effect=ProcessLookupError):
+            RUNNER.terminate_process_group(process)
+        process.wait.assert_called_once_with()
 
     def test_prepare_validation_python_rejects_unsafe_runtime_lock_identity(self) -> None:
         for case in ("missing", "symlink", "hardlink", "foreign-owner"):
