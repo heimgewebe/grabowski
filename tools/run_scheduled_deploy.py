@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -945,7 +946,17 @@ def _validation_environment(validation_root: Path) -> dict[str, str]:
             "NO_COLOR": "1",
         }
     )
-    for key in ("GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_ASKPASS", "SSH_ASKPASS"):
+    for key in (
+        "GIT_EXTERNAL_DIFF",
+        "GIT_DIFF_OPTS",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "MAKEFLAGS",
+        "MFLAGS",
+        "GNUMAKEFLAGS",
+        "MAKEFILES",
+        "MAKELEVEL",
+    ):
         environment.pop(key, None)
     for name in FINALIZATION_ENV.values():
         environment.pop(name, None)
@@ -959,10 +970,12 @@ def _verify_validation_distributions(
     python: Path,
     locked: dict[str, str],
     environment: dict[str, str],
+    validation_root: Path,
 ) -> None:
     result = deploy_core.run(
         [
             str(python),
+            "-I",
             "-c",
             (
                 "import importlib.metadata,json; "
@@ -974,6 +987,7 @@ def _verify_validation_distributions(
         capture=True,
         timeout=deploy_core.TIMEOUTS["python"],
         env=environment,
+        cwd=validation_root,
     )
     try:
         installed_raw = json.loads(result.stdout)
@@ -1009,36 +1023,118 @@ def _verify_validation_distributions(
         )
 
 
-def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
-    """Build an isolated validation interpreter from the exact target runtime lock."""
-    lock_path = repo / deploy_core.RUNTIME_LOCK_RELATIVE
+def _snapshot_validation_runtime_lock(
+    repo: Path,
+    validation_root: Path,
+) -> tuple[Path, dict[str, str]]:
+    """Copy one stable, no-follow runtime lock into the private validation root."""
+    directory_flags = (
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    repo_descriptor = -1
+    requirements_descriptor = -1
+    lock_descriptor = -1
+    chunks: list[bytes] = []
     try:
-        metadata = lock_path.lstat()
+        repo_descriptor = os.open(repo, directory_flags)
+        requirements_descriptor = os.open(
+            deploy_core.RUNTIME_LOCK_RELATIVE.parent.as_posix(),
+            directory_flags,
+            dir_fd=repo_descriptor,
+        )
+        requirements_metadata = os.fstat(requirements_descriptor)
+        if (
+            not stat.S_ISDIR(requirements_metadata.st_mode)
+            or requirements_metadata.st_uid != os.getuid()
+        ):
+            raise RuntimeError("target runtime lock parent is unsafe")
+        lock_descriptor = os.open(
+            deploy_core.RUNTIME_LOCK_RELATIVE.name,
+            file_flags,
+            dir_fd=requirements_descriptor,
+        )
+        before = os.fstat(lock_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+        ):
+            raise RuntimeError("target runtime lock is unsafe")
+        total = 0
+        while chunk := os.read(lock_descriptor, 1024 * 1024):
+            chunks.append(chunk)
+            total += len(chunk)
+        after = os.fstat(lock_descriptor)
+        if (
+            total != before.st_size
+            or (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            )
+            != (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+        ):
+            raise RuntimeError("target runtime lock changed while being read")
     except OSError as exc:
         raise RuntimeError("target runtime lock is unsafe") from exc
-    if (
-        lock_path.is_symlink()
-        or not lock_path.is_file()
-        or metadata.st_uid != os.getuid()
-        or metadata.st_nlink != 1
-    ):
-        raise RuntimeError("target runtime lock is unsafe")
+    finally:
+        if lock_descriptor >= 0:
+            os.close(lock_descriptor)
+        if requirements_descriptor >= 0:
+            os.close(requirements_descriptor)
+        if repo_descriptor >= 0:
+            os.close(repo_descriptor)
 
-    # Reject requirements-file directives and invalid pins before pip sees the
-    # target lock. This mirrors build_release() and keeps validation fail-closed.
-    locked = deploy_core.parse_runtime_lock(lock_path)
+    lock_copy = validation_root / "runtime.lock.txt"
+    output_descriptor = os.open(
+        lock_copy,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        view = memoryview(b"".join(chunks))
+        while view:
+            written = os.write(output_descriptor, view)
+            if written <= 0:
+                raise RuntimeError("validation runtime lock copy write failed")
+            view = view[written:]
+        os.fsync(output_descriptor)
+    finally:
+        os.close(output_descriptor)
+    locked = deploy_core.parse_runtime_lock(lock_copy)
+    return lock_copy, locked
+
+
+def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
+    """Build an isolated validation interpreter from the exact target runtime lock."""
+    lock_path, locked = _snapshot_validation_runtime_lock(repo, validation_root)
 
     venv = validation_root / "target-runtime"
     environment = _validation_environment(validation_root)
     deploy_core.run(
-        [str(deploy_core.runtime_venv_builder_python()), "-m", "venv", str(venv)],
+        [
+            str(deploy_core.runtime_venv_builder_python()),
+            "-I",
+            "-m",
+            "venv",
+            str(venv),
+        ],
         timeout=deploy_core.TIMEOUTS["python"],
         env=environment,
+        cwd=validation_root,
     )
     python = venv / "bin" / "python"
     deploy_core.run(
         [
             str(python),
+            "-I",
             "-m",
             "pip",
             "install",
@@ -1055,22 +1151,39 @@ def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
         ],
         timeout=deploy_core.TIMEOUTS["package_install"],
         env=environment,
+        cwd=validation_root,
     )
     deploy_core.run(
-        [str(python), "-m", "pip", "check"],
+        [str(python), "-I", "-m", "pip", "check"],
         timeout=deploy_core.TIMEOUTS["python"],
         env=environment,
+        cwd=validation_root,
     )
-    _verify_validation_distributions(python, locked, environment)
+    _verify_validation_distributions(
+        python,
+        locked,
+        environment,
+        validation_root,
+    )
     return python
+
+
+def _raise_validation_sigterm(signum: int, _frame: Any) -> None:
+    raise RuntimeError(f"validate interrupted by signal {signum} (SIGTERM)")
 
 
 def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str) -> None:
     emit(f"{phase}-start", argv=argv)
     environment = child_environment()
+    effective_argv = list(argv)
     validation_tmp = None
+    previous_sigterm: Any = None
     try:
         if phase == "validate":
+            if argv != ["make", "validate"]:
+                raise RuntimeError("validate phase requires canonical make validate argv")
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, _raise_validation_sigterm)
             validation_tmp = tempfile.TemporaryDirectory(
                 prefix="gdv-",
                 dir=_validation_temp_parent(),
@@ -1083,11 +1196,16 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
             environment["PATH"] = str(validation_python.parent) + (
                 os.pathsep + inherited_path if inherited_path else ""
             )
-            environment["DEPLOY_TOOLING_VENV"] = str(
-                validation_root / "deploy-tooling" / ".venv"
-            )
+            tooling_venv = validation_root / "deploy-tooling" / ".venv"
+            environment["DEPLOY_TOOLING_VENV"] = str(tooling_venv)
+            effective_argv = [
+                "make",
+                f"PYTHON={validation_python}",
+                f"DEPLOY_TOOLING_VENV={tooling_venv}",
+                "validate",
+            ]
         process = subprocess.Popen(
-            argv,
+            effective_argv,
             cwd=cwd,
             env=environment,
             stdin=subprocess.DEVNULL,
@@ -1105,8 +1223,12 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
         if returncode != 0:
             raise RuntimeError(f"{phase} failed with return code {returncode}")
     finally:
-        if validation_tmp is not None:
-            validation_tmp.cleanup()
+        try:
+            if validation_tmp is not None:
+                validation_tmp.cleanup()
+        finally:
+            if previous_sigterm is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def verify_live_manifest(expected_head: str) -> dict[str, Any]:

@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 from pathlib import Path
 import sys
@@ -4981,9 +4982,21 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             "PIP_INDEX_URL": "https://untrusted.invalid/simple",
             "PIP_EXTRA_INDEX_URL": "https://untrusted.invalid/extra",
         }
+        make_bindings = {
+            "MAKEFLAGS": "--eval=bad",
+            "MFLAGS": "--bad",
+            "GNUMAKEFLAGS": "--eval=bad",
+            "MAKEFILES": "/tmp/untrusted.mk",
+            "MAKELEVEL": "7",
+        }
         with tempfile.TemporaryDirectory() as temporary_parent, patch.dict(
             os.environ,
-            {**bindings, **python_bindings, "GRABOWSKI_UNRELATED": "preserved"},
+            {
+                **bindings,
+                **python_bindings,
+                **make_bindings,
+                "GRABOWSKI_UNRELATED": "preserved",
+            },
             clear=False,
         ), patch.object(
             RUNNER, "_validation_temp_parent", return_value=Path(temporary_parent)
@@ -5013,12 +5026,21 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         )
         self.assertEqual(environment["GRABOWSKI_UNRELATED"], "preserved")
         self.assertEqual(environment["PIP_CONFIG_FILE"], "/dev/null")
-        for name in (*bindings, *python_bindings):
+        for name in (*bindings, *python_bindings, *make_bindings):
             self.assertNotIn(name, environment)
         self.assertEqual(environment["TMPDIR"], environment["TMP"])
         self.assertEqual(environment["TMPDIR"], environment["TEMP"])
         self.assertEqual(Path(environment["TMPDIR"]).parent, Path(temporary_parent))
         tooling_venv = Path(environment["DEPLOY_TOOLING_VENV"])
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "make",
+                "PYTHON=/validation/bin/python",
+                f"DEPLOY_TOOLING_VENV={tooling_venv}",
+                "validate",
+            ],
+        )
         self.assertEqual(tooling_venv.name, ".venv")
         self.assertEqual(tooling_venv.parent.name, "deploy-tooling")
         self.assertEqual(tooling_venv.parents[2], Path(temporary_parent))
@@ -5068,20 +5090,31 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
 
         self.assertEqual(result, python)
         self.assertEqual(run.call_count, 4)
+        lock_copy = validation_root / "runtime.lock.txt"
         self.assertEqual(
             run.call_args_list[0].args[0],
-            [str(base_python), "-m", "venv", str(validation_root / "target-runtime")],
+            [
+                str(base_python),
+                "-I",
+                "-m",
+                "venv",
+                str(validation_root / "target-runtime"),
+            ],
         )
         install = run.call_args_list[1].args[0]
-        self.assertEqual(install[:4], [str(python), "-m", "pip", "install"])
+        self.assertEqual(
+            install[:5],
+            [str(python), "-I", "-m", "pip", "install"],
+        )
         self.assertIn("--require-hashes", install)
         self.assertIn("--no-deps", install)
         self.assertIn("--only-binary=:all:", install)
-        self.assertEqual(install[-2:], ["-r", str(lock)])
+        self.assertEqual(install[-2:], ["-r", str(lock_copy)])
         verification = run.call_args_list[3]
-        self.assertEqual(verification.args[0][0], str(python))
+        self.assertEqual(verification.args[0][:3], [str(python), "-I", "-c"])
         self.assertTrue(verification.kwargs["capture"])
         for call_ in run.call_args_list:
+            self.assertEqual(call_.kwargs["cwd"], validation_root)
             environment = call_.kwargs["env"]
             self.assertEqual(environment["TMPDIR"], str(validation_root))
             self.assertEqual(environment["TMP"], str(validation_root))
@@ -5160,7 +5193,10 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(exception, message):
                     RUNNER._verify_validation_distributions(
-                        python, locked, environment
+                        python,
+                        locked,
+                        environment,
+                        Path("/validation"),
                     )
 
     def test_validate_preparation_failure_never_starts_make_and_cleans_temp(self) -> None:
@@ -5180,6 +5216,31 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                 )
             popen.assert_not_called()
             self.assertEqual(list(Path(temporary_parent).iterdir()), [])
+
+    def test_validate_sigterm_runs_cleanup_and_restores_handler(self) -> None:
+        process = Mock()
+        process.wait.side_effect = lambda timeout: signal.raise_signal(signal.SIGTERM)
+        previous = signal.getsignal(signal.SIGTERM)
+        with tempfile.TemporaryDirectory() as temporary_parent, patch.object(
+            RUNNER, "_validation_temp_parent", return_value=Path(temporary_parent)
+        ), patch.object(
+            RUNNER,
+            "_prepare_validation_python",
+            return_value=Path("/validation/bin/python"),
+        ), patch.object(
+            RUNNER.subprocess,
+            "Popen",
+            return_value=process,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "SIGTERM"):
+                RUNNER.run_streamed(
+                    ["make", "validate"],
+                    cwd=Path("/tmp"),
+                    timeout_seconds=30,
+                    phase="validate",
+                )
+            self.assertEqual(list(Path(temporary_parent).iterdir()), [])
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
 
     def test_prepare_validation_python_rejects_unsafe_runtime_lock_identity(self) -> None:
         for case in ("missing", "symlink", "hardlink", "foreign-owner"):
@@ -5205,7 +5266,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                     )
                 with getuid, patch.object(RUNNER.deploy_core, "run") as run:
                     with self.assertRaisesRegex(
-                        RuntimeError, "runtime lock is unsafe"
+                        RuntimeError, r"runtime lock.*unsafe"
                     ):
                         RUNNER._prepare_validation_python(repo, validation_root)
                 run.assert_not_called()
