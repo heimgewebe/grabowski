@@ -18,6 +18,40 @@ if str(SRC) not in sys.path:
 import grabowski_flowlines as flowlines
 
 
+EXPECTED_OTLP_AUTH_ENV = frozenset(
+    {
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_METRICS_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_LOGS_CREDENTIAL_PROVIDER",
+        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+    }
+)
+EXPECTED_CHILD_OTLP_ENV = EXPECTED_OTLP_AUTH_ENV | frozenset(
+    {
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    }
+)
+
+
 class FlowlinesSecurityRegressionTests(unittest.TestCase):
     def test_posthog_token_is_redacted_in_all_flowlines_text_surfaces(self) -> None:
         token = "ph" + "c_" + ("P" * 32)
@@ -265,11 +299,12 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
         self.assertNotIn("Environment=GRABOWSKI_FLOWLINES_ENABLED=1", service)
         self.assertNotIn("Environment=OTEL_EXPORTER_OTLP_ENDPOINT=", service)
         self.assertNotIn("Environment=OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=", service)
-        self.assertIn(
-            "UnsetEnvironment=OTEL_EXPORTER_OTLP_ENDPOINT "
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT "
-            "OTEL_EXPORTER_OTLP_HEADERS OTEL_EXPORTER_OTLP_TRACES_HEADERS",
-            service,
+        unset_line = next(
+            line for line in service.splitlines() if line.startswith("UnsetEnvironment=")
+        )
+        self.assertEqual(
+            frozenset(unset_line.removeprefix("UnsetEnvironment=").split()),
+            EXPECTED_CHILD_OTLP_ENV,
         )
         self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS=", service)
         self.assertNotIn("OTEL_EXPORTER_OTLP_TRACES_HEADERS=", service)
@@ -290,17 +325,21 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
         self.assertIn("load_environment_exporter=False", main_block)
 
     def test_all_forbidden_otlp_auth_variables_are_consumed(self) -> None:
+        self.assertEqual(
+            frozenset(flowlines._FLOWLINES_FORBIDDEN_EXPORT_ENV),
+            EXPECTED_OTLP_AUTH_ENV,
+        )
         environment = {
             "GRABOWSKI_FLOWLINES_ENABLED": "0",
             "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
             "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://api.flowlines.ai/v1/traces",
         }
-        environment.update({key: "fixture-secret" for key in flowlines._FLOWLINES_FORBIDDEN_EXPORT_ENV})
+        environment.update({key: "fixture-secret" for key in EXPECTED_OTLP_AUTH_ENV})
         with mock.patch.dict(os.environ, environment, clear=True):
             tracer, provider = flowlines._build_environment_tracer()
             self.assertIsNone(tracer)
             self.assertIsNone(provider)
-            for key in flowlines._FLOWLINES_FORBIDDEN_EXPORT_ENV:
+            for key in EXPECTED_OTLP_AUTH_ENV:
                 self.assertNotIn(key, os.environ)
 
     def test_verified_flowlines_identity_fallback_is_local_only(self) -> None:
@@ -320,16 +359,28 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
         self.assertIn("verified_identity_resolver=grabowski_mcp._flowlines_verified_identity", runtime)
 
     def test_child_boundaries_strip_full_otlp_auth_surface(self) -> None:
+        import grabowski_agent_sandbox as sandbox
+        import grabowski_mcp
+
         operator = (SRC / "grabowski_operator.py").read_text(encoding="utf-8")
-        mcp = (SRC / "grabowski_mcp.py").read_text(encoding="utf-8")
-        sandbox = (SRC / "grabowski_agent_sandbox.py").read_text(encoding="utf-8")
-        service = (ROOT / "systemd" / "grabowski-operator.service.example").read_text(encoding="utf-8")
-        for key in flowlines._FLOWLINES_FORBIDDEN_EXPORT_ENV:
+        service = (
+            ROOT / "systemd" / "grabowski-operator.service.example"
+        ).read_text(encoding="utf-8")
+
+        self.assertTrue(
+            EXPECTED_CHILD_OTLP_ENV.issubset(grabowski_mcp.SERVER_ONLY_CHILD_ENV_KEYS)
+        )
+        parent = {key: "fixture-secret" for key in EXPECTED_CHILD_OTLP_ENV}
+        with mock.patch.dict(os.environ, parent, clear=True):
+            mcp_child = grabowski_mcp._server_child_environment()
+        sandbox_child = sandbox.safe_git_environment(parent)
+
+        for key in EXPECTED_CHILD_OTLP_ENV:
             with self.subTest(key=key):
                 self.assertIn(key, operator)
-                self.assertIn(key, mcp)
-                self.assertIn(key, sandbox)
                 self.assertIn(key, service)
+                self.assertNotIn(key, mcp_child)
+                self.assertNotIn(key, sandbox_child)
 
 
 if __name__ == "__main__":
