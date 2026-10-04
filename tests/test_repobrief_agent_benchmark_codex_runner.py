@@ -4113,6 +4113,103 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIsNone(arguments["repo"])
             self.assertIsNone(arguments["stem"])
 
+    def test_codex_projects_bound_repoground_evidence(self) -> None:
+        value = request(condition="treatment")
+        payload = {
+            "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+            "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+            "tool": "ask_context",
+            "status": "ok",
+            "context_pack": {
+                "resolved_ranges": [{"path": "src/example.py"}],
+                "budget": {"context_bytes_used": 654},
+            },
+            "live_freshness": {
+                "status": "fresh",
+                "snapshot_provenance": {"git_commit": COMMIT},
+            },
+        }
+        events = [{
+            "type": "item.completed",
+            "item": {
+                "type": "mcp_tool_call",
+                "server": "repobrief",
+                "tool": "ask_context",
+                "arguments": {"query": "example"},
+                "result": {"structured_content": payload},
+                "error": None,
+                "status": "completed",
+            },
+        }]
+        calls = [{
+            "sequence": 1,
+            "name": "ask_context",
+            "status": "success",
+            "duration_ms": 0,
+            "input_bytes": 1,
+            "output_bytes": 1,
+        }]
+        with patch.object(
+            runner,
+            "_validated_treatment_structured_payload",
+            return_value=payload,
+        ):
+            evidence = runner._repoground_evidence_from_codex_events(
+                value, events, calls
+            )
+        self.assertEqual(
+            evidence,
+            {
+                "target_commit": COMMIT,
+                "bundle_commit": COMMIT,
+                "calls": [{
+                    "sequence": 1,
+                    "tool": "ask_context",
+                    "freshness_status": "fresh",
+                    "resolved_range_count": 1,
+                    "context_bytes_used": 654,
+                    "grounding_status": None,
+                }],
+            },
+        )
+
+    def test_codex_does_not_project_unbound_repoground_evidence(self) -> None:
+        value = request(condition="treatment")
+        payload = {
+            "kind": "repobrief.live_freshness",
+            "status": "not_comparable",
+            "snapshot_provenance": None,
+        }
+        events = [{
+            "type": "item.completed",
+            "item": {
+                "type": "mcp_tool_call",
+                "server": "repobrief",
+                "tool": "live_freshness",
+                "arguments": {},
+                "result": {"structured_content": payload},
+                "error": None,
+                "status": "completed",
+            },
+        }]
+        calls = [{
+            "sequence": 1,
+            "name": "live_freshness",
+            "status": "success",
+            "duration_ms": 0,
+            "input_bytes": 1,
+            "output_bytes": 1,
+        }]
+        with patch.object(
+            runner,
+            "_validated_treatment_structured_payload",
+            return_value=payload,
+        ):
+            evidence = runner._repoground_evidence_from_codex_events(
+                value, events, calls
+            )
+        self.assertIsNone(evidence)
+
     def test_normalize_rejects_boolean_token_counts(self) -> None:
         for field, value in (('input_tokens', True), ('output_tokens', False)):
             with self.subTest(field=field, value=value):

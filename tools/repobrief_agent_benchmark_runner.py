@@ -1205,6 +1205,214 @@ def normalize_tool_calls(
     return calls
 
 
+_REPOGROUND_FRESHNESS = {"fresh", "stale", "unknown", "not_comparable", "not_applicable"}
+_REPOGROUND_GROUNDING = {"pass", "fail", "warn", "degraded", "not_applicable"}
+
+
+def _decoded_repoground_payload(result: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    content = result.get("content")
+    candidates: list[Any] = []
+    if isinstance(content, str):
+        candidates.append(content)
+    elif isinstance(content, Mapping):
+        candidates.append(content)
+    elif isinstance(content, list):
+        candidates.extend(content)
+    for candidate in candidates:
+        value: Any = candidate
+        if isinstance(candidate, Mapping) and isinstance(candidate.get("text"), str):
+            value = candidate.get("text")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(value, Mapping):
+            continue
+        nested = value.get("structuredContent")
+        if not isinstance(nested, Mapping):
+            nested = value.get("structured_content")
+        if isinstance(nested, Mapping):
+            return nested
+        result_value = value.get("result")
+        if isinstance(result_value, Mapping):
+            nested = result_value.get("structuredContent")
+            if not isinstance(nested, Mapping):
+                nested = result_value.get("structured_content")
+            if isinstance(nested, Mapping):
+                return nested
+        if value.get("kind") in {
+            "repobrief.mcp.read_only_frontdoor",
+            "repobrief.live_freshness",
+        }:
+            return value
+    return None
+
+
+def _bundle_commit(freshness: Mapping[str, Any]) -> str | None:
+    snapshot = freshness.get("snapshot_provenance")
+    commit = snapshot.get("git_commit") if isinstance(snapshot, Mapping) else None
+    if (
+        isinstance(commit, str)
+        and len(commit) in {40, 64}
+        and all(char in "0123456789abcdef" for char in commit)
+    ):
+        return commit
+    return None
+
+
+def _repoground_evidence_call(
+    *,
+    tool_name: str,
+    sequence: int,
+    result: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    payload = _decoded_repoground_payload(result)
+    if payload is None:
+        return None
+    if tool_name == "ask_context":
+        if (
+            payload.get("kind") != "repobrief.mcp.read_only_frontdoor"
+            or payload.get("version") != "v1"
+            or payload.get("tool") != "ask_context"
+            or payload.get("status") != "ok"
+        ):
+            return None
+        pack = payload.get("context_pack")
+        freshness = payload.get("live_freshness")
+        if (
+            not isinstance(pack, Mapping)
+            or pack.get("kind") != "repobrief.ask_context_pack"
+            or pack.get("version") != "1.0"
+            or not isinstance(freshness, Mapping)
+            or freshness.get("kind") != "repobrief.live_freshness"
+            or freshness.get("version") != "v1"
+        ):
+            return None
+        ranges = pack.get("resolved_ranges")
+        budget = pack.get("budget")
+        if not isinstance(ranges, list) or not isinstance(budget, Mapping):
+            return None
+        context_bytes = budget.get("context_bytes_used")
+        status = freshness.get("status")
+        commit = _bundle_commit(freshness)
+        if (
+            status not in _REPOGROUND_FRESHNESS
+            or isinstance(context_bytes, bool)
+            or not isinstance(context_bytes, int)
+            or context_bytes < 0
+            or commit is None
+        ):
+            return None
+        return commit, {
+            "sequence": sequence,
+            "tool": "ask_context",
+            "freshness_status": status,
+            "resolved_range_count": len(ranges),
+            "context_bytes_used": context_bytes,
+            "grounding_status": None,
+        }
+    if tool_name == "live_freshness":
+        status = payload.get("status")
+        commit = _bundle_commit(payload)
+        if (
+            payload.get("kind") != "repobrief.live_freshness"
+            or payload.get("version") != "v1"
+            or status not in _REPOGROUND_FRESHNESS
+            or commit is None
+        ):
+            return None
+        return commit, {
+            "sequence": sequence,
+            "tool": "live_freshness",
+            "freshness_status": status,
+            "resolved_range_count": None,
+            "context_bytes_used": None,
+            "grounding_status": None,
+        }
+    if tool_name == "grounding_verify":
+        if (
+            payload.get("kind") != "repobrief.mcp.read_only_frontdoor"
+            or payload.get("version") != "v1"
+            or payload.get("tool") != "grounding_verify"
+        ):
+            return None
+        verdict = payload.get("verdict")
+        freshness = payload.get("live_freshness")
+        if (
+            not isinstance(verdict, Mapping)
+            or verdict.get("kind") != "repobrief.answer_grounding_verdict"
+            or verdict.get("version") != "1.0"
+            or not isinstance(freshness, Mapping)
+            or freshness.get("kind") != "repobrief.live_freshness"
+            or freshness.get("version") != "v1"
+        ):
+            return None
+        grounding = verdict.get("status")
+        status = freshness.get("status")
+        commit = _bundle_commit(freshness)
+        if (
+            grounding not in _REPOGROUND_GROUNDING
+            or status not in _REPOGROUND_FRESHNESS
+            or commit is None
+        ):
+            return None
+        return commit, {
+            "sequence": sequence,
+            "tool": "grounding_verify",
+            "freshness_status": status,
+            "resolved_range_count": None,
+            "context_bytes_used": None,
+            "grounding_status": grounding,
+        }
+    return None
+
+
+def normalize_repoground_evidence(
+    request: Mapping[str, Any],
+    messages: Sequence[Mapping[str, Any]],
+    calls: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    if request.get("condition") != "treatment":
+        return None
+    uses, results = _tool_blocks(messages)
+    benchmark_uses = [
+        use for use in uses if use.get("name") != STRUCTURED_OUTPUT_TOOL
+    ]
+    evidence_calls: list[dict[str, Any]] = []
+    commits: set[str] = set()
+    for sequence, use in enumerate(benchmark_uses, start=1):
+        concrete = str(use.get("name", ""))
+        abstract = ABSTRACT_TOOL_MAP.get(concrete)
+        if abstract not in {"ask_context", "grounding_verify", "live_freshness"}:
+            continue
+        call = calls[sequence - 1] if sequence <= len(calls) else {}
+        if call.get("name") != abstract or call.get("status") != "success":
+            continue
+        result = results.get(str(use.get("id")))
+        if not isinstance(result, Mapping):
+            continue
+        normalized = _repoground_evidence_call(
+            tool_name=abstract,
+            sequence=sequence,
+            result=result,
+        )
+        if normalized is None:
+            continue
+        commit, evidence_call = normalized
+        commits.add(commit)
+        evidence_calls.append(evidence_call)
+    if not evidence_calls:
+        return None
+    if len(commits) != 1:
+        return None
+    return {
+        "target_commit": str(_mapping(request.get("repository")).get("commit", "")),
+        "bundle_commit": next(iter(commits)),
+        "calls": evidence_calls,
+    }
+
+
 def validate_answer(value: Any) -> dict[str, Any]:
     answer = _mapping(value)
     required = set(ANSWER_SCHEMA["required"])
@@ -1288,6 +1496,7 @@ def build_receipt(
         raise RunnerError("provider did not produce a successful result")
     answer = validate_answer(result.get("structured_output"))
     calls = normalize_tool_calls(request, messages)
+    repoground_evidence = normalize_repoground_evidence(request, messages, calls)
     elapsed = max(int((ended_at - started_at).total_seconds() * 1000), 0)
     wall_limit = int(_mapping(request.get("budgets")).get("wall_seconds", 0)) * 1000
     if elapsed > wall_limit:
@@ -1311,6 +1520,11 @@ def build_receipt(
         "duration_ms": elapsed,
         "exit_code": returncode,
         "tool_calls": calls,
+        **(
+            {"repoground_evidence": repoground_evidence}
+            if repoground_evidence is not None
+            else {}
+        ),
         "answer": answer,
         "transcript": {
             "storage": "artifact",

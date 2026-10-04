@@ -5603,6 +5603,125 @@ def _codex_mcp_result_is_success(
     return False
 
 
+def _repoground_evidence_from_codex_events(
+    request: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]],
+    calls: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    if request.get("condition") != "treatment":
+        return None
+    binding = request.get("repobrief")
+    manifest = (
+        Path(str(binding.get("manifest")))
+        if isinstance(binding, Mapping) and isinstance(binding.get("manifest"), str)
+        else None
+    )
+    if manifest is None:
+        return None
+    sequence = 0
+    evidence_calls: list[dict[str, Any]] = []
+    commits: set[str] = set()
+    for event in events:
+        if event.get("type") != "item.completed":
+            continue
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        item_type = item.get("type")
+        if item_type in {"agent_message", "reasoning", "todo_list"}:
+            continue
+        if item_type not in {"command_execution", "mcp_tool_call"}:
+            continue
+        sequence += 1
+        if item_type != "mcp_tool_call":
+            continue
+        tool_name = item.get("tool")
+        if tool_name not in {"ask_context", "grounding_verify", "live_freshness"}:
+            continue
+        if sequence > len(calls):
+            continue
+        call = calls[sequence - 1]
+        if call.get("name") != tool_name or call.get("status") != "success":
+            continue
+        result_value = item.get("result")
+        if not isinstance(result_value, Mapping):
+            continue
+        structured = result_value.get("structured_content")
+        if not isinstance(structured, Mapping):
+            continue
+        try:
+            payload = _validated_treatment_structured_payload(
+                structured,
+                tool_name=str(tool_name),
+                expected_manifest=manifest,
+                is_error=False,
+            )
+        except RunnerError:
+            continue
+        freshness = payload if tool_name == "live_freshness" else payload.get("live_freshness")
+        if not isinstance(freshness, Mapping):
+            continue
+        snapshot = freshness.get("snapshot_provenance")
+        commit = snapshot.get("git_commit") if isinstance(snapshot, Mapping) else None
+        if (
+            not isinstance(commit, str)
+            or len(commit) not in {40, 64}
+            or any(char not in "0123456789abcdef" for char in commit)
+        ):
+            continue
+        if tool_name == "ask_context":
+            pack = payload.get("context_pack")
+            if not isinstance(pack, Mapping):
+                continue
+            ranges = pack.get("resolved_ranges")
+            budget = pack.get("budget")
+            if not isinstance(ranges, list) or not isinstance(budget, Mapping):
+                continue
+            context_bytes = budget.get("context_bytes_used")
+            if (
+                isinstance(context_bytes, bool)
+                or not isinstance(context_bytes, int)
+                or context_bytes < 0
+            ):
+                continue
+            call_evidence = {
+                "sequence": sequence,
+                "tool": "ask_context",
+                "freshness_status": freshness.get("status"),
+                "resolved_range_count": len(ranges),
+                "context_bytes_used": context_bytes,
+                "grounding_status": None,
+            }
+        elif tool_name == "grounding_verify":
+            verdict = payload.get("verdict")
+            if not isinstance(verdict, Mapping):
+                continue
+            call_evidence = {
+                "sequence": sequence,
+                "tool": "grounding_verify",
+                "freshness_status": freshness.get("status"),
+                "resolved_range_count": None,
+                "context_bytes_used": None,
+                "grounding_status": verdict.get("status"),
+            }
+        else:
+            call_evidence = {
+                "sequence": sequence,
+                "tool": "live_freshness",
+                "freshness_status": freshness.get("status"),
+                "resolved_range_count": None,
+                "context_bytes_used": None,
+                "grounding_status": None,
+            }
+        commits.add(commit)
+        evidence_calls.append(call_evidence)
+    if not evidence_calls or len(commits) != 1:
+        return None
+    return {
+        "target_commit": str(request["repository"]["commit"]),
+        "bundle_commit": next(iter(commits)),
+        "calls": evidence_calls,
+    }
+
+
 def normalize(
     request: Mapping[str, Any], events: Sequence[Mapping[str, Any]]
 ) -> tuple[int, int, list[dict[str, Any]], dict[str, Any]]:
@@ -5738,6 +5857,9 @@ def receipt(
         raise RunnerError(f"Codex exited nonzero: {returncode}")
     events = parse_events(raw)
     input_tokens, output_tokens, calls, answer = normalize(request, events)
+    repoground_evidence = _repoground_evidence_from_codex_events(
+        request, events, calls
+    )
     elapsed = max(0, int((ended_at - started_at).total_seconds() * 1000))
     if elapsed > int(request["budgets"]["wall_seconds"]) * 1000:
         raise RunnerError("Codex wall budget exceeded")
@@ -5760,6 +5882,11 @@ def receipt(
         "duration_ms": elapsed,
         "exit_code": 0,
         "tool_calls": calls,
+        **(
+            {"repoground_evidence": repoground_evidence}
+            if repoground_evidence is not None
+            else {}
+        ),
         "answer": answer,
         "transcript": {
             "storage": "artifact",

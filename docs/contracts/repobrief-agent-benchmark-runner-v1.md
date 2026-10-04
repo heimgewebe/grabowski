@@ -221,6 +221,10 @@ Der Receipt enthält:
 - Provider- und exakte Modellkennung;
 - Provider-gemeldete Input- und Output-Tokens;
 - normalisierte Toolaufrufe in Reihenfolge;
+- bei auswertbarer Treatment-Nutzung optional repoground_evidence mit
+  Zielcommit, beobachtetem Bundle-Commit und pro RepoGround-Aufruf nur den
+  für die Exposure-Messung nötigen Feldern (Freshness, Range-Anzahl,
+  Kontextbytes bzw. Grounding-Status);
 - strukturierte Antwort, Pfade, Symbole, Belege und Claim-Labels;
 - Start, Ende, Gesamtdauer und Exitstatus;
 - hashgebundenes Transcript-Artefakt;
@@ -248,6 +252,12 @@ Dieser Modus belegt:
 - Fail-closed-Grenzen;
 - Checkout-Isolierung;
 - Transcript- und Receipt-Bindung.
+
+repoground_evidence ist bewusst keine Runner-Entscheidung über Nutzen:
+Der Runner projiziert nur validierte, revisionsgebundene Beobachtungen. Ob diese
+für Navigation, Struktur oder Grounding als tatsächliches Treatment-Exposure
+zählen, entscheidet der RepoGround-Evaluator. Nicht auswertbare oder nicht an
+einen Snapshot-Commit gebundene Toolresultate erzeugen kein Exposure-Feld.
 
 Er belegt ausdrücklich nicht:
 
