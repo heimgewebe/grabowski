@@ -1158,6 +1158,100 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
                     result["source_identity_sha256"], source_identity["identity_sha256"]
                 )
 
+    def test_midcutover_resume_coalescing_preserves_stale_pending_reconciliation(self) -> None:
+        binding = {
+            "cutover_id": "bgc-coalesced-stale-pending",
+            "resumed_receipt_sha256": "cd" * 32,
+            "binding_sha256": "ab" * 32,
+            "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+        }
+        lane = {
+            "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+            "resume_binding": binding,
+            "classification_sha256": "ef" * 32,
+            "reasons": [],
+        }
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "resume_binding": binding,
+            "recovery_lane": lane,
+        }
+        source_identity = {
+            **_source_identity(ROOT),
+            "identity_sha256": "12" * 32,
+        }
+        match = {
+            "unit": "grabowski-job-resume-coalesced",
+            "kind": "deploy",
+            "argv_sha256": "34" * 32,
+            "final_status": "running",
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000003",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 3,
+            "evidence_sha256": "c" * 64,
+        }
+        volatile = {
+            "reasons": [],
+            "checks": {},
+            "competing_deployment": {
+                "idempotent_match": match,
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+        with (
+            patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery,
+                "_resume_source_preflight",
+                return_value=(
+                    ROOT,
+                    ROOT / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+                    source_identity,
+                ),
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_midcutover_resume_command",
+                return_value=["python3"],
+            ),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="de" * 32,
+            ),
+            patch.object(provenance_recovery.base, "_append_audit") as audit,
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+            patch.object(
+                provenance_recovery.self_deploy, "_write_deploy_index"
+            ) as write_index,
+        ):
+            result = provenance_recovery._resume_under_schedule_lock(HEAD)
+
+        start_job.assert_not_called()
+        write_index.assert_not_called()
+        self.assertTrue(result["already_dispatched"])
+        self.assertEqual(result["stale_pending_reconciliation"], reconciliation)
+        coalesced = [
+            call.args[0]
+            for call in audit.call_args_list
+            if call.args
+            and call.args[0].get("operation") == "midcutover-resume-coalesced"
+        ]
+        self.assertEqual(coalesced[-1]["stale_pending_reconciliation"], reconciliation)
+
     def test_midcutover_resume_denial_preserves_stale_pending_reconciliation(self) -> None:
         binding = {
             "cutover_id": "bgc-stale-pending",
@@ -1586,6 +1680,45 @@ class DispatchCoalescingTests(unittest.TestCase):
             call.args[0].get("operation") for call in audit.call_args_list if call.args
         ]
         self.assertIn("provenance-recovery-coalesced", operations)
+
+    def test_identical_running_repair_preserves_stale_pending_reconciliation(self) -> None:
+        match = {
+            "unit": "grabowski-job-888888888888",
+            "kind": "deploy",
+            "argv_sha256": "ef" * 32,
+            "final_status": "running",
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000002",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 2,
+            "evidence_sha256": "b" * 64,
+        }
+        result, start_job, audit, write_index = self._repair(
+            {
+                "reasons": [],
+                "checks": {},
+                "competing_deployment": {
+                    "idempotent_match": match,
+                    "stale_pending_reconciliation": reconciliation,
+                },
+            }
+        )
+        start_job.assert_not_called()
+        write_index.assert_not_called()
+        self.assertTrue(result["already_dispatched"])
+        self.assertEqual(result["stale_pending_reconciliation"], reconciliation)
+        coalesced = [
+            call.args[0]
+            for call in audit.call_args_list
+            if call.args
+            and call.args[0].get("operation") == "provenance-recovery-coalesced"
+        ]
+        self.assertEqual(coalesced[-1]["stale_pending_reconciliation"], reconciliation)
 
     def test_absent_match_still_dispatches_normally(self) -> None:
         result, start_job, _audit, _write = self._repair(

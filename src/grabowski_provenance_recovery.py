@@ -1039,6 +1039,11 @@ def _resume_under_schedule_lock(
     already_running = (volatile.get("competing_deployment") or {}).get(
         "idempotent_match"
     )
+    stale_pending_reconciliation = (
+        (volatile.get("competing_deployment") or {}).get(
+            "stale_pending_reconciliation"
+        )
+    )
     if already_running is not None and not volatile["reasons"]:
         base._append_audit(
             {
@@ -1047,6 +1052,7 @@ def _resume_under_schedule_lock(
                 "expected_head": expected_head,
                 "cutover_id": resume_binding["cutover_id"],
                 "unit": already_running["unit"],
+                "stale_pending_reconciliation": stale_pending_reconciliation,
                 "intent_sha256": intent_sha256,
             }
         )
@@ -1059,6 +1065,7 @@ def _resume_under_schedule_lock(
             "gate": gate,
             "job": already_running,
             "already_dispatched": True,
+            "stale_pending_reconciliation": stale_pending_reconciliation,
             "intent_sha256": intent_sha256,
             "source_identity_sha256": source_identity["identity_sha256"],
             "post_state_readback_required": True,
@@ -1260,6 +1267,11 @@ def _repair_under_schedule_lock(
     already_running = (volatile.get("competing_deployment") or {}).get(
         "idempotent_match"
     )
+    stale_pending_reconciliation = (
+        (volatile.get("competing_deployment") or {}).get(
+            "stale_pending_reconciliation"
+        )
+    )
     if already_running is not None and not volatile["reasons"]:
         # This exact intent is already in flight.  Starting a second job would
         # be the historically observed double dispatch, so the existing one is
@@ -1270,6 +1282,7 @@ def _repair_under_schedule_lock(
                 "operation": "provenance-recovery-coalesced",
                 "expected_head": expected_head,
                 "unit": already_running["unit"],
+                "stale_pending_reconciliation": stale_pending_reconciliation,
                 "intent_sha256": intent_sha256,
             }
         )
@@ -1280,6 +1293,7 @@ def _repair_under_schedule_lock(
             "gate": gate,
             "job": already_running,
             "already_dispatched": True,
+            "stale_pending_reconciliation": stale_pending_reconciliation,
             "intent_sha256": intent_sha256,
             "repair_intent_id": repair_intent_id,
             "post_state_readback_required": True,
