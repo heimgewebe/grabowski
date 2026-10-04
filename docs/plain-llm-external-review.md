@@ -53,7 +53,10 @@ This path is deliberately distinct from coding-agent review:
   current user or root and may be group- or world-writable only with sticky-bit
   replacement protection, and the resolved pathname must be valid Unicode;
   Grok additionally requires the canonical native binary under the private
-  `~/.grok/bin` directory rather than an npm or Node trampoline;
+  `~/.grok/bin` directory rather than an npm or Node trampoline. When
+  `--executable` is omitted, the Grok CLI default binds that canonical path
+  directly instead of resolving `grok` through `PATH`; an explicit executable
+  must still resolve to the same native binary;
 - the selected temporary base is validated before workspace creation; the
   private workspace has mode `0700`, a trusted full ancestry, and a stable inode
   identity checked immediately before and after the provider turn; readback

@@ -2599,7 +2599,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     default_executable = {
         "gemini": "agy",
-        "grok": "grok",
+        "grok": str(Path.home() / ".grok" / "bin" / "grok"),
         "ox-alpha": "opencode",
     }.get(args.provider)
     if default_executable is None:

@@ -2319,6 +2319,48 @@ class PlainExternalReviewTests(unittest.TestCase):
             self.assertFalse(output.with_suffix(".review.txt").exists())
             self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
+    def test_main_defaults_grok_to_canonical_native_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            stdout = io.StringIO()
+            evidence = {"reviews": [{"verdict": "PASS"}]}
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(home)},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    plain,
+                    "run_from_manifest",
+                    return_value=evidence,
+                ) as run,
+                contextlib.redirect_stdout(stdout),
+            ):
+                rc = plain.main(
+                    [
+                        "--manifest",
+                        str(manifest),
+                        "--output",
+                        str(output),
+                        "--provider",
+                        "grok",
+                        "--model",
+                        "grok-4.6",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                run.call_args.kwargs["executable"],
+                str(home / ".grok" / "bin" / "grok"),
+            )
+
     def test_main_reports_provider_failure_without_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
