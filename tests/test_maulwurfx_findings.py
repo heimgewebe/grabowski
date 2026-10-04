@@ -93,6 +93,13 @@ class MaulwurfXFindingTests(unittest.TestCase):
         )
 
     def make_call_body(self, request_id: int) -> bytes:
+        arguments = self.finding_arguments()
+        arguments.update(
+            {
+                "reason": "Record one evidence-bound finding",
+                "user_intent": "Submit this observation for operator review",
+            }
+        )
         return json.dumps(
             {
                 "jsonrpc": "2.0",
@@ -100,7 +107,7 @@ class MaulwurfXFindingTests(unittest.TestCase):
                 "method": "tools/call",
                 "params": {
                     "name": gateway.PROPOSAL_TOOL_NAME,
-                    "arguments": self.finding_arguments(),
+                    "arguments": arguments,
                 },
             }
         ).encode("utf-8")
@@ -133,7 +140,11 @@ class MaulwurfXFindingTests(unittest.TestCase):
         self.assertFalse(proposal["annotations"]["readOnlyHint"])
         self.assertFalse(proposal["annotations"]["destructiveHint"])
         self.assertTrue(proposal["annotations"]["idempotentHint"])
-        self.assertFalse(proposal["inputSchema"]["additionalProperties"])
+        schema = proposal["inputSchema"]
+        self.assertFalse(schema["additionalProperties"])
+        self.assertTrue({"reason", "user_intent"}.issubset(schema["required"]))
+        self.assertEqual(schema["properties"]["reason"]["maxLength"], 128)
+        self.assertEqual(schema["properties"]["user_intent"]["maxLength"], 256)
 
         nonterminal = json.loads(json.dumps(terminal))
         nonterminal["result"]["nextCursor"] = "page-2"
@@ -385,7 +396,42 @@ class MaulwurfXFindingTests(unittest.TestCase):
             receipt = result["result"]["structuredContent"]
             self.assertEqual(receipt["status"], "recorded")
             self.assertFalse(receipt["execution_authority"])
-            self.assertEqual(len(list(finding_root.glob("*.json"))), 1)
+            files = list(finding_root.glob("*.json"))
+            self.assertEqual(len(files), 1)
+            stored = json.loads(files[0].read_text(encoding="utf-8"))
+            self.assertNotIn("reason", stored["finding"])
+            self.assertNotIn("user_intent", stored["finding"])
+            self.assertEqual(
+                stored["finding"],
+                gateway._normalize_finding_arguments(self.finding_arguments()),
+            )
+
+    def test_gateway_local_tool_call_requires_analytics_contract(self) -> None:
+        try:
+            __import__("starlette")
+        except ModuleNotFoundError:
+            self.skipTest("starlette runtime dependency is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            finding_root = self.make_finding_root(root)
+            manifest = self.make_manifest(root)
+            server = self.make_server(finding_root, manifest)
+            body = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 18,
+                    "method": "tools/call",
+                    "params": {
+                        "name": gateway.PROPOSAL_TOOL_NAME,
+                        "arguments": self.finding_arguments(),
+                    },
+                }
+            ).encode("utf-8")
+            response = asyncio.run(server.proxy(_Request(body, self.EXTERNAL)))
+            result = json.loads(response.body.decode("utf-8"))
+            self.assertEqual(result["id"], 18)
+            self.assertEqual(result["error"]["code"], -32602)
+            self.assertEqual(len(list(finding_root.glob("*.json"))), 0)
 
     def test_concurrent_duplicate_records_create_exactly_one_proposal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

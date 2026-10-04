@@ -17,6 +17,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertTrue((ROOT / "src" / "grabowski_audit_query.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_checkouts.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_runtime.py").is_file())
+        self.assertTrue((ROOT / "src" / "grabowski_flowlines.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_read_surface.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_grip_orchestration.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_merge_guard.py").is_file())
@@ -186,8 +187,9 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 201)
+        self.assertEqual(len(tools), 202)
         self.assertIn("grabowski_operational_guidance", tools)
+        self.assertIn("report_outcome", tools)
         self.assertNotIn("grabowski_agent_workspace_adopt", tools)
         self.assertIn("grabowski_browser_worker_semantic", tools)
         self.assertIn("grabowski_tailscale_status", tools)
@@ -202,7 +204,7 @@ class RepositoryContractTests(unittest.TestCase):
         profiles = json.loads(
             (ROOT / "contracts" / "publication-profiles.v1.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(profiles["counts"], {"core": 23, "full": 201, "operator": 185})
+        self.assertEqual(profiles["counts"], {"core": 24, "full": 202, "operator": 186})
         self.assertNotIn("grabowski_task_reconcile", profiles["profiles"]["full"])
         self.assertNotIn("grabowski_task_reconcile", profiles["profiles"]["operator"])
         self.assertTrue(
@@ -289,6 +291,9 @@ class RepositoryContractTests(unittest.TestCase):
         }
         self.assertEqual(
             supporting["grabowski_operator_core"], "src/grabowski_operator.py"
+        )
+        self.assertEqual(
+            supporting["grabowski_flowlines"], "src/grabowski_flowlines.py"
         )
         self.assertEqual(
             supporting["grabowski_read_surface"], "src/grabowski_read_surface.py"
@@ -544,11 +549,28 @@ class RepositoryContractTests(unittest.TestCase):
         ]
         self.assertIn("mcp==1.30.0", runtime_lines)
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8").lower()
-        for requirement in ("filelock==3.32.2", "jsonschema==4.26.0", "pyyaml==6.0.3"):
+        for requirement in (
+            "filelock==3.32.2",
+            "jsonschema==4.26.0",
+            "opentelemetry-api==1.45.0",
+            "opentelemetry-sdk==1.45.0",
+            "opentelemetry-exporter-otlp-proto-http==1.45.0",
+            "posthog==7.62.0",
+            "pyyaml==6.0.3",
+        ):
             self.assertIn(requirement, runtime_lines)
             self.assertIn(f'"{requirement}', pyproject)
         lock_text = runtime_lock.read_text(encoding="utf-8")
-        for package in ("filelock", "jsonschema", "mcp", "pyyaml"):
+        for package in (
+            "filelock",
+            "jsonschema",
+            "mcp",
+            "opentelemetry-api",
+            "opentelemetry-sdk",
+            "opentelemetry-exporter-otlp-proto-http",
+            "posthog",
+            "pyyaml",
+        ):
             self.assertIn(f"{package}==", lock_text)
         self.assertIn("--hash=sha256:", lock_text)
 

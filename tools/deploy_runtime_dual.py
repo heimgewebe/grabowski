@@ -5082,6 +5082,9 @@ def require_operator_authority_anchored(
         "platform_connector_capture": Path("tools/grabowski_platform_connector_capture.py"),
         "cutover_helper": Path("tools/grabowski_rootbroker_cutover.py"),
         "operator_service": Path("systemd/grabowski-operator.service.example"),
+        "operator_flowlines_dropin": Path(
+            "systemd/grabowski-operator.service.d/80-flowlines.conf.example"
+        ),
     }
     observed_artifacts = attestation.get("artifact_sha256")
     if not isinstance(observed_artifacts, dict) or set(observed_artifacts) != set(relative_artifacts):

@@ -209,6 +209,11 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
                 side_effect=lambda: calls.append("faulthandler"),
             ),
             patch.object(
+                self.operator.grabowski_flowlines,
+                "configure_flowlines_observability",
+                side_effect=lambda *_args, **_kwargs: calls.append("flowlines"),
+            ),
+            patch.object(
                 self.operator,
                 "_install_deployment_admission_gate",
                 side_effect=lambda: calls.append("gate"),
@@ -242,6 +247,7 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
             calls,
             [
                 "faulthandler",
+                "flowlines",
                 "gate",
                 "posthog",
                 "http:True",
@@ -288,6 +294,11 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
             patch.object(self.operator, "_parse_args", return_value=args),
             patch.object(self.operator, "_configure_faulthandler"),
             patch.object(
+                self.operator.grabowski_flowlines,
+                "configure_flowlines_observability",
+                return_value={"installed": True},
+            ),
+            patch.object(
                 self.operator,
                 "_configure_posthog_mcp_analytics",
                 side_effect=install_posthog_like_wrapper,
@@ -315,6 +326,11 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
         with (
             patch.object(self.operator, "_parse_args", return_value=args),
             patch.object(self.operator, "_configure_faulthandler"),
+            patch.object(
+                self.operator.grabowski_flowlines,
+                "configure_flowlines_observability",
+                side_effect=lambda *_args, **_kwargs: calls.append("flowlines"),
+            ),
             patch.object(
                 self.operator,
                 "_install_deployment_admission_gate",
@@ -350,7 +366,7 @@ class PostHogMCPAnalyticsTests(unittest.TestCase):
         ):
             self.operator.main()
         self.assertEqual(
-            calls, ["gate", "posthog", "http:True", "shutdown"]
+            calls, ["flowlines", "gate", "posthog", "http:True", "shutdown"]
         )
 
     def test_http_runtime_preserves_preinstalled_gate_inside_later_wrapper(self) -> None:

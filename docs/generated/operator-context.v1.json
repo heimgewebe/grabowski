@@ -103,6 +103,17 @@
       "tool": "grabowski_context"
     },
     {
+      "category": "operations-observability",
+      "description": "REQUIRED final call in every conversation before the assistant gives its final answer.\n\nAccepts the agent's outcome self-report without mutating product data.\nWhen Flowlines export is enabled, this tool call is the telemetry report.\nFor blocked work, report partial if any of the user goal was accomplished;\notherwise report failed, and describe the blocker in unmet_needs.",
+      "effects": [],
+      "id": "report_outcome",
+      "purpose": "Accept the required final agent outcome self-report for Flowlines telemetry when export is enabled, without product mutation.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "report_outcome"
+    },
+    {
       "category": "grip-surface",
       "description": "Return the first-class allowed Grabowski grip surface.",
       "effects": [],
@@ -2878,6 +2889,7 @@
     "expected_tools": [
       "grabowski_status",
       "grabowski_context",
+      "report_outcome",
       "grip_list",
       "grip_run",
       "grabowski_list_directory",
@@ -3131,6 +3143,14 @@
       {
         "module": "grabowski_operator_core",
         "source": "src/grabowski_operator.py"
+      },
+      {
+        "module": "grabowski_flowlines",
+        "source": "src/grabowski_flowlines.py"
+      },
+      {
+        "module": "grabowski_redaction",
+        "source": "src/grabowski_redaction.py"
       },
       {
         "module": "grabowski_bureau_runtime_refresh_executor",
@@ -3634,7 +3654,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "7d671c856396c38b3e682216c24a905e02656fb3512294eb3f720db6c1312a06"
+      "sha256": "3d3685376352e7a8b8c36145aa88d614b16f0f9f865450a9a522b02a088921b1"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3642,7 +3662,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "bd94b08a5b4690a752e47d3e1ae20e30945bac55df2aed58840fb260e055eabd"
+      "sha256": "37d292863168f2239c99ea41506d1626d58d0eeac4822c3bcc8c24854596d2c0"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3697,6 +3717,7 @@
       "src/grabowski_execution_plan.py": "d4c71362493f73714b5d0420c5b5a9f115f39c38cbf203cfa4a5507527fe4a54",
       "src/grabowski_fleet.py": "fbe1efbceefdb72715cb67e7e9e6a491576a642d889d87d18b641b28ddcb4782",
       "src/grabowski_fleet_mutation.py": "f03f8d44e6ac436ffbe016341e3f3dba4a313cbd7973b1f18929e4fa643d3be9",
+      "src/grabowski_flowlines.py": "69bafe615fcebfa810c158eda526875115e4a638c2a2e7282dc41d106ce6c406",
       "src/grabowski_forrest_server_exit.py": "f7a709556197a5c15240e1b0be9c2015f35cad198ce29fe98c4b6fe1204f9cea",
       "src/grabowski_friction.py": "524d7839aabd0cbb8b710714b7656214f17aa3bc9504dc635f890231e3a37e4f",
       "src/grabowski_git_preimage.py": "dce907040db976bffbac92b8428b925cf75cfdf44c119ffa4549a8393a17fe96",
@@ -3748,10 +3769,11 @@
       "src/grabowski_read_surface.py": "1df8cb96e2c84f52817bbb0f64832de0f66f376de37a683849d41f50e7b08e1f",
       "src/grabowski_recall.py": "386afec03e078b6a7934b0744eb17edb1ae97b0addde982c34c544d0c1b74413",
       "src/grabowski_recovery.py": "0ed22cef9bc1f41b18e4f40b4cedf0492a78469b9d02ffd2747481c337b43013",
+      "src/grabowski_redaction.py": "d1f394aa11e3feb6c8b37e39dfad3b445a2b6fee343f1ff60dd6ac48ca854e84",
       "src/grabowski_repobrief.py": "1e842a9f310c967012914afbaf2dbbc4af3a29c222734f14f902421773713ded",
       "src/grabowski_repoground_catalog.py": "b8ea8d611a37bb287ae8836790c6aa7abf29c08dcccf252492fb355c9f9ba58f",
       "src/grabowski_resources.py": "4c6fa4fff67425607702a23bbdf33fb2deeb6da43430b844a6bb12d1e54fac57",
-      "src/grabowski_runtime.py": "832c895ec4660801dc63f4e68dfa4d75ee80a4646f22fa99d0d7a4ead8432582",
+      "src/grabowski_runtime.py": "783a6ed8635da45733a80ed9872a5afcd33aedf638f567fea464e4ab623ff182",
       "src/grabowski_runtime_contract.py": "4528ec08c1019a2b773a7e05250f4842ca2403d1c9171b19ef98a63c6e588054",
       "src/grabowski_runtime_extensions.py": "4bbaabe4120acc6879297e85d3664c69193fe0a9850e48522d1839b7844b2297",
       "src/grabowski_self_deploy.py": "1c2bd7e9800a1d98fa8d4f456dd33759b66c3d6b4523e63012a31684c86c3db1",
