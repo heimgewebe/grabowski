@@ -89,6 +89,22 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
     }
 
 
+
+def bind_manifest(value: dict, root: Path, *, commit: str = COMMIT) -> Path:
+    manifest = {
+        "kind": "repoground.bundle.manifest",
+        "version": "2.0",
+        "snapshot_provenance": {"repositories": [{"git_commit": commit}]},
+    }
+    raw = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    path = root / "repo.bundle.manifest.json"
+    path.write_bytes(raw)
+    value["repobrief"]["manifest"] = str(path)
+    value["repobrief"]["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+    return path
+
 def answer() -> dict:
     return {
         "text": "The implementation is in src/example.py.",
@@ -682,104 +698,224 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         self.assertEqual(receipt["tool_calls"][0]["name"], "ask_context")
 
     def test_treatment_projects_bound_repoground_evidence(self) -> None:
-        value = request(condition="treatment")
-        messages = runner.parse_jsonl(
-            stream(value, tool_name="mcp__repobrief__ask_context")
-        )
-        tool_result = next(
-            block
-            for message in messages
-            for block in runner._list(runner._mapping(message.get("message")).get("content"))
-            if runner._mapping(block).get("type") == "tool_result"
-        )
-        payload = {
-            "kind": "repobrief.mcp.read_only_frontdoor",
-            "version": "v1",
-            "tool": "ask_context",
-            "status": "ok",
-            "context_pack": {
-                "kind": "repobrief.ask_context_pack",
-                "version": "1.0",
-                "resolved_ranges": [{"path": "src/example.py"}],
-                "budget": {"context_bytes_used": 321},
-            },
-            "live_freshness": {
-                "kind": "repobrief.live_freshness",
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="mcp__repobrief__ask_context")
+            )
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            payload = {
+                "kind": "repobrief.mcp.read_only_frontdoor",
                 "version": "v1",
-                "status": "fresh",
-                "snapshot_provenance": {"git_commit": COMMIT},
-            },
-        }
-        tool_result["content"] = json.dumps(
-            {"structuredContent": payload}, sort_keys=True
-        )
-        calls = runner.normalize_tool_calls(value, messages)
-        evidence = runner.normalize_repoground_evidence(value, messages, calls)
-        self.assertEqual(
-            evidence,
-            {
-                "target_commit": COMMIT,
-                "bundle_commit": COMMIT,
-                "calls": [{
-                    "sequence": 1,
-                    "tool": "ask_context",
-                    "freshness_status": "fresh",
-                    "resolved_range_count": 1,
-                    "context_bytes_used": 321,
-                    "grounding_status": None,
-                }],
-            },
-        )
+                "tool": "ask_context",
+                "status": "ok",
+                "context_pack": {
+                    "kind": "repobrief.ask_context_pack",
+                    "version": "1.0",
+                    "snapshot_ref": {
+                        "manifest_path": str(manifest),
+                        "manifest_sha256": value["repobrief"]["manifest_sha256"],
+                        "git_commit": None,
+                        "freshness_status": "fresh",
+                    },
+                    "freshness": {"status": "fresh"},
+                    "resolved_ranges": [
+                        {"path": "src/example.py", "status": "resolved"},
+                        {"path": "src/missing.py", "status": "missing"},
+                    ],
+                    "budget": {"context_bytes_used": 321},
+                },
+            }
+            tool_result["content"] = json.dumps(
+                {"structuredContent": payload}, sort_keys=True
+            )
+            calls = runner.normalize_tool_calls(value, messages)
+            self.assertEqual(
+                runner.normalize_repoground_evidence(value, messages, calls),
+                {
+                    "target_commit": COMMIT,
+                    "bundle_commit": COMMIT,
+                    "calls": [{
+                        "sequence": 1,
+                        "tool": "ask_context",
+                        "freshness_status": "fresh",
+                        "resolved_range_count": 1,
+                        "context_bytes_used": 321,
+                        "grounding_status": None,
+                    }],
+                },
+            )
+
+            wrong = json.loads(json.dumps(payload))
+            wrong["context_pack"]["snapshot_ref"]["manifest_sha256"] = "0" * 64
+            tool_result["content"] = json.dumps(
+                {"structuredContent": wrong}, sort_keys=True
+            )
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
+
+    def test_treatment_projects_grounding_from_verdict_snapshot_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="mcp__repobrief__grounding_verify")
+            )
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            payload = {
+                "kind": "repobrief.mcp.read_only_frontdoor",
+                "version": "v1",
+                "tool": "grounding_verify",
+                "status": "pass",
+                "verdict": {
+                    "kind": "repobrief.answer_grounding_verdict",
+                    "version": "1.0",
+                    "status": "pass",
+                    "snapshot_ref": {
+                        "manifest_path": str(manifest),
+                        "git_commit": None,
+                        "freshness_status": "fresh",
+                    },
+                },
+                "live_freshness": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v1",
+                    "status": "fresh",
+                    "bundle_manifest": str(manifest),
+                    "snapshot_provenance": {"git_commit": COMMIT},
+                },
+            }
+            tool_result["content"] = json.dumps(
+                {"structuredContent": payload}, sort_keys=True
+            )
+            calls = runner.normalize_tool_calls(value, messages)
+            self.assertEqual(
+                runner.normalize_repoground_evidence(value, messages, calls),
+                {
+                    "target_commit": COMMIT,
+                    "bundle_commit": COMMIT,
+                    "calls": [{
+                        "sequence": 1,
+                        "tool": "grounding_verify",
+                        "freshness_status": "fresh",
+                        "resolved_range_count": None,
+                        "context_bytes_used": None,
+                        "grounding_status": "pass",
+                    }],
+                },
+            )
+
+            payload["live_freshness"]["bundle_manifest"] = str(
+                Path(directory) / "other.bundle.manifest.json"
+            )
+            tool_result["content"] = json.dumps(
+                {"structuredContent": payload}, sort_keys=True
+            )
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
 
     def test_treatment_does_not_project_version_drift_as_repoground_evidence(self) -> None:
-        value = request(condition="treatment")
-        messages = runner.parse_jsonl(
-            stream(value, tool_name="mcp__repobrief__live_freshness")
-        )
-        tool_result = next(
-            block
-            for message in messages
-            for block in runner._list(runner._mapping(message.get("message")).get("content"))
-            if runner._mapping(block).get("type") == "tool_result"
-        )
-        tool_result["content"] = json.dumps(
-            {"structuredContent": {
-                "kind": "repobrief.live_freshness",
-                "version": "v2",
-                "status": "fresh",
-                "snapshot_provenance": {"git_commit": COMMIT},
-            }},
-            sort_keys=True,
-        )
-        calls = runner.normalize_tool_calls(value, messages)
-        self.assertIsNone(
-            runner.normalize_repoground_evidence(value, messages, calls)
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="mcp__repobrief__live_freshness")
+            )
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            tool_result["content"] = json.dumps(
+                {"structuredContent": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v2",
+                    "status": "fresh",
+                    "bundle_manifest": str(manifest),
+                    "snapshot_provenance": {"git_commit": COMMIT},
+                }},
+                sort_keys=True,
+            )
+            calls = runner.normalize_tool_calls(value, messages)
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(value, messages, calls)
+            )
 
     def test_treatment_does_not_project_unbound_repoground_evidence(self) -> None:
-        value = request(condition="treatment")
-        messages = runner.parse_jsonl(
-            stream(value, tool_name="mcp__repobrief__live_freshness")
-        )
-        tool_result = next(
-            block
-            for message in messages
-            for block in runner._list(runner._mapping(message.get("message")).get("content"))
-            if runner._mapping(block).get("type") == "tool_result"
-        )
-        tool_result["content"] = json.dumps(
-            {"structuredContent": {
-                "kind": "repobrief.live_freshness",
-                "version": "v1",
-                "status": "not_comparable",
-                "snapshot_provenance": None,
-            }},
-            sort_keys=True,
-        )
-        calls = runner.normalize_tool_calls(value, messages)
-        self.assertIsNone(
-            runner.normalize_repoground_evidence(value, messages, calls)
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="mcp__repobrief__live_freshness")
+            )
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            tool_result["content"] = json.dumps(
+                {"structuredContent": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v1",
+                    "status": "not_comparable",
+                    "bundle_manifest": str(manifest),
+                    "snapshot_provenance": None,
+                }},
+                sort_keys=True,
+            )
+            calls = runner.normalize_tool_calls(value, messages)
+            self.assertEqual(
+                runner.normalize_repoground_evidence(value, messages, calls),
+                {
+                    "target_commit": COMMIT,
+                    "bundle_commit": COMMIT,
+                    "calls": [{
+                        "sequence": 1,
+                        "tool": "live_freshness",
+                        "freshness_status": "not_comparable",
+                        "resolved_range_count": None,
+                        "context_bytes_used": None,
+                        "grounding_status": None,
+                    }],
+                },
+            )
+            drifted = json.loads(tool_result["content"])
+            drifted["structuredContent"]["bundle_manifest"] = str(
+                Path(directory) / "other.bundle.manifest.json"
+            )
+            tool_result["content"] = json.dumps(drifted, sort_keys=True)
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
 
     def test_provider_evidence_fails_closed(self) -> None:
         cases = [

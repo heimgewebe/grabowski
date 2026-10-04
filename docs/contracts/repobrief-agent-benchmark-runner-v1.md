@@ -256,8 +256,11 @@ Dieser Modus belegt:
 repoground_evidence ist bewusst keine Runner-Entscheidung über Nutzen:
 Der Runner projiziert nur validierte, revisionsgebundene Beobachtungen. Ob diese
 für Navigation, Struktur oder Grounding als tatsächliches Treatment-Exposure
-zählen, entscheidet der RepoGround-Evaluator. Nicht auswertbare oder nicht an
-einen Snapshot-Commit gebundene Toolresultate erzeugen kein Exposure-Feld.
+zählen, entscheidet der RepoGround-Evaluator. Die Projektion bleibt an das
+digestgebundene Manifest gekoppelt; bei produktivem `not_comparable` ohne
+Live-Snapshot-Provenienz dient dessen Manifest-Commit als Fallback. Nicht
+auswertbare oder nicht an dieses Manifest gebundene Toolresultate erzeugen kein
+Exposure-Feld.
 
 Er belegt ausdrücklich nicht:
 

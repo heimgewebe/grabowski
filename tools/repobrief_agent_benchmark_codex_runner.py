@@ -5656,61 +5656,15 @@ def _repoground_evidence_from_codex_events(
             )
         except RunnerError:
             continue
-        freshness = payload if tool_name == "live_freshness" else payload.get("live_freshness")
-        if not isinstance(freshness, Mapping):
+        normalized = base._repoground_evidence_from_payload(
+            request=request,
+            tool_name=str(tool_name),
+            sequence=sequence,
+            payload=payload,
+        )
+        if normalized is None:
             continue
-        snapshot = freshness.get("snapshot_provenance")
-        commit = snapshot.get("git_commit") if isinstance(snapshot, Mapping) else None
-        if (
-            not isinstance(commit, str)
-            or len(commit) not in {40, 64}
-            or any(char not in "0123456789abcdef" for char in commit)
-        ):
-            continue
-        if tool_name == "ask_context":
-            pack = payload.get("context_pack")
-            if not isinstance(pack, Mapping):
-                continue
-            ranges = pack.get("resolved_ranges")
-            budget = pack.get("budget")
-            if not isinstance(ranges, list) or not isinstance(budget, Mapping):
-                continue
-            context_bytes = budget.get("context_bytes_used")
-            if (
-                isinstance(context_bytes, bool)
-                or not isinstance(context_bytes, int)
-                or context_bytes < 0
-            ):
-                continue
-            call_evidence = {
-                "sequence": sequence,
-                "tool": "ask_context",
-                "freshness_status": freshness.get("status"),
-                "resolved_range_count": len(ranges),
-                "context_bytes_used": context_bytes,
-                "grounding_status": None,
-            }
-        elif tool_name == "grounding_verify":
-            verdict = payload.get("verdict")
-            if not isinstance(verdict, Mapping):
-                continue
-            call_evidence = {
-                "sequence": sequence,
-                "tool": "grounding_verify",
-                "freshness_status": freshness.get("status"),
-                "resolved_range_count": None,
-                "context_bytes_used": None,
-                "grounding_status": verdict.get("status"),
-            }
-        else:
-            call_evidence = {
-                "sequence": sequence,
-                "tool": "live_freshness",
-                "freshness_status": freshness.get("status"),
-                "resolved_range_count": None,
-                "context_bytes_used": None,
-                "grounding_status": None,
-            }
+        commit, call_evidence = normalized
         commits.add(commit)
         evidence_calls.append(call_evidence)
     if not evidence_calls or len(commits) != 1:
