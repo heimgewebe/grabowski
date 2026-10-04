@@ -1537,14 +1537,17 @@ def _successor_handoff_live_leases(
     return owner, registered, leases, minimum_remaining
 
 
-def _github_open_pr_exact_head(
+def _github_pr_exact_head(
     repo: Path,
     *,
     pr_number: int,
     branch: str,
     head: str,
+    required_state: str,
 ) -> dict[str, Any]:
-    """Require one exact open GitHub PR publication for the successor head."""
+    """Require one exact GitHub PR publication for the successor head."""
+    if required_state not in {"OPEN", "MERGED"}:
+        raise RuntimeError("successor handoff PR state requirement is invalid")
     if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
         raise RuntimeError("successor handoff PR number is invalid")
     _text(branch, "successor handoff PR branch")
@@ -1595,8 +1598,10 @@ def _github_open_pr_exact_head(
         raise RuntimeError("successor handoff GitHub PR readback returned invalid payload")
     if payload.get("number") != pr_number:
         raise RuntimeError("successor handoff GitHub PR number drifted")
-    if payload.get("state") != "OPEN":
-        raise RuntimeError("successor handoff requires the bound PR to remain open")
+    if payload.get("state") != required_state:
+        if required_state == "OPEN":
+            raise RuntimeError("successor handoff requires the bound PR to remain open")
+        raise RuntimeError("successor handoff pending retry requires the bound PR to be merged")
     if payload.get("headRefName") != branch:
         raise RuntimeError("successor handoff GitHub PR branch drifted")
     observed_head = payload.get("headRefOid")
@@ -1605,10 +1610,42 @@ def _github_open_pr_exact_head(
     return {
         "repository": github_repo,
         "pr_number": pr_number,
-        "state": "OPEN",
+        "state": required_state,
         "head_ref_name": branch,
         "head_sha": head,
     }
+
+
+def _github_open_pr_exact_head(
+    repo: Path,
+    *,
+    pr_number: int,
+    branch: str,
+    head: str,
+) -> dict[str, Any]:
+    return _github_pr_exact_head(
+        repo,
+        pr_number=pr_number,
+        branch=branch,
+        head=head,
+        required_state="OPEN",
+    )
+
+
+def _github_merged_pr_exact_head(
+    repo: Path,
+    *,
+    pr_number: int,
+    branch: str,
+    head: str,
+) -> dict[str, Any]:
+    return _github_pr_exact_head(
+        repo,
+        pr_number=pr_number,
+        branch=branch,
+        head=head,
+        required_state="MERGED",
+    )
 
 
 def _verify_successor_handoff_locked(
@@ -1617,6 +1654,7 @@ def _verify_successor_handoff_locked(
     assessment: dict[str, Any],
     *,
     successor_receipt_path: Path | None = None,
+    allow_terminal_successor_retry: bool = False,
 ) -> dict[str, Any]:
     binding = _successor_handoff_binding(assessment)
     predecessor_lane_id = str(binding["predecessor_lane_id"])
@@ -1642,12 +1680,26 @@ def _verify_successor_handoff_locked(
         raise RuntimeError("successor handoff successor inputs are invalid")
     if successor_record.get("receipt_sha256") != binding["successor_receipt_sha256"]:
         raise RuntimeError("successor handoff successor receipt changed")
-    if (
-        successor_record.get("state") != "ready"
-        or successor_record.get("terminal_closeout") is not None
-        or successor_record.get("terminal_closeout_pending") is not None
-    ):
-        raise RuntimeError("successor handoff requires one active ready successor lane")
+    successor_terminal = _terminal_closeout_assessment(successor_record)
+    if successor_terminal is None:
+        if (
+            successor_record.get("state") != "ready"
+            or successor_record.get("terminal_closeout_pending") is not None
+        ):
+            raise RuntimeError("successor handoff requires one active ready successor lane")
+    else:
+        if not allow_terminal_successor_retry:
+            raise RuntimeError("successor handoff requires one active ready successor lane")
+        if successor_record.get("terminal_closeout_pending") is not None:
+            raise RuntimeError("successor handoff terminal successor has pending closeout state")
+        if successor_terminal.get("closeout_state") not in {"pr_merged", "deployed"}:
+            raise RuntimeError(
+                "successor handoff pending retry requires a merged or deployed successor"
+            )
+        if successor_terminal.get("terminal_head_sha") != binding["successor_head_sha"]:
+            raise RuntimeError("successor handoff terminal successor head drifted")
+        if successor_terminal.get("action_required") is not False:
+            raise RuntimeError("successor handoff terminal successor still requires action")
     if successor_inputs.get("source") != {
         "kind": "work_lane",
         "id": predecessor_lane_id,
@@ -1666,12 +1718,23 @@ def _verify_successor_handoff_locked(
     ):
         raise RuntimeError("successor handoff successor is not newer than predecessor")
 
-    (
-        successor_owner,
-        successor_registered,
-        successor_leases,
-        _initial_minimum_remaining,
-    ) = _successor_handoff_live_leases(successor_record)
+    if successor_terminal is None:
+        (
+            successor_owner,
+            successor_registered,
+            successor_leases,
+            _initial_minimum_remaining,
+        ) = _successor_handoff_live_leases(successor_record)
+    else:
+        (
+            successor_owner,
+            successor_registered,
+            successor_leases,
+        ) = _terminal_lane_resource_observation(successor_record)
+        if successor_leases:
+            raise RuntimeError(
+                "successor handoff terminal successor still owns live resource leases"
+            )
 
     repo = Path(str(predecessor_inputs["repo"]))
     predecessor_path = Path(str(predecessor_inputs["target_path"]))
@@ -1730,11 +1793,23 @@ def _verify_successor_handoff_locked(
         raise RuntimeError("successor handoff successor head is not a descendant")
     # Publication deliberately keeps the predecessor PR branch name while
     # the exact head SHA comes from the successor lane after base convergence.
-    publication = _github_open_pr_exact_head(
-        repo,
-        pr_number=int(binding["pr_number"]),
-        branch=str(predecessor_inputs["branch"]),
-        head=str(binding["successor_head_sha"]),
+    # A first-time handoff still requires an open PR. Only a retry whose pending
+    # intent predated successor terminalization may accept that same exact PR as
+    # already merged.
+    publication = (
+        _github_open_pr_exact_head(
+            repo,
+            pr_number=int(binding["pr_number"]),
+            branch=str(predecessor_inputs["branch"]),
+            head=str(binding["successor_head_sha"]),
+        )
+        if successor_terminal is None
+        else _github_merged_pr_exact_head(
+            repo,
+            pr_number=int(binding["pr_number"]),
+            branch=str(predecessor_inputs["branch"]),
+            head=str(binding["successor_head_sha"]),
+        )
     )
 
     # The GitHub read above crosses a network boundary. Re-orient the successor
@@ -1770,17 +1845,44 @@ def _verify_successor_handoff_locked(
         if reread.get("receipt_sha256") != binding["successor_receipt_sha256"]:
             raise RuntimeError("successor handoff successor receipt changed after publication")
         final_successor_record = reread
-    (
-        _final_owner,
-        _final_registered,
-        _final_leases,
-        minimum_remaining,
-    ) = _successor_handoff_live_leases(
-        final_successor_record,
-        expected_owner=successor_owner,
-        expected_registered=successor_registered,
-        expected_leases=successor_leases,
-    )
+    if successor_terminal is None:
+        (
+            _final_owner,
+            _final_registered,
+            _final_leases,
+            minimum_remaining,
+        ) = _successor_handoff_live_leases(
+            final_successor_record,
+            expected_owner=successor_owner,
+            expected_registered=successor_registered,
+            expected_leases=successor_leases,
+        )
+    else:
+        final_terminal = _terminal_closeout_assessment(final_successor_record)
+        if (
+            final_terminal is None
+            or final_terminal.get("assessment_sha256")
+            != successor_terminal.get("assessment_sha256")
+            or final_terminal.get("terminal_head_sha")
+            != binding["successor_head_sha"]
+        ):
+            raise RuntimeError(
+                "successor handoff terminal successor changed after publication"
+            )
+        (
+            final_owner,
+            final_registered,
+            final_leases,
+        ) = _terminal_lane_resource_observation(final_successor_record)
+        if (
+            final_owner != successor_owner
+            or final_registered != successor_registered
+            or final_leases
+        ):
+            raise RuntimeError(
+                "successor handoff terminal successor lease state changed after publication"
+            )
+        minimum_remaining = None
     return {
         "schema_version": 1,
         "kind": "grabowski.work_lane_successor_handoff_verification",
@@ -1827,6 +1929,9 @@ def persist_successor_handoff_closeout(
         if predecessor_record is None or predecessor_record.get("lane_id") != lane_id:
             raise RuntimeError("work-lane receipt is missing or bound to another lane")
         existing = _terminal_closeout_assessment(predecessor_record)
+        retrying_pending = (
+            _terminal_closeout_pending_assessment(predecessor_record) is not None
+        )
     if existing is not None:
         result = _persist_terminal_closeout_impl(
             lane_id,
@@ -1865,6 +1970,7 @@ def persist_successor_handoff_closeout(
                 current_successor,
                 assessment_value,
                 successor_receipt_path=successor_receipt_path,
+                allow_terminal_successor_retry=retrying_pending,
             )
             verification.clear()
             verification.update(current)
