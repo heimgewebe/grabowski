@@ -936,6 +936,17 @@ def wait_for_deployment_window(
 
 def _validation_environment(validation_root: Path) -> dict[str, str]:
     environment = deploy_core.pip_env()
+    environment.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+            "NO_COLOR": "1",
+        }
+    )
+    for key in ("GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_ASKPASS", "SSH_ASKPASS"):
+        environment.pop(key, None)
     for name in FINALIZATION_ENV.values():
         environment.pop(name, None)
     environment.update(
@@ -946,7 +957,7 @@ def _validation_environment(validation_root: Path) -> dict[str, str]:
 
 def _verify_validation_distributions(
     python: Path,
-    lock_path: Path,
+    locked: dict[str, str],
     environment: dict[str, str],
 ) -> None:
     result = deploy_core.run(
@@ -974,7 +985,6 @@ def _verify_validation_distributions(
     ):
         raise RuntimeError("validation interpreter returned invalid distribution inventory")
 
-    locked = deploy_core.parse_runtime_lock(lock_path)
     installed = {
         deploy_core.normalize_package_name(name): version
         for name, version in installed_raw.items()
@@ -1002,7 +1012,10 @@ def _verify_validation_distributions(
 def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
     """Build an isolated validation interpreter from the exact target runtime lock."""
     lock_path = repo / deploy_core.RUNTIME_LOCK_RELATIVE
-    metadata = lock_path.lstat()
+    try:
+        metadata = lock_path.lstat()
+    except OSError as exc:
+        raise RuntimeError("target runtime lock is unsafe") from exc
     if (
         lock_path.is_symlink()
         or not lock_path.is_file()
@@ -1010,6 +1023,10 @@ def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
         or metadata.st_nlink != 1
     ):
         raise RuntimeError("target runtime lock is unsafe")
+
+    # Reject requirements-file directives and invalid pins before pip sees the
+    # target lock. This mirrors build_release() and keeps validation fail-closed.
+    locked = deploy_core.parse_runtime_lock(lock_path)
 
     venv = validation_root / "target-runtime"
     environment = _validation_environment(validation_root)
@@ -1044,7 +1061,7 @@ def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
         timeout=deploy_core.TIMEOUTS["python"],
         env=environment,
     )
-    _verify_validation_distributions(python, lock_path, environment)
+    _verify_validation_distributions(python, locked, environment)
     return python
 
 
@@ -1058,11 +1075,13 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
                 prefix="gdv-",
                 dir=_validation_temp_parent(),
             )
-            environment.update(
-                {name: validation_tmp.name for name in ("TMPDIR", "TMP", "TEMP")}
-            )
+            validation_root = Path(validation_tmp.name)
+            environment = _validation_environment(validation_root)
             environment["PYTHON"] = str(
-                _prepare_validation_python(cwd, Path(validation_tmp.name))
+                _prepare_validation_python(cwd, validation_root)
+            )
+            environment["DEPLOY_TOOLING_VENV"] = str(
+                validation_root / "deploy-tooling" / ".venv"
             )
         process = subprocess.Popen(
             argv,

@@ -4974,8 +4974,17 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         process = Mock()
         process.wait.return_value = 0
         bindings = {name: "secret-binding" for name in RUNNER.FINALIZATION_ENV.values()}
+        python_bindings = {
+            "PYTHONPATH": "/untrusted/pythonpath",
+            "PYTHONHOME": "/untrusted/pythonhome",
+            "VIRTUAL_ENV": "/untrusted/venv",
+            "PIP_INDEX_URL": "https://untrusted.invalid/simple",
+            "PIP_EXTRA_INDEX_URL": "https://untrusted.invalid/extra",
+        }
         with tempfile.TemporaryDirectory() as temporary_parent, patch.dict(
-            os.environ, bindings, clear=False
+            os.environ,
+            {**bindings, **python_bindings, "GRABOWSKI_UNRELATED": "preserved"},
+            clear=False,
         ), patch.object(
             RUNNER, "_validation_temp_parent", return_value=Path(temporary_parent)
         ), patch.object(
@@ -4994,12 +5003,19 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         environment = popen.call_args.kwargs["env"]
         prepare.assert_called_once()
         self.assertEqual(environment["PYTHON"], "/validation/bin/python")
-        for name in bindings:
+        self.assertEqual(environment["GRABOWSKI_UNRELATED"], "preserved")
+        self.assertEqual(environment["PIP_CONFIG_FILE"], "/dev/null")
+        for name in (*bindings, *python_bindings):
             self.assertNotIn(name, environment)
         self.assertEqual(environment["TMPDIR"], environment["TMP"])
         self.assertEqual(environment["TMPDIR"], environment["TEMP"])
         self.assertEqual(Path(environment["TMPDIR"]).parent, Path(temporary_parent))
+        tooling_venv = Path(environment["DEPLOY_TOOLING_VENV"])
+        self.assertEqual(tooling_venv.name, ".venv")
+        self.assertEqual(tooling_venv.parent.name, "deploy-tooling")
+        self.assertEqual(tooling_venv.parents[2], Path(temporary_parent))
         self.assertFalse(Path(environment["TMPDIR"]).exists())
+        self.assertFalse(tooling_venv.exists())
 
     def test_prepare_validation_python_uses_target_runtime_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -5066,6 +5082,79 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             for name in bindings:
                 self.assertNotIn(name, environment)
 
+    def test_prepare_validation_python_validates_lock_before_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            repo = root / "repo"
+            validation_root = root / "validation"
+            lock = repo / "requirements/runtime.lock.txt"
+            lock.parent.mkdir(parents=True)
+            validation_root.mkdir()
+            lock.write_text(
+                "--extra-index-url https://untrusted.invalid/simple\n",
+                encoding="utf-8",
+            )
+            with patch.object(RUNNER.deploy_core, "run") as run:
+                with self.assertRaisesRegex(
+                    RUNNER.deploy_core.DeployError,
+                    "Nicht erlaubte Runtime-Lock-Anforderung",
+                ):
+                    RUNNER._prepare_validation_python(repo, validation_root)
+            run.assert_not_called()
+
+    def test_verify_validation_distributions_fails_closed(self) -> None:
+        python = Path("/validation/bin/python")
+        environment = {"PIP_CONFIG_FILE": "/dev/null"}
+        cases = (
+            (
+                "invalid-json",
+                "not-json",
+                {"mcp": "1.30.0"},
+                RuntimeError,
+                "invalid distribution JSON",
+            ),
+            (
+                "invalid-inventory",
+                "[]",
+                {"mcp": "1.30.0"},
+                RuntimeError,
+                "invalid distribution inventory",
+            ),
+            (
+                "unexpected",
+                json.dumps({"mcp": "1.30.0", "extra": "1.0"}),
+                {"mcp": "1.30.0"},
+                RUNNER.deploy_core.DeployError,
+                "Unerwartete installierte Distributionen",
+            ),
+            (
+                "missing",
+                json.dumps({"mcp": "1.30.0"}),
+                {"mcp": "1.30.0", "pydantic": "2.13.4"},
+                RUNNER.deploy_core.DeployError,
+                "Runtime-Lockpakete fehlen",
+            ),
+            (
+                "mismatch",
+                json.dumps({"mcp": "1.29.0"}),
+                {"mcp": "1.30.0"},
+                RUNNER.deploy_core.DeployError,
+                "Installierte Versionen weichen",
+            ),
+        )
+        for name, stdout, locked, exception, message in cases:
+            with self.subTest(name=name), patch.object(
+                RUNNER.deploy_core,
+                "run",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=stdout, stderr=""
+                ),
+            ):
+                with self.assertRaisesRegex(exception, message):
+                    RUNNER._verify_validation_distributions(
+                        python, locked, environment
+                    )
+
     def test_validate_preparation_failure_never_starts_make_and_cleans_temp(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_parent, patch.object(
             RUNNER, "_validation_temp_parent", return_value=Path(temporary_parent)
@@ -5084,21 +5173,34 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             popen.assert_not_called()
             self.assertEqual(list(Path(temporary_parent).iterdir()), [])
 
-    def test_prepare_validation_python_rejects_symlink_runtime_lock(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary).resolve()
-            repo = root / "repo"
-            validation_root = root / "validation"
-            lock = repo / "requirements/runtime.lock.txt"
-            target = root / "runtime.lock"
-            lock.parent.mkdir(parents=True)
-            validation_root.mkdir()
-            target.write_text("lock fixture\n", encoding="utf-8")
-            lock.symlink_to(target)
-            with patch.object(RUNNER.deploy_core, "run") as run:
-                with self.assertRaisesRegex(RuntimeError, "runtime lock is unsafe"):
-                    RUNNER._prepare_validation_python(repo, validation_root)
-            run.assert_not_called()
+    def test_prepare_validation_python_rejects_unsafe_runtime_lock_identity(self) -> None:
+        for case in ("missing", "symlink", "hardlink", "foreign-owner"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                repo = root / "repo"
+                validation_root = root / "validation"
+                lock = repo / "requirements/runtime.lock.txt"
+                target = root / "runtime.lock"
+                lock.parent.mkdir(parents=True)
+                validation_root.mkdir()
+                getuid = nullcontext()
+                if case == "symlink":
+                    target.write_text("lock fixture\n", encoding="utf-8")
+                    lock.symlink_to(target)
+                elif case == "hardlink":
+                    target.write_text("lock fixture\n", encoding="utf-8")
+                    os.link(target, lock)
+                elif case == "foreign-owner":
+                    lock.write_text("lock fixture\n", encoding="utf-8")
+                    getuid = patch.object(
+                        RUNNER.os, "getuid", return_value=os.getuid() + 1
+                    )
+                with getuid, patch.object(RUNNER.deploy_core, "run") as run:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "runtime lock is unsafe"
+                    ):
+                        RUNNER._prepare_validation_python(repo, validation_root)
+                run.assert_not_called()
 
     def test_validation_temp_parent_rejects_git_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
