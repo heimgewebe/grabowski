@@ -15623,5 +15623,9 @@ _freeze_serving_process_identity()
 if __name__ == "__main__":
     import grabowski_flowlines
 
-    grabowski_flowlines.configure_flowlines_observability(mcp, READ_ANNOTATIONS)
+    grabowski_flowlines.configure_flowlines_observability(
+        mcp,
+        READ_ANNOTATIONS,
+        load_environment_exporter=False,
+    )
     mcp.run()

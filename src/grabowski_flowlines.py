@@ -920,7 +920,10 @@ def configure_flowlines_observability(
     tracer: Any | None = None,
     provider: Any | None = None,
     verified_identity_resolver: Callable[[Any], Mapping[str, Any] | None] | None = None,
+    load_environment_exporter: bool = True,
 ) -> dict[str, Any]:
+    if not isinstance(load_environment_exporter, bool):
+        raise ValueError("load_environment_exporter must be a boolean")
     if getattr(mcp, _INSTALL_MARKER, False):
         return {"installed": True, "already_installed": True}
 
@@ -932,7 +935,7 @@ def configure_flowlines_observability(
         if getattr(tool, "name", None) != REPORT_OUTCOME_TOOL:
             _augment_tool_schema(tool)
 
-    if tracer is None:
+    if tracer is None and load_environment_exporter:
         tracer, provider = _build_environment_tracer()
     _install_strip_wrapper(manager, require_context=tracer is not None)
     _install_lowlevel_handler(

@@ -94,12 +94,11 @@ class AgentInstructionsTests(unittest.TestCase):
         marker = 'if __name__ == "__main__":'
         self.assertEqual(source.count(marker), 1)
         direct_entrypoint = source.split(marker, 1)[1]
-        configure = (
-            "grabowski_flowlines.configure_flowlines_observability"
-            "(mcp, READ_ANNOTATIONS)"
-        )
+        configure = "grabowski_flowlines.configure_flowlines_observability("
         self.assertIn("import grabowski_flowlines", direct_entrypoint)
         self.assertIn(configure, direct_entrypoint)
+        self.assertIn("READ_ANNOTATIONS", direct_entrypoint)
+        self.assertIn("load_environment_exporter=False", direct_entrypoint)
         self.assertLess(
             direct_entrypoint.index(configure),
             direct_entrypoint.index("mcp.run()"),

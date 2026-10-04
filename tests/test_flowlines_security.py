@@ -273,11 +273,20 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
         self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS=", service)
         self.assertNotIn("OTEL_EXPORTER_OTLP_TRACES_HEADERS=", service)
 
-        self.assertIn("Environment=GRABOWSKI_FLOWLINES_ENABLED=1", dropin)
+        self.assertNotIn("Environment=GRABOWSKI_FLOWLINES_ENABLED=1", dropin)
+        self.assertIn(
+            "EnvironmentFile=-/etc/grabowski/flowlines-enabled.env",
+            dropin,
+        )
         self.assertIn("/etc/grabowski/flowlines-headers", dropin)
-        self.assertNotIn("EnvironmentFile=", dropin)
         self.assertNotIn("OTEL_EXPORTER_OTLP_ENDPOINT=", dropin)
         self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS=", dropin)
+
+    def test_standalone_entrypoint_does_not_load_environment_exporter(self) -> None:
+        source = (SRC / "grabowski_mcp.py").read_text(encoding="utf-8")
+        main_block = source.split('if __name__ == "__main__":', 1)[1]
+        self.assertIn("configure_flowlines_observability(", main_block)
+        self.assertIn("load_environment_exporter=False", main_block)
 
 
 if __name__ == "__main__":

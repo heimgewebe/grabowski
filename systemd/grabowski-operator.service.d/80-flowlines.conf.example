@@ -1,6 +1,7 @@
 [Service]
-# Explicit non-secret Flowlines opt-in. The exporter credential remains
-# root-owned at /etc/grabowski/flowlines-headers and is read by the operator
-# MainPID through the existing privileged broker. The trace endpoint is pinned
-# in grabowski_flowlines.py; ambient OTLP endpoint/header overrides stay unset.
-Environment=GRABOWSKI_FLOWLINES_ENABLED=1
+# Commit-bound non-secret Flowlines configuration. Export remains disabled unless
+# an operator explicitly provisions the root-owned local enablement file with
+# GRABOWSKI_FLOWLINES_ENABLED=1. The exporter credential remains separate at
+# /etc/grabowski/flowlines-headers and is read only by the authorized operator
+# MainPID through the privileged broker.
+EnvironmentFile=-/etc/grabowski/flowlines-enabled.env

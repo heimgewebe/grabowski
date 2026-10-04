@@ -533,6 +533,28 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.root.structuredContent, {"value": "legacy"})
         self.assertEqual(self.exporter.get_finished_spans(), ())
 
+    def test_standalone_contract_can_skip_environment_exporter(self) -> None:
+        mcp = FastMCP("grabowski-test", instructions="fixture")
+
+        @mcp.tool(name="echo", annotations=READ_ONLY)
+        def echo(value: str) -> dict[str, str]:
+            return {"value": value}
+
+        with mock.patch.object(flowlines, "_build_environment_tracer") as build:
+            state = flowlines.configure_flowlines_observability(
+                mcp,
+                READ_ONLY,
+                load_environment_exporter=False,
+            )
+
+        build.assert_not_called()
+        self.assertFalse(state["export_enabled"])
+        self.assertIsNotNone(
+            mcp._tool_manager.get_tool(flowlines.REPORT_OUTCOME_TOOL)
+        )
+        published = mcp._tool_manager.get_tool("echo").parameters
+        self.assertTrue({"reason", "user_intent"}.issubset(published["required"]))
+
     def test_existing_domain_analytics_schemas_are_not_overwritten(self) -> None:
         tool = SimpleNamespace(
             name="domain_fields",
