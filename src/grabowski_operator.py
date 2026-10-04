@@ -486,7 +486,12 @@ REDACTIONS = (
     (_ANTHROPIC_SECRET_PATTERN, "<REDACTED_ANTHROPIC_KEY>"),
     (
         re.compile(
-            r"(?im)^(\s*OTEL_EXPORTER_OTLP(?:_TRACES)?_(?:HEADERS|ENDPOINT)\s*[:=]\s*).+$"
+            r"(?im)^(\s*(?:"
+            r"OTEL_EXPORTER_OTLP(?:_(?:TRACES|METRICS|LOGS))?_"
+            r"(?:HEADERS|ENDPOINT|CERTIFICATE|CLIENT_CERTIFICATE|CLIENT_KEY)"
+            r"|OTEL_PYTHON_EXPORTER_OTLP_HTTP"
+            r"(?:_(?:TRACES|METRICS|LOGS))?_CREDENTIAL_PROVIDER"
+            r")\s*[:=]\s*).+$"
         ),
         r"\1<REDACTED>",
     ),
