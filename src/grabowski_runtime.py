@@ -218,7 +218,11 @@ def grabowski_merge_delivery_record(
 
 
 def main() -> None:
-    grabowski_flowlines.configure_flowlines_observability(mcp, READ_ONLY)
+    grabowski_flowlines.configure_flowlines_observability(
+        mcp,
+        READ_ONLY,
+        verified_identity_resolver=grabowski_mcp._flowlines_verified_identity,
+    )
     grabowski_operator_core.main()
 
 

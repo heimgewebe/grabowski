@@ -322,8 +322,28 @@ SENSITIVE_ENV_KEYS = frozenset(
     {
         "OTEL_EXPORTER_OTLP_ENDPOINT",
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
         "OTEL_EXPORTER_OTLP_HEADERS",
         "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_METRICS_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_LOGS_CREDENTIAL_PROVIDER",
+        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
     }
 )
 PRIVILEGE_ESCALATORS = {"sudo", "su", "pkexec", "doas"}
@@ -466,7 +486,12 @@ REDACTIONS = (
     (_ANTHROPIC_SECRET_PATTERN, "<REDACTED_ANTHROPIC_KEY>"),
     (
         re.compile(
-            r"(?im)^(\s*OTEL_EXPORTER_OTLP(?:_TRACES)?_(?:HEADERS|ENDPOINT)\s*[:=]\s*).+$"
+            r"(?im)^(\s*(?:"
+            r"OTEL_EXPORTER_OTLP(?:_(?:TRACES|METRICS|LOGS))?_"
+            r"(?:HEADERS|ENDPOINT|CERTIFICATE|CLIENT_CERTIFICATE|CLIENT_KEY)"
+            r"|OTEL_PYTHON_EXPORTER_OTLP_HTTP"
+            r"(?:_(?:TRACES|METRICS|LOGS))?_CREDENTIAL_PROVIDER"
+            r")\s*[:=]\s*).+$"
         ),
         r"\1<REDACTED>",
     ),
@@ -10484,7 +10509,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     _configure_faulthandler()
-    grabowski_flowlines.configure_flowlines_observability(mcp, READ_ONLY)
+    grabowski_flowlines.configure_flowlines_observability(
+        mcp,
+        READ_ONLY,
+        verified_identity_resolver=base._flowlines_verified_identity,
+    )
     if args.transport == "streamable-http":
         if args.host != "127.0.0.1":
             raise SystemExit(

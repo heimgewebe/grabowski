@@ -184,6 +184,7 @@ def _load_operator_module():
     fake_base._transport_authorize_connector_tool = (
         lambda context, tool_name, arguments=None: None
     )
+    fake_base._flowlines_verified_identity = lambda request_context: None
     fake_base._retain_pending_transport_target = (
         lambda challenge_receipt_sha256, **kwargs: {
             "challenge_receipt_sha256": challenge_receipt_sha256,
@@ -278,15 +279,39 @@ class OperatorContractTests(unittest.TestCase):
             environment["UV_CACHE_DIR"],
         )
 
-    def test_safe_environment_never_exports_flowlines_headers(self) -> None:
+    def test_safe_environment_never_exports_or_logs_otlp_boundary_variables(self) -> None:
         operator = _load_operator_module()
-        headers = {
-            "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
-            "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "x-flowlines-api-key=trace-secret",
-            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai?a=b",
-            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": (
-                "https://api.flowlines.ai/v1/traces?a=b"
-            ),
+        boundary_names = frozenset(
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+                "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+                "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+                "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
+                "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+                "OTEL_PYTHON_EXPORTER_OTLP_HTTP_METRICS_CREDENTIAL_PROVIDER",
+                "OTEL_PYTHON_EXPORTER_OTLP_HTTP_LOGS_CREDENTIAL_PROVIDER",
+                "OTEL_EXPORTER_OTLP_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+                "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+                "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+                "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+            }
+        )
+        otlp_environment = {
+            name: f"fixture-secret-{index}"
+            for index, name in enumerate(sorted(boundary_names), start=1)
         }
         for trusted in (False, True):
             with (
@@ -295,17 +320,17 @@ class OperatorContractTests(unittest.TestCase):
                     operator.os.environ,
                     {
                         "XDG_RUNTIME_DIR": "/run/user/1000",
-                        **headers,
+                        **otlp_environment,
                     },
                     clear=True,
                 ),
                 patch.object(operator, "_trusted_owner_mode", return_value=trusted),
             ):
                 environment = operator._safe_environment()
-            for name in headers:
+            for name in boundary_names:
                 self.assertNotIn(name, environment)
 
-        for name, value in headers.items():
+        for name, value in otlp_environment.items():
             with self.subTest(name=name):
                 self.assertEqual(
                     operator._redact(f"{name}={value}"),
@@ -329,11 +354,12 @@ class OperatorContractTests(unittest.TestCase):
         main_marker = "def main() -> None:"
         self.assertEqual(source.count(main_marker), 1)
         main = source.split(main_marker, 1)[1]
-        configure = (
-            "grabowski_flowlines.configure_flowlines_observability"
-            "(mcp, READ_ONLY)"
-        )
+        configure = "grabowski_flowlines.configure_flowlines_observability("
         self.assertIn(configure, main)
+        self.assertIn(
+            "verified_identity_resolver=base._flowlines_verified_identity",
+            main,
+        )
         for later in (
             "_install_deployment_admission_gate()",
             "_configure_posthog_mcp_analytics()",
