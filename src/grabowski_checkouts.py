@@ -1310,6 +1310,33 @@ def _retention_records(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
         connection.close()
     return {row["checkout_key"]: _retention_public(row) for row in rows}
 
+def _release_retention_exact(retention: dict[str, Any]) -> bool:
+    required = (
+        retention.get("checkout_key"),
+        retention.get("owner_id"),
+        retention.get("created_at_unix"),
+        retention.get("updated_at_unix"),
+    )
+    if not isinstance(required[0], str) or not isinstance(required[1], str):
+        return False
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for value in required[2:]
+    ):
+        return False
+    with _database() as connection:
+        deleted = connection.execute(
+            """
+            DELETE FROM retention
+            WHERE checkout_key=? AND owner_id=?
+              AND created_at_unix=? AND updated_at_unix=?
+            """,
+            required,
+        )
+        connection.commit()
+    return deleted.rowcount == 1
+
+
 
 def _archive_supersession_ids(connection: sqlite3.Connection) -> set[str]:
     try:
@@ -3138,6 +3165,79 @@ def _materialize_uncertainty_lifecycle(
         raise RuntimeError("Materialize uncertainty lifecycle binding mismatch")
     return lifecycle
 
+def _materialize_uncertainty_retention(
+    fence: dict[str, Any],
+) -> dict[str, Any] | None:
+    evidence = fence["evidence"]
+    checkout_key = str(evidence["checkout_key"])
+    connection = _readonly_connection(CHECKOUT_DB)
+    if connection is None:
+        raise RuntimeError("Materialize uncertainty retention store is unavailable")
+    try:
+        row = connection.execute(
+            "SELECT * FROM retention WHERE checkout_key=?",
+            (checkout_key,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            "Materialize uncertainty retention readback failed"
+        ) from exc
+    finally:
+        connection.close()
+    if row is None:
+        return None
+    retention = _retention_public(row)
+    expected = {
+        "checkout_key": evidence["checkout_key"],
+        "repo_common_dir": evidence["git_common_dir"],
+        "repo_path": evidence["repo"],
+        "checkout_path": evidence["checkout_path"],
+        "owner_id": evidence["owner_id"],
+        "expected_head": evidence["expected_head"],
+        "expected_branch": None,
+    }
+    expected_purpose = (
+        "detached runtime deploy source "
+        + str(evidence["expected_head"])[:12]
+    )
+    if (
+        any(retention.get(key) != value for key, value in expected.items())
+        or retention.get("purpose") != expected_purpose
+    ):
+        raise RuntimeError("Materialize uncertainty retention binding mismatch")
+    return retention
+
+
+def _materialize_completed_obligation_matches_fence(
+    fence: dict[str, Any],
+    status: dict[str, Any],
+) -> bool:
+    evidence = fence["evidence"]
+    if status.get("obligation_id") != evidence.get("obligation_id"):
+        return False
+    items = status.get("evidence")
+    if not isinstance(items, list):
+        return False
+    expected_reference = (
+        "runtime-deploy-source-materialized:"
+        + str(evidence["expected_head"])
+        + ":"
+        + str(fence["operation_id"])
+    )
+    matches = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and item.get("acceptance_id") == "source-materialized"
+        and item.get("status") == "passed"
+        and item.get("source") == "receipt"
+        and item.get("reference") == expected_reference
+        and isinstance(item.get("sha256"), str)
+        and SHA256_RE.fullmatch(str(item["sha256"])) is not None
+    ]
+    return len(matches) == 1
+
+
 
 def _materialize_uncertainty_readback(
     fence: dict[str, Any],
@@ -3290,6 +3390,50 @@ def _reconcile_materialize_uncertainty(
         readback = _materialize_uncertainty_readback(fence)
         state = str(readback.get("state"))
         if state == "confirmed_no_effect":
+            try:
+                retention = _materialize_uncertainty_retention(fence)
+            except Exception as exc:
+                return {
+                    "state": "still_fenced",
+                    "reason": (
+                        "materialize-no-effect-retention-readback-failed:"
+                        f"{type(exc).__name__}"
+                    ),
+                    "readback": readback,
+                }
+            if retention is not None:
+                try:
+                    if not _release_retention_exact(retention):
+                        return {
+                            "state": "still_fenced",
+                            "reason": "materialize-no-effect-retention-release-failed",
+                            "readback": readback,
+                        }
+                except Exception as exc:
+                    return {
+                        "state": "still_fenced",
+                        "reason": (
+                            "materialize-no-effect-retention-release-failed:"
+                            f"{type(exc).__name__}"
+                        ),
+                        "readback": readback,
+                    }
+                try:
+                    if _materialize_uncertainty_retention(fence) is not None:
+                        return {
+                            "state": "still_fenced",
+                            "reason": "materialize-no-effect-retention-still-present",
+                            "readback": readback,
+                        }
+                except Exception as exc:
+                    return {
+                        "state": "still_fenced",
+                        "reason": (
+                            "materialize-no-effect-retention-readback-failed:"
+                            f"{type(exc).__name__}"
+                        ),
+                        "readback": readback,
+                    }
             lifecycle = _materialize_uncertainty_lifecycle(fence)
             if lifecycle is not None and not _release_checkout_lifecycle_exact(lifecycle):
                 return {
@@ -3315,6 +3459,17 @@ def _reconcile_materialize_uncertainty(
         if state != "recoverable_created":
             return readback
         evidence = fence["evidence"]
+        try:
+            retention = _materialize_uncertainty_retention(fence)
+        except Exception as exc:
+            return {
+                "state": "still_fenced",
+                "reason": (
+                    "materialize-retention-readback-failed:"
+                    f"{type(exc).__name__}"
+                ),
+                "readback": readback,
+            }
         import grabowski_operator_obligation as obligations
 
         obligation_status = obligations.status_obligation(
@@ -3327,6 +3482,20 @@ def _reconcile_materialize_uncertainty(
                     "reason": "materialize-completed-obligation-still-requires-continuation",
                     "readback": readback,
                 }
+            if retention is None:
+                return {
+                    "state": "still_fenced",
+                    "reason": "materialize-completed-retention-missing",
+                    "readback": readback,
+                }
+            if not _materialize_completed_obligation_matches_fence(
+                fence, obligation_status
+            ):
+                return {
+                    "state": "still_fenced",
+                    "reason": "materialize-completed-obligation-evidence-mismatch",
+                    "readback": readback,
+                }
             return {
                 "state": "confirmed_success",
                 "checkout_key": evidence["checkout_key"],
@@ -3336,6 +3505,7 @@ def _reconcile_materialize_uncertainty(
                     "state": obligation_status.get("state"),
                     "close_file_sha256": obligation_status.get("close_file_sha256"),
                 },
+                "retention": retention,
             }
         repo = _resolve_repo(str(evidence["repo"]))
         checkout = Path(str(evidence["checkout_path"]))
@@ -3354,6 +3524,39 @@ def _reconcile_materialize_uncertainty(
             return {
                 "state": "still_fenced",
                 "reason": "materialize-recovery-postcondition-failed",
+                "readback": after,
+            }
+        if retention is not None:
+            try:
+                if not _release_retention_exact(retention):
+                    return {
+                        "state": "still_fenced",
+                        "reason": "materialize-recovery-retention-release-failed",
+                        "readback": after,
+                    }
+            except Exception as exc:
+                return {
+                    "state": "still_fenced",
+                    "reason": (
+                        "materialize-recovery-retention-release-failed:"
+                        f"{type(exc).__name__}"
+                    ),
+                    "readback": after,
+                }
+        try:
+            if _materialize_uncertainty_retention(fence) is not None:
+                return {
+                    "state": "still_fenced",
+                    "reason": "materialize-recovery-retention-still-present",
+                    "readback": after,
+                }
+        except Exception as exc:
+            return {
+                "state": "still_fenced",
+                "reason": (
+                    "materialize-recovery-retention-readback-failed:"
+                    f"{type(exc).__name__}"
+                ),
                 "readback": after,
             }
         lifecycle = _materialize_uncertainty_lifecycle(fence)

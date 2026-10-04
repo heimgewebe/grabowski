@@ -2564,10 +2564,28 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertFalse(obligation_status["continuation_required"])
         self.assertEqual(obligation_status["resolution_disposition"], "resolved")
 
+    def _materialize_uncertainty_retention(
+        self,
+        target: Path,
+        lifecycle: dict[str, object],
+    ) -> dict[str, object]:
+        return checkouts._upsert_retention(
+            checkout_key=str(lifecycle["checkout_key"]),
+            repo_common_dir=checkouts._git_common_dir(self.repo),
+            repo_path=self.repo,
+            checkout_path=target,
+            owner_id=str(lifecycle["owner_id"]),
+            purpose=f"detached runtime deploy source {self.head[:12]}",
+            retention_until_unix=int(lifecycle["retention_until_unix"]),
+            expected_head=self.head,
+            expected_branch=None,
+        )
+
     def test_materialize_uncertainty_reconcile_preserves_completed_source(self) -> None:
         target, fence, lifecycle, _common_dir_key = (
             self._materialize_uncertainty_fixture(create_worktree=True)
         )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
         obligations.close_obligation(
             {
                 "obligation_id": "goo-runtime-deploy-source-materialize-test",
@@ -2577,7 +2595,10 @@ class CheckoutLifecycleTests(unittest.TestCase):
                         "acceptance_id": "source-materialized",
                         "status": "passed",
                         "source": "receipt",
-                        "reference": "runtime-deploy-source-materialized:test",
+                        "reference": (
+                            f"runtime-deploy-source-materialized:{self.head}:"
+                            "materialize-test"
+                        ),
                         "sha256": "8" * 64,
                     }
                 ],
@@ -2597,12 +2618,92 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(
             checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
         )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
         self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
         obligation_status = obligations.status_obligation(
             "goo-runtime-deploy-source-materialize-test"
         )
         self.assertEqual(obligation_status["state"], "completed")
         self.assertFalse(obligation_status["continuation_required"])
+
+    def test_materialize_uncertainty_reconcile_removes_bound_retention(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "reconciled_success")
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(retention["expected_head"], self.head)
+
+    def test_materialize_uncertainty_reconcile_retries_retention_release(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        with patch.object(
+            checkouts,
+            "_release_retention_exact",
+            return_value=False,
+            create=True,
+        ) as release_retention:
+            first = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        self.assertEqual(first["state"], "still_fenced")
+        self.assertIn("retention-release-failed", first["readback"]["reason"])
+        release_retention.assert_called_once_with(retention)
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
+        retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(retry["state"], "reconciled")
+        self.assertEqual(retry["outcome"], "confirmed_no_effect")
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
 
     def test_materialize_uncertainty_reconcile_clears_proven_no_effect(self) -> None:
         target, fence, lifecycle, _common_dir_key = (
