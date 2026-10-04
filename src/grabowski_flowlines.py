@@ -118,14 +118,24 @@ ReportOutcomeUnmetNeeds = Annotated[
 _FLOWLINES_FORBIDDEN_EXPORT_ENV = (
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+    "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
     "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
     "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+    "OTEL_PYTHON_EXPORTER_OTLP_HTTP_METRICS_CREDENTIAL_PROVIDER",
+    "OTEL_PYTHON_EXPORTER_OTLP_HTTP_LOGS_CREDENTIAL_PROVIDER",
     "OTEL_EXPORTER_OTLP_CERTIFICATE",
     "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
     "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
-    "OTEL_EXPORTER_OTLP_CLIENT_KEY",
     "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+    "OTEL_EXPORTER_OTLP_CLIENT_KEY",
     "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+    "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
 )
 _SENSITIVE_ARGUMENT_KEYS = frozenset(
     {
@@ -661,15 +671,15 @@ def _endpoint_is_flowlines() -> bool:
 
 def _build_environment_tracer() -> tuple[Any | None, Any | None]:
     enabled = os.environ.get("GRABOWSKI_FLOWLINES_ENABLED", "").strip().lower()
-    # Detect forbidden overrides before consuming credential-bearing header
+    # Detect forbidden overrides before consuming credential-bearing exporter
     # variables. Neither generic nor trace-specific OTLP authentication may
     # remain available to later child processes.
     unsafe_overrides = _unsafe_flowlines_export_overrides()
     endpoint_is_flowlines = _endpoint_is_flowlines()
     os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
     os.environ.pop("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", None)
-    os.environ.pop("OTEL_EXPORTER_OTLP_HEADERS", None)
-    os.environ.pop("OTEL_EXPORTER_OTLP_TRACES_HEADERS", None)
+    for key in _FLOWLINES_FORBIDDEN_EXPORT_ENV:
+        os.environ.pop(key, None)
     if enabled not in {"1", "true", "yes", "on"}:
         return None, None
     if not endpoint_is_flowlines or unsafe_overrides:
@@ -838,13 +848,16 @@ def _install_lowlevel_handler(
             return await original(req)
         meta = _meta_mapping(request_context)
         verified: Mapping[str, Any] | None = None
+        verified_identity_failed = False
         if verified_identity_resolver is not None:
             try:
                 candidate = verified_identity_resolver(request_context)
                 if isinstance(candidate, Mapping):
                     verified = candidate
             except Exception:
-                verified = None
+                verified_identity_failed = True
+        if verified_identity_failed:
+            return await original(req)
         identity = _identity_from_meta(meta, verified)
         if tracer is None or identity is None:
             return await original(req)
