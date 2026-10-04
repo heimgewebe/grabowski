@@ -1679,8 +1679,29 @@ def _verify_successor_handoff_locked(
     ):
         raise RuntimeError("successor handoff successor inputs are invalid")
     successor_terminal = _terminal_closeout_assessment(successor_record)
-    if successor_terminal is not None and not allow_terminal_successor_retry:
-        raise RuntimeError("successor handoff requires one active ready successor lane")
+    if successor_terminal is not None:
+        if not allow_terminal_successor_retry:
+            raise RuntimeError("successor handoff requires one active ready successor lane")
+        pending_retry = _terminal_closeout_pending_assessment(predecessor_record)
+        if (
+            pending_retry is None
+            or _successor_handoff_binding(pending_retry) != binding
+        ):
+            raise RuntimeError(
+                "successor handoff terminal retry requires matching durable pending intent"
+            )
+        pending_observed_at = pending_retry.get("observed_at_unix")
+        terminal_observed_at = successor_terminal.get("observed_at_unix")
+        # Equality is deliberately fail-closed: second-granularity timestamps
+        # cannot prove that pending intent existed before terminalization.
+        if (
+            type(pending_observed_at) is not int
+            or type(terminal_observed_at) is not int
+            or pending_observed_at >= terminal_observed_at
+        ):
+            raise RuntimeError(
+                "successor handoff pending intent does not predate successor terminalization"
+            )
     bound_successor_receipt = binding["successor_receipt_sha256"]
     current_successor_receipt = successor_record.get("receipt_sha256")
     if current_successor_receipt != bound_successor_receipt:
@@ -1703,8 +1724,6 @@ def _verify_successor_handoff_locked(
         ):
             raise RuntimeError("successor handoff requires one active ready successor lane")
     else:
-        if not allow_terminal_successor_retry:
-            raise RuntimeError("successor handoff requires one active ready successor lane")
         if successor_record.get("terminal_closeout_pending") is not None:
             raise RuntimeError("successor handoff terminal successor has pending closeout state")
         if successor_terminal.get("closeout_state") not in {"pr_merged", "deployed"}:

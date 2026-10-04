@@ -4811,6 +4811,99 @@ class WorkAcquireTests(unittest.TestCase):
             verify.call_args.kwargs["allow_terminal_successor_retry"]
         )
 
+    def test_successor_handoff_terminal_bootstrap_pending_does_not_enable_retry(self) -> None:
+        predecessor_params = self.parameters()
+        predecessor_inputs, predecessor_receipt = self.store_lane(predecessor_params)
+        predecessor_id = str(predecessor_inputs["lane_id"])
+
+        successor_params = self.parameters()
+        successor_params.update(
+            source_kind="work_lane",
+            source_id=predecessor_id,
+            branch="feat/authority-successor-terminal-bootstrap",
+            target_path=str(self.root / "successor-terminal-bootstrap-worktree"),
+            base_head="b" * 40,
+            idempotency_key="authority-successor-terminal-bootstrap",
+        )
+        successor_inputs, successor_receipt = self.store_lane(successor_params)
+        successor_id = str(successor_inputs["lane_id"])
+        terminal = closeout.assess(
+            closeout.LaneCloseoutObservation(
+                lane_id=successor_id,
+                repository=str(self.repo),
+                workspace=str(self.root / "successor-terminal-bootstrap-worktree"),
+                branch="feat/authority-successor-terminal-bootstrap",
+                base_revision="b" * 40,
+                writer_state="completed",
+                task_active=False,
+                process_active=False,
+                lease_active=False,
+                git_dirty=False,
+                head_sha="b" * 40,
+                remote_head_sha="b" * 40,
+                ahead_commits=0,
+                behind_commits=0,
+                deployed_sha="b" * 40,
+            ),
+            observed_at_unix=100,
+        )
+        with work_acquire._lane_lock(successor_id) as receipt_path:
+            current = work_acquire._read_state(receipt_path)
+            self.assertIsNotNone(current)
+            assert current is not None
+            work_acquire._write_state(
+                receipt_path,
+                {
+                    **current,
+                    "terminal_closeout": {
+                        "schema_version": 1,
+                        "kind": "grabowski.work_lane_terminal_closeout",
+                        "closeout_state": terminal["closeout_state"],
+                        "assessment_sha256": terminal["assessment_sha256"],
+                        "expected_receipt_sha256": successor_receipt["receipt_sha256"],
+                        "assessment": terminal,
+                    },
+                    "updated_at_unix": 100,
+                },
+            )
+
+        call_kwargs = {
+            "successor_lane_id": successor_id,
+            "expected_predecessor_head": SHA,
+            "expected_successor_head": "b" * 40,
+            "expected_successor_receipt_sha256": str(
+                successor_receipt["receipt_sha256"]
+            ),
+            "expected_pr_number": 1329,
+        }
+        with (
+            patch.object(closeout.time, "time", return_value=200),
+            self.assertRaisesRegex(RuntimeError, "active ready successor lane"),
+        ):
+            work_acquire.persist_successor_handoff_closeout(
+                predecessor_id,
+                expected_receipt_sha256=str(predecessor_receipt["receipt_sha256"]),
+                **call_kwargs,
+            )
+
+        with work_acquire._lane_lock(predecessor_id) as receipt_path:
+            pending_receipt = work_acquire._read_state(receipt_path)
+        self.assertIsNotNone(pending_receipt)
+        assert pending_receipt is not None
+        self.assertIsNotNone(pending_receipt.get("terminal_closeout_pending"))
+
+        with (
+            patch.object(closeout.time, "time", return_value=200),
+            self.assertRaisesRegex(
+                RuntimeError, "does not predate successor terminalization"
+            ),
+        ):
+            work_acquire.persist_successor_handoff_closeout(
+                predecessor_id,
+                expected_receipt_sha256=str(pending_receipt["receipt_sha256"]),
+                **call_kwargs,
+            )
+
     def test_successor_handoff_verifier_requires_ready_newer_successor(self) -> None:
         predecessor_id = "a" * 32
         successor_id = "b" * 32
@@ -4944,6 +5037,15 @@ class WorkAcquireTests(unittest.TestCase):
             work_acquire._verify_successor_handoff_locked(
                 predecessor, successor, assessment
             )
+
+        predecessor["terminal_closeout_pending"] = {
+            "schema_version": 1,
+            "kind": work_acquire.TERMINAL_PENDING_KIND,
+            "closeout_state": "successor_handoff",
+            "assessment_sha256": assessment["assessment_sha256"],
+            "expected_receipt_sha256": "9" * 64,
+            "assessment": assessment,
+        }
 
         old_checkout = {"branch": "topic-old"}
         new_checkout = {"branch": "topic-new"}
