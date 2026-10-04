@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import socket
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -301,6 +302,16 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
             self.assertIsNone(provider)
             for key in flowlines._FLOWLINES_FORBIDDEN_EXPORT_ENV:
                 self.assertNotIn(key, os.environ)
+
+    def test_verified_flowlines_identity_fallback_is_local_only(self) -> None:
+        import grabowski_mcp
+
+        local_context = SimpleNamespace(request=None)
+        transport_context = SimpleNamespace(request=SimpleNamespace(headers={}))
+
+        self.assertIsNone(grabowski_mcp._flowlines_verified_identity(local_context))
+        with self.assertRaisesRegex(RuntimeError, "enrolled connector identity"):
+            grabowski_mcp._flowlines_verified_identity(transport_context)
 
     def test_production_entrypoints_bind_verified_flowlines_identity(self) -> None:
         operator = (SRC / "grabowski_operator.py").read_text(encoding="utf-8")

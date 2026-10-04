@@ -5678,6 +5678,14 @@ def _flowlines_verified_identity(request_context: Any) -> dict[str, str] | None:
 
     connector_id = _transport_connector_identity(_ContextAdapter(request_context))
     if connector_id is None:
+        # Streamable HTTP/SSE attach the transport request to RequestContext.
+        # A transport request without an enrolled connector must never fall back
+        # to client-supplied telemetry identity. Stdio/local contexts keep the
+        # existing metadata fallback because their transport request is absent.
+        if getattr(request_context, "request", None) is not None:
+            raise RuntimeError(
+                "Flowlines transport telemetry requires an enrolled connector identity"
+            )
         return None
     return {"id": connector_id}
 
