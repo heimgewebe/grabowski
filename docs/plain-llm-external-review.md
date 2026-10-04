@@ -53,7 +53,10 @@ This path is deliberately distinct from coding-agent review:
   current user or root and may be group- or world-writable only with sticky-bit
   replacement protection, and the resolved pathname must be valid Unicode;
   Grok additionally requires the canonical native binary under the private
-  `~/.grok/bin` directory rather than an npm or Node trampoline;
+  `~/.grok/bin` directory rather than an npm or Node trampoline. When
+  `--executable` is omitted, the Grok CLI default binds that canonical path
+  directly instead of resolving `grok` through `PATH`; an explicit executable
+  must still resolve to the same native binary;
 - the selected temporary base is validated before workspace creation; the
   private workspace has mode `0700`, a trusted full ancestry, and a stable inode
   identity checked immediately before and after the provider turn; readback
@@ -139,9 +142,11 @@ python3 tools/external_review_plain.py \
   --model grok-4.6
 ```
 
-The default executable name is `grok`, but it must resolve to the canonical
-owner-controlled native binary behind `~/.grok/bin/grok`. Wrappers elsewhere on
-`PATH`, including npm or Node trampolines, fail closed.
+The default executable is the fixed canonical native path
+`~/.grok/bin/grok`; it is not resolved through `PATH`. Wrappers elsewhere on
+`PATH`, including npm or Node trampolines, are therefore never selected when
+`--executable` is omitted. An explicit `--executable` must still resolve to the
+same canonical native binary.
 
 ## Ox Alpha (retired)
 
