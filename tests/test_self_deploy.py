@@ -5082,8 +5082,8 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                 "parse_runtime_lock",
                 return_value={"pydantic": "2.13.4"},
             ), patch.object(
-                RUNNER.deploy_core,
-                "run",
+                RUNNER,
+                "_run_validation_command",
                 side_effect=[completed, completed, completed, inventory],
             ) as run:
                 result = RUNNER._prepare_validation_python(repo, validation_root)
@@ -5135,7 +5135,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                 "--extra-index-url https://untrusted.invalid/simple\n",
                 encoding="utf-8",
             )
-            with patch.object(RUNNER.deploy_core, "run") as run:
+            with patch.object(RUNNER, "_run_validation_command") as run:
                 with self.assertRaisesRegex(
                     RUNNER.deploy_core.DeployError,
                     "Nicht erlaubte Runtime-Lock-Anforderung",
@@ -5185,8 +5185,8 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         )
         for name, stdout, locked, exception, message in cases:
             with self.subTest(name=name), patch.object(
-                RUNNER.deploy_core,
-                "run",
+                RUNNER,
+                "_run_validation_command",
                 return_value=subprocess.CompletedProcess(
                     [], 0, stdout=stdout, stderr=""
                 ),
@@ -5198,6 +5198,31 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                         environment,
                         Path("/validation"),
                     )
+
+    def test_validation_command_sigterm_terminates_bootstrap_process_group(self) -> None:
+        process = Mock()
+        process.wait.side_effect = lambda timeout: signal.raise_signal(signal.SIGTERM)
+        process.poll.return_value = None
+        previous = signal.getsignal(signal.SIGTERM)
+        try:
+            signal.signal(signal.SIGTERM, RUNNER._raise_validation_sigterm)
+            with patch.object(
+                RUNNER.subprocess, "Popen", return_value=process
+            ) as popen, patch.object(
+                RUNNER, "terminate_process_group"
+            ) as terminate_group:
+                with self.assertRaisesRegex(RuntimeError, "SIGTERM"):
+                    RUNNER._run_validation_command(
+                        ["/usr/bin/python3", "-I", "-m", "venv", "/validation"],
+                        timeout=30,
+                        cwd=Path("/validation"),
+                        env={"PATH": "/usr/bin"},
+                    )
+                terminate_group.assert_called_once_with(process)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(popen.call_args.kwargs["cwd"], Path("/validation"))
 
     def test_validate_preparation_failure_never_starts_make_and_cleans_temp(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_parent, patch.object(
@@ -5288,7 +5313,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                     getuid = patch.object(
                         RUNNER.os, "getuid", return_value=os.getuid() + 1
                     )
-                with getuid, patch.object(RUNNER.deploy_core, "run") as run:
+                with getuid, patch.object(RUNNER, "_run_validation_command") as run:
                     with self.assertRaisesRegex(
                         RuntimeError, r"runtime lock.*unsafe"
                     ):

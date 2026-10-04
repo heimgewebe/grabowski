@@ -967,13 +967,76 @@ def _validation_environment(validation_root: Path) -> dict[str, str]:
     return environment
 
 
+def _run_validation_command(
+    argv: list[str],
+    *,
+    timeout: int,
+    cwd: Path,
+    check: bool = True,
+    capture: bool = False,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    """Run one validation-bootstrap command in a killable, reapable process group."""
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        start_new_session=True,
+    )
+    stdout: str | None = None
+    stderr: str | None = None
+    try:
+        try:
+            if capture:
+                stdout, stderr = process.communicate(timeout=timeout)
+            else:
+                process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            terminate_process_group(process)
+            deploy_core.fail(
+                "Externer Befehl hat sein Timeout überschritten.",
+                phase="command-timeout",
+                details={
+                    "argv": deploy_core.redact_argv(argv),
+                    "timeout_seconds": timeout,
+                    "cwd": str(cwd),
+                },
+            )
+            raise AssertionError from exc
+        except BaseException:
+            terminate_process_group(process)
+            raise
+        if check and process.returncode != 0:
+            raise subprocess.CalledProcessError(
+                process.returncode,
+                argv,
+                output=stdout,
+                stderr=stderr,
+            )
+        return subprocess.CompletedProcess(
+            argv,
+            process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    finally:
+        if capture:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+
 def _verify_validation_distributions(
     python: Path,
     locked: dict[str, str],
     environment: dict[str, str],
     validation_root: Path,
 ) -> None:
-    result = deploy_core.run(
+    result = _run_validation_command(
         [
             str(python),
             "-I",
@@ -1119,7 +1182,7 @@ def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
 
     venv = validation_root / "target-runtime"
     environment = _validation_environment(validation_root)
-    deploy_core.run(
+    _run_validation_command(
         [
             str(deploy_core.runtime_venv_builder_python()),
             "-I",
@@ -1132,7 +1195,7 @@ def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
         cwd=validation_root,
     )
     python = venv / "bin" / "python"
-    deploy_core.run(
+    _run_validation_command(
         [
             str(python),
             "-I",
@@ -1154,7 +1217,7 @@ def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
         env=environment,
         cwd=validation_root,
     )
-    deploy_core.run(
+    _run_validation_command(
         [str(python), "-I", "-m", "pip", "check"],
         timeout=deploy_core.TIMEOUTS["python"],
         env=environment,
