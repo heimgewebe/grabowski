@@ -2370,6 +2370,54 @@ class SelfDeployToolTests(unittest.TestCase):
             )
             fake._release_checkout_lifecycle_exact.assert_called_once_with(lifecycle)
 
+    def test_materialize_opens_obligation_before_durable_fence_acquire(self) -> None:
+        expected = "b" * 40
+        canonical = Path("/tmp/pr1366-canonical")
+        target = Path("/tmp/pr1366-auto-source")
+        plan = {
+            "canonical_repository": canonical,
+            "target": target,
+            "owner_id": "runtime-deploy-source:test",
+            "generation": "gen000000001",
+            "obligation_id": "goo-runtime-deploy-source-bbbbbbbbbbbb-gen000000001",
+            "operation_key": "repo:test:operation:auto-source",
+            "path_key": f"path:{target}",
+        }
+        stale = {
+            "canonical_repository": str(canonical),
+            "current_head": "a" * 40,
+            "target_head": expected,
+            "origin_main": expected,
+            "clean": True,
+            "lease_evidence": {"resource_key": f"path:{canonical}", "lease": None},
+        }
+        events = []
+        def open_obligation(_plan, _head):
+            events.append("open")
+            return {"state": "open", "obligation_id": plan["obligation_id"]}
+        def acquire(_plan, _head):
+            events.append("acquire")
+            raise RuntimeError("simulated fence acquire failure")
+        def block(_plan, _exc):
+            events.append("block")
+            return {"state": "blocked"}
+        with patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot", return_value=stale
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=plan
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", return_value=False
+        ), patch.object(
+            SELF_DEPLOY, "_open_auto_deploy_source_obligation", side_effect=open_obligation
+        ), patch.object(
+            SELF_DEPLOY, "_acquire_auto_deploy_source_resources", side_effect=acquire
+        ), patch.object(
+            SELF_DEPLOY, "_block_auto_deploy_source_obligation", side_effect=block
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated fence acquire failure"):
+                SELF_DEPLOY._materialize_auto_deploy_source(expected)
+        self.assertEqual(events, ["open", "acquire", "block"])
+
     def test_auto_deploy_source_materialization_is_operation_and_path_lease_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -2977,11 +3025,7 @@ class SelfDeployToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "open failed"):
                 SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
         block_obligation.assert_not_called()
-        release_resources.assert_called_once_with(
-            f["owner"],
-            [f["operation_key"], f["path_key"]],
-            [f["operation_lease"], f["path_lease"]],
-        )
+        release_resources.assert_not_called()
 
     def test_auto_deploy_source_malformed_acquisition_uses_live_snapshot_cleanup(self) -> None:
         f = self._auto_deploy_uncertain_fixture()
@@ -2996,14 +3040,18 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY, "_live_auto_deploy_source_lease_snapshot",
             side_effect=lambda key, owner: f["path_lease"] if key == f["path_key"] else None,
         ) as live_snapshot, patch.object(
-            SELF_DEPLOY, "_open_auto_deploy_source_obligation"
+            SELF_DEPLOY, "_open_auto_deploy_source_obligation",
+            return_value={"state": "open", "obligation_id": f["plan"]["obligation_id"]},
         ) as open_obligation, patch.object(
+            SELF_DEPLOY, "_block_auto_deploy_source_obligation",
+            return_value={"state": "blocked"},
+        ), patch.object(
             SELF_DEPLOY, "_release_auto_deploy_source_resources",
             return_value={"released": [f["operation_lease"], f["path_lease"]]},
         ) as release_resources:
             with self.assertRaisesRegex(RuntimeError, "lease receipt omitted"):
                 SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
-        open_obligation.assert_not_called()
+        open_obligation.assert_called_once_with(f["plan"], f["expected"])
         live_snapshot.assert_called_once_with(f["path_key"], f["owner"])
         release_resources.assert_called_once_with(
             f["owner"],
@@ -3055,17 +3103,20 @@ class SelfDeployToolTests(unittest.TestCase):
         ), patch.object(
             SELF_DEPLOY, "_auto_deploy_source_plan", return_value=f["plan"]
         ), patch.object(
-            SELF_DEPLOY, "_acquire_auto_deploy_source_resources",
-            return_value={"leases": [f["operation_lease"], f["path_lease"]]},
-        ), patch.object(
             SELF_DEPLOY, "_open_auto_deploy_source_obligation",
-            side_effect=RuntimeError("open failed"),
+            return_value={"state": "open", "obligation_id": f["plan"]["obligation_id"]},
+        ), patch.object(
+            SELF_DEPLOY, "_acquire_auto_deploy_source_resources",
+            return_value={"leases": [f["operation_lease"]]},
+        ), patch.object(
+            SELF_DEPLOY, "_block_auto_deploy_source_obligation",
+            return_value={"state": "blocked"},
         ), patch.object(
             SELF_DEPLOY, "_release_auto_deploy_source_resources",
             side_effect=RuntimeError("lease store unavailable"),
         ):
             with self.assertRaisesRegex(
-                RuntimeError, "open failed; cleanup failures: resource-release"
+                RuntimeError, "lease receipt omitted.*cleanup failures: resource-release"
             ):
                 SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
 

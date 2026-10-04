@@ -3222,7 +3222,7 @@ def _resolve_materialize_recovery_obligation(
         "obligation_id": obligation_id,
         "checkout_key": evidence["checkout_key"],
         "expected_head": evidence["expected_head"],
-        "recovery_state": recovery_state,
+        "recovery_class": "materialization_not_usable",
     }
     recovery_sha256 = _sha256_json(recovery_material)
     status = obligations.status_obligation(obligation_id)

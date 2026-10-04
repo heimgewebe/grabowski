@@ -3689,6 +3689,13 @@ def _materialize_auto_deploy_source(
     operation_lease_released = False
     common_dir_lease_released = False
     try:
+        obligation = _open_auto_deploy_source_obligation(plan, expected_head)
+        obligation_state = obligation.get("state")
+        if obligation_state != "open":
+            raise RuntimeError(
+                "fresh automatic deployment source obligation is not open"
+            )
+        obligation_opened = True
         acquisition = _acquire_auto_deploy_source_resources(plan, expected_head)
         operation_lease = _lease_for_key(acquisition, plan["operation_key"])
         path_lease = _lease_for_key(acquisition, plan["path_key"])
@@ -3709,13 +3716,6 @@ def _materialize_auto_deploy_source(
                     "automatic deployment source checkout uncertainty fence is missing"
                 )
             uncertainty_fence = dict(raw_uncertainty_fence)
-        obligation = _open_auto_deploy_source_obligation(plan, expected_head)
-        obligation_state = obligation.get("state")
-        if obligation_state != "open":
-            raise RuntimeError(
-                "fresh automatic deployment source obligation is not open"
-            )
-        obligation_opened = True
         lifecycle = _reserve_auto_deploy_source_lifecycle(plan, expected_head)
         locked_snapshot = _canonical_stale_main_snapshot(expected_head)
         if (

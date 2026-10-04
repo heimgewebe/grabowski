@@ -2623,6 +2623,23 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertFalse(status["continuation_required"])
         self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
 
+    def test_materialize_recovery_evidence_is_stable_across_retry_states(self) -> None:
+        _target, fence, _lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        first = checkouts._resolve_materialize_recovery_obligation(
+            fence, recovery_state="reconciled_success"
+        )
+        second = checkouts._resolve_materialize_recovery_obligation(
+            fence, recovery_state="confirmed_no_effect"
+        )
+        self.assertEqual(first["recovery_sha256"], second["recovery_sha256"])
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+
     def test_materialize_uncertainty_reconcile_keeps_fence_when_obligation_recovery_fails(self) -> None:
         _target, fence, lifecycle, _common_dir_key = (
             self._materialize_uncertainty_fixture(create_worktree=False)
