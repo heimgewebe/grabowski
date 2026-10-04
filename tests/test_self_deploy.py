@@ -2400,7 +2400,14 @@ class SelfDeployToolTests(unittest.TestCase):
             raise RuntimeError("simulated fence acquire failure")
         def block(_plan, _exc):
             events.append("block")
-            return {"state": "blocked"}
+            return {"state": "blocked", "close_file_sha256": "a" * 64}
+        def resolve_no_effect(_plan, blocked):
+            events.append("resolve")
+            self.assertEqual(blocked["state"], "blocked")
+            return {
+                "resolution_disposition": "resolved",
+                "continuation_required": False,
+            }
         with patch.object(
             SELF_DEPLOY, "_canonical_stale_main_snapshot", return_value=stale
         ), patch.object(
@@ -2412,11 +2419,56 @@ class SelfDeployToolTests(unittest.TestCase):
         ), patch.object(
             SELF_DEPLOY, "_acquire_auto_deploy_source_resources", side_effect=acquire
         ), patch.object(
+            SELF_DEPLOY, "_live_auto_deploy_source_lease_snapshot", return_value=None
+        ), patch.object(
             SELF_DEPLOY, "_block_auto_deploy_source_obligation", side_effect=block
+        ), patch.object(
+            SELF_DEPLOY,
+            "_resolve_auto_deploy_source_obligation_no_effect",
+            side_effect=resolve_no_effect,
+            create=True,
         ):
             with self.assertRaisesRegex(RuntimeError, "simulated fence acquire failure"):
                 SELF_DEPLOY._materialize_auto_deploy_source(expected)
-        self.assertEqual(events, ["open", "acquire", "block"])
+        self.assertEqual(events, ["open", "acquire", "block", "resolve"])
+
+    def test_auto_deploy_source_no_effect_obligation_resolution_is_terminal(self) -> None:
+        plan = {
+            "obligation_id": "goo-runtime-deploy-source-bbbbbbbbbbbb-gen000000001",
+            "generation": "gen000000001",
+        }
+        blocked = {
+            "state": "blocked",
+            "close_file_sha256": "a" * 64,
+        }
+        fake = Mock()
+        fake.resolve_obligation.return_value = {
+            "resolution_disposition": "resolved",
+            "continuation_required": False,
+            "resolution_file_sha256": "b" * 64,
+        }
+        with patch.dict(sys.modules, {"grabowski_operator_obligation": fake}):
+            result = SELF_DEPLOY._resolve_auto_deploy_source_obligation_no_effect(
+                plan, blocked
+            )
+        self.assertEqual(result["resolution_disposition"], "resolved")
+        self.assertFalse(result["continuation_required"])
+        fake.resolve_obligation.assert_called_once_with(
+            {
+                "obligation_id": plan["obligation_id"],
+                "disposition": "resolved",
+                "evidence": [
+                    {
+                        "source": "receipt",
+                        "reference": (
+                            "auto-deploy-source-pre-effect:"
+                            + plan["generation"]
+                        ),
+                        "sha256": blocked["close_file_sha256"],
+                    }
+                ],
+            }
+        )
 
     def test_auto_deploy_source_materialization_is_operation_and_path_lease_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2550,11 +2602,17 @@ class SelfDeployToolTests(unittest.TestCase):
             ) as release, patch.object(
                 SELF_DEPLOY,
                 "_append_deploy_audit",
-            ), patch.object(
+            ) as append_audit, patch.object(
                 SELF_DEPLOY,
                 "_clear_auto_deploy_source_uncertainty",
                 return_value={"cleared_at_unix": 11},
             ) as clear_uncertainty:
+                ordering = Mock()
+                ordering.attach_mock(bind_retention, "bind_retention")
+                ordering.attach_mock(release, "release")
+                ordering.attach_mock(close_obligation, "close_obligation")
+                ordering.attach_mock(append_audit, "append_audit")
+                ordering.attach_mock(clear_uncertainty, "clear_uncertainty")
                 repository, runner, observed_identity, receipt = (
                     SELF_DEPLOY._materialize_auto_deploy_source(expected)
                 )
@@ -2579,7 +2637,28 @@ class SelfDeployToolTests(unittest.TestCase):
             clear_uncertainty.assert_called_once_with(
                 {"fence_id": "f" * 32},
                 outcome="confirmed_success",
-                reason="exact detached deployment source post-state observed",
+                reason="exact detached deployment source finalization completed",
+            )
+            self.assertEqual(
+                [
+                    item[0]
+                    for item in ordering.mock_calls
+                    if item[0]
+                    in {
+                        "bind_retention",
+                        "release",
+                        "close_obligation",
+                        "append_audit",
+                        "clear_uncertainty",
+                    }
+                ],
+                [
+                    "bind_retention",
+                    "release",
+                    "close_obligation",
+                    "append_audit",
+                    "clear_uncertainty",
+                ],
             )
             bind_retention.assert_called_once_with(plan, lifecycle, expected)
             self.assertEqual(close_obligation.call_count, 1)

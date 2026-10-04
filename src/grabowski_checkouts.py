@@ -3315,6 +3315,28 @@ def _reconcile_materialize_uncertainty(
         if state != "recoverable_created":
             return readback
         evidence = fence["evidence"]
+        import grabowski_operator_obligation as obligations
+
+        obligation_status = obligations.status_obligation(
+            str(evidence["obligation_id"])
+        )
+        if obligation_status.get("state") == "completed":
+            if obligation_status.get("continuation_required") is not False:
+                return {
+                    "state": "still_fenced",
+                    "reason": "materialize-completed-obligation-still-requires-continuation",
+                    "readback": readback,
+                }
+            return {
+                "state": "confirmed_success",
+                "checkout_key": evidence["checkout_key"],
+                "expected_head": evidence["expected_head"],
+                "completed_obligation": {
+                    "obligation_id": obligation_status.get("obligation_id"),
+                    "state": obligation_status.get("state"),
+                    "close_file_sha256": obligation_status.get("close_file_sha256"),
+                },
+            }
         repo = _resolve_repo(str(evidence["repo"]))
         checkout = Path(str(evidence["checkout_path"]))
         physical_identity = physical_checkout.capture_physical_checkout_identity(

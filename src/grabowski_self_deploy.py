@@ -3558,6 +3558,47 @@ def _block_auto_deploy_source_obligation(
     )
 
 
+def _resolve_auto_deploy_source_obligation_no_effect(
+    plan: dict[str, Any],
+    blocked: dict[str, Any],
+) -> dict[str, Any]:
+    import grabowski_operator_obligation as obligations
+
+    close_file_sha256 = blocked.get("close_file_sha256")
+    if (
+        blocked.get("state") != "blocked"
+        or not isinstance(close_file_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", close_file_sha256) is None
+    ):
+        raise RuntimeError(
+            "automatic deployment source blocked obligation lacks terminal close evidence"
+        )
+    resolved = obligations.resolve_obligation(
+        {
+            "obligation_id": plan["obligation_id"],
+            "disposition": "resolved",
+            "evidence": [
+                {
+                    "source": "receipt",
+                    "reference": (
+                        "auto-deploy-source-pre-effect:"
+                        + str(plan["generation"])
+                    ),
+                    "sha256": close_file_sha256,
+                }
+            ],
+        }
+    )
+    if (
+        resolved.get("resolution_disposition") != "resolved"
+        or resolved.get("continuation_required") is not False
+    ):
+        raise RuntimeError(
+            "automatic deployment source no-effect obligation did not settle terminally"
+        )
+    return resolved
+
+
 def _reserve_auto_deploy_source_lifecycle(
     plan: dict[str, Any],
     expected_head: str,
@@ -3686,6 +3727,7 @@ def _materialize_auto_deploy_source(
     lifecycle: dict[str, Any] | None = None
     obligation_opened = False
     obligation_completed = False
+    obligation_blocked: dict[str, Any] | None = None
     operation_lease_released = False
     common_dir_lease_released = False
     try:
@@ -3816,13 +3858,6 @@ def _materialize_auto_deploy_source(
                 "automatic deployment source mutation failed with no observed effect: "
                 + (message or "git worktree add reported failure")
             )
-        if uncertainty_fence is not None and not uncertainty_fence_cleared:
-            _clear_auto_deploy_source_uncertainty(
-                uncertainty_fence,
-                outcome="confirmed_success",
-                reason="exact detached deployment source post-state observed",
-            )
-            uncertainty_fence_cleared = True
         assert repository is not None and runner is not None and source_identity is not None
         command_reported_success = bool(
             mutation_error is None
@@ -3940,12 +3975,19 @@ def _materialize_auto_deploy_source(
                 "materialization_receipt_sha256": materialization["receipt_sha256"],
             }
         )
+        if uncertainty_fence is not None and not uncertainty_fence_cleared:
+            _clear_auto_deploy_source_uncertainty(
+                uncertainty_fence,
+                outcome="confirmed_success",
+                reason="exact detached deployment source finalization completed",
+            )
+            uncertainty_fence_cleared = True
         return repository, runner, source_identity, materialization
     except Exception as exc:
         cleanup_failures: list[tuple[str, Exception]] = []
         if obligation_opened and not obligation_completed:
             try:
-                _block_auto_deploy_source_obligation(plan, exc)
+                obligation_blocked = _block_auto_deploy_source_obligation(plan, exc)
             except Exception as cleanup_error:
                 cleanup_failures.append(("obligation-block", cleanup_error))
         preserve_recovery_asset = bool(mutation_attempted and recovery_asset_present)
@@ -4030,6 +4072,18 @@ def _materialize_auto_deploy_source(
                 )
             except Exception as cleanup_error:
                 cleanup_failures.append(("resource-release", cleanup_error))
+        if (
+            obligation_blocked is not None
+            and acquisition is None
+            and not mutation_attempted
+            and not cleanup_failures
+        ):
+            try:
+                _resolve_auto_deploy_source_obligation_no_effect(
+                    plan, obligation_blocked
+                )
+            except Exception as cleanup_error:
+                cleanup_failures.append(("obligation-resolve", cleanup_error))
         if cleanup_failures:
             raise RuntimeError(
                 f"{type(exc).__name__}: {exc}; cleanup failures: "

@@ -2564,6 +2564,46 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertFalse(obligation_status["continuation_required"])
         self.assertEqual(obligation_status["resolution_disposition"], "resolved")
 
+    def test_materialize_uncertainty_reconcile_preserves_completed_source(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "source-materialized",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": "runtime-deploy-source-materialized:test",
+                        "sha256": "8" * 64,
+                    }
+                ],
+                "closure_classification": {
+                    "convergence_required": False,
+                    "reason": "process_only",
+                },
+            }
+        )
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_success")
+        self.assertTrue(target.exists())
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+        obligation_status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(obligation_status["state"], "completed")
+        self.assertFalse(obligation_status["continuation_required"])
+
     def test_materialize_uncertainty_reconcile_clears_proven_no_effect(self) -> None:
         target, fence, lifecycle, _common_dir_key = (
             self._materialize_uncertainty_fixture(create_worktree=False)
