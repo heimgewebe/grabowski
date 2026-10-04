@@ -934,6 +934,58 @@ def wait_for_deployment_window(
     raise AssertionError("unreachable deployment contention retry state")
 
 
+def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
+    """Build an isolated validation interpreter from the exact target runtime lock."""
+    lock_path = repo / deploy_core.RUNTIME_LOCK_RELATIVE
+    metadata = lock_path.lstat()
+    if (
+        lock_path.is_symlink()
+        or not lock_path.is_file()
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+    ):
+        raise RuntimeError("target runtime lock is unsafe")
+
+    venv = validation_root / "target-runtime"
+    environment = deploy_core.pip_env()
+    environment.update(
+        {name: str(validation_root) for name in ("TMPDIR", "TMP", "TEMP")}
+    )
+    deploy_core.run(
+        [str(deploy_core.runtime_venv_builder_python()), "-m", "venv", str(venv)],
+        timeout=deploy_core.TIMEOUTS["python"],
+        env=environment,
+    )
+    python = venv / "bin" / "python"
+    deploy_core.run(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--isolated",
+            "--disable-pip-version-check",
+            "--no-input",
+            "--require-hashes",
+            "--no-deps",
+            "--only-binary=:all:",
+            "--index-url",
+            "https://pypi.org/simple",
+            "-r",
+            str(lock_path),
+        ],
+        timeout=deploy_core.TIMEOUTS["package_install"],
+        env=environment,
+    )
+    deploy_core.run(
+        [str(python), "-m", "pip", "check"],
+        timeout=deploy_core.TIMEOUTS["python"],
+        env=environment,
+    )
+    deploy_core.verify_installed_distributions(python, lock_path)
+    return python
+
+
 def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str) -> None:
     emit(f"{phase}-start", argv=argv)
     environment = child_environment()
@@ -946,6 +998,9 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
             )
             environment.update(
                 {name: validation_tmp.name for name in ("TMPDIR", "TMP", "TEMP")}
+            )
+            environment["PYTHON"] = str(
+                _prepare_validation_python(cwd, Path(validation_tmp.name))
             )
         process = subprocess.Popen(
             argv,

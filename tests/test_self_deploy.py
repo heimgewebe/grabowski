@@ -4979,6 +4979,10 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         ), patch.object(
             RUNNER, "_validation_temp_parent", return_value=Path(temporary_parent)
         ), patch.object(
+            RUNNER,
+            "_prepare_validation_python",
+            return_value=Path("/validation/bin/python"),
+        ) as prepare, patch.object(
             RUNNER.subprocess, "Popen", return_value=process
         ) as popen:
             RUNNER.run_streamed(
@@ -4988,12 +4992,56 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                 phase="validate",
             )
         environment = popen.call_args.kwargs["env"]
+        prepare.assert_called_once()
+        self.assertEqual(environment["PYTHON"], "/validation/bin/python")
         for name in bindings:
             self.assertNotIn(name, environment)
         self.assertEqual(environment["TMPDIR"], environment["TMP"])
         self.assertEqual(environment["TMPDIR"], environment["TEMP"])
         self.assertEqual(Path(environment["TMPDIR"]).parent, Path(temporary_parent))
         self.assertFalse(Path(environment["TMPDIR"]).exists())
+
+    def test_prepare_validation_python_uses_target_runtime_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            repo = root / "repo"
+            validation_root = root / "validation"
+            lock = repo / "requirements/runtime.lock.txt"
+            lock.parent.mkdir(parents=True)
+            validation_root.mkdir()
+            lock.write_text("pydantic==2.13.4 --hash=sha256:" + "a" * 64 + "\n", encoding="utf-8")
+            base_python = Path("/usr/bin/python3")
+            environment = {"PIP_CONFIG_FILE": "/dev/null"}
+            with patch.object(
+                RUNNER.deploy_core,
+                "runtime_venv_builder_python",
+                return_value=base_python,
+            ), patch.object(
+                RUNNER.deploy_core, "pip_env", return_value=dict(environment)
+            ), patch.object(
+                RUNNER.deploy_core, "run"
+            ) as run, patch.object(
+                RUNNER.deploy_core, "verify_installed_distributions"
+            ) as verify:
+                python = RUNNER._prepare_validation_python(repo, validation_root)
+
+        self.assertEqual(python, validation_root / "target-runtime/bin/python")
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [str(base_python), "-m", "venv", str(validation_root / "target-runtime")],
+        )
+        install = run.call_args_list[1].args[0]
+        self.assertEqual(install[:4], [str(python), "-m", "pip", "install"])
+        self.assertIn("--require-hashes", install)
+        self.assertIn("--no-deps", install)
+        self.assertIn("--only-binary=:all:", install)
+        self.assertEqual(install[-2:], ["-r", str(lock)])
+        for call_ in run.call_args_list:
+            self.assertEqual(call_.kwargs["env"]["TMPDIR"], str(validation_root))
+            self.assertEqual(call_.kwargs["env"]["TMP"], str(validation_root))
+            self.assertEqual(call_.kwargs["env"]["TEMP"], str(validation_root))
+        verify.assert_called_once_with(python, lock)
 
     def test_validation_temp_parent_rejects_git_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
