@@ -2548,6 +2548,49 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
 
+    def test_uncertainty_persist_has_no_post_commit_secondary_readback(self) -> None:
+        target = self.root / "worktrees" / "materialize-readback"
+        common_dir = checkouts._git_common_dir(self.repo)
+        owner = "runtime-deploy-source:materialize-readback"
+        checkout_key = checkouts._checkout_key(common_dir, target)
+        resource_keys = [f"path:{target}", f"path:{common_dir}"]
+        acquisition = checkouts.resources.acquire_resources(
+            owner,
+            resource_keys,
+            purpose="materialize uncertainty committed receipt",
+            ttl_seconds=120,
+        )
+        with patch.object(
+            checkouts,
+            "_load_checkout_operation_uncertainty",
+            side_effect=AssertionError("post-commit secondary readback must not run"),
+        ):
+            fence = checkouts._persist_checkout_operation_uncertainty(
+                lease={
+                    "owner_id": owner,
+                    "leases": acquisition["leases"],
+                },
+                checkout_key=checkout_key,
+                owner_id=owner,
+                operation="materialize",
+                operation_id="materialize-readback",
+                evidence={
+                    "repo": str(self.repo.resolve()),
+                    "git_common_dir": str(common_dir),
+                    "checkout_path": str(target),
+                    "checkout_key": checkout_key,
+                    "owner_id": owner,
+                    "expected_head": self.head,
+                    "expected_branch": None,
+                    "obligation_id": "goo-runtime-deploy-source-materialize-readback",
+                },
+            )
+        self.assertRegex(fence["fence_id"], r"^[0-9a-f]{32}$")
+        stored = checkouts._load_checkout_operation_uncertainty(fence["fence_id"])
+        self.assertEqual(stored, fence)
+        self.assertEqual(set(fence["resource_keys"]), set(resource_keys))
+        self.assertIsNone(fence["cleared_at_unix"])
+
     def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:
         self._publish_remote()
         archive = self._archive()["archive"]

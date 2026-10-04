@@ -15513,7 +15513,7 @@ def _captain_runtime_deploy_target_errors(
     return errors
 
 
-def _runtime_deploy_local_mutation_evidence_valid(
+def _runtime_deploy_stale_pending_reconciliation_valid(
     evidence: Any,
     *,
     expected_job_prefix: str,
@@ -15553,6 +15553,150 @@ def _runtime_deploy_local_mutation_evidence_valid(
         is not None
         and evidence.get("evidence_sha256") == sha256_json(material)
     )
+
+
+def _runtime_deploy_origin_main_refresh_evidence_valid(
+    evidence: Any,
+    *,
+    expected_head: str,
+) -> bool:
+    fields = {
+        "schema_version",
+        "kind",
+        "canonical_repository",
+        "expected_head",
+        "previous_head",
+        "previous_branch",
+        "previous_origin_main",
+        "observed_origin_main",
+        "owner_id",
+        "operation_resource_key",
+        "canonical_resource_key",
+        "common_dir_resource_key",
+        "objects_resource_key",
+        "origin_main_ref_resource_key",
+        "fetch",
+        "update_ref",
+        "public_github_main",
+        "receipt_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    material = {
+        key: value
+        for key, value in evidence.items()
+        if key != "receipt_sha256"
+    }
+    fetch = evidence.get("fetch")
+    update_ref = evidence.get("update_ref")
+    public = evidence.get("public_github_main")
+    resource_fields = (
+        "operation_resource_key",
+        "canonical_resource_key",
+        "common_dir_resource_key",
+        "objects_resource_key",
+        "origin_main_ref_resource_key",
+    )
+    return bool(
+        evidence.get("schema_version") == 1
+        and evidence.get("kind")
+        == "grabowski_runtime_deploy_origin_main_refresh"
+        and evidence.get("expected_head") == expected_head
+        and evidence.get("observed_origin_main") == expected_head
+        and isinstance(evidence.get("canonical_repository"), str)
+        and str(evidence.get("canonical_repository")).startswith("/")
+        and isinstance(evidence.get("previous_head"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", evidence.get("previous_head", "")) is not None
+        and isinstance(evidence.get("previous_origin_main"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", evidence.get("previous_origin_main", ""))
+        is not None
+        and (
+            evidence.get("previous_branch") is None
+            or isinstance(evidence.get("previous_branch"), str)
+        )
+        and isinstance(evidence.get("owner_id"), str)
+        and bool(evidence.get("owner_id"))
+        and all(
+            isinstance(evidence.get(key), str) and bool(evidence.get(key))
+            for key in resource_fields
+        )
+        and isinstance(fetch, dict)
+        and set(fetch) == {"returncode", "timed_out"}
+        and fetch.get("returncode") == 0
+        and fetch.get("timed_out") is False
+        and isinstance(update_ref, dict)
+        and set(update_ref) == {"returncode", "timed_out", "reported_success"}
+        and (
+            update_ref.get("returncode") is None
+            or (
+                isinstance(update_ref.get("returncode"), int)
+                and not isinstance(update_ref.get("returncode"), bool)
+            )
+        )
+        and isinstance(update_ref.get("timed_out"), bool)
+        and isinstance(update_ref.get("reported_success"), bool)
+        and update_ref.get("reported_success")
+        == (
+            update_ref.get("timed_out") is False
+            and update_ref.get("returncode") == 0
+        )
+        and isinstance(public, dict)
+        and set(public) == {"before_fetch", "after_fetch", "after_cas"}
+        and public.get("before_fetch") == expected_head
+        and public.get("after_fetch") == expected_head
+        and public.get("after_cas") == expected_head
+        and evidence.get("receipt_sha256") == sha256_json(material)
+    )
+
+
+def _runtime_deploy_local_mutation_evidence_valid(
+    evidence: Any,
+    *,
+    expected_job_prefix: str,
+    expected_head: str,
+) -> bool:
+    if _runtime_deploy_stale_pending_reconciliation_valid(
+        evidence,
+        expected_job_prefix=expected_job_prefix,
+    ):
+        return True
+    if _runtime_deploy_origin_main_refresh_evidence_valid(
+        evidence,
+        expected_head=expected_head,
+    ):
+        return True
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "schema_version",
+        "kind",
+        "effects",
+        "evidence_sha256",
+    }:
+        return False
+    if (
+        evidence.get("schema_version") != 1
+        or evidence.get("kind")
+        != "grabowski_runtime_deploy_local_mutation_bundle"
+    ):
+        return False
+    effects = evidence.get("effects")
+    if not isinstance(effects, list) or len(effects) != 2:
+        return False
+    if not _runtime_deploy_stale_pending_reconciliation_valid(
+        effects[0],
+        expected_job_prefix=expected_job_prefix,
+    ):
+        return False
+    if not _runtime_deploy_origin_main_refresh_evidence_valid(
+        effects[1],
+        expected_head=expected_head,
+    ):
+        return False
+    material = {
+        key: value
+        for key, value in evidence.items()
+        if key != "evidence_sha256"
+    }
+    return evidence.get("evidence_sha256") == sha256_json(material)
 
 
 def _runtime_deploy_schedule_errors(
@@ -15618,6 +15762,7 @@ def _runtime_deploy_schedule_errors(
         and not _runtime_deploy_local_mutation_evidence_valid(
             local_mutation_evidence,
             expected_job_prefix=expected_job_prefix,
+            expected_head=expected_head,
         )
     ):
         errors.append("runtime_deploy_schedule_local_mutation_evidence_invalid")
@@ -15731,6 +15876,7 @@ def _run_captain_runtime_deploy(
         if _runtime_deploy_local_mutation_evidence_valid(
             local_mutation_evidence,
             expected_job_prefix=expected_job_prefix,
+            expected_head=expected_head,
         ):
             execution_result["local_mutation_observed"] = True
             execution_result["local_mutation_evidence"] = dict(

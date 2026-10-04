@@ -1683,6 +1683,32 @@ class DeployScheduleFailureAfterLocalMutation(RuntimeError):
         self.local_mutation_evidence = dict(local_mutation_evidence)
 
 
+def _tracked_runtime_deploy_local_mutation_evidence(
+    tracker: dict[str, Any],
+) -> dict[str, Any] | None:
+    effects: list[dict[str, Any]] = []
+    for key in ("stale_pending_reconciliation", "origin_main_refresh"):
+        value = tracker.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise RuntimeError(f"tracked local mutation evidence {key} is malformed")
+        effects.append(dict(value))
+    if not effects:
+        return None
+    if len(effects) == 1:
+        return effects[0]
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_local_mutation_bundle",
+        "effects": effects,
+    }
+    return {
+        **material,
+        "evidence_sha256": _source_identity_sha256(material),
+    }
+
+
 class IndexedRuntimeJobConflict(RuntimeError):
     """An indexed runtime job forbids starting another one right now."""
 
@@ -4729,7 +4755,9 @@ def _grabowski_runtime_deploy_schedule_impl(
                 "deployment source preflight returned malformed local mutation evidence"
             )
         if local_mutation_evidence is not None:
-            local_mutation_tracker["evidence"] = dict(local_mutation_evidence)
+            local_mutation_tracker["stale_pending_reconciliation"] = dict(
+                local_mutation_evidence
+            )
         inflight_error = inflight_before_resolution.get("error")
         if inflight_error:
             raise RuntimeError(
@@ -4776,6 +4804,9 @@ def _grabowski_runtime_deploy_schedule_impl(
             try:
                 origin_main_refresh = _refresh_canonical_origin_main(
                     expected_head, canonical_refresh_snapshot
+                )
+                local_mutation_tracker["origin_main_refresh"] = dict(
+                    origin_main_refresh
                 )
             except DeploySchedulePreEffectRefusal as exc:
                 reconciliation = inflight_before_resolution.get(
@@ -5131,7 +5162,9 @@ def grabowski_runtime_deploy_schedule(
             local_mutation_tracker=local_mutation_tracker,
         )
     except DeploySchedulePreEffectRefusal as exc:
-        evidence = local_mutation_tracker.get("evidence")
+        evidence = _tracked_runtime_deploy_local_mutation_evidence(
+            local_mutation_tracker
+        )
         if evidence is None or getattr(exc, "local_mutation_evidence", None) is not None:
             raise
         raise DeploySchedulePreEffectRefusal(
@@ -5141,7 +5174,9 @@ def grabowski_runtime_deploy_schedule(
     except DeployScheduleFailureAfterLocalMutation:
         raise
     except Exception as exc:
-        evidence = local_mutation_tracker.get("evidence")
+        evidence = _tracked_runtime_deploy_local_mutation_evidence(
+            local_mutation_tracker
+        )
         if not isinstance(evidence, dict):
             raise
         raise DeployScheduleFailureAfterLocalMutation(

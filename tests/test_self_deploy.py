@@ -4947,6 +4947,164 @@ class SelfDeployToolTests(unittest.TestCase):
         )
         SELF_DEPLOY.operator._start_job.assert_not_called()
 
+    def test_schedule_failure_after_origin_main_refresh_preserves_local_mutation_evidence(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        expected = "d" * 40
+        identity = _source_identity(repo, expected)
+        refresh = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_origin_main_refresh",
+            "expected_head": expected,
+            "observed_origin_main": expected,
+            "receipt_sha256": "b" * 64,
+        }
+        refresh_candidate = {
+            "canonical_repository": str(repo),
+            "current_head": expected,
+            "current_branch": "main",
+            "target_head": expected,
+            "origin_main": "c" * 40,
+            "clean": True,
+        }
+        with patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=[
+                RuntimeError("canonical source needs refresh"),
+                (repo, runner, identity),
+            ],
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            side_effect=RuntimeError("not a stale-main materialization case"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value=refresh_candidate,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_refresh_canonical_origin_main",
+            return_value=refresh,
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": []},
+        ), patch.object(
+            SELF_DEPLOY.privileged,
+            "ensure_rootbroker_authority",
+            return_value={
+                "success": False,
+                "outcome": "failed",
+                "failure_reason": "authority mismatch",
+            },
+        ):
+            with self.assertRaises(
+                SELF_DEPLOY.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        self.assertIn("authority refresh failed", str(raised.exception))
+        self.assertEqual(raised.exception.local_mutation_evidence, refresh)
+
+    def test_schedule_failure_preserves_reconciliation_and_origin_main_refresh_evidence(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        runner = repo / "tools/run_scheduled_deploy.py"
+        expected = "d" * 40
+        identity = _source_identity(repo, expected)
+        reconciliation_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-123456abcdef",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+        }
+        reconciliation = {
+            **reconciliation_material,
+            "evidence_sha256": SELF_DEPLOY._source_identity_sha256(
+                reconciliation_material
+            ),
+        }
+        refresh = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_origin_main_refresh",
+            "expected_head": expected,
+            "observed_origin_main": expected,
+            "receipt_sha256": "b" * 64,
+        }
+        refresh_candidate = {
+            "canonical_repository": str(repo),
+            "current_head": expected,
+            "current_branch": "main",
+            "target_head": expected,
+            "origin_main": "c" * 40,
+            "clean": True,
+        }
+        with patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=[
+                RuntimeError("canonical source needs refresh"),
+                (repo, runner, identity),
+            ],
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            side_effect=RuntimeError("not a stale-main materialization case"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value=refresh_candidate,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_refresh_canonical_origin_main",
+            return_value=refresh,
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={
+                "error": None,
+                "inflight_units": [],
+                "stale_pending_reconciliation": reconciliation,
+            },
+        ), patch.object(
+            SELF_DEPLOY.privileged,
+            "ensure_rootbroker_authority",
+            return_value={
+                "success": False,
+                "outcome": "failed",
+                "failure_reason": "authority mismatch",
+            },
+        ):
+            with self.assertRaises(
+                SELF_DEPLOY.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        evidence = raised.exception.local_mutation_evidence
+        self.assertEqual(
+            evidence["kind"],
+            "grabowski_runtime_deploy_local_mutation_bundle",
+        )
+        self.assertEqual(evidence["effects"], [reconciliation, refresh])
+        material = {
+            key: value
+            for key, value in evidence.items()
+            if key != "evidence_sha256"
+        }
+        self.assertEqual(
+            evidence["evidence_sha256"],
+            SELF_DEPLOY._source_identity_sha256(material),
+        )
+
     def test_schedule_rejects_source_identity_drift_during_authority_refresh(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         runner = repo / "tools/run_scheduled_deploy.py"

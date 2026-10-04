@@ -15104,6 +15104,103 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertFalse(execution["local_mutation_observed"])
         self.assertNotIn("local_mutation_evidence", execution)
 
+    def test_runtime_deploy_local_mutation_evidence_accepts_refresh_and_bundle(self) -> None:
+        reconciliation_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-123456abcdef",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+        }
+        reconciliation = {
+            **reconciliation_material,
+            "evidence_sha256": grips.sha256_json(reconciliation_material),
+        }
+        refresh_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_origin_main_refresh",
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "expected_head": CAPTAIN_HEAD,
+            "previous_head": "a" * 40,
+            "previous_branch": "main",
+            "previous_origin_main": "b" * 40,
+            "observed_origin_main": CAPTAIN_HEAD,
+            "owner_id": "runtime-deploy-ref:captain-test",
+            "operation_resource_key": "repo:/home/alex/repos/grabowski:operation:runtime-deploy-origin-main-refresh",
+            "canonical_resource_key": "path:/home/alex/repos/grabowski",
+            "common_dir_resource_key": "path:/home/alex/repos/grabowski/.git",
+            "objects_resource_key": "path:/home/alex/repos/grabowski/.git/objects",
+            "origin_main_ref_resource_key": "path:/home/alex/repos/grabowski/.git/refs/remotes/origin/main",
+            "fetch": {"returncode": 0, "timed_out": False},
+            "update_ref": {
+                "returncode": 0,
+                "timed_out": False,
+                "reported_success": True,
+            },
+            "public_github_main": {
+                "before_fetch": CAPTAIN_HEAD,
+                "after_fetch": CAPTAIN_HEAD,
+                "after_cas": CAPTAIN_HEAD,
+            },
+        }
+        refresh = {
+            **refresh_material,
+            "receipt_sha256": grips.sha256_json(refresh_material),
+        }
+        bundle_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_local_mutation_bundle",
+            "effects": [reconciliation, refresh],
+        }
+        bundle = {
+            **bundle_material,
+            "evidence_sha256": grips.sha256_json(bundle_material),
+        }
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                refresh,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+        for update_ref in (
+            {"returncode": 1, "timed_out": False, "reported_success": False},
+            {"returncode": None, "timed_out": True, "reported_success": False},
+        ):
+            with self.subTest(update_ref=update_ref):
+                observed_effect_material = {
+                    **refresh_material,
+                    "update_ref": update_ref,
+                }
+                observed_effect = {
+                    **observed_effect_material,
+                    "receipt_sha256": grips.sha256_json(observed_effect_material),
+                }
+                self.assertTrue(
+                    grips._runtime_deploy_local_mutation_evidence_valid(
+                        observed_effect,
+                        expected_job_prefix="grabowski-job-",
+                        expected_head=CAPTAIN_HEAD,
+                    )
+                )
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                bundle,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+        forged = dict(refresh, receipt_sha256="0" * 64)
+        self.assertFalse(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                forged,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+
     def test_captain_reused_schedule_preserves_known_local_reconciliation(self) -> None:
         action = captain_action(
             action="runtime-deploy",

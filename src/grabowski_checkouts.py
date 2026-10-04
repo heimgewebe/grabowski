@@ -1670,8 +1670,17 @@ def _persist_checkout_operation_uncertainty(
                 created,
             ),
         )
+        row = connection.execute(
+            "SELECT * FROM operation_uncertainty WHERE fence_id=?",
+            (fence_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                "Checkout operation uncertainty insert readback is missing"
+            )
+        fence = _operation_uncertainty_public(row)
         connection.commit()
-    return _load_checkout_operation_uncertainty(fence_id)
+    return fence
 
 
 def _clear_checkout_operation_uncertainty(
