@@ -91,7 +91,7 @@ def bind_manifest(value: dict, root: Path, *, commit: str = COMMIT) -> Path:
     manifest = {
         "kind": "repoground.bundle.manifest",
         "version": "2.0",
-        "snapshot_provenance": {"repositories": [{"git_commit": commit}]},
+        "snapshotProvenance": {"repositories": [{"git_commit": commit}]},
     }
     raw = json.dumps(
         manifest, sort_keys=True, separators=(",", ":")

@@ -90,11 +90,20 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
 
 
 
-def bind_manifest(value: dict, root: Path, *, commit: str = COMMIT) -> Path:
+def bind_manifest(
+    value: dict,
+    root: Path,
+    *,
+    commit: str = COMMIT,
+    provenance_key: str = "snapshot_provenance",
+    repositories: list[dict] | None = None,
+) -> Path:
+    if repositories is None:
+        repositories = [{"git_commit": commit}]
     manifest = {
         "kind": "repoground.bundle.manifest",
         "version": "2.0",
-        "snapshot_provenance": {"repositories": [{"git_commit": commit}]},
+        provenance_key: {"repositories": repositories},
     }
     raw = json.dumps(
         manifest, sort_keys=True, separators=(",", ":")
@@ -727,10 +736,15 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                         "freshness_status": "fresh",
                     },
                     "freshness": {"status": "fresh"},
-                    "resolved_ranges": [
-                        {"path": "src/example.py", "status": "resolved"},
-                        {"path": "src/missing.py", "status": "missing"},
-                    ],
+                    "resolved_ranges": [{
+                        "source_path": "src/example.py",
+                        "text_excerpt": "def example():",
+                        "range_ref": {
+                            "path": "src/example.py",
+                            "start_line": 1,
+                            "end_line": 1,
+                        },
+                    }],
                     "budget": {"context_bytes_used": 321},
                 },
             }
@@ -764,6 +778,38 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     value, messages, runner.normalize_tool_calls(value, messages)
                 )
             )
+
+    def test_bound_manifest_accepts_canonical_multi_repo_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(
+                value,
+                Path(directory),
+                provenance_key="snapshotProvenance",
+                repositories=[
+                    {"repository": "other/repo", "git_commit": "b" * 40},
+                    {"repository": "heimgewebe/repo", "git_commit": COMMIT},
+                ],
+            )
+            path, sha256, commit = runner._bound_repoground_manifest(value)
+            self.assertEqual(path, manifest.resolve())
+            self.assertEqual(sha256, value["repobrief"]["manifest_sha256"])
+            self.assertEqual(commit, COMMIT)
+
+    def test_bound_manifest_rejects_ambiguous_multi_repo_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            bind_manifest(
+                value,
+                Path(directory),
+                provenance_key="snapshotProvenance",
+                repositories=[
+                    {"repo": "repo", "git_commit": COMMIT},
+                    {"repository": "heimgewebe/repo", "git_commit": "b" * 40},
+                ],
+            )
+            with self.assertRaises(runner.RunnerError):
+                runner._bound_repoground_manifest(value)
 
     def test_treatment_projects_grounding_from_verdict_snapshot_ref(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

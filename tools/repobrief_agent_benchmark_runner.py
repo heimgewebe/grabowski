@@ -1277,17 +1277,47 @@ def _bound_repoground_manifest(
     if _sha256_bytes(raw) != expected_sha:
         raise RunnerError("RepoGround manifest SHA mismatch")
     document = _load_object_bytes(raw, label="RepoGround manifest")
-    provenance = document.get("snapshot_provenance")
+    provenance = document.get("snapshotProvenance")
+    if not isinstance(provenance, Mapping):
+        provenance = document.get("snapshot_provenance")
     repositories = (
         provenance.get("repositories") if isinstance(provenance, Mapping) else None
     )
     if (
         not isinstance(repositories, list)
-        or len(repositories) != 1
-        or not isinstance(repositories[0], Mapping)
+        or not repositories
+        or any(not isinstance(item, Mapping) for item in repositories)
     ):
         raise RunnerError("RepoGround manifest provenance is invalid")
-    commit = repositories[0].get("git_commit")
+
+    if len(repositories) == 1:
+        selected = repositories[0]
+    else:
+        repository = _mapping(request.get("repository"))
+        requested_names = {
+            value
+            for value in (repository.get("id"), repository.get("repository"))
+            if isinstance(value, str)
+        }
+        matches = []
+        for item in repositories:
+            names = {
+                value
+                for value in (
+                    item.get("repo"),
+                    item.get("repository"),
+                    item.get("repo_id"),
+                    item.get("name"),
+                )
+                if isinstance(value, str)
+            }
+            if requested_names & names:
+                matches.append(item)
+        if len(matches) != 1:
+            raise RunnerError("RepoGround manifest repository binding is ambiguous")
+        selected = matches[0]
+
+    commit = selected.get("git_commit")
     if not _is_commit(commit):
         raise RunnerError("RepoGround manifest commit is invalid")
     return manifest_path, expected_sha, str(commit)
@@ -1393,11 +1423,9 @@ def _repoground_evidence_from_payload(
             or context_bytes < 0
         ):
             return None
-        resolved_range_count = sum(
-            1
-            for item in ranges
-            if isinstance(item, Mapping) and item.get("status") == "resolved"
-        )
+        if any(not isinstance(item, Mapping) for item in ranges):
+            return None
+        resolved_range_count = len(ranges)
         return commit, {
             "sequence": sequence,
             "tool": "ask_context",
