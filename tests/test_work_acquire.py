@@ -4918,7 +4918,7 @@ class WorkAcquireTests(unittest.TestCase):
             "lane_id": successor_id,
             "inputs": successor_inputs,
             "inputs_sha256": work_acquire._sha(successor_inputs),
-            "receipt_sha256": "e" * 64,
+            "receipt_sha256": "f" * 64,
             "created_at_unix": 101,
             "state": "ready",
             "terminal_closeout": {
@@ -4926,7 +4926,7 @@ class WorkAcquireTests(unittest.TestCase):
                 "kind": "grabowski.work_lane_terminal_closeout",
                 "closeout_state": terminal["closeout_state"],
                 "assessment_sha256": terminal["assessment_sha256"],
-                "expected_receipt_sha256": "f" * 64,
+                "expected_receipt_sha256": "e" * 64,
                 "assessment": terminal,
             },
         }
@@ -5002,6 +5002,19 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertIsNone(result["successor_minimum_lease_remaining_seconds"])
         self.assertEqual("MERGED", result["publication"]["state"])
         merged_pr.assert_called_once()
+
+        broken = dict(successor)
+        broken["terminal_closeout"] = {
+            **successor["terminal_closeout"],
+            "expected_receipt_sha256": "9" * 64,
+        }
+        with self.assertRaisesRegex(RuntimeError, "successor receipt changed"):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor,
+                broken,
+                assessment,
+                allow_terminal_successor_retry=True,
+            )
 
     def test_successor_handoff_verifier_requires_exact_successor_receipt(self) -> None:
         predecessor_id = "a" * 32

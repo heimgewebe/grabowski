@@ -1678,9 +1678,24 @@ def _verify_successor_handoff_locked(
         or successor_inputs.get("lease_owner_id") != f"lane:{successor_lane_id}"
     ):
         raise RuntimeError("successor handoff successor inputs are invalid")
-    if successor_record.get("receipt_sha256") != binding["successor_receipt_sha256"]:
-        raise RuntimeError("successor handoff successor receipt changed")
     successor_terminal = _terminal_closeout_assessment(successor_record)
+    if successor_terminal is not None and not allow_terminal_successor_retry:
+        raise RuntimeError("successor handoff requires one active ready successor lane")
+    bound_successor_receipt = binding["successor_receipt_sha256"]
+    current_successor_receipt = successor_record.get("receipt_sha256")
+    if current_successor_receipt != bound_successor_receipt:
+        terminal_wrapper = successor_record.get("terminal_closeout")
+        terminal_preimage_receipt = (
+            terminal_wrapper.get("expected_receipt_sha256")
+            if isinstance(terminal_wrapper, dict)
+            else None
+        )
+        if (
+            not allow_terminal_successor_retry
+            or successor_terminal is None
+            or terminal_preimage_receipt != bound_successor_receipt
+        ):
+            raise RuntimeError("successor handoff successor receipt changed")
     if successor_terminal is None:
         if (
             successor_record.get("state") != "ready"
@@ -1842,8 +1857,23 @@ def _verify_successor_handoff_locked(
         reread = _read_state(successor_receipt_path)
         if reread is None or reread.get("lane_id") != successor_lane_id:
             raise RuntimeError("successor Work Lane receipt disappeared after publication")
+        final_terminal = _terminal_closeout_assessment(reread)
         if reread.get("receipt_sha256") != binding["successor_receipt_sha256"]:
-            raise RuntimeError("successor handoff successor receipt changed after publication")
+            terminal_wrapper = reread.get("terminal_closeout")
+            terminal_preimage_receipt = (
+                terminal_wrapper.get("expected_receipt_sha256")
+                if isinstance(terminal_wrapper, dict)
+                else None
+            )
+            if (
+                not allow_terminal_successor_retry
+                or final_terminal is None
+                or terminal_preimage_receipt
+                != binding["successor_receipt_sha256"]
+            ):
+                raise RuntimeError(
+                    "successor handoff successor receipt changed after publication"
+                )
         final_successor_record = reread
     if successor_terminal is None:
         (
