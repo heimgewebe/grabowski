@@ -957,6 +957,8 @@ def _validation_environment(validation_root: Path) -> dict[str, str]:
         "GNUMAKEFLAGS",
         "MAKEFILES",
         "MAKELEVEL",
+        "DEPLOY_TOOLING_LOCK",
+        "DEPLOY_TOOLING_VENV",
     ):
         environment.pop(key, None)
     for name in FINALIZATION_ENV.values():
@@ -977,18 +979,23 @@ def _run_validation_command(
     env: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
     """Run one validation-bootstrap command in a killable, reapable process group."""
-    process = subprocess.Popen(
-        argv,
-        cwd=cwd,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.PIPE if capture else None,
-        start_new_session=True,
-    )
+    process: subprocess.Popen[str] | None = None
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
     stdout: str | None = None
     stderr: str | None = None
     try:
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE if capture else None,
+                stderr=subprocess.PIPE if capture else None,
+                start_new_session=True,
+            )
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         try:
             if capture:
                 stdout, stderr = process.communicate(timeout=timeout)
@@ -1006,9 +1013,6 @@ def _run_validation_command(
                 },
             )
             raise AssertionError from exc
-        except BaseException:
-            terminate_process_group(process)
-            raise
         if check and process.returncode != 0:
             raise subprocess.CalledProcessError(
                 process.returncode,
@@ -1022,8 +1026,12 @@ def _run_validation_command(
             stdout=stdout,
             stderr=stderr,
         )
+    except BaseException:
+        if process is not None:
+            terminate_process_group(process)
+        raise
     finally:
-        if capture:
+        if capture and process is not None:
             if process.stdout is not None:
                 process.stdout.close()
             if process.stderr is not None:
@@ -1087,11 +1095,16 @@ def _verify_validation_distributions(
         )
 
 
-def _snapshot_validation_runtime_lock(
+def _snapshot_validation_lock(
     repo: Path,
     validation_root: Path,
+    *,
+    relative_path: Path,
+    copy_name: str,
+    label: str,
+    parser: Any,
 ) -> tuple[Path, dict[str, str]]:
-    """Copy one stable, no-follow runtime lock into the private validation root."""
+    """Copy one stable, no-follow lock into the private validation root."""
     directory_flags = (
         os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
     )
@@ -1103,7 +1116,7 @@ def _snapshot_validation_runtime_lock(
     try:
         repo_descriptor = os.open(repo, directory_flags)
         requirements_descriptor = os.open(
-            deploy_core.RUNTIME_LOCK_RELATIVE.parent.as_posix(),
+            relative_path.parent.as_posix(),
             directory_flags,
             dir_fd=repo_descriptor,
         )
@@ -1112,9 +1125,9 @@ def _snapshot_validation_runtime_lock(
             not stat.S_ISDIR(requirements_metadata.st_mode)
             or requirements_metadata.st_uid != os.getuid()
         ):
-            raise RuntimeError("target runtime lock parent is unsafe")
+            raise RuntimeError(f"target {label} parent is unsafe")
         lock_descriptor = os.open(
-            deploy_core.RUNTIME_LOCK_RELATIVE.name,
+            relative_path.name,
             file_flags,
             dir_fd=requirements_descriptor,
         )
@@ -1124,7 +1137,7 @@ def _snapshot_validation_runtime_lock(
             or before.st_uid != os.getuid()
             or before.st_nlink != 1
         ):
-            raise RuntimeError("target runtime lock is unsafe")
+            raise RuntimeError(f"target {label} is unsafe")
         total = 0
         while chunk := os.read(lock_descriptor, 1024 * 1024):
             chunks.append(chunk)
@@ -1145,9 +1158,9 @@ def _snapshot_validation_runtime_lock(
                 before.st_mtime_ns,
             )
         ):
-            raise RuntimeError("target runtime lock changed while being read")
+            raise RuntimeError(f"target {label} changed while being read")
     except OSError as exc:
-        raise RuntimeError("target runtime lock is unsafe") from exc
+        raise RuntimeError(f"target {label} is unsafe") from exc
     finally:
         if lock_descriptor >= 0:
             os.close(lock_descriptor)
@@ -1156,7 +1169,7 @@ def _snapshot_validation_runtime_lock(
         if repo_descriptor >= 0:
             os.close(repo_descriptor)
 
-    lock_copy = validation_root / "runtime.lock.txt"
+    lock_copy = validation_root / copy_name
     output_descriptor = os.open(
         lock_copy,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -1167,14 +1180,43 @@ def _snapshot_validation_runtime_lock(
         while view:
             written = os.write(output_descriptor, view)
             if written <= 0:
-                raise RuntimeError("validation runtime lock copy write failed")
+                raise RuntimeError(f"validation {label} copy write failed")
             view = view[written:]
         os.fsync(output_descriptor)
     finally:
         os.close(output_descriptor)
-    locked = deploy_core.parse_runtime_lock(lock_copy)
+    locked = parser(lock_copy)
     return lock_copy, locked
 
+
+def _snapshot_validation_runtime_lock(
+    repo: Path,
+    validation_root: Path,
+) -> tuple[Path, dict[str, str]]:
+    return _snapshot_validation_lock(
+        repo,
+        validation_root,
+        relative_path=deploy_core.RUNTIME_LOCK_RELATIVE,
+        copy_name="runtime.lock.txt",
+        label="runtime lock",
+        parser=deploy_core.parse_runtime_lock,
+    )
+
+
+def _snapshot_validation_deploy_tooling_lock(
+    repo: Path,
+    validation_root: Path,
+) -> tuple[Path, dict[str, str]]:
+    return _snapshot_validation_lock(
+        repo,
+        validation_root,
+        relative_path=Path("requirements/deploy-tooling.lock.txt"),
+        copy_name="deploy-tooling.lock.txt",
+        label="deploy-tooling lock",
+        parser=lambda path: deploy_core.parse_pinned_lock_file(
+            path, label="Deploy-Tooling-Lockfile"
+        ),
+    )
 
 def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
     """Build an isolated validation interpreter from the exact target runtime lock."""
@@ -1256,7 +1298,11 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
             validation_root = Path(validation_tmp.name)
             environment = _validation_environment(validation_root)
             validation_python = _prepare_validation_python(cwd, validation_root)
+            tooling_lock, _tooling_locked = _snapshot_validation_deploy_tooling_lock(
+                cwd, validation_root
+            )
             environment["PYTHON"] = str(validation_python)
+            environment["DEPLOY_TOOLING_LOCK"] = str(tooling_lock)
             inherited_path = environment.get("PATH")
             environment["PATH"] = str(validation_python.parent) + (
                 os.pathsep + inherited_path if inherited_path else ""
@@ -1267,17 +1313,27 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
                 "make",
                 f"PYTHON={validation_python}",
                 f"DEPLOY_TOOLING_VENV={tooling_venv}",
+                f"DEPLOY_TOOLING_LOCK={tooling_lock}",
                 "validate",
             ]
-        process = subprocess.Popen(
-            effective_argv,
-            cwd=cwd,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=None,
-            stderr=None,
-            start_new_session=True,
-        )
+        spawn_mask = None
+        if validation_tmp is not None:
+            spawn_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, {signal.SIGTERM}
+            )
+        try:
+            process = subprocess.Popen(
+                effective_argv,
+                cwd=cwd,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=None,
+                stderr=None,
+                start_new_session=True,
+            )
+        finally:
+            if spawn_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, spawn_mask)
         try:
             returncode = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
