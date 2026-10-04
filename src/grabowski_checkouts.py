@@ -3193,6 +3193,74 @@ def _materialize_uncertainty_readback(
     }
 
 
+def _resolve_materialize_recovery_obligation(
+    fence: dict[str, Any],
+    *,
+    recovery_state: str,
+) -> dict[str, Any]:
+    import grabowski_operator_obligation as obligations
+
+    evidence = fence["evidence"]
+    obligation_id = str(evidence["obligation_id"])
+    recovery_material = {
+        "schema_version": 1,
+        "kind": "grabowski_materialize_uncertainty_recovery",
+        "fence_id": fence["fence_id"],
+        "obligation_id": obligation_id,
+        "checkout_key": evidence["checkout_key"],
+        "expected_head": evidence["expected_head"],
+        "recovery_state": recovery_state,
+    }
+    recovery_sha256 = _sha256_json(recovery_material)
+    close = obligations.close_obligation(
+        {
+            "obligation_id": obligation_id,
+            "outcome": "blocked",
+            "evidence": [],
+            "blockers": [
+                {
+                    "code": "materialization-recovered",
+                    "detail": (
+                        "Checkout uncertainty recovery proved that the original "
+                        "deployment-source materialization did not remain usable."
+                    ),
+                    "reference": f"checkout-uncertainty:{fence['fence_id']}",
+                    "sha256": recovery_sha256,
+                }
+            ],
+            "next_action": (
+                "No continuation is required for this recovered materialization; "
+                "a future deployment request may create a new obligation."
+            ),
+        }
+    )
+    resolved = obligations.resolve_obligation(
+        {
+            "obligation_id": obligation_id,
+            "disposition": "resolved",
+            "evidence": [
+                {
+                    "source": "receipt",
+                    "reference": f"checkout-uncertainty:{fence['fence_id']}",
+                    "sha256": recovery_sha256,
+                }
+            ],
+        }
+    )
+    if (
+        close.get("state") != "blocked"
+        or resolved.get("resolution_disposition") != "resolved"
+        or resolved.get("continuation_required") is not False
+    ):
+        raise RuntimeError("Materialize recovery obligation did not settle terminally")
+    return {
+        "obligation_id": obligation_id,
+        "recovery_sha256": recovery_sha256,
+        "close_file_sha256": close.get("close_file_sha256"),
+        "resolution_file_sha256": resolved.get("resolution_file_sha256"),
+    }
+
+
 def _reconcile_materialize_uncertainty(
     fence: dict[str, Any],
 ) -> dict[str, Any]:
@@ -3208,7 +3276,21 @@ def _reconcile_materialize_uncertainty(
                     "reason": "materialize-no-effect-lifecycle-release-failed",
                     "readback": readback,
                 }
-            return readback
+            try:
+                obligation_recovery = _resolve_materialize_recovery_obligation(
+                    fence,
+                    recovery_state="confirmed_no_effect",
+                )
+            except Exception as exc:
+                return {
+                    "state": "still_fenced",
+                    "reason": (
+                        "materialize-no-effect-obligation-recovery-failed:"
+                        f"{type(exc).__name__}"
+                    ),
+                    "readback": readback,
+                }
+            return {**readback, "obligation_recovery": obligation_recovery}
         if state != "recoverable_created":
             return readback
         evidence = fence["evidence"]
@@ -3238,12 +3320,27 @@ def _reconcile_materialize_uncertainty(
                 "reason": "materialize-recovery-lifecycle-release-failed",
                 "readback": after,
             }
+        try:
+            obligation_recovery = _resolve_materialize_recovery_obligation(
+                fence,
+                recovery_state="reconciled_success",
+            )
+        except Exception as exc:
+            return {
+                "state": "still_fenced",
+                "reason": (
+                    "materialize-recovery-obligation-recovery-failed:"
+                    f"{type(exc).__name__}"
+                ),
+                "readback": after,
+            }
         return {
             "state": "reconciled_success",
             "checkout_key": evidence["checkout_key"],
             "expected_head": evidence["expected_head"],
             "removed_recovery_worktree": True,
             "git_returncode": result.get("returncode"),
+            "obligation_recovery": obligation_recovery,
         }
     finally:
         resources.release_resources(

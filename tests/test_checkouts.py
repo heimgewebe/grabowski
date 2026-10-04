@@ -47,6 +47,7 @@ if "mcp" not in sys.modules:
 
 
 import grabowski_checkouts as checkouts
+import grabowski_operator_obligation as obligations
 import grabowski_work_admission as work_admission
 
 
@@ -81,6 +82,15 @@ class CheckoutLifecycleTests(unittest.TestCase):
             patch.object(checkouts.operator, "_require_operator_capability"),
             patch.object(checkouts.base, "_append_audit"),
             patch.object(checkouts, "_processes_under", return_value=[]),
+            patch.dict(
+                os.environ,
+                {
+                    "GRABOWSKI_OPERATOR_OBLIGATION_ROOT": str(
+                        self.root / "state" / "operator-obligations"
+                    )
+                },
+            ),
+            patch.object(obligations.alert_outbox, "enqueue_and_schedule"),
         ]
         for item in self.patches:
             item.start()
@@ -2502,6 +2512,27 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         if create_worktree:
             self._git("worktree", "add", "--detach", str(target), self.head)
+        obligations.open_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "objective": "Materialize the exact detached deployment source.",
+                "acceptance": [
+                    {
+                        "id": "source-materialized",
+                        "description": "The exact detached source exists.",
+                    }
+                ],
+                "origin": {
+                    "source": "grabowski_runtime_deploy_schedule",
+                    "repo": "heimgewebe/grabowski",
+                },
+            }
+        )
+        self.assertTrue(
+            obligations.status_obligation(
+                "goo-runtime-deploy-source-materialize-test"
+            )["continuation_required"]
+        )
         with self.assertRaisesRegex(RuntimeError, "durably fenced"):
             checkouts._require_no_checkout_operation_uncertainty([common_dir_key])
         self._expire_uncertainty_lease(fence)
@@ -2527,6 +2558,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
             checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
         )
         self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+        obligation_status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertFalse(obligation_status["continuation_required"])
+        self.assertEqual(obligation_status["resolution_disposition"], "resolved")
 
     def test_materialize_uncertainty_reconcile_clears_proven_no_effect(self) -> None:
         target, fence, lifecycle, _common_dir_key = (
@@ -2547,6 +2583,42 @@ class CheckoutLifecycleTests(unittest.TestCase):
             checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
         )
         self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+        obligation_status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertFalse(obligation_status["continuation_required"])
+        self.assertEqual(obligation_status["resolution_disposition"], "resolved")
+
+    def test_materialize_uncertainty_reconcile_keeps_fence_when_obligation_recovery_fails(self) -> None:
+        _target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        with patch.object(
+            checkouts,
+            "_resolve_materialize_recovery_obligation",
+            side_effect=RuntimeError("obligation close unavailable"),
+        ):
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        self.assertEqual(result["state"], "still_fenced")
+        self.assertIn(
+            "obligation-recovery-failed",
+            result["readback"]["reason"],
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertTrue(
+            obligations.status_obligation(
+                "goo-runtime-deploy-source-materialize-test"
+            )["continuation_required"]
+        )
 
     def test_uncertainty_persist_has_no_post_commit_secondary_readback(self) -> None:
         target = self.root / "worktrees" / "materialize-readback"
