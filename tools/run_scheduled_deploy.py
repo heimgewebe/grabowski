@@ -1077,8 +1077,11 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
             )
             validation_root = Path(validation_tmp.name)
             environment = _validation_environment(validation_root)
-            environment["PYTHON"] = str(
-                _prepare_validation_python(cwd, validation_root)
+            validation_python = _prepare_validation_python(cwd, validation_root)
+            environment["PYTHON"] = str(validation_python)
+            inherited_path = environment.get("PATH")
+            environment["PATH"] = str(validation_python.parent) + (
+                os.pathsep + inherited_path if inherited_path else ""
             )
             environment["DEPLOY_TOOLING_VENV"] = str(
                 validation_root / "deploy-tooling" / ".venv"

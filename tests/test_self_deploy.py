@@ -5003,6 +5003,14 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         environment = popen.call_args.kwargs["env"]
         prepare.assert_called_once()
         self.assertEqual(environment["PYTHON"], "/validation/bin/python")
+        self.assertEqual(
+            environment["PATH"].split(os.pathsep, 1)[0],
+            "/validation/bin",
+        )
+        self.assertEqual(
+            Path(environment["PATH"].split(os.pathsep, 1)[0]) / "python3",
+            Path("/validation/bin/python3"),
+        )
         self.assertEqual(environment["GRABOWSKI_UNRELATED"], "preserved")
         self.assertEqual(environment["PIP_CONFIG_FILE"], "/dev/null")
         for name in (*bindings, *python_bindings):
