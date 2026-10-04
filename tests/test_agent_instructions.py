@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import importlib.util
 from pathlib import Path
 import re
@@ -80,6 +81,29 @@ class AgentInstructionsTests(unittest.TestCase):
             grabowski_mcp.AGENT_INSTRUCTIONS,
         )
 
+    def test_mandatory_outcome_tool_is_available_in_core_profile(self) -> None:
+        profiles = json.loads(
+            (ROOT / "contracts/publication-profiles.v1.json").read_text(encoding="utf-8")
+        )
+        for profile in ("core", "operator", "full"):
+            with self.subTest(profile=profile):
+                self.assertIn("report_outcome", profiles["profiles"][profile])
+
+    def test_direct_module_entrypoint_configures_flowlines_before_run(self) -> None:
+        source = (ROOT / "src/grabowski_mcp.py").read_text(encoding="utf-8")
+        marker = 'if __name__ == "__main__":'
+        self.assertEqual(source.count(marker), 1)
+        direct_entrypoint = source.split(marker, 1)[1]
+        configure = "grabowski_flowlines.configure_flowlines_observability("
+        self.assertIn("import grabowski_flowlines", direct_entrypoint)
+        self.assertIn(configure, direct_entrypoint)
+        self.assertIn("READ_ANNOTATIONS", direct_entrypoint)
+        self.assertIn("load_environment_exporter=False", direct_entrypoint)
+        self.assertLess(
+            direct_entrypoint.index(configure),
+            direct_entrypoint.index("mcp.run()"),
+        )
+
     def test_rules_cover_routing_mutation_retry_and_authority_boundaries(self) -> None:
         rules = dict(grabowski_mcp.AGENT_INSTRUCTION_RULES)
         self.assertEqual(len(rules), len(grabowski_mcp.AGENT_INSTRUCTION_RULES))
@@ -133,9 +157,9 @@ class AgentInstructionsTests(unittest.TestCase):
             "before host dispatch",
             "no grabowski receipt",
             "platform_filter",
-            "do not attribute it to the grabowski runtime",
-            "do not retry the blocked call unchanged",
-            "lane or task receipts",
+            "do not attribute it to grabowski runtime",
+            "retry unchanged",
+            "lane/task receipts",
             "supported conversation",
         ):
             self.assertIn(phrase, pre_runtime)
@@ -221,7 +245,18 @@ class AgentInstructionsTests(unittest.TestCase):
         ):
             self.assertIn(phrase, obligation)
         authority = rules["no-authority-escalation"].lower()
-        for phrase in ("action", "merge", "deploy", "secret", "retry"):
+        for phrase in (
+            "action",
+            "merge",
+            "deploy",
+            "secret",
+            "retry",
+            "reason+user_intent",
+            "report_outcome",
+            "final tool call",
+            "every final answer",
+            "read-only/partial/failed/blocked",
+        ):
             self.assertIn(phrase, authority)
 
     def test_contract_documentation_rule_numbers_are_sequential(self) -> None:

@@ -278,6 +278,155 @@ class OperatorContractTests(unittest.TestCase):
             environment["UV_CACHE_DIR"],
         )
 
+    def test_safe_environment_never_exports_flowlines_headers(self) -> None:
+        operator = _load_operator_module()
+        headers = {
+            "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "x-flowlines-api-key=trace-secret",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai?a=b",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": (
+                "https://api.flowlines.ai/v1/traces?a=b"
+            ),
+        }
+        for trusted in (False, True):
+            with (
+                self.subTest(trusted=trusted),
+                patch.dict(
+                    operator.os.environ,
+                    {
+                        "XDG_RUNTIME_DIR": "/run/user/1000",
+                        **headers,
+                    },
+                    clear=True,
+                ),
+                patch.object(operator, "_trusted_owner_mode", return_value=trusted),
+            ):
+                environment = operator._safe_environment()
+            for name in headers:
+                self.assertNotIn(name, environment)
+
+        for name, value in headers.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    operator._redact(f"{name}={value}"),
+                    f"{name}=<REDACTED>",
+                )
+                self.assertEqual(
+                    operator._redact_argv([f"{name}={value}"]),
+                    [f"{name}=<REDACTED>"],
+                )
+
+    def test_operator_service_entrypoint_configures_flowlines_before_wrappers(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        service = (
+            ROOT / "systemd" / "grabowski-operator.service.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "-m grabowski_operator --transport streamable-http",
+            service,
+        )
+        self.assertIn("import grabowski_flowlines", source)
+        main_marker = "def main() -> None:"
+        self.assertEqual(source.count(main_marker), 1)
+        main = source.split(main_marker, 1)[1]
+        configure = (
+            "grabowski_flowlines.configure_flowlines_observability"
+            "(mcp, READ_ONLY)"
+        )
+        self.assertIn(configure, main)
+        for later in (
+            "_install_deployment_admission_gate()",
+            "_configure_posthog_mcp_analytics()",
+            "mcp.run(transport=args.transport)",
+        ):
+            with self.subTest(later=later):
+                self.assertIn(later, main)
+                self.assertLess(main.index(configure), main.index(later))
+
+    def test_admission_policy_ignores_only_injected_flowlines_fields(self) -> None:
+        operator = _load_operator_module()
+        injected_tool = types.SimpleNamespace(
+            fn_metadata=types.SimpleNamespace(
+                arg_model=types.SimpleNamespace(model_fields={})
+            ),
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        raw_git = {
+            "repo": "/tmp/repo",
+            "arguments": ["status", "--short", "--branch"],
+            "reason": "Observe repository state",
+            "user_intent": "Verify the current revision",
+        }
+        policy_git = operator._operator_policy_arguments(
+            "grabowski_git",
+            raw_git,
+            injected_tool,
+        )
+        self.assertNotIn("reason", policy_git)
+        self.assertNotIn("user_intent", policy_git)
+        self.assertTrue(operator._grabowski_git_server_verified_read(policy_git))
+
+        read_tool = types.SimpleNamespace(
+            fn_metadata=types.SimpleNamespace(
+                arg_model=types.SimpleNamespace(model_fields={})
+            ),
+            annotations=types.SimpleNamespace(readOnlyHint=True),
+        )
+        raw_status = {
+            "view": "minimal",
+            "reason": "Check readiness",
+            "user_intent": "Observe deployment status",
+        }
+        policy_status = operator._operator_policy_arguments(
+            "grabowski_status",
+            raw_status,
+            read_tool,
+        )
+        self.assertTrue(
+            operator._deployment_readiness_status_call(
+                "grabowski_status",
+                policy_status,
+                read_tool,
+            )
+        )
+
+        raw_recovery_status = {
+            "operation": "maulwurf-recovery-status",
+            "parameters": None,
+            "reason": "Observe recovery state",
+            "user_intent": "Check the recovery controller",
+        }
+        policy_recovery_status = operator._operator_policy_arguments(
+            "grabowski_operation_run",
+            raw_recovery_status,
+            injected_tool,
+        )
+        self.assertNotIn("reason", policy_recovery_status)
+        self.assertNotIn("user_intent", policy_recovery_status)
+        with patch.dict(
+            os.environ,
+            {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+        ):
+            self.assertTrue(
+                operator._transport_roundtrip_exempt_call(
+                    "grabowski_operation_run",
+                    policy_recovery_status,
+                )
+            )
+
+        domain_reason_tool = types.SimpleNamespace(
+            fn_metadata=types.SimpleNamespace(
+                arg_model=types.SimpleNamespace(model_fields={"reason": object()})
+            )
+        )
+        domain_arguments = operator._operator_policy_arguments(
+            "domain_tool",
+            {"reason": "domain-owned", "user_intent": "analytics-only"},
+            domain_reason_tool,
+        )
+        self.assertEqual(domain_arguments["reason"], "domain-owned")
+        self.assertNotIn("user_intent", domain_arguments)
+
     def test_http_recovery_contract_is_loopback_bound(self) -> None:
         operator = _load_operator_module()
         metadata = operator._protected_resource_metadata(

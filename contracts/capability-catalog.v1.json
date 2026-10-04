@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "7d671c856396c38b3e682216c24a905e02656fb3512294eb3f720db6c1312a06",
+  "capability_source_sha256": "3d3685376352e7a8b8c36145aa88d614b16f0f9f865450a9a522b02a088921b1",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "bd94b08a5b4690a752e47d3e1ae20e30945bac55df2aed58840fb260e055eabd",
+  "contract_sha256": "37d292863168f2239c99ea41506d1626d58d0eeac4822c3bcc8c24854596d2c0",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -41,6 +41,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_context"
+    },
+    {
+      "category": "operations-observability",
+      "description": "REQUIRED final call in every conversation before the assistant gives its final answer.\n\nAccepts the agent's outcome self-report without mutating product data.\nWhen Flowlines export is enabled, this tool call is the telemetry report.\nFor blocked work, report partial if any of the user goal was accomplished;\notherwise report failed, and describe the blocker in unmet_needs.",
+      "effects": [],
+      "id": "report_outcome",
+      "purpose": "Accept the required final agent outcome self-report for Flowlines telemetry when export is enabled, without product mutation.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "report_outcome"
     },
     {
       "category": "grip-surface",

@@ -37,12 +37,19 @@ if "mcp" not in sys.modules:
     fake_types = types.ModuleType("mcp.types")
     fake_fastmcp.FastMCP = _FakeFastMCP
     fake_types.ToolAnnotations = _FakeToolAnnotations
-    sys.modules["mcp"] = fake_mcp
-    sys.modules["mcp.server"] = fake_server
-    sys.modules["mcp.server.fastmcp"] = fake_fastmcp
-    sys.modules["mcp.types"] = fake_types
-
-import grabowski_agent_competition as competition  # noqa: E402
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "mcp": fake_mcp,
+            "mcp.server": fake_server,
+            "mcp.server.fastmcp": fake_fastmcp,
+            "mcp.types": fake_types,
+        },
+        clear=False,
+    ):
+        import grabowski_agent_competition as competition  # noqa: E402
+else:
+    import grabowski_agent_competition as competition  # noqa: E402
 
 
 class AgentCompetitionTests(unittest.TestCase):

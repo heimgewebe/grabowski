@@ -216,6 +216,13 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             "operator_service": __import__("hashlib").sha256(
                 blobs[Path("systemd/grabowski-operator.service.example")]
             ).hexdigest(),
+            "operator_flowlines_dropin": __import__("hashlib").sha256(
+                blobs[
+                    Path(
+                        "systemd/grabowski-operator.service.d/80-flowlines.conf.example"
+                    )
+                ]
+            ).hexdigest(),
         }
         attestation: dict[str, object] = {
             "schema_version": 1,
@@ -462,6 +469,10 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
         self.assertEqual(dual._rootbroker_artifact_source_paths(helper), expected)
         self.assertIn(Path("src/grabowski_blockade_authority.py"), expected)
         self.assertIn(Path("src/grabowski_command_identity.py"), expected)
+        self.assertIn(
+            Path("systemd/grabowski-operator.service.d/80-flowlines.conf.example"),
+            expected,
+        )
 
     def test_bootstrap_compatible_predecessor_attestation_is_accepted(self) -> None:
         attestation, blobs = self._fixture()
