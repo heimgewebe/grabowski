@@ -4198,7 +4198,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 },
             )
 
-    def test_codex_does_not_project_unbound_repoground_evidence(self) -> None:
+    def test_codex_projects_bound_not_comparable_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
             manifest = bind_manifest(value, Path(directory))
@@ -4206,8 +4206,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "kind": "repobrief.live_freshness",
                 "version": "v1",
                 "status": "not_comparable",
+                "reason": "repo_root_not_configured",
                 "bundle_manifest": str(Path(directory) / "other.bundle.manifest.json"),
-                "snapshot_provenance": None,
+                "repo_root": None,
+                "read_only_git_probe": False,
             }
             events = [{
                 "type": "item.completed",

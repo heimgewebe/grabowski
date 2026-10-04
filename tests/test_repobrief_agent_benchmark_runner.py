@@ -823,6 +823,19 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 },
             )
 
+            payload["verdict"]["snapshot_ref"]["manifest_path"] = str(
+                Path(directory) / "other.bundle.manifest.json"
+            )
+            tool_result["content"] = json.dumps(
+                {"structuredContent": payload}, sort_keys=True
+            )
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
+
+            payload["verdict"]["snapshot_ref"]["manifest_path"] = str(manifest)
             payload["live_freshness"]["bundle_manifest"] = str(
                 Path(directory) / "other.bundle.manifest.json"
             )
@@ -865,7 +878,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 runner.normalize_repoground_evidence(value, messages, calls)
             )
 
-    def test_treatment_does_not_project_unbound_repoground_evidence(self) -> None:
+    def test_treatment_projects_bound_not_comparable_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
             manifest = bind_manifest(value, Path(directory))
@@ -885,8 +898,10 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     "kind": "repobrief.live_freshness",
                     "version": "v1",
                     "status": "not_comparable",
+                    "reason": "repo_root_not_configured",
                     "bundle_manifest": str(manifest),
-                    "snapshot_provenance": None,
+                    "repo_root": None,
+                    "read_only_git_probe": False,
                 }},
                 sort_keys=True,
             )

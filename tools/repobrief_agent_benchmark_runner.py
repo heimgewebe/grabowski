@@ -1296,13 +1296,16 @@ def _bound_repoground_manifest(
 def _snapshot_ref_matches_manifest(
     snapshot_ref: Mapping[str, Any],
     *,
+    manifest_path: Path,
     manifest_sha256: str,
     require_sha: bool,
 ) -> bool:
     observed_sha = snapshot_ref.get("manifest_sha256")
-    if require_sha:
+    if observed_sha is not None:
         return observed_sha == manifest_sha256
-    return observed_sha is None or observed_sha == manifest_sha256
+    if require_sha:
+        return False
+    return snapshot_ref.get("manifest_path") == str(manifest_path)
 
 
 def _snapshot_ref_commit(
@@ -1327,7 +1330,9 @@ def _live_snapshot_commit(
         return None
     if (
         payload.get("status") == "not_comparable"
-        and "snapshot_provenance" in payload
+        and payload.get("reason") == "repo_root_not_configured"
+        and payload.get("repo_root") is None
+        and payload.get("read_only_git_probe") is False
         and snapshot is None
     ):
         return manifest_commit
@@ -1366,6 +1371,7 @@ def _repoground_evidence_from_payload(
             or snapshot_ref.get("freshness_status") != freshness.get("status")
             or not _snapshot_ref_matches_manifest(
                 snapshot_ref,
+                manifest_path=manifest_path,
                 manifest_sha256=manifest_sha256,
                 require_sha=True,
             )
@@ -1449,6 +1455,7 @@ def _repoground_evidence_from_payload(
             not isinstance(snapshot_ref, Mapping)
             or not _snapshot_ref_matches_manifest(
                 snapshot_ref,
+                manifest_path=manifest_path,
                 manifest_sha256=manifest_sha256,
                 require_sha=False,
             )
