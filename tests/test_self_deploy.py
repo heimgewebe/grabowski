@@ -4229,6 +4229,16 @@ class SelfDeployToolTests(unittest.TestCase):
             "expires_at_unix": 200,
             "metadata_sha256": "3" * 64,
         }
+        common_dir = f["canonical"] / ".git"
+        common_dir_key = f"path:{common_dir}"
+        common_dir_lease = {
+            "resource_key": common_dir_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 20,
+            "updated_at_unix": 20,
+            "expires_at_unix": 200,
+            "metadata_sha256": "4" * 64,
+        }
         materialization = {
             "expected_head": f["expected"],
             "repository": str(f["target"]),
@@ -4240,9 +4250,16 @@ class SelfDeployToolTests(unittest.TestCase):
         }
         resources = types.ModuleType("grabowski_resources")
         resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
-        resources.acquire_resources = Mock(return_value={"leases": [cleanup_lease]})
-        with patch.dict(sys.modules, {"grabowski_resources": resources}), patch.object(
+        resources.acquire_resources = Mock(return_value={"leases": [cleanup_lease, common_dir_lease]})
+        checkouts = types.ModuleType("grabowski_checkouts")
+        checkouts._require_no_checkout_operation_uncertainty = Mock(return_value=None)
+        with patch.dict(
+            sys.modules,
+            {"grabowski_resources": resources, "grabowski_checkouts": checkouts},
+        ), patch.object(
             SELF_DEPLOY, "_validated_repository_path", return_value=f["canonical"]
+        ), patch.object(
+            SELF_DEPLOY, "_git_common_directory", return_value=common_dir
         ), patch.object(
             SELF_DEPLOY, "_deployment_source_preflight",
             return_value=(f["target"], f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH, f["identity"]),
@@ -4258,7 +4275,7 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY, "_release_auto_deploy_source_retention", return_value=True
         ) as release_retention, patch.object(
             SELF_DEPLOY, "_release_auto_deploy_source_resources",
-            return_value={"released": [cleanup_lease, f["path_lease"]]},
+            return_value={"released": [cleanup_lease, common_dir_lease, f["path_lease"]]},
         ) as release_resources, patch.object(SELF_DEPLOY, "_append_deploy_audit"):
             receipt = SELF_DEPLOY._cleanup_auto_deploy_source_before_dispatch(
                 f["expected"], f["identity"], materialization
@@ -4270,13 +4287,108 @@ class SelfDeployToolTests(unittest.TestCase):
         release_retention.assert_called_once_with(f["retention"])
         release_resources.assert_called_once_with(
             f["owner"],
-            [cleanup_key, f["path_key"]],
-            [cleanup_lease, f["path_lease"]],
+            [cleanup_key, common_dir_key, f["path_key"]],
+            [cleanup_lease, common_dir_lease, f["path_lease"]],
         )
         self.assertEqual(receipt["kind"], "grabowski_auto_runtime_deploy_source_cleanup")
         self.assertRegex(receipt["receipt_sha256"], r"[0-9a-f]{64}")
 
-    def test_cleanup_auto_deploy_source_malformed_cleanup_receipt_releases_live_cleanup_lease_only(self) -> None:
+    def test_cleanup_auto_deploy_source_before_dispatch_serializes_common_dir_and_respects_uncertainty(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        cleanup_key = (
+            f"repo:{f['canonical']}:operation:worktree-remove:{f['target'].name}"
+        )
+        common_dir = f["canonical"] / ".git"
+        common_dir_key = f"path:{common_dir}"
+        cleanup_lease = {
+            "resource_key": cleanup_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 20,
+            "updated_at_unix": 20,
+            "expires_at_unix": 200,
+            "metadata_sha256": "3" * 64,
+        }
+        common_dir_lease = {
+            "resource_key": common_dir_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 20,
+            "updated_at_unix": 20,
+            "expires_at_unix": 200,
+            "metadata_sha256": "4" * 64,
+        }
+        materialization = {
+            "expected_head": f["expected"],
+            "repository": str(f["target"]),
+            "owner_id": f["owner"],
+            "path_resource_key": f["path_key"],
+            "path_lease": f["path_lease"],
+            "lifecycle": f["lifecycle"],
+            "retention": f["retention"],
+        }
+        resources = types.ModuleType("grabowski_resources")
+        resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
+        resources.acquire_resources = Mock(
+            return_value={"leases": [cleanup_lease, common_dir_lease]}
+        )
+        checkouts = types.ModuleType("grabowski_checkouts")
+        checkouts._require_no_checkout_operation_uncertainty = Mock(
+            side_effect=RuntimeError("checkout resources are durably fenced")
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "grabowski_resources": resources,
+                "grabowski_checkouts": checkouts,
+            },
+        ), patch.object(
+            SELF_DEPLOY, "_validated_repository_path", return_value=f["canonical"]
+        ), patch.object(
+            SELF_DEPLOY, "_git_common_directory", return_value=common_dir
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            return_value=(
+                f["target"],
+                f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH,
+                f["identity"],
+            ),
+        ), patch.object(
+            SELF_DEPLOY, "_mutating_git_result", return_value=_result("")
+        ) as mutate, patch.object(
+            SELF_DEPLOY.os.path, "lexists", return_value=False
+        ), patch.object(
+            SELF_DEPLOY, "_worktree_registration_present", return_value=False
+        ), patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_lifecycle", return_value=True
+        ), patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_retention", return_value=True
+        ), patch.object(
+            SELF_DEPLOY,
+            "_release_auto_deploy_source_resources",
+            return_value={"released": [cleanup_lease, common_dir_lease]},
+        ) as release_resources:
+            with self.assertRaisesRegex(RuntimeError, "checkout coordination"):
+                SELF_DEPLOY._cleanup_auto_deploy_source_before_dispatch(
+                    f["expected"], f["identity"], materialization
+                )
+        resources.acquire_resources.assert_called_once_with(
+            f["owner"],
+            [cleanup_key, common_dir_key],
+            purpose=f"remove unused detached runtime deploy source {f['expected'][:12]}",
+            ttl_seconds=SELF_DEPLOY.AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS,
+            metadata={"operation_scope": {"scope": "cleanup"}},
+        )
+        checkouts._require_no_checkout_operation_uncertainty.assert_called_once_with(
+            [common_dir_key]
+        )
+        mutate.assert_not_called()
+        release_resources.assert_called_once_with(
+            f["owner"],
+            [cleanup_key, common_dir_key],
+            [cleanup_lease, common_dir_lease],
+        )
+
+    def test_cleanup_auto_deploy_source_malformed_cleanup_receipt_releases_live_cleanup_leases(self) -> None:
         f = self._auto_deploy_uncertain_fixture()
         cleanup_key = f"repo:{f['canonical']}:operation:worktree-remove:{f['target'].name}"
         cleanup_lease = {
@@ -4286,6 +4398,16 @@ class SelfDeployToolTests(unittest.TestCase):
             "updated_at_unix": 20,
             "expires_at_unix": 200,
             "metadata_sha256": "3" * 64,
+        }
+        common_dir = f["canonical"] / ".git"
+        common_dir_key = f"path:{common_dir}"
+        common_dir_lease = {
+            "resource_key": common_dir_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 20,
+            "updated_at_unix": 20,
+            "expires_at_unix": 200,
+            "metadata_sha256": "4" * 64,
         }
         materialization = {
             "expected_head": f["expected"],
@@ -4299,27 +4421,43 @@ class SelfDeployToolTests(unittest.TestCase):
         resources = types.ModuleType("grabowski_resources")
         resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
         resources.acquire_resources = Mock(return_value={"leases": []})
-        with patch.dict(sys.modules, {"grabowski_resources": resources}), patch.object(
+        checkouts = types.ModuleType("grabowski_checkouts")
+        with patch.dict(
+            sys.modules,
+            {"grabowski_resources": resources, "grabowski_checkouts": checkouts},
+        ), patch.object(
             SELF_DEPLOY, "_validated_repository_path", return_value=f["canonical"]
+        ), patch.object(
+            SELF_DEPLOY, "_git_common_directory", return_value=common_dir
         ), patch.object(
             SELF_DEPLOY, "_deployment_source_preflight",
             return_value=(f["target"], f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH, f["identity"]),
         ), patch.object(
-            SELF_DEPLOY, "_live_auto_deploy_source_lease_snapshot", return_value=cleanup_lease
+            SELF_DEPLOY,
+            "_live_auto_deploy_source_lease_snapshot",
+            side_effect=[cleanup_lease, common_dir_lease],
         ) as live_snapshot, patch.object(
             SELF_DEPLOY, "_mutating_git_result"
         ) as mutate, patch.object(
             SELF_DEPLOY, "_release_auto_deploy_source_resources",
-            return_value={"released": [cleanup_lease]},
+            return_value={"released": [cleanup_lease, common_dir_lease]},
         ) as release_resources:
             with self.assertRaisesRegex(RuntimeError, "lease receipt omitted"):
                 SELF_DEPLOY._cleanup_auto_deploy_source_before_dispatch(
                     f["expected"], f["identity"], materialization
                 )
-        live_snapshot.assert_called_once_with(cleanup_key, f["owner"])
+        self.assertEqual(
+            live_snapshot.call_args_list,
+            [
+                call(cleanup_key, f["owner"]),
+                call(common_dir_key, f["owner"]),
+            ],
+        )
         mutate.assert_not_called()
         release_resources.assert_called_once_with(
-            f["owner"], [cleanup_key], [cleanup_lease]
+            f["owner"],
+            [cleanup_key, common_dir_key],
+            [cleanup_lease, common_dir_lease],
         )
 
     def test_cleanup_auto_source_releases_leases_even_when_lifecycle_release_fails_after_remove(self) -> None:
@@ -4333,6 +4471,16 @@ class SelfDeployToolTests(unittest.TestCase):
             "expires_at_unix": 200,
             "metadata_sha256": "3" * 64,
         }
+        common_dir = f["canonical"] / ".git"
+        common_dir_key = f"path:{common_dir}"
+        common_dir_lease = {
+            "resource_key": common_dir_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 20,
+            "updated_at_unix": 20,
+            "expires_at_unix": 200,
+            "metadata_sha256": "4" * 64,
+        }
         materialization = {
             "expected_head": f["expected"],
             "repository": str(f["target"]),
@@ -4344,9 +4492,16 @@ class SelfDeployToolTests(unittest.TestCase):
         }
         resources = types.ModuleType("grabowski_resources")
         resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
-        resources.acquire_resources = Mock(return_value={"leases": [cleanup_lease]})
-        with patch.dict(sys.modules, {"grabowski_resources": resources}), patch.object(
+        resources.acquire_resources = Mock(return_value={"leases": [cleanup_lease, common_dir_lease]})
+        checkouts = types.ModuleType("grabowski_checkouts")
+        checkouts._require_no_checkout_operation_uncertainty = Mock(return_value=None)
+        with patch.dict(
+            sys.modules,
+            {"grabowski_resources": resources, "grabowski_checkouts": checkouts},
+        ), patch.object(
             SELF_DEPLOY, "_validated_repository_path", return_value=f["canonical"]
+        ), patch.object(
+            SELF_DEPLOY, "_git_common_directory", return_value=common_dir
         ), patch.object(
             SELF_DEPLOY, "_deployment_source_preflight",
             return_value=(f["target"], f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH, f["identity"]),
@@ -4358,7 +4513,7 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY, "_worktree_registration_present", return_value=False
         ), patch.object(
             SELF_DEPLOY, "_release_auto_deploy_source_resources",
-            return_value={"released": [cleanup_lease, f["path_lease"]]},
+            return_value={"released": [cleanup_lease, common_dir_lease, f["path_lease"]]},
         ) as release_resources, patch.object(
             SELF_DEPLOY, "_release_auto_deploy_source_lifecycle", return_value=False
         ) as release_lifecycle, patch.object(
@@ -4372,8 +4527,8 @@ class SelfDeployToolTests(unittest.TestCase):
                 )
         release_resources.assert_called_once_with(
             f["owner"],
-            [cleanup_key, f["path_key"]],
-            [cleanup_lease, f["path_lease"]],
+            [cleanup_key, common_dir_key, f["path_key"]],
+            [cleanup_lease, common_dir_lease, f["path_lease"]],
         )
         release_lifecycle.assert_called_once_with(f["lifecycle"])
         release_retention.assert_called_once_with(f["retention"])
@@ -4389,6 +4544,16 @@ class SelfDeployToolTests(unittest.TestCase):
             "expires_at_unix": 200,
             "metadata_sha256": "3" * 64,
         }
+        common_dir = f["canonical"] / ".git"
+        common_dir_key = f"path:{common_dir}"
+        common_dir_lease = {
+            "resource_key": common_dir_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 20,
+            "updated_at_unix": 20,
+            "expires_at_unix": 200,
+            "metadata_sha256": "4" * 64,
+        }
         materialization = {
             "expected_head": f["expected"],
             "repository": str(f["target"]),
@@ -4400,9 +4565,16 @@ class SelfDeployToolTests(unittest.TestCase):
         }
         resources = types.ModuleType("grabowski_resources")
         resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
-        resources.acquire_resources = Mock(return_value={"leases": [cleanup_lease]})
-        with patch.dict(sys.modules, {"grabowski_resources": resources}), patch.object(
+        resources.acquire_resources = Mock(return_value={"leases": [cleanup_lease, common_dir_lease]})
+        checkouts = types.ModuleType("grabowski_checkouts")
+        checkouts._require_no_checkout_operation_uncertainty = Mock(return_value=None)
+        with patch.dict(
+            sys.modules,
+            {"grabowski_resources": resources, "grabowski_checkouts": checkouts},
+        ), patch.object(
             SELF_DEPLOY, "_validated_repository_path", return_value=f["canonical"]
+        ), patch.object(
+            SELF_DEPLOY, "_git_common_directory", return_value=common_dir
         ), patch.object(
             SELF_DEPLOY, "_deployment_source_preflight",
             return_value=(f["target"], f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH, f["identity"]),

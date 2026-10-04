@@ -4043,6 +4043,7 @@ def _cleanup_auto_deploy_source_before_dispatch(
     source_identity: dict[str, Any],
     materialization: dict[str, Any],
 ) -> dict[str, Any]:
+    import grabowski_checkouts as checkouts
     import grabowski_resources as resources
 
     if materialization.get("expected_head") != expected_head:
@@ -4088,19 +4089,30 @@ def _cleanup_auto_deploy_source_before_dispatch(
         effect_class="worktree_admin",
         operation_class="worktree-admin",
     )
+    common_dir = _git_common_directory(canonical)
+    common_dir_key = f"path:{common_dir}"
     cleanup_lease: dict[str, Any] | None = None
+    common_dir_lease: dict[str, Any] | None = None
     mutation_attempted = False
     mutation_result: dict[str, Any] | None = None
     mutation_error: Exception | None = None
     try:
         acquisition = resources.acquire_resources(
             owner_id,
-            [cleanup_key],
+            [cleanup_key, common_dir_key],
             purpose=f"remove unused detached runtime deploy source {expected_head[:12]}",
             ttl_seconds=AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS,
             metadata={"operation_scope": cleanup_scope},
         )
         cleanup_lease = _lease_for_key(acquisition, cleanup_key)
+        common_dir_lease = _lease_for_key(acquisition, common_dir_key)
+        try:
+            checkouts._require_no_checkout_operation_uncertainty([common_dir_key])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "automatic deployment source cleanup is blocked before mutation "
+                "by checkout coordination"
+            ) from exc
         mutation_attempted = True
         try:
             mutation_result = _mutating_git_result(
@@ -4132,11 +4144,11 @@ def _cleanup_auto_deploy_source_before_dispatch(
         try:
             release = _release_auto_deploy_source_resources(
                 owner_id,
-                [cleanup_key, path_key],
-                [cleanup_lease, path_lease],
+                [cleanup_key, common_dir_key, path_key],
+                [cleanup_lease, common_dir_lease, path_lease],
             )
             released = release.get("released")
-            if not isinstance(released, list) or len(released) != 2:
+            if not isinstance(released, list) or len(released) != 3:
                 post_remove_failures.append(
                     (
                         "resource-release",
@@ -4211,21 +4223,31 @@ def _cleanup_auto_deploy_source_before_dispatch(
     except Exception as exc:
         cleanup_failures: list[tuple[str, Exception]] = []
         if not mutation_attempted:
-            candidate_cleanup_lease = cleanup_lease
-            if candidate_cleanup_lease is None:
-                try:
-                    candidate_cleanup_lease = _live_auto_deploy_source_lease_snapshot(
-                        cleanup_key, owner_id
-                    )
-                except Exception as cleanup_error:
-                    cleanup_failures.append(("cleanup-lease-readback", cleanup_error))
-                    candidate_cleanup_lease = None
-            if candidate_cleanup_lease is not None:
+            release_keys: list[str] = []
+            release_leases: list[dict[str, Any]] = []
+            for label, resource_key, candidate_lease in (
+                ("cleanup", cleanup_key, cleanup_lease),
+                ("common-dir", common_dir_key, common_dir_lease),
+            ):
+                if candidate_lease is None:
+                    try:
+                        candidate_lease = _live_auto_deploy_source_lease_snapshot(
+                            resource_key, owner_id
+                        )
+                    except Exception as cleanup_error:
+                        cleanup_failures.append(
+                            (f"{label}-lease-readback", cleanup_error)
+                        )
+                        candidate_lease = None
+                if candidate_lease is not None:
+                    release_keys.append(resource_key)
+                    release_leases.append(candidate_lease)
+            if release_keys:
                 try:
                     _release_auto_deploy_source_resources(
                         owner_id,
-                        [cleanup_key],
-                        [candidate_cleanup_lease],
+                        release_keys,
+                        release_leases,
                     )
                 except Exception as cleanup_error:
                     cleanup_failures.append(("cleanup-operation-release", cleanup_error))
