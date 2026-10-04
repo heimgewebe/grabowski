@@ -142,9 +142,11 @@ python3 tools/external_review_plain.py \
   --model grok-4.6
 ```
 
-The default executable name is `grok`, but it must resolve to the canonical
-owner-controlled native binary behind `~/.grok/bin/grok`. Wrappers elsewhere on
-`PATH`, including npm or Node trampolines, fail closed.
+The default executable is the fixed canonical native path
+`~/.grok/bin/grok`; it is not resolved through `PATH`. Wrappers elsewhere on
+`PATH`, including npm or Node trampolines, are therefore never selected when
+`--executable` is omitted. An explicit `--executable` must still resolve to the
+same canonical native binary.
 
 ## Ox Alpha (retired)
 
