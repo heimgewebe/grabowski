@@ -3994,20 +3994,6 @@ def _materialize_auto_deploy_source(
             except Exception as cleanup_error:
                 cleanup_failures.append(("obligation-block", cleanup_error))
         preserve_recovery_asset = bool(mutation_attempted and recovery_asset_present)
-        if (
-            uncertainty_fence is not None
-            and not uncertainty_fence_cleared
-            and not preserve_recovery_asset
-        ):
-            try:
-                _clear_auto_deploy_source_uncertainty(
-                    uncertainty_fence,
-                    outcome="confirmed_no_effect",
-                    reason="automatic deployment source mutation had no observed effect",
-                )
-                uncertainty_fence_cleared = True
-            except Exception as cleanup_error:
-                cleanup_failures.append(("uncertainty-fence-clear", cleanup_error))
         if lifecycle is not None and not preserve_recovery_asset:
             try:
                 if not _release_auto_deploy_source_lifecycle(lifecycle):
@@ -4077,7 +4063,7 @@ def _materialize_auto_deploy_source(
                 cleanup_failures.append(("resource-release", cleanup_error))
         if (
             obligation_blocked is not None
-            and not mutation_attempted
+            and not preserve_recovery_asset
             and not cleanup_failures
         ):
             try:
@@ -4086,6 +4072,21 @@ def _materialize_auto_deploy_source(
                 )
             except Exception as cleanup_error:
                 cleanup_failures.append(("obligation-resolve", cleanup_error))
+        if (
+            uncertainty_fence is not None
+            and not uncertainty_fence_cleared
+            and not preserve_recovery_asset
+            and not cleanup_failures
+        ):
+            try:
+                _clear_auto_deploy_source_uncertainty(
+                    uncertainty_fence,
+                    outcome="confirmed_no_effect",
+                    reason="automatic deployment source mutation had no observed effect",
+                )
+                uncertainty_fence_cleared = True
+            except Exception as cleanup_error:
+                cleanup_failures.append(("uncertainty-fence-clear", cleanup_error))
         if cleanup_failures:
             raise RuntimeError(
                 f"{type(exc).__name__}: {exc}; cleanup failures: "

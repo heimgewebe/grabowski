@@ -3106,7 +3106,11 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY,
             "_release_auto_deploy_source_resources",
             return_value={"released": [f["operation_lease"], f["path_lease"]]},
-        ) as release_resources:
+        ) as release_resources, patch.object(
+            SELF_DEPLOY,
+            "_resolve_auto_deploy_source_obligation_no_effect",
+            return_value={"resolution_disposition": "resolved"},
+        ) as resolve_obligation:
             with self.assertRaisesRegex(RuntimeError, "no observed effect"):
                 SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
         release_lifecycle.assert_called_once_with(f["lifecycle"])
@@ -3115,6 +3119,178 @@ class SelfDeployToolTests(unittest.TestCase):
             [f["operation_key"], f["path_key"]],
             [f["operation_lease"], f["path_lease"]],
         )
+        resolve_obligation.assert_called_once_with(
+            f["plan"],
+            {"state": "blocked"},
+        )
+
+    def test_auto_deploy_source_no_effect_clears_fence_only_after_cleanup(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        common_dir_key = f"path:{f['canonical'] / '.git'}"
+        common_dir_lease = {
+            "resource_key": common_dir_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 10,
+            "updated_at_unix": 10,
+            "expires_at_unix": 100,
+            "metadata_sha256": "3" * 64,
+        }
+        drifted = dict(f["stale"])
+        drifted["current_head"] = "c" * 40
+        blocked = {"state": "blocked"}
+        with patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            side_effect=[f["stale"], drifted],
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=f["plan"]
+        ), patch.object(
+            SELF_DEPLOY,
+            "_acquire_auto_deploy_source_resources",
+            return_value={
+                "leases": [
+                    f["operation_lease"],
+                    f["path_lease"],
+                    common_dir_lease,
+                ],
+                "common_dir_key": common_dir_key,
+                "checkout_uncertainty_fence": {"fence_id": "f" * 32},
+            },
+        ), patch.object(
+            SELF_DEPLOY,
+            "_open_auto_deploy_source_obligation",
+            return_value={"state": "open", "obligation_id": f["plan"]["obligation_id"]},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_reserve_auto_deploy_source_lifecycle",
+            return_value=f["lifecycle"],
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", return_value=False
+        ), patch.object(
+            SELF_DEPLOY,
+            "_block_auto_deploy_source_obligation",
+            return_value=blocked,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_release_auto_deploy_source_lifecycle",
+            return_value=True,
+        ) as release_lifecycle, patch.object(
+            SELF_DEPLOY,
+            "_release_auto_deploy_source_resources",
+            return_value={
+                "released": [
+                    f["operation_lease"],
+                    common_dir_lease,
+                    f["path_lease"],
+                ]
+            },
+        ) as release_resources, patch.object(
+            SELF_DEPLOY,
+            "_resolve_auto_deploy_source_obligation_no_effect",
+            return_value={"resolution_disposition": "resolved"},
+        ) as resolve_obligation, patch.object(
+            SELF_DEPLOY,
+            "_clear_auto_deploy_source_uncertainty",
+            return_value={"cleared_at_unix": 11},
+        ) as clear_uncertainty:
+            ordering = Mock()
+            ordering.attach_mock(release_lifecycle, "release_lifecycle")
+            ordering.attach_mock(release_resources, "release_resources")
+            ordering.attach_mock(resolve_obligation, "resolve_obligation")
+            ordering.attach_mock(clear_uncertainty, "clear_uncertainty")
+            with self.assertRaisesRegex(RuntimeError, "canonical main state drifted"):
+                SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
+
+        self.assertEqual(
+            [item[0] for item in ordering.mock_calls],
+            [
+                "release_lifecycle",
+                "release_resources",
+                "resolve_obligation",
+                "clear_uncertainty",
+            ],
+        )
+        resolve_obligation.assert_called_once_with(f["plan"], blocked)
+        clear_uncertainty.assert_called_once_with(
+            {"fence_id": "f" * 32},
+            outcome="confirmed_no_effect",
+            reason="automatic deployment source mutation had no observed effect",
+        )
+
+    def test_auto_deploy_source_no_effect_cleanup_failure_keeps_fence(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        common_dir_key = f"path:{f['canonical'] / '.git'}"
+        common_dir_lease = {
+            "resource_key": common_dir_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 10,
+            "updated_at_unix": 10,
+            "expires_at_unix": 100,
+            "metadata_sha256": "3" * 64,
+        }
+        drifted = dict(f["stale"])
+        drifted["current_head"] = "c" * 40
+        with patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            side_effect=[f["stale"], drifted],
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=f["plan"]
+        ), patch.object(
+            SELF_DEPLOY,
+            "_acquire_auto_deploy_source_resources",
+            return_value={
+                "leases": [
+                    f["operation_lease"],
+                    f["path_lease"],
+                    common_dir_lease,
+                ],
+                "common_dir_key": common_dir_key,
+                "checkout_uncertainty_fence": {"fence_id": "f" * 32},
+            },
+        ), patch.object(
+            SELF_DEPLOY,
+            "_open_auto_deploy_source_obligation",
+            return_value={"state": "open", "obligation_id": f["plan"]["obligation_id"]},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_reserve_auto_deploy_source_lifecycle",
+            return_value=f["lifecycle"],
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", return_value=False
+        ), patch.object(
+            SELF_DEPLOY,
+            "_block_auto_deploy_source_obligation",
+            return_value={"state": "blocked"},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_release_auto_deploy_source_lifecycle",
+            return_value=False,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_release_auto_deploy_source_resources",
+            return_value={
+                "released": [
+                    f["operation_lease"],
+                    common_dir_lease,
+                    f["path_lease"],
+                ]
+            },
+        ), patch.object(
+            SELF_DEPLOY,
+            "_resolve_auto_deploy_source_obligation_no_effect",
+        ) as resolve_obligation, patch.object(
+            SELF_DEPLOY,
+            "_clear_auto_deploy_source_uncertainty",
+        ) as clear_uncertainty:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "cleanup failures: lifecycle-release",
+            ):
+                SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
+
+        resolve_obligation.assert_not_called()
+        clear_uncertainty.assert_not_called()
 
     def test_auto_deploy_source_timeout_never_proves_no_effect(self) -> None:
         f = self._auto_deploy_uncertain_fixture()
