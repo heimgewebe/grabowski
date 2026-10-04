@@ -184,6 +184,7 @@ def _load_operator_module():
     fake_base._transport_authorize_connector_tool = (
         lambda context, tool_name, arguments=None: None
     )
+    fake_base._flowlines_verified_identity = lambda request_context: None
     fake_base._retain_pending_transport_target = (
         lambda challenge_receipt_sha256, **kwargs: {
             "challenge_receipt_sha256": challenge_receipt_sha256,
@@ -329,11 +330,12 @@ class OperatorContractTests(unittest.TestCase):
         main_marker = "def main() -> None:"
         self.assertEqual(source.count(main_marker), 1)
         main = source.split(main_marker, 1)[1]
-        configure = (
-            "grabowski_flowlines.configure_flowlines_observability"
-            "(mcp, READ_ONLY)"
-        )
+        configure = "grabowski_flowlines.configure_flowlines_observability("
         self.assertIn(configure, main)
+        self.assertIn(
+            "verified_identity_resolver=base._flowlines_verified_identity",
+            main,
+        )
         for later in (
             "_install_deployment_admission_gate()",
             "_configure_posthog_mcp_analytics()",

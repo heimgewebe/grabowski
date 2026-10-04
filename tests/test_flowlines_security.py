@@ -288,6 +288,38 @@ class FlowlinesSecurityRegressionTests(unittest.TestCase):
         self.assertIn("configure_flowlines_observability(", main_block)
         self.assertIn("load_environment_exporter=False", main_block)
 
+    def test_all_forbidden_otlp_auth_variables_are_consumed(self) -> None:
+        environment = {
+            "GRABOWSKI_FLOWLINES_ENABLED": "0",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "https://api.flowlines.ai",
+            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "https://api.flowlines.ai/v1/traces",
+        }
+        environment.update({key: "fixture-secret" for key in flowlines._FLOWLINES_FORBIDDEN_EXPORT_ENV})
+        with mock.patch.dict(os.environ, environment, clear=True):
+            tracer, provider = flowlines._build_environment_tracer()
+            self.assertIsNone(tracer)
+            self.assertIsNone(provider)
+            for key in flowlines._FLOWLINES_FORBIDDEN_EXPORT_ENV:
+                self.assertNotIn(key, os.environ)
+
+    def test_production_entrypoints_bind_verified_flowlines_identity(self) -> None:
+        operator = (SRC / "grabowski_operator.py").read_text(encoding="utf-8")
+        runtime = (SRC / "grabowski_runtime.py").read_text(encoding="utf-8")
+        self.assertIn("verified_identity_resolver=base._flowlines_verified_identity", operator)
+        self.assertIn("verified_identity_resolver=grabowski_mcp._flowlines_verified_identity", runtime)
+
+    def test_child_boundaries_strip_full_otlp_auth_surface(self) -> None:
+        operator = (SRC / "grabowski_operator.py").read_text(encoding="utf-8")
+        mcp = (SRC / "grabowski_mcp.py").read_text(encoding="utf-8")
+        sandbox = (SRC / "grabowski_agent_sandbox.py").read_text(encoding="utf-8")
+        service = (ROOT / "systemd" / "grabowski-operator.service.example").read_text(encoding="utf-8")
+        for key in flowlines._FLOWLINES_FORBIDDEN_EXPORT_ENV:
+            with self.subTest(key=key):
+                self.assertIn(key, operator)
+                self.assertIn(key, mcp)
+                self.assertIn(key, sandbox)
+                self.assertIn(key, service)
+
 
 if __name__ == "__main__":
     unittest.main()

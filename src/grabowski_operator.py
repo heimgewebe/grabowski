@@ -324,6 +324,14 @@ SENSITIVE_ENV_KEYS = frozenset(
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
         "OTEL_EXPORTER_OTLP_HEADERS",
         "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
     }
 )
 PRIVILEGE_ESCALATORS = {"sudo", "su", "pkexec", "doas"}
@@ -10484,7 +10492,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     _configure_faulthandler()
-    grabowski_flowlines.configure_flowlines_observability(mcp, READ_ONLY)
+    grabowski_flowlines.configure_flowlines_observability(
+        mcp,
+        READ_ONLY,
+        verified_identity_resolver=base._flowlines_verified_identity,
+    )
     if args.transport == "streamable-http":
         if args.host != "127.0.0.1":
             raise SystemExit(
