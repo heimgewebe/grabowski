@@ -1486,6 +1486,7 @@ class IndexedInflightJobEvidenceGateTests(unittest.TestCase):
             result["competing_deployment"]["state"],
             "not_evaluated_due_to_stop_gate",
         )
+        self.assertIsNone(result["checks"]["no_competing_deployment"])
         competing.assert_not_called()
 
     def test_volatile_recheck_short_circuits_deploy_index_when_blockade_denies(self) -> None:
@@ -1508,6 +1509,7 @@ class IndexedInflightJobEvidenceGateTests(unittest.TestCase):
             result["competing_deployment"]["state"],
             "not_evaluated_due_to_stop_gate",
         )
+        self.assertIsNone(result["checks"]["no_competing_deployment"])
         competing.assert_not_called()
 
     def test_identical_running_intent_is_reported_as_idempotent(self) -> None:

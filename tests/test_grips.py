@@ -15165,6 +15165,58 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 expected_head=CAPTAIN_HEAD,
             )
         )
+        partial_reconciliation_material = {
+            **reconciliation_material,
+            "audit_recorded": False,
+        }
+        partial_reconciliation = {
+            **partial_reconciliation_material,
+            "evidence_sha256": grips.sha256_json(partial_reconciliation_material),
+        }
+        authority_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_rootbroker_authority_effect",
+            "expected_head": CAPTAIN_HEAD,
+            "outcome": "succeeded",
+            "attested_head": CAPTAIN_HEAD,
+            "effect_started": True,
+            "request_id": "rootbroker-test",
+            "reference_sha256": "c" * 64,
+        }
+        authority = {
+            **authority_material,
+            "evidence_sha256": grips.sha256_json(authority_material),
+        }
+        three_effect_bundle_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_local_mutation_bundle",
+            "effects": [partial_reconciliation, refresh, authority],
+        }
+        three_effect_bundle = {
+            **three_effect_bundle_material,
+            "evidence_sha256": grips.sha256_json(three_effect_bundle_material),
+        }
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                partial_reconciliation,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                authority,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                three_effect_bundle,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
         for update_ref in (
             {"returncode": 1, "timed_out": False, "reported_success": False},
             {"returncode": None, "timed_out": True, "reported_success": False},
@@ -15380,7 +15432,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             expected_job_prefix=job_prefix,
             expected_source_identity_sha256="e" * 64,
         )
-        self.assertIn(
+        self.assertNotIn(
             "runtime_deploy_schedule_local_mutation_evidence_invalid",
             local_mutation_errors,
         )

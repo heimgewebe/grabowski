@@ -1607,23 +1607,34 @@ def _reconcile_stale_pending_reservation(
         units=list(index["units"]),
         pending_unit=None,
     )
-    _append_deploy_audit(
-        {
-            "timestamp_unix": int(time.time()),
-            "operation": "runtime-deploy-stale-pending-cleared",
-            "unit": pending,
-            "dispatch_readback": readback,
-        }
-    )
     effect_material = {
         "schema_version": 1,
         "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
         "unit": pending,
         "dispatch_outcome": "not_started",
         "deploy_index_updated": True,
-        "audit_recorded": True,
+        "audit_recorded": False,
         "index_updated_at_unix": reconciled["updated_at_unix"],
     }
+    try:
+        _append_deploy_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "runtime-deploy-stale-pending-cleared",
+                "unit": pending,
+                "dispatch_readback": readback,
+            }
+        )
+    except Exception as exc:
+        effect = {
+            **effect_material,
+            "evidence_sha256": _source_identity_sha256(effect_material),
+        }
+        raise DeployScheduleFailureAfterLocalMutation(
+            f"stale pending reservation audit failed after deploy-index clear: {exc}",
+            local_mutation_evidence=effect,
+        ) from exc
+    effect_material["audit_recorded"] = True
     effect = {
         **effect_material,
         "evidence_sha256": _source_identity_sha256(effect_material),
@@ -1683,11 +1694,37 @@ class DeployScheduleFailureAfterLocalMutation(RuntimeError):
         self.local_mutation_evidence = dict(local_mutation_evidence)
 
 
+def _rootbroker_authority_effect_evidence(
+    authority: Any,
+    expected_head: str,
+) -> dict[str, Any] | None:
+    if not isinstance(authority, dict) or authority.get("effect_started") is not True:
+        return None
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_rootbroker_authority_effect",
+        "expected_head": expected_head,
+        "outcome": authority.get("outcome"),
+        "attested_head": authority.get("attested_head"),
+        "effect_started": True,
+        "request_id": authority.get("request_id"),
+        "reference_sha256": authority.get("reference_sha256"),
+    }
+    return {
+        **material,
+        "evidence_sha256": _source_identity_sha256(material),
+    }
+
+
 def _tracked_runtime_deploy_local_mutation_evidence(
     tracker: dict[str, Any],
 ) -> dict[str, Any] | None:
     effects: list[dict[str, Any]] = []
-    for key in ("stale_pending_reconciliation", "origin_main_refresh"):
+    for key in (
+        "stale_pending_reconciliation",
+        "origin_main_refresh",
+        "rootbroker_authority",
+    ):
         value = tracker.get(key)
         if value is None:
             continue
@@ -2361,6 +2398,15 @@ def inflight_runtime_job_evidence(
             evidence["stale_pending_reconciliation"] = reconciliation
         else:
             index = _deploy_index(jobs_root)
+    except DeployScheduleFailureAfterLocalMutation as exc:
+        evidence["stale_pending_reconciliation"] = dict(
+            exc.local_mutation_evidence
+        )
+        evidence["error"] = (
+            "deployment stale-pending reconciliation failed after a known "
+            f"local mutation: {exc}"
+        )
+        return evidence
     except (OSError, RuntimeError, ValueError) as exc:
         evidence["error"] = f"deployment job index is unreadable: {exc}"
         return evidence
@@ -3721,6 +3767,7 @@ def _materialize_auto_deploy_source(
     common_dir_lease: dict[str, Any] | None = None
     uncertainty_fence: dict[str, Any] | None = None
     uncertainty_fence_cleared = False
+    preserve_uncertainty_fence = False
     created = False
     mutation_attempted = False
     recovery_asset_present = False
@@ -3754,7 +3801,25 @@ def _materialize_auto_deploy_source(
                     "automatic deployment source checkout uncertainty fence is missing"
                 )
             uncertainty_fence = dict(raw_uncertainty_fence)
-        obligation = _open_auto_deploy_source_obligation(plan, expected_head)
+        try:
+            obligation = _open_auto_deploy_source_obligation(plan, expected_head)
+        except Exception as open_error:
+            import grabowski_operator_obligation as obligations
+
+            try:
+                obligation = obligations.status_obligation(plan["obligation_id"])
+            except FileNotFoundError:
+                raise open_error
+            except Exception:
+                preserve_uncertainty_fence = True
+                raise open_error
+            if (
+                not isinstance(obligation, dict)
+                or obligation.get("obligation_id") != plan["obligation_id"]
+                or obligation.get("state") != "open"
+            ):
+                preserve_uncertainty_fence = True
+                raise open_error
         obligation_state = obligation.get("state")
         if obligation_state != "open":
             raise RuntimeError(
@@ -4076,6 +4141,7 @@ def _materialize_auto_deploy_source(
             uncertainty_fence is not None
             and not uncertainty_fence_cleared
             and not preserve_recovery_asset
+            and not preserve_uncertainty_fence
             and not cleanup_failures
         ):
             try:
@@ -5012,6 +5078,11 @@ def _grabowski_runtime_deploy_schedule_impl(
                     None,
                 )
         authority = privileged.ensure_rootbroker_authority(expected_head)
+        authority_effect = _rootbroker_authority_effect_evidence(
+            authority, expected_head
+        )
+        if authority_effect is not None:
+            local_mutation_tracker["rootbroker_authority"] = authority_effect
         if not authority.get("success"):
             raise RuntimeError(
                 "Rootbroker authority refresh failed before deployment scheduling: "
@@ -5185,7 +5256,9 @@ def _grabowski_runtime_deploy_schedule_impl(
                 already_scheduled=True,
                 source_identity=source_identity,
                 automatic_source=automatic_source_binding,
-                local_mutation_evidence=local_mutation_evidence,
+                local_mutation_evidence=_tracked_runtime_deploy_local_mutation_evidence(
+                    local_mutation_tracker
+                ),
             )
 
         intent = {
@@ -5325,7 +5398,9 @@ def _grabowski_runtime_deploy_schedule_impl(
             already_scheduled=False,
             source_identity=source_identity,
             automatic_source=automatic_source_binding,
-            local_mutation_evidence=local_mutation_evidence,
+            local_mutation_evidence=_tracked_runtime_deploy_local_mutation_evidence(
+                local_mutation_tracker
+            ),
             deployment_observer_capability=observer_capability,
         )
 

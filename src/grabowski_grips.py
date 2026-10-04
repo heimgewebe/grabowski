@@ -15541,7 +15541,7 @@ def _runtime_deploy_stale_pending_reconciliation_valid(
         == "grabowski_runtime_deploy_stale_pending_reconciliation"
         and evidence.get("dispatch_outcome") == "not_started"
         and evidence.get("deploy_index_updated") is True
-        and evidence.get("audit_recorded") is True
+        and isinstance(evidence.get("audit_recorded"), bool)
         and not isinstance(evidence.get("index_updated_at_unix"), bool)
         and isinstance(evidence.get("index_updated_at_unix"), int)
         and evidence.get("index_updated_at_unix", -1) >= 0
@@ -15649,6 +15649,62 @@ def _runtime_deploy_origin_main_refresh_evidence_valid(
     )
 
 
+def _runtime_deploy_rootbroker_authority_evidence_valid(
+    evidence: Any,
+    *,
+    expected_head: str,
+) -> bool:
+    fields = {
+        "schema_version",
+        "kind",
+        "expected_head",
+        "outcome",
+        "attested_head",
+        "effect_started",
+        "request_id",
+        "reference_sha256",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    material = {
+        key: value
+        for key, value in evidence.items()
+        if key != "evidence_sha256"
+    }
+    attested_head = evidence.get("attested_head")
+    request_id = evidence.get("request_id")
+    reference_sha256 = evidence.get("reference_sha256")
+    return bool(
+        evidence.get("schema_version") == 1
+        and evidence.get("kind")
+        == "grabowski_runtime_deploy_rootbroker_authority_effect"
+        and evidence.get("expected_head") == expected_head
+        and isinstance(evidence.get("outcome"), str)
+        and bool(evidence.get("outcome"))
+        and evidence.get("effect_started") is True
+        and (
+            attested_head is None
+            or (
+                isinstance(attested_head, str)
+                and re.fullmatch(r"[0-9a-f]{40}", attested_head) is not None
+            )
+        )
+        and (
+            request_id is None
+            or (isinstance(request_id, str) and 0 < len(request_id) <= 256)
+        )
+        and (
+            reference_sha256 is None
+            or (
+                isinstance(reference_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", reference_sha256) is not None
+            )
+        )
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
+
+
 def _runtime_deploy_local_mutation_evidence_valid(
     evidence: Any,
     *,
@@ -15661,6 +15717,11 @@ def _runtime_deploy_local_mutation_evidence_valid(
     ):
         return True
     if _runtime_deploy_origin_main_refresh_evidence_valid(
+        evidence,
+        expected_head=expected_head,
+    ):
+        return True
+    if _runtime_deploy_rootbroker_authority_evidence_valid(
         evidence,
         expected_head=expected_head,
     ):
@@ -15679,17 +15740,38 @@ def _runtime_deploy_local_mutation_evidence_valid(
     ):
         return False
     effects = evidence.get("effects")
-    if not isinstance(effects, list) or len(effects) != 2:
+    if not isinstance(effects, list) or not 2 <= len(effects) <= 3:
         return False
-    if not _runtime_deploy_stale_pending_reconciliation_valid(
-        effects[0],
-        expected_job_prefix=expected_job_prefix,
-    ):
-        return False
-    if not _runtime_deploy_origin_main_refresh_evidence_valid(
-        effects[1],
-        expected_head=expected_head,
-    ):
+    expected_order = {
+        "grabowski_runtime_deploy_stale_pending_reconciliation": 0,
+        "grabowski_runtime_deploy_origin_main_refresh": 1,
+        "grabowski_runtime_deploy_rootbroker_authority_effect": 2,
+    }
+    observed_order: list[int] = []
+    for effect in effects:
+        kind = effect.get("kind") if isinstance(effect, dict) else None
+        order = expected_order.get(kind)
+        if order is None:
+            return False
+        observed_order.append(order)
+        if kind == "grabowski_runtime_deploy_stale_pending_reconciliation":
+            valid = _runtime_deploy_stale_pending_reconciliation_valid(
+                effect,
+                expected_job_prefix=expected_job_prefix,
+            )
+        elif kind == "grabowski_runtime_deploy_origin_main_refresh":
+            valid = _runtime_deploy_origin_main_refresh_evidence_valid(
+                effect,
+                expected_head=expected_head,
+            )
+        else:
+            valid = _runtime_deploy_rootbroker_authority_evidence_valid(
+                effect,
+                expected_head=expected_head,
+            )
+        if not valid:
+            return False
+    if observed_order != sorted(set(observed_order)):
         return False
     material = {
         key: value

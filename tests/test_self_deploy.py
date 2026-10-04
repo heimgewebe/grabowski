@@ -542,6 +542,74 @@ class SelfDeployToolTests(unittest.TestCase):
             self.assertTrue(reconciliation["audit_recorded"])
             self.assertRegex(reconciliation["evidence_sha256"], r"^[0-9a-f]{64}$")
 
+    def test_stale_pending_reservation_preserves_index_clear_evidence_when_audit_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            unit = "grabowski-job-abcdef012345"
+            SELF_DEPLOY._write_deploy_index(jobs, units=[], pending_unit=unit)
+            readback = {
+                "query_valid": True,
+                "outcome": "not_started",
+                "load_state": "not-found",
+                "active_state": "inactive",
+            }
+            with patch.object(
+                SELF_DEPLOY.operator, "_unit_dispatch_readback", return_value=readback
+            ), patch.object(
+                SELF_DEPLOY,
+                "_append_deploy_audit",
+                side_effect=OSError("audit unavailable"),
+            ):
+                with self.assertRaises(
+                    SELF_DEPLOY.DeployScheduleFailureAfterLocalMutation
+                ) as raised:
+                    SELF_DEPLOY._reconcile_stale_pending_reservation(jobs)
+            index = SELF_DEPLOY._read_deploy_index(jobs)
+            self.assertIsNotNone(index)
+            assert index is not None
+            self.assertIsNone(index["pending_unit"])
+            evidence = raised.exception.local_mutation_evidence
+            self.assertTrue(evidence["deploy_index_updated"])
+            self.assertFalse(evidence["audit_recorded"])
+            material = {
+                key: value
+                for key, value in evidence.items()
+                if key != "evidence_sha256"
+            }
+            self.assertEqual(
+                evidence["evidence_sha256"],
+                SELF_DEPLOY._source_identity_sha256(material),
+            )
+
+    def test_inflight_evidence_preserves_stale_pending_mutation_when_reconciliation_audit_fails(self) -> None:
+        evidence_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-abcdef012345",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": False,
+            "index_updated_at_unix": 1,
+        }
+        evidence = {
+            **evidence_material,
+            "evidence_sha256": SELF_DEPLOY._source_identity_sha256(evidence_material),
+        }
+        with patch.object(
+            SELF_DEPLOY,
+            "_reconcile_stale_pending_reservation",
+            side_effect=SELF_DEPLOY.DeployScheduleFailureAfterLocalMutation(
+                "audit unavailable",
+                local_mutation_evidence=evidence,
+            ),
+        ):
+            result = SELF_DEPLOY.inflight_runtime_job_evidence(
+                reconcile_stale_pending=True
+            )
+        self.assertEqual(result["stale_pending_reconciliation"], evidence)
+        self.assertIn("audit unavailable", result["error"])
+
     def test_stale_pending_reservation_preserves_ambiguous_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             jobs = Path(temporary) / "jobs"
@@ -2544,6 +2612,147 @@ class SelfDeployToolTests(unittest.TestCase):
                 SELF_DEPLOY._materialize_auto_deploy_source(expected)
 
         self.assertEqual(events, ["acquire", "open"])
+
+    def test_materialize_ambiguous_obligation_open_keeps_recovery_fence(self) -> None:
+        expected = "b" * 40
+        canonical = Path("/tmp/pr1366-canonical")
+        target = Path("/tmp/pr1366-auto-source")
+        owner = "runtime-deploy-source:test"
+        operation_key = "repo:test:operation:auto-source"
+        path_key = f"path:{target}"
+        common_dir_key = f"path:{canonical / '.git'}"
+        plan = {
+            "canonical_repository": canonical,
+            "target": target,
+            "owner_id": owner,
+            "generation": "gen000000001",
+            "obligation_id": "goo-runtime-deploy-source-bbbbbbbbbbbb-gen000000001",
+            "operation_key": operation_key,
+            "path_key": path_key,
+        }
+        stale = {
+            "canonical_repository": str(canonical),
+            "current_head": "a" * 40,
+            "target_head": expected,
+            "origin_main": expected,
+            "clean": True,
+            "lease_evidence": {"resource_key": f"path:{canonical}", "lease": None},
+        }
+        leases = [
+            {"resource_key": operation_key, "owner_id": owner, "acquired_at_unix": 1, "updated_at_unix": 1, "expires_at_unix": 100, "metadata_sha256": "1" * 64},
+            {"resource_key": path_key, "owner_id": owner, "acquired_at_unix": 1, "updated_at_unix": 1, "expires_at_unix": 100, "metadata_sha256": "2" * 64},
+            {"resource_key": common_dir_key, "owner_id": owner, "acquired_at_unix": 1, "updated_at_unix": 1, "expires_at_unix": 100, "metadata_sha256": "3" * 64},
+        ]
+        fence = {"fence_id": "a" * 32}
+        fake_obligations = types.ModuleType("grabowski_operator_obligation")
+        fake_obligations.status_obligation = Mock(
+            side_effect=RuntimeError("obligation status unavailable")
+        )
+        with patch.dict(
+            sys.modules, {"grabowski_operator_obligation": fake_obligations}
+        ), patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot", return_value=stale
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=plan
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", return_value=False
+        ), patch.object(
+            SELF_DEPLOY,
+            "_acquire_auto_deploy_source_resources",
+            return_value={
+                "leases": leases,
+                "common_dir_key": common_dir_key,
+                "checkout_uncertainty_fence": fence,
+            },
+        ), patch.object(
+            SELF_DEPLOY,
+            "_open_auto_deploy_source_obligation",
+            side_effect=RuntimeError("post-publish readback failed"),
+        ), patch.object(
+            SELF_DEPLOY, "_clear_auto_deploy_source_uncertainty"
+        ) as clear_fence, patch.object(
+            SELF_DEPLOY,
+            "_release_auto_deploy_source_resources",
+            return_value={"released": leases},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "post-publish readback failed"):
+                SELF_DEPLOY._materialize_auto_deploy_source(expected)
+        fake_obligations.status_obligation.assert_called_once_with(
+            plan["obligation_id"]
+        )
+        clear_fence.assert_not_called()
+
+    def test_materialize_recovers_confirmed_open_obligation_after_open_helper_error(self) -> None:
+        expected = "b" * 40
+        canonical = Path("/tmp/pr1366-canonical")
+        target = Path("/tmp/pr1366-auto-source")
+        owner = "runtime-deploy-source:test"
+        operation_key = "repo:test:operation:auto-source"
+        path_key = f"path:{target}"
+        common_dir_key = f"path:{canonical / '.git'}"
+        plan = {
+            "canonical_repository": canonical,
+            "target": target,
+            "owner_id": owner,
+            "generation": "gen000000001",
+            "obligation_id": "goo-runtime-deploy-source-bbbbbbbbbbbb-gen000000001",
+            "operation_key": operation_key,
+            "path_key": path_key,
+        }
+        stale = {
+            "canonical_repository": str(canonical),
+            "current_head": "a" * 40,
+            "target_head": expected,
+            "origin_main": expected,
+            "clean": True,
+            "lease_evidence": {"resource_key": f"path:{canonical}", "lease": None},
+        }
+        leases = [
+            {"resource_key": operation_key, "owner_id": owner, "acquired_at_unix": 1, "updated_at_unix": 1, "expires_at_unix": 100, "metadata_sha256": "1" * 64},
+            {"resource_key": path_key, "owner_id": owner, "acquired_at_unix": 1, "updated_at_unix": 1, "expires_at_unix": 100, "metadata_sha256": "2" * 64},
+            {"resource_key": common_dir_key, "owner_id": owner, "acquired_at_unix": 1, "updated_at_unix": 1, "expires_at_unix": 100, "metadata_sha256": "3" * 64},
+        ]
+        fake_obligations = types.ModuleType("grabowski_operator_obligation")
+        fake_obligations.status_obligation = Mock(
+            return_value={
+                "obligation_id": plan["obligation_id"],
+                "state": "open",
+            }
+        )
+        reserve = Mock(side_effect=KeyboardInterrupt("stop after confirmed open"))
+        with patch.dict(
+            sys.modules, {"grabowski_operator_obligation": fake_obligations}
+        ), patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot", return_value=stale
+        ), patch.object(
+            SELF_DEPLOY, "_auto_deploy_source_plan", return_value=plan
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", return_value=False
+        ), patch.object(
+            SELF_DEPLOY,
+            "_acquire_auto_deploy_source_resources",
+            return_value={
+                "leases": leases,
+                "common_dir_key": common_dir_key,
+                "checkout_uncertainty_fence": {"fence_id": "a" * 32},
+            },
+        ), patch.object(
+            SELF_DEPLOY,
+            "_open_auto_deploy_source_obligation",
+            side_effect=RuntimeError("post-publish readback failed"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_reserve_auto_deploy_source_lifecycle",
+            reserve,
+        ):
+            with self.assertRaisesRegex(
+                KeyboardInterrupt, "stop after confirmed open"
+            ):
+                SELF_DEPLOY._materialize_auto_deploy_source(expected)
+        fake_obligations.status_obligation.assert_called_once_with(
+            plan["obligation_id"]
+        )
+        reserve.assert_called_once_with(plan, expected)
 
     def test_auto_deploy_source_no_effect_obligation_resolution_is_terminal(self) -> None:
         plan = {
@@ -5604,6 +5813,78 @@ class SelfDeployToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "GitHub main drifted"):
                 SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
         SELF_DEPLOY.operator._start_job.assert_not_called()
+
+    def test_schedule_materialization_refusal_after_rootbroker_effect_preserves_authority_evidence(self) -> None:
+        canonical_state = tempfile.TemporaryDirectory()
+        self.addCleanup(canonical_state.cleanup)
+        canonical = Path(canonical_state.name).resolve()
+        expected = "d" * 40
+        authority = {
+            "success": True,
+            "outcome": "succeeded",
+            "expected_head": expected,
+            "attested_head": expected,
+            "effect_started": True,
+            "request_id": "rootbroker-test",
+            "reference_sha256": "a" * 64,
+        }
+        stale = {
+            "canonical_repository": str(canonical),
+            "current_head": "a" * 40,
+            "current_branch": "feature/active",
+            "target_head": expected,
+            "origin_main": expected,
+            "clean": True,
+            "shallow": False,
+            "lease_evidence": {"resource_key": f"path:{canonical}", "lease": None},
+        }
+        with patch.object(
+            SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=[RuntimeError("HEAD drift"), RuntimeError("HEAD still drifted")],
+        ), patch.object(
+            SELF_DEPLOY, "_canonical_stale_main_snapshot", return_value=stale
+        ), patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": []},
+        ), patch.object(
+            SELF_DEPLOY.privileged,
+            "ensure_rootbroker_authority",
+            return_value=authority,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_require_target_deploy_runner",
+        ), patch.object(
+            SELF_DEPLOY,
+            "_materialize_auto_deploy_source",
+            side_effect=SELF_DEPLOY.DeploySchedulePreEffectRefusal(
+                "common-dir lease busy"
+            ),
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ):
+            with self.assertRaises(
+                SELF_DEPLOY.DeploySchedulePreEffectRefusal
+            ) as raised:
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        evidence = raised.exception.local_mutation_evidence
+        self.assertIsInstance(evidence, dict)
+        assert isinstance(evidence, dict)
+        self.assertEqual(
+            evidence["kind"],
+            "grabowski_runtime_deploy_rootbroker_authority_effect",
+        )
+        self.assertTrue(evidence["effect_started"])
+        self.assertEqual(evidence["expected_head"], expected)
+        self.assertEqual(evidence["request_id"], authority["request_id"])
+        self.assertEqual(
+            evidence["reference_sha256"], authority["reference_sha256"]
+        )
 
     def test_schedule_blocks_when_rootbroker_authority_refresh_fails(self) -> None:
         repo = Path("/home/alex/repos/grabowski")

@@ -451,7 +451,7 @@ def _volatile_gate_recheck(
         "kill_switch_clear": kill_switch_clear,
         "no_blocking_operator_blockade": blockade_allows_mutation,
         "no_competing_deployment": (
-            True
+            None
             if not mutation_allowed
             else (
                 bool(competing.get("deploy_lock_free"))
@@ -463,7 +463,9 @@ def _volatile_gate_recheck(
     return {
         "checked_at_unix": int(time.time()),
         "checks": checks,
-        "reasons": sorted(name for name, passed in checks.items() if not passed),
+        "reasons": sorted(
+            name for name, passed in checks.items() if passed is False
+        ),
         "operator_blockade": blockade,
         "competing_deployment": competing,
     }
