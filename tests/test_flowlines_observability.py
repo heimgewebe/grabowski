@@ -748,6 +748,24 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("user.name", span.attributes)
         self.assertNotIn("user.email", span.attributes)
 
+    async def test_verified_identity_resolver_failure_does_not_fallback_to_client_identity(self) -> None:
+        def broken_resolver(_ctx):
+            raise RuntimeError("verified identity unavailable")
+
+        mcp = self.server(verified_resolver=broken_resolver)
+        result = await self.call(
+            mcp,
+            arguments={
+                "value": "hello",
+                "reason": "Read the fixture value",
+                "user_intent": "Verify resolver failure isolation",
+            },
+            meta=self.meta(**{"user.id": "spoofed"}),
+        )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(result.root.structuredContent, {"value": "hello"})
+        self.assertEqual(self.exporter.get_finished_spans(), ())
+
     async def test_error_span_is_explicit_and_does_not_export_raw_exception(self) -> None:
         mcp = FastMCP("grabowski-test", instructions="fixture")
 
