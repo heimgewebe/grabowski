@@ -15705,6 +15705,63 @@ def _runtime_deploy_rootbroker_authority_evidence_valid(
     )
 
 
+def _runtime_deploy_auto_source_effect_evidence_valid(
+    evidence: Any,
+    *,
+    expected_head: str,
+) -> bool:
+    fields = {
+        "schema_version",
+        "kind",
+        "expected_head",
+        "repository",
+        "owner_id",
+        "generation",
+        "path_resource_key",
+        "target_present",
+        "registration_present",
+        "source_identity_sha256",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    material = {
+        key: value
+        for key, value in evidence.items()
+        if key != "evidence_sha256"
+    }
+    repository = evidence.get("repository")
+    source_identity_sha256 = evidence.get("source_identity_sha256")
+    return bool(
+        evidence.get("schema_version") == 1
+        and evidence.get("kind")
+        == "grabowski_runtime_deploy_auto_source_effect"
+        and evidence.get("expected_head") == expected_head
+        and isinstance(repository, str)
+        and repository.startswith("/")
+        and isinstance(evidence.get("owner_id"), str)
+        and bool(evidence.get("owner_id"))
+        and isinstance(evidence.get("generation"), str)
+        and bool(evidence.get("generation"))
+        and evidence.get("path_resource_key") == f"path:{repository}"
+        and isinstance(evidence.get("target_present"), bool)
+        and isinstance(evidence.get("registration_present"), bool)
+        and (
+            evidence.get("target_present") is True
+            or evidence.get("registration_present") is True
+        )
+        and (
+            source_identity_sha256 is None
+            or (
+                isinstance(source_identity_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", source_identity_sha256)
+                is not None
+            )
+        )
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
+
+
 def _runtime_deploy_local_mutation_evidence_valid(
     evidence: Any,
     *,
@@ -15726,6 +15783,11 @@ def _runtime_deploy_local_mutation_evidence_valid(
         expected_head=expected_head,
     ):
         return True
+    if _runtime_deploy_auto_source_effect_evidence_valid(
+        evidence,
+        expected_head=expected_head,
+    ):
+        return True
     if not isinstance(evidence, dict) or set(evidence) != {
         "schema_version",
         "kind",
@@ -15740,12 +15802,13 @@ def _runtime_deploy_local_mutation_evidence_valid(
     ):
         return False
     effects = evidence.get("effects")
-    if not isinstance(effects, list) or not 2 <= len(effects) <= 3:
+    if not isinstance(effects, list) or not 2 <= len(effects) <= 4:
         return False
     expected_order = {
         "grabowski_runtime_deploy_stale_pending_reconciliation": 0,
         "grabowski_runtime_deploy_origin_main_refresh": 1,
         "grabowski_runtime_deploy_rootbroker_authority_effect": 2,
+        "grabowski_runtime_deploy_auto_source_effect": 3,
     }
     observed_order: list[int] = []
     for effect in effects:
@@ -15764,8 +15827,13 @@ def _runtime_deploy_local_mutation_evidence_valid(
                 effect,
                 expected_head=expected_head,
             )
-        else:
+        elif kind == "grabowski_runtime_deploy_rootbroker_authority_effect":
             valid = _runtime_deploy_rootbroker_authority_evidence_valid(
+                effect,
+                expected_head=expected_head,
+            )
+        else:
+            valid = _runtime_deploy_auto_source_effect_evidence_valid(
                 effect,
                 expected_head=expected_head,
             )

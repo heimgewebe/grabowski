@@ -15217,6 +15217,61 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 expected_head=CAPTAIN_HEAD,
             )
         )
+        auto_source_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_auto_source_effect",
+            "expected_head": CAPTAIN_HEAD,
+            "repository": "/home/alex/repos/.grabowski-deploy-worktrees/auto-current-main-test",
+            "owner_id": "runtime-deploy-source:captain-test",
+            "generation": "gen000000001",
+            "path_resource_key": "path:/home/alex/repos/.grabowski-deploy-worktrees/auto-current-main-test",
+            "target_present": True,
+            "registration_present": True,
+            "source_identity_sha256": "d" * 64,
+        }
+        auto_source = {
+            **auto_source_material,
+            "evidence_sha256": grips.sha256_json(auto_source_material),
+        }
+        four_effect_bundle_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_local_mutation_bundle",
+            "effects": [partial_reconciliation, refresh, authority, auto_source],
+        }
+        four_effect_bundle = {
+            **four_effect_bundle_material,
+            "evidence_sha256": grips.sha256_json(four_effect_bundle_material),
+        }
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                auto_source,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                four_effect_bundle,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+        no_effect_material = {
+            **auto_source_material,
+            "target_present": False,
+            "registration_present": False,
+        }
+        no_effect = {
+            **no_effect_material,
+            "evidence_sha256": grips.sha256_json(no_effect_material),
+        }
+        self.assertFalse(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                no_effect,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
         for update_ref in (
             {"returncode": 1, "timed_out": False, "reported_success": False},
             {"returncode": None, "timed_out": True, "reported_success": False},
