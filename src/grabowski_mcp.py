@@ -973,8 +973,28 @@ SERVER_ONLY_CHILD_ENV_KEYS = frozenset(
     {
         "OTEL_EXPORTER_OTLP_HEADERS",
         "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
         "OTEL_EXPORTER_OTLP_ENDPOINT",
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_METRICS_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_LOGS_CREDENTIAL_PROVIDER",
+        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
     }
 )
 
@@ -5660,6 +5680,26 @@ def _transport_connector_identity(ctx: Context | None) -> str | None:
     if len(matches) != 1:
         raise RuntimeError("transport connector capability is not enrolled")
     return matches[0]
+
+
+def _flowlines_verified_identity(request_context: Any) -> dict[str, str] | None:
+    """Return the server-enrolled connector identity for telemetry when present."""
+    class _ContextAdapter:
+        def __init__(self, request_context: Any) -> None:
+            self.request_context = request_context
+
+    connector_id = _transport_connector_identity(_ContextAdapter(request_context))
+    if connector_id is None:
+        # Streamable HTTP/SSE attach the transport request to RequestContext.
+        # A transport request without an enrolled connector must never fall back
+        # to client-supplied telemetry identity. Stdio/local contexts keep the
+        # existing metadata fallback because their transport request is absent.
+        if getattr(request_context, "request", None) is not None:
+            raise RuntimeError(
+                "Flowlines transport telemetry requires an enrolled connector identity"
+            )
+        return None
+    return {"id": connector_id}
 
 
 def _transport_registered_tool_names() -> list[str]:
