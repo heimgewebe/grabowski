@@ -2589,6 +2589,40 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertFalse(obligation_status["continuation_required"])
         self.assertEqual(obligation_status["resolution_disposition"], "resolved")
 
+    def test_materialize_uncertainty_reconcile_resolves_existing_blocked_obligation(self) -> None:
+        _target, fence, _lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "materialization-failed",
+                        "detail": "Original scheduler already classified materialization as blocked.",
+                        "reference": "auto-deploy-source:test",
+                        "sha256": "7" * 64,
+                    }
+                ],
+                "next_action": "Reconcile the durable checkout uncertainty fence.",
+            }
+        )
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_no_effect")
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
     def test_materialize_uncertainty_reconcile_keeps_fence_when_obligation_recovery_fails(self) -> None:
         _target, fence, lifecycle, _common_dir_key = (
             self._materialize_uncertainty_fixture(create_worktree=False)
@@ -2662,6 +2696,50 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(stored, fence)
         self.assertEqual(set(fence["resource_keys"]), set(resource_keys))
         self.assertIsNone(fence["cleared_at_unix"])
+
+    def test_uncertainty_clear_has_no_post_commit_secondary_readback(self) -> None:
+        target = self.root / "worktrees" / "clear-readback"
+        common_dir = checkouts._git_common_dir(self.repo)
+        owner = "runtime-deploy-source:clear-readback"
+        checkout_key = checkouts._checkout_key(common_dir, target)
+        resource_keys = [f"path:{target}", f"path:{common_dir}"]
+        acquisition = checkouts.resources.acquire_resources(
+            owner,
+            resource_keys,
+            purpose="materialize uncertainty clearance receipt",
+            ttl_seconds=120,
+        )
+        fence = checkouts._persist_checkout_operation_uncertainty(
+            lease={"owner_id": owner, "leases": acquisition["leases"]},
+            checkout_key=checkout_key,
+            owner_id=owner,
+            operation="materialize",
+            operation_id="clear-readback",
+            evidence={
+                "repo": str(self.repo.resolve()),
+                "git_common_dir": str(common_dir),
+                "checkout_path": str(target),
+                "checkout_key": checkout_key,
+                "owner_id": owner,
+                "expected_head": self.head,
+                "expected_branch": None,
+                "obligation_id": "goo-runtime-deploy-source-clear-readback",
+            },
+        )
+        with patch.object(
+            checkouts,
+            "_load_checkout_operation_uncertainty",
+            side_effect=AssertionError("post-commit secondary readback must not run"),
+        ):
+            cleared = checkouts._clear_checkout_operation_uncertainty(
+                fence["fence_id"],
+                outcome="confirmed_no_effect",
+                evidence={"reason": "test"},
+            )
+        self.assertIsNotNone(cleared["cleared_at_unix"])
+        stored = checkouts._load_checkout_operation_uncertainty(fence["fence_id"])
+        self.assertEqual(stored, cleared)
+        self.assertEqual(stored["clearance"]["outcome"], "confirmed_no_effect")
 
     def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:
         self._publish_remote()

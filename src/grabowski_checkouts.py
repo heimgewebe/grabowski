@@ -1721,8 +1721,21 @@ def _clear_checkout_operation_uncertainty(
                 fence_id,
             ),
         )
+        row = connection.execute(
+            "SELECT * FROM operation_uncertainty WHERE fence_id=?",
+            (fence_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Checkout operation uncertainty clearance readback is missing")
+        cleared = _operation_uncertainty_public(row)
+        if (
+            cleared["cleared_at_unix"] is None
+            or cleared["clearance_sha256"] != clearance_sha256
+            or cleared["clearance"] != clearance
+        ):
+            raise RuntimeError("Checkout operation uncertainty clearance readback mismatch")
         connection.commit()
-    return _load_checkout_operation_uncertainty(fence_id)
+    return cleared
 
 
 def _acquire_checkout_resources(
@@ -3212,28 +3225,36 @@ def _resolve_materialize_recovery_obligation(
         "recovery_state": recovery_state,
     }
     recovery_sha256 = _sha256_json(recovery_material)
-    close = obligations.close_obligation(
-        {
-            "obligation_id": obligation_id,
-            "outcome": "blocked",
-            "evidence": [],
-            "blockers": [
-                {
-                    "code": "materialization-recovered",
-                    "detail": (
-                        "Checkout uncertainty recovery proved that the original "
-                        "deployment-source materialization did not remain usable."
-                    ),
-                    "reference": f"checkout-uncertainty:{fence['fence_id']}",
-                    "sha256": recovery_sha256,
-                }
-            ],
-            "next_action": (
-                "No continuation is required for this recovered materialization; "
-                "a future deployment request may create a new obligation."
-            ),
-        }
-    )
+    status = obligations.status_obligation(obligation_id)
+    if status.get("state") == "open":
+        close = obligations.close_obligation(
+            {
+                "obligation_id": obligation_id,
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "materialization-recovered",
+                        "detail": (
+                            "Checkout uncertainty recovery proved that the original "
+                            "deployment-source materialization did not remain usable."
+                        ),
+                        "reference": f"checkout-uncertainty:{fence['fence_id']}",
+                        "sha256": recovery_sha256,
+                    }
+                ],
+                "next_action": (
+                    "No continuation is required for this recovered materialization; "
+                    "a future deployment request may create a new obligation."
+                ),
+            }
+        )
+    elif status.get("state") == "blocked":
+        close = status
+    else:
+        raise RuntimeError(
+            "Materialize recovery obligation is not open or blocked"
+        )
     resolved = obligations.resolve_obligation(
         {
             "obligation_id": obligation_id,
