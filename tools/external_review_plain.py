@@ -2599,13 +2599,24 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     default_executable = {
         "gemini": "agy",
-        "grok": "grok",
         "ox-alpha": "opencode",
     }.get(args.provider)
-    if default_executable is None:
+    if args.provider not in {"gemini", "grok", "ox-alpha"}:
         parser.error("unsupported plain review provider")
-    executable = args.executable or default_executable
     try:
+        if args.executable:
+            executable = args.executable
+        elif args.provider == "grok":
+            try:
+                executable = str(Path.home() / ".grok" / "bin" / "grok")
+            except RuntimeError as exc:
+                raise PlainReviewError(
+                    "Grok review cannot resolve the account home directory"
+                ) from exc
+        elif default_executable is not None:
+            executable = default_executable
+        else:
+            raise PlainReviewError("unsupported plain review provider")
         evidence = run_from_manifest(
             manifest_path=Path(args.manifest),
             output_path=Path(args.output),
