@@ -3731,13 +3731,9 @@ def _materialize_auto_deploy_source(
     operation_lease_released = False
     common_dir_lease_released = False
     try:
-        obligation = _open_auto_deploy_source_obligation(plan, expected_head)
-        obligation_state = obligation.get("state")
-        if obligation_state != "open":
-            raise RuntimeError(
-                "fresh automatic deployment source obligation is not open"
-            )
-        obligation_opened = True
+        # Establish durable recovery authority before opening the obligation.
+        # If the process dies after this point but before open_obligation()
+        # completes, the fence still makes the proven-no-effect gap discoverable.
         acquisition = _acquire_auto_deploy_source_resources(plan, expected_head)
         operation_lease = _lease_for_key(acquisition, plan["operation_key"])
         path_lease = _lease_for_key(acquisition, plan["path_key"])
@@ -3758,6 +3754,13 @@ def _materialize_auto_deploy_source(
                     "automatic deployment source checkout uncertainty fence is missing"
                 )
             uncertainty_fence = dict(raw_uncertainty_fence)
+        obligation = _open_auto_deploy_source_obligation(plan, expected_head)
+        obligation_state = obligation.get("state")
+        if obligation_state != "open":
+            raise RuntimeError(
+                "fresh automatic deployment source obligation is not open"
+            )
+        obligation_opened = True
         lifecycle = _reserve_auto_deploy_source_lifecycle(plan, expected_head)
         locked_snapshot = _canonical_stale_main_snapshot(expected_head)
         if (
@@ -4074,7 +4077,6 @@ def _materialize_auto_deploy_source(
                 cleanup_failures.append(("resource-release", cleanup_error))
         if (
             obligation_blocked is not None
-            and acquisition is None
             and not mutation_attempted
             and not cleanup_failures
         ):
@@ -4147,6 +4149,8 @@ def _cleanup_auto_deploy_source_before_dispatch(
     common_dir_key = f"path:{common_dir}"
     cleanup_lease: dict[str, Any] | None = None
     common_dir_lease: dict[str, Any] | None = None
+    uncertainty_fence: dict[str, Any] | None = None
+    uncertainty_fence_cleared = False
     mutation_attempted = False
     mutation_result: dict[str, Any] | None = None
     mutation_error: Exception | None = None
@@ -4167,6 +4171,31 @@ def _cleanup_auto_deploy_source_before_dispatch(
                 "automatic deployment source cleanup is blocked before mutation "
                 "by checkout coordination"
             ) from exc
+        checkout_key = checkouts._checkout_key(common_dir, repository)
+        uncertainty_fence = checkouts._persist_checkout_operation_uncertainty(
+            lease={
+                "owner_id": owner_id,
+                "leases": [cleanup_lease, common_dir_lease, path_lease],
+            },
+            checkout_key=checkout_key,
+            owner_id=owner_id,
+            operation="cleanup",
+            operation_id=f"auto-source-cleanup:{repository.name}",
+            evidence={
+                "kind": "grabowski_auto_runtime_deploy_source_cleanup_uncertainty",
+                "repo": str(canonical),
+                "git_common_dir": str(common_dir),
+                "checkout_path": str(repository),
+                "checkout_key": checkout_key,
+                "owner_id": owner_id,
+                "expected_head": expected_head,
+                "expected_branch": None,
+                "source_identity_sha256": source_identity_sha256,
+                "lifecycle": lifecycle,
+                "retention": retention,
+                "path_resource_key": path_key,
+            },
+        )
         mutation_attempted = True
         try:
             mutation_result = _mutating_git_result(
@@ -4273,9 +4302,35 @@ def _cleanup_auto_deploy_source_before_dispatch(
                 "cleanup_receipt_sha256": receipt["receipt_sha256"],
             }
         )
+        if uncertainty_fence is not None and not uncertainty_fence_cleared:
+            checkouts._clear_checkout_operation_uncertainty(
+                uncertainty_fence["fence_id"],
+                outcome="confirmed_success",
+                evidence={
+                    "reason": "automatic deployment source cleanup finalized",
+                    "cleanup_receipt_sha256": receipt["receipt_sha256"],
+                },
+            )
+            uncertainty_fence_cleared = True
         return receipt
     except Exception as exc:
         cleanup_failures: list[tuple[str, Exception]] = []
+        if (
+            uncertainty_fence is not None
+            and not uncertainty_fence_cleared
+            and not mutation_attempted
+        ):
+            try:
+                checkouts._clear_checkout_operation_uncertainty(
+                    uncertainty_fence["fence_id"],
+                    outcome="confirmed_no_effect",
+                    evidence={
+                        "reason": "automatic deployment source cleanup stopped before mutation",
+                    },
+                )
+                uncertainty_fence_cleared = True
+            except Exception as cleanup_error:
+                cleanup_failures.append(("cleanup-uncertainty-fence-clear", cleanup_error))
         if not mutation_attempted:
             release_keys: list[str] = []
             release_leases: list[dict[str, Any]] = []

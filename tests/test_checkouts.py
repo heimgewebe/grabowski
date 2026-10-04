@@ -2629,6 +2629,60 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(obligation_status["state"], "completed")
         self.assertFalse(obligation_status["continuation_required"])
 
+    def test_materialize_uncertainty_reconcile_removes_expired_completed_source(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "source-materialized",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": (
+                            f"runtime-deploy-source-materialized:{self.head}:"
+                            "materialize-test"
+                        ),
+                        "sha256": "8" * 64,
+                    }
+                ],
+                "closure_classification": {
+                    "convergence_required": False,
+                    "reason": "process_only",
+                },
+            }
+        )
+        with patch.object(
+            checkouts,
+            "_now",
+            return_value=int(retention["retention_until_unix"]),
+        ):
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "reconciled_success")
+        self.assertTrue(result["readback"]["expired_completed_source_removed"])
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["state"], "completed")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
     def test_materialize_uncertainty_reconcile_removes_bound_retention(self) -> None:
         target, fence, lifecycle, _common_dir_key = (
             self._materialize_uncertainty_fixture(create_worktree=True)
@@ -2705,6 +2759,96 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(status["resolution_disposition"], "resolved")
         self.assertFalse(status["continuation_required"])
 
+    def test_auto_source_cleanup_uncertainty_reconcile_removes_exact_source_end_to_end(self) -> None:
+        target = self.root / "worktrees" / "auto-source-cleanup-recovery"
+        common_dir = checkouts._git_common_dir(self.repo)
+        owner = "runtime-deploy-source:cleanup-recovery"
+        checkout_key = checkouts._checkout_key(common_dir, target)
+        purpose = f"detached runtime deploy source {self.head[:12]}"
+        retention_until = int(time.time()) + 3600
+        lifecycle = checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=target,
+            owner_id=owner,
+            purpose=purpose,
+            source_kind="operator_obligation",
+            source_id="goo-runtime-deploy-source-cleanup-recovery",
+            artifact_class="deployment-source-worktree",
+            retention_until_unix=retention_until,
+            expected_head=self.head,
+            expected_branch=None,
+        )
+        self._git("worktree", "add", "--detach", str(target), self.head)
+        retention = checkouts._upsert_retention(
+            checkout_key=checkout_key,
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=target,
+            owner_id=owner,
+            purpose=purpose,
+            retention_until_unix=retention_until,
+            expected_head=self.head,
+            expected_branch=None,
+        )
+        cleanup_key = (
+            f"repo:{self.repo.resolve()}:operation:worktree-remove:{target.name}"
+        )
+        path_key = f"path:{target}"
+        common_dir_key = f"path:{common_dir}"
+        scope = checkouts.resources.operation_scope_contract(
+            cleanup_key,
+            repository=str(self.repo.resolve()),
+            effect_class="worktree_admin",
+            operation_class="worktree-admin",
+        )
+        acquisition = checkouts.resources.acquire_resources(
+            owner,
+            [cleanup_key, path_key, common_dir_key],
+            purpose="recover uncertain automatic deployment source cleanup",
+            ttl_seconds=120,
+            metadata={"operation_scope": scope},
+        )
+        fence = checkouts._persist_checkout_operation_uncertainty(
+            lease={"owner_id": owner, "leases": acquisition["leases"]},
+            checkout_key=checkout_key,
+            owner_id=owner,
+            operation="cleanup",
+            operation_id=f"auto-source-cleanup:{target.name}",
+            evidence={
+                "kind": "grabowski_auto_runtime_deploy_source_cleanup_uncertainty",
+                "repo": str(self.repo.resolve()),
+                "git_common_dir": str(common_dir),
+                "checkout_path": str(target),
+                "checkout_key": checkout_key,
+                "owner_id": owner,
+                "expected_head": self.head,
+                "expected_branch": None,
+                "source_identity_sha256": "9" * 64,
+                "lifecycle": lifecycle,
+                "retention": retention,
+                "path_resource_key": path_key,
+            },
+        )
+        self._expire_uncertainty_lease(fence)
+
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "reconciled_success")
+        self.assertTrue(result["readback"]["auto_source_cleanup"])
+        self.assertTrue(result["readback"]["removed_recovery_worktree"])
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts._retention_records([checkout_key]),
+            {},
+        )
+        self.assertIsNone(checkouts._strict_lifecycle_binding(checkout_key))
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
     def test_materialize_uncertainty_reconcile_clears_proven_no_effect(self) -> None:
         target, fence, lifecycle, _common_dir_key = (
             self._materialize_uncertainty_fixture(create_worktree=False)
@@ -2763,6 +2907,33 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(status["resolution_disposition"], "resolved")
         self.assertFalse(status["continuation_required"])
         self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_materialize_no_effect_recovery_accepts_missing_preopen_obligation(self) -> None:
+        fence = {
+            "fence_id": "f" * 32,
+            "evidence": {
+                "obligation_id": "goo-runtime-deploy-source-missing-test",
+                "checkout_key": "a" * 64,
+                "expected_head": "b" * 40,
+            },
+        }
+        with patch.object(
+            obligations,
+            "status_obligation",
+            side_effect=FileNotFoundError("obligation was never opened"),
+        ), patch.object(
+            obligations, "close_obligation"
+        ) as close_obligation, patch.object(
+            obligations, "resolve_obligation"
+        ) as resolve_obligation:
+            result = checkouts._resolve_materialize_recovery_obligation(
+                fence,
+                recovery_state="confirmed_no_effect",
+            )
+        self.assertEqual(result["obligation_state"], "absent_before_open")
+        self.assertEqual(result["obligation_id"], fence["evidence"]["obligation_id"])
+        close_obligation.assert_not_called()
+        resolve_obligation.assert_not_called()
 
     def test_materialize_recovery_evidence_is_stable_across_retry_states(self) -> None:
         _target, fence, _lifecycle, _common_dir_key = (

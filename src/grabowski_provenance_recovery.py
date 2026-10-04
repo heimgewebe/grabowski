@@ -426,22 +426,38 @@ def _volatile_gate_recheck(
     kill_switch_clear = not bool(kill_switch.get("engaged"))
     blockade_allows_mutation = bool(blockade["allows_mutation"])
     mutation_allowed = kill_switch_clear and blockade_allows_mutation
-    # Carries the exact argv: the recheck runs under the schedule lock, which is
-    # where an identical intent that started meanwhile must be recognised as
-    # ours rather than dispatched a second time.  Stop gates are read first;
-    # once either is active, classification stays strictly read-only.
-    competing = _competing_deployment_evidence(
-        command,
-        prune=mutation_allowed,
-        reconcile_stale_pending=mutation_allowed,
-    )
+    # Stop-gate classification must not touch deploy-index readers at all:
+    # _deploy_index() may normalize a pending started unit by writing the index.
+    # Once either stop gate denies mutation, competing-deploy classification is
+    # explicitly not evaluated; the failed stop gate already closes dispatch.
+    if mutation_allowed:
+        competing = _competing_deployment_evidence(
+            command,
+            prune=True,
+            reconcile_stale_pending=True,
+        )
+    else:
+        competing = {
+            "state": "not_evaluated_due_to_stop_gate",
+            "deploy_lock_free": None,
+            "inflight_deploy_jobs": [],
+            "inflight_units": [],
+            "idempotent_match": None,
+            "pruned_units": [],
+            "stale_pending_reconciliation": None,
+            "error": None,
+        }
     checks = {
         "kill_switch_clear": kill_switch_clear,
         "no_blocking_operator_blockade": blockade_allows_mutation,
         "no_competing_deployment": (
-            bool(competing.get("deploy_lock_free"))
-            and not competing.get("inflight_deploy_jobs")
-            and competing.get("error") is None
+            True
+            if not mutation_allowed
+            else (
+                bool(competing.get("deploy_lock_free"))
+                and not competing.get("inflight_deploy_jobs")
+                and competing.get("error") is None
+            )
         ),
     }
     return {

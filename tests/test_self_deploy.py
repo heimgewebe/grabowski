@@ -2370,18 +2370,22 @@ class SelfDeployToolTests(unittest.TestCase):
             )
             fake._release_checkout_lifecycle_exact.assert_called_once_with(lifecycle)
 
-    def test_materialize_opens_obligation_before_durable_fence_acquire(self) -> None:
+    def test_materialize_establishes_recovery_fence_before_opening_obligation(self) -> None:
         expected = "b" * 40
         canonical = Path("/tmp/pr1366-canonical")
         target = Path("/tmp/pr1366-auto-source")
+        owner = "runtime-deploy-source:test"
+        operation_key = "repo:test:operation:auto-source"
+        path_key = f"path:{target}"
+        common_dir_key = f"path:{canonical / '.git'}"
         plan = {
             "canonical_repository": canonical,
             "target": target,
-            "owner_id": "runtime-deploy-source:test",
+            "owner_id": owner,
             "generation": "gen000000001",
             "obligation_id": "goo-runtime-deploy-source-bbbbbbbbbbbb-gen000000001",
-            "operation_key": "repo:test:operation:auto-source",
-            "path_key": f"path:{target}",
+            "operation_key": operation_key,
+            "path_key": path_key,
         }
         stale = {
             "canonical_repository": str(canonical),
@@ -2391,23 +2395,47 @@ class SelfDeployToolTests(unittest.TestCase):
             "clean": True,
             "lease_evidence": {"resource_key": f"path:{canonical}", "lease": None},
         }
+        leases = [
+            {
+                "resource_key": operation_key,
+                "owner_id": owner,
+                "acquired_at_unix": 1,
+                "updated_at_unix": 1,
+                "expires_at_unix": 100,
+                "metadata_sha256": "1" * 64,
+            },
+            {
+                "resource_key": path_key,
+                "owner_id": owner,
+                "acquired_at_unix": 1,
+                "updated_at_unix": 1,
+                "expires_at_unix": 100,
+                "metadata_sha256": "2" * 64,
+            },
+            {
+                "resource_key": common_dir_key,
+                "owner_id": owner,
+                "acquired_at_unix": 1,
+                "updated_at_unix": 1,
+                "expires_at_unix": 100,
+                "metadata_sha256": "3" * 64,
+            },
+        ]
+        fence = {"fence_id": "a" * 32}
         events = []
-        def open_obligation(_plan, _head):
-            events.append("open")
-            return {"state": "open", "obligation_id": plan["obligation_id"]}
+
         def acquire(_plan, _head):
             events.append("acquire")
-            raise RuntimeError("simulated fence acquire failure")
-        def block(_plan, _exc):
-            events.append("block")
-            return {"state": "blocked", "close_file_sha256": "a" * 64}
-        def resolve_no_effect(_plan, blocked):
-            events.append("resolve")
-            self.assertEqual(blocked["state"], "blocked")
             return {
-                "resolution_disposition": "resolved",
-                "continuation_required": False,
+                "leases": leases,
+                "common_dir_key": common_dir_key,
+                "checkout_uncertainty_fence": fence,
             }
+
+        def open_obligation(_plan, _head):
+            events.append("open")
+            raise KeyboardInterrupt("simulated process death after fence persistence")
+
         with patch.object(
             SELF_DEPLOY, "_canonical_stale_main_snapshot", return_value=stale
         ), patch.object(
@@ -2415,22 +2443,14 @@ class SelfDeployToolTests(unittest.TestCase):
         ), patch.object(
             SELF_DEPLOY.os.path, "lexists", return_value=False
         ), patch.object(
-            SELF_DEPLOY, "_open_auto_deploy_source_obligation", side_effect=open_obligation
-        ), patch.object(
             SELF_DEPLOY, "_acquire_auto_deploy_source_resources", side_effect=acquire
         ), patch.object(
-            SELF_DEPLOY, "_live_auto_deploy_source_lease_snapshot", return_value=None
-        ), patch.object(
-            SELF_DEPLOY, "_block_auto_deploy_source_obligation", side_effect=block
-        ), patch.object(
-            SELF_DEPLOY,
-            "_resolve_auto_deploy_source_obligation_no_effect",
-            side_effect=resolve_no_effect,
-            create=True,
+            SELF_DEPLOY, "_open_auto_deploy_source_obligation", side_effect=open_obligation
         ):
-            with self.assertRaisesRegex(RuntimeError, "simulated fence acquire failure"):
+            with self.assertRaisesRegex(KeyboardInterrupt, "simulated process death"):
                 SELF_DEPLOY._materialize_auto_deploy_source(expected)
-        self.assertEqual(events, ["open", "acquire", "block", "resolve"])
+
+        self.assertEqual(events, ["acquire", "open"])
 
     def test_auto_deploy_source_no_effect_obligation_resolution_is_terminal(self) -> None:
         plan = {
@@ -3104,7 +3124,11 @@ class SelfDeployToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "open failed"):
                 SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
         block_obligation.assert_not_called()
-        release_resources.assert_not_called()
+        release_resources.assert_called_once_with(
+            f["owner"],
+            [f["operation_key"], f["path_key"]],
+            [f["operation_lease"], f["path_lease"]],
+        )
 
     def test_auto_deploy_source_malformed_acquisition_uses_live_snapshot_cleanup(self) -> None:
         f = self._auto_deploy_uncertain_fixture()
@@ -3130,7 +3154,7 @@ class SelfDeployToolTests(unittest.TestCase):
         ) as release_resources:
             with self.assertRaisesRegex(RuntimeError, "lease receipt omitted"):
                 SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
-        open_obligation.assert_called_once_with(f["plan"], f["expected"])
+        open_obligation.assert_not_called()
         live_snapshot.assert_called_once_with(f["path_key"], f["owner"])
         release_resources.assert_called_once_with(
             f["owner"],
@@ -4383,6 +4407,13 @@ class SelfDeployToolTests(unittest.TestCase):
         resources.acquire_resources = Mock(return_value={"leases": [cleanup_lease, common_dir_lease]})
         checkouts = types.ModuleType("grabowski_checkouts")
         checkouts._require_no_checkout_operation_uncertainty = Mock(return_value=None)
+        checkouts._checkout_key = Mock(return_value="checkout-key")
+        checkouts._persist_checkout_operation_uncertainty = Mock(
+            return_value={"fence_id": "e" * 32}
+        )
+        checkouts._clear_checkout_operation_uncertainty = Mock(
+            return_value={"fence_id": "e" * 32, "cleared_at_unix": 1}
+        )
         with patch.dict(
             sys.modules,
             {"grabowski_resources": resources, "grabowski_checkouts": checkouts},
@@ -4422,6 +4453,94 @@ class SelfDeployToolTests(unittest.TestCase):
         )
         self.assertEqual(receipt["kind"], "grabowski_auto_runtime_deploy_source_cleanup")
         self.assertRegex(receipt["receipt_sha256"], r"[0-9a-f]{64}")
+
+    def test_cleanup_auto_deploy_source_uncertain_remove_keeps_durable_fence(self) -> None:
+        f = self._auto_deploy_uncertain_fixture()
+        cleanup_key = (
+            f"repo:{f['canonical']}:operation:worktree-remove:{f['target'].name}"
+        )
+        common_dir = f["canonical"] / ".git"
+        common_dir_key = f"path:{common_dir}"
+        cleanup_lease = {
+            "resource_key": cleanup_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 20,
+            "updated_at_unix": 20,
+            "expires_at_unix": 200,
+            "metadata_sha256": "3" * 64,
+        }
+        common_dir_lease = {
+            "resource_key": common_dir_key,
+            "owner_id": f["owner"],
+            "acquired_at_unix": 20,
+            "updated_at_unix": 20,
+            "expires_at_unix": 200,
+            "metadata_sha256": "4" * 64,
+        }
+        materialization = {
+            "expected_head": f["expected"],
+            "repository": str(f["target"]),
+            "owner_id": f["owner"],
+            "path_resource_key": f["path_key"],
+            "path_lease": f["path_lease"],
+            "lifecycle": f["lifecycle"],
+            "retention": f["retention"],
+        }
+        resources = types.ModuleType("grabowski_resources")
+        resources.operation_scope_contract = Mock(return_value={"scope": "cleanup"})
+        resources.acquire_resources = Mock(
+            return_value={"leases": [cleanup_lease, common_dir_lease]}
+        )
+        checkouts = types.ModuleType("grabowski_checkouts")
+        checkouts._require_no_checkout_operation_uncertainty = Mock(return_value=None)
+        checkouts._checkout_key = Mock(return_value="checkout-key")
+        fence = {"fence_id": "f" * 32}
+        events = []
+
+        def persist(**_kwargs):
+            events.append("fence")
+            return fence
+
+        checkouts._persist_checkout_operation_uncertainty = Mock(side_effect=persist)
+        checkouts._clear_checkout_operation_uncertainty = Mock()
+        with patch.dict(
+            sys.modules,
+            {"grabowski_resources": resources, "grabowski_checkouts": checkouts},
+        ), patch.object(
+            SELF_DEPLOY, "_validated_repository_path", return_value=f["canonical"]
+        ), patch.object(
+            SELF_DEPLOY, "_git_common_directory", return_value=common_dir
+        ), patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            return_value=(
+                f["target"],
+                f["target"] / SELF_DEPLOY.RUNNER_RELATIVE_PATH,
+                f["identity"],
+            ),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_mutating_git_result",
+            side_effect=lambda *_args: (
+                events.append("mutate")
+                or {"returncode": None, "timed_out": True, "stdout": "", "stderr": ""}
+            ),
+        ), patch.object(
+            SELF_DEPLOY.os.path, "lexists", return_value=True
+        ), patch.object(
+            SELF_DEPLOY, "_worktree_registration_present", return_value=True
+        ), patch.object(
+            SELF_DEPLOY, "_release_auto_deploy_source_resources"
+        ) as release_resources:
+            with self.assertRaisesRegex(RuntimeError, "not proven complete"):
+                SELF_DEPLOY._cleanup_auto_deploy_source_before_dispatch(
+                    f["expected"], f["identity"], materialization
+                )
+
+        self.assertEqual(events, ["fence", "mutate"])
+        checkouts._persist_checkout_operation_uncertainty.assert_called_once()
+        checkouts._clear_checkout_operation_uncertainty.assert_not_called()
+        release_resources.assert_not_called()
 
     def test_cleanup_auto_deploy_source_before_dispatch_serializes_common_dir_and_respects_uncertainty(self) -> None:
         f = self._auto_deploy_uncertain_fixture()
@@ -4625,6 +4744,13 @@ class SelfDeployToolTests(unittest.TestCase):
         resources.acquire_resources = Mock(return_value={"leases": [cleanup_lease, common_dir_lease]})
         checkouts = types.ModuleType("grabowski_checkouts")
         checkouts._require_no_checkout_operation_uncertainty = Mock(return_value=None)
+        checkouts._checkout_key = Mock(return_value="checkout-key")
+        checkouts._persist_checkout_operation_uncertainty = Mock(
+            return_value={"fence_id": "e" * 32}
+        )
+        checkouts._clear_checkout_operation_uncertainty = Mock(
+            return_value={"fence_id": "e" * 32, "cleared_at_unix": 1}
+        )
         with patch.dict(
             sys.modules,
             {"grabowski_resources": resources, "grabowski_checkouts": checkouts},
@@ -4698,6 +4824,13 @@ class SelfDeployToolTests(unittest.TestCase):
         resources.acquire_resources = Mock(return_value={"leases": [cleanup_lease, common_dir_lease]})
         checkouts = types.ModuleType("grabowski_checkouts")
         checkouts._require_no_checkout_operation_uncertainty = Mock(return_value=None)
+        checkouts._checkout_key = Mock(return_value="checkout-key")
+        checkouts._persist_checkout_operation_uncertainty = Mock(
+            return_value={"fence_id": "e" * 32}
+        )
+        checkouts._clear_checkout_operation_uncertainty = Mock(
+            return_value={"fence_id": "e" * 32, "cleared_at_unix": 1}
+        )
         with patch.dict(
             sys.modules,
             {"grabowski_resources": resources, "grabowski_checkouts": checkouts},
