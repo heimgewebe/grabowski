@@ -1317,7 +1317,9 @@ def _bound_repoground_manifest(
             raise RunnerError("RepoGround manifest repository binding is ambiguous")
         selected = matches[0]
 
-    commit = selected.get("git_commit")
+    commit = (
+        selected.get("git_commit") or selected.get("commit") or selected.get("head")
+    )
     if not _is_commit(commit):
         raise RunnerError("RepoGround manifest commit is invalid")
     return manifest_path, expected_sha, str(commit)

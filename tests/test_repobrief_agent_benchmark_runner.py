@@ -796,6 +796,18 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             self.assertEqual(sha256, value["repobrief"]["manifest_sha256"])
             self.assertEqual(commit, COMMIT)
 
+    def test_bound_manifest_accepts_supported_commit_fields(self) -> None:
+        for field in ("git_commit", "commit", "head"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                value = request(condition="treatment")
+                bind_manifest(
+                    value,
+                    Path(directory),
+                    repositories=[{field: COMMIT}],
+                )
+                _, _, commit = runner._bound_repoground_manifest(value)
+                self.assertEqual(commit, COMMIT)
+
     def test_bound_manifest_rejects_ambiguous_multi_repo_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
