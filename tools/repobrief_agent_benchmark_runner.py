@@ -1250,6 +1250,33 @@ def _decoded_repoground_payload(result: Mapping[str, Any]) -> Mapping[str, Any] 
     return None
 
 
+def _decoded_resource_read_result(
+    result: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    if "contents" in result and "_meta" in result:
+        return result
+    content = result.get("content")
+    candidates: list[Any] = []
+    if isinstance(content, str):
+        candidates.append(content)
+    elif isinstance(content, Mapping):
+        candidates.append(content)
+    elif isinstance(content, list):
+        candidates.extend(content)
+    for candidate in candidates:
+        value: Any = candidate
+        if isinstance(candidate, Mapping) and isinstance(candidate.get("text"), str):
+            value = candidate.get("text")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(value, Mapping) and "contents" in value and "_meta" in value:
+            return value
+    return None
+
+
 def _is_commit(value: Any) -> bool:
     return bool(
         isinstance(value, str)
@@ -1353,8 +1380,18 @@ def _snapshot_ref_commit(
 
 
 def _live_snapshot_commit(
-    payload: Mapping[str, Any], *, manifest_commit: str
+    payload: Mapping[str, Any],
+    *,
+    manifest_path: Path,
+    manifest_commit: str,
 ) -> str | None:
+    if (
+        payload.get("kind") != "repobrief.live_freshness"
+        or payload.get("version") != "v1"
+        or payload.get("status") not in _REPOGROUND_LIVE_FRESHNESS
+        or payload.get("bundle_manifest") != str(manifest_path)
+    ):
+        return None
     snapshot = payload.get("snapshot_provenance")
     if isinstance(snapshot, Mapping):
         commit = snapshot.get("git_commit")
@@ -1366,6 +1403,18 @@ def _live_snapshot_commit(
         and payload.get("reason") == "repo_root_not_configured"
         and payload.get("repo_root") is None
         and payload.get("read_only_git_probe") is False
+        and payload.get("implicit_refresh") is False
+        and snapshot is None
+    ):
+        return manifest_commit
+    if (
+        payload.get("status") == "unknown"
+        and isinstance(payload.get("reason"), str)
+        and bool(payload.get("reason"))
+        and isinstance(payload.get("repo_root"), str)
+        and bool(payload.get("repo_root"))
+        and payload.get("read_only_git_probe") is True
+        and payload.get("implicit_refresh") is False
         and snapshot is None
     ):
         return manifest_commit
@@ -1381,11 +1430,22 @@ def _repoground_evidence_from_payload(
 ) -> tuple[str, dict[str, Any]] | None:
     manifest_path, manifest_sha256, manifest_commit = _bound_repoground_manifest(request)
     if tool_name == "ask_context":
+        live_freshness = payload.get("live_freshness")
+        live_commit = (
+            _live_snapshot_commit(
+                live_freshness,
+                manifest_path=manifest_path,
+                manifest_commit=manifest_commit,
+            )
+            if isinstance(live_freshness, Mapping)
+            else None
+        )
         if (
             payload.get("kind") != "repobrief.mcp.read_only_frontdoor"
             or payload.get("version") != "v1"
             or payload.get("tool") != "ask_context"
             or payload.get("status") != "ok"
+            or live_commit is None
         ):
             return None
         pack = payload.get("context_pack")
@@ -1413,7 +1473,7 @@ def _repoground_evidence_from_payload(
         commit = _snapshot_ref_commit(
             snapshot_ref, manifest_commit=manifest_commit
         )
-        if commit is None:
+        if commit is None or commit != live_commit:
             return None
         ranges = pack.get("resolved_ranges")
         budget = pack.get("budget")
@@ -1426,27 +1486,27 @@ def _repoground_evidence_from_payload(
             or context_bytes < 0
         ):
             return None
-        if any(not isinstance(item, Mapping) for item in ranges):
-            return None
-        resolved_range_count = len(ranges)
+        resolved_range_count = sum(
+            1
+            for item in ranges
+            if isinstance(item, Mapping) and item.get("status") == "resolved"
+        )
         return commit, {
             "sequence": sequence,
             "tool": "ask_context",
-            "freshness_status": freshness.get("status"),
+            "freshness_status": live_freshness.get("status"),
             "resolved_range_count": resolved_range_count,
             "context_bytes_used": context_bytes,
             "grounding_status": None,
         }
     if tool_name == "live_freshness":
         status = payload.get("status")
-        commit = _live_snapshot_commit(payload, manifest_commit=manifest_commit)
-        if (
-            payload.get("kind") != "repobrief.live_freshness"
-            or payload.get("version") != "v1"
-            or status not in _REPOGROUND_LIVE_FRESHNESS
-            or payload.get("bundle_manifest") != str(manifest_path)
-            or commit is None
-        ):
+        commit = _live_snapshot_commit(
+            payload,
+            manifest_path=manifest_path,
+            manifest_commit=manifest_commit,
+        )
+        if commit is None:
             return None
         return commit, {
             "sequence": sequence,
@@ -1477,7 +1537,9 @@ def _repoground_evidence_from_payload(
             or live_freshness.get("status") not in _REPOGROUND_LIVE_FRESHNESS
             or live_freshness.get("bundle_manifest") != str(manifest_path)
             or _live_snapshot_commit(
-                live_freshness, manifest_commit=manifest_commit
+                live_freshness,
+                manifest_path=manifest_path,
+                manifest_commit=manifest_commit,
             ) is None
         ):
             return None
@@ -1534,6 +1596,68 @@ def _repoground_evidence_call(
     )
 
 
+def _repoground_resource_read_evidence(
+    *,
+    request: Mapping[str, Any],
+    sequence: int,
+    result: Mapping[str, Any],
+    expected_uri: str | None,
+) -> tuple[str, dict[str, Any]] | None:
+    decoded = _decoded_resource_read_result(result)
+    if decoded is None:
+        return None
+    contents = decoded.get("contents")
+    meta = decoded.get("_meta")
+    if (
+        not isinstance(expected_uri, str)
+        or not expected_uri
+        or not isinstance(contents, list)
+        or len(contents) != 1
+        or not isinstance(contents[0], Mapping)
+        or contents[0].get("uri") != expected_uri
+        or not isinstance(meta, Mapping)
+    ):
+        return None
+    item = contents[0]
+    text_value = item.get("text")
+    mime_type = item.get("mimeType")
+    repoground = meta.get("repoground")
+    if (
+        not isinstance(text_value, str)
+        or not text_value
+        or not isinstance(mime_type, str)
+        or not mime_type
+        or not isinstance(repoground, Mapping)
+        or repoground.get("status") != "available"
+        or repoground.get("implicitRefresh") is not False
+        or not isinstance(repoground.get("snapshotContext"), Mapping)
+        or not isinstance(repoground.get("identity"), Mapping)
+    ):
+        return None
+    live_freshness = repoground.get("liveFreshness")
+    if not isinstance(live_freshness, Mapping):
+        return None
+    manifest_path, _manifest_sha256, manifest_commit = _bound_repoground_manifest(request)
+    commit = _live_snapshot_commit(
+        live_freshness,
+        manifest_path=manifest_path,
+        manifest_commit=manifest_commit,
+    )
+    if commit is None:
+        return None
+    content_bytes = len(text_value.encode("utf-8"))
+    if content_bytes <= 0:
+        return None
+    return commit, {
+        "sequence": sequence,
+        "tool": "repobrief_resource_read",
+        "freshness_status": live_freshness.get("status"),
+        "resolved_range_count": None,
+        "context_bytes_used": content_bytes,
+        "grounding_status": None,
+    }
+
+
 def normalize_repoground_evidence(
     request: Mapping[str, Any],
     messages: Sequence[Mapping[str, Any]],
@@ -1550,7 +1674,11 @@ def normalize_repoground_evidence(
     for sequence, use in enumerate(benchmark_uses, start=1):
         concrete = str(use.get("name", ""))
         abstract = ABSTRACT_TOOL_MAP.get(concrete)
-        if abstract not in {"ask_context", "grounding_verify", "live_freshness"}:
+        is_resource_read = concrete in {"ReadMcpResource", "ReadMcpResourceTool"}
+        if (
+            abstract not in {"ask_context", "grounding_verify", "live_freshness"}
+            and not is_resource_read
+        ):
             continue
         call = calls[sequence - 1] if sequence <= len(calls) else {}
         if call.get("name") != abstract or call.get("status") != "success":
@@ -1558,12 +1686,24 @@ def normalize_repoground_evidence(
         result = results.get(str(use.get("id")))
         if not isinstance(result, Mapping):
             continue
-        normalized = _repoground_evidence_call(
-            request=request,
-            tool_name=abstract,
-            sequence=sequence,
-            result=result,
-        )
+        if is_resource_read:
+            arguments = use.get("input")
+            expected_uri = (
+                arguments.get("uri") if isinstance(arguments, Mapping) else None
+            )
+            normalized = _repoground_resource_read_evidence(
+                request=request,
+                sequence=sequence,
+                result=result,
+                expected_uri=expected_uri,
+            )
+        else:
+            normalized = _repoground_evidence_call(
+                request=request,
+                tool_name=str(abstract),
+                sequence=sequence,
+                result=result,
+            )
         if normalized is None:
             continue
         commit, evidence_call = normalized

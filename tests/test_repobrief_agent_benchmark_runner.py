@@ -733,10 +733,11 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                         "manifest_path": str(manifest),
                         "manifest_sha256": value["repobrief"]["manifest_sha256"],
                         "git_commit": None,
-                        "freshness_status": "fresh",
+                        "freshness_status": "not_comparable",
                     },
-                    "freshness": {"status": "fresh"},
+                    "freshness": {"status": "not_comparable"},
                     "resolved_ranges": [{
+                        "status": "resolved",
                         "source_path": "src/example.py",
                         "text_excerpt": "def example():",
                         "range_ref": {
@@ -746,6 +747,17 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                         },
                     }],
                     "budget": {"context_bytes_used": 321},
+                },
+                "live_freshness": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v1",
+                    "status": "fresh",
+                    "reason": "git_head_matches_snapshot",
+                    "bundle_manifest": str(manifest),
+                    "repo_root": "/tmp/repo",
+                    "read_only_git_probe": True,
+                    "implicit_refresh": False,
+                    "snapshot_provenance": {"git_commit": COMMIT},
                 },
             }
             tool_result["content"] = json.dumps(
@@ -776,6 +788,163 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             self.assertIsNone(
                 runner.normalize_repoground_evidence(
                     value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
+
+    def test_treatment_uses_same_call_live_freshness_and_semantic_ranges(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="mcp__repobrief__ask_context")
+            )
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            payload = {
+                "kind": "repobrief.mcp.read_only_frontdoor",
+                "version": "v1",
+                "tool": "ask_context",
+                "status": "ok",
+                "context_pack": {
+                    "kind": "repobrief.ask_context_pack",
+                    "version": "1.0",
+                    "snapshot_ref": {
+                        "manifest_path": str(manifest),
+                        "manifest_sha256": value["repobrief"]["manifest_sha256"],
+                        "git_commit": COMMIT,
+                        "freshness_status": "not_comparable",
+                    },
+                    "freshness": {"status": "not_comparable"},
+                    "resolved_ranges": [
+                        {"status": "resolved", "source_path": "src/resolved.py"},
+                        {"source_path": "src/no-status.py"},
+                        {"status": "candidate", "source_path": "src/candidate.py"},
+                    ],
+                    "budget": {"context_bytes_used": 17},
+                },
+                "live_freshness": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v1",
+                    "status": "fresh",
+                    "reason": "git_head_matches_snapshot",
+                    "bundle_manifest": str(manifest),
+                    "repo_root": "/tmp/repo",
+                    "read_only_git_probe": True,
+                    "implicit_refresh": False,
+                    "snapshot_provenance": {"git_commit": COMMIT},
+                },
+            }
+            tool_result["content"] = json.dumps(
+                {"structuredContent": payload}, sort_keys=True
+            )
+            calls = runner.normalize_tool_calls(value, messages)
+            evidence = runner.normalize_repoground_evidence(value, messages, calls)
+            self.assertEqual(evidence["calls"][0]["freshness_status"], "fresh")
+            self.assertEqual(evidence["calls"][0]["resolved_range_count"], 1)
+
+            missing_live = copy.deepcopy(payload)
+            missing_live.pop("live_freshness")
+            tool_result["content"] = json.dumps(
+                {"structuredContent": missing_live}, sort_keys=True
+            )
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
+
+    def test_treatment_projects_revision_bound_resource_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            uri = "repoground://snapshot/demo/canonical"
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="ReadMcpResource")
+            )
+            tool_use = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_use"
+            )
+            tool_use["input"] = {"uri": uri}
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            live_freshness = {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "fresh",
+                "reason": "git_head_matches_snapshot",
+                "bundle_manifest": str(manifest),
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+                "snapshot_provenance": {"git_commit": COMMIT},
+            }
+            resource = {
+                "contents": [{
+                    "uri": uri,
+                    "text": "# Demo\n",
+                    "mimeType": "text/markdown",
+                }],
+                "_meta": {
+                    "repoground": {
+                        "status": "available",
+                        "implicitRefresh": False,
+                        "snapshotContext": {},
+                        "identity": {},
+                        "liveFreshness": live_freshness,
+                    }
+                },
+            }
+            tool_result["content"] = json.dumps(resource, sort_keys=True)
+            calls = runner.normalize_tool_calls(value, messages)
+            self.assertEqual(
+                runner.normalize_repoground_evidence(value, messages, calls),
+                {
+                    "target_commit": COMMIT,
+                    "bundle_commit": COMMIT,
+                    "calls": [{
+                        "sequence": 1,
+                        "tool": "repobrief_resource_read",
+                        "freshness_status": "fresh",
+                        "resolved_range_count": None,
+                        "context_bytes_used": len("# Demo\n".encode("utf-8")),
+                        "grounding_status": None,
+                    }],
+                },
+            )
+
+            resource["contents"][0]["uri"] = "repoground://snapshot/other"
+            tool_result["content"] = json.dumps(resource, sort_keys=True)
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
+
+            list_messages = runner.parse_jsonl(
+                stream(value, tool_name="ListMcpResources")
+            )
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value,
+                    list_messages,
+                    runner.normalize_tool_calls(value, list_messages),
                 )
             )
 
@@ -1009,6 +1178,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     "bundle_manifest": str(manifest),
                     "repo_root": None,
                     "read_only_git_probe": False,
+                    "implicit_refresh": False,
                 }},
                 sort_keys=True,
             )
@@ -1033,6 +1203,48 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 Path(directory) / "other.bundle.manifest.json"
             )
             tool_result["content"] = json.dumps(drifted, sort_keys=True)
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
+
+    def test_treatment_projects_strict_unknown_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="mcp__repobrief__live_freshness")
+            )
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            payload = {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "unknown",
+                "reason": "git_probe_failed",
+                "bundle_manifest": str(manifest),
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+            }
+            tool_result["content"] = json.dumps(
+                {"structuredContent": payload}, sort_keys=True
+            )
+            calls = runner.normalize_tool_calls(value, messages)
+            evidence = runner.normalize_repoground_evidence(value, messages, calls)
+            self.assertEqual(evidence["calls"][0]["freshness_status"], "unknown")
+
+            payload["implicit_refresh"] = True
+            tool_result["content"] = json.dumps(
+                {"structuredContent": payload}, sort_keys=True
+            )
             self.assertIsNone(
                 runner.normalize_repoground_evidence(
                     value, messages, runner.normalize_tool_calls(value, messages)

@@ -5634,7 +5634,12 @@ def _repoground_evidence_from_codex_events(
         if item_type != "mcp_tool_call":
             continue
         tool_name = item.get("tool")
-        if tool_name not in {"ask_context", "grounding_verify", "live_freshness"}:
+        if tool_name not in {
+            "ask_context",
+            "grounding_verify",
+            "live_freshness",
+            "repobrief_resource_read",
+        }:
             continue
         if sequence > len(calls):
             continue
@@ -5644,24 +5649,38 @@ def _repoground_evidence_from_codex_events(
         result_value = item.get("result")
         if not isinstance(result_value, Mapping):
             continue
-        structured = result_value.get("structured_content")
-        if not isinstance(structured, Mapping):
-            continue
-        try:
-            payload = _validated_treatment_structured_payload(
-                structured,
-                tool_name=str(tool_name),
-                expected_manifest=manifest,
-                is_error=False,
+        if tool_name == "repobrief_resource_read":
+            arguments = item.get("arguments")
+            if (
+                not isinstance(arguments, Mapping)
+                or arguments.get("action") != "read"
+            ):
+                continue
+            normalized = base._repoground_resource_read_evidence(
+                request=request,
+                sequence=sequence,
+                result=result_value,
+                expected_uri=arguments.get("uri"),
             )
-        except RunnerError:
-            continue
-        normalized = base._repoground_evidence_from_payload(
-            request=request,
-            tool_name=str(tool_name),
-            sequence=sequence,
-            payload=payload,
-        )
+        else:
+            structured = result_value.get("structured_content")
+            if not isinstance(structured, Mapping):
+                continue
+            try:
+                payload = _validated_treatment_structured_payload(
+                    structured,
+                    tool_name=str(tool_name),
+                    expected_manifest=manifest,
+                    is_error=False,
+                )
+            except RunnerError:
+                continue
+            normalized = base._repoground_evidence_from_payload(
+                request=request,
+                tool_name=str(tool_name),
+                sequence=sequence,
+                payload=payload,
+            )
         if normalized is None:
             continue
         commit, call_evidence = normalized

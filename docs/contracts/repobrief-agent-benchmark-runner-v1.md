@@ -223,8 +223,11 @@ Der Receipt enthält:
 - normalisierte Toolaufrufe in Reihenfolge;
 - bei auswertbarer Treatment-Nutzung optional repoground_evidence mit
   Zielcommit, beobachtetem Bundle-Commit und pro RepoGround-Aufruf nur den
-  für die Exposure-Messung nötigen Feldern (Freshness, Range-Anzahl,
-  Kontextbytes bzw. Grounding-Status);
+  für die Exposure-Messung nötigen Feldern (Freshness, semantisch aufgelöste
+  Range-Anzahl, Kontextbytes bzw. Grounding-Status); `ask_context` bindet
+  dabei die same-call `live_freshness`-Hülle, revisionsgebundene
+  Resource-Reads zählen ihre tatsächlich gelesenen Inhaltsbytes, reines
+  Resource-Listing bleibt Nicht-Evidence;
 - strukturierte Antwort, Pfade, Symbole, Belege und Claim-Labels;
 - Start, Ende, Gesamtdauer und Exitstatus;
 - hashgebundenes Transcript-Artefakt;
@@ -257,10 +260,17 @@ repoground_evidence ist bewusst keine Runner-Entscheidung über Nutzen:
 Der Runner projiziert nur validierte, revisionsgebundene Beobachtungen. Ob diese
 für Navigation, Struktur oder Grounding als tatsächliches Treatment-Exposure
 zählen, entscheidet der RepoGround-Evaluator. Die Projektion bleibt an das
-digestgebundene Manifest gekoppelt; bei produktivem `not_comparable` ohne
-Live-Snapshot-Provenienz dient dessen Manifest-Commit als Fallback. Nicht
-auswertbare oder nicht an dieses Manifest gebundene Toolresultate erzeugen kein
-Exposure-Feld.
+digestgebundene Manifest gekoppelt. Für `ask_context` müssen Pack-Commit und
+same-call Live-Commit übereinstimmen; der projizierte Freshness-Status stammt aus
+dieser Live-Hülle, und nur Ranges mit `status=resolved` werden gezählt.
+Produktives `not_comparable` ohne Snapshot-Provenienz darf nur im
+`repo_root_not_configured`-Fall mit `implicit_refresh=false` auf den
+Manifest-Commit zurückfallen; `unknown` darf denselben Fallback nur nach einer
+tatsächlich versuchten read-only Git-Probe mit gebundenem Repo-Pfad nutzen.
+Resource-Reads erzeugen Evidence ausschließlich für genau einen nichtleeren,
+URI-gebundenen Inhalt mit verfügbarer RepoGround-Metadatenhülle und gebundener
+`liveFreshness`; Resource-Listing erzeugt keine Evidence. Nicht auswertbare
+oder nicht an dieses Manifest gebundene Toolresultate erzeugen kein Exposure-Feld.
 
 Er belegt ausdrücklich nicht:
 

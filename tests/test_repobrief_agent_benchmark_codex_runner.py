@@ -4153,6 +4153,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     ],
                     "budget": {"context_bytes_used": 654},
                 },
+                "live_freshness": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v1",
+                    "status": "fresh",
+                    "reason": "git_head_matches_snapshot",
+                    "bundle_manifest": str(manifest),
+                    "repo_root": "/tmp/repo",
+                    "read_only_git_probe": True,
+                    "implicit_refresh": False,
+                    "snapshot_provenance": {"git_commit": COMMIT.upper()},
+                },
             }
             events = [{
                 "type": "item.completed",
@@ -4210,6 +4221,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "bundle_manifest": str(Path(directory) / "other.bundle.manifest.json"),
                 "repo_root": None,
                 "read_only_git_probe": False,
+                "implicit_refresh": False,
             }
             events = [{
                 "type": "item.completed",
@@ -4264,6 +4276,145 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         "grounding_status": None,
                     }],
                 },
+            )
+
+    def test_codex_projects_strict_unknown_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            payload = {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "unknown",
+                "reason": "git_probe_failed",
+                "bundle_manifest": str(manifest),
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+            }
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "live_freshness",
+                    "arguments": {},
+                    "result": {"structured_content": payload},
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{
+                "sequence": 1,
+                "name": "live_freshness",
+                "status": "success",
+                "duration_ms": 0,
+                "input_bytes": 1,
+                "output_bytes": 1,
+            }]
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                evidence = runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                )
+            self.assertEqual(evidence["calls"][0]["freshness_status"], "unknown")
+
+            payload["implicit_refresh"] = True
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                self.assertIsNone(
+                    runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                )
+
+    def test_codex_projects_revision_bound_resource_read_not_list(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            uri = "repoground://snapshot/demo/canonical"
+            live_freshness = {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "fresh",
+                "reason": "git_head_matches_snapshot",
+                "bundle_manifest": str(manifest),
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+                "snapshot_provenance": {"git_commit": COMMIT},
+            }
+            resource = {
+                "contents": [{
+                    "uri": uri,
+                    "text": "# Demo\n",
+                    "mimeType": "text/markdown",
+                }],
+                "_meta": {
+                    "repoground": {
+                        "status": "available",
+                        "implicitRefresh": False,
+                        "snapshotContext": {},
+                        "identity": {},
+                        "liveFreshness": live_freshness,
+                    }
+                },
+            }
+            result = {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(resource, sort_keys=True),
+                }]
+            }
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "repobrief_resource_read",
+                    "arguments": {"action": "read", "uri": uri},
+                    "result": result,
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{
+                "sequence": 1,
+                "name": "repobrief_resource_read",
+                "status": "success",
+                "duration_ms": 0,
+                "input_bytes": 1,
+                "output_bytes": 1000,
+            }]
+            self.assertEqual(
+                runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                ),
+                {
+                    "target_commit": COMMIT,
+                    "bundle_commit": COMMIT,
+                    "calls": [{
+                        "sequence": 1,
+                        "tool": "repobrief_resource_read",
+                        "freshness_status": "fresh",
+                        "resolved_range_count": None,
+                        "context_bytes_used": len("# Demo\n".encode("utf-8")),
+                        "grounding_status": None,
+                    }],
+                },
+            )
+
+            events[0]["item"]["arguments"] = {"action": "list"}
+            self.assertIsNone(
+                runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                )
             )
 
     def test_normalize_rejects_boolean_token_counts(self) -> None:
