@@ -1036,13 +1036,10 @@ def _resume_under_schedule_lock(
     # Absent evidence is not a match: a recheck that carries no competing-job
     # projection means nothing was recognised as ours, which must dispatch
     # normally rather than silently coalesce onto nothing.
-    already_running = (volatile.get("competing_deployment") or {}).get(
-        "idempotent_match"
-    )
-    stale_pending_reconciliation = (
-        (volatile.get("competing_deployment") or {}).get(
-            "stale_pending_reconciliation"
-        )
+    competing_deployment = volatile.get("competing_deployment") or {}
+    already_running = competing_deployment.get("idempotent_match")
+    stale_pending_reconciliation = competing_deployment.get(
+        "stale_pending_reconciliation"
     )
     if already_running is not None and not volatile["reasons"]:
         base._append_audit(
@@ -1264,13 +1261,10 @@ def _repair_under_schedule_lock(
     # Absent evidence is not a match: a recheck that carries no competing-job
     # projection means nothing was recognised as ours, which must dispatch
     # normally rather than silently coalesce onto nothing.
-    already_running = (volatile.get("competing_deployment") or {}).get(
-        "idempotent_match"
-    )
-    stale_pending_reconciliation = (
-        (volatile.get("competing_deployment") or {}).get(
-            "stale_pending_reconciliation"
-        )
+    competing_deployment = volatile.get("competing_deployment") or {}
+    already_running = competing_deployment.get("idempotent_match")
+    stale_pending_reconciliation = competing_deployment.get(
+        "stale_pending_reconciliation"
     )
     if already_running is not None and not volatile["reasons"]:
         # This exact intent is already in flight.  Starting a second job would

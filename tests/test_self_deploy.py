@@ -61,13 +61,6 @@ def _load_self_deploy():
     read_surface._git_command = lambda repo, *args: ["git", "-C", str(repo), *args]
     read_surface._run_read = Mock()
     privileged = types.ModuleType("grabowski_privileged")
-    class RootbrokerAuthorityFailureAfterObservedEffect(RuntimeError):
-        def __init__(self, message: str, *, authority: dict[str, object]) -> None:
-            super().__init__(message)
-            self.authority = dict(authority)
-    privileged.RootbrokerAuthorityFailureAfterObservedEffect = (
-        RootbrokerAuthorityFailureAfterObservedEffect
-    )
     privileged.ensure_rootbroker_authority = Mock(
         side_effect=lambda expected_head: {
             "success": True,
@@ -343,6 +336,25 @@ def _unpersisted_outcome_unknown_blue_green_result(
 
 
 class SelfDeployToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        guard_patch = patch.object(
+            SELF_DEPLOY,
+            "_require_auto_deploy_source_mutation_leases",
+        )
+        guard_patch.start()
+        self.addCleanup(guard_patch.stop)
+        evidence_patch = patch.object(
+            SELF_DEPLOY,
+            "_auto_deploy_source_effect_evidence",
+            return_value={
+                "schema_version": 1,
+                "kind": "grabowski_runtime_deploy_auto_source_effect",
+                "effect_observed": True,
+            },
+        )
+        evidence_patch.start()
+        self.addCleanup(evidence_patch.stop)
+
     def test_mutating_git_result_serializes_worktree_admin(self) -> None:
         state = {"held": False}
         fake_checkouts = types.ModuleType("grabowski_checkouts")
@@ -2163,7 +2175,9 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(sequence, ["refresh", "authority", "materialize"])
         refresh.assert_called_once_with(expected, refresh_candidate)
         authority.assert_called_once_with(expected)
-        materialize.assert_called_once_with(expected, local_mutation_tracker=mock.ANY)
+        materialize.assert_called_once_with(
+            expected, local_mutation_tracker=mock.ANY
+        )
         self.assertTrue(result["already_scheduled"])
         self.assertEqual(result["automatic_source"], materialization)
 
@@ -3227,7 +3241,6 @@ class SelfDeployToolTests(unittest.TestCase):
 
     def test_auto_deploy_source_does_not_reblock_completed_obligation_on_audit_failure(self) -> None:
         f = self._auto_deploy_uncertain_fixture()
-        local_mutation_tracker: dict[str, object] = {}
         with patch.object(
             SELF_DEPLOY,
             "_canonical_stale_main_snapshot",
@@ -3280,32 +3293,7 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY, "_append_deploy_audit", side_effect=RuntimeError("audit unavailable")
         ):
             with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
-                SELF_DEPLOY._materialize_auto_deploy_source(
-                    f["expected"],
-                    local_mutation_tracker=local_mutation_tracker,
-                )
-        evidence = local_mutation_tracker["auto_source_materialization"]
-        self.assertIsInstance(evidence, dict)
-        assert isinstance(evidence, dict)
-        self.assertEqual(
-            evidence["kind"], "grabowski_runtime_deploy_auto_source_effect"
-        )
-        self.assertEqual(evidence["expected_head"], f["expected"])
-        self.assertEqual(evidence["repository"], str(f["target"]))
-        self.assertTrue(evidence["target_present"])
-        self.assertTrue(evidence["registration_present"])
-        self.assertEqual(
-            evidence["source_identity_sha256"], f["identity"]["identity_sha256"]
-        )
-        material = {
-            key: value
-            for key, value in evidence.items()
-            if key != "evidence_sha256"
-        }
-        self.assertEqual(
-            evidence["evidence_sha256"],
-            SELF_DEPLOY._source_identity_sha256(material),
-        )
+                SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
         block_obligation.assert_not_called()
         release_resources.assert_called_once_with(
             f["owner"], [f["operation_key"]], [f["operation_lease"]]
@@ -4334,7 +4322,9 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(public_main.call_count, 3)
         SELF_DEPLOY.privileged.ensure_rootbroker_authority.assert_called_once_with(expected)
         target_runner.assert_called_once_with(canonical, expected)
-        materialize.assert_called_once_with(expected, local_mutation_tracker=mock.ANY)
+        materialize.assert_called_once_with(
+            expected, local_mutation_tracker=mock.ANY
+        )
         self.assertEqual(
             preflight.call_args_list[-1].args,
             (expected, str(source), owner),
@@ -5919,67 +5909,6 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(
             evidence["reference_sha256"], authority["reference_sha256"]
         )
-
-    def test_schedule_preserves_rootbroker_effect_when_authority_audit_fails(self) -> None:
-        canonical_state = tempfile.TemporaryDirectory()
-        self.addCleanup(canonical_state.cleanup)
-        canonical = Path(canonical_state.name).resolve()
-        expected = "d" * 40
-        authority = {
-            "success": True,
-            "outcome": "succeeded",
-            "expected_head": expected,
-            "attested_head": expected,
-            "effect_started": True,
-            "request_id": "rootbroker-audit-failure",
-            "reference_sha256": "a" * 64,
-        }
-        stale = {
-            "canonical_repository": str(canonical),
-            "current_head": "a" * 40,
-            "current_branch": "feature/active",
-            "target_head": expected,
-            "origin_main": expected,
-            "clean": True,
-            "shallow": False,
-            "lease_evidence": {"resource_key": f"path:{canonical}", "lease": None},
-        }
-        with patch.object(
-            SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical
-        ), patch.object(
-            SELF_DEPLOY,
-            "_deployment_source_preflight",
-            side_effect=RuntimeError("HEAD drift"),
-        ), patch.object(
-            SELF_DEPLOY, "_canonical_stale_main_snapshot", return_value=stale
-        ), patch.object(
-            SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
-        ), patch.object(
-            SELF_DEPLOY,
-            "inflight_runtime_job_evidence",
-            return_value={"error": None, "inflight_units": []},
-        ), patch.object(
-            SELF_DEPLOY.privileged,
-            "ensure_rootbroker_authority",
-            side_effect=SELF_DEPLOY.privileged.RootbrokerAuthorityFailureAfterObservedEffect(
-                "audit unavailable",
-                authority=authority,
-            ),
-        ), patch.object(
-            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
-        ):
-            with self.assertRaises(
-                SELF_DEPLOY.DeployScheduleFailureAfterLocalMutation
-            ) as raised:
-                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
-        evidence = raised.exception.local_mutation_evidence
-        self.assertEqual(
-            evidence["kind"],
-            "grabowski_runtime_deploy_rootbroker_authority_effect",
-        )
-        self.assertEqual(evidence["expected_head"], expected)
-        self.assertEqual(evidence["attested_head"], expected)
-        self.assertEqual(evidence["request_id"], authority["request_id"])
 
     def test_schedule_blocks_when_rootbroker_authority_refresh_fails(self) -> None:
         repo = Path("/home/alex/repos/grabowski")

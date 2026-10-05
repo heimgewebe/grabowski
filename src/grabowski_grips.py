@@ -15718,20 +15718,23 @@ def _runtime_deploy_auto_source_effect_evidence_valid(
         "owner_id",
         "generation",
         "path_resource_key",
-        "target_present",
-        "registration_present",
         "source_identity_sha256",
+        "lifecycle_checkout_key",
+        "uncertainty_fence_id",
+        "uncertainty_evidence_sha256",
+        "effect_observed",
         "evidence_sha256",
     }
     if not isinstance(evidence, dict) or set(evidence) != fields:
         return False
+    repository = evidence.get("repository")
+    owner_id = evidence.get("owner_id")
+    generation = evidence.get("generation")
     material = {
         key: value
         for key, value in evidence.items()
         if key != "evidence_sha256"
     }
-    repository = evidence.get("repository")
-    source_identity_sha256 = evidence.get("source_identity_sha256")
     return bool(
         evidence.get("schema_version") == 1
         and evidence.get("kind")
@@ -15739,25 +15742,31 @@ def _runtime_deploy_auto_source_effect_evidence_valid(
         and evidence.get("expected_head") == expected_head
         and isinstance(repository, str)
         and repository.startswith("/")
-        and isinstance(evidence.get("owner_id"), str)
-        and bool(evidence.get("owner_id"))
-        and isinstance(evidence.get("generation"), str)
-        and bool(evidence.get("generation"))
+        and isinstance(owner_id, str)
+        and isinstance(generation, str)
+        and re.fullmatch(r"[0-9a-f]{12}", generation) is not None
+        and owner_id
+        == f"runtime-deploy-source:{expected_head[:12]}:{generation}"
         and evidence.get("path_resource_key") == f"path:{repository}"
-        and isinstance(evidence.get("target_present"), bool)
-        and isinstance(evidence.get("registration_present"), bool)
-        and (
-            evidence.get("target_present") is True
-            or evidence.get("registration_present") is True
+        and isinstance(evidence.get("source_identity_sha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", evidence["source_identity_sha256"]
         )
-        and (
-            source_identity_sha256 is None
-            or (
-                isinstance(source_identity_sha256, str)
-                and re.fullmatch(r"[0-9a-f]{64}", source_identity_sha256)
-                is not None
-            )
+        is not None
+        and isinstance(evidence.get("lifecycle_checkout_key"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", evidence["lifecycle_checkout_key"]
         )
+        is not None
+        and isinstance(evidence.get("uncertainty_fence_id"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", evidence["uncertainty_fence_id"])
+        is not None
+        and isinstance(evidence.get("uncertainty_evidence_sha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", evidence["uncertainty_evidence_sha256"]
+        )
+        is not None
+        and evidence.get("effect_observed") is True
         and evidence.get("evidence_sha256") == sha256_json(material)
     )
 

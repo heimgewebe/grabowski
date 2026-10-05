@@ -1698,7 +1698,13 @@ def _rootbroker_authority_effect_evidence(
     authority: Any,
     expected_head: str,
 ) -> dict[str, Any] | None:
-    if not isinstance(authority, dict) or authority.get("effect_started") is not True:
+    if (
+        not isinstance(authority, dict)
+        or authority.get("effect_started") is not True
+        or authority.get("success") is not True
+        or authority.get("expected_head") != expected_head
+        or authority.get("attested_head") != expected_head
+    ):
         return None
     material = {
         "schema_version": 1,
@@ -3749,37 +3755,111 @@ def _live_auto_deploy_source_lease_snapshot(
     return {field: lease[field] for field in fields}
 
 
-def _auto_deploy_source_effect_evidence(
-    *,
-    expected_head: str,
-    plan: dict[str, Any],
-    target_present: bool,
-    registration_present: bool,
-    source_identity: dict[str, Any] | None,
-) -> dict[str, Any] | None:
-    if not target_present and not registration_present:
-        return None
-    identity_sha256 = (
-        source_identity.get("identity_sha256")
-        if isinstance(source_identity, dict)
-        else None
+def _require_auto_deploy_source_mutation_leases(
+    owner_id: str,
+    expected_leases: list[dict[str, Any]],
+) -> None:
+    import grabowski_resources as resources
+
+    fields = (
+        "resource_key",
+        "owner_id",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
     )
+    expected_by_key: dict[str, dict[str, Any]] = {}
+    for lease in expected_leases:
+        if not isinstance(lease, dict) or any(field not in lease for field in fields):
+            raise RuntimeError(
+                "automatic deployment source mutation lease snapshot is malformed"
+            )
+        resource_key = lease["resource_key"]
+        if (
+            not isinstance(resource_key, str)
+            or not resource_key
+            or lease["owner_id"] != owner_id
+            or resource_key in expected_by_key
+        ):
+            raise RuntimeError(
+                "automatic deployment source mutation lease snapshot is malformed"
+            )
+        expected_by_key[resource_key] = {field: lease[field] for field in fields}
+    if not expected_by_key:
+        raise RuntimeError(
+            "automatic deployment source mutation lease snapshots are missing"
+        )
+    try:
+        live_leases = resources.inspect_resources(expected_by_key)
+    except Exception as exc:
+        raise DeploySchedulePreEffectRefusal(
+            "automatic deployment source leases could not be revalidated before Git mutation"
+        ) from exc
+    if set(live_leases) != set(expected_by_key):
+        raise DeploySchedulePreEffectRefusal(
+            "automatic deployment source lease expired or disappeared before Git mutation"
+        )
+    for resource_key, expected_snapshot in expected_by_key.items():
+        live = live_leases.get(resource_key)
+        if not isinstance(live, dict) or any(field not in live for field in fields):
+            raise DeploySchedulePreEffectRefusal(
+                "automatic deployment source live lease snapshot is malformed before Git mutation"
+            )
+        current_snapshot = {field: live[field] for field in fields}
+        if current_snapshot != expected_snapshot:
+            raise DeploySchedulePreEffectRefusal(
+                "automatic deployment source lease changed before Git mutation"
+            )
+
+
+def _auto_deploy_source_effect_evidence(
+    plan: dict[str, Any],
+    expected_head: str,
+    repository: Path,
+    source_identity: dict[str, Any],
+    lifecycle: dict[str, Any] | None,
+    uncertainty_fence: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(lifecycle, dict) or not isinstance(uncertainty_fence, dict):
+        raise RuntimeError("automatic deployment source effect recovery binding is malformed")
+    source_identity_sha256 = source_identity.get("identity_sha256")
+    lifecycle_checkout_key = lifecycle.get("checkout_key")
+    fence_id = uncertainty_fence.get("fence_id")
+    fence_evidence_sha256 = uncertainty_fence.get("evidence_sha256")
+    if repository != plan.get("target"):
+        raise RuntimeError("automatic deployment source effect repository drifted")
+    if (
+        not isinstance(source_identity_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_identity_sha256) is None
+        or not isinstance(lifecycle_checkout_key, str)
+        or re.fullmatch(r"[0-9a-f]{64}", lifecycle_checkout_key) is None
+        or not isinstance(fence_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", fence_id) is None
+        or not isinstance(fence_evidence_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", fence_evidence_sha256) is None
+        or uncertainty_fence.get("checkout_key") != lifecycle_checkout_key
+        or uncertainty_fence.get("owner_id") != plan.get("owner_id")
+        or uncertainty_fence.get("operation") != "materialize"
+        or uncertainty_fence.get("operation_id") != plan.get("generation")
+        or uncertainty_fence.get("cleared_at_unix") is not None
+    ):
+        raise RuntimeError("automatic deployment source effect evidence is malformed")
     material = {
         "schema_version": 1,
         "kind": "grabowski_runtime_deploy_auto_source_effect",
         "expected_head": expected_head,
-        "repository": str(plan["target"]),
+        "repository": str(repository),
         "owner_id": plan["owner_id"],
         "generation": plan["generation"],
         "path_resource_key": plan["path_key"],
-        "target_present": target_present,
-        "registration_present": registration_present,
-        "source_identity_sha256": identity_sha256,
+        "source_identity_sha256": source_identity_sha256,
+        "lifecycle_checkout_key": lifecycle_checkout_key,
+        "uncertainty_fence_id": fence_id,
+        "uncertainty_evidence_sha256": fence_evidence_sha256,
+        "effect_observed": True,
     }
-    return {
-        **material,
-        "evidence_sha256": _source_identity_sha256(material),
-    }
+    return {**material, "evidence_sha256": _source_identity_sha256(material)}
 
 
 def _materialize_auto_deploy_source(
@@ -3787,10 +3867,6 @@ def _materialize_auto_deploy_source(
     *,
     local_mutation_tracker: dict[str, Any] | None = None,
 ) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
-    if local_mutation_tracker is not None and not isinstance(
-        local_mutation_tracker, dict
-    ):
-        raise ValueError("local_mutation_tracker must be a mapping")
     stale_snapshot = _canonical_stale_main_snapshot(expected_head)
     if stale_snapshot is None:
         raise RuntimeError(
@@ -3811,13 +3887,13 @@ def _materialize_auto_deploy_source(
     created = False
     mutation_attempted = False
     recovery_asset_present = False
+    observed_effect_evidence: dict[str, Any] | None = None
     lifecycle: dict[str, Any] | None = None
     obligation_opened = False
     obligation_completed = False
     obligation_blocked: dict[str, Any] | None = None
     operation_lease_released = False
     common_dir_lease_released = False
-    observed_auto_source_effect: dict[str, Any] | None = None
     try:
         # Establish durable recovery authority before opening the obligation.
         # If the process dies after this point but before open_obligation()
@@ -3881,6 +3957,12 @@ def _materialize_auto_deploy_source(
             raise RuntimeError(
                 "automatic deployment source target appeared after lease acquisition"
             )
+        mutation_leases = [operation_lease, path_lease]
+        if common_dir_lease is not None:
+            mutation_leases.append(common_dir_lease)
+        _require_auto_deploy_source_mutation_leases(
+            plan["owner_id"], mutation_leases
+        )
         mutation_attempted = True
         # Once the Git effect boundary is entered, preserve recovery authority by
         # default. Only successful observation of both an absent target path and
@@ -3934,13 +4016,20 @@ def _materialize_auto_deploy_source(
             and source_identity is not None
             and registration_present_after_mutation
         )
-        observed_auto_source_effect = _auto_deploy_source_effect_evidence(
-            expected_head=expected_head,
-            plan=plan,
-            target_present=target_present_after_mutation,
-            registration_present=registration_present_after_mutation,
-            source_identity=source_identity,
-        )
+        if exact_post_state:
+            assert source_identity is not None
+            observed_effect_evidence = _auto_deploy_source_effect_evidence(
+                plan,
+                expected_head,
+                target,
+                source_identity,
+                lifecycle,
+                uncertainty_fence,
+            )
+            if local_mutation_tracker is not None:
+                local_mutation_tracker["auto_source_materialization"] = dict(
+                    observed_effect_evidence
+                )
         if uncertain_mutation_outcome:
             raise RuntimeError(
                 "automatic deployment source mutation outcome is uncertain; "
@@ -4100,13 +4189,6 @@ def _materialize_auto_deploy_source(
             uncertainty_fence_cleared = True
         return repository, runner, source_identity, materialization
     except Exception as exc:
-        if (
-            local_mutation_tracker is not None
-            and observed_auto_source_effect is not None
-        ):
-            local_mutation_tracker["auto_source_materialization"] = dict(
-                observed_auto_source_effect
-            )
         cleanup_failures: list[tuple[str, Exception]] = []
         if obligation_opened and not obligation_completed:
             try:
@@ -4209,9 +4291,20 @@ def _materialize_auto_deploy_source(
             except Exception as cleanup_error:
                 cleanup_failures.append(("uncertainty-fence-clear", cleanup_error))
         if cleanup_failures:
-            raise RuntimeError(
+            message = (
                 f"{type(exc).__name__}: {exc}; cleanup failures: "
                 + _cleanup_failure_text(cleanup_failures)
+            )
+            if observed_effect_evidence is not None:
+                raise DeployScheduleFailureAfterLocalMutation(
+                    message,
+                    local_mutation_evidence=observed_effect_evidence,
+                ) from exc
+            raise RuntimeError(message) from exc
+        if observed_effect_evidence is not None:
+            raise DeployScheduleFailureAfterLocalMutation(
+                str(exc),
+                local_mutation_evidence=observed_effect_evidence,
             ) from exc
         raise
 
@@ -5134,9 +5227,10 @@ def _grabowski_runtime_deploy_schedule_impl(
                 )
         try:
             authority = privileged.ensure_rootbroker_authority(expected_head)
-        except privileged.RootbrokerAuthorityFailureAfterObservedEffect as exc:
+        except Exception as exc:
+            authority_result = getattr(exc, "authority_result", None)
             authority_effect = _rootbroker_authority_effect_evidence(
-                exc.authority, expected_head
+                authority_result, expected_head
             )
             if authority_effect is not None:
                 local_mutation_tracker["rootbroker_authority"] = authority_effect
@@ -5186,15 +5280,29 @@ def _grabowski_runtime_deploy_schedule_impl(
                 ),
                 expected_head,
             )
-            (
-                repository,
-                runner,
-                source_identity,
-                automatic_source,
-            ) = _materialize_auto_deploy_source(
-                expected_head,
-                local_mutation_tracker=local_mutation_tracker,
-            )
+            try:
+                (
+                    repository,
+                    runner,
+                    source_identity,
+                    automatic_source,
+                ) = _materialize_auto_deploy_source(
+                    expected_head,
+                    local_mutation_tracker=local_mutation_tracker,
+                )
+            except DeployScheduleFailureAfterLocalMutation as exc:
+                local_mutation_tracker["auto_source_materialization"] = dict(
+                    exc.local_mutation_evidence
+                )
+                combined_evidence = _tracked_runtime_deploy_local_mutation_evidence(
+                    local_mutation_tracker
+                )
+                if not isinstance(combined_evidence, dict):
+                    raise
+                raise DeployScheduleFailureAfterLocalMutation(
+                    str(exc),
+                    local_mutation_evidence=combined_evidence,
+                ) from exc
             effective_source_repository = str(repository)
             effective_source_lease_owner_id = automatic_source["owner_id"]
             automatic_source_binding = automatic_source

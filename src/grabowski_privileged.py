@@ -563,12 +563,12 @@ def _operator_authority_attestation_head() -> str | None:
     return expected_head
 
 
-class RootbrokerAuthorityFailureAfterObservedEffect(RuntimeError):
-    """Rootbroker refresh failed after the request/effect boundary was observed."""
+class RootbrokerAuthorityAuditFailure(RuntimeError):
+    """Rootbroker effect was observed but its operator audit could not be recorded."""
 
-    def __init__(self, message: str, *, authority: dict[str, Any]) -> None:
+    def __init__(self, message: str, *, authority_result: dict[str, Any]) -> None:
         super().__init__(message)
-        self.authority = dict(authority)
+        self.authority_result = dict(authority_result)
 
 
 def ensure_rootbroker_authority(
@@ -661,7 +661,7 @@ def ensure_rootbroker_authority(
         "failure_reason": failure_reason,
         "force_refresh": force_refresh,
     }
-    authority = {
+    authority_result = {
         "success": success,
         "outcome": outcome,
         "expected_head": expected_head,
@@ -676,11 +676,11 @@ def ensure_rootbroker_authority(
     try:
         _append_operator_audit(audit_record)
     except Exception as exc:
-        raise RootbrokerAuthorityFailureAfterObservedEffect(
-            "Rootbroker authority audit failed after the broker effect boundary",
-            authority=authority,
+        raise RootbrokerAuthorityAuditFailure(
+            f"Rootbroker authority effect audit failed: {type(exc).__name__}: {exc}",
+            authority_result=authority_result,
         ) from exc
-    return authority
+    return authority_result
 
 
 def root_task_systemd_request(

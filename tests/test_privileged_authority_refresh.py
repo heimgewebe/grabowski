@@ -55,37 +55,6 @@ class RootbrokerAuthorityRefreshTests(unittest.TestCase):
         self.assertFalse(result["force_refresh"])
         broker.assert_not_called()
 
-    def test_audit_failure_preserves_post_effect_authority_evidence(self) -> None:
-        head = "a" * 40
-        response = json.dumps({"returncode": 0, "stderr": ""}).encode() + b"\n"
-        reference = {"request_id": "b" * 32, "reference_sha256": "c" * 64}
-        with patch.object(
-            priv.operator, "_require_operator_capability"
-        ), patch.object(
-            priv, "_operator_authority_attestation_head", side_effect=["d" * 40, head]
-        ), patch.object(
-            priv, "_privileged_broker_status", return_value={"ready": True}
-        ), patch.object(
-            priv, "_create_privileged_reference", return_value=reference
-        ), patch.object(
-            priv.socket, "socket", return_value=FakeSocket(response)
-        ), patch.object(
-            priv, "_append_operator_audit", side_effect=OSError("audit unavailable")
-        ):
-            with self.assertRaises(
-                priv.RootbrokerAuthorityFailureAfterObservedEffect
-            ) as raised:
-                priv.ensure_rootbroker_authority(head)
-        authority = raised.exception.authority
-        self.assertTrue(authority["success"])
-        self.assertTrue(authority["effect_started"])
-        self.assertEqual(authority["expected_head"], head)
-        self.assertEqual(authority["attested_head"], head)
-        self.assertEqual(authority["request_id"], reference["request_id"])
-        self.assertEqual(
-            authority["reference_sha256"], reference["reference_sha256"]
-        )
-
     def test_force_refresh_executes_even_when_attestation_head_matches(self) -> None:
         head = "a" * 40
         response = json.dumps({"returncode": 0, "stderr": ""}).encode() + b"\n"
@@ -105,6 +74,33 @@ class RootbrokerAuthorityRefreshTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertTrue(result["force_refresh"])
         self.assertEqual(create.call_args.kwargs["target"], head)
+
+    def test_successful_refresh_preserves_authority_result_when_audit_fails(self) -> None:
+        head = "a" * 40
+        response = json.dumps({"returncode": 0, "stderr": ""}).encode() + b"\\n"
+        reference = {"request_id": "b" * 32, "reference_sha256": "c" * 64}
+        with patch.object(
+            priv.operator, "_require_operator_capability"
+        ), patch.object(
+            priv, "_operator_authority_attestation_head", side_effect=["d" * 40, head]
+        ), patch.object(
+            priv, "_privileged_broker_status", return_value={"ready": True}
+        ), patch.object(
+            priv, "_create_privileged_reference", return_value=reference
+        ), patch.object(
+            priv.socket, "socket", return_value=FakeSocket(response)
+        ), patch.object(
+            priv, "_append_operator_audit", side_effect=OSError("audit unavailable")
+        ):
+            with self.assertRaises(priv.RootbrokerAuthorityAuditFailure) as raised:
+                priv.ensure_rootbroker_authority(head)
+        authority = raised.exception.authority_result
+        self.assertTrue(authority["success"])
+        self.assertTrue(authority["effect_started"])
+        self.assertEqual(authority["expected_head"], head)
+        self.assertEqual(authority["attested_head"], head)
+        self.assertEqual(authority["request_id"], reference["request_id"])
+        self.assertEqual(authority["reference_sha256"], reference["reference_sha256"])
 
 
 if __name__ == "__main__":
