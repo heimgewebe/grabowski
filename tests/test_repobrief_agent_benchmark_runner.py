@@ -710,6 +710,10 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
             manifest = bind_manifest(value, Path(directory))
+            logical_parent = Path(directory) / "sub"
+            logical_parent.mkdir()
+            logical_manifest = logical_parent / ".." / manifest.name
+            value["repobrief"]["manifest"] = str(logical_manifest)
             messages = runner.parse_jsonl(
                 stream(value, tool_name="mcp__repobrief__ask_context")
             )
@@ -753,7 +757,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     "version": "v1",
                     "status": "fresh",
                     "reason": "git_head_matches_snapshot",
-                    "bundle_manifest": str(manifest),
+                    "bundle_manifest": str(logical_manifest),
                     "repo_root": "/tmp/repo",
                     "read_only_git_probe": True,
                     "implicit_refresh": False,
@@ -778,6 +782,23 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                         "grounding_status": None,
                     }],
                 },
+            )
+
+            alternate_parent = Path(directory) / "alternate"
+            alternate_parent.mkdir()
+            unexpected_alias = alternate_parent / ".." / manifest.name
+            unexpected = copy.deepcopy(payload)
+            unexpected["live_freshness"]["bundle_manifest"] = str(unexpected_alias)
+            tool_result["content"] = json.dumps(
+                {"structuredContent": unexpected}, sort_keys=True
+            )
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
+            tool_result["content"] = json.dumps(
+                {"structuredContent": payload}, sort_keys=True
             )
 
             wrong = json.loads(json.dumps(payload))
@@ -863,6 +884,10 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
             manifest = bind_manifest(value, Path(directory))
+            logical_parent = Path(directory) / "sub"
+            logical_parent.mkdir()
+            logical_manifest = logical_parent / ".." / manifest.name
+            value["repobrief"]["manifest"] = str(logical_manifest)
             uri = "repoground://snapshot/demo/canonical"
             messages = runner.parse_jsonl(
                 stream(value, tool_name="ReadMcpResource")
@@ -889,7 +914,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 "version": "v1",
                 "status": "fresh",
                 "reason": "git_head_matches_snapshot",
-                "bundle_manifest": str(manifest),
+                "bundle_manifest": str(logical_manifest),
                 "repo_root": "/tmp/repo",
                 "read_only_git_probe": True,
                 "implicit_refresh": False,
@@ -1004,6 +1029,10 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
             manifest = bind_manifest(value, Path(directory))
+            logical_parent = Path(directory) / "sub"
+            logical_parent.mkdir()
+            logical_manifest = logical_parent / ".." / manifest.name
+            value["repobrief"]["manifest"] = str(logical_manifest)
             messages = runner.parse_jsonl(
                 stream(value, tool_name="mcp__repobrief__grounding_verify")
             )
@@ -1025,7 +1054,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     "version": "1.0",
                     "status": "pass",
                     "snapshot_ref": {
-                        "manifest_path": str(manifest),
+                        "manifest_path": str(logical_manifest),
                         "git_commit": COMMIT.upper(),
                         "freshness_status": "fresh",
                     },
@@ -1034,7 +1063,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     "kind": "repobrief.live_freshness",
                     "version": "v1",
                     "status": "fresh",
-                    "bundle_manifest": str(manifest),
+                    "bundle_manifest": str(logical_manifest),
                     "snapshot_provenance": {"git_commit": COMMIT.upper()},
                 },
             }
@@ -1158,6 +1187,10 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
             manifest = bind_manifest(value, Path(directory))
+            logical_parent = Path(directory) / "sub"
+            logical_parent.mkdir()
+            logical_manifest = logical_parent / ".." / manifest.name
+            value["repobrief"]["manifest"] = str(logical_manifest)
             messages = runner.parse_jsonl(
                 stream(value, tool_name="mcp__repobrief__live_freshness")
             )
@@ -1175,7 +1208,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     "version": "v1",
                     "status": "not_comparable",
                     "reason": "repo_root_not_configured",
-                    "bundle_manifest": str(manifest),
+                    "bundle_manifest": str(logical_manifest),
                     "repo_root": None,
                     "read_only_git_probe": False,
                     "implicit_refresh": False,

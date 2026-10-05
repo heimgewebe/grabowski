@@ -1353,10 +1353,23 @@ def _bound_repoground_manifest(
     return manifest_path, expected_sha, str(commit).lower()
 
 
+def _authorized_manifest_paths(
+    request: Mapping[str, Any], *, manifest_path: Path
+) -> frozenset[str]:
+    binding = _mapping(request.get("repobrief"))
+    logical_path = Path(
+        _require_string(binding.get("manifest"), "repobrief.manifest")
+    ).expanduser()
+    paths = {str(manifest_path)}
+    if logical_path.is_absolute():
+        paths.add(str(logical_path))
+    return frozenset(paths)
+
+
 def _snapshot_ref_matches_manifest(
     snapshot_ref: Mapping[str, Any],
     *,
-    manifest_path: Path,
+    manifest_paths: frozenset[str],
     manifest_sha256: str,
     require_sha: bool,
 ) -> bool:
@@ -1365,7 +1378,7 @@ def _snapshot_ref_matches_manifest(
         return observed_sha == manifest_sha256
     if require_sha:
         return False
-    return snapshot_ref.get("manifest_path") == str(manifest_path)
+    return snapshot_ref.get("manifest_path") in manifest_paths
 
 
 def _snapshot_ref_commit(
@@ -1382,14 +1395,14 @@ def _snapshot_ref_commit(
 def _live_snapshot_commit(
     payload: Mapping[str, Any],
     *,
-    manifest_path: Path,
+    manifest_paths: frozenset[str],
     manifest_commit: str,
 ) -> str | None:
     if (
         payload.get("kind") != "repobrief.live_freshness"
         or payload.get("version") != "v1"
         or payload.get("status") not in _REPOGROUND_LIVE_FRESHNESS
-        or payload.get("bundle_manifest") != str(manifest_path)
+        or payload.get("bundle_manifest") not in manifest_paths
     ):
         return None
     snapshot = payload.get("snapshot_provenance")
@@ -1429,12 +1442,13 @@ def _repoground_evidence_from_payload(
     payload: Mapping[str, Any],
 ) -> tuple[str, dict[str, Any]] | None:
     manifest_path, manifest_sha256, manifest_commit = _bound_repoground_manifest(request)
+    manifest_paths = _authorized_manifest_paths(request, manifest_path=manifest_path)
     if tool_name == "ask_context":
         live_freshness = payload.get("live_freshness")
         live_commit = (
             _live_snapshot_commit(
                 live_freshness,
-                manifest_path=manifest_path,
+                manifest_paths=manifest_paths,
                 manifest_commit=manifest_commit,
             )
             if isinstance(live_freshness, Mapping)
@@ -1464,7 +1478,7 @@ def _repoground_evidence_from_payload(
             or snapshot_ref.get("freshness_status") != freshness.get("status")
             or not _snapshot_ref_matches_manifest(
                 snapshot_ref,
-                manifest_path=manifest_path,
+                manifest_paths=manifest_paths,
                 manifest_sha256=manifest_sha256,
                 require_sha=True,
             )
@@ -1503,7 +1517,7 @@ def _repoground_evidence_from_payload(
         status = payload.get("status")
         commit = _live_snapshot_commit(
             payload,
-            manifest_path=manifest_path,
+            manifest_paths=manifest_paths,
             manifest_commit=manifest_commit,
         )
         if commit is None:
@@ -1535,10 +1549,10 @@ def _repoground_evidence_from_payload(
             or live_freshness.get("kind") != "repobrief.live_freshness"
             or live_freshness.get("version") != "v1"
             or live_freshness.get("status") not in _REPOGROUND_LIVE_FRESHNESS
-            or live_freshness.get("bundle_manifest") != str(manifest_path)
+            or live_freshness.get("bundle_manifest") not in manifest_paths
             or _live_snapshot_commit(
                 live_freshness,
-                manifest_path=manifest_path,
+                manifest_paths=manifest_paths,
                 manifest_commit=manifest_commit,
             ) is None
         ):
@@ -1548,7 +1562,7 @@ def _repoground_evidence_from_payload(
             not isinstance(snapshot_ref, Mapping)
             or not _snapshot_ref_matches_manifest(
                 snapshot_ref,
-                manifest_path=manifest_path,
+                manifest_paths=manifest_paths,
                 manifest_sha256=manifest_sha256,
                 require_sha=False,
             )
@@ -1638,9 +1652,10 @@ def _repoground_resource_read_evidence(
     if not isinstance(live_freshness, Mapping):
         return None
     manifest_path, _manifest_sha256, manifest_commit = _bound_repoground_manifest(request)
+    manifest_paths = _authorized_manifest_paths(request, manifest_path=manifest_path)
     commit = _live_snapshot_commit(
         live_freshness,
-        manifest_path=manifest_path,
+        manifest_paths=manifest_paths,
         manifest_commit=manifest_commit,
     )
     if commit is None:
