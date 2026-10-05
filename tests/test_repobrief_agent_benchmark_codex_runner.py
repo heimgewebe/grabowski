@@ -4132,7 +4132,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
     def test_codex_projects_bound_repoground_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
-            manifest = bind_manifest(value, Path(directory))
+            manifest = bind_manifest(value, Path(directory), commit=COMMIT.upper())
             payload = {
                 "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
                 "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
@@ -4144,7 +4144,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "snapshot_ref": {
                         "manifest_path": str(manifest),
                         "manifest_sha256": value["repobrief"]["manifest_sha256"],
-                        "git_commit": None,
+                        "git_commit": COMMIT.upper(),
                         "freshness_status": "fresh",
                     },
                     "freshness": {"status": "fresh"},

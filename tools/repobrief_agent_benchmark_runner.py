@@ -1253,7 +1253,7 @@ def _is_commit(value: Any) -> bool:
     return bool(
         isinstance(value, str)
         and len(value) in {40, 64}
-        and all(char in "0123456789abcdef" for char in value)
+        and all(char in "0123456789abcdefABCDEF" for char in value)
     )
 
 
@@ -1322,7 +1322,7 @@ def _bound_repoground_manifest(
     )
     if not _is_commit(commit):
         raise RunnerError("RepoGround manifest commit is invalid")
-    return manifest_path, expected_sha, str(commit)
+    return manifest_path, expected_sha, str(commit).lower()
 
 
 def _snapshot_ref_matches_manifest(
@@ -1345,7 +1345,7 @@ def _snapshot_ref_commit(
 ) -> str | None:
     commit = snapshot_ref.get("git_commit")
     if _is_commit(commit):
-        return manifest_commit if commit == manifest_commit else None
+        return manifest_commit if str(commit).lower() == manifest_commit else None
     if commit is None:
         return manifest_commit
     return None
@@ -1357,7 +1357,7 @@ def _live_snapshot_commit(
     snapshot = payload.get("snapshot_provenance")
     if isinstance(snapshot, Mapping):
         commit = snapshot.get("git_commit")
-        if _is_commit(commit) and commit == manifest_commit:
+        if _is_commit(commit) and str(commit).lower() == manifest_commit:
             return manifest_commit
         return None
     if (

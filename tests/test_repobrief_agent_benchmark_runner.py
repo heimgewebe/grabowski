@@ -808,6 +808,14 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 _, _, commit = runner._bound_repoground_manifest(value)
                 self.assertEqual(commit, COMMIT)
 
+    def test_bound_manifest_normalizes_uppercase_commit(self) -> None:
+        for raw_commit in (COMMIT.upper(), ("ab" * 32).upper()):
+            with self.subTest(length=len(raw_commit)), tempfile.TemporaryDirectory() as directory:
+                value = request(condition="treatment")
+                bind_manifest(value, Path(directory), commit=raw_commit)
+                _, _, commit = runner._bound_repoground_manifest(value)
+                self.assertEqual(commit, raw_commit.lower())
+
     def test_bound_manifest_rejects_ambiguous_multi_repo_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
@@ -849,7 +857,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     "status": "pass",
                     "snapshot_ref": {
                         "manifest_path": str(manifest),
-                        "git_commit": None,
+                        "git_commit": COMMIT.upper(),
                         "freshness_status": "fresh",
                     },
                 },
@@ -858,7 +866,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     "version": "v1",
                     "status": "fresh",
                     "bundle_manifest": str(manifest),
-                    "snapshot_provenance": {"git_commit": COMMIT},
+                    "snapshot_provenance": {"git_commit": COMMIT.upper()},
                 },
             }
             tool_result["content"] = json.dumps(
