@@ -3538,6 +3538,17 @@ def _resolve_materialize_recovery_obligation(
             }
         )
     elif status.get("state") == "blocked":
+        if (
+            status.get("resolution_disposition") in {"resolved", "superseded"}
+            and status.get("continuation_required") is False
+        ):
+            return {
+                "obligation_id": obligation_id,
+                "obligation_state": "blocked_terminal_preserved",
+                "recovery_sha256": recovery_sha256,
+                "close_file_sha256": status.get("close_file_sha256"),
+                "resolution_file_sha256": status.get("resolution_file_sha256"),
+            }
         close = status
     else:
         raise RuntimeError(

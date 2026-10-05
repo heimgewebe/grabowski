@@ -1042,17 +1042,25 @@ def _resume_under_schedule_lock(
         "stale_pending_reconciliation"
     )
     if already_running is not None and not volatile["reasons"]:
-        base._append_audit(
-            {
-                "timestamp_unix": int(time.time()),
-                "operation": "midcutover-resume-coalesced",
-                "expected_head": expected_head,
-                "cutover_id": resume_binding["cutover_id"],
-                "unit": already_running["unit"],
-                "stale_pending_reconciliation": stale_pending_reconciliation,
-                "intent_sha256": intent_sha256,
-            }
-        )
+        try:
+            base._append_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "midcutover-resume-coalesced",
+                    "expected_head": expected_head,
+                    "cutover_id": resume_binding["cutover_id"],
+                    "unit": already_running["unit"],
+                    "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "intent_sha256": intent_sha256,
+                }
+            )
+        except Exception as exc:
+            if stale_pending_reconciliation is not None:
+                raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                    f"{type(exc).__name__}: {exc}",
+                    local_mutation_evidence=stale_pending_reconciliation,
+                ) from exc
+            raise
         return {
             "schema_version": SCHEMA_VERSION,
             "kind": "grabowski_midcutover_resume_receipt",
@@ -1270,16 +1278,24 @@ def _repair_under_schedule_lock(
         # This exact intent is already in flight.  Starting a second job would
         # be the historically observed double dispatch, so the existing one is
         # returned instead: same argv, same target, same receipt lineage.
-        base._append_audit(
-            {
-                "timestamp_unix": int(time.time()),
-                "operation": "provenance-recovery-coalesced",
-                "expected_head": expected_head,
-                "unit": already_running["unit"],
-                "stale_pending_reconciliation": stale_pending_reconciliation,
-                "intent_sha256": intent_sha256,
-            }
-        )
+        try:
+            base._append_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "provenance-recovery-coalesced",
+                    "expected_head": expected_head,
+                    "unit": already_running["unit"],
+                    "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "intent_sha256": intent_sha256,
+                }
+            )
+        except Exception as exc:
+            if stale_pending_reconciliation is not None:
+                raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                    f"{type(exc).__name__}: {exc}",
+                    local_mutation_evidence=stale_pending_reconciliation,
+                ) from exc
+            raise
         return {
             "schema_version": SCHEMA_VERSION,
             "kind": "grabowski_provenance_recovery_receipt",

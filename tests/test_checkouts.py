@@ -3145,6 +3145,73 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertFalse(status["continuation_required"])
         self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
 
+    def test_materialize_uncertainty_reconcile_preserves_already_resolved_no_effect_obligation(
+        self,
+    ) -> None:
+        _target, fence, _lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        blocked = obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "materialization-failed",
+                        "detail": "Scheduler proved the materialization had no effect.",
+                        "reference": "auto-deploy-source:test",
+                        "sha256": "7" * 64,
+                    }
+                ],
+                "next_action": "No continuation is required after no-effect cleanup.",
+            }
+        )
+        resolved = obligations.resolve_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "disposition": "resolved",
+                "evidence": [
+                    {
+                        "source": "receipt",
+                        "reference": "auto-deploy-source-pre-effect:test",
+                        "sha256": blocked["close_file_sha256"],
+                    }
+                ],
+            }
+        )
+        resolution_sha256 = resolved["resolution_file_sha256"]
+
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_no_effect")
+        self.assertEqual(
+            result["readback"]["obligation_recovery"]["obligation_state"],
+            "blocked_terminal_preserved",
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(status["resolution_file_sha256"], resolution_sha256)
+        self.assertEqual(
+            status["resolution_evidence"],
+            [
+                {
+                    "source": "receipt",
+                    "reference": "auto-deploy-source-pre-effect:test",
+                    "sha256": blocked["close_file_sha256"],
+                }
+            ],
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
     def test_materialize_no_effect_recovery_accepts_missing_preopen_obligation(self) -> None:
         fence = {
             "fence_id": "f" * 32,
