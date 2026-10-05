@@ -1206,6 +1206,7 @@ def normalize_tool_calls(
 
 
 _REPOGROUND_FRESHNESS = {"fresh", "stale", "unknown", "not_comparable", "not_applicable"}
+_REPOGROUND_LIVE_FRESHNESS = {"fresh", "stale", "unknown", "not_comparable"}
 _REPOGROUND_GROUNDING = {"pass", "fail", "warn", "degraded", "not_applicable"}
 
 
@@ -1442,7 +1443,7 @@ def _repoground_evidence_from_payload(
         if (
             payload.get("kind") != "repobrief.live_freshness"
             or payload.get("version") != "v1"
-            or status not in _REPOGROUND_FRESHNESS
+            or status not in _REPOGROUND_LIVE_FRESHNESS
             or payload.get("bundle_manifest") != str(manifest_path)
             or commit is None
         ):
@@ -1473,7 +1474,7 @@ def _repoground_evidence_from_payload(
             or not isinstance(live_freshness, Mapping)
             or live_freshness.get("kind") != "repobrief.live_freshness"
             or live_freshness.get("version") != "v1"
-            or live_freshness.get("status") not in _REPOGROUND_FRESHNESS
+            or live_freshness.get("status") not in _REPOGROUND_LIVE_FRESHNESS
             or live_freshness.get("bundle_manifest") != str(manifest_path)
             or _live_snapshot_commit(
                 live_freshness, manifest_commit=manifest_commit

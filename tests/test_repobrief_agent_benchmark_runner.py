@@ -914,6 +914,17 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 )
             )
 
+            payload["live_freshness"]["bundle_manifest"] = str(manifest)
+            payload["live_freshness"]["status"] = "not_applicable"
+            tool_result["content"] = json.dumps(
+                {"structuredContent": payload}, sort_keys=True
+            )
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
+
     def test_treatment_does_not_project_version_drift_as_repoground_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
@@ -934,6 +945,36 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     "kind": "repobrief.live_freshness",
                     "version": "v2",
                     "status": "fresh",
+                    "bundle_manifest": str(manifest),
+                    "snapshot_provenance": {"git_commit": COMMIT},
+                }},
+                sort_keys=True,
+            )
+            calls = runner.normalize_tool_calls(value, messages)
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(value, messages, calls)
+            )
+
+    def test_treatment_rejects_not_applicable_live_freshness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="mcp__repobrief__live_freshness")
+            )
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            tool_result["content"] = json.dumps(
+                {"structuredContent": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v1",
+                    "status": "not_applicable",
                     "bundle_manifest": str(manifest),
                     "snapshot_provenance": {"git_commit": COMMIT},
                 }},
