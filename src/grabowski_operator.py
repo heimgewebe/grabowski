@@ -2079,6 +2079,7 @@ def _require_transport_roundtrip_for_tool(
     arguments: Any,
     context: Context | None,
     tool: Any,
+    transport_arguments: Any | None = None,
 ) -> dict[str, Any] | None:
     typed_read_redirect = _terminal_typed_read_redirect(tool_name, arguments)
     if typed_read_redirect is not None:
@@ -2106,9 +2107,18 @@ def _require_transport_roundtrip_for_tool(
         return None
     runtime_binding = base._transport_roundtrip_runtime_binding()
     try:
+        domain_arguments = arguments if arguments is not None else {}
+        public_arguments = (
+            domain_arguments if transport_arguments is None else transport_arguments
+        )
         arguments_sha256 = (
             grabowski_transport_roundtrip.canonical_arguments_sha256(
-                arguments if arguments is not None else {}
+                domain_arguments
+            )
+        )
+        transport_arguments_sha256 = (
+            grabowski_transport_assertion.canonical_arguments_sha256(
+                public_arguments if public_arguments is not None else {}
             )
         )
         tool_name_text = str(tool_name)
@@ -2118,7 +2128,7 @@ def _require_transport_roundtrip_for_tool(
                 signed_evidence = signed_transport(
                     context,
                     tool_name=tool_name_text,
-                    arguments_sha256=arguments_sha256,
+                    arguments_sha256=transport_arguments_sha256,
                     runtime_binding=runtime_binding,
                 )
             except grabowski_transport_assertion.TransportAssertionReplay as replay_exc:
@@ -3253,6 +3263,7 @@ def _install_deployment_admission_gate() -> None:
                 arguments=policy_arguments,
                 context=context,
                 tool=tool,
+                transport_arguments=arguments,
             )
             (
                 admission_transport_evidence,
