@@ -5468,6 +5468,26 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                         RUNNER._prepare_validation_python(repo, validation_root)
                 run.assert_not_called()
 
+    def test_validation_temp_parent_rejects_shell_unsafe_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for name in ("runtime root", "runtime;touch-marker", "runtime$(id)"):
+                with self.subTest(name=name):
+                    runtime_root = root / name
+                    runtime_root.mkdir()
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "XDG_RUNTIME_DIR": str(runtime_root),
+                            RUNNER.FINALIZATION_ENV["finalization"]: "",
+                        },
+                        clear=False,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "unsupported shell characters"
+                        ):
+                            RUNNER._validation_temp_parent()
+
     def test_validation_temp_parent_rejects_git_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

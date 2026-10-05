@@ -271,6 +271,10 @@ def _validation_temp_parent() -> Path:
     resolved = parent.resolve(strict=True)
     if resolved != parent:
         raise RuntimeError("validation temporary parent is not canonical")
+    if re.fullmatch(r"/[A-Za-z0-9._/-]+", resolved.as_posix()) is None:
+        raise RuntimeError(
+            "validation temporary parent contains unsupported shell characters"
+        )
     if any((ancestor / ".git").exists() for ancestor in (resolved, *resolved.parents)):
         raise RuntimeError("validation temporary parent must not be inside a Git worktree")
     return resolved
