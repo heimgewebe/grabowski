@@ -15683,13 +15683,7 @@ def _runtime_deploy_rootbroker_authority_evidence_valid(
         and isinstance(evidence.get("outcome"), str)
         and bool(evidence.get("outcome"))
         and evidence.get("effect_started") is True
-        and (
-            attested_head is None
-            or (
-                isinstance(attested_head, str)
-                and re.fullmatch(r"[0-9a-f]{40}", attested_head) is not None
-            )
-        )
+        and attested_head == expected_head
         and (
             request_id is None
             or (isinstance(request_id, str) and 0 < len(request_id) <= 256)

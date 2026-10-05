@@ -652,6 +652,30 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
             **authority_material,
             "evidence_sha256": grips.sha256_json(authority_material),
         }
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                authority,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+        wrong_head = "0" * 40 if CAPTAIN_HEAD != "0" * 40 else "1" * 40
+        for attested_head in (None, wrong_head):
+            forged_material = {
+                **authority_material,
+                "attested_head": attested_head,
+            }
+            forged = {
+                **forged_material,
+                "evidence_sha256": grips.sha256_json(forged_material),
+            }
+            self.assertFalse(
+                grips._runtime_deploy_local_mutation_evidence_valid(
+                    forged,
+                    expected_job_prefix="grabowski-job-",
+                    expected_head=CAPTAIN_HEAD,
+                )
+            )
         bundle_material = {
             "schema_version": 1,
             "kind": "grabowski_runtime_deploy_local_mutation_bundle",
