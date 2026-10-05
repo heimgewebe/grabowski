@@ -928,6 +928,61 @@ class DispatchOutcomeTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
 
+    def test_reservation_setup_failure_preserves_stale_pending_reconciliation(
+        self,
+    ) -> None:
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "runtime_integrity": {"failed_integrity_flags": ["provenance_valid"]},
+            "source_identity": _source_identity(ROOT),
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale-reservation-setup",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 14,
+            "evidence_sha256": "f" * 64,
+        }
+        volatile = {
+            "reasons": [],
+            "checks": {},
+            "competing_deployment": {
+                "idempotent_match": None,
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+        with (
+            patch.object(provenance_recovery, "evaluate_gate", return_value=gate),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="d" * 64,
+            ),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_write_deploy_index",
+                side_effect=OSError("reservation setup failed"),
+            ),
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+        ):
+            with self.assertRaises(
+                provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                provenance_recovery.grabowski_recovery_provenance_repair(HEAD)
+
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
+        start_job.assert_not_called()
+
     def test_unknown_dispatch_outcome_keeps_reservation_and_reconciliation(self) -> None:
         """Unknown dispatch remains authoritative and keeps prior local mutation evidence."""
         gate = {
@@ -1718,6 +1773,91 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
                 provenance_recovery.base,
                 "_append_audit",
                 side_effect=fail_aborted_audit,
+            ),
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+        ):
+            with self.assertRaises(
+                provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                provenance_recovery._resume_under_schedule_lock(HEAD)
+
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
+        start_job.assert_not_called()
+
+    def test_midcutover_resume_reservation_setup_failure_preserves_stale_pending_reconciliation(
+        self,
+    ) -> None:
+        binding = {
+            "cutover_id": "bgc-reservation-setup-failure",
+            "resumed_receipt_sha256": "cd" * 32,
+            "binding_sha256": "ab" * 32,
+            "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+        }
+        lane = {
+            "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+            "resume_binding": binding,
+            "classification_sha256": "ef" * 32,
+            "reasons": [],
+        }
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "resume_binding": binding,
+            "recovery_lane": lane,
+        }
+        source_identity = {
+            **_source_identity(ROOT),
+            "identity_sha256": "12" * 32,
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale-resume-reservation-setup",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 15,
+            "evidence_sha256": "1" * 64,
+        }
+        volatile = {
+            "reasons": [],
+            "checks": {},
+            "competing_deployment": {
+                "idempotent_match": None,
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+        with (
+            patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery,
+                "_resume_source_preflight",
+                return_value=(
+                    ROOT,
+                    ROOT / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+                    source_identity,
+                ),
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_midcutover_resume_command",
+                return_value=["python3"],
+            ),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="de" * 32,
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_write_deploy_index",
+                side_effect=OSError("reservation setup failed"),
             ),
             patch.object(provenance_recovery.operator, "_start_job") as start_job,
         ):

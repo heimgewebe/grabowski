@@ -1106,13 +1106,21 @@ def _resume_under_schedule_lock(
             volatile["reasons"], {**gate, "recheck": volatile}
         )
 
-    jobs_root = operator._jobs_root()
-    reserved_unit = self_deploy.DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
-    self_deploy._write_deploy_index(
-        jobs_root,
-        units=self_deploy._deploy_index(jobs_root)["units"],
-        pending_unit=reserved_unit,
-    )
+    try:
+        jobs_root = operator._jobs_root()
+        reserved_unit = self_deploy.DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
+        self_deploy._write_deploy_index(
+            jobs_root,
+            units=self_deploy._deploy_index(jobs_root)["units"],
+            pending_unit=reserved_unit,
+        )
+    except Exception as exc:
+        if stale_pending_reconciliation is not None:
+            raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                f"{type(exc).__name__}: {exc}",
+                local_mutation_evidence=stale_pending_reconciliation,
+            ) from exc
+        raise
     try:
         job = operator._start_job(
             command,
@@ -1363,13 +1371,21 @@ def _repair_under_schedule_lock(
             raise
         raise ProvenanceRecoveryDenied(volatile["reasons"], {**gate, "recheck": volatile})
 
-    jobs_root = operator._jobs_root()
-    reserved_unit = self_deploy.DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
-    self_deploy._write_deploy_index(
-        jobs_root,
-        units=self_deploy._deploy_index(jobs_root)["units"],
-        pending_unit=reserved_unit,
-    )
+    try:
+        jobs_root = operator._jobs_root()
+        reserved_unit = self_deploy.DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
+        self_deploy._write_deploy_index(
+            jobs_root,
+            units=self_deploy._deploy_index(jobs_root)["units"],
+            pending_unit=reserved_unit,
+        )
+    except Exception as exc:
+        if stale_pending_reconciliation is not None:
+            raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                f"{type(exc).__name__}: {exc}",
+                local_mutation_evidence=stale_pending_reconciliation,
+            ) from exc
+        raise
     try:
         job = operator._start_job(
             command,
