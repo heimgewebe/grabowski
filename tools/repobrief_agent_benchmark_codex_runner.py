@@ -1178,6 +1178,24 @@ def _validated_resource_read_result(value: Any, *, expected_uri: str) -> dict[st
     return json.loads(json.dumps(value))
 
 
+def _rebind_resource_read_manifest(
+    value: Mapping[str, Any],
+    *,
+    staged_manifest: Path,
+    external_manifest: Path,
+) -> dict[str, Any]:
+    rebound = json.loads(json.dumps(value))
+    meta = rebound.get("_meta")
+    repoground = meta.get("repoground") if isinstance(meta, dict) else None
+    freshness = repoground.get("liveFreshness") if isinstance(repoground, dict) else None
+    if (
+        isinstance(freshness, dict)
+        and freshness.get("bundle_manifest") == str(staged_manifest)
+    ):
+        freshness["bundle_manifest"] = str(external_manifest)
+    return rebound
+
+
 def _validated_live_freshness_payload(
     value: Any, *, expected_manifest: Path
 ) -> dict[str, Any]:
@@ -4446,6 +4464,11 @@ def run_mcp_proxy(
                         raise RunnerError("MCP resource-read request URI is unavailable")
                     validated_read = _validated_resource_read_result(
                         message.get("result"), expected_uri=_uri
+                    )
+                    validated_read = _rebind_resource_read_manifest(
+                        validated_read,
+                        staged_manifest=staged_manifest,
+                        external_manifest=external_manifest,
                     )
                     text = canonical(validated_read); is_error = False
                 if action == "list":

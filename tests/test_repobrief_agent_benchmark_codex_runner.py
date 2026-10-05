@@ -2404,6 +2404,83 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             self.assertEqual(count_path.read_text(), "1")
 
+    def test_mcp_proxy_rebinds_resource_read_live_freshness_to_logical_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            observed_manifest = root / "observed-manifest-path.txt"
+            upstream = root / "mcp.py"
+            upstream.write_text(
+                "import json, pathlib, sys\n"
+                f"TOOLS = {treatment_tools()!r}\n"
+                f"OBSERVED = pathlib.Path({str(observed_manifest)!r})\n"
+                "manifest = sys.argv[sys.argv.index('--bundle-root') + 1]\n"
+                "OBSERVED.write_text(manifest)\n"
+                "for line in sys.stdin:\n"
+                "    m=json.loads(line); method=m.get('method'); ident=m.get('id')\n"
+                "    if method=='tools/list':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':TOOLS}}),flush=True)\n"
+                "    elif method=='resources/list':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'resources':[{'uri':'repobrief://frozen/a'}]}}),flush=True)\n"
+                "    elif method=='resources/read':\n"
+                "        fresh={'kind':'repobrief.live_freshness','version':'v1','status':'fresh','reason':'git_head_matches_snapshot','bundle_manifest':manifest,'repo_root':'/tmp/repo','read_only_git_probe':True,'implicit_refresh':False,'snapshot_provenance':{'git_commit':'c'*40}}\n"
+                "        meta={'repoground':{'status':'available','implicitRefresh':False,'snapshotContext':{},'identity':{},'liveFreshness':fresh}}\n"
+                "        result={'contents':[{'uri':'repobrief://frozen/a','mimeType':'text/plain','text':'bound context'}],'_meta':meta}\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':result}),flush=True)\n",
+                encoding="utf-8",
+            )
+            process = subprocess.Popen(
+                proxy_command(upstream, root),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertIsNotNone(process.stdin)
+            self.assertIsNotNone(process.stdout)
+            self.assertIsNotNone(process.stderr)
+
+            def roundtrip(message: dict) -> dict:
+                assert process.stdin is not None and process.stdout is not None
+                process.stdin.write(json.dumps(message).encode() + b"\n")
+                process.stdin.flush()
+                return json.loads(process.stdout.readline())
+
+            tools = roundtrip(
+                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+            )
+            self.assertIn("result", tools)
+            listed = roundtrip(
+                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"repobrief_resource_read",
+                    "arguments":{"action":"list"},
+                }}
+            )
+            self.assertFalse(listed["result"]["isError"])
+            read = roundtrip(
+                {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                    "name":"repobrief_resource_read",
+                    "arguments":{"action":"read","uri":"repobrief://frozen/a"},
+                }}
+            )
+            self.assertFalse(read["result"]["isError"])
+            assert process.stdin is not None
+            assert process.stdout is not None
+            assert process.stderr is not None
+            process.stdin.close()
+            returncode = process.wait(timeout=5)
+            stderr = process.stderr.read().decode()
+            process.stdout.close()
+            process.stderr.close()
+            self.assertEqual(returncode, 0, stderr)
+
+            logical_manifest = root / "bound.bundle.manifest.json"
+            staged_manifest = Path(observed_manifest.read_text())
+            self.assertNotEqual(staged_manifest, logical_manifest)
+            read_result = json.loads(read["result"]["content"][0]["text"])
+            self.assertEqual(
+                read_result["_meta"]["repoground"]["liveFreshness"]["bundle_manifest"],
+                str(logical_manifest),
+            )
+
     def test_mcp_proxy_rejects_malformed_resource_read_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
