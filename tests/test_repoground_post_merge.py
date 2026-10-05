@@ -580,6 +580,133 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
             minimum_convergence_budget,
         )
 
+    def test_repeated_queued_merge_reuses_same_nonterminal_job(self) -> None:
+        jobs: dict[str, dict[str, object]] = {}
+        starts: list[str] = []
+
+        def argv_hash(_argv: list[str]) -> str:
+            return "d" * 64
+
+        def read_metadata(unit: str) -> dict[str, object]:
+            if unit not in jobs:
+                raise ValueError("missing")
+            return jobs[unit]
+
+        def require_mutation(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        def private_start(
+            argv: list[str],
+            *,
+            cwd: str,
+            runtime_seconds: int,
+            reserved_unit: str,
+        ) -> dict[str, object]:
+            starts.append(reserved_unit)
+            job: dict[str, object] = {
+                "unit": reserved_unit,
+                "job_id": reserved_unit.removeprefix("grabowski-job-"),
+                "argv_sha256": argv_hash(argv),
+                "cwd": cwd,
+                "runtime_seconds": runtime_seconds,
+                "final_status": "running",
+                "expected_receipt": {"status_tool": "grabowski_job_status"},
+            }
+            jobs[reserved_unit] = job
+            return job
+
+        operator = types.SimpleNamespace(
+            grabowski_job_start=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("public starter should be wrapped")
+            ),
+            _argv_hash=argv_hash,
+            _read_job_metadata=read_metadata,
+            _require_operator_mutation=require_mutation,
+            _start_job=private_start,
+        )
+        starter = post_merge.resolve_job_starter({"grabowski_operator": operator})
+        self.assertIsNotNone(starter)
+
+        first = post_merge.schedule_from_captain_result(
+            captain_result(completed=False, queued=True),
+            job_starter=starter,
+            python_executable="/usr/bin/python3",
+            script_path=Path(post_merge.__file__),
+        )
+        second = post_merge.schedule_from_captain_result(
+            captain_result(completed=False, queued=True),
+            job_starter=starter,
+            python_executable="/usr/bin/python3",
+            script_path=Path(post_merge.__file__),
+        )
+
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(first["unit"], second["unit"])
+        self.assertFalse(first["reused"])
+        self.assertTrue(second["reused"])
+        self.assertEqual(first["reason"], "durable_merge_queue_watch_started")
+        self.assertEqual(second["reason"], "durable_merge_queue_watch_reused")
+
+    def test_uncertain_existing_queue_job_fails_closed_without_duplicate(self) -> None:
+        jobs: dict[str, dict[str, object]] = {}
+        starts: list[str] = []
+
+        def argv_hash(_argv: list[str]) -> str:
+            return "e" * 64
+
+        def read_metadata(unit: str) -> dict[str, object]:
+            if unit not in jobs:
+                raise ValueError("missing")
+            return jobs[unit]
+
+        def private_start(
+            argv: list[str],
+            *,
+            cwd: str,
+            runtime_seconds: int,
+            reserved_unit: str,
+        ) -> dict[str, object]:
+            starts.append(reserved_unit)
+            job: dict[str, object] = {
+                "unit": reserved_unit,
+                "job_id": reserved_unit.removeprefix("grabowski-job-"),
+                "argv_sha256": argv_hash(argv),
+                "cwd": cwd,
+                "runtime_seconds": runtime_seconds,
+                "final_status": "running",
+            }
+            jobs[reserved_unit] = job
+            return job
+
+        operator = types.SimpleNamespace(
+            grabowski_job_start=lambda *_args, **_kwargs: {},
+            _argv_hash=argv_hash,
+            _read_job_metadata=read_metadata,
+            _require_operator_mutation=lambda *_args, **_kwargs: None,
+            _start_job=private_start,
+        )
+        starter = post_merge.resolve_job_starter({"grabowski_operator": operator})
+        self.assertIsNotNone(starter)
+
+        first = post_merge.schedule_from_captain_result(
+            captain_result(completed=False, queued=True),
+            job_starter=starter,
+            python_executable="/usr/bin/python3",
+            script_path=Path(post_merge.__file__),
+        )
+        jobs[first["unit"]]["final_status"] = "launch_outcome_unknown"
+        second = post_merge.schedule_from_captain_result(
+            captain_result(completed=False, queued=True),
+            job_starter=starter,
+            python_executable="/usr/bin/python3",
+            script_path=Path(post_merge.__file__),
+        )
+
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(second["status"], "schedule_unknown")
+        self.assertEqual(second["reason"], "durable_job_reuse_outcome_unknown")
+        self.assertEqual(second["unit"], first["unit"])
+
     def test_queue_watch_rejects_runtime_without_convergence_reserve(self) -> None:
         with self.assertRaisesRegex(
             post_merge.RepoGroundPostMergeError,

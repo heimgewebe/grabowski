@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -45,18 +46,138 @@ QueueReader = Callable[[str, int], dict[str, Any]]
 QueueConverger = Callable[[str, str], dict[str, Any]]
 
 
+POST_MERGE_REUSABLE_JOB_STATUSES = frozenset({"launch_submitted", "running"})
+POST_MERGE_UNCERTAIN_JOB_STATUSES = frozenset(
+    {"launch_prepared", "launch_outcome_unknown"}
+)
+POST_MERGE_JOB_SLOT_LIMIT = 16
+
+
+def _post_merge_job_starter(
+    operator_module: Any,
+    public_starter: JobStarter,
+) -> JobStarter:
+    argv_hash = getattr(operator_module, "_argv_hash", None)
+    read_metadata = getattr(operator_module, "_read_job_metadata", None)
+    require_mutation = getattr(operator_module, "_require_operator_mutation", None)
+    private_starter = getattr(operator_module, "_start_job", None)
+    if not all(
+        callable(candidate)
+        for candidate in (argv_hash, read_metadata, require_mutation, private_starter)
+    ):
+        return public_starter
+
+    def start_reusable_job(
+        argv: list[str],
+        *,
+        cwd: str,
+        runtime_seconds: int,
+    ) -> dict[str, Any]:
+        working_directory = str(Path(cwd).expanduser().resolve())
+        expected_argv_sha256 = argv_hash(list(argv))
+        identity_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "argv_sha256": expected_argv_sha256,
+                    "cwd": working_directory,
+                    "runtime_seconds": runtime_seconds,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        def exact(metadata: dict[str, Any]) -> bool:
+            return bool(
+                metadata.get("argv_sha256") == expected_argv_sha256
+                and metadata.get("cwd") == working_directory
+                and metadata.get("runtime_seconds") == runtime_seconds
+            )
+
+        def reuse(metadata: dict[str, Any]) -> dict[str, Any] | None:
+            final_status = metadata.get("final_status")
+            if final_status in POST_MERGE_REUSABLE_JOB_STATUSES:
+                return {**metadata, "reused": True}
+            if final_status in POST_MERGE_UNCERTAIN_JOB_STATUSES:
+                return {
+                    **metadata,
+                    "reused": True,
+                    "reuse_uncertain": True,
+                }
+            return None
+
+        for attempt in range(POST_MERGE_JOB_SLOT_LIMIT):
+            unit = f"grabowski-job-rgpm-{identity_sha256[:16]}-{attempt:02d}"
+            try:
+                existing = read_metadata(unit)
+            except (OSError, PermissionError, ValueError):
+                existing = None
+            if isinstance(existing, dict):
+                if not exact(existing):
+                    raise RuntimeError(
+                        "existing RepoGround post-merge job identity mismatched"
+                    )
+                reusable = reuse(existing)
+                if reusable is not None:
+                    return reusable
+                continue
+
+            require_mutation(
+                "durable_job",
+                path=working_directory,
+                opaque_command=True,
+            )
+            try:
+                started = private_starter(
+                    list(argv),
+                    cwd=working_directory,
+                    runtime_seconds=runtime_seconds,
+                    reserved_unit=unit,
+                )
+            except Exception as exc:
+                try:
+                    readback = read_metadata(unit)
+                except (OSError, PermissionError, ValueError):
+                    readback = None
+                if isinstance(readback, dict) and exact(readback):
+                    reusable = reuse(readback)
+                    if reusable is not None:
+                        return reusable
+                    if isinstance(exc, FileExistsError):
+                        continue
+                raise
+
+            if (
+                not isinstance(started, dict)
+                or started.get("unit") != unit
+                or started.get("argv_sha256") != expected_argv_sha256
+            ):
+                raise RuntimeError(
+                    "RepoGround post-merge job start receipt mismatched"
+                )
+            return {**started, "reused": False}
+
+        raise RuntimeError("RepoGround post-merge reusable job slots exhausted")
+
+    return start_reusable_job
+
+
 def resolve_job_starter(modules: Mapping[str, Any]) -> JobStarter | None:
     operator_module = modules.get("grabowski_operator")
     starter = getattr(operator_module, "grabowski_job_start", None)
     if callable(starter):
-        return starter
+        return _post_merge_job_starter(operator_module, starter)
 
     main_module = modules.get("__main__")
     main_spec = getattr(main_module, "__spec__", None)
     if getattr(main_spec, "name", None) != "grabowski_operator":
         return None
     starter = getattr(main_module, "grabowski_job_start", None)
-    return starter if callable(starter) else None
+    return (
+        _post_merge_job_starter(main_module, starter)
+        if callable(starter)
+        else None
+    )
 
 
 FOLLOWUP_KIND = "grabowski.repoground_post_merge_followup"
@@ -945,10 +1066,43 @@ def schedule_from_captain_result(
             ],
         }
 
+    if job.get("reuse_uncertain") is True:
+        return {
+            **_followup_base(
+                status="schedule_unknown",
+                reason="durable_job_reuse_outcome_unknown",
+                repository=identity["repository"],
+                merge_sha=identity.get("merge_sha"),
+            ),
+            **(
+                {"pull_request": identity["pull_request"]}
+                if "pull_request" in identity
+                else {}
+            ),
+            "unit": unit,
+            "job_id": job.get("job_id"),
+            "argv_sha256": job.get("argv_sha256"),
+            "expected_receipt": job.get("expected_receipt"),
+            "does_not_establish": [
+                "job_not_started",
+                "freshness_failed",
+                "merge_failure",
+            ],
+        }
+
+    reused = job.get("reused") is True
     reason = (
-        "durable_merge_queue_watch_started"
+        (
+            "durable_merge_queue_watch_reused"
+            if reused
+            else "durable_merge_queue_watch_started"
+        )
         if request_status == "ready_queue_watch"
-        else "durable_freshness_job_started"
+        else (
+            "durable_freshness_job_reused"
+            if reused
+            else "durable_freshness_job_started"
+        )
     )
     return {
         **_followup_base(
@@ -963,6 +1117,7 @@ def schedule_from_captain_result(
             else {}
         ),
         "unit": unit,
+        "reused": reused,
         "job_id": job.get("job_id"),
         "argv_sha256": job.get("argv_sha256"),
         "expected_receipt": job.get("expected_receipt"),
