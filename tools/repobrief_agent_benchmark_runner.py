@@ -1404,7 +1404,16 @@ def _live_snapshot_commit(
         payload.get("kind") != "repobrief.live_freshness"
         or payload.get("version") != "v1"
         or payload.get("status") not in _REPOGROUND_LIVE_FRESHNESS
+        or not isinstance(payload.get("reason"), str)
+        or not payload.get("reason")
         or payload.get("bundle_manifest") not in manifest_paths
+        or "repo_root" not in payload
+        or (
+            payload.get("repo_root") is not None
+            and not isinstance(payload.get("repo_root"), str)
+        )
+        or not isinstance(payload.get("read_only_git_probe"), bool)
+        or payload.get("implicit_refresh") is not False
     ):
         return None
     snapshot = payload.get("snapshot_provenance")

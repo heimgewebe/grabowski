@@ -4524,6 +4524,29 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 },
             )
 
+            for name, updates, removals in [
+                ("implicit_refresh_true", {"implicit_refresh": True}, ()),
+                ("missing_implicit_refresh", {}, ("implicit_refresh",)),
+            ]:
+                with self.subTest(name=name):
+                    invalid = json.loads(json.dumps(resource))
+                    freshness = invalid["_meta"]["repoground"]["liveFreshness"]
+                    freshness.update(updates)
+                    for field in removals:
+                        freshness.pop(field)
+                    events[0]["item"]["result"] = {
+                        "content": [{
+                            "type": "text",
+                            "text": json.dumps(invalid, sort_keys=True),
+                        }]
+                    }
+                    self.assertIsNone(
+                        runner._repoground_evidence_from_codex_events(
+                            value, events, calls
+                        )
+                    )
+
+            events[0]["item"]["result"] = result
             events[0]["item"]["arguments"] = {"action": "list"}
             self.assertIsNone(
                 runner._repoground_evidence_from_codex_events(

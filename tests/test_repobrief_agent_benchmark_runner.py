@@ -880,6 +880,31 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 )
             )
 
+            invalid_variants = [
+                ("implicit_refresh_true", {"implicit_refresh": True}, ()),
+                ("missing_implicit_refresh", {}, ("implicit_refresh",)),
+                ("non_boolean_read_only_git_probe", {"read_only_git_probe": "yes"}, ()),
+                ("missing_reason", {}, ("reason",)),
+                ("missing_repo_root", {}, ("repo_root",)),
+            ]
+            for name, updates, removals in invalid_variants:
+                with self.subTest(name=name):
+                    invalid = copy.deepcopy(payload)
+                    freshness = invalid["live_freshness"]
+                    freshness.update(updates)
+                    for field in removals:
+                        freshness.pop(field)
+                    tool_result["content"] = json.dumps(
+                        {"structuredContent": invalid}, sort_keys=True
+                    )
+                    self.assertIsNone(
+                        runner.normalize_repoground_evidence(
+                            value,
+                            messages,
+                            runner.normalize_tool_calls(value, messages),
+                        )
+                    )
+
     def test_treatment_projects_revision_bound_resource_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
@@ -954,6 +979,30 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 },
             )
 
+            invalid_variants = [
+                ("implicit_refresh_true", {"implicit_refresh": True}, ()),
+                ("missing_implicit_refresh", {}, ("implicit_refresh",)),
+                ("non_boolean_read_only_git_probe", {"read_only_git_probe": "yes"}, ()),
+                ("missing_reason", {}, ("reason",)),
+                ("missing_repo_root", {}, ("repo_root",)),
+            ]
+            for name, updates, removals in invalid_variants:
+                with self.subTest(name=name):
+                    invalid = copy.deepcopy(resource)
+                    freshness = invalid["_meta"]["repoground"]["liveFreshness"]
+                    freshness.update(updates)
+                    for field in removals:
+                        freshness.pop(field)
+                    tool_result["content"] = json.dumps(invalid, sort_keys=True)
+                    self.assertIsNone(
+                        runner.normalize_repoground_evidence(
+                            value,
+                            messages,
+                            runner.normalize_tool_calls(value, messages),
+                        )
+                    )
+
+            tool_result["content"] = json.dumps(resource, sort_keys=True)
             resource["contents"][0]["uri"] = "repoground://snapshot/other"
             tool_result["content"] = json.dumps(resource, sort_keys=True)
             self.assertIsNone(
@@ -1079,7 +1128,11 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     "kind": "repobrief.live_freshness",
                     "version": "v1",
                     "status": "fresh",
+                    "reason": "git_head_matches_snapshot",
                     "bundle_manifest": str(logical_manifest),
+                    "repo_root": "/tmp/repo",
+                    "read_only_git_probe": True,
+                    "implicit_refresh": False,
                     "snapshot_provenance": {"git_commit": COMMIT.upper()},
                 },
             }
