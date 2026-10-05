@@ -15,15 +15,30 @@ DEFAULT_PUBLISHER = Path.home() / ".local" / "bin" / "repoground-publish-fleet"
 DEFAULT_MAX_ATTEMPTS = 8
 DEFAULT_BUSY_SLEEP_SECONDS = 15.0
 DEFAULT_PUBLISH_TIMEOUT_SECONDS = 900
+DEFAULT_ANCESTRY_TIMEOUT_SECONDS = 30
 MAX_PUBLISH_OUTPUT_BYTES = 2 * 1024 * 1024
 MAX_GITHUB_OUTPUT_BYTES = 128 * 1024
+DEFAULT_JOB_RUNTIME_SECONDS = 21_600
 DEFAULT_QUEUE_POLL_SECONDS = 15.0
 DEFAULT_QUEUE_MAX_ATTEMPTS = 1_320
+DEFAULT_QUEUE_READ_TIMEOUT_SECONDS = 60
+CONVERGENCE_RUNTIME_SAFETY_MARGIN_SECONDS = 2_000
+DEFAULT_CONVERGENCE_RUNTIME_RESERVE_SECONDS = int(
+    DEFAULT_MAX_ATTEMPTS * DEFAULT_PUBLISH_TIMEOUT_SECONDS
+    + (DEFAULT_MAX_ATTEMPTS - 1) * DEFAULT_BUSY_SLEEP_SECONDS
+    + DEFAULT_MAX_ATTEMPTS * DEFAULT_ANCESTRY_TIMEOUT_SECONDS
+    + DEFAULT_QUEUE_READ_TIMEOUT_SECONDS
+    + CONVERGENCE_RUNTIME_SAFETY_MARGIN_SECONDS
+)
+DEFAULT_QUEUE_WATCH_SECONDS = float(
+    DEFAULT_JOB_RUNTIME_SECONDS - DEFAULT_CONVERGENCE_RUNTIME_RESERVE_SECONDS
+)
 QUEUE_OBSERVATION_LIMIT = 20
 
 PublisherRunner = Callable[[list[str], int], dict[str, Any]]
 FreshnessReader = Callable[[str], dict[str, Any]]
 SleepFn = Callable[[float], None]
+MonotonicFn = Callable[[], float]
 AncestryChecker = Callable[[str, str, str], bool]
 JobStarter = Callable[..., dict[str, Any]]
 QueueReader = Callable[[str, int], dict[str, Any]]
@@ -45,7 +60,6 @@ def resolve_job_starter(modules: Mapping[str, Any]) -> JobStarter | None:
 
 
 FOLLOWUP_KIND = "grabowski.repoground_post_merge_followup"
-DEFAULT_JOB_RUNTIME_SECONDS = 21_600
 
 
 class RepoGroundPostMergeError(RuntimeError):
@@ -133,7 +147,19 @@ def _run_bounded_process(
                     raise RepoGroundPostMergeError(
                         f"subprocess {stream_name} exceeds bounded output"
                     )
-        returncode = process.wait()
+        returncode = process.poll()
+        if returncode is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                raise subprocess.TimeoutExpired(argv, timeout_seconds)
+            try:
+                returncode = process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired as exc:
+                process.kill()
+                process.wait()
+                raise subprocess.TimeoutExpired(argv, timeout_seconds) from exc
     finally:
         selector.close()
         process.stdout.close()
@@ -191,7 +217,7 @@ def _check_ancestry(repo_path: str, merge_sha: str, live_head: str) -> bool:
         stderr=subprocess.PIPE,
         text=True,
         check=False,
-        timeout=30,
+        timeout=DEFAULT_ANCESTRY_TIMEOUT_SECONDS,
     )
     if completed.returncode == 0:
         return True
@@ -395,7 +421,7 @@ def _read_queue_pr(repository: str, pull_request: int) -> dict[str, Any]:
             "--json",
             "number,state,headRefOid,baseRefName,mergeCommit",
         ],
-        60,
+        DEFAULT_QUEUE_READ_TIMEOUT_SECONDS,
         max_output_bytes=MAX_GITHUB_OUTPUT_BYTES,
     )
     if completed["returncode"] != 0:
@@ -426,6 +452,8 @@ def watch_merge_queue(
     queue_reader: QueueReader = _read_queue_pr,
     queue_converger: QueueConverger = _queue_converge,
     sleep_fn: SleepFn = time.sleep,
+    watch_seconds: float = DEFAULT_QUEUE_WATCH_SECONDS,
+    monotonic_fn: MonotonicFn = time.monotonic,
 ) -> dict[str, Any]:
     repository = _validate_repository(repository)
     pull_request = _validate_pull_request(pull_request)
@@ -435,9 +463,33 @@ def watch_merge_queue(
         raise RepoGroundPostMergeError("queue max_attempts must be between 1 and 2000")
     if poll_seconds < 0 or poll_seconds > 300:
         raise RepoGroundPostMergeError("queue poll_seconds is out of bounds")
+    if (
+        isinstance(watch_seconds, bool)
+        or not isinstance(watch_seconds, (int, float))
+        or watch_seconds <= 0
+        or watch_seconds > DEFAULT_QUEUE_WATCH_SECONDS
+    ):
+        raise RepoGroundPostMergeError("queue watch_seconds is out of bounds")
 
+    started_at = monotonic_fn()
     observations: list[dict[str, Any]] = []
+
+    def deadline_result(attempt: int) -> dict[str, Any]:
+        return {
+            "kind": "grabowski.repoground_merge_queue_followup",
+            "schema_version": 1,
+            "status": "failed",
+            "reason": "merge_queue_watch_deadline_exhausted",
+            "repository": repository,
+            "pull_request": pull_request,
+            "attempt_count": attempt,
+            "watch_seconds": watch_seconds,
+            "observations": observations,
+        }
+
     for attempt in range(1, max_attempts + 1):
+        if monotonic_fn() - started_at >= watch_seconds:
+            return deadline_result(attempt - 1)
         try:
             viewed = queue_reader(repository, pull_request)
         except (
@@ -455,6 +507,8 @@ def watch_merge_queue(
                 }
             )
             observations[:] = observations[-QUEUE_OBSERVATION_LIMIT:]
+            if monotonic_fn() - started_at >= watch_seconds:
+                return deadline_result(attempt)
             if attempt == max_attempts:
                 return {
                     "kind": "grabowski.repoground_merge_queue_followup",
@@ -466,7 +520,8 @@ def watch_merge_queue(
                     "attempt_count": attempt,
                     "observations": observations,
                 }
-            sleep_fn(poll_seconds)
+            remaining = watch_seconds - (monotonic_fn() - started_at)
+            sleep_fn(min(poll_seconds, max(0.0, remaining)))
             continue
 
         if not isinstance(viewed, dict):
@@ -489,6 +544,8 @@ def watch_merge_queue(
         }
         observations.append(observation)
         observations[:] = observations[-QUEUE_OBSERVATION_LIMIT:]
+        if monotonic_fn() - started_at >= watch_seconds:
+            return deadline_result(attempt)
 
         if (
             observed_number != pull_request
@@ -582,7 +639,8 @@ def watch_merge_queue(
                 "observations": observations,
             }
         if attempt < max_attempts:
-            sleep_fn(poll_seconds)
+            remaining = watch_seconds - (monotonic_fn() - started_at)
+            sleep_fn(min(poll_seconds, max(0.0, remaining)))
 
     return {
         "kind": "grabowski.repoground_merge_queue_followup",
@@ -802,9 +860,21 @@ def schedule_from_captain_result(
         raise RepoGroundPostMergeError("job runtime is out of bounds")
 
     identity = _schedule_request_identity(request)
+    job_argv = list(request["argv"])
+    if request_status == "ready_queue_watch":
+        queue_watch_seconds = (
+            runtime_seconds - DEFAULT_CONVERGENCE_RUNTIME_RESERVE_SECONDS
+        )
+        if queue_watch_seconds < 60:
+            raise RepoGroundPostMergeError(
+                "queue watcher runtime leaves no convergence reserve"
+            )
+        job_argv.extend(
+            ["--queue-watch-seconds", str(float(queue_watch_seconds))]
+        )
     try:
         job = job_starter(
-            list(request["argv"]),
+            job_argv,
             cwd=str(request["cwd"]),
             runtime_seconds=runtime_seconds,
         )
@@ -935,6 +1005,11 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_QUEUE_POLL_SECONDS,
     )
+    parser.add_argument(
+        "--queue-watch-seconds",
+        type=float,
+        default=DEFAULT_QUEUE_WATCH_SECONDS,
+    )
     return parser
 
 
@@ -954,6 +1029,7 @@ def main(argv: list[str] | None = None) -> int:
                 expected_base=args.expected_base,
                 max_attempts=args.queue_max_attempts,
                 poll_seconds=args.queue_poll_seconds,
+                watch_seconds=args.queue_watch_seconds,
             )
         else:
             result = converge(

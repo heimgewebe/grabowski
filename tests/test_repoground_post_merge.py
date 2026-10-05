@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 import sys
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -228,6 +230,23 @@ class RepoGroundPublisherBoundTests(unittest.TestCase):
                 post_merge._run_publisher([sys.executable, "-c", code], 5)
 
 
+    def test_timeout_still_applies_after_child_closes_output_pipes(self) -> None:
+        code = (
+            "import os,time;"
+            "os.close(1);"
+            "os.close(2);"
+            "time.sleep(5)"
+        )
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            post_merge._run_bounded_process(
+                [sys.executable, "-c", code],
+                1,
+                max_output_bytes=1024,
+            )
+        self.assertLess(time.monotonic() - started, 3)
+
+
 class RepoGroundMergeQueueWatchTests(unittest.TestCase):
     @staticmethod
     def _view(
@@ -335,6 +354,60 @@ class RepoGroundMergeQueueWatchTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["reason"], "merge_queue_identity_mismatch")
         self.assertFalse(converged)
+
+    def test_watch_deadline_preserves_convergence_runtime_reserve(self) -> None:
+        now = [0.0]
+        reads = 0
+
+        def read_queue(_repo: str, _pr: int) -> dict[str, object]:
+            nonlocal reads
+            reads += 1
+            now[0] += 1
+            return self._view("OPEN")
+
+        def sleep(seconds: float) -> None:
+            now[0] += seconds
+
+        result = post_merge.watch_merge_queue(
+            repository=REPO,
+            pull_request=PR,
+            expected_head=HEAD,
+            expected_base=BASE,
+            max_attempts=50,
+            poll_seconds=5,
+            watch_seconds=12,
+            queue_reader=read_queue,
+            queue_converger=lambda _repo, _sha: (_ for _ in ()).throw(
+                AssertionError("deadline exhaustion must not start convergence")
+            ),
+            sleep_fn=sleep,
+            monotonic_fn=lambda: now[0],
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "merge_queue_watch_deadline_exhausted")
+        self.assertEqual(result["attempt_count"], 2)
+        self.assertEqual(reads, 2)
+        self.assertEqual(now[0], 12)
+
+    def test_watch_rejects_budget_that_uses_convergence_reserve(self) -> None:
+        with self.assertRaisesRegex(
+            post_merge.RepoGroundPostMergeError,
+            "queue watch_seconds is out of bounds",
+        ):
+            post_merge.watch_merge_queue(
+                repository=REPO,
+                pull_request=PR,
+                expected_head=HEAD,
+                expected_base=BASE,
+                max_attempts=1,
+                poll_seconds=0,
+                watch_seconds=post_merge.DEFAULT_QUEUE_WATCH_SECONDS + 1,
+                queue_reader=lambda _repo, _pr: (_ for _ in ()).throw(
+                    AssertionError("invalid budget must fail before queue read")
+                ),
+                sleep_fn=lambda _seconds: None,
+            )
 
     def test_closed_without_merge_is_terminal_and_does_not_converge(self) -> None:
         result = post_merge.watch_merge_queue(
@@ -478,10 +551,49 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
         self.assertIn("--expected-base", argv)
         self.assertIn(BASE, argv)
         self.assertNotIn("--merge-sha", argv)
+        self.assertIn("--queue-watch-seconds", argv)
+        watch_index = argv.index("--queue-watch-seconds")
+        self.assertEqual(
+            float(argv[watch_index + 1]),
+            post_merge.DEFAULT_QUEUE_WATCH_SECONDS,
+        )
         self.assertEqual(
             calls[0]["runtime_seconds"],
             post_merge.DEFAULT_JOB_RUNTIME_SECONDS,
         )
+        self.assertEqual(
+            post_merge.DEFAULT_QUEUE_WATCH_SECONDS
+            + post_merge.DEFAULT_CONVERGENCE_RUNTIME_RESERVE_SECONDS,
+            post_merge.DEFAULT_JOB_RUNTIME_SECONDS,
+        )
+        minimum_convergence_budget = (
+            post_merge.DEFAULT_MAX_ATTEMPTS
+            * post_merge.DEFAULT_PUBLISH_TIMEOUT_SECONDS
+            + (post_merge.DEFAULT_MAX_ATTEMPTS - 1)
+            * post_merge.DEFAULT_BUSY_SLEEP_SECONDS
+            + post_merge.DEFAULT_MAX_ATTEMPTS
+            * post_merge.DEFAULT_ANCESTRY_TIMEOUT_SECONDS
+            + post_merge.DEFAULT_QUEUE_READ_TIMEOUT_SECONDS
+        )
+        self.assertGreater(
+            post_merge.DEFAULT_CONVERGENCE_RUNTIME_RESERVE_SECONDS,
+            minimum_convergence_budget,
+        )
+
+    def test_queue_watch_rejects_runtime_without_convergence_reserve(self) -> None:
+        with self.assertRaisesRegex(
+            post_merge.RepoGroundPostMergeError,
+            "leaves no convergence reserve",
+        ):
+            post_merge.schedule_from_captain_result(
+                captain_result(completed=False, queued=True),
+                job_starter=lambda *_args, **_kwargs: {
+                    "unit": "grabowski-job-must-not-start"
+                },
+                python_executable="/usr/bin/python3",
+                script_path=Path(post_merge.__file__),
+                runtime_seconds=post_merge.DEFAULT_CONVERGENCE_RUNTIME_RESERVE_SECONDS,
+            )
 
     def test_unverified_merge_does_not_schedule(self) -> None:
         result = post_merge.schedule_from_captain_result(
