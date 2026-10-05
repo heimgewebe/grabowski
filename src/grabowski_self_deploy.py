@@ -2981,6 +2981,65 @@ def _release_origin_main_refresh_resources(
     )
 
 
+def _origin_main_refresh_effect_evidence(
+    *,
+    plan: dict[str, Any],
+    initial_snapshot: dict[str, Any],
+    expected_head: str,
+    observed_origin_main: str,
+    fetch_result: dict[str, Any],
+    update_result: dict[str, Any],
+    public_before_fetch: str,
+    public_after_fetch: str,
+) -> dict[str, Any]:
+    if (
+        observed_origin_main != expected_head
+        or public_before_fetch != expected_head
+        or public_after_fetch != expected_head
+        or fetch_result.get("timed_out") is True
+        or fetch_result.get("returncode") != 0
+    ):
+        raise RuntimeError(
+            "protected-main ref refresh effect evidence is not bound to an observed target CAS"
+        )
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_origin_main_refresh_effect",
+        "canonical_repository": str(plan["canonical_repository"]),
+        "expected_head": expected_head,
+        "previous_head": initial_snapshot["current_head"],
+        "previous_branch": initial_snapshot.get("current_branch"),
+        "previous_origin_main": initial_snapshot["origin_main"],
+        "observed_origin_main": observed_origin_main,
+        "owner_id": plan["owner_id"],
+        "operation_resource_key": plan["operation_key"],
+        "canonical_resource_key": plan["canonical_key"],
+        "common_dir_resource_key": plan["common_dir_key"],
+        "objects_resource_key": plan["objects_key"],
+        "origin_main_ref_resource_key": plan["origin_main_ref_key"],
+        "fetch": {
+            "returncode": fetch_result.get("returncode"),
+            "timed_out": fetch_result.get("timed_out") is True,
+        },
+        "update_ref": {
+            "returncode": update_result.get("returncode"),
+            "timed_out": update_result.get("timed_out") is True,
+            "reported_success": (
+                update_result.get("timed_out") is not True
+                and update_result.get("returncode") == 0
+            ),
+        },
+        "public_github_main": {
+            "before_fetch": public_before_fetch,
+            "after_fetch": public_after_fetch,
+        },
+        "effect_observed": True,
+    }
+    return {
+        **material,
+        "evidence_sha256": _source_identity_sha256(material),
+    }
+
 
 def _refresh_canonical_origin_main(
     expected_head: str,
@@ -2999,6 +3058,7 @@ def _refresh_canonical_origin_main(
     common_dir_lease: dict[str, Any] | None = None
     objects_lease: dict[str, Any] | None = None
     origin_main_ref_lease: dict[str, Any] | None = None
+    observed_effect_evidence: dict[str, Any] | None = None
     try:
         acquisition = _acquire_origin_main_refresh_resources(plan, expected_head)
         operation_lease = _lease_for_key(acquisition, plan["operation_key"])
@@ -3108,6 +3168,16 @@ def _refresh_canonical_origin_main(
             raise RuntimeError(
                 "origin/main changed to an unexpected commit during CAS update"
             )
+        observed_effect_evidence = _origin_main_refresh_effect_evidence(
+            plan=plan,
+            initial_snapshot=initial_snapshot,
+            expected_head=expected_head,
+            observed_origin_main=observed_origin_main,
+            fetch_result=fetch_result,
+            update_result=update_result,
+            public_before_fetch=public_before_fetch,
+            public_after_fetch=public_after_fetch,
+        )
         after_cas = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
         expected_after = {
             **_canonical_main_refresh_state(initial_snapshot),
@@ -3229,9 +3299,20 @@ def _refresh_canonical_origin_main(
             except Exception as cleanup_error:
                 cleanup_failures.append(("resource-release", cleanup_error))
         if cleanup_failures:
-            raise RuntimeError(
+            message = (
                 f"{type(exc).__name__}: {exc}; cleanup failures: "
                 + _cleanup_failure_text(cleanup_failures)
+            )
+            if observed_effect_evidence is not None:
+                raise DeployScheduleFailureAfterLocalMutation(
+                    message,
+                    local_mutation_evidence=observed_effect_evidence,
+                ) from exc
+            raise RuntimeError(message) from exc
+        if observed_effect_evidence is not None:
+            raise DeployScheduleFailureAfterLocalMutation(
+                str(exc),
+                local_mutation_evidence=observed_effect_evidence,
             ) from exc
         raise
     assert (
@@ -3241,26 +3322,36 @@ def _refresh_canonical_origin_main(
         and objects_lease is not None
         and origin_main_ref_lease is not None
     )
-    release = _release_origin_main_refresh_resources(
-        plan,
-        [
-            plan["operation_key"],
-            plan["canonical_key"],
-            plan["common_dir_key"],
-            plan["objects_key"],
-            plan["origin_main_ref_key"],
-        ],
-        [
-            operation_lease,
-            canonical_lease,
-            common_dir_lease,
-            objects_lease,
-            origin_main_ref_lease,
-        ],
-    )
-    released = release.get("released")
-    if not isinstance(released, list) or len(released) != 5:
-        raise RuntimeError("protected-main ref refresh resource release was incomplete")
+    try:
+        release = _release_origin_main_refresh_resources(
+            plan,
+            [
+                plan["operation_key"],
+                plan["canonical_key"],
+                plan["common_dir_key"],
+                plan["objects_key"],
+                plan["origin_main_ref_key"],
+            ],
+            [
+                operation_lease,
+                canonical_lease,
+                common_dir_lease,
+                objects_lease,
+                origin_main_ref_lease,
+            ],
+        )
+        released = release.get("released")
+        if not isinstance(released, list) or len(released) != 5:
+            raise RuntimeError(
+                "protected-main ref refresh resource release was incomplete"
+            )
+    except Exception as exc:
+        if observed_effect_evidence is not None:
+            raise DeployScheduleFailureAfterLocalMutation(
+                str(exc),
+                local_mutation_evidence=observed_effect_evidence,
+            ) from exc
+        raise
     return receipt
 
 
@@ -5205,6 +5296,19 @@ def _grabowski_runtime_deploy_schedule_impl(
                 local_mutation_tracker["origin_main_refresh"] = dict(
                     origin_main_refresh
                 )
+            except DeployScheduleFailureAfterLocalMutation as exc:
+                local_mutation_tracker["origin_main_refresh"] = dict(
+                    exc.local_mutation_evidence
+                )
+                combined_evidence = _tracked_runtime_deploy_local_mutation_evidence(
+                    local_mutation_tracker
+                )
+                if not isinstance(combined_evidence, dict):
+                    raise
+                raise DeployScheduleFailureAfterLocalMutation(
+                    str(exc),
+                    local_mutation_evidence=combined_evidence,
+                ) from exc
             except DeploySchedulePreEffectRefusal as exc:
                 reconciliation = inflight_before_resolution.get(
                     "stale_pending_reconciliation"

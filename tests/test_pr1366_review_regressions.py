@@ -692,6 +692,257 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
                 expected_head=CAPTAIN_HEAD,
             )
         )
+    def test_origin_main_refresh_post_cas_failure_reports_observed_effect(self) -> None:
+        canonical = Path("/tmp/pr1366-origin-main-effect")
+        common = canonical / ".git"
+        expected = "d" * 40
+        current = "a" * 40
+        previous_origin = "b" * 40
+        owner = "runtime-deploy-ref:dddddddddddd:abc123def456"
+        plan = {
+            "canonical_repository": canonical,
+            "owner_id": owner,
+            "operation_key": f"repo:{canonical}:operation:runtime-deploy-origin-main-refresh",
+            "canonical_key": f"path:{canonical}",
+            "common_dir_key": f"path:{common}",
+            "objects_key": f"path:{common / 'objects'}",
+            "origin_main_ref_key": f"path:{common / 'refs/remotes/origin/main'}",
+        }
+        leases = [
+            {
+                "resource_key": key,
+                "owner_id": owner,
+                "acquired_at_unix": 10,
+                "updated_at_unix": 10,
+                "expires_at_unix": 100,
+                "metadata_sha256": str(index) * 64,
+            }
+            for index, key in enumerate(
+                [
+                    plan["operation_key"],
+                    plan["canonical_key"],
+                    plan["common_dir_key"],
+                    plan["objects_key"],
+                    plan["origin_main_ref_key"],
+                ],
+                start=1,
+            )
+        ]
+        initial = {
+            "canonical_repository": str(canonical),
+            "current_head": current,
+            "current_branch": "feature/active-work",
+            "target_head": expected,
+            "origin_main": previous_origin,
+            "clean": True,
+            "shallow": False,
+            "lease_evidence": {
+                "resource_key": f"path:{canonical}",
+                "lease": None,
+            },
+        }
+        locked = dict(initial)
+        after_cas = {**initial, "origin_main": expected}
+        with patch.object(
+            SELF_DEPLOY, "_origin_main_refresh_plan", return_value=plan
+        ), patch.object(
+            SELF_DEPLOY,
+            "_acquire_origin_main_refresh_resources",
+            return_value={"leases": leases},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_release_origin_main_refresh_resources",
+            return_value={"released": leases},
+        ) as release, patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            side_effect=[locked, locked, after_cas],
+        ), patch.object(
+            SELF_DEPLOY,
+            "_fresh_public_github_main",
+            side_effect=[expected, expected, expected],
+        ), patch.object(
+            SELF_DEPLOY,
+            "_mutating_git_result",
+            side_effect=[_result(""), _result("")],
+        ), patch.object(
+            SELF_DEPLOY,
+            "_git_result",
+            side_effect=[
+                _result(expected),
+                _result("", 0),
+                _result(expected),
+            ],
+        ), patch.object(
+            SELF_DEPLOY,
+            "_append_deploy_audit",
+            side_effect=OSError("audit unavailable after CAS"),
+        ):
+            with self.assertRaises(
+                SELF_DEPLOY.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
+        release.assert_called_once()
+        evidence = raised.exception.local_mutation_evidence
+        self.assertEqual(
+            evidence["kind"],
+            "grabowski_runtime_deploy_origin_main_refresh_effect",
+        )
+        self.assertTrue(evidence["effect_observed"])
+        self.assertEqual(evidence["expected_head"], expected)
+        self.assertEqual(evidence["observed_origin_main"], expected)
+        self.assertEqual(
+            evidence["public_github_main"],
+            {"before_fetch": expected, "after_fetch": expected},
+        )
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                evidence,
+                expected_job_prefix="grabowski-job-",
+                expected_head=expected,
+            )
+        )
+        forged_material = {
+            key: value
+            for key, value in evidence.items()
+            if key != "evidence_sha256"
+        }
+        forged_material["observed_origin_main"] = "0" * 40
+        forged = {
+            **forged_material,
+            "evidence_sha256": grips.sha256_json(forged_material),
+        }
+        self.assertFalse(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                forged,
+                expected_job_prefix="grabowski-job-",
+                expected_head=expected,
+            )
+        )
+
+    def test_scheduler_bundles_reconciliation_with_refresh_helper_effect_failure(
+        self,
+    ) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        expected = "d" * 40
+        reconciliation_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-123456abcdef",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+        }
+        reconciliation = {
+            **reconciliation_material,
+            "evidence_sha256": SELF_DEPLOY._source_identity_sha256(
+                reconciliation_material
+            ),
+        }
+        refresh_effect_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_origin_main_refresh_effect",
+            "canonical_repository": str(repo),
+            "expected_head": expected,
+            "previous_head": "a" * 40,
+            "previous_branch": "main",
+            "previous_origin_main": "b" * 40,
+            "observed_origin_main": expected,
+            "owner_id": "runtime-deploy-ref:dddddddddddd:abc123def456",
+            "operation_resource_key": (
+                f"repo:{repo}:operation:runtime-deploy-origin-main-refresh"
+            ),
+            "canonical_resource_key": f"path:{repo}",
+            "common_dir_resource_key": f"path:{repo / '.git'}",
+            "objects_resource_key": f"path:{repo / '.git' / 'objects'}",
+            "origin_main_ref_resource_key": (
+                f"path:{repo / '.git' / 'refs/remotes/origin/main'}"
+            ),
+            "fetch": {"returncode": 0, "timed_out": False},
+            "update_ref": {
+                "returncode": 0,
+                "timed_out": False,
+                "reported_success": True,
+            },
+            "public_github_main": {
+                "before_fetch": expected,
+                "after_fetch": expected,
+            },
+            "effect_observed": True,
+        }
+        refresh_effect = {
+            **refresh_effect_material,
+            "evidence_sha256": SELF_DEPLOY._source_identity_sha256(
+                refresh_effect_material
+            ),
+        }
+        refresh_failure = SELF_DEPLOY.DeployScheduleFailureAfterLocalMutation(
+            "post-CAS audit unavailable",
+            local_mutation_evidence=refresh_effect,
+        )
+        refresh_candidate = {
+            "canonical_repository": str(repo),
+            "current_head": expected,
+            "current_branch": "main",
+            "target_head": expected,
+            "origin_main": "b" * 40,
+            "clean": True,
+        }
+        with patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            side_effect=[RuntimeError("canonical source needs refresh")],
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY, "_fresh_public_github_main", return_value=expected
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_stale_main_snapshot",
+            side_effect=RuntimeError("not a stale-main materialization case"),
+        ), patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            return_value=refresh_candidate,
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={
+                "error": None,
+                "inflight_units": [],
+                "stale_pending_reconciliation": reconciliation,
+            },
+        ), patch.object(
+            SELF_DEPLOY,
+            "_refresh_canonical_origin_main",
+            side_effect=refresh_failure,
+        ):
+            with self.assertRaises(
+                SELF_DEPLOY.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+        evidence = raised.exception.local_mutation_evidence
+        self.assertEqual(
+            evidence["kind"],
+            "grabowski_runtime_deploy_local_mutation_bundle",
+        )
+        self.assertEqual(
+            [item["kind"] for item in evidence["effects"]],
+            [
+                "grabowski_runtime_deploy_stale_pending_reconciliation",
+                "grabowski_runtime_deploy_origin_main_refresh_effect",
+            ],
+        )
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                evidence,
+                expected_job_prefix="grabowski-job-",
+                expected_head=expected,
+            )
+        )
+
+
 
 
 if __name__ == "__main__":
