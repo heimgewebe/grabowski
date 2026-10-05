@@ -740,6 +740,37 @@ class ProductionRecoverySemanticsTests(unittest.TestCase):
 
 
 class ProductionPreflightHardeningTests(unittest.TestCase):
+    def test_target_release_schema_identity_applies_flowlines_schema_layer_without_exporter(self) -> None:
+        artifact = connector_contract.mixed_artifact_from_runtime_tools(
+            [{"name": "grabowski_status", "inputSchema": {"type": "object"}}]
+        )
+        _, _, metadata = connector_contract.parse_observed_artifact(
+            artifact, label="test target release artifact"
+        )
+        observed = mock.Mock(returncode=0, stdout=json.dumps(artifact))
+        with mock.patch.object(dual.core, "run", return_value=observed) as run:
+            result = dual._release_complete_schema_identity(
+                release_path=Path("/release/green"),
+                expected_tool_count=1,
+                expected_names_sha256=metadata["names_sha256"],
+                timeout_seconds=10,
+            )
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:2], ["/release/green/.venv/bin/python", "-c"])
+        probe_code = argv[2]
+        configure = probe_code.index("configure_flowlines_observability")
+        observe = probe_code.index("_runtime_connector_observed_tools")
+        self.assertLess(configure, observe)
+        self.assertIn(
+            "verified_identity_resolver=grabowski_mcp._flowlines_verified_identity",
+            probe_code,
+        )
+        self.assertIn("load_environment_exporter=False", probe_code)
+        self.assertEqual(
+            result["complete_schema_sha256"],
+            metadata["complete_schema_sha256"],
+        )
+
     def test_stop_green_requests_stop_while_unit_is_still_activating(self) -> None:
         activating = mock.Mock(
             confirmed_active=False,

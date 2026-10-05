@@ -6132,7 +6132,11 @@ def _release_complete_schema_identity(
     """Derive the complete tool-schema identity from the immutable target release."""
     python = release_path / ".venv/bin/python"
     code = (
-        "import json, grabowski_operator, grabowski_mcp; "
+        "import json, grabowski_flowlines, grabowski_operator, grabowski_mcp; "
+        "grabowski_flowlines.configure_flowlines_observability("
+        "grabowski_operator.mcp, grabowski_operator.READ_ONLY, "
+        "verified_identity_resolver=grabowski_mcp._flowlines_verified_identity, "
+        "load_environment_exporter=False); "
         "print(json.dumps(grabowski_mcp._runtime_connector_observed_tools(), sort_keys=True))"
     )
     result = core.run(
