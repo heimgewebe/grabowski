@@ -3498,6 +3498,22 @@ def _resolve_materialize_recovery_obligation(
             "close_file_sha256": None,
             "resolution_file_sha256": None,
         }
+    if status.get("state") == "completed":
+        if status.get("continuation_required") is not False:
+            raise RuntimeError(
+                "Completed materialize recovery obligation still requires continuation"
+            )
+        if not _materialize_completed_obligation_matches_fence(fence, status):
+            raise RuntimeError(
+                "Completed materialize recovery obligation evidence does not match fence"
+            )
+        return {
+            "obligation_id": obligation_id,
+            "obligation_state": "completed_preserved",
+            "recovery_sha256": recovery_sha256,
+            "close_file_sha256": status.get("close_file_sha256"),
+            "resolution_file_sha256": status.get("resolution_file_sha256"),
+        }
     if status.get("state") == "open":
         close = obligations.close_obligation(
             {
