@@ -3212,6 +3212,51 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
 
+    def test_materialize_recovery_preserves_strategically_settled_obligation_states(
+        self,
+    ) -> None:
+        _target, fence, _lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        cases = [
+            ("open", "deferred"),
+            ("open", "superseded"),
+            ("blocked", "deferred"),
+        ]
+        for state, disposition in cases:
+            with self.subTest(state=state, disposition=disposition):
+                status = {
+                    "state": state,
+                    "resolution_disposition": disposition,
+                    "continuation_required": False,
+                    "close_file_sha256": "c" * 64 if state == "blocked" else None,
+                    "resolution_file_sha256": "d" * 64,
+                }
+                with (
+                    patch.object(
+                        obligations,
+                        "status_obligation",
+                        return_value=status,
+                    ),
+                    patch.object(obligations, "close_obligation") as close_obligation,
+                    patch.object(obligations, "resolve_obligation") as resolve_obligation,
+                ):
+                    result = checkouts._resolve_materialize_recovery_obligation(
+                        fence,
+                        recovery_state="confirmed_no_effect",
+                    )
+
+                self.assertEqual(
+                    result["obligation_state"],
+                    f"{state}_resolution_preserved",
+                )
+                self.assertEqual(
+                    result["resolution_file_sha256"],
+                    status["resolution_file_sha256"],
+                )
+                close_obligation.assert_not_called()
+                resolve_obligation.assert_not_called()
+
     def test_materialize_no_effect_recovery_accepts_missing_preopen_obligation(self) -> None:
         fence = {
             "fence_id": "f" * 32,

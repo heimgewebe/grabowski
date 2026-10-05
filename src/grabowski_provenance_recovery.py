@@ -1084,20 +1084,24 @@ def _resume_under_schedule_lock(
             ],
         }
     if volatile["reasons"]:
-        base._append_audit(
-            {
-                "timestamp_unix": int(time.time()),
-                "operation": "midcutover-resume-aborted-before-dispatch",
-                "expected_head": expected_head,
-                "reasons": volatile["reasons"],
-                "intent_sha256": intent_sha256,
-                "stale_pending_reconciliation": (
-                    (volatile.get("competing_deployment") or {}).get(
-                        "stale_pending_reconciliation"
-                    )
-                ),
-            }
-        )
+        try:
+            base._append_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "midcutover-resume-aborted-before-dispatch",
+                    "expected_head": expected_head,
+                    "reasons": volatile["reasons"],
+                    "intent_sha256": intent_sha256,
+                    "stale_pending_reconciliation": stale_pending_reconciliation,
+                }
+            )
+        except Exception as exc:
+            if stale_pending_reconciliation is not None:
+                raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                    f"{type(exc).__name__}: {exc}",
+                    local_mutation_evidence=stale_pending_reconciliation,
+                ) from exc
+            raise
         raise ProvenanceRecoveryDenied(
             volatile["reasons"], {**gate, "recheck": volatile}
         )
@@ -1119,19 +1123,34 @@ def _resume_under_schedule_lock(
             invoker_tool="grabowski_recovery_provenance_repair",
         )
     except operator.JobDispatchUnknown as exc:
-        base._append_audit(
-            {
-                "timestamp_unix": int(time.time()),
-                "operation": "midcutover-resume-dispatch-outcome-unknown",
-                "expected_head": expected_head,
-                "cutover_id": resume_binding["cutover_id"],
-                "unit": exc.unit,
-                "evidence": exc.evidence,
-                "intent_sha256": intent_sha256,
-            }
-        )
+        dispatch_evidence = dict(exc.evidence)
+        if stale_pending_reconciliation is not None:
+            dispatch_evidence["stale_pending_reconciliation"] = stale_pending_reconciliation
+        try:
+            base._append_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "midcutover-resume-dispatch-outcome-unknown",
+                    "expected_head": expected_head,
+                    "cutover_id": resume_binding["cutover_id"],
+                    "unit": exc.unit,
+                    "evidence": dispatch_evidence,
+                    "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "intent_sha256": intent_sha256,
+                }
+            )
+        except Exception as audit_exc:
+            if stale_pending_reconciliation is None:
+                raise
+            dispatch_evidence["audit_append_error"] = (
+                f"{type(audit_exc).__name__}: {audit_exc}"
+            )
+            exc.evidence = dispatch_evidence
+            raise exc from audit_exc
+        if stale_pending_reconciliation is not None:
+            exc.evidence = dispatch_evidence
         raise
-    except Exception:
+    except Exception as exc:
         try:
             self_deploy._write_deploy_index(
                 jobs_root,
@@ -1140,6 +1159,11 @@ def _resume_under_schedule_lock(
             )
         except Exception:  # noqa: BLE001 - the start failure is the real error
             pass
+        if stale_pending_reconciliation is not None:
+            raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                f"{type(exc).__name__}: {exc}",
+                local_mutation_evidence=stale_pending_reconciliation,
+            ) from exc
         raise
 
     post_dispatch_warnings: list[str] = list(job.get("post_dispatch_warnings") or [])
@@ -1153,6 +1177,7 @@ def _resume_under_schedule_lock(
                 "unit": job["unit"],
                 "argv_sha256": job["argv_sha256"],
                 "source_identity_sha256": source_identity["identity_sha256"],
+                "stale_pending_reconciliation": stale_pending_reconciliation,
             }
         )
     except Exception as exc:  # noqa: BLE001 - effect already dispatched
@@ -1182,6 +1207,7 @@ def _resume_under_schedule_lock(
         "job": job,
         "intent_sha256": intent_sha256,
         "scheduled_sha256": scheduled_sha256,
+        "stale_pending_reconciliation": stale_pending_reconciliation,
         "post_dispatch_warnings": post_dispatch_warnings,
         "post_state_readback_required": True,
         "next_action": (
@@ -1317,20 +1343,24 @@ def _repair_under_schedule_lock(
             ],
         }
     if volatile["reasons"]:
-        base._append_audit(
-            {
-                "timestamp_unix": int(time.time()),
-                "operation": "provenance-recovery-aborted-before-dispatch",
-                "expected_head": expected_head,
-                "reasons": volatile["reasons"],
-                "intent_sha256": intent_sha256,
-                "stale_pending_reconciliation": (
-                    (volatile.get("competing_deployment") or {}).get(
-                        "stale_pending_reconciliation"
-                    )
-                ),
-            }
-        )
+        try:
+            base._append_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "provenance-recovery-aborted-before-dispatch",
+                    "expected_head": expected_head,
+                    "reasons": volatile["reasons"],
+                    "intent_sha256": intent_sha256,
+                    "stale_pending_reconciliation": stale_pending_reconciliation,
+                }
+            )
+        except Exception as exc:
+            if stale_pending_reconciliation is not None:
+                raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                    f"{type(exc).__name__}: {exc}",
+                    local_mutation_evidence=stale_pending_reconciliation,
+                ) from exc
+            raise
         raise ProvenanceRecoveryDenied(volatile["reasons"], {**gate, "recheck": volatile})
 
     jobs_root = operator._jobs_root()
@@ -1355,19 +1385,34 @@ def _repair_under_schedule_lock(
         # second repair start alongside it, and reporting a clean failure would
         # be a lie about an effect that may already exist.  Keep the
         # reservation, record the ambiguity, and make the operator read back.
-        base._append_audit(
-            {
-                "timestamp_unix": int(time.time()),
-                "operation": "provenance-recovery-dispatch-outcome-unknown",
-                "expected_head": expected_head,
-                "repair_intent_id": repair_intent_id,
-                "unit": exc.unit,
-                "evidence": exc.evidence,
-                "intent_sha256": intent_sha256,
-            }
-        )
+        dispatch_evidence = dict(exc.evidence)
+        if stale_pending_reconciliation is not None:
+            dispatch_evidence["stale_pending_reconciliation"] = stale_pending_reconciliation
+        try:
+            base._append_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "provenance-recovery-dispatch-outcome-unknown",
+                    "expected_head": expected_head,
+                    "repair_intent_id": repair_intent_id,
+                    "unit": exc.unit,
+                    "evidence": dispatch_evidence,
+                    "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "intent_sha256": intent_sha256,
+                }
+            )
+        except Exception as audit_exc:
+            if stale_pending_reconciliation is None:
+                raise
+            dispatch_evidence["audit_append_error"] = (
+                f"{type(audit_exc).__name__}: {audit_exc}"
+            )
+            exc.evidence = dispatch_evidence
+            raise exc from audit_exc
+        if stale_pending_reconciliation is not None:
+            exc.evidence = dispatch_evidence
         raise
-    except Exception:
+    except Exception as exc:
         # Definitive non-start, so the reservation must go.  Re-read rather than
         # restoring the snapshot taken before the attempt: another deploy may
         # have finished and removed itself meanwhile, and writing back the stale
@@ -1380,6 +1425,11 @@ def _repair_under_schedule_lock(
             )
         except Exception:  # noqa: BLE001 - the start failure is the real error
             pass
+        if stale_pending_reconciliation is not None:
+            raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                f"{type(exc).__name__}: {exc}",
+                local_mutation_evidence=stale_pending_reconciliation,
+            ) from exc
         raise
 
     # The effect now exists.  From here on nothing may raise: an exception after
@@ -1395,6 +1445,7 @@ def _repair_under_schedule_lock(
         "unit": job["unit"],
         "argv_sha256": job["argv_sha256"],
         "source_identity_sha256": source_identity["identity_sha256"],
+        "stale_pending_reconciliation": stale_pending_reconciliation,
     }
     post_dispatch_warnings: list[str] = list(job.get("post_dispatch_warnings") or [])
     try:
@@ -1422,6 +1473,7 @@ def _repair_under_schedule_lock(
         "intent_sha256": intent_sha256,
         "scheduled_sha256": scheduled_sha256,
         "repair_intent_id": repair_intent_id,
+        "stale_pending_reconciliation": stale_pending_reconciliation,
         "post_dispatch_warnings": post_dispatch_warnings,
         "post_state_readback_required": True,
         "next_action": (

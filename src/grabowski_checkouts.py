@@ -3514,6 +3514,21 @@ def _resolve_materialize_recovery_obligation(
             "close_file_sha256": status.get("close_file_sha256"),
             "resolution_file_sha256": status.get("resolution_file_sha256"),
         }
+    if (
+        status.get("continuation_required") is False
+        and status.get("resolution_disposition") in {"resolved", "superseded", "deferred"}
+        and not (
+            status.get("state") == "blocked"
+            and status.get("resolution_disposition") in {"resolved", "superseded"}
+        )
+    ):
+        return {
+            "obligation_id": obligation_id,
+            "obligation_state": f"{status.get('state')}_resolution_preserved",
+            "recovery_sha256": recovery_sha256,
+            "close_file_sha256": status.get("close_file_sha256"),
+            "resolution_file_sha256": status.get("resolution_file_sha256"),
+        }
     if status.get("state") == "open":
         close = obligations.close_obligation(
             {
