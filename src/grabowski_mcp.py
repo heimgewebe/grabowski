@@ -15139,6 +15139,42 @@ def _grip_run_core(
                 "error_code": _captain_audit_completion_error_code(exc),
                 "does_not_establish": ["audited_execution_completion"],
             }
+    if name == "captain-run" and allow_mutation:
+        actions = dispatch_parameters.get("actions")
+        captain_pr_merge = (
+            isinstance(actions, list)
+            and len(actions) == 1
+            and isinstance(actions[0], dict)
+            and actions[0].get("action") == "pr-merge"
+        )
+        if captain_pr_merge:
+            try:
+                import grabowski_repoground_post_merge as repoground_post_merge
+
+                job_starter = repoground_post_merge.resolve_job_starter(sys.modules)
+                if job_starter is None:
+                    raise RuntimeError("durable Grabowski job starter is unavailable")
+                result["repoground_freshness_followup"] = (
+                    repoground_post_merge.schedule_from_captain_result(
+                        result,
+                        job_starter=job_starter,
+                        python_executable=sys.executable,
+                        script_path=Path(repoground_post_merge.__file__).resolve(),
+                    )
+                )
+            except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                result["repoground_freshness_followup"] = {
+                    "kind": "grabowski.repoground_post_merge_followup",
+                    "schema_version": 1,
+                    "status": "schedule_error",
+                    "reason": "followup_integration_failed",
+                    "error_class": type(exc).__name__,
+                    "does_not_establish": [
+                        "job_not_started",
+                        "freshness_failed",
+                        "merge_failure",
+                    ],
+                }
     return result
 
 

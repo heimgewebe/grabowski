@@ -317,6 +317,10 @@
       "source": "src/grabowski_post_merge_sync_apply.py"
     },
     {
+      "module": "grabowski_repoground_post_merge",
+      "source": "src/grabowski_repoground_post_merge.py"
+    },
+    {
       "module": "grabowski_forrest_server_exit",
       "source": "src/grabowski_forrest_server_exit.py"
     },

@@ -3249,6 +3249,10 @@
         "source": "src/grabowski_post_merge_sync_apply.py"
       },
       {
+        "module": "grabowski_repoground_post_merge",
+        "source": "src/grabowski_repoground_post_merge.py"
+      },
+      {
         "module": "grabowski_forrest_server_exit",
         "source": "src/grabowski_forrest_server_exit.py"
       },
@@ -3662,7 +3666,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "37d292863168f2239c99ea41506d1626d58d0eeac4822c3bcc8c24854596d2c0"
+      "sha256": "043c579e8d0717ea00226965d77d1a0555aed91fe587402d6c7472d60914678e"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3772,6 +3776,7 @@
       "src/grabowski_redaction.py": "d1f394aa11e3feb6c8b37e39dfad3b445a2b6fee343f1ff60dd6ac48ca854e84",
       "src/grabowski_repobrief.py": "1e842a9f310c967012914afbaf2dbbc4af3a29c222734f14f902421773713ded",
       "src/grabowski_repoground_catalog.py": "b8ea8d611a37bb287ae8836790c6aa7abf29c08dcccf252492fb355c9f9ba58f",
+      "src/grabowski_repoground_post_merge.py": "6907ea6de2a66209975d3b835fe4bf70683a35bffdcbe479182e9ae010954a5a",
       "src/grabowski_resources.py": "4c6fa4fff67425607702a23bbdf33fb2deeb6da43430b844a6bb12d1e54fac57",
       "src/grabowski_runtime.py": "783a6ed8635da45733a80ed9872a5afcd33aedf638f567fea464e4ab623ff182",
       "src/grabowski_runtime_contract.py": "4528ec08c1019a2b773a7e05250f4842ca2403d1c9171b19ef98a63c6e588054",
