@@ -38,6 +38,12 @@ DEPLOYMENT_CONTENTION_RETRY_DELAYS_SECONDS = (5, 10, 20)
 DEPLOYMENT_CONTENTION_MAX_ATTEMPTS = (
     len(DEPLOYMENT_CONTENTION_RETRY_DELAYS_SECONDS) + 1
 )
+_VALIDATION_CHILD_EXEC = (
+    "import os,signal,sys;"
+    "mask={signal.Signals(int(item)) for item in sys.argv[1].split(',') if item};"
+    "signal.pthread_sigmask(signal.SIG_SETMASK, mask);"
+    "os.execvpe(sys.argv[2], sys.argv[2:], os.environ)"
+)
 
 
 class DeploymentContentionDeferred(RuntimeError):
@@ -969,6 +975,60 @@ def _validation_environment(validation_root: Path) -> dict[str, str]:
     return environment
 
 
+def _validation_child_argv(
+    argv: list[str],
+    previous_mask: set[signal.Signals],
+) -> list[str]:
+    if not argv:
+        raise ValueError("validation child argv must not be empty")
+    mask = ",".join(str(int(item)) for item in sorted(previous_mask, key=int))
+    return [
+        sys.executable,
+        "-I",
+        "-c",
+        _VALIDATION_CHILD_EXEC,
+        mask,
+        *argv,
+    ]
+
+
+def _spawn_validation_process(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    text: bool,
+    stdin: Any,
+    stdout: Any,
+    stderr: Any,
+) -> subprocess.Popen[Any]:
+    """Spawn one validation process without leaking the parent's SIGTERM guard."""
+    process: subprocess.Popen[Any] | None = None
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    restored = False
+    try:
+        process = subprocess.Popen(
+            _validation_child_argv(argv, previous_mask),
+            cwd=cwd,
+            env=env,
+            text=text,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        restored = True
+        return process
+    except BaseException:
+        if process is not None:
+            terminate_process_group(process)
+        raise
+    finally:
+        if not restored:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
 def _run_validation_command(
     argv: list[str],
     *,
@@ -979,23 +1039,18 @@ def _run_validation_command(
     env: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
     """Run one validation-bootstrap command in a killable, reapable process group."""
-    process: subprocess.Popen[str] | None = None
-    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    process = _spawn_validation_process(
+        argv,
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdin=None,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
     stdout: str | None = None
     stderr: str | None = None
     try:
-        try:
-            process = subprocess.Popen(
-                argv,
-                cwd=cwd,
-                env=env,
-                text=True,
-                stdout=subprocess.PIPE if capture else None,
-                stderr=subprocess.PIPE if capture else None,
-                start_new_session=True,
-            )
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         try:
             if capture:
                 stdout, stderr = process.communicate(timeout=timeout)
@@ -1027,11 +1082,10 @@ def _run_validation_command(
             stderr=stderr,
         )
     except BaseException:
-        if process is not None:
-            terminate_process_group(process)
+        terminate_process_group(process)
         raise
     finally:
-        if capture and process is not None:
+        if capture:
             if process.stdout is not None:
                 process.stdout.close()
             if process.stderr is not None:
@@ -1316,12 +1370,17 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
                 f"DEPLOY_TOOLING_LOCK={tooling_lock}",
                 "validate",
             ]
-        spawn_mask = None
         if validation_tmp is not None:
-            spawn_mask = signal.pthread_sigmask(
-                signal.SIG_BLOCK, {signal.SIGTERM}
+            process = _spawn_validation_process(
+                effective_argv,
+                cwd=cwd,
+                env=environment,
+                text=False,
+                stdin=subprocess.DEVNULL,
+                stdout=None,
+                stderr=None,
             )
-        try:
+        else:
             process = subprocess.Popen(
                 effective_argv,
                 cwd=cwd,
@@ -1331,9 +1390,6 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
                 stderr=None,
                 start_new_session=True,
             )
-        finally:
-            if spawn_mask is not None:
-                signal.pthread_sigmask(signal.SIG_SETMASK, spawn_mask)
         try:
             returncode = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:

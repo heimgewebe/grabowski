@@ -5044,16 +5044,16 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         self.assertEqual(environment["TMPDIR"], environment["TEMP"])
         self.assertEqual(Path(environment["TMPDIR"]).parent, Path(temporary_parent))
         tooling_venv = Path(environment["DEPLOY_TOOLING_VENV"])
-        self.assertEqual(
-            popen.call_args.args[0],
-            [
-                "make",
-                "PYTHON=/validation/bin/python",
-                f"DEPLOY_TOOLING_VENV={tooling_venv}",
-                "DEPLOY_TOOLING_LOCK=/validation/deploy-tooling.lock.txt",
-                "validate",
-            ],
-        )
+        expected_make_argv = [
+            "make",
+            "PYTHON=/validation/bin/python",
+            f"DEPLOY_TOOLING_VENV={tooling_venv}",
+            "DEPLOY_TOOLING_LOCK=/validation/deploy-tooling.lock.txt",
+            "validate",
+        ]
+        spawned_argv = popen.call_args.args[0]
+        self.assertEqual(spawned_argv[-len(expected_make_argv):], expected_make_argv)
+        self.assertEqual(spawned_argv[:3], [sys.executable, "-I", "-c"])
         self.assertEqual(tooling_venv.name, ".venv")
         self.assertEqual(tooling_venv.parent.name, "deploy-tooling")
         self.assertEqual(tooling_venv.parents[2], Path(temporary_parent))
@@ -5211,6 +5211,26 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                         environment,
                         Path("/validation"),
                     )
+
+    def test_validation_command_exec_target_restores_sigterm_mask(self) -> None:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        self.assertNotIn(signal.SIGTERM, previous_mask)
+        completed = RUNNER._run_validation_command(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                (
+                    "import signal; "
+                    "mask=signal.pthread_sigmask(signal.SIG_BLOCK, set()); "
+                    "raise SystemExit(1 if signal.SIGTERM in mask else 0)"
+                ),
+            ],
+            timeout=30,
+            cwd=Path("/tmp"),
+            env=os.environ.copy(),
+        )
+        self.assertEqual(completed.returncode, 0)
 
     def test_validation_command_sigterm_terminates_bootstrap_process_group(self) -> None:
         process = Mock()
