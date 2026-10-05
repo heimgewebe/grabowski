@@ -4,6 +4,7 @@ PYTHON ?= python3
 UV ?= uv
 UV_RUNTIME_LOCK_VERSION := 0.9.18
 DEPLOY_TOOLING_VENV ?= build/deploy-tooling/.venv
+DEPLOY_TOOLING_LOCK ?= requirements/deploy-tooling.lock.txt
 DEPLOY_TOOL_PYTHON := $(DEPLOY_TOOLING_VENV)/bin/python
 GRABOWSKI_RUNTIME_PYTHON ?= $(HOME)/.local/share/grabowski-mcp/.venv/bin/python
 RETENTION_MIN_AGE_SECONDS ?= 86400
@@ -57,7 +58,7 @@ runtime-lock-refresh:
 
 deploy-tooling:
 >$(PYTHON) -m venv --clear $(DEPLOY_TOOLING_VENV)
->PIP_CONFIG_FILE=/dev/null PIP_NO_INPUT=1 PYTHONNOUSERSITE=1 $(DEPLOY_TOOL_PYTHON) -m pip install --isolated --disable-pip-version-check --no-input --require-hashes --no-deps --only-binary=:all: --index-url https://pypi.org/simple -r requirements/deploy-tooling.lock.txt
+>PIP_CONFIG_FILE=/dev/null PIP_NO_INPUT=1 PYTHONNOUSERSITE=1 $(DEPLOY_TOOL_PYTHON) -m pip install --isolated --disable-pip-version-check --no-input --require-hashes --no-deps --only-binary=:all: --index-url https://pypi.org/simple -r $(DEPLOY_TOOLING_LOCK)
 
 deploy-tooling-check: deploy-tooling
 >$(DEPLOY_TOOL_PYTHON) -c 'import yaml; raise SystemExit(0 if yaml.__version__ == "6.0.3" else 1)'
