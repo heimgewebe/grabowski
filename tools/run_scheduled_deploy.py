@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import selectors
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,12 @@ EARLY_DISPATCHER_SAMPLE_INTERVAL_SECONDS = 0.05
 DEPLOYMENT_CONTENTION_RETRY_DELAYS_SECONDS = (5, 10, 20)
 DEPLOYMENT_CONTENTION_MAX_ATTEMPTS = (
     len(DEPLOYMENT_CONTENTION_RETRY_DELAYS_SECONDS) + 1
+)
+_VALIDATION_CHILD_EXEC = (
+    "import os,signal,sys;"
+    "mask={signal.Signals(int(item)) for item in sys.argv[1].split(',') if item};"
+    "signal.pthread_sigmask(signal.SIG_SETMASK, mask);"
+    "os.execvpe(sys.argv[2], sys.argv[2:], os.environ)"
 )
 
 
@@ -264,6 +271,10 @@ def _validation_temp_parent() -> Path:
     resolved = parent.resolve(strict=True)
     if resolved != parent:
         raise RuntimeError("validation temporary parent is not canonical")
+    if re.fullmatch(r"/[A-Za-z0-9._/-]+", resolved.as_posix()) is None:
+        raise RuntimeError(
+            "validation temporary parent contains unsupported shell characters"
+        )
     if any((ancestor / ".git").exists() for ancestor in (resolved, *resolved.parents)):
         raise RuntimeError("validation temporary parent must not be inside a Git worktree")
     return resolved
@@ -275,6 +286,7 @@ def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
+        process.wait()
         return
     try:
         process.wait(timeout=5)
@@ -934,28 +946,454 @@ def wait_for_deployment_window(
     raise AssertionError("unreachable deployment contention retry state")
 
 
+def _validation_environment(validation_root: Path) -> dict[str, str]:
+    environment = deploy_core.pip_env()
+    environment.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+            "NO_COLOR": "1",
+        }
+    )
+    for key in (
+        "GIT_EXTERNAL_DIFF",
+        "GIT_DIFF_OPTS",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "MAKEFLAGS",
+        "MFLAGS",
+        "GNUMAKEFLAGS",
+        "MAKEFILES",
+        "MAKELEVEL",
+        "DEPLOY_TOOLING_LOCK",
+        "DEPLOY_TOOLING_VENV",
+    ):
+        environment.pop(key, None)
+    for name in FINALIZATION_ENV.values():
+        environment.pop(name, None)
+    environment.update(
+        {name: str(validation_root) for name in ("TMPDIR", "TMP", "TEMP")}
+    )
+    return environment
+
+
+def _validation_child_argv(
+    argv: list[str],
+    previous_mask: set[signal.Signals],
+) -> list[str]:
+    if not argv:
+        raise ValueError("validation child argv must not be empty")
+    mask = ",".join(str(int(item)) for item in sorted(previous_mask, key=int))
+    return [
+        sys.executable,
+        "-I",
+        "-c",
+        _VALIDATION_CHILD_EXEC,
+        mask,
+        *argv,
+    ]
+
+
+def _spawn_validation_process(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    text: bool,
+    stdin: Any,
+    stdout: Any,
+    stderr: Any,
+) -> subprocess.Popen[Any]:
+    """Spawn one validation process without leaking the parent's SIGTERM guard."""
+    process: subprocess.Popen[Any] | None = None
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    restored = False
+    try:
+        process = subprocess.Popen(
+            _validation_child_argv(argv, previous_mask),
+            cwd=cwd,
+            env=env,
+            text=text,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        restored = True
+        return process
+    except BaseException:
+        if process is not None:
+            terminate_process_group(process)
+        raise
+    finally:
+        if not restored:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+def _run_validation_command(
+    argv: list[str],
+    *,
+    timeout: int,
+    cwd: Path,
+    check: bool = True,
+    capture: bool = False,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    """Run one validation-bootstrap command in a killable, reapable process group."""
+    process = _spawn_validation_process(
+        argv,
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdin=None,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
+    stdout: str | None = None
+    stderr: str | None = None
+    try:
+        try:
+            if capture:
+                stdout, stderr = process.communicate(timeout=timeout)
+            else:
+                process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            terminate_process_group(process)
+            deploy_core.fail(
+                "Externer Befehl hat sein Timeout überschritten.",
+                phase="command-timeout",
+                details={
+                    "argv": deploy_core.redact_argv(argv),
+                    "timeout_seconds": timeout,
+                    "cwd": str(cwd),
+                },
+            )
+            raise AssertionError from exc
+        if check and process.returncode != 0:
+            raise subprocess.CalledProcessError(
+                process.returncode,
+                argv,
+                output=stdout,
+                stderr=stderr,
+            )
+        return subprocess.CompletedProcess(
+            argv,
+            process.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    except BaseException:
+        terminate_process_group(process)
+        raise
+    finally:
+        if capture:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+
+def _verify_validation_distributions(
+    python: Path,
+    locked: dict[str, str],
+    environment: dict[str, str],
+    validation_root: Path,
+) -> None:
+    result = _run_validation_command(
+        [
+            str(python),
+            "-I",
+            "-c",
+            (
+                "import importlib.metadata,json; "
+                "print(json.dumps({d.metadata['Name']: d.version "
+                "for d in importlib.metadata.distributions() "
+                "if d.metadata.get('Name')}, sort_keys=True))"
+            ),
+        ],
+        capture=True,
+        timeout=deploy_core.TIMEOUTS["python"],
+        env=environment,
+        cwd=validation_root,
+    )
+    try:
+        installed_raw = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("validation interpreter returned invalid distribution JSON") from exc
+    if not isinstance(installed_raw, dict) or not all(
+        isinstance(name, str) and isinstance(version, str)
+        for name, version in installed_raw.items()
+    ):
+        raise RuntimeError("validation interpreter returned invalid distribution inventory")
+
+    installed = {
+        deploy_core.normalize_package_name(name): version
+        for name, version in installed_raw.items()
+    }
+    allowed = set(locked) | deploy_core.ALLOWED_VENV_BASE_DISTS
+    unexpected = sorted(set(installed) - allowed)
+    if unexpected:
+        deploy_core.fail(
+            "Unerwartete installierte Distributionen: " + ", ".join(unexpected)
+        )
+    missing = sorted(set(locked) - set(installed))
+    if missing:
+        deploy_core.fail("Runtime-Lockpakete fehlen in der Venv: " + ", ".join(missing))
+    mismatched = sorted(
+        f"{name}=={installed[name]} != {locked[name]}"
+        for name in locked
+        if installed.get(name) != locked[name]
+    )
+    if mismatched:
+        deploy_core.fail(
+            "Installierte Versionen weichen vom Lock ab: " + ", ".join(mismatched)
+        )
+
+
+def _snapshot_validation_lock(
+    repo: Path,
+    validation_root: Path,
+    *,
+    relative_path: Path,
+    copy_name: str,
+    label: str,
+    parser: Any,
+) -> tuple[Path, dict[str, str]]:
+    """Copy one stable, no-follow lock into the private validation root."""
+    directory_flags = (
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    repo_descriptor = -1
+    requirements_descriptor = -1
+    lock_descriptor = -1
+    chunks: list[bytes] = []
+    try:
+        repo_descriptor = os.open(repo, directory_flags)
+        requirements_descriptor = os.open(
+            relative_path.parent.as_posix(),
+            directory_flags,
+            dir_fd=repo_descriptor,
+        )
+        requirements_metadata = os.fstat(requirements_descriptor)
+        if (
+            not stat.S_ISDIR(requirements_metadata.st_mode)
+            or requirements_metadata.st_uid != os.getuid()
+        ):
+            raise RuntimeError(f"target {label} parent is unsafe")
+        lock_descriptor = os.open(
+            relative_path.name,
+            file_flags,
+            dir_fd=requirements_descriptor,
+        )
+        before = os.fstat(lock_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+        ):
+            raise RuntimeError(f"target {label} is unsafe")
+        total = 0
+        while chunk := os.read(lock_descriptor, 1024 * 1024):
+            chunks.append(chunk)
+            total += len(chunk)
+        after = os.fstat(lock_descriptor)
+        if (
+            total != before.st_size
+            or (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            )
+            != (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+        ):
+            raise RuntimeError(f"target {label} changed while being read")
+    except OSError as exc:
+        raise RuntimeError(f"target {label} is unsafe") from exc
+    finally:
+        if lock_descriptor >= 0:
+            os.close(lock_descriptor)
+        if requirements_descriptor >= 0:
+            os.close(requirements_descriptor)
+        if repo_descriptor >= 0:
+            os.close(repo_descriptor)
+
+    lock_copy = validation_root / copy_name
+    output_descriptor = os.open(
+        lock_copy,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        view = memoryview(b"".join(chunks))
+        while view:
+            written = os.write(output_descriptor, view)
+            if written <= 0:
+                raise RuntimeError(f"validation {label} copy write failed")
+            view = view[written:]
+        os.fsync(output_descriptor)
+    finally:
+        os.close(output_descriptor)
+    locked = parser(lock_copy)
+    return lock_copy, locked
+
+
+def _snapshot_validation_runtime_lock(
+    repo: Path,
+    validation_root: Path,
+) -> tuple[Path, dict[str, str]]:
+    return _snapshot_validation_lock(
+        repo,
+        validation_root,
+        relative_path=deploy_core.RUNTIME_LOCK_RELATIVE,
+        copy_name="runtime.lock.txt",
+        label="runtime lock",
+        parser=deploy_core.parse_runtime_lock,
+    )
+
+
+def _snapshot_validation_deploy_tooling_lock(
+    repo: Path,
+    validation_root: Path,
+) -> tuple[Path, dict[str, str]]:
+    return _snapshot_validation_lock(
+        repo,
+        validation_root,
+        relative_path=Path("requirements/deploy-tooling.lock.txt"),
+        copy_name="deploy-tooling.lock.txt",
+        label="deploy-tooling lock",
+        parser=lambda path: deploy_core.parse_pinned_lock_file(
+            path, label="Deploy-Tooling-Lockfile"
+        ),
+    )
+
+def _prepare_validation_python(repo: Path, validation_root: Path) -> Path:
+    """Build an isolated validation interpreter from the exact target runtime lock."""
+    lock_path, locked = _snapshot_validation_runtime_lock(repo, validation_root)
+
+    venv = validation_root / "target-runtime"
+    environment = _validation_environment(validation_root)
+    _run_validation_command(
+        [
+            str(deploy_core.runtime_venv_builder_python()),
+            "-I",
+            "-m",
+            "venv",
+            str(venv),
+        ],
+        timeout=deploy_core.TIMEOUTS["python"],
+        env=environment,
+        cwd=validation_root,
+    )
+    python = venv / "bin" / "python"
+    _run_validation_command(
+        [
+            str(python),
+            "-I",
+            "-m",
+            "pip",
+            "install",
+            "--isolated",
+            "--disable-pip-version-check",
+            "--no-input",
+            "--require-hashes",
+            "--no-deps",
+            "--only-binary=:all:",
+            "--index-url",
+            "https://pypi.org/simple",
+            "-r",
+            str(lock_path),
+        ],
+        timeout=deploy_core.TIMEOUTS["package_install"],
+        env=environment,
+        cwd=validation_root,
+    )
+    _run_validation_command(
+        [str(python), "-I", "-m", "pip", "check"],
+        timeout=deploy_core.TIMEOUTS["python"],
+        env=environment,
+        cwd=validation_root,
+    )
+    _verify_validation_distributions(
+        python,
+        locked,
+        environment,
+        validation_root,
+    )
+    return python
+
+
+def _raise_validation_sigterm(signum: int, _frame: Any) -> None:
+    raise RuntimeError(f"validate interrupted by signal {signum} (SIGTERM)")
+
+
 def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str) -> None:
     emit(f"{phase}-start", argv=argv)
     environment = child_environment()
+    effective_argv = list(argv)
     validation_tmp = None
+    process: subprocess.Popen[bytes] | None = None
+    previous_sigterm: Any = None
     try:
         if phase == "validate":
+            if argv != ["make", "validate"]:
+                raise RuntimeError("validate phase requires canonical make validate argv")
+            previous_sigterm = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, _raise_validation_sigterm)
             validation_tmp = tempfile.TemporaryDirectory(
                 prefix="gdv-",
                 dir=_validation_temp_parent(),
             )
-            environment.update(
-                {name: validation_tmp.name for name in ("TMPDIR", "TMP", "TEMP")}
+            validation_root = Path(validation_tmp.name)
+            environment = _validation_environment(validation_root)
+            validation_python = _prepare_validation_python(cwd, validation_root)
+            tooling_lock, _tooling_locked = _snapshot_validation_deploy_tooling_lock(
+                cwd, validation_root
             )
-        process = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=None,
-            stderr=None,
-            start_new_session=True,
-        )
+            environment["PYTHON"] = str(validation_python)
+            environment["DEPLOY_TOOLING_LOCK"] = str(tooling_lock)
+            inherited_path = environment.get("PATH")
+            environment["PATH"] = str(validation_python.parent) + (
+                os.pathsep + inherited_path if inherited_path else ""
+            )
+            tooling_venv = validation_root / "deploy-tooling" / ".venv"
+            environment["DEPLOY_TOOLING_VENV"] = str(tooling_venv)
+            effective_argv = [
+                "make",
+                f"PYTHON={validation_python}",
+                f"DEPLOY_TOOLING_VENV={tooling_venv}",
+                f"DEPLOY_TOOLING_LOCK={tooling_lock}",
+                "validate",
+            ]
+        if validation_tmp is not None:
+            process = _spawn_validation_process(
+                effective_argv,
+                cwd=cwd,
+                env=environment,
+                text=False,
+                stdin=subprocess.DEVNULL,
+                stdout=None,
+                stderr=None,
+            )
+        else:
+            process = subprocess.Popen(
+                effective_argv,
+                cwd=cwd,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=None,
+                stderr=None,
+                start_new_session=True,
+            )
         try:
             returncode = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
@@ -966,8 +1404,18 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
         if returncode != 0:
             raise RuntimeError(f"{phase} failed with return code {returncode}")
     finally:
-        if validation_tmp is not None:
-            validation_tmp.cleanup()
+        try:
+            if (
+                validation_tmp is not None
+                and process is not None
+                and process.poll() is None
+            ):
+                terminate_process_group(process)
+            if validation_tmp is not None:
+                validation_tmp.cleanup()
+        finally:
+            if previous_sigterm is not None:
+                signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def verify_live_manifest(expected_head: str) -> dict[str, Any]:

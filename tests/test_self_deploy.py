@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 from pathlib import Path
 import sys
@@ -4974,11 +4975,43 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         process = Mock()
         process.wait.return_value = 0
         bindings = {name: "secret-binding" for name in RUNNER.FINALIZATION_ENV.values()}
+        python_bindings = {
+            "PYTHONPATH": "/untrusted/pythonpath",
+            "PYTHONHOME": "/untrusted/pythonhome",
+            "VIRTUAL_ENV": "/untrusted/venv",
+            "PIP_INDEX_URL": "https://untrusted.invalid/simple",
+            "PIP_EXTRA_INDEX_URL": "https://untrusted.invalid/extra",
+        }
+        make_bindings = {
+            "MAKEFLAGS": "--eval=bad",
+            "MFLAGS": "--bad",
+            "GNUMAKEFLAGS": "--eval=bad",
+            "MAKEFILES": "/tmp/untrusted.mk",
+            "MAKELEVEL": "7",
+        }
         with tempfile.TemporaryDirectory() as temporary_parent, patch.dict(
-            os.environ, bindings, clear=False
+            os.environ,
+            {
+                **bindings,
+                **python_bindings,
+                **make_bindings,
+                "GRABOWSKI_UNRELATED": "preserved",
+            },
+            clear=False,
         ), patch.object(
             RUNNER, "_validation_temp_parent", return_value=Path(temporary_parent)
         ), patch.object(
+            RUNNER,
+            "_prepare_validation_python",
+            return_value=Path("/validation/bin/python"),
+        ) as prepare, patch.object(
+            RUNNER,
+            "_snapshot_validation_deploy_tooling_lock",
+            return_value=(
+                Path("/validation/deploy-tooling.lock.txt"),
+                {"pyyaml": "6.0.3"},
+            ),
+        ) as tooling_snapshot, patch.object(
             RUNNER.subprocess, "Popen", return_value=process
         ) as popen:
             RUNNER.run_streamed(
@@ -4988,12 +5021,472 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                 phase="validate",
             )
         environment = popen.call_args.kwargs["env"]
-        for name in bindings:
+        prepare.assert_called_once()
+        tooling_snapshot.assert_called_once()
+        self.assertEqual(environment["PYTHON"], "/validation/bin/python")
+        self.assertEqual(
+            environment["DEPLOY_TOOLING_LOCK"],
+            "/validation/deploy-tooling.lock.txt",
+        )
+        self.assertEqual(
+            environment["PATH"].split(os.pathsep, 1)[0],
+            "/validation/bin",
+        )
+        self.assertEqual(
+            Path(environment["PATH"].split(os.pathsep, 1)[0]) / "python3",
+            Path("/validation/bin/python3"),
+        )
+        self.assertEqual(environment["GRABOWSKI_UNRELATED"], "preserved")
+        self.assertEqual(environment["PIP_CONFIG_FILE"], "/dev/null")
+        for name in (*bindings, *python_bindings, *make_bindings):
             self.assertNotIn(name, environment)
         self.assertEqual(environment["TMPDIR"], environment["TMP"])
         self.assertEqual(environment["TMPDIR"], environment["TEMP"])
         self.assertEqual(Path(environment["TMPDIR"]).parent, Path(temporary_parent))
+        tooling_venv = Path(environment["DEPLOY_TOOLING_VENV"])
+        expected_make_argv = [
+            "make",
+            "PYTHON=/validation/bin/python",
+            f"DEPLOY_TOOLING_VENV={tooling_venv}",
+            "DEPLOY_TOOLING_LOCK=/validation/deploy-tooling.lock.txt",
+            "validate",
+        ]
+        spawned_argv = popen.call_args.args[0]
+        self.assertEqual(spawned_argv[-len(expected_make_argv):], expected_make_argv)
+        self.assertEqual(spawned_argv[:3], [sys.executable, "-I", "-c"])
+        self.assertEqual(tooling_venv.name, ".venv")
+        self.assertEqual(tooling_venv.parent.name, "deploy-tooling")
+        self.assertEqual(tooling_venv.parents[2], Path(temporary_parent))
         self.assertFalse(Path(environment["TMPDIR"]).exists())
+        self.assertFalse(tooling_venv.exists())
+
+    def test_prepare_validation_python_uses_target_runtime_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            repo = root / "repo"
+            validation_root = root / "validation"
+            lock = repo / "requirements/runtime.lock.txt"
+            lock.parent.mkdir(parents=True)
+            validation_root.mkdir()
+            lock.write_text("lock fixture\n", encoding="utf-8")
+            base_python = Path("/usr/bin/python3")
+            python = validation_root / "target-runtime/bin/python"
+            bindings = {
+                name: f"finalization-{index}"
+                for index, name in enumerate(RUNNER.FINALIZATION_ENV.values())
+            }
+            completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+            inventory = subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=json.dumps({"pydantic": "2.13.4"}),
+                stderr="",
+            )
+            with patch.dict(
+                os.environ,
+                {**bindings, "GRABOWSKI_UNRELATED": "preserved"},
+                clear=False,
+            ), patch.object(
+                RUNNER.deploy_core,
+                "runtime_venv_builder_python",
+                return_value=base_python,
+            ), patch.object(
+                RUNNER.deploy_core,
+                "parse_runtime_lock",
+                return_value={"pydantic": "2.13.4"},
+            ), patch.object(
+                RUNNER,
+                "_run_validation_command",
+                side_effect=[completed, completed, completed, inventory],
+            ) as run:
+                result = RUNNER._prepare_validation_python(repo, validation_root)
+
+        self.assertEqual(result, python)
+        self.assertEqual(run.call_count, 4)
+        lock_copy = validation_root / "runtime.lock.txt"
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [
+                str(base_python),
+                "-I",
+                "-m",
+                "venv",
+                str(validation_root / "target-runtime"),
+            ],
+        )
+        install = run.call_args_list[1].args[0]
+        self.assertEqual(
+            install[:5],
+            [str(python), "-I", "-m", "pip", "install"],
+        )
+        self.assertIn("--require-hashes", install)
+        self.assertIn("--no-deps", install)
+        self.assertIn("--only-binary=:all:", install)
+        self.assertEqual(install[-2:], ["-r", str(lock_copy)])
+        verification = run.call_args_list[3]
+        self.assertEqual(verification.args[0][:3], [str(python), "-I", "-c"])
+        self.assertTrue(verification.kwargs["capture"])
+        for call_ in run.call_args_list:
+            self.assertEqual(call_.kwargs["cwd"], validation_root)
+            environment = call_.kwargs["env"]
+            self.assertEqual(environment["TMPDIR"], str(validation_root))
+            self.assertEqual(environment["TMP"], str(validation_root))
+            self.assertEqual(environment["TEMP"], str(validation_root))
+            self.assertEqual(environment["GRABOWSKI_UNRELATED"], "preserved")
+            for name in bindings:
+                self.assertNotIn(name, environment)
+
+    def test_prepare_validation_python_validates_lock_before_subprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            repo = root / "repo"
+            validation_root = root / "validation"
+            lock = repo / "requirements/runtime.lock.txt"
+            lock.parent.mkdir(parents=True)
+            validation_root.mkdir()
+            lock.write_text(
+                "--extra-index-url https://untrusted.invalid/simple\n",
+                encoding="utf-8",
+            )
+            with patch.object(RUNNER, "_run_validation_command") as run:
+                with self.assertRaisesRegex(
+                    RUNNER.deploy_core.DeployError,
+                    "Nicht erlaubte Runtime-Lock-Anforderung",
+                ):
+                    RUNNER._prepare_validation_python(repo, validation_root)
+            run.assert_not_called()
+
+    def test_verify_validation_distributions_fails_closed(self) -> None:
+        python = Path("/validation/bin/python")
+        environment = {"PIP_CONFIG_FILE": "/dev/null"}
+        cases = (
+            (
+                "invalid-json",
+                "not-json",
+                {"mcp": "1.30.0"},
+                RuntimeError,
+                "invalid distribution JSON",
+            ),
+            (
+                "invalid-inventory",
+                "[]",
+                {"mcp": "1.30.0"},
+                RuntimeError,
+                "invalid distribution inventory",
+            ),
+            (
+                "unexpected",
+                json.dumps({"mcp": "1.30.0", "extra": "1.0"}),
+                {"mcp": "1.30.0"},
+                RUNNER.deploy_core.DeployError,
+                "Unerwartete installierte Distributionen",
+            ),
+            (
+                "missing",
+                json.dumps({"mcp": "1.30.0"}),
+                {"mcp": "1.30.0", "pydantic": "2.13.4"},
+                RUNNER.deploy_core.DeployError,
+                "Runtime-Lockpakete fehlen",
+            ),
+            (
+                "mismatch",
+                json.dumps({"mcp": "1.29.0"}),
+                {"mcp": "1.30.0"},
+                RUNNER.deploy_core.DeployError,
+                "Installierte Versionen weichen",
+            ),
+        )
+        for name, stdout, locked, exception, message in cases:
+            with self.subTest(name=name), patch.object(
+                RUNNER,
+                "_run_validation_command",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=stdout, stderr=""
+                ),
+            ):
+                with self.assertRaisesRegex(exception, message):
+                    RUNNER._verify_validation_distributions(
+                        python,
+                        locked,
+                        environment,
+                        Path("/validation"),
+                    )
+
+    def test_validation_command_exec_target_restores_sigterm_mask(self) -> None:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        self.assertNotIn(signal.SIGTERM, previous_mask)
+        completed = RUNNER._run_validation_command(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                (
+                    "import signal; "
+                    "mask=signal.pthread_sigmask(signal.SIG_BLOCK, set()); "
+                    "raise SystemExit(1 if signal.SIGTERM in mask else 0)"
+                ),
+            ],
+            timeout=30,
+            cwd=Path("/tmp"),
+            env=os.environ.copy(),
+        )
+        self.assertEqual(completed.returncode, 0)
+
+    def test_validation_command_sigterm_terminates_bootstrap_process_group(self) -> None:
+        process = Mock()
+        process.wait.side_effect = lambda timeout: signal.raise_signal(signal.SIGTERM)
+        process.poll.return_value = None
+        previous = signal.getsignal(signal.SIGTERM)
+        try:
+            signal.signal(signal.SIGTERM, RUNNER._raise_validation_sigterm)
+            with patch.object(
+                RUNNER.subprocess, "Popen", return_value=process
+            ) as popen, patch.object(
+                RUNNER, "terminate_process_group"
+            ) as terminate_group:
+                with self.assertRaisesRegex(RuntimeError, "SIGTERM"):
+                    RUNNER._run_validation_command(
+                        ["/usr/bin/python3", "-I", "-m", "venv", "/validation"],
+                        timeout=30,
+                        cwd=Path("/validation"),
+                        env={"PATH": "/usr/bin"},
+                    )
+                terminate_group.assert_called_once_with(process)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(popen.call_args.kwargs["cwd"], Path("/validation"))
+
+    def test_validation_command_sigterm_during_spawn_terminates_process_group(self) -> None:
+        process = Mock()
+        process.poll.return_value = None
+        previous_handler = signal.getsignal(signal.SIGTERM)
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        try:
+            signal.signal(signal.SIGTERM, RUNNER._raise_validation_sigterm)
+
+            def spawn(*_args: object, **_kwargs: object) -> Mock:
+                os.kill(os.getpid(), signal.SIGTERM)
+                return process
+
+            with patch.object(
+                RUNNER.subprocess, "Popen", side_effect=spawn
+            ), patch.object(
+                RUNNER, "terminate_process_group"
+            ) as terminate_group:
+                with self.assertRaisesRegex(RuntimeError, "SIGTERM"):
+                    RUNNER._run_validation_command(
+                        ["/usr/bin/python3", "-I", "-m", "venv", "/validation"],
+                        timeout=30,
+                        cwd=Path("/validation"),
+                        env={"PATH": "/usr/bin"},
+                    )
+                terminate_group.assert_called_once_with(process)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            signal.signal(signal.SIGTERM, previous_handler)
+
+    def test_validate_rejects_deploy_tooling_directive_before_make(self) -> None:
+        previous = signal.getsignal(signal.SIGTERM)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            repo = root / "repo"
+            parent = root / "validation-parent"
+            lock = repo / "requirements/deploy-tooling.lock.txt"
+            lock.parent.mkdir(parents=True)
+            parent.mkdir()
+            lock.write_text(
+                "--extra-index-url https://untrusted.invalid/simple\n",
+                encoding="utf-8",
+            )
+            with patch.object(
+                RUNNER, "_validation_temp_parent", return_value=parent
+            ), patch.object(
+                RUNNER,
+                "_prepare_validation_python",
+                return_value=Path("/validation/bin/python"),
+            ), patch.object(RUNNER.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(
+                    RUNNER.deploy_core.DeployError,
+                    "Nicht erlaubte Runtime-Lock-Anforderung",
+                ):
+                    RUNNER.run_streamed(
+                        ["make", "validate"],
+                        cwd=repo,
+                        timeout_seconds=30,
+                        phase="validate",
+                    )
+                popen.assert_not_called()
+                self.assertEqual(list(parent.iterdir()), [])
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+
+    def test_validate_sigterm_during_make_spawn_terminates_before_cleanup(self) -> None:
+        process = Mock()
+        process.poll.return_value = None
+        previous = signal.getsignal(signal.SIGTERM)
+        observations: list[bool] = []
+        with tempfile.TemporaryDirectory() as temporary_parent, patch.object(
+            RUNNER, "_validation_temp_parent", return_value=Path(temporary_parent)
+        ), patch.object(
+            RUNNER,
+            "_prepare_validation_python",
+            return_value=Path("/validation/bin/python"),
+        ), patch.object(
+            RUNNER,
+            "_snapshot_validation_deploy_tooling_lock",
+            return_value=(
+                Path("/validation/deploy-tooling.lock.txt"),
+                {"pyyaml": "6.0.3"},
+            ),
+        ):
+
+            def spawn(*_args: object, **_kwargs: object) -> Mock:
+                os.kill(os.getpid(), signal.SIGTERM)
+                return process
+
+            def terminate(child: Mock) -> None:
+                observations.append(any(Path(temporary_parent).iterdir()))
+                child.poll.return_value = -signal.SIGTERM
+
+            with patch.object(
+                RUNNER.subprocess, "Popen", side_effect=spawn
+            ), patch.object(
+                RUNNER, "terminate_process_group", side_effect=terminate
+            ) as terminate_group:
+                with self.assertRaisesRegex(RuntimeError, "SIGTERM"):
+                    RUNNER.run_streamed(
+                        ["make", "validate"],
+                        cwd=Path("/tmp"),
+                        timeout_seconds=30,
+                        phase="validate",
+                    )
+                terminate_group.assert_called_once_with(process)
+                self.assertEqual(observations, [True])
+                self.assertEqual(list(Path(temporary_parent).iterdir()), [])
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+
+    def test_validate_preparation_failure_never_starts_make_and_cleans_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_parent, patch.object(
+            RUNNER, "_validation_temp_parent", return_value=Path(temporary_parent)
+        ), patch.object(
+            RUNNER,
+            "_prepare_validation_python",
+            side_effect=RuntimeError("preparation failed"),
+        ), patch.object(RUNNER.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(RuntimeError, "preparation failed"):
+                RUNNER.run_streamed(
+                    ["make", "validate"],
+                    cwd=Path("/tmp"),
+                    timeout_seconds=30,
+                    phase="validate",
+                )
+            popen.assert_not_called()
+            self.assertEqual(list(Path(temporary_parent).iterdir()), [])
+
+    def test_validate_sigterm_terminates_child_before_cleanup_and_restores_handler(self) -> None:
+        process = Mock()
+        process.wait.side_effect = lambda timeout: signal.raise_signal(signal.SIGTERM)
+        process.poll.return_value = None
+        previous = signal.getsignal(signal.SIGTERM)
+        termination_observations: list[tuple[bool, bool]] = []
+        with tempfile.TemporaryDirectory() as temporary_parent, patch.object(
+            RUNNER, "_validation_temp_parent", return_value=Path(temporary_parent)
+        ), patch.object(
+            RUNNER,
+            "_prepare_validation_python",
+            return_value=Path("/validation/bin/python"),
+        ), patch.object(
+            RUNNER,
+            "_snapshot_validation_deploy_tooling_lock",
+            return_value=(
+                Path("/validation/deploy-tooling.lock.txt"),
+                {"pyyaml": "6.0.3"},
+            ),
+        ), patch.object(
+            RUNNER.subprocess,
+            "Popen",
+            return_value=process,
+        ):
+
+            def terminate(child: Mock) -> None:
+                termination_observations.append(
+                    (child is process, any(Path(temporary_parent).iterdir()))
+                )
+                child.returncode = -signal.SIGTERM
+                child.poll.return_value = -signal.SIGTERM
+
+            with patch.object(
+                RUNNER, "terminate_process_group", side_effect=terminate
+            ) as terminate_group:
+                with self.assertRaisesRegex(RuntimeError, "SIGTERM"):
+                    RUNNER.run_streamed(
+                        ["make", "validate"],
+                        cwd=Path("/tmp"),
+                        timeout_seconds=30,
+                        phase="validate",
+                    )
+                terminate_group.assert_called_once_with(process)
+                self.assertEqual(termination_observations, [(True, True)])
+                self.assertEqual(process.poll(), -signal.SIGTERM)
+                self.assertEqual(list(Path(temporary_parent).iterdir()), [])
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+
+    def test_terminate_process_group_reaps_after_process_group_race(self) -> None:
+        process = Mock()
+        process.poll.return_value = None
+        process.pid = 12345
+        with patch.object(RUNNER.os, "killpg", side_effect=ProcessLookupError):
+            RUNNER.terminate_process_group(process)
+        process.wait.assert_called_once_with()
+
+    def test_prepare_validation_python_rejects_unsafe_runtime_lock_identity(self) -> None:
+        for case in ("missing", "symlink", "hardlink", "foreign-owner"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                repo = root / "repo"
+                validation_root = root / "validation"
+                lock = repo / "requirements/runtime.lock.txt"
+                target = root / "runtime.lock"
+                lock.parent.mkdir(parents=True)
+                validation_root.mkdir()
+                getuid = nullcontext()
+                if case == "symlink":
+                    target.write_text("lock fixture\n", encoding="utf-8")
+                    lock.symlink_to(target)
+                elif case == "hardlink":
+                    target.write_text("lock fixture\n", encoding="utf-8")
+                    os.link(target, lock)
+                elif case == "foreign-owner":
+                    lock.write_text("lock fixture\n", encoding="utf-8")
+                    getuid = patch.object(
+                        RUNNER.os, "getuid", return_value=os.getuid() + 1
+                    )
+                with getuid, patch.object(RUNNER, "_run_validation_command") as run:
+                    with self.assertRaisesRegex(
+                        RuntimeError, r"runtime lock.*unsafe"
+                    ):
+                        RUNNER._prepare_validation_python(repo, validation_root)
+                run.assert_not_called()
+
+    def test_validation_temp_parent_rejects_shell_unsafe_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for name in ("runtime root", "runtime;touch-marker", "runtime$(id)"):
+                with self.subTest(name=name):
+                    runtime_root = root / name
+                    runtime_root.mkdir()
+                    with patch.dict(
+                        os.environ,
+                        {
+                            "XDG_RUNTIME_DIR": str(runtime_root),
+                            RUNNER.FINALIZATION_ENV["finalization"]: "",
+                        },
+                        clear=False,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "unsupported shell characters"
+                        ):
+                            RUNNER._validation_temp_parent()
 
     def test_validation_temp_parent_rejects_git_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -5943,6 +6436,14 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             failure_type="RuntimeError",
             blue_green=None,
         )
+
+    def test_make_deploy_tooling_lock_is_overridable(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn(
+            "DEPLOY_TOOLING_LOCK ?= requirements/deploy-tooling.lock.txt",
+            makefile,
+        )
+        self.assertIn("-r $(DEPLOY_TOOLING_LOCK)", makefile)
 
     def test_make_deploy_schedules_not_direct_apply(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
