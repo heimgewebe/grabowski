@@ -677,6 +677,221 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(evidence["transport_mode"], assertion.ASSERTION_VERSION)
         self.assertEqual(evidence["client_scope_kind"], "connector_capability")
 
+    def _signed_headers_for_arguments(
+        self,
+        arguments: dict[str, object],
+        *,
+        session_id: str,
+        request_id: int,
+    ) -> dict[str, str]:
+        body = _tool_body(arguments, request_id=request_id)
+        signed = ingress.signed_tool_headers(
+            token=SECRET,
+            body=body,
+            session_id=session_id,
+            runtime_binding_sha256=_runtime_sha256(),
+            now_unix=int(__import__("time").time()),
+        )
+        return {
+            base._TRANSPORT_CONNECTOR_CAPABILITY_HEADER: SECRET,
+            base._TRANSPORT_INGRESS_VERSION_HEADER: assertion.ASSERTION_VERSION,
+            base._TRANSPORT_MCP_SESSION_ID_HEADER: session_id,
+            base._TRANSPORT_REQUEST_ID_HEADER: signed[ingress.REQUEST_ID_HEADER],
+            base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: signed[
+                ingress.REQUEST_TIMESTAMP_HEADER
+            ],
+            base._TRANSPORT_REQUEST_AUDIENCE_HEADER: signed[
+                ingress.REQUEST_AUDIENCE_HEADER
+            ],
+            base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: signed[
+                ingress.REQUEST_BODY_SHA256_HEADER
+            ],
+            base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: signed[
+                ingress.RUNTIME_BINDING_SHA256_HEADER
+            ],
+            base._TRANSPORT_REQUEST_MAC_HEADER: signed[ingress.REQUEST_MAC_HEADER],
+        }
+
+    def test_operator_signed_one_call_accepts_flowlines_augmented_public_arguments(
+        self,
+    ) -> None:
+        domain_arguments = {"argv": ["true"]}
+        public_arguments = {
+            **domain_arguments,
+            "reason": "Run bounded verification",
+            "user_intent": "Verify the requested repository change",
+        }
+        headers = self._signed_headers_for_arguments(
+            public_arguments,
+            session_id="flowlines-analytics-accepted",
+            request_id=71,
+        )
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with mock.patch.object(
+            roundtrip,
+            "consume_verified",
+            side_effect=AssertionError("legacy roundtrip must not run"),
+        ):
+            evidence = operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_terminal_run",
+                arguments=domain_arguments,
+                transport_arguments=public_arguments,
+                context=_ctx(headers),
+                tool=tool,
+            )
+        self.assertEqual(evidence["transport_mode"], assertion.ASSERTION_VERSION)
+        self.assertNotEqual(
+            assertion.canonical_arguments_sha256(public_arguments),
+            roundtrip.canonical_arguments_sha256(domain_arguments),
+        )
+
+    def test_operator_signed_one_call_rejects_domain_tamper_after_signature(
+        self,
+    ) -> None:
+        original_public_arguments = {
+            "argv": ["true"],
+            "reason": "Run bounded verification",
+            "user_intent": "Verify the requested repository change",
+        }
+        headers = self._signed_headers_for_arguments(
+            original_public_arguments,
+            session_id="flowlines-domain-tamper",
+            request_id=72,
+        )
+        tampered_domain_arguments = {"argv": ["false"]}
+        tampered_public_arguments = {
+            **tampered_domain_arguments,
+            "reason": original_public_arguments["reason"],
+            "user_intent": original_public_arguments["user_intent"],
+        }
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with self.assertRaisesRegex(RuntimeError, "MAC mismatch"):
+            operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_terminal_run",
+                arguments=tampered_domain_arguments,
+                transport_arguments=tampered_public_arguments,
+                context=_ctx(headers),
+                tool=tool,
+            )
+
+    def test_operator_signed_one_call_rejects_analytics_tamper_without_resigning(
+        self,
+    ) -> None:
+        domain_arguments = {"argv": ["true"]}
+        original_public_arguments = {
+            **domain_arguments,
+            "reason": "Original reason",
+            "user_intent": "Original intent",
+        }
+        headers = self._signed_headers_for_arguments(
+            original_public_arguments,
+            session_id="flowlines-analytics-tamper",
+            request_id=73,
+        )
+        tampered_public_arguments = {
+            **original_public_arguments,
+            "reason": "Changed reason",
+        }
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with self.assertRaisesRegex(RuntimeError, "MAC mismatch"):
+            operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_terminal_run",
+                arguments=domain_arguments,
+                transport_arguments=tampered_public_arguments,
+                context=_ctx(headers),
+                tool=tool,
+            )
+
+    def test_resigned_analytics_variants_keep_identical_domain_policy(
+        self,
+    ) -> None:
+        domain_arguments = {"argv": ["true"]}
+        tool = SimpleNamespace(
+            fn_metadata=SimpleNamespace(
+                arg_model=SimpleNamespace(model_fields={"argv": object()})
+            ),
+            annotations=SimpleNamespace(readOnlyHint=False),
+        )
+        raw_digests: list[str] = []
+        for request_id, (reason, user_intent) in enumerate(
+            (
+                ("First reason", "First intent"),
+                ("Second reason", "Second intent"),
+            ),
+            start=74,
+        ):
+            public_arguments = {
+                **domain_arguments,
+                "reason": reason,
+                "user_intent": user_intent,
+            }
+            policy_arguments = operator._operator_policy_arguments(
+                "grabowski_terminal_run",
+                public_arguments,
+                tool,
+            )
+            self.assertEqual(policy_arguments, domain_arguments)
+            headers = self._signed_headers_for_arguments(
+                public_arguments,
+                session_id=f"flowlines-resigned-{request_id}",
+                request_id=request_id,
+            )
+            evidence = operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_terminal_run",
+                arguments=policy_arguments,
+                transport_arguments=public_arguments,
+                context=_ctx(headers),
+                tool=tool,
+            )
+            self.assertEqual(evidence["transport_mode"], assertion.ASSERTION_VERSION)
+            raw_digests.append(
+                assertion.canonical_arguments_sha256(public_arguments)
+            )
+        self.assertNotEqual(raw_digests[0], raw_digests[1])
+
+    def test_legacy_roundtrip_stays_bound_to_domain_arguments(
+        self,
+    ) -> None:
+        domain_arguments = {"argv": ["true"]}
+        public_arguments = {
+            **domain_arguments,
+            "reason": "Analytics only",
+            "user_intent": "Analytics only",
+        }
+        expected_domain_digest = roundtrip.canonical_arguments_sha256(
+            domain_arguments
+        )
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with (
+            mock.patch.object(
+                base, "_transport_signed_one_call_evidence", return_value=None
+            ),
+            mock.patch.object(
+                base, "_transport_roundtrip_client_scope", return_value=SCOPE
+            ),
+            mock.patch.object(
+                roundtrip,
+                "consume_verified",
+                return_value={"state": "consumed", "transport_mode": "legacy-test"},
+            ) as consume_verified,
+        ):
+            evidence = operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_terminal_run",
+                arguments=domain_arguments,
+                transport_arguments=public_arguments,
+                context=_ctx({}),
+                tool=tool,
+            )
+        self.assertEqual(evidence["transport_mode"], "legacy-test")
+        self.assertEqual(
+            consume_verified.call_args.kwargs["arguments_sha256"],
+            expected_domain_digest,
+        )
+        self.assertNotEqual(
+            expected_domain_digest,
+            roundtrip.canonical_arguments_sha256(public_arguments),
+        )
+
     def test_mcp_task_start_exact_request_is_single_use_and_fresh_retry_delegates(self) -> None:
         arguments = {"host": "heim-pc", "argv": ["true"]}
         body = json.dumps(
