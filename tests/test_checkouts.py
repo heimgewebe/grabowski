@@ -3066,6 +3066,114 @@ class CheckoutLifecycleTests(unittest.TestCase):
             [fence["fence_id"]],
         )
 
+    def test_auto_source_cleanup_uncertainty_stays_fenced_after_effect_leases_drop_while_owner_active(
+        self,
+    ) -> None:
+        target, fence, lifecycle, retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=True)
+        )
+        path_lease_before = checkouts.resources.inspect_resource(path_key)
+        effect_leases = [dict(item) for item in fence["evidence"]["effect_leases"]]
+        checkouts.resources.release_resources(
+            str(fence["lease_owner_id"]),
+            [str(item["resource_key"]) for item in effect_leases],
+            expected_leases=effect_leases,
+        )
+        descriptor = os.open(
+            checkouts.AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK,
+            os.O_RDWR | os.O_CLOEXEC,
+        )
+        try:
+            checkouts.fcntl.flock(descriptor, checkouts.fcntl.LOCK_EX)
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        finally:
+            checkouts.fcntl.flock(descriptor, checkouts.fcntl.LOCK_UN)
+            os.close(descriptor)
+
+        self.assertEqual(result["state"], "still_fenced")
+        self.assertEqual(
+            result["readback"]["reason"],
+            "auto-source-cleanup-owner-still-active",
+        )
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts.resources.inspect_resource(path_key),
+            path_lease_before,
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
+    def test_auto_source_cleanup_uncertainty_clears_dead_lease_fence_under_activity_guard(
+        self,
+    ) -> None:
+        target, fence, lifecycle, _retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=True)
+        )
+        effect_leases = [dict(item) for item in fence["evidence"]["effect_leases"]]
+        checkouts.resources.release_resources(
+            str(fence["lease_owner_id"]),
+            [str(item["resource_key"]) for item in effect_leases],
+            expected_leases=effect_leases,
+        )
+        activity = {"depth": 0}
+
+        @checkouts.contextmanager
+        def tracked_activity_guard(_fence):
+            activity["depth"] += 1
+            try:
+                yield True
+            finally:
+                activity["depth"] -= 1
+
+        real_clear = checkouts._clear_checkout_operation_uncertainty
+
+        def clear_while_guarded(*args, **kwargs):
+            self.assertGreater(activity["depth"], 0)
+            return real_clear(*args, **kwargs)
+
+        with (
+            patch.object(
+                checkouts,
+                "_auto_source_cleanup_activity_guard",
+                tracked_activity_guard,
+            ),
+            patch.object(
+                checkouts,
+                "_clear_checkout_operation_uncertainty",
+                side_effect=clear_while_guarded,
+            ),
+        ):
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_success")
+        self.assertEqual(activity["depth"], 0)
+        self.assertFalse(target.exists())
+        self.assertIsNone(checkouts.resources.inspect_resource(path_key))
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
     def test_auto_source_cleanup_uncertainty_reconciles_success_under_live_leases(self) -> None:
         target, fence, lifecycle, _retention, path_key = (
             self._auto_source_cleanup_uncertainty_fixture(remove_source=True)

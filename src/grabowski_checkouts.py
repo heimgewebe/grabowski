@@ -3995,33 +3995,29 @@ def _reconcile_auto_source_cleanup_uncertainty(
     *,
     effect_leases_live: bool,
 ) -> dict[str, Any]:
-    if effect_leases_live:
-        try:
-            with _auto_source_cleanup_activity_guard(fence) as inactive:
-                if not inactive:
-                    return {
-                        "state": "still_fenced",
-                        "reason": "auto-source-cleanup-owner-still-active",
-                    }
+    try:
+        with _auto_source_cleanup_activity_guard(fence) as inactive:
+            if not inactive:
+                return {
+                    "state": "still_fenced",
+                    "reason": "auto-source-cleanup-owner-still-active",
+                }
+            if effect_leases_live:
                 lease_state = _auto_source_cleanup_effect_leases_readback(fence)
                 if lease_state["state"] != "expected":
                     return lease_state
-                return _reconcile_auto_source_cleanup_uncertainty_guarded(
-                    fence,
-                    effect_leases_live=True,
-                )
-        except (OSError, PermissionError, RuntimeError) as exc:
-            return {
-                "state": "still_fenced",
-                "reason": (
-                    "auto-source-cleanup-activity-readback-failed:"
-                    f"{type(exc).__name__}"
-                ),
-            }
-    return _reconcile_auto_source_cleanup_uncertainty_guarded(
-        fence,
-        effect_leases_live=False,
-    )
+            return _reconcile_auto_source_cleanup_uncertainty_guarded(
+                fence,
+                effect_leases_live=effect_leases_live,
+            )
+    except (OSError, PermissionError, RuntimeError) as exc:
+        return {
+            "state": "still_fenced",
+            "reason": (
+                "auto-source-cleanup-activity-readback-failed:"
+                f"{type(exc).__name__}"
+            ),
+        }
 
 
 def _reconcile_auto_source_cleanup_uncertainty_guarded(
@@ -4277,6 +4273,53 @@ def grabowski_checkout_uncertainty_status(fence_id: str = "") -> dict[str, Any]:
     return {"fences": fences[:256], "count": len(fences), "truncated": len(fences) > 256}
 
 
+def _finalize_checkout_uncertainty_reconcile(
+    fence: dict[str, Any],
+    readback: dict[str, Any],
+    outcome: str,
+) -> dict[str, Any]:
+    lease_preparation = _prepare_uncertainty_fence_release(fence)
+    audit = {
+        "timestamp_unix": _now(),
+        "operation": "checkout-operation-uncertainty-reconcile",
+        "fence_id": fence["fence_id"],
+        "checkout_key": fence["checkout_key"],
+        "owner_id": fence["owner_id"],
+        "effect_operation": fence["operation"],
+        "effect_operation_id": fence["operation_id"],
+        "outcome": outcome,
+        "readback": readback,
+        "lease_preparation": lease_preparation,
+    }
+    if lease_preparation["state"] != "ready":
+        if outcome == "reconciled_success":
+            base._append_audit(audit)
+        return {
+            "state": "still_fenced",
+            "reason": lease_preparation["reason"],
+            "fence": fence,
+            "readback": readback,
+            "lease_preparation": lease_preparation,
+            **({"audit": audit} if outcome == "reconciled_success" else {}),
+        }
+    base._append_audit(audit)
+    lease_release = _release_uncertainty_fence_resources(fence)
+    cleared = _clear_checkout_operation_uncertainty(
+        fence["fence_id"],
+        outcome=outcome,
+        evidence={"readback": readback, "audit_timestamp_unix": audit["timestamp_unix"]},
+    )
+    return {
+        "state": "reconciled",
+        "outcome": outcome,
+        "fence": cleared,
+        "lease_release": lease_release,
+        "lease_preparation": lease_preparation,
+        "readback": readback,
+        "audit": audit,
+    }
+
+
 @mcp.tool(name="grabowski_checkout_uncertainty_reconcile", annotations=MUTATING)
 def grabowski_checkout_uncertainty_reconcile(
     fence_id: str,
@@ -4434,46 +4477,36 @@ def grabowski_checkout_uncertainty_reconcile(
         return {"state": "still_fenced", "fence": fence, "readback": readback}
     if outcome not in {"confirmed_success", "confirmed_no_effect", "reconciled_success"}:
         raise RuntimeError("Checkout uncertainty readback returned an invalid state")
-    lease_preparation = _prepare_uncertainty_fence_release(fence)
-    audit = {
-        "timestamp_unix": _now(),
-        "operation": "checkout-operation-uncertainty-reconcile",
-        "fence_id": fence["fence_id"],
-        "checkout_key": fence["checkout_key"],
-        "owner_id": fence["owner_id"],
-        "effect_operation": fence["operation"],
-        "effect_operation_id": fence["operation_id"],
-        "outcome": outcome,
-        "readback": readback,
-        "lease_preparation": lease_preparation,
-    }
-    if lease_preparation["state"] != "ready":
-        if outcome == "reconciled_success":
-            base._append_audit(audit)
-        return {
-            "state": "still_fenced",
-            "reason": lease_preparation["reason"],
-            "fence": fence,
-            "readback": readback,
-            "lease_preparation": lease_preparation,
-            **({"audit": audit} if outcome == "reconciled_success" else {}),
-        }
-    base._append_audit(audit)
-    lease_release = _release_uncertainty_fence_resources(fence)
-    cleared = _clear_checkout_operation_uncertainty(
-        fence["fence_id"],
-        outcome=outcome,
-        evidence={"readback": readback, "audit_timestamp_unix": audit["timestamp_unix"]},
+    if fence["operation"] == "auto-source-cleanup":
+        try:
+            with _auto_source_cleanup_activity_guard(fence) as inactive:
+                if not inactive:
+                    return {
+                        "state": "still_fenced",
+                        "reason": "auto-source-cleanup-owner-became-active-before-fence-clear",
+                        "fence": fence,
+                        "readback": readback,
+                    }
+                return _finalize_checkout_uncertainty_reconcile(
+                    fence,
+                    readback,
+                    outcome,
+                )
+        except (OSError, PermissionError, RuntimeError) as exc:
+            return {
+                "state": "still_fenced",
+                "reason": (
+                    "auto-source-cleanup-finalization-activity-readback-failed:"
+                    f"{type(exc).__name__}"
+                ),
+                "fence": fence,
+                "readback": readback,
+            }
+    return _finalize_checkout_uncertainty_reconcile(
+        fence,
+        readback,
+        outcome,
     )
-    return {
-        "state": "reconciled",
-        "outcome": outcome,
-        "fence": cleared,
-        "lease_release": lease_release,
-        "lease_preparation": lease_preparation,
-        "readback": readback,
-        "audit": audit,
-    }
 
 
 def _require_retention_owner(checkout_key: str, owner_id: str) -> None:

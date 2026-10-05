@@ -775,6 +775,9 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
             ],
         ), patch.object(
             SELF_DEPLOY,
+            "_require_target_deploy_runner",
+        ) as target_runner, patch.object(
+            SELF_DEPLOY,
             "_append_deploy_audit",
             side_effect=OSError("audit unavailable after CAS"),
         ):
@@ -782,6 +785,7 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
                 SELF_DEPLOY.DeployScheduleFailureAfterLocalMutation
             ) as raised:
                 SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
+        target_runner.assert_called_once_with(canonical, expected)
         release.assert_called_once()
         evidence = raised.exception.local_mutation_evidence
         self.assertEqual(

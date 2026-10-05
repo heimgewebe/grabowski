@@ -1555,13 +1555,14 @@ def _bootstrap_deploy_index(
     return _write_deploy_index(jobs_root, units=units, pending_unit=None)
 
 
-def _deploy_index(
+def _deploy_index_with_pending_promotion_evidence(
     jobs_root: Path,
     _repository: Path | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     index = _read_deploy_index(jobs_root)
     if index is None:
         index = _bootstrap_deploy_index(jobs_root)
+    promotion: dict[str, Any] | None = None
     pending = index["pending_unit"]
     if pending is not None:
         pending_entry = jobs_root / pending
@@ -1572,12 +1573,38 @@ def _deploy_index(
                 raise RuntimeError("pending runtime deploy job path is not a directory")
             units = sorted(set(index["units"]) | {pending})
             index = _write_deploy_index(jobs_root, units=units, pending_unit=None)
+            material = {
+                "schema_version": 1,
+                "kind": "grabowski_runtime_deploy_pending_unit_promotion",
+                "unit": pending,
+                "deploy_index_updated": True,
+                "index_updated_at_unix": index["updated_at_unix"],
+            }
+            promotion = {
+                **material,
+                "evidence_sha256": _source_identity_sha256(material),
+            }
+    return index, promotion
+
+
+def _deploy_index(
+    jobs_root: Path,
+    _repository: Path | None = None,
+) -> dict[str, Any]:
+    index, _promotion = _deploy_index_with_pending_promotion_evidence(
+        jobs_root,
+        _repository,
+    )
     return index
 
 
 def _reconcile_stale_pending_reservation(
     jobs_root: Path,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
     """Clear one pre-dispatch reservation only when no unit could have started.
 
     Callers must already hold the deploy schedule lock. Lock-free readers keep
@@ -1586,22 +1613,23 @@ def _reconcile_stale_pending_reservation(
     missing directory plus an authoritative not_started unit readback is the
     narrow proof that this reservation never crossed the dispatch boundary.
 
-    The second return value is present only after both the index update and its
-    audit append succeeded, so later refusal receipts can expose that exact
-    local reconciliation effect without weakening no-job-registration proof.
+    The second return value is present only after both the stale-reservation
+    index clear and its audit append succeeded. The third return value reports
+    an earlier pending-unit promotion performed while reading the index, so
+    callers do not lose evidence of that local mutation when later work fails.
     """
-    index = _deploy_index(jobs_root)
+    index, index_mutation = _deploy_index_with_pending_promotion_evidence(jobs_root)
     pending = index["pending_unit"]
     if pending is None:
-        return index, None
+        return index, None, index_mutation
     entry = jobs_root / pending
     if entry.is_symlink():
         raise RuntimeError("pending runtime deploy job path is a symlink")
     if entry.exists():
-        return index, None
+        return index, None, index_mutation
     readback = operator._unit_dispatch_readback(pending)
     if not isinstance(readback, dict) or readback.get("outcome") != "not_started":
-        return index, None
+        return index, None, index_mutation
     reconciled = _write_deploy_index(
         jobs_root,
         units=list(index["units"]),
@@ -1639,7 +1667,7 @@ def _reconcile_stale_pending_reservation(
         **effect_material,
         "evidence_sha256": _source_identity_sha256(effect_material),
     }
-    return reconciled, effect
+    return reconciled, effect, index_mutation
 
 
 def _validated_deploy_job_receipt(entry: Path, metadata: dict[str, Any]) -> dict[str, str]:
@@ -1727,6 +1755,7 @@ def _tracked_runtime_deploy_local_mutation_evidence(
 ) -> dict[str, Any] | None:
     effects: list[dict[str, Any]] = []
     for key in (
+        "deploy_index_mutation",
         "stale_pending_reconciliation",
         "origin_main_refresh",
         "rootbroker_authority",
@@ -2394,6 +2423,7 @@ def inflight_runtime_job_evidence(
         "idempotent_match": None,
         "ambiguous_identical_units": [],
         "pruned_units": [],
+        "deploy_index_mutation": None,
         "stale_pending_reconciliation": None,
         "error": None,
     }
@@ -2401,7 +2431,10 @@ def inflight_runtime_job_evidence(
     try:
         jobs_root = operator._jobs_root()
         if reconcile_stale_pending:
-            index, reconciliation = _reconcile_stale_pending_reservation(jobs_root)
+            index, reconciliation, index_mutation = _reconcile_stale_pending_reservation(
+                jobs_root
+            )
+            evidence["deploy_index_mutation"] = index_mutation
             evidence["stale_pending_reconciliation"] = reconciliation
         else:
             index = _deploy_index(jobs_root)
@@ -3146,6 +3179,7 @@ def _refresh_canonical_origin_main(
                 "public GitHub main drifted after exact object fetch: "
                 f"expected {expected_head}, found {public_after_fetch}"
             )
+        _require_target_deploy_runner(canonical, expected_head)
         update_result = _mutating_git_result(
             canonical,
             "update-ref",
@@ -3766,6 +3800,60 @@ def _reserve_auto_deploy_source_lifecycle(
     )
 
 
+def _read_auto_deploy_source_lifecycle_after_reservation_error(
+    plan: dict[str, Any],
+    expected_head: str,
+    uncertainty_fence: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    import grabowski_checkouts as checkouts
+
+    if not isinstance(uncertainty_fence, dict):
+        raise RuntimeError(
+            "automatic deployment source lifecycle reservation outcome lacks a recovery fence"
+        )
+    checkout_key = uncertainty_fence.get("checkout_key")
+    if (
+        not isinstance(checkout_key, str)
+        or re.fullmatch(r"[0-9a-f]{64}", checkout_key) is None
+    ):
+        raise RuntimeError(
+            "automatic deployment source lifecycle reservation recovery key is malformed"
+        )
+    lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
+    if lifecycle is None:
+        return None
+    expected_contract = {
+        "checkout_key": checkout_key,
+        "repo_path": str(plan["canonical_repository"]),
+        "checkout_path": str(plan["target"]),
+        "owner_id": plan["owner_id"],
+        "purpose": f"detached runtime deploy source {expected_head[:12]}",
+        "source_kind": "operator_obligation",
+        "source_id": plan["obligation_id"],
+        "artifact_class": "deployment-source-worktree",
+        "phase": "active",
+        "expected_head": expected_head,
+        "expected_branch": None,
+    }
+    mismatches = [
+        field
+        for field, expected_value in expected_contract.items()
+        if lifecycle.get(field) != expected_value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "automatic deployment source lifecycle reservation readback conflicts: "
+            + ",".join(sorted(mismatches))
+        )
+    for field in ("created_at_unix", "updated_at_unix"):
+        value = lifecycle.get(field)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise RuntimeError(
+                "automatic deployment source lifecycle reservation readback is incomplete"
+            )
+    return lifecycle
+
+
 def _bind_auto_deploy_source_retention(
     plan: dict[str, Any],
     lifecycle: dict[str, Any],
@@ -4034,7 +4122,19 @@ def _materialize_auto_deploy_source(
                 "fresh automatic deployment source obligation is not open"
             )
         obligation_opened = True
-        lifecycle = _reserve_auto_deploy_source_lifecycle(plan, expected_head)
+        try:
+            lifecycle = _reserve_auto_deploy_source_lifecycle(plan, expected_head)
+        except Exception as reservation_error:
+            try:
+                lifecycle = _read_auto_deploy_source_lifecycle_after_reservation_error(
+                    plan,
+                    expected_head,
+                    uncertainty_fence,
+                )
+            except Exception:
+                preserve_uncertainty_fence = True
+                raise reservation_error
+            raise
         locked_snapshot = _canonical_stale_main_snapshot(expected_head)
         if (
             locked_snapshot is None
@@ -5233,6 +5333,19 @@ def _grabowski_runtime_deploy_schedule_impl(
         inflight_before_resolution = inflight_runtime_job_evidence(
             reconcile_stale_pending=True
         )
+        deploy_index_mutation = inflight_before_resolution.get(
+            "deploy_index_mutation"
+        )
+        if deploy_index_mutation is not None and not isinstance(
+            deploy_index_mutation, dict
+        ):
+            raise RuntimeError(
+                "deployment source preflight returned malformed deploy-index mutation evidence"
+            )
+        if deploy_index_mutation is not None:
+            local_mutation_tracker["deploy_index_mutation"] = dict(
+                deploy_index_mutation
+            )
         local_mutation_evidence = inflight_before_resolution.get(
             "stale_pending_reconciliation"
         )
