@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import selectors
 import subprocess
 import time
 from typing import Any, Callable, Mapping
@@ -15,12 +16,18 @@ DEFAULT_MAX_ATTEMPTS = 8
 DEFAULT_BUSY_SLEEP_SECONDS = 15.0
 DEFAULT_PUBLISH_TIMEOUT_SECONDS = 900
 MAX_PUBLISH_OUTPUT_BYTES = 2 * 1024 * 1024
+MAX_GITHUB_OUTPUT_BYTES = 128 * 1024
+DEFAULT_QUEUE_POLL_SECONDS = 15.0
+DEFAULT_QUEUE_MAX_ATTEMPTS = 1_320
+QUEUE_OBSERVATION_LIMIT = 20
 
 PublisherRunner = Callable[[list[str], int], dict[str, Any]]
 FreshnessReader = Callable[[str], dict[str, Any]]
 SleepFn = Callable[[float], None]
 AncestryChecker = Callable[[str, str, str], bool]
 JobStarter = Callable[..., dict[str, Any]]
+QueueReader = Callable[[str, int], dict[str, Any]]
+QueueConverger = Callable[[str, str], dict[str, Any]]
 
 
 def resolve_job_starter(modules: Mapping[str, Any]) -> JobStarter | None:
@@ -38,7 +45,7 @@ def resolve_job_starter(modules: Mapping[str, Any]) -> JobStarter | None:
 
 
 FOLLOWUP_KIND = "grabowski.repoground_post_merge_followup"
-DEFAULT_JOB_RUNTIME_SECONDS = 9_000
+DEFAULT_JOB_RUNTIME_SECONDS = 21_600
 
 
 class RepoGroundPostMergeError(RuntimeError):
@@ -71,26 +78,87 @@ def _publisher_command(publisher: Path, repository: str) -> list[str]:
     ]
 
 
-def _run_publisher(argv: list[str], timeout_seconds: int) -> dict[str, Any]:
-    completed = subprocess.run(
+def _run_bounded_process(
+    argv: list[str],
+    timeout_seconds: int,
+    *,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    if type(timeout_seconds) is not int or timeout_seconds < 1:
+        raise RepoGroundPostMergeError("subprocess timeout must be a positive integer")
+    if type(max_output_bytes) is not int or max_output_bytes < 1:
+        raise RepoGroundPostMergeError("subprocess output limit must be positive")
+
+    process = subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-        timeout=timeout_seconds,
     )
-    stdout = completed.stdout
-    stderr = completed.stderr
-    if len(stdout.encode("utf-8")) > MAX_PUBLISH_OUTPUT_BYTES:
-        raise RepoGroundPostMergeError(
-            "RepoGround publisher stdout exceeds bounded output"
-        )
-    if len(stderr.encode("utf-8")) > MAX_PUBLISH_OUTPUT_BYTES:
-        raise RepoGroundPostMergeError(
-            "RepoGround publisher stderr exceeds bounded output"
-        )
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        process.wait()
+        raise RepoGroundPostMergeError("subprocess pipes are unavailable")
+
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                raise subprocess.TimeoutExpired(argv, timeout_seconds)
+
+            ready = selector.select(timeout=min(0.25, remaining))
+            if not ready:
+                continue
+
+            for key, _events in ready:
+                chunk = key.fileobj.read1(64 * 1024)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                stream_name = str(key.data)
+                buffer = buffers[stream_name]
+                capacity = max_output_bytes + 1 - len(buffer)
+                if capacity > 0:
+                    buffer.extend(chunk[:capacity])
+                if len(buffer) > max_output_bytes or len(chunk) > capacity:
+                    process.kill()
+                    process.wait()
+                    raise RepoGroundPostMergeError(
+                        f"subprocess {stream_name} exceeds bounded output"
+                    )
+        returncode = process.wait()
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+
+    try:
+        stdout = bytes(buffers["stdout"]).decode("utf-8", errors="strict")
+        stderr = bytes(buffers["stderr"]).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise RepoGroundPostMergeError("subprocess output is not valid UTF-8") from exc
+    return {
+        "returncode": returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+    }
+
+
+def _run_publisher(argv: list[str], timeout_seconds: int) -> dict[str, Any]:
+    completed = _run_bounded_process(
+        argv,
+        timeout_seconds,
+        max_output_bytes=MAX_PUBLISH_OUTPUT_BYTES,
+    )
+    stdout = str(completed["stdout"])
+    stderr = str(completed["stderr"])
     payload: Any = None
     if stdout.strip():
         try:
@@ -100,7 +168,7 @@ def _run_publisher(argv: list[str], timeout_seconds: int) -> dict[str, Any]:
                 "RepoGround publisher returned malformed JSON"
             ) from exc
     return {
-        "returncode": completed.returncode,
+        "returncode": completed["returncode"],
         "payload": payload,
         "stderr": stderr[-4000:],
     }
@@ -298,6 +366,236 @@ def converge(
     }
 
 
+def _validate_pull_request(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise RepoGroundPostMergeError("pull request number must be a positive integer")
+    return value
+
+
+def _validate_base_ref(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 255
+        or "\x00" in value
+    ):
+        raise RepoGroundPostMergeError("expected base ref is invalid")
+    return value
+
+
+def _read_queue_pr(repository: str, pull_request: int) -> dict[str, Any]:
+    completed = _run_bounded_process(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(pull_request),
+            "--repo",
+            repository,
+            "--json",
+            "number,state,headRefOid,baseRefName,mergeCommit",
+        ],
+        60,
+        max_output_bytes=MAX_GITHUB_OUTPUT_BYTES,
+    )
+    if completed["returncode"] != 0:
+        raise RepoGroundPostMergeError(
+            "GitHub PR read failed: " + str(completed["stderr"])[-1000:]
+        )
+    try:
+        payload = json.loads(str(completed["stdout"]))
+    except json.JSONDecodeError as exc:
+        raise RepoGroundPostMergeError("GitHub PR read returned malformed JSON") from exc
+    if not isinstance(payload, dict):
+        raise RepoGroundPostMergeError("GitHub PR read returned a non-object")
+    return payload
+
+
+def _queue_converge(repository: str, merge_sha: str) -> dict[str, Any]:
+    return converge(repository=repository, merge_sha=merge_sha)
+
+
+def watch_merge_queue(
+    *,
+    repository: str,
+    pull_request: int,
+    expected_head: str,
+    expected_base: str,
+    max_attempts: int = DEFAULT_QUEUE_MAX_ATTEMPTS,
+    poll_seconds: float = DEFAULT_QUEUE_POLL_SECONDS,
+    queue_reader: QueueReader = _read_queue_pr,
+    queue_converger: QueueConverger = _queue_converge,
+    sleep_fn: SleepFn = time.sleep,
+) -> dict[str, Any]:
+    repository = _validate_repository(repository)
+    pull_request = _validate_pull_request(pull_request)
+    expected_head = _validate_sha(expected_head)
+    expected_base = _validate_base_ref(expected_base)
+    if type(max_attempts) is not int or max_attempts < 1 or max_attempts > 2_000:
+        raise RepoGroundPostMergeError("queue max_attempts must be between 1 and 2000")
+    if poll_seconds < 0 or poll_seconds > 300:
+        raise RepoGroundPostMergeError("queue poll_seconds is out of bounds")
+
+    observations: list[dict[str, Any]] = []
+    for attempt in range(1, max_attempts + 1):
+        try:
+            viewed = queue_reader(repository, pull_request)
+        except (
+            OSError,
+            RepoGroundPostMergeError,
+            subprocess.SubprocessError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            observations.append(
+                {
+                    "attempt": attempt,
+                    "status": "read_error",
+                    "error_class": type(exc).__name__,
+                }
+            )
+            observations[:] = observations[-QUEUE_OBSERVATION_LIMIT:]
+            if attempt == max_attempts:
+                return {
+                    "kind": "grabowski.repoground_merge_queue_followup",
+                    "schema_version": 1,
+                    "status": "failed",
+                    "reason": "merge_queue_read_exhausted",
+                    "repository": repository,
+                    "pull_request": pull_request,
+                    "attempt_count": attempt,
+                    "observations": observations,
+                }
+            sleep_fn(poll_seconds)
+            continue
+
+        if not isinstance(viewed, dict):
+            raise RepoGroundPostMergeError("queue reader returned a non-object")
+        state = viewed.get("state")
+        observed_head = viewed.get("headRefOid")
+        observed_head = (
+            observed_head.lower()
+            if isinstance(observed_head, str)
+            and SHA40_RE.fullmatch(observed_head.lower()) is not None
+            else None
+        )
+        observed_base = viewed.get("baseRefName")
+        observed_number = viewed.get("number")
+        observation = {
+            "attempt": attempt,
+            "state": state,
+            "head": observed_head,
+            "base": observed_base,
+        }
+        observations.append(observation)
+        observations[:] = observations[-QUEUE_OBSERVATION_LIMIT:]
+
+        if (
+            observed_number != pull_request
+            or observed_head != expected_head
+            or observed_base != expected_base
+        ):
+            return {
+                "kind": "grabowski.repoground_merge_queue_followup",
+                "schema_version": 1,
+                "status": "failed",
+                "reason": "merge_queue_identity_mismatch",
+                "repository": repository,
+                "pull_request": pull_request,
+                "attempt_count": attempt,
+                "observations": observations,
+            }
+
+        if state == "MERGED":
+            merge_commit = viewed.get("mergeCommit")
+            merge_sha = (
+                merge_commit.get("oid")
+                if isinstance(merge_commit, dict)
+                else None
+            )
+            if (
+                not isinstance(merge_sha, str)
+                or SHA40_RE.fullmatch(merge_sha.lower()) is None
+            ):
+                return {
+                    "kind": "grabowski.repoground_merge_queue_followup",
+                    "schema_version": 1,
+                    "status": "failed",
+                    "reason": "merge_queue_merge_sha_unavailable",
+                    "repository": repository,
+                    "pull_request": pull_request,
+                    "attempt_count": attempt,
+                    "observations": observations,
+                }
+            merge_sha = merge_sha.lower()
+            convergence = queue_converger(repository, merge_sha)
+            if not isinstance(convergence, dict):
+                raise RepoGroundPostMergeError(
+                    "queue convergence returned a non-object"
+                )
+            if convergence.get("status") != "fresh_exact":
+                return {
+                    "kind": "grabowski.repoground_merge_queue_followup",
+                    "schema_version": 1,
+                    "status": "failed",
+                    "reason": "freshness_after_queue_merge_failed",
+                    "repository": repository,
+                    "pull_request": pull_request,
+                    "merge_sha": merge_sha,
+                    "attempt_count": attempt,
+                    "observations": observations,
+                    "convergence": convergence,
+                }
+            return {
+                "kind": "grabowski.repoground_merge_queue_followup",
+                "schema_version": 1,
+                "status": "fresh_exact",
+                "reason": "merge_queue_completed_and_freshness_converged",
+                "repository": repository,
+                "pull_request": pull_request,
+                "merge_sha": merge_sha,
+                "attempt_count": attempt,
+                "observations": observations,
+                "convergence": convergence,
+            }
+
+        if state == "CLOSED":
+            return {
+                "kind": "grabowski.repoground_merge_queue_followup",
+                "schema_version": 1,
+                "status": "failed",
+                "reason": "merge_queue_closed_without_merge",
+                "repository": repository,
+                "pull_request": pull_request,
+                "attempt_count": attempt,
+                "observations": observations,
+            }
+        if state != "OPEN":
+            return {
+                "kind": "grabowski.repoground_merge_queue_followup",
+                "schema_version": 1,
+                "status": "failed",
+                "reason": "merge_queue_pr_state_unexpected",
+                "repository": repository,
+                "pull_request": pull_request,
+                "attempt_count": attempt,
+                "observations": observations,
+            }
+        if attempt < max_attempts:
+            sleep_fn(poll_seconds)
+
+    return {
+        "kind": "grabowski.repoground_merge_queue_followup",
+        "schema_version": 1,
+        "status": "failed",
+        "reason": "merge_queue_wait_exhausted",
+        "repository": repository,
+        "pull_request": pull_request,
+        "attempt_count": max_attempts,
+        "observations": observations,
+    }
+
+
 def _captain_pr_merge_execution(result: dict[str, Any]) -> dict[str, Any] | None:
     output = result.get("output")
     executions = output.get("executions") if isinstance(output, dict) else None
@@ -355,6 +653,18 @@ def _followup_base(
     return result
 
 
+def _validated_runtime_request(
+    *, python_executable: str, script_path: Path
+) -> tuple[str, Path]:
+    executable = str(python_executable)
+    if not executable or "\x00" in executable:
+        raise RepoGroundPostMergeError("python executable is invalid")
+    script = Path(script_path).expanduser().resolve(strict=True)
+    if not script.is_file():
+        raise RepoGroundPostMergeError("RepoGround post-merge script is unavailable")
+    return executable, script
+
+
 def captain_followup_request(
     result: dict[str, Any],
     *,
@@ -382,20 +692,52 @@ def captain_followup_request(
             repository=repository,
         )
 
+    executable, script = _validated_runtime_request(
+        python_executable=python_executable,
+        script_path=script_path,
+    )
+
     if execution.get("merge_completion_verified") is not True:
-        return _followup_base(
-            status=(
-                "pending_merge_queue"
-                if execution.get("merge_queued") is True
-                else "not_scheduled"
+        if execution.get("merge_queued") is not True:
+            return _followup_base(
+                status="not_scheduled",
+                reason="merge_completion_not_verified",
+                repository=repository,
+            )
+        try:
+            pull_request = _validate_pull_request(execution.get("pr"))
+            expected_head = _validate_sha(execution.get("expected_head"))
+            expected_base = _validate_base_ref(execution.get("expected_base"))
+        except RepoGroundPostMergeError:
+            return _followup_base(
+                status="not_scheduled",
+                reason="merge_queue_identity_invalid",
+                repository=repository,
+            )
+        return {
+            **_followup_base(
+                status="ready_queue_watch",
+                reason="verified_merge_queue_ready_for_watch",
+                repository=repository,
             ),
-            reason=(
-                "merge_queued_not_completed"
-                if execution.get("merge_queued") is True
-                else "merge_completion_not_verified"
-            ),
-            repository=repository,
-        )
+            "pull_request": pull_request,
+            "expected_head": expected_head,
+            "expected_base": expected_base,
+            "argv": [
+                executable,
+                "-B",
+                str(script),
+                "--repo",
+                repository,
+                "--pr",
+                str(pull_request),
+                "--expected-head",
+                expected_head,
+                "--expected-base",
+                expected_base,
+            ],
+            "cwd": str(script.parent),
+        }
 
     merge_sha = _verified_merge_sha(execution)
     if merge_sha is None:
@@ -404,13 +746,6 @@ def captain_followup_request(
             reason="verified_merge_sha_unavailable",
             repository=repository,
         )
-
-    executable = str(python_executable)
-    if not executable or "\x00" in executable:
-        raise RepoGroundPostMergeError("python executable is invalid")
-    script = Path(script_path).expanduser().resolve(strict=True)
-    if not script.is_file():
-        raise RepoGroundPostMergeError("RepoGround post-merge script is unavailable")
 
     return {
         **_followup_base(
@@ -432,6 +767,17 @@ def captain_followup_request(
     }
 
 
+def _schedule_request_identity(request: dict[str, Any]) -> dict[str, Any]:
+    identity: dict[str, Any] = {"repository": str(request["repository"])}
+    merge_sha = request.get("merge_sha")
+    if isinstance(merge_sha, str):
+        identity["merge_sha"] = merge_sha
+    pull_request = request.get("pull_request")
+    if isinstance(pull_request, int):
+        identity["pull_request"] = pull_request
+    return identity
+
+
 def schedule_from_captain_result(
     result: dict[str, Any],
     *,
@@ -445,7 +791,8 @@ def schedule_from_captain_result(
         python_executable=python_executable,
         script_path=script_path,
     )
-    if request.get("status") != "ready":
+    request_status = request.get("status")
+    if request_status not in {"ready", "ready_queue_watch"}:
         return request
     if (
         type(runtime_seconds) is not int
@@ -454,6 +801,7 @@ def schedule_from_captain_result(
     ):
         raise RepoGroundPostMergeError("job runtime is out of bounds")
 
+    identity = _schedule_request_identity(request)
     try:
         job = job_starter(
             list(request["argv"]),
@@ -464,12 +812,19 @@ def schedule_from_captain_result(
         unit = getattr(exc, "unit", None)
         return {
             **_followup_base(
-                status="schedule_unknown"
-                if isinstance(unit, str) and unit
-                else "schedule_error",
+                status=(
+                    "schedule_unknown"
+                    if isinstance(unit, str) and unit
+                    else "schedule_error"
+                ),
                 reason="durable_job_start_failed",
-                repository=str(request["repository"]),
-                merge_sha=str(request["merge_sha"]),
+                repository=identity["repository"],
+                merge_sha=identity.get("merge_sha"),
+            ),
+            **(
+                {"pull_request": identity["pull_request"]}
+                if "pull_request" in identity
+                else {}
             ),
             "error_class": type(exc).__name__,
             **({"unit": unit} if isinstance(unit, str) and unit else {}),
@@ -485,8 +840,13 @@ def schedule_from_captain_result(
             **_followup_base(
                 status="schedule_unknown",
                 reason="durable_job_start_result_invalid",
-                repository=str(request["repository"]),
-                merge_sha=str(request["merge_sha"]),
+                repository=identity["repository"],
+                merge_sha=identity.get("merge_sha"),
+            ),
+            **(
+                {"pull_request": identity["pull_request"]}
+                if "pull_request" in identity
+                else {}
             ),
             "does_not_establish": [
                 "job_not_started",
@@ -500,8 +860,13 @@ def schedule_from_captain_result(
             **_followup_base(
                 status="schedule_unknown",
                 reason="durable_job_identity_unavailable",
-                repository=str(request["repository"]),
-                merge_sha=str(request["merge_sha"]),
+                repository=identity["repository"],
+                merge_sha=identity.get("merge_sha"),
+            ),
+            **(
+                {"pull_request": identity["pull_request"]}
+                if "pull_request" in identity
+                else {}
             ),
             "does_not_establish": [
                 "job_not_started",
@@ -510,12 +875,22 @@ def schedule_from_captain_result(
             ],
         }
 
+    reason = (
+        "durable_merge_queue_watch_started"
+        if request_status == "ready_queue_watch"
+        else "durable_freshness_job_started"
+    )
     return {
         **_followup_base(
             status="scheduled",
-            reason="durable_freshness_job_started",
-            repository=str(request["repository"]),
-            merge_sha=str(request["merge_sha"]),
+            reason=reason,
+            repository=identity["repository"],
+            merge_sha=identity.get("merge_sha"),
+        ),
+        **(
+            {"pull_request": identity["pull_request"]}
+            if "pull_request" in identity
+            else {}
         ),
         "unit": unit,
         "job_id": job.get("job_id"),
@@ -528,13 +903,19 @@ def schedule_from_captain_result(
         ],
     }
 
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Converge one verified PR merge to an exact RepoGround fleet publication."
+        description=(
+            "Converge one verified PR merge to an exact RepoGround fleet publication, "
+            "or watch one verified merge-queue entry until it is merged."
+        )
     )
     parser.add_argument("--repo", required=True)
-    parser.add_argument("--merge-sha", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--merge-sha")
+    mode.add_argument("--pr", type=int)
+    parser.add_argument("--expected-head")
+    parser.add_argument("--expected-base")
     parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
     parser.add_argument(
         "--busy-sleep-seconds", type=float, default=DEFAULT_BUSY_SLEEP_SECONDS
@@ -544,19 +925,44 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_PUBLISH_TIMEOUT_SECONDS,
     )
+    parser.add_argument(
+        "--queue-max-attempts",
+        type=int,
+        default=DEFAULT_QUEUE_MAX_ATTEMPTS,
+    )
+    parser.add_argument(
+        "--queue-poll-seconds",
+        type=float,
+        default=DEFAULT_QUEUE_POLL_SECONDS,
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
     try:
-        result = converge(
-            repository=args.repo,
-            merge_sha=args.merge_sha,
-            max_attempts=args.max_attempts,
-            busy_sleep_seconds=args.busy_sleep_seconds,
-            publish_timeout_seconds=args.publish_timeout_seconds,
-        )
+        if args.pr is not None:
+            if args.expected_head is None or args.expected_base is None:
+                parser.error(
+                    "--pr requires --expected-head and --expected-base"
+                )
+            result = watch_merge_queue(
+                repository=args.repo,
+                pull_request=args.pr,
+                expected_head=args.expected_head,
+                expected_base=args.expected_base,
+                max_attempts=args.queue_max_attempts,
+                poll_seconds=args.queue_poll_seconds,
+            )
+        else:
+            result = converge(
+                repository=args.repo,
+                merge_sha=args.merge_sha,
+                max_attempts=args.max_attempts,
+                busy_sleep_seconds=args.busy_sleep_seconds,
+                publish_timeout_seconds=args.publish_timeout_seconds,
+            )
     except (
         OSError,
         RepoGroundPostMergeError,

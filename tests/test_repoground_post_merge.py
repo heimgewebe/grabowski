@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -13,6 +14,8 @@ import grabowski_repoground_post_merge as post_merge  # noqa: E402
 MERGE = "a" * 40
 HEAD = "b" * 40
 REPO = "heimgewebe/demo"
+PR = 96
+BASE = "main"
 
 
 def publisher_result(status: str = "ok", returncode: int = 0) -> dict[str, object]:
@@ -57,6 +60,9 @@ def captain_result(
     execution: dict[str, object] = {
         "action": "pr-merge",
         "repo": REPO,
+        "pr": PR,
+        "expected_head": HEAD,
+        "expected_base": BASE,
         "verification_passed": verified,
         "merge_completion_verified": completed,
         "merge_queued": queued,
@@ -192,6 +198,163 @@ class RepoGroundPostMergeConvergenceTests(unittest.TestCase):
         self.assertEqual(result["reason"], "freshness_not_converged")
 
 
+class RepoGroundPublisherBoundTests(unittest.TestCase):
+    def test_stdout_limit_is_enforced_while_publisher_runs(self) -> None:
+        code = (
+            "import sys,time;"
+            "sys.stdout.write('x'*4096);"
+            "sys.stdout.flush();"
+            "time.sleep(5)"
+        )
+        with patch.object(post_merge, "MAX_PUBLISH_OUTPUT_BYTES", 1024):
+            with self.assertRaisesRegex(
+                post_merge.RepoGroundPostMergeError,
+                "stdout exceeds bounded output",
+            ):
+                post_merge._run_publisher([sys.executable, "-c", code], 5)
+
+    def test_stderr_limit_is_enforced_while_publisher_runs(self) -> None:
+        code = (
+            "import sys,time;"
+            "sys.stderr.write('x'*4096);"
+            "sys.stderr.flush();"
+            "time.sleep(5)"
+        )
+        with patch.object(post_merge, "MAX_PUBLISH_OUTPUT_BYTES", 1024):
+            with self.assertRaisesRegex(
+                post_merge.RepoGroundPostMergeError,
+                "stderr exceeds bounded output",
+            ):
+                post_merge._run_publisher([sys.executable, "-c", code], 5)
+
+
+class RepoGroundMergeQueueWatchTests(unittest.TestCase):
+    @staticmethod
+    def _view(
+        state: str,
+        *,
+        head: str = HEAD,
+        base: str = BASE,
+        merge_sha: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "number": PR,
+            "state": state,
+            "headRefOid": head,
+            "baseRefName": base,
+            "mergeCommit": (
+                {"oid": merge_sha}
+                if merge_sha is not None
+                else None
+            ),
+        }
+
+    def test_waits_for_merge_then_runs_existing_convergence(self) -> None:
+        views = iter(
+            [
+                self._view("OPEN"),
+                self._view("MERGED", merge_sha=MERGE),
+            ]
+        )
+        sleeps: list[float] = []
+        converged: list[tuple[str, str]] = []
+
+        def converge_queue(repository: str, merge_sha: str) -> dict[str, object]:
+            converged.append((repository, merge_sha))
+            return {"status": "fresh_exact"}
+
+        result = post_merge.watch_merge_queue(
+            repository=REPO,
+            pull_request=PR,
+            expected_head=HEAD,
+            expected_base=BASE,
+            max_attempts=3,
+            poll_seconds=2,
+            queue_reader=lambda _repo, _pr: next(views),
+            queue_converger=converge_queue,
+            sleep_fn=sleeps.append,
+        )
+
+        self.assertEqual(result["status"], "fresh_exact")
+        self.assertEqual(result["reason"], "merge_queue_completed_and_freshness_converged")
+        self.assertEqual(result["merge_sha"], MERGE)
+        self.assertEqual(result["attempt_count"], 2)
+        self.assertEqual(converged, [(REPO, MERGE)])
+        self.assertEqual(sleeps, [2])
+
+    def test_transient_queue_read_error_is_retried(self) -> None:
+        calls = 0
+
+        def read_queue(_repo: str, _pr: int) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise post_merge.RepoGroundPostMergeError("temporary read failure")
+            return self._view("MERGED", merge_sha=MERGE)
+
+        result = post_merge.watch_merge_queue(
+            repository=REPO,
+            pull_request=PR,
+            expected_head=HEAD,
+            expected_base=BASE,
+            max_attempts=2,
+            poll_seconds=0,
+            queue_reader=read_queue,
+            queue_converger=lambda _repo, _sha: {"status": "fresh_exact"},
+            sleep_fn=lambda _seconds: None,
+        )
+
+        self.assertEqual(result["status"], "fresh_exact")
+        self.assertEqual(calls, 2)
+        self.assertEqual(result["attempt_count"], 2)
+
+    def test_identity_drift_fails_before_convergence(self) -> None:
+        converged = False
+
+        def converge_queue(_repository: str, _merge_sha: str) -> dict[str, object]:
+            nonlocal converged
+            converged = True
+            return {"status": "fresh_exact"}
+
+        result = post_merge.watch_merge_queue(
+            repository=REPO,
+            pull_request=PR,
+            expected_head=HEAD,
+            expected_base=BASE,
+            max_attempts=1,
+            poll_seconds=0,
+            queue_reader=lambda _repo, _pr: self._view(
+                "MERGED",
+                head="c" * 40,
+                merge_sha=MERGE,
+            ),
+            queue_converger=converge_queue,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "merge_queue_identity_mismatch")
+        self.assertFalse(converged)
+
+    def test_closed_without_merge_is_terminal_and_does_not_converge(self) -> None:
+        result = post_merge.watch_merge_queue(
+            repository=REPO,
+            pull_request=PR,
+            expected_head=HEAD,
+            expected_base=BASE,
+            max_attempts=1,
+            poll_seconds=0,
+            queue_reader=lambda _repo, _pr: self._view("CLOSED"),
+            queue_converger=lambda _repo, _sha: (_ for _ in ()).throw(
+                AssertionError("closed PR must not converge")
+            ),
+            sleep_fn=lambda _seconds: None,
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "merge_queue_closed_without_merge")
+
+
 class RepoGroundPostMergeJobStarterResolutionTests(unittest.TestCase):
     def test_resolves_normally_imported_operator_module(self) -> None:
         def starter(*_args: object, **_kwargs: object) -> dict[str, object]:
@@ -278,13 +441,23 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
         self.assertEqual(result["status"], "scheduled")
         self.assertEqual(result["merge_sha"], MERGE)
 
-    def test_queued_merge_does_not_schedule_before_completion(self) -> None:
-        started = False
+    def test_queued_merge_schedules_bound_durable_watcher(self) -> None:
+        calls: list[dict[str, object]] = []
 
-        def start_job(*_args: object, **_kwargs: object) -> dict[str, object]:
-            nonlocal started
-            started = True
-            return {"unit": "grabowski-job-should-not-start"}
+        def start_job(
+            argv: list[str], *, cwd: str, runtime_seconds: int
+        ) -> dict[str, object]:
+            calls.append(
+                {
+                    "argv": argv,
+                    "cwd": cwd,
+                    "runtime_seconds": runtime_seconds,
+                }
+            )
+            return {
+                "unit": "grabowski-job-queue123456",
+                "job_id": "queue123456",
+            }
 
         result = post_merge.schedule_from_captain_result(
             captain_result(completed=False, queued=True),
@@ -293,9 +466,22 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
             script_path=Path(post_merge.__file__),
         )
 
-        self.assertEqual(result["status"], "pending_merge_queue")
-        self.assertEqual(result["reason"], "merge_queued_not_completed")
-        self.assertFalse(started)
+        self.assertEqual(result["status"], "scheduled")
+        self.assertEqual(result["reason"], "durable_merge_queue_watch_started")
+        self.assertEqual(result["pull_request"], PR)
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]["argv"]
+        self.assertIn("--pr", argv)
+        self.assertIn(str(PR), argv)
+        self.assertIn("--expected-head", argv)
+        self.assertIn(HEAD, argv)
+        self.assertIn("--expected-base", argv)
+        self.assertIn(BASE, argv)
+        self.assertNotIn("--merge-sha", argv)
+        self.assertEqual(
+            calls[0]["runtime_seconds"],
+            post_merge.DEFAULT_JOB_RUNTIME_SECONDS,
+        )
 
     def test_unverified_merge_does_not_schedule(self) -> None:
         result = post_merge.schedule_from_captain_result(
