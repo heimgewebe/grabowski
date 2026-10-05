@@ -46,9 +46,8 @@ QueueReader = Callable[[str, int], dict[str, Any]]
 QueueConverger = Callable[[str, str], dict[str, Any]]
 
 
-POST_MERGE_REUSABLE_JOB_STATUSES = frozenset({"launch_submitted", "running"})
-POST_MERGE_UNCERTAIN_JOB_STATUSES = frozenset(
-    {"launch_prepared", "launch_outcome_unknown"}
+POST_MERGE_TERMINAL_JOB_STATUSES = frozenset(
+    {"succeeded", "failed", "launch_failed"}
 )
 POST_MERGE_JOB_SLOT_LIMIT = 16
 
@@ -59,11 +58,18 @@ def _post_merge_job_starter(
 ) -> JobStarter:
     argv_hash = getattr(operator_module, "_argv_hash", None)
     read_metadata = getattr(operator_module, "_read_job_metadata", None)
+    read_status = getattr(operator_module, "grabowski_job_status", None)
     require_mutation = getattr(operator_module, "_require_operator_mutation", None)
     private_starter = getattr(operator_module, "_start_job", None)
     if not all(
         callable(candidate)
-        for candidate in (argv_hash, read_metadata, require_mutation, private_starter)
+        for candidate in (
+            argv_hash,
+            read_metadata,
+            read_status,
+            require_mutation,
+            private_starter,
+        )
     ):
         return public_starter
 
@@ -94,17 +100,45 @@ def _post_merge_job_starter(
                 and metadata.get("runtime_seconds") == runtime_seconds
             )
 
-        def reuse(metadata: dict[str, Any]) -> dict[str, Any] | None:
-            final_status = metadata.get("final_status")
-            if final_status in POST_MERGE_REUSABLE_JOB_STATUSES:
-                return {**metadata, "reused": True}
-            if final_status in POST_MERGE_UNCERTAIN_JOB_STATUSES:
-                return {
-                    **metadata,
-                    "reused": True,
-                    "reuse_uncertain": True,
-                }
-            return None
+        def uncertain(
+            metadata: dict[str, Any],
+            *,
+            final_status: Any = None,
+            error_class: str | None = None,
+        ) -> dict[str, Any]:
+            result = {
+                **metadata,
+                "reused": True,
+                "reuse_uncertain": True,
+            }
+            if isinstance(final_status, str):
+                result["observed_final_status"] = final_status
+            if isinstance(error_class, str):
+                result["reuse_status_error_class"] = error_class
+            return result
+
+        def reuse(unit: str, metadata: dict[str, Any]) -> dict[str, Any] | None:
+            try:
+                status = read_status(unit)
+            except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+                return uncertain(metadata, error_class=type(exc).__name__)
+            if not isinstance(status, dict):
+                return uncertain(metadata, error_class="InvalidStatusResult")
+            if status.get("unit") != unit:
+                raise RuntimeError(
+                    "existing RepoGround post-merge job status identity mismatched"
+                )
+            observed_metadata = status.get("metadata")
+            if not isinstance(observed_metadata, dict) or not exact(observed_metadata):
+                raise RuntimeError(
+                    "existing RepoGround post-merge job status scope mismatched"
+                )
+            final_status = status.get("final_status")
+            if final_status == "running":
+                return {**observed_metadata, "reused": True}
+            if final_status in POST_MERGE_TERMINAL_JOB_STATUSES:
+                return None
+            return uncertain(observed_metadata, final_status=final_status)
 
         for attempt in range(POST_MERGE_JOB_SLOT_LIMIT):
             unit = f"grabowski-job-rgpm-{identity_sha256[:16]}-{attempt:02d}"
@@ -117,7 +151,7 @@ def _post_merge_job_starter(
                     raise RuntimeError(
                         "existing RepoGround post-merge job identity mismatched"
                     )
-                reusable = reuse(existing)
+                reusable = reuse(unit, existing)
                 if reusable is not None:
                     return reusable
                 continue
@@ -140,11 +174,16 @@ def _post_merge_job_starter(
                 except (OSError, PermissionError, ValueError):
                     readback = None
                 if isinstance(readback, dict) and exact(readback):
-                    reusable = reuse(readback)
+                    reusable = reuse(unit, readback)
                     if reusable is not None:
                         return reusable
                     if isinstance(exc, FileExistsError):
                         continue
+                    return uncertain(
+                        readback,
+                        final_status="terminal_after_ambiguous_start",
+                        error_class=type(exc).__name__,
+                    )
                 raise
 
             if (
@@ -160,7 +199,6 @@ def _post_merge_job_starter(
         raise RuntimeError("RepoGround post-merge reusable job slots exhausted")
 
     return start_reusable_job
-
 
 def resolve_job_starter(modules: Mapping[str, Any]) -> JobStarter | None:
     operator_module = modules.get("grabowski_operator")
@@ -695,16 +733,23 @@ def watch_merge_queue(
                 not isinstance(merge_sha, str)
                 or SHA40_RE.fullmatch(merge_sha.lower()) is None
             ):
-                return {
-                    "kind": "grabowski.repoground_merge_queue_followup",
-                    "schema_version": 1,
-                    "status": "failed",
-                    "reason": "merge_queue_merge_sha_unavailable",
-                    "repository": repository,
-                    "pull_request": pull_request,
-                    "attempt_count": attempt,
-                    "observations": observations,
-                }
+                observations[-1]["merge_sha_status"] = "unsettled"
+                if monotonic_fn() - started_at >= watch_seconds:
+                    return deadline_result(attempt)
+                if attempt == max_attempts:
+                    return {
+                        "kind": "grabowski.repoground_merge_queue_followup",
+                        "schema_version": 1,
+                        "status": "failed",
+                        "reason": "merge_queue_merge_sha_unavailable",
+                        "repository": repository,
+                        "pull_request": pull_request,
+                        "attempt_count": attempt,
+                        "observations": observations,
+                    }
+                remaining = watch_seconds - (monotonic_fn() - started_at)
+                sleep_fn(min(poll_seconds, max(0.0, remaining)))
+                continue
             merge_sha = merge_sha.lower()
             convergence = queue_converger(repository, merge_sha)
             if not isinstance(convergence, dict):

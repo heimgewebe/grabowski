@@ -9128,16 +9128,24 @@ def _repoground_freshness_from_status(
         comparison_head = checkout_head if checkout_rc == 0 else None
         comparison_ref = "HEAD"
         branch_head_observation: dict[str, Any] | None = None
-        if source_kind == "publication_source_checkout":
+        freshness_ref = source_ref
+        if source_kind == "conventional_checkout":
+            publication_ref = status.get("publication_ref")
+            freshness_ref = (
+                publication_ref
+                if isinstance(publication_ref, str) and publication_ref.strip()
+                else "main"
+            )
+        if source_kind in {"publication_source_checkout", "conventional_checkout"}:
             branch_head_observation = _repoground_remote_branch_observation(
-                repo_path, source_ref
+                repo_path, freshness_ref
             )
             comparison_head = (
                 branch_head_observation.get("head")
                 if branch_head_observation.get("status") == "observed"
                 else None
             )
-            comparison_ref = f"origin/{source_ref}" if source_ref else None
+            comparison_ref = f"origin/{freshness_ref}" if freshness_ref else None
         live.update(
             {
                 "head_returncode": checkout_rc,
@@ -9164,7 +9172,7 @@ def _repoground_freshness_from_status(
             freshness_status = "dirty_overlay"
             reason = "dirty_source_or_publication_overlay"
         elif (
-            source_kind == "publication_source_checkout"
+            source_kind in {"publication_source_checkout", "conventional_checkout"}
             and (
                 branch_head_observation is None
                 or branch_head_observation.get("status") != "observed"

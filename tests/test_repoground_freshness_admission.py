@@ -70,6 +70,50 @@ def _freshness(
     }
 
 
+def test_conventional_checkout_freshness_requires_fresh_remote_main() -> None:
+    status = {"stem": "demo-stem", "repo": "heimgewebe/demo", "git_commit": TARGET, "git_dirty": False}
+    git_results = {
+        ("rev-parse", "HEAD"): (0, TARGET, ""),
+        ("status", "--porcelain"): (0, "", ""),
+        ("ls-remote", "--exit-code", "--refs", "--", "origin", "refs/heads/main"): (0, f"{TARGET}\trefs/heads/main\n", ""),
+    }
+    def fake_git(_repo_path: Path, args: list[str]) -> tuple[int, str, str]:
+        return git_results[tuple(args)]
+    with (
+        patch.object(mcp, "_repoground_freshness_source", return_value=(Path("/tmp/repo"), "conventional_checkout", None)),
+        patch.object(Path, "is_dir", return_value=True),
+        patch.object(Path, "is_symlink", return_value=False),
+        patch.object(mcp, "_repoground_git", side_effect=fake_git),
+    ):
+        result = mcp._repoground_freshness_from_status("heimgewebe/demo", status)
+    assert result["freshness"] == "fresh_exact"
+    assert result["live_repo"]["head"] == TARGET
+    assert result["live_repo"]["comparison_ref"] == "origin/main"
+    assert result["live_repo"]["branch_head_observation"]["head"] == TARGET
+
+
+def test_conventional_checkout_remote_drift_is_stale() -> None:
+    status = {"stem": "demo-stem", "repo": "heimgewebe/demo", "git_commit": TARGET, "git_dirty": False}
+    git_results = {
+        ("rev-parse", "HEAD"): (0, TARGET, ""),
+        ("status", "--porcelain"): (0, "", ""),
+        ("ls-remote", "--exit-code", "--refs", "--", "origin", "refs/heads/main"): (0, f"{OTHER}\trefs/heads/main\n", ""),
+    }
+    def fake_git(_repo_path: Path, args: list[str]) -> tuple[int, str, str]:
+        return git_results[tuple(args)]
+    with (
+        patch.object(mcp, "_repoground_freshness_source", return_value=(Path("/tmp/repo"), "conventional_checkout", None)),
+        patch.object(Path, "is_dir", return_value=True),
+        patch.object(Path, "is_symlink", return_value=False),
+        patch.object(mcp, "_repoground_git", side_effect=fake_git),
+    ):
+        result = mcp._repoground_freshness_from_status("heimgewebe/demo", status)
+    assert result["freshness"] == "stale_head"
+    assert result["live_repo"]["checkout_head"] == TARGET
+    assert result["live_repo"]["head"] == OTHER
+    assert result["live_repo"]["branch_head_observation"]["head"] == OTHER
+
+
 def test_agent_freshness_admission_accepts_only_exact() -> None:
     exact = _freshness("fresh", "fresh_exact")
     exact["bundle"] = {"git_dirty": False}
