@@ -4044,7 +4044,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "version": runner.EXPECTED_GROUNDING_VERDICT_VERSION,
             "status": "degraded",
             "checked_declaration": {},
-            "snapshot_ref": {},
+            "snapshot_ref": {"manifest_path": str(manifest)},
             "citation_checks": [],
             "range_checks": [],
             "required_reading_checks": [],
@@ -4107,6 +4107,43 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     validated["content"],
                     [{"type": "text", "text": runner.canonical(payload)}],
                 )
+
+        external_manifest = Path("/logical/repo.bundle.manifest.json")
+        grounding_result = {
+            "content": [{"type": "text", "text": "ok"}],
+            "structuredContent": cases["grounding_verify"],
+            "isError": False,
+        }
+        rebound = runner._validated_treatment_tool_result(
+            grounding_result,
+            tool_name="grounding_verify",
+            expected_manifest=manifest,
+            external_manifest=external_manifest,
+        )
+        self.assertEqual(
+            rebound["structuredContent"]["live_freshness"]["bundle_manifest"],
+            str(external_manifest),
+        )
+        self.assertEqual(
+            rebound["structuredContent"]["verdict"]["snapshot_ref"]["manifest_path"],
+            str(external_manifest),
+        )
+        foreign = json.loads(json.dumps(cases["grounding_verify"]))
+        foreign["verdict"]["snapshot_ref"]["manifest_path"] = "/foreign/manifest.json"
+        rebound_foreign = runner._validated_treatment_tool_result(
+            {
+                "content": [{"type": "text", "text": "ok"}],
+                "structuredContent": foreign,
+                "isError": False,
+            },
+            tool_name="grounding_verify",
+            expected_manifest=manifest,
+            external_manifest=external_manifest,
+        )
+        self.assertEqual(
+            rebound_foreign["structuredContent"]["verdict"]["snapshot_ref"]["manifest_path"],
+            "/foreign/manifest.json",
+        )
 
         nested_drifts = {
             "ask_context": "context_pack",

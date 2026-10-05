@@ -1208,6 +1208,7 @@ def normalize_tool_calls(
 _REPOGROUND_FRESHNESS = {"fresh", "stale", "unknown", "not_comparable", "not_applicable"}
 _REPOGROUND_LIVE_FRESHNESS = {"fresh", "stale", "unknown", "not_comparable"}
 _REPOGROUND_GROUNDING = {"pass", "fail", "warn", "degraded", "not_applicable"}
+_REPOGROUND_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 
 
 def _decoded_repoground_payload(result: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -1294,10 +1295,11 @@ def _bound_repoground_manifest(
         raise RunnerError("RepoGround manifest must not be a symlink")
     try:
         manifest_path = raw_path.resolve(strict=True)
-        raw = manifest_path.read_bytes()
+        with manifest_path.open("rb") as handle:
+            raw = handle.read(_REPOGROUND_MANIFEST_MAX_BYTES + 1)
     except OSError as exc:
         raise RunnerError("RepoGround manifest is unavailable") from exc
-    if len(raw) > 16 * 1024 * 1024:
+    if len(raw) > _REPOGROUND_MANIFEST_MAX_BYTES:
         raise RunnerError("RepoGround manifest exceeds configured limit")
     expected_sha = _require_string(
         binding.get("manifest_sha256"), "repobrief.manifest_sha256", maximum=64

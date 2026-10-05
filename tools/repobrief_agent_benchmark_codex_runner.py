@@ -1474,6 +1474,16 @@ def _validated_treatment_tool_result(
         if not isinstance(freshness, dict):
             raise RunnerError("RepoGround treatment tool freshness binding is missing")
         freshness["bundle_manifest"] = str(external_manifest)
+        if tool_name == "grounding_verify":
+            verdict = structured.get("verdict")
+            snapshot_ref = (
+                verdict.get("snapshot_ref") if isinstance(verdict, dict) else None
+            )
+            if (
+                isinstance(snapshot_ref, dict)
+                and snapshot_ref.get("manifest_path") == str(expected_manifest)
+            ):
+                snapshot_ref["manifest_path"] = str(external_manifest)
     return {
         "content": [{"type": "text", "text": canonical(structured)}],
         "structuredContent": structured,

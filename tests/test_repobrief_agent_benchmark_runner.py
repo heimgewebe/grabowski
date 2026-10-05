@@ -1010,6 +1010,22 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 _, _, commit = runner._bound_repoground_manifest(value)
                 self.assertEqual(commit, raw_commit.lower())
 
+    def test_bound_manifest_rejects_oversized_before_unbounded_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            with manifest.open("wb") as handle:
+                handle.truncate(16 * 1024 * 1024 + 1)
+            with patch.object(
+                Path,
+                "read_bytes",
+                side_effect=AssertionError("unbounded manifest read"),
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "exceeds configured limit"
+                ):
+                    runner._bound_repoground_manifest(value)
+
     def test_bound_manifest_rejects_ambiguous_multi_repo_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
