@@ -437,6 +437,121 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
             auto["evidence_sha256"],
         )
 
+    def test_captain_preserves_returned_local_effect_on_post_return_failures(
+        self,
+    ) -> None:
+        from tests.test_grips import captain_action
+
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "read back scheduling state",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": "/home/alex/repos/grabowski",
+            "runner": "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": CAPTAIN_HEAD,
+            "source_kind": "canonical-main",
+            "source_identity_sha256": "e" * 64,
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        reconciliation_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-123456abcdef",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+        }
+        reconciliation = {
+            **reconciliation_material,
+            "evidence_sha256": grips.sha256_json(reconciliation_material),
+        }
+        unit = "grabowski-job-abcdef012345"
+        job_dir = Path(preflight["job_root"]) / unit
+        schedule = {
+            "scheduled": True,
+            "already_scheduled": False,
+            "expected_head": CAPTAIN_HEAD,
+            "requested_delay_seconds": 8,
+            "delay_seconds": 8,
+            "unit": unit,
+            "argv_sha256": "d" * 64,
+            "source_identity_sha256": "e" * 64,
+            "source_identity": {"identity_sha256": "e" * 64},
+            "metadata_path": str(job_dir / "metadata.json"),
+            "stdout_path": str(job_dir / "stdout.log"),
+            "stderr_path": str(job_dir / "stderr.log"),
+            "expected_connector_disconnect": True,
+            "status_tool": "grabowski_job_status",
+            "logs_tool": "grabowski_job_logs",
+            "local_mutation_evidence": reconciliation,
+        }
+
+        with self.subTest(failure="source-readback"), patch.object(
+            grips, "_runtime_deploy_self_preflight", return_value=preflight
+        ), patch.object(
+            grips, "_runtime_deploy_self_schedule", return_value=schedule
+        ), patch.object(
+            grips,
+            "_runtime_deploy_self_schedule_source_preflight",
+            side_effect=RuntimeError("source readback failed"),
+        ):
+            execution = grips._run_captain_runtime_deploy(
+                action,
+                {"expected_head": CAPTAIN_HEAD, "delay_seconds": 8},
+            )
+            self.assertTrue(execution["command_returned"])
+            self.assertTrue(execution["mutation_outcome_unknown"])
+            self.assertTrue(execution["local_mutation_outcome_unknown"])
+            self.assertTrue(execution["local_mutation_observed"])
+            self.assertEqual(execution["local_mutation_evidence"], reconciliation)
+
+        invalid_schedule = {
+            **schedule,
+            "status_tool": "wrong-status-tool",
+        }
+        with self.subTest(failure="schedule-validation"), patch.object(
+            grips, "_runtime_deploy_self_preflight", return_value=preflight
+        ), patch.object(
+            grips, "_runtime_deploy_self_schedule", return_value=invalid_schedule
+        ), patch.object(
+            grips,
+            "_runtime_deploy_self_schedule_source_preflight",
+            return_value=preflight,
+        ), patch.object(
+            grips,
+            "_runtime_deploy_self_expected_argv_sha256",
+            return_value="d" * 64,
+        ):
+            execution = grips._run_captain_runtime_deploy(
+                action,
+                {"expected_head": CAPTAIN_HEAD, "delay_seconds": 8},
+            )
+            self.assertTrue(execution["command_returned"])
+            self.assertTrue(execution["mutation_outcome_unknown"])
+            self.assertTrue(execution["local_mutation_outcome_unknown"])
+            self.assertTrue(execution["local_mutation_observed"])
+            self.assertEqual(execution["local_mutation_evidence"], reconciliation)
+            self.assertIn(
+                "runtime_deploy_status_tool_missing",
+                execution["post_verify_errors"],
+            )
+
     def test_captain_accepts_auto_source_effect_and_four_effect_bundle(self) -> None:
         auto_material = {
             "schema_version": 1,

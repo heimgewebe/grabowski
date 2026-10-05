@@ -16049,6 +16049,23 @@ def _run_captain_runtime_deploy(
         )
         return execution_result
     execution_result["schedule"] = schedule
+    returned_local_mutation_evidence = (
+        schedule.get("local_mutation_evidence")
+        if isinstance(schedule, dict)
+        else None
+    )
+    if (
+        returned_local_mutation_evidence is not None
+        and _runtime_deploy_local_mutation_evidence_valid(
+            returned_local_mutation_evidence,
+            expected_job_prefix=str(preflight.get("job_prefix") or ""),
+            expected_head=expected_head,
+        )
+    ):
+        execution_result["local_mutation_observed"] = True
+        execution_result["local_mutation_evidence"] = dict(
+            returned_local_mutation_evidence
+        )
     try:
         source_readback = _runtime_deploy_self_schedule_source_preflight(
             schedule,
