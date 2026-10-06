@@ -812,6 +812,61 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
         self.assertEqual(result["outcomes"][0]["status"], "scheduled")
         self.assertFalse(result["outcomes"][0]["reused"])
 
+    def test_reconcile_accepts_projected_iso_timestamp_without_unix_field(self) -> None:
+        items = [
+            {
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp": "1970-01-01T02:45:50+00:00",
+                },
+                "evidence": {"record_sha256": "1" * 64},
+            }
+        ]
+        audit_query = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=100,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter(items),
+        )
+        scheduled: list[str] = []
+
+        def schedule(record_sha256: str, **_kwargs: object) -> dict[str, object]:
+            scheduled.append(record_sha256)
+            return {
+                "status": "scheduled",
+                "reason": "durable_freshness_job_started",
+                "repository": REPO,
+                "merge_sha": MERGE,
+                "unit": "grabowski-job-one",
+                "reused": False,
+            }
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "grabowski_audit_query": audit_query,
+                    "grabowski_operator": types.SimpleNamespace(),
+                },
+            ),
+            patch.object(post_merge.time, "time", return_value=10_000),
+            patch.object(
+                post_merge,
+                "resolve_job_starter",
+                return_value=lambda *_args, **_kwargs: {},
+            ),
+            patch.object(
+                post_merge,
+                "schedule_from_captain_audit_completion",
+                side_effect=schedule,
+            ),
+        ):
+            result = post_merge.reconcile_recent_captain_audit_followups()
+
+        self.assertEqual(scheduled, ["1" * 64])
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["processed"], 1)
+
     def test_reconcile_retry_backoff_allows_older_pending_merge_to_progress(self) -> None:
         items = [
             {
@@ -1328,6 +1383,8 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
                 jobs: dict[str, dict[str, object]] = {}
                 live_status: dict[str, str] = {}
                 starts: list[str] = []
+                created_at = 10_000
+                terminalized_at = created_at + 900
 
                 def argv_hash(_argv: list[str]) -> str:
                     return "e" * 64
@@ -1339,11 +1396,21 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
 
                 def read_status(unit: str) -> dict[str, object]:
                     metadata = read_metadata(unit)
-                    return {
+                    result: dict[str, object] = {
                         "unit": unit,
                         "metadata": metadata,
                         "final_status": live_status[unit],
                     }
+                    if live_status[unit] in {
+                        "failed",
+                        "timed_out",
+                        "signalled",
+                        "terminated_unclear",
+                    }:
+                        result["finalization_receipt"] = {
+                            "timestamp_unix": terminalized_at,
+                        }
+                    return result
 
                 def private_start(
                     argv: list[str],
@@ -1359,6 +1426,7 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
                         "argv_sha256": argv_hash(argv),
                         "cwd": cwd,
                         "runtime_seconds": runtime_seconds,
+                        "created_at_unix": created_at,
                         "final_status": "launch_submitted",
                     }
                     jobs[reserved_unit] = job
@@ -1382,22 +1450,30 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
                     script_path=Path(post_merge.__file__),
                 )
                 live_status[first["unit"]] = terminal_status
-                second = post_merge.schedule_from_captain_result(
-                    captain_result(completed=False, queued=True),
-                    job_starter=starter,
-                    python_executable="/usr/bin/python3",
-                    script_path=Path(post_merge.__file__),
-                )
+                with patch.object(
+                    post_merge.time,
+                    "time",
+                    return_value=terminalized_at
+                    + post_merge.POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS
+                    + 1,
+                ):
+                    second = post_merge.schedule_from_captain_result(
+                        captain_result(completed=False, queued=True),
+                        job_starter=starter,
+                        python_executable="/usr/bin/python3",
+                        script_path=Path(post_merge.__file__),
+                    )
                 self.assertEqual(len(starts), 2)
                 self.assertNotEqual(first["unit"], second["unit"])
                 self.assertFalse(second["reused"])
 
 
-    def test_recent_failed_job_defers_retry_without_new_mutation(self) -> None:
+    def test_retry_backoff_starts_when_long_running_job_finishes(self) -> None:
         jobs: dict[str, dict[str, object]] = {}
         live_status: dict[str, str] = {}
         starts: list[str] = []
         created_at = 10_000
+        terminalized_at = created_at + 900
 
         def argv_hash(_argv: list[str]) -> str:
             return "9" * 64
@@ -1409,11 +1485,16 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
 
         def read_status(unit: str) -> dict[str, object]:
             metadata = read_metadata(unit)
-            return {
+            result: dict[str, object] = {
                 "unit": unit,
                 "metadata": metadata,
                 "final_status": live_status[unit],
             }
+            if live_status[unit] == "failed":
+                result["finalization_receipt"] = {
+                    "timestamp_unix": terminalized_at,
+                }
+            return result
 
         def private_start(
             argv: list[str],
@@ -1454,7 +1535,7 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
             script_path=Path(post_merge.__file__),
         )
         live_status[first["unit"]] = "failed"
-        with patch.object(post_merge.time, "time", return_value=created_at + 60):
+        with patch.object(post_merge.time, "time", return_value=terminalized_at + 60):
             second = post_merge.schedule_from_captain_result(
                 captain_result(completed=False, queued=True),
                 job_starter=starter,
@@ -1467,8 +1548,81 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
         self.assertTrue(second["reused"])
         self.assertEqual(
             second["retry_after_unix"],
-            created_at + post_merge.POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS,
+            terminalized_at + post_merge.POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS,
         )
+
+    def test_terminal_job_without_finalization_evidence_defers_read_only(self) -> None:
+        jobs: dict[str, dict[str, object]] = {}
+        live_status: dict[str, str] = {}
+        starts: list[str] = []
+
+        def argv_hash(_argv: list[str]) -> str:
+            return "8" * 64
+
+        def read_metadata(unit: str) -> dict[str, object]:
+            if unit not in jobs:
+                raise ValueError("missing")
+            return jobs[unit]
+
+        def read_status(unit: str) -> dict[str, object]:
+            metadata = read_metadata(unit)
+            return {
+                "unit": unit,
+                "metadata": metadata,
+                "final_status": live_status[unit],
+                "finalization_receipt": None,
+            }
+
+        def private_start(
+            argv: list[str],
+            *,
+            cwd: str,
+            runtime_seconds: int,
+            reserved_unit: str,
+        ) -> dict[str, object]:
+            starts.append(reserved_unit)
+            job: dict[str, object] = {
+                "unit": reserved_unit,
+                "job_id": reserved_unit.removeprefix("grabowski-job-"),
+                "argv_sha256": argv_hash(argv),
+                "cwd": cwd,
+                "runtime_seconds": runtime_seconds,
+                "created_at_unix": 10_000,
+                "final_status": "launch_submitted",
+            }
+            jobs[reserved_unit] = job
+            live_status[reserved_unit] = "running"
+            return job
+
+        operator = types.SimpleNamespace(
+            grabowski_job_start=lambda *_args, **_kwargs: {},
+            grabowski_job_status=read_status,
+            _argv_hash=argv_hash,
+            _read_job_metadata=read_metadata,
+            _require_operator_mutation=lambda *_args, **_kwargs: None,
+            _start_job=private_start,
+        )
+        starter = post_merge.resolve_job_starter({"grabowski_operator": operator})
+        self.assertIsNotNone(starter)
+
+        first = post_merge.schedule_from_captain_result(
+            captain_result(completed=False, queued=True),
+            job_starter=starter,
+            python_executable="/usr/bin/python3",
+            script_path=Path(post_merge.__file__),
+        )
+        live_status[first["unit"]] = "failed"
+        second = post_merge.schedule_from_captain_result(
+            captain_result(completed=False, queued=True),
+            job_starter=starter,
+            python_executable="/usr/bin/python3",
+            script_path=Path(post_merge.__file__),
+        )
+
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(second["status"], "retry_deferred")
+        self.assertTrue(second["terminal_evidence_pending"])
+        self.assertIsNone(second["retry_after_unix"])
 
     def test_exhausted_retry_slots_are_read_only_not_scheduled(self) -> None:
         jobs: dict[str, dict[str, object]] = {}
@@ -1486,11 +1640,16 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
 
         def read_status(unit: str) -> dict[str, object]:
             metadata = read_metadata(unit)
-            return {
+            result: dict[str, object] = {
                 "unit": unit,
                 "metadata": metadata,
                 "final_status": live_status[unit],
             }
+            if live_status[unit] == "failed":
+                result["finalization_receipt"] = {
+                    "timestamp_unix": created_at,
+                }
+            return result
 
         def private_start(
             argv: list[str],

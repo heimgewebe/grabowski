@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -156,23 +157,44 @@ def _post_merge_job_starter(
                     "observed_final_status": "succeeded",
                 }
             if final_status in POST_MERGE_TERMINAL_JOB_STATUSES:
-                created_at_unix = observed_metadata.get("created_at_unix")
-                if (
-                    isinstance(created_at_unix, int)
-                    and not isinstance(created_at_unix, bool)
-                    and created_at_unix >= 0
-                ):
-                    retry_after_unix = (
-                        created_at_unix + POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS
-                    )
-                    if int(time.time()) < retry_after_unix:
-                        return {
-                            **observed_metadata,
-                            "reused": True,
-                            "reuse_retry_deferred": True,
-                            "observed_final_status": final_status,
-                            "retry_after_unix": retry_after_unix,
-                        }
+                retry_anchor_unix: int | None = None
+                finalization_receipt = status.get("finalization_receipt")
+                if isinstance(finalization_receipt, dict):
+                    terminalized_at_unix = finalization_receipt.get("timestamp_unix")
+                    if (
+                        isinstance(terminalized_at_unix, int)
+                        and not isinstance(terminalized_at_unix, bool)
+                        and terminalized_at_unix >= 0
+                    ):
+                        retry_anchor_unix = terminalized_at_unix
+                if retry_anchor_unix is None and final_status == "launch_failed":
+                    created_at_unix = observed_metadata.get("created_at_unix")
+                    if (
+                        isinstance(created_at_unix, int)
+                        and not isinstance(created_at_unix, bool)
+                        and created_at_unix >= 0
+                    ):
+                        retry_anchor_unix = created_at_unix
+                if retry_anchor_unix is None:
+                    return {
+                        **observed_metadata,
+                        "reused": True,
+                        "reuse_retry_deferred": True,
+                        "reuse_terminal_evidence_pending": True,
+                        "observed_final_status": final_status,
+                        "retry_after_unix": None,
+                    }
+                retry_after_unix = (
+                    retry_anchor_unix + POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS
+                )
+                if int(time.time()) < retry_after_unix:
+                    return {
+                        **observed_metadata,
+                        "reused": True,
+                        "reuse_retry_deferred": True,
+                        "observed_final_status": final_status,
+                        "retry_after_unix": retry_after_unix,
+                    }
                 return None
             return uncertain(observed_metadata, final_status=final_status)
 
@@ -1292,6 +1314,9 @@ def schedule_followup_request(
             "reused": True,
             "observed_final_status": job.get("observed_final_status"),
             "retry_after_unix": job.get("retry_after_unix"),
+            "terminal_evidence_pending": (
+                job.get("reuse_terminal_evidence_pending") is True
+            ),
             "does_not_establish": [
                 "freshness_converged",
                 "future_branch_freshness",
@@ -1514,6 +1539,38 @@ def schedule_from_captain_audit_completion(
     return result
 
 
+def _reconcile_record_timestamp_unix(record: Mapping[str, Any]) -> int:
+    timestamp_unix = record.get("timestamp_unix")
+    if type(timestamp_unix) is int and timestamp_unix >= 0:
+        return timestamp_unix
+    timestamp = record.get("timestamp")
+    if not isinstance(timestamp, str) or not timestamp:
+        raise RepoGroundPostMergeError(
+            "Captain audit reconciliation timestamp is invalid"
+        )
+    normalized = (
+        timestamp[:-1] + "+00:00"
+        if timestamp.endswith("Z")
+        else timestamp
+    )
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise RepoGroundPostMergeError(
+            "Captain audit reconciliation timestamp is invalid"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise RepoGroundPostMergeError(
+            "Captain audit reconciliation timestamp is invalid"
+        )
+    parsed_unix = int(parsed.timestamp())
+    if parsed_unix < 0:
+        raise RepoGroundPostMergeError(
+            "Captain audit reconciliation timestamp is invalid"
+        )
+    return parsed_unix
+
+
 def reconcile_recent_captain_audit_followups(
     *,
     lookback_seconds: int = DEFAULT_RECONCILE_LOOKBACK_SECONDS,
@@ -1556,11 +1613,7 @@ def reconcile_recent_captain_audit_followups(
             raise RepoGroundPostMergeError(
                 "Captain audit reconciliation snapshot item is invalid"
             )
-        timestamp_unix = record.get("timestamp_unix")
-        if type(timestamp_unix) is not int:
-            raise RepoGroundPostMergeError(
-                "Captain audit reconciliation timestamp is invalid"
-            )
+        timestamp_unix = _reconcile_record_timestamp_unix(record)
         if timestamp_unix < since_unix:
             lookback_horizon_reached = True
             break
