@@ -4352,6 +4352,62 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(bound_manifest.call_count, 1)
             self.assertEqual(len(repeated["calls"]), 2)
 
+    def test_codex_manifest_bind_failure_omits_optional_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            malformed = {
+                "kind": "repoground.bundle.manifest",
+                "version": "2.0",
+                "snapshotProvenance": {"repositories": []},
+            }
+            raw = json.dumps(
+                malformed, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            manifest.write_bytes(raw)
+            value["repobrief"]["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+            payload = {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "fresh",
+                "reason": "git_head_matches_snapshot",
+                "bundle_manifest": str(manifest),
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+                "snapshot_provenance": {"git_commit": COMMIT},
+            }
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "live_freshness",
+                    "arguments": {},
+                    "result": {"structured_content": payload},
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{
+                "sequence": 1,
+                "name": "live_freshness",
+                "status": "success",
+                "duration_ms": 0,
+                "input_bytes": 1,
+                "output_bytes": 1,
+            }]
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                self.assertIsNone(
+                    runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                )
+
     def test_codex_rejects_conflicting_grounding_freshness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")

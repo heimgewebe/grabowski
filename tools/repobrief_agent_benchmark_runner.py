@@ -1367,12 +1367,12 @@ def _authorized_manifest_paths(
     request: Mapping[str, Any], *, manifest_path: Path
 ) -> frozenset[str]:
     binding = _mapping(request.get("repobrief"))
-    logical_path = Path(
-        _require_string(binding.get("manifest"), "repobrief.manifest")
-    ).expanduser()
-    paths = {str(manifest_path)}
-    if logical_path.is_absolute():
-        paths.add(str(logical_path))
+    logical = _require_string(binding.get("manifest"), "repobrief.manifest")
+    expanded = Path(logical).expanduser()
+    # Authorize only representations derived from the exact request-bound
+    # manifest path.  Do not admit arbitrary lexical aliases that happen to
+    # resolve to the same file.
+    paths = {logical, str(expanded), str(manifest_path)}
     return frozenset(paths)
 
 
@@ -1391,6 +1391,18 @@ def _repoground_manifest_binding(
         manifest_repo_root,
         _authorized_manifest_paths(request, manifest_path=manifest_path),
     )
+
+
+def _optional_repoground_manifest_binding(
+    request: Mapping[str, Any],
+) -> tuple[str, str, str | None, frozenset[str]] | None:
+    try:
+        return _repoground_manifest_binding(request)
+    except RunnerError:
+        # RepoGround evidence is an optional receipt projection.  A manifest
+        # that cannot be safely bound must suppress the projection, not turn an
+        # otherwise completed provider run into a receipt-construction failure.
+        return None
 
 
 def _snapshot_ref_matches_manifest(
@@ -1761,7 +1773,9 @@ def normalize_repoground_evidence(
             if prepared_resource is None:
                 continue
             if manifest_binding is None:
-                manifest_binding = _repoground_manifest_binding(request)
+                manifest_binding = _optional_repoground_manifest_binding(request)
+                if manifest_binding is None:
+                    return None
             live_freshness, content_bytes = prepared_resource
             normalized = _repoground_resource_read_evidence(
                 manifest_binding=manifest_binding,
@@ -1774,7 +1788,9 @@ def normalize_repoground_evidence(
             if payload is None:
                 continue
             if manifest_binding is None:
-                manifest_binding = _repoground_manifest_binding(request)
+                manifest_binding = _optional_repoground_manifest_binding(request)
+                if manifest_binding is None:
+                    return None
             normalized = _repoground_evidence_from_payload(
                 manifest_binding=manifest_binding,
                 tool_name=str(abstract),

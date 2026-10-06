@@ -5697,7 +5697,9 @@ def _repoground_evidence_from_codex_events(
             if prepared_resource is None:
                 continue
             if manifest_binding is None:
-                manifest_binding = base._repoground_manifest_binding(request)
+                manifest_binding = base._optional_repoground_manifest_binding(request)
+                if manifest_binding is None:
+                    return None
             live_freshness, content_bytes = prepared_resource
             normalized = base._repoground_resource_read_evidence(
                 manifest_binding=manifest_binding,
@@ -5719,7 +5721,9 @@ def _repoground_evidence_from_codex_events(
             except RunnerError:
                 continue
             if manifest_binding is None:
-                manifest_binding = base._repoground_manifest_binding(request)
+                manifest_binding = base._optional_repoground_manifest_binding(request)
+                if manifest_binding is None:
+                    return None
             normalized = base._repoground_evidence_from_payload(
                 manifest_binding=manifest_binding,
                 tool_name=str(tool_name),

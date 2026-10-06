@@ -812,6 +812,66 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 )
             )
 
+    def test_authorized_manifest_paths_include_only_request_derived_forms(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory)).resolve()
+            relative = os.path.relpath(manifest, Path.cwd())
+            value["repobrief"]["manifest"] = relative
+            paths = runner._authorized_manifest_paths(
+                value, manifest_path=manifest
+            )
+            self.assertIn(relative, paths)
+            self.assertIn(str(Path(relative).expanduser()), paths)
+            self.assertIn(str(manifest), paths)
+
+            unexpected_parent = Path(directory) / "other"
+            unexpected_parent.mkdir()
+            unexpected_alias = unexpected_parent / ".." / manifest.name
+            self.assertNotIn(str(unexpected_alias), paths)
+
+            with patch.dict(os.environ, {"HOME": directory}):
+                value["repobrief"]["manifest"] = f"~/{manifest.name}"
+                tilde_paths = runner._authorized_manifest_paths(
+                    value, manifest_path=manifest
+                )
+            self.assertIn(f"~/{manifest.name}", tilde_paths)
+            self.assertIn(str(manifest), tilde_paths)
+
+    def test_treatment_manifest_bind_failure_omits_optional_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory), repositories=[])
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="mcp__repobrief__live_freshness")
+            )
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            tool_result["content"] = json.dumps(
+                {"structuredContent": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v1",
+                    "status": "fresh",
+                    "reason": "git_head_matches_snapshot",
+                    "bundle_manifest": str(manifest),
+                    "repo_root": "/tmp/repo",
+                    "read_only_git_probe": True,
+                    "implicit_refresh": False,
+                    "snapshot_provenance": {"git_commit": COMMIT},
+                }},
+                sort_keys=True,
+            )
+            calls = runner.normalize_tool_calls(value, messages)
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(value, messages, calls)
+            )
+
     def test_treatment_uses_same_call_live_freshness_and_semantic_ranges(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
