@@ -1,0 +1,15 @@
+[Unit]
+Description=Reconcile verified RepoGround post-merge follow-ups
+After=grabowski-operator.service
+PartOf=grabowski-operator.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python -I -m grabowski_repoground_post_merge --reconcile-audit-followups --reconcile-lookback-seconds 900
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/grabowski
+UMask=0077
+TimeoutStartSec=30s

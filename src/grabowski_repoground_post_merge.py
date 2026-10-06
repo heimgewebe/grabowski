@@ -48,7 +48,6 @@ QueueConverger = Callable[[str, str], dict[str, Any]]
 
 POST_MERGE_TERMINAL_JOB_STATUSES = frozenset(
     {
-        "succeeded",
         "failed",
         "timed_out",
         "signalled",
@@ -143,6 +142,13 @@ def _post_merge_job_starter(
             final_status = status.get("final_status")
             if final_status == "running":
                 return {**observed_metadata, "reused": True}
+            if final_status == "succeeded":
+                return {
+                    **observed_metadata,
+                    "reused": True,
+                    "reuse_satisfied": True,
+                    "observed_final_status": "succeeded",
+                }
             if final_status in POST_MERGE_TERMINAL_JOB_STATUSES:
                 return None
             return uncertain(observed_metadata, final_status=final_status)
@@ -410,8 +416,44 @@ def _freshness_projection(value: dict[str, Any]) -> dict[str, Any]:
         "bundle_commit": bundle.get("git_commit") if isinstance(bundle, dict) else None,
         "live_head": live.get("head") if isinstance(live, dict) else None,
         "remote_head": branch.get("head"),
+        "source_kind": live.get("source_kind") if isinstance(live, dict) else None,
         "repo_path": live.get("repo_path") if isinstance(live, dict) else None,
     }
+
+
+def _read_remote_main_head(repo_path: str) -> str:
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            repo_path,
+            "ls-remote",
+            "--exit-code",
+            "--refs",
+            "--",
+            "origin",
+            "refs/heads/main",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=DEFAULT_ANCESTRY_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+        raise RepoGroundPostMergeError("authoritative remote main head is unavailable")
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise RepoGroundPostMergeError("authoritative remote main head is ambiguous")
+    fields = lines[0].split()
+    if (
+        len(fields) != 2
+        or fields[1] != "refs/heads/main"
+        or SHA40_RE.fullmatch(fields[0].lower()) is None
+    ):
+        raise RepoGroundPostMergeError("authoritative remote main head is invalid")
+    return fields[0].lower()
 
 
 def _fresh_exact(
@@ -424,7 +466,24 @@ def _fresh_exact(
     bundle_commit = projection["bundle_commit"]
     live_head = projection["live_head"]
     remote_head = projection["remote_head"]
+    source_kind = projection["source_kind"]
     repo_path = projection["repo_path"]
+    if (
+        source_kind == "conventional_checkout"
+        and isinstance(repo_path, str)
+        and repo_path
+    ):
+        try:
+            remote_head = _read_remote_main_head(repo_path)
+            projection["remote_head"] = remote_head
+            projection["remote_head_status"] = "observed"
+            projection["remote_head_basis"] = "git_ls_remote_origin"
+        except (OSError, RepoGroundPostMergeError, subprocess.SubprocessError):
+            projection["remote_head"] = None
+            projection["remote_head_status"] = "unavailable"
+            projection["remote_head_basis"] = "git_ls_remote_origin"
+            projection["merge_is_ancestor"] = None
+            return False, projection
     exact = (
         freshness.get("freshness") == "fresh_exact"
         and freshness.get("freshness_status") == "fresh"
@@ -528,6 +587,17 @@ def converge(
                 "kind": "grabowski.repoground_post_merge_freshness",
                 "schema_version": 1,
                 "status": "fresh_exact",
+                "repository": repository,
+                "merge_sha": merge_sha,
+                "attempts": attempts,
+                "final": projection,
+            }
+        if projection.get("remote_head_status") == "unavailable":
+            return {
+                "kind": "grabowski.repoground_post_merge_freshness",
+                "schema_version": 1,
+                "status": "failed",
+                "reason": "authoritative_remote_head_unavailable",
                 "repository": repository,
                 "merge_sha": merge_sha,
                 "attempts": attempts,
@@ -1111,6 +1181,27 @@ def schedule_followup_request(
             ],
         }
 
+    if job.get("reuse_satisfied") is True:
+        return {
+            **_followup_base(
+                status="already_satisfied",
+                reason="durable_freshness_job_already_succeeded",
+                repository=identity["repository"],
+                merge_sha=identity.get("merge_sha"),
+            ),
+            **(
+                {"pull_request": identity["pull_request"]}
+                if "pull_request" in identity
+                else {}
+            ),
+            "unit": unit,
+            "reused": True,
+            "job_id": job.get("job_id"),
+            "argv_sha256": job.get("argv_sha256"),
+            "expected_receipt": job.get("expected_receipt"),
+            "does_not_establish": ["future_branch_freshness"],
+        }
+
     if job.get("reuse_uncertain") is True:
         return {
             **_followup_base(
@@ -1193,6 +1284,215 @@ def schedule_from_captain_result(
     )
 
 
+def _verified_captain_completion_record(
+    completion_record_sha256: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(completion_record_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", completion_record_sha256) is None
+    ):
+        raise RepoGroundPostMergeError("Captain completion record SHA-256 is invalid")
+    import grabowski_audit_query
+    import grabowski_grip_orchestration
+
+    snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
+    record = grabowski_grip_orchestration._verified_captain_audit_record(
+        completion_record_sha256,
+        snapshot=snapshot,
+        audit_query_module=grabowski_audit_query,
+    )
+    if (
+        not isinstance(record, dict)
+        or record.get("operation") != "captain-run-audit-completion"
+        or record.get("kind") != "grabowski_captain_run_audit"
+        or record.get("schema_version") != 1
+        or record.get("phase") != "completion"
+        or record.get("action") != "pr-merge"
+    ):
+        raise RepoGroundPostMergeError("Captain completion audit record is not a PR merge")
+    return record
+
+
+def captain_followup_request_from_audit(
+    completion_record_sha256: str,
+    *,
+    python_executable: str,
+    script_path: Path,
+) -> dict[str, Any]:
+    record = _verified_captain_completion_record(completion_record_sha256)
+    repository = _validate_repository(record.get("target_repo"))
+    execution = record.get("execution_result")
+    if not isinstance(execution, dict):
+        raise RepoGroundPostMergeError("Captain completion execution result is unavailable")
+    if execution.get("verification_passed") is not True:
+        return _followup_base(
+            status="not_scheduled",
+            reason="merge_verification_not_passed",
+            repository=repository,
+        )
+    executable, script = _validated_runtime_request(
+        python_executable=python_executable,
+        script_path=script_path,
+    )
+    provenance_mode = execution.get("provenance_mode")
+    if provenance_mode == "captain_dispatch_verified":
+        merge_sha = _validate_sha(execution.get("observed_merge_sha"))
+        return {
+            **_followup_base(
+                status="ready",
+                reason="verified_captain_merge_ready_for_freshness",
+                repository=repository,
+                merge_sha=merge_sha,
+            ),
+            "captain_audit_completion_sha256": completion_record_sha256,
+            "argv": [
+                executable,
+                "-B",
+                str(script),
+                "--repo",
+                repository,
+                "--merge-sha",
+                merge_sha,
+            ],
+            "cwd": str(script.parent),
+        }
+    if provenance_mode == "captain_queue_dispatch_pending":
+        pull_request = _validate_pull_request(record.get("target_pr"))
+        expected_head = _validate_sha(record.get("expected_head"))
+        expected_base = _validate_base_ref(record.get("expected_base"))
+        return {
+            **_followup_base(
+                status="ready_queue_watch",
+                reason="verified_captain_merge_queue_ready_for_watch",
+                repository=repository,
+            ),
+            "captain_audit_completion_sha256": completion_record_sha256,
+            "pull_request": pull_request,
+            "expected_head": expected_head,
+            "expected_base": expected_base,
+            "argv": [
+                executable,
+                "-B",
+                str(script),
+                "--repo",
+                repository,
+                "--pr",
+                str(pull_request),
+                "--expected-head",
+                expected_head,
+                "--expected-base",
+                expected_base,
+            ],
+            "cwd": str(script.parent),
+        }
+    return _followup_base(
+        status="not_scheduled",
+        reason="captain_merge_not_fast_path_eligible",
+        repository=repository,
+    )
+
+
+def schedule_from_captain_audit_completion(
+    completion_record_sha256: str,
+    *,
+    job_starter: JobStarter,
+    python_executable: str,
+    script_path: Path,
+    runtime_seconds: int = DEFAULT_JOB_RUNTIME_SECONDS,
+) -> dict[str, Any]:
+    request = captain_followup_request_from_audit(
+        completion_record_sha256,
+        python_executable=python_executable,
+        script_path=script_path,
+    )
+    result = schedule_followup_request(
+        request,
+        job_starter=job_starter,
+        runtime_seconds=runtime_seconds,
+    )
+    result["captain_audit_completion_sha256"] = completion_record_sha256
+    return result
+
+
+def reconcile_recent_captain_audit_followups(
+    *,
+    lookback_seconds: int = 900,
+    limit: int = 64,
+) -> dict[str, Any]:
+    if type(lookback_seconds) is not int or not 60 <= lookback_seconds <= 86_400:
+        raise RepoGroundPostMergeError("reconcile lookback is out of bounds")
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise RepoGroundPostMergeError("reconcile limit is out of bounds")
+
+    import grabowski_audit_query
+    import grabowski_operator
+
+    since_unix = int(time.time()) - lookback_seconds
+    queried = grabowski_audit_query.query_audit(
+        {
+            "operation": "captain-run-audit-completion",
+            "since_unix": since_unix,
+        },
+        limit=limit,
+        order="desc",
+    )
+    items = queried.get("items")
+    if not isinstance(items, list):
+        raise RepoGroundPostMergeError("Captain audit reconciliation query is invalid")
+    starter = resolve_job_starter({"grabowski_operator": grabowski_operator})
+    if starter is None:
+        raise RepoGroundPostMergeError("durable Grabowski job starter is unavailable")
+
+    outcomes: list[dict[str, Any]] = []
+    for item in items:
+        evidence = item.get("evidence") if isinstance(item, dict) else None
+        record = item.get("record") if isinstance(item, dict) else None
+        if not isinstance(evidence, dict) or not isinstance(record, dict):
+            continue
+        if record.get("action") != "pr-merge":
+            continue
+        record_sha256 = evidence.get("record_sha256")
+        if not isinstance(record_sha256, str):
+            continue
+        outcome = schedule_from_captain_audit_completion(
+            record_sha256,
+            job_starter=starter,
+            python_executable=__import__("sys").executable,
+            script_path=Path(__file__).resolve(),
+        )
+        outcome_summary = {
+            "captain_audit_completion_sha256": record_sha256,
+            "status": outcome.get("status"),
+            "reason": outcome.get("reason"),
+            "repository": outcome.get("repository"),
+            "merge_sha": outcome.get("merge_sha"),
+            "pull_request": outcome.get("pull_request"),
+            "unit": outcome.get("unit"),
+            "reused": outcome.get("reused") is True,
+        }
+        outcomes.append(outcome_summary)
+        # One reconciliation invocation is one mutation attempt. Reads may skip
+        # already-satisfied/running work, but after a new or uncertain launch
+        # we stop so a single reconcile pass can never create two jobs.
+        status = outcome.get("status")
+        safe_read_only = (
+            status in {"already_satisfied", "not_scheduled"}
+            or (status == "scheduled" and outcome.get("reused") is True)
+        )
+        if not safe_read_only:
+            break
+    return {
+        "kind": "grabowski.repoground_post_merge_reconcile",
+        "schema_version": 1,
+        "status": "ok",
+        "lookback_seconds": lookback_seconds,
+        "matched": queried.get("matched"),
+        "processed": len(outcomes),
+        "outcomes": outcomes,
+        "audit_query_truncated": queried.get("truncated") is True,
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1200,10 +1500,12 @@ def _parser() -> argparse.ArgumentParser:
             "or watch one verified merge-queue entry until it is merged."
         )
     )
-    parser.add_argument("--repo", required=True)
+    parser.add_argument("--repo")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--merge-sha")
     mode.add_argument("--pr", type=int)
+    mode.add_argument("--reconcile-audit-followups", action="store_true")
+    parser.add_argument("--reconcile-lookback-seconds", type=int, default=900)
     parser.add_argument("--expected-head")
     parser.add_argument("--expected-base")
     parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
@@ -1237,7 +1539,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        if args.pr is not None:
+        if args.reconcile_audit_followups:
+            if args.repo is not None:
+                parser.error("--reconcile-audit-followups does not accept --repo")
+            result = reconcile_recent_captain_audit_followups(
+                lookback_seconds=args.reconcile_lookback_seconds,
+            )
+        elif args.pr is not None:
+            if args.repo is None:
+                parser.error("--pr requires --repo")
             if args.expected_head is None or args.expected_base is None:
                 parser.error(
                     "--pr requires --expected-head and --expected-base"
@@ -1252,6 +1562,8 @@ def main(argv: list[str] | None = None) -> int:
                 watch_seconds=args.queue_watch_seconds,
             )
         else:
+            if args.repo is None:
+                parser.error("--merge-sha requires --repo")
             result = converge(
                 repository=args.repo,
                 merge_sha=args.merge_sha,
@@ -1274,7 +1586,7 @@ def main(argv: list[str] | None = None) -> int:
             "error_class": type(exc).__name__,
         }
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 0 if result.get("status") == "fresh_exact" else 1
+    return 0 if result.get("status") in {"fresh_exact", "ok"} else 1
 
 
 if __name__ == "__main__":

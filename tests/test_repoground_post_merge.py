@@ -34,6 +34,7 @@ def freshness(
     bundle: str,
     live: str,
     remote: str | None = None,
+    source_kind: str = "publication_source_checkout",
 ) -> dict[str, object]:
     return {
         "freshness": state,
@@ -42,11 +43,18 @@ def freshness(
         "bundle": {"git_commit": bundle},
         "live_repo": {
             "repo_path": "/tmp/repo",
+            "source_kind": source_kind,
             "head": live,
-            "branch_head_observation": {
-                "status": "observed",
-                "head": remote if remote is not None else live,
-            },
+            **(
+                {
+                    "branch_head_observation": {
+                        "status": "observed",
+                        "head": remote if remote is not None else live,
+                    }
+                }
+                if source_kind == "publication_source_checkout"
+                else {}
+            ),
         },
     }
 
@@ -198,6 +206,50 @@ class RepoGroundPostMergeConvergenceTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["reason"], "freshness_not_converged")
+
+
+    def test_conventional_checkout_requires_remote_exactness_only_in_post_merge(self) -> None:
+        with patch.object(post_merge, "_read_remote_main_head", return_value=HEAD):
+            result = post_merge.converge(
+                repository=REPO,
+                merge_sha=MERGE,
+                publisher_runner=lambda _argv, _timeout: publisher_result(),
+                freshness_reader=lambda _repo: freshness(
+                    state="fresh_exact",
+                    bundle=HEAD,
+                    live=HEAD,
+                    source_kind="conventional_checkout",
+                ),
+                ancestry_checker=lambda _path, _merge, _head: True,
+                sleep_fn=lambda _seconds: None,
+                max_attempts=1,
+            )
+        self.assertEqual(result["status"], "fresh_exact")
+        self.assertEqual(result["final"]["remote_head"], HEAD)
+
+    def test_conventional_checkout_remote_unavailable_is_explicit_failure(self) -> None:
+        with patch.object(
+            post_merge,
+            "_read_remote_main_head",
+            side_effect=post_merge.RepoGroundPostMergeError("synthetic unavailable"),
+        ):
+            result = post_merge.converge(
+                repository=REPO,
+                merge_sha=MERGE,
+                publisher_runner=lambda _argv, _timeout: publisher_result(),
+                freshness_reader=lambda _repo: freshness(
+                    state="fresh_exact",
+                    bundle=HEAD,
+                    live=HEAD,
+                    source_kind="conventional_checkout",
+                ),
+                ancestry_checker=lambda _path, _merge, _head: True,
+                sleep_fn=lambda _seconds: None,
+                max_attempts=3,
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "authoritative_remote_head_unavailable")
+        self.assertEqual(len(result["attempts"]), 1)
 
 
 class RepoGroundPublisherBoundTests(unittest.TestCase):
@@ -466,6 +518,248 @@ class RepoGroundPostMergeJobStarterResolutionTests(unittest.TestCase):
         self.assertIsNone(post_merge.resolve_job_starter(modules))
 
 
+class RepoGroundCaptainAuditFollowupTests(unittest.TestCase):
+    def test_audit_bound_direct_merge_reconstructs_trusted_command(self) -> None:
+        record = {
+            "operation": "captain-run-audit-completion",
+            "kind": "grabowski_captain_run_audit",
+            "schema_version": 1,
+            "phase": "completion",
+            "action": "pr-merge",
+            "target_repo": REPO,
+            "target_pr": PR,
+            "expected_head": HEAD,
+            "expected_base": BASE,
+            "execution_result": {
+                "verification_passed": True,
+                "provenance_mode": "captain_dispatch_verified",
+                "observed_merge_sha": MERGE,
+            },
+        }
+        with patch.object(
+            post_merge,
+            "_verified_captain_completion_record",
+            return_value=record,
+        ):
+            request = post_merge.captain_followup_request_from_audit(
+                "1" * 64,
+                python_executable="/usr/bin/python3",
+                script_path=Path(post_merge.__file__),
+            )
+
+        self.assertEqual(request["status"], "ready")
+        self.assertEqual(request["repository"], REPO)
+        self.assertEqual(request["merge_sha"], MERGE)
+        self.assertEqual(
+            request["argv"][-4:],
+            ["--repo", REPO, "--merge-sha", MERGE],
+        )
+
+    def test_audit_bound_queue_reconstructs_identity_without_caller_argv(self) -> None:
+        record = {
+            "operation": "captain-run-audit-completion",
+            "kind": "grabowski_captain_run_audit",
+            "schema_version": 1,
+            "phase": "completion",
+            "action": "pr-merge",
+            "target_repo": REPO,
+            "target_pr": PR,
+            "expected_head": HEAD,
+            "expected_base": BASE,
+            "execution_result": {
+                "verification_passed": True,
+                "provenance_mode": "captain_queue_dispatch_pending",
+                "observed_merge_sha": None,
+            },
+        }
+        with patch.object(
+            post_merge,
+            "_verified_captain_completion_record",
+            return_value=record,
+        ):
+            request = post_merge.captain_followup_request_from_audit(
+                "2" * 64,
+                python_executable="/usr/bin/python3",
+                script_path=Path(post_merge.__file__),
+            )
+
+        self.assertEqual(request["status"], "ready_queue_watch")
+        self.assertEqual(request["pull_request"], PR)
+        self.assertIn("--expected-head", request["argv"])
+        self.assertIn(HEAD, request["argv"])
+        self.assertIn("--expected-base", request["argv"])
+        self.assertIn(BASE, request["argv"])
+
+    def test_external_merge_is_not_fast_path_eligible(self) -> None:
+        record = {
+            "operation": "captain-run-audit-completion",
+            "kind": "grabowski_captain_run_audit",
+            "schema_version": 1,
+            "phase": "completion",
+            "action": "pr-merge",
+            "target_repo": REPO,
+            "target_pr": PR,
+            "expected_head": HEAD,
+            "expected_base": BASE,
+            "execution_result": {
+                "verification_passed": True,
+                "provenance_mode": "external_merge_reconciled",
+                "observed_merge_sha": MERGE,
+            },
+        }
+        with patch.object(
+            post_merge,
+            "_verified_captain_completion_record",
+            return_value=record,
+        ):
+            request = post_merge.captain_followup_request_from_audit(
+                "3" * 64,
+                python_executable="/usr/bin/python3",
+                script_path=Path(post_merge.__file__),
+            )
+
+        self.assertEqual(request["status"], "not_scheduled")
+        self.assertEqual(request["reason"], "captain_merge_not_fast_path_eligible")
+
+
+class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
+    def test_reconcile_scans_newest_captain_audits_first(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def query_audit(filters, *, limit, order):
+            calls.append({"filters": filters, "limit": limit, "order": order})
+            return {
+                "items": [],
+                "matched": 0,
+                "truncated": False,
+            }
+
+        audit_query = types.SimpleNamespace(query_audit=query_audit)
+        operator = types.SimpleNamespace()
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "grabowski_audit_query": audit_query,
+                    "grabowski_operator": operator,
+                },
+            ),
+            patch.object(
+                post_merge,
+                "resolve_job_starter",
+                return_value=lambda *_args, **_kwargs: {},
+            ),
+        ):
+            result = post_merge.reconcile_recent_captain_audit_followups(
+                lookback_seconds=900,
+                limit=64,
+            )
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["matched"], 0)
+        self.assertEqual(result["processed"], 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["order"], "desc")
+
+    def test_reconcile_stops_after_first_new_job_mutation(self) -> None:
+        items = [
+            {
+                "record": {"action": "pr-merge"},
+                "evidence": {"record_sha256": "1" * 64},
+            },
+            {
+                "record": {"action": "pr-merge"},
+                "evidence": {"record_sha256": "2" * 64},
+            },
+        ]
+        audit_query = types.SimpleNamespace(
+            query_audit=lambda *_args, **_kwargs: {
+                "items": items,
+                "matched": 2,
+                "truncated": False,
+            }
+        )
+        scheduled: list[str] = []
+
+        def schedule(record_sha256: str, **_kwargs: object) -> dict[str, object]:
+            scheduled.append(record_sha256)
+            return {
+                "status": "scheduled",
+                "reason": "durable_freshness_job_started",
+                "repository": REPO,
+                "merge_sha": MERGE,
+                "unit": "grabowski-job-one",
+                "reused": False,
+            }
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "grabowski_audit_query": audit_query,
+                    "grabowski_operator": types.SimpleNamespace(),
+                },
+            ),
+            patch.object(
+                post_merge,
+                "resolve_job_starter",
+                return_value=lambda *_args, **_kwargs: {},
+            ),
+            patch.object(
+                post_merge,
+                "schedule_from_captain_audit_completion",
+                side_effect=schedule,
+            ),
+        ):
+            result = post_merge.reconcile_recent_captain_audit_followups()
+
+        self.assertEqual(scheduled, ["1" * 64])
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["outcomes"][0]["status"], "scheduled")
+        self.assertFalse(result["outcomes"][0]["reused"])
+
+    def test_verified_completion_record_uses_verified_snapshot_contract(self) -> None:
+        snapshot = object()
+        completion_sha = "1" * 64
+        record = {
+            "operation": "captain-run-audit-completion",
+            "kind": "grabowski_captain_run_audit",
+            "schema_version": 1,
+            "phase": "completion",
+            "action": "pr-merge",
+        }
+
+        audit_query = types.SimpleNamespace(
+            capture_verified_audit_snapshot=lambda: snapshot,
+        )
+
+        def verified(
+            record_sha256: str,
+            *,
+            snapshot: object,
+            audit_query_module: object,
+        ) -> dict[str, object]:
+            self.assertEqual(record_sha256, completion_sha)
+            self.assertIs(snapshot, audit_query.capture_verified_audit_snapshot())
+            self.assertIs(audit_query_module, audit_query)
+            return record
+
+        orchestration = types.SimpleNamespace(
+            _verified_captain_audit_record=verified,
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "grabowski_audit_query": audit_query,
+                "grabowski_grip_orchestration": orchestration,
+            },
+        ):
+            result = post_merge._verified_captain_completion_record(completion_sha)
+
+        self.assertEqual(result, record)
+
+
 class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
     def test_verified_merge_schedules_durable_freshness_job(self) -> None:
         calls: list[dict[str, object]] = []
@@ -728,13 +1022,13 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
         )
 
         self.assertEqual(jobs[first["unit"]]["final_status"], "launch_submitted")
-        self.assertEqual(len(starts), 2)
-        self.assertNotEqual(first["unit"], second["unit"])
-        self.assertFalse(second["reused"])
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(first["unit"], second["unit"])
+        self.assertEqual(second["status"], "already_satisfied")
+        self.assertTrue(second["reused"])
 
     def test_all_terminal_live_statuses_allow_replacement_job(self) -> None:
         for terminal_status in (
-            "succeeded",
             "failed",
             "timed_out",
             "signalled",

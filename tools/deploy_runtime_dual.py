@@ -211,6 +211,24 @@ WATCHDOG_HOST_ASSETS = (
         reloads_systemd=True,
     ),
     WatchdogHostAsset(
+        source=Path("systemd/grabowski-repoground-post-merge-reconcile.service.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-repoground-post-merge-reconcile.service",
+        mode=0o600,
+        unit="grabowski-repoground-post-merge-reconcile.service",
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-repoground-post-merge-reconcile.timer.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-repoground-post-merge-reconcile.timer",
+        mode=0o600,
+        unit="grabowski-repoground-post-merge-reconcile.timer",
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-operator.service.d/95-repoground-post-merge-reconcile.conf.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-operator.service.d/95-repoground-post-merge-reconcile.conf",
+        mode=0o600,
+        reloads_systemd=True,
+    ),
+    WatchdogHostAsset(
         source=Path("systemd/grabowski-operator-watchdog.service.example"),
         target=core.HOME / ".config/systemd/user/grabowski-operator-watchdog.service",
         mode=0o600,

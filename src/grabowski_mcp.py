@@ -669,7 +669,6 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_agent_competition_compare": ("durable_job",),
     "grabowski_terminal_run": ("terminal_execute",),
     "grabowski_job_start": ("durable_job",),
-    "grabowski_repoground_post_merge_schedule": ("durable_job",),
     "grabowski_job_status": ("durable_job",),
     "grabowski_job_notification_list": ("durable_job",),
     "grabowski_job_notification_ack": ("durable_job",),
@@ -843,7 +842,6 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_agent_competition_compare",
     "grabowski_terminal_run",
     "grabowski_job_start",
-    "grabowski_repoground_post_merge_schedule",
     "grabowski_job_status",
     "grabowski_job_notification_list",
     "grabowski_job_notification_ack",
@@ -9130,24 +9128,16 @@ def _repoground_freshness_from_status(
         comparison_head = checkout_head if checkout_rc == 0 else None
         comparison_ref = "HEAD"
         branch_head_observation: dict[str, Any] | None = None
-        freshness_ref = source_ref
-        if source_kind == "conventional_checkout":
-            publication_ref = status.get("publication_ref")
-            freshness_ref = (
-                publication_ref
-                if isinstance(publication_ref, str) and publication_ref.strip()
-                else "main"
-            )
-        if source_kind in {"publication_source_checkout", "conventional_checkout"}:
+        if source_kind == "publication_source_checkout":
             branch_head_observation = _repoground_remote_branch_observation(
-                repo_path, freshness_ref
+                repo_path, source_ref
             )
             comparison_head = (
                 branch_head_observation.get("head")
                 if branch_head_observation.get("status") == "observed"
                 else None
             )
-            comparison_ref = f"origin/{freshness_ref}" if freshness_ref else None
+            comparison_ref = f"origin/{source_ref}" if source_ref else None
         live.update(
             {
                 "head_returncode": checkout_rc,
@@ -9174,7 +9164,7 @@ def _repoground_freshness_from_status(
             freshness_status = "dirty_overlay"
             reason = "dirty_source_or_publication_overlay"
         elif (
-            source_kind in {"publication_source_checkout", "conventional_checkout"}
+            source_kind == "publication_source_checkout"
             and (
                 branch_head_observation is None
                 or branch_head_observation.get("status") != "observed"
@@ -15158,25 +15148,41 @@ def _grip_run_core(
             and actions[0].get("action") == "pr-merge"
         )
         if captain_pr_merge:
-            try:
-                import grabowski_repoground_post_merge as repoground_post_merge
-
-                result["repoground_freshness_followup"] = (
-                    repoground_post_merge.captain_followup_request(
-                        result,
-                        python_executable=sys.executable,
-                        script_path=Path(repoground_post_merge.__file__).resolve(),
-                    )
-                )
-            except (ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            completion = (
+                result.get("captain_audit", {}).get("completion")
+                if isinstance(result.get("captain_audit"), dict)
+                else None
+            )
+            completion_sha256 = (
+                completion.get("audit_record_sha256")
+                if isinstance(completion, dict)
+                else None
+            )
+            if (
+                isinstance(completion_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", completion_sha256) is not None
+            ):
+                result["repoground_freshness_followup"] = {
+                    "kind": "grabowski.repoground_post_merge_followup",
+                    "schema_version": 1,
+                    "status": "durable_pending",
+                    "reason": "captain_audit_completion_persisted",
+                    "captain_audit_completion_sha256": completion_sha256,
+                    "reconciler": "grabowski-repoground-post-merge-reconcile.timer",
+                    "does_not_establish": [
+                        "job_started",
+                        "freshness_converged",
+                        "future_branch_freshness",
+                    ],
+                }
+            else:
                 result["repoground_freshness_followup"] = {
                     "kind": "grabowski.repoground_post_merge_followup",
                     "schema_version": 1,
                     "status": "schedule_error",
-                    "reason": "followup_integration_failed",
-                    "error_class": type(exc).__name__,
+                    "reason": "captain_audit_completion_unavailable",
                     "does_not_establish": [
-                        "job_not_started",
+                        "job_started",
                         "freshness_failed",
                         "merge_failure",
                     ],

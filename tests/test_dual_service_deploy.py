@@ -2262,7 +2262,7 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         return SimpleNamespace(repo_head="a" * 40)
 
     def test_default_projection_declares_complete_watchdog_asset_set(self) -> None:
-        self.assertEqual(15, len(dual.WATCHDOG_HOST_ASSETS))
+        self.assertEqual(18, len(dual.WATCHDOG_HOST_ASSETS))
         self.assertEqual(
             {
                 "tools/component_watchdog.py",
@@ -2274,6 +2274,9 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                 "systemd/grabowski-external-connector-maulwurf-x.service.example",
                 "systemd/tunnel-client-grabowski.service.d/70-operator-dependency.conf.example",
                 "systemd/grabowski-operator.service.d/90-recovery-target.conf.example",
+                "systemd/grabowski-repoground-post-merge-reconcile.service.example",
+                "systemd/grabowski-repoground-post-merge-reconcile.timer.example",
+                "systemd/grabowski-operator.service.d/95-repoground-post-merge-reconcile.conf.example",
                 "systemd/grabowski-operator-watchdog.service.example",
                 "systemd/grabowski-operator-watchdog.timer.example",
                 "systemd/grabowski-tunnel-watchdog.service.example",
@@ -2288,6 +2291,8 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                 "grabowski-transport-ingress.service",
                 "grabowski-transport-ingress-maulwurf-x.service",
                 "grabowski-external-connector-maulwurf-x.service",
+                "grabowski-repoground-post-merge-reconcile.service",
+                "grabowski-repoground-post-merge-reconcile.timer",
                 "grabowski-operator-watchdog.service",
                 "grabowski-operator-watchdog.timer",
                 "grabowski-tunnel-watchdog.service",
@@ -2297,6 +2302,17 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
             },
             {asset.unit for asset in dual.WATCHDOG_HOST_ASSETS if asset.unit},
         )
+
+    def test_repoground_post_merge_reconcile_assets_are_operator_lifecycle_bound(self) -> None:
+        sources = {asset.source.as_posix(): asset for asset in dual.WATCHDOG_HOST_ASSETS}
+        service = sources["systemd/grabowski-repoground-post-merge-reconcile.service.example"]
+        timer = sources["systemd/grabowski-repoground-post-merge-reconcile.timer.example"]
+        dropin = sources["systemd/grabowski-operator.service.d/95-repoground-post-merge-reconcile.conf.example"]
+        self.assertEqual("grabowski-repoground-post-merge-reconcile.service", service.unit)
+        self.assertEqual("grabowski-repoground-post-merge-reconcile.timer", timer.unit)
+        self.assertTrue(dropin.reloads_systemd)
+        self.assertIsNone(dropin.unit)
+
 
     def test_watchdog_helper_is_installed_before_importing_script(self) -> None:
         sources = [asset.source.as_posix() for asset in dual.WATCHDOG_HOST_ASSETS]
