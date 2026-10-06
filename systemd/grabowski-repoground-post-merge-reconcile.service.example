@@ -11,4 +11,6 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%h/.local/state/grabowski
 UMask=0077
-TimeoutStartSec=120s
+# Worst case: 16 reusable-slot status reads at 30s each plus a 60s launch.
+# Keep additional margin for audit verification and launch ambiguity readback.
+TimeoutStartSec=900s

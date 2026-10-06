@@ -1613,14 +1613,20 @@ def reconcile_recent_captain_audit_followups(
             raise RepoGroundPostMergeError(
                 "Captain audit reconciliation snapshot item is invalid"
             )
-        timestamp_unix = _reconcile_record_timestamp_unix(record)
+        is_pr_merge_completion = bool(
+            record.get("operation") == "captain-run-audit-completion"
+            and record.get("action") == "pr-merge"
+        )
+        try:
+            timestamp_unix = _reconcile_record_timestamp_unix(record)
+        except RepoGroundPostMergeError:
+            if is_pr_merge_completion:
+                raise
+            continue
         if timestamp_unix < since_unix:
             lookback_horizon_reached = True
             break
-        if (
-            record.get("operation") != "captain-run-audit-completion"
-            or record.get("action") != "pr-merge"
-        ):
+        if not is_pr_merge_completion:
             continue
         record_sha256 = evidence.get("record_sha256")
         if (
