@@ -15682,6 +15682,80 @@ def _runtime_deploy_origin_main_refresh_evidence_valid(
     )
 
 
+def _runtime_deploy_origin_main_fetch_effect_evidence_valid(
+    evidence: Any,
+    *,
+    expected_head: str,
+) -> bool:
+    fields = {
+        "schema_version",
+        "kind",
+        "canonical_repository",
+        "expected_head",
+        "previous_head",
+        "previous_branch",
+        "previous_origin_main",
+        "owner_id",
+        "operation_resource_key",
+        "canonical_resource_key",
+        "common_dir_resource_key",
+        "objects_resource_key",
+        "origin_main_ref_resource_key",
+        "target_object",
+        "fetch",
+        "public_github_main",
+        "effect_observed",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    material = {k:v for k,v in evidence.items() if k != "evidence_sha256"}
+    fetch = evidence.get("fetch")
+    target_object = evidence.get("target_object")
+    public = evidence.get("public_github_main")
+    resource_fields = (
+        "operation_resource_key",
+        "canonical_resource_key",
+        "common_dir_resource_key",
+        "objects_resource_key",
+        "origin_main_ref_resource_key",
+    )
+    return bool(
+        evidence.get("schema_version") == 1
+        and evidence.get("kind") == "grabowski_runtime_deploy_origin_main_fetch_effect"
+        and evidence.get("expected_head") == expected_head
+        and evidence.get("effect_observed") is True
+        and isinstance(evidence.get("canonical_repository"), str)
+        and str(evidence.get("canonical_repository")).startswith("/")
+        and isinstance(evidence.get("previous_head"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", evidence.get("previous_head", "")) is not None
+        and isinstance(evidence.get("previous_origin_main"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", evidence.get("previous_origin_main", "")) is not None
+        and (
+            evidence.get("previous_branch") is None
+            or isinstance(evidence.get("previous_branch"), str)
+        )
+        and isinstance(evidence.get("owner_id"), str)
+        and bool(evidence.get("owner_id"))
+        and all(
+            isinstance(evidence.get(k), str) and bool(evidence.get(k))
+            for k in resource_fields
+        )
+        and isinstance(fetch, dict)
+        and set(fetch) == {"returncode", "timed_out"}
+        and fetch.get("returncode") == 0
+        and fetch.get("timed_out") is False
+        and isinstance(target_object, dict)
+        and set(target_object) == {"before_fetch_present", "after_fetch_commit"}
+        and target_object.get("before_fetch_present") is False
+        and target_object.get("after_fetch_commit") == expected_head
+        and isinstance(public, dict)
+        and set(public) == {"before_fetch"}
+        and public.get("before_fetch") == expected_head
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
+
+
 def _runtime_deploy_origin_main_refresh_effect_evidence_valid(
     evidence: Any,
     *,
@@ -15914,6 +15988,11 @@ def _runtime_deploy_local_mutation_evidence_valid(
         expected_head=expected_head,
     ):
         return True
+    if _runtime_deploy_origin_main_fetch_effect_evidence_valid(
+        evidence,
+        expected_head=expected_head,
+    ):
+        return True
     if _runtime_deploy_origin_main_refresh_effect_evidence_valid(
         evidence,
         expected_head=expected_head,
@@ -15949,6 +16028,7 @@ def _runtime_deploy_local_mutation_evidence_valid(
         "grabowski_runtime_deploy_pending_unit_promotion": -1,
         "grabowski_runtime_deploy_stale_pending_reconciliation": 0,
         "grabowski_runtime_deploy_origin_main_refresh": 1,
+        "grabowski_runtime_deploy_origin_main_fetch_effect": 1,
         "grabowski_runtime_deploy_origin_main_refresh_effect": 1,
         "grabowski_runtime_deploy_rootbroker_authority_effect": 2,
         "grabowski_runtime_deploy_auto_source_effect": 3,
@@ -15972,6 +16052,11 @@ def _runtime_deploy_local_mutation_evidence_valid(
             )
         elif kind == "grabowski_runtime_deploy_origin_main_refresh":
             valid = _runtime_deploy_origin_main_refresh_evidence_valid(
+                effect,
+                expected_head=expected_head,
+            )
+        elif kind == "grabowski_runtime_deploy_origin_main_fetch_effect":
+            valid = _runtime_deploy_origin_main_fetch_effect_evidence_valid(
                 effect,
                 expected_head=expected_head,
             )

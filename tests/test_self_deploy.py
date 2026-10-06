@@ -1337,6 +1337,7 @@ class SelfDeployToolTests(unittest.TestCase):
                     _result(origin),
                     _result(""),
                     _result("false"),
+                    _result("", 1),
                 ],
             ) as git_result:
                 snapshot = SELF_DEPLOY._canonical_main_refresh_candidate(expected)
@@ -1344,8 +1345,9 @@ class SelfDeployToolTests(unittest.TestCase):
             self.assertEqual(snapshot["origin_main"], origin)
             self.assertEqual(snapshot["target_head"], expected)
             self.assertFalse(snapshot["shallow"])
+            self.assertFalse(snapshot["target_object_present"])
             flattened = [item for call_item in git_result.call_args_list for item in call_item.args]
-            self.assertNotIn(f"{expected}^{{commit}}", flattened)
+            self.assertIn(f"{expected}^{{commit}}", flattened)
             self.assertFalse(any("merge-base" in call_item.args for call_item in git_result.call_args_list))
 
     def test_schedule_preflight_defers_exact_source_for_clean_non_main_checkout(self) -> None:

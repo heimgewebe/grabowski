@@ -740,6 +740,131 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
                     invalid, expected_job_prefix="grabowski-job-", expected_head=CAPTAIN_HEAD
                 )
             )
+    def test_origin_main_refresh_post_fetch_failure_reports_observed_effect(self) -> None:
+        canonical = Path("/tmp/pr1366-origin-main-fetch-effect")
+        common = canonical / ".git"
+        expected = "d" * 40
+        current = "a" * 40
+        previous_origin = "b" * 40
+        owner = "runtime-deploy-ref:dddddddddddd:abc123def456"
+        plan = {
+            "canonical_repository": canonical,
+            "owner_id": owner,
+            "operation_key": f"repo:{canonical}:operation:runtime-deploy-origin-main-refresh",
+            "canonical_key": f"path:{canonical}",
+            "common_dir_key": f"path:{common}",
+            "objects_key": f"path:{common / 'objects'}",
+            "origin_main_ref_key": f"path:{common / 'refs/remotes/origin/main'}",
+        }
+        leases = [
+            {
+                "resource_key": key,
+                "owner_id": owner,
+                "acquired_at_unix": 10,
+                "updated_at_unix": 10,
+                "expires_at_unix": 100,
+                "metadata_sha256": str(index) * 64,
+            }
+            for index, key in enumerate(
+                [
+                    plan["operation_key"],
+                    plan["canonical_key"],
+                    plan["common_dir_key"],
+                    plan["objects_key"],
+                    plan["origin_main_ref_key"],
+                ],
+                start=1,
+            )
+        ]
+        initial = {
+            "canonical_repository": str(canonical),
+            "current_head": current,
+            "current_branch": "feature/active-work",
+            "target_head": expected,
+            "origin_main": previous_origin,
+            "clean": True,
+            "shallow": False,
+            "target_object_present": False,
+            "lease_evidence": {
+                "resource_key": f"path:{canonical}",
+                "lease": None,
+            },
+        }
+        locked = dict(initial)
+        with patch.object(
+            SELF_DEPLOY, "_origin_main_refresh_plan", return_value=plan
+        ), patch.object(
+            SELF_DEPLOY,
+            "_acquire_origin_main_refresh_resources",
+            return_value={"leases": leases},
+        ), patch.object(
+            SELF_DEPLOY,
+            "_release_origin_main_refresh_resources",
+            return_value={"released": leases},
+        ) as release, patch.object(
+            SELF_DEPLOY,
+            "_canonical_main_refresh_candidate",
+            side_effect=[locked, RuntimeError("canonical drift after fetch")],
+        ), patch.object(
+            SELF_DEPLOY,
+            "_fresh_public_github_main",
+            return_value=expected,
+        ), patch.object(
+            SELF_DEPLOY,
+            "_mutating_git_result",
+            return_value=_result(""),
+        ) as mutate, patch.object(
+            SELF_DEPLOY,
+            "_git_result",
+            return_value=_result(expected),
+        ):
+            with self.assertRaises(
+                SELF_DEPLOY.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                SELF_DEPLOY._refresh_canonical_origin_main(expected, initial)
+        mutate.assert_called_once()
+        self.assertEqual(mutate.call_args.args[1], "fetch")
+        release.assert_called_once()
+        evidence = raised.exception.local_mutation_evidence
+        self.assertEqual(
+            evidence["kind"],
+            "grabowski_runtime_deploy_origin_main_fetch_effect",
+        )
+        self.assertEqual(
+            evidence["target_object"],
+            {
+                "before_fetch_present": False,
+                "after_fetch_commit": expected,
+            },
+        )
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                evidence,
+                expected_job_prefix="grabowski-job-",
+                expected_head=expected,
+            )
+        )
+        forged_material = {
+            key: value
+            for key, value in evidence.items()
+            if key != "evidence_sha256"
+        }
+        forged_material["target_object"] = {
+            **evidence["target_object"],
+            "before_fetch_present": True,
+        }
+        forged = {
+            **forged_material,
+            "evidence_sha256": grips.sha256_json(forged_material),
+        }
+        self.assertFalse(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                forged,
+                expected_job_prefix="grabowski-job-",
+                expected_head=expected,
+            )
+        )
+
     def test_origin_main_refresh_post_cas_failure_reports_observed_effect(self) -> None:
         canonical = Path("/tmp/pr1366-origin-main-effect")
         common = canonical / ".git"

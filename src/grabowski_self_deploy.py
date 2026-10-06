@@ -2943,6 +2943,20 @@ def _canonical_main_refresh_candidate(
         _git_result(canonical, "rev-parse", "--is-shallow-repository"),
         "canonical shallow-repository lookup",
     )
+    target_object = _git_result(
+        canonical,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"{expected_head}^{{commit}}",
+    )
+    target_object_returncode = target_object.get("returncode")
+    if (
+        target_object.get("timed_out") is True
+        or isinstance(target_object_returncode, bool)
+        or target_object_returncode not in {0, 1}
+    ):
+        raise RuntimeError("protected-main target object presence probe failed")
     if status:
         raise RuntimeError(
             "protected-main ref refresh requires a clean canonical checkout"
@@ -2962,6 +2976,7 @@ def _canonical_main_refresh_candidate(
         "origin_main": origin_main,
         "clean": True,
         "shallow": False,
+        "target_object_present": target_object_returncode == 0,
         "lease_evidence": lease_evidence,
     }
 
@@ -3040,6 +3055,56 @@ def _release_origin_main_refresh_resources(
     return resources.release_resources(
         plan["owner_id"], resource_keys, expected_leases=expected_leases
     )
+
+
+def _origin_main_fetch_effect_evidence(
+    *,
+    plan: dict[str, Any],
+    pre_fetch_snapshot: dict[str, Any],
+    expected_head: str,
+    resolved_target: str,
+    fetch_result: dict[str, Any],
+    public_before_fetch: str,
+) -> dict[str, Any]:
+    if (
+        pre_fetch_snapshot.get("target_object_present") is not False
+        or resolved_target != expected_head
+        or public_before_fetch != expected_head
+        or fetch_result.get("timed_out") is True
+        or fetch_result.get("returncode") != 0
+    ):
+        raise RuntimeError(
+            "protected-main fetch effect evidence is not bound to an observed object-store mutation"
+        )
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_origin_main_fetch_effect",
+        "canonical_repository": str(plan["canonical_repository"]),
+        "expected_head": expected_head,
+        "previous_head": pre_fetch_snapshot["current_head"],
+        "previous_branch": pre_fetch_snapshot.get("current_branch"),
+        "previous_origin_main": pre_fetch_snapshot["origin_main"],
+        "owner_id": plan["owner_id"],
+        "operation_resource_key": plan["operation_key"],
+        "canonical_resource_key": plan["canonical_key"],
+        "common_dir_resource_key": plan["common_dir_key"],
+        "objects_resource_key": plan["objects_key"],
+        "origin_main_ref_resource_key": plan["origin_main_ref_key"],
+        "target_object": {
+            "before_fetch_present": False,
+            "after_fetch_commit": resolved_target,
+        },
+        "fetch": {
+            "returncode": fetch_result.get("returncode"),
+            "timed_out": fetch_result.get("timed_out") is True,
+        },
+        "public_github_main": {"before_fetch": public_before_fetch},
+        "effect_observed": True,
+    }
+    return {
+        **material,
+        "evidence_sha256": _source_identity_sha256(material),
+    }
 
 
 def _origin_main_refresh_effect_evidence(
@@ -3155,13 +3220,6 @@ def _refresh_canonical_origin_main(
         )
         if fetch_result.get("timed_out") is True or fetch_result.get("returncode") != 0:
             raise RuntimeError("exact protected-main object fetch failed")
-        after_fetch = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
-        if _canonical_main_refresh_state(after_fetch) != _canonical_main_refresh_state(
-            initial_snapshot
-        ):
-            raise RuntimeError(
-                "canonical checkout or origin/main changed during exact object fetch"
-            )
         resolved_target = _required_stdout(
             _git_result(
                 canonical,
@@ -3173,6 +3231,22 @@ def _refresh_canonical_origin_main(
         )
         if resolved_target != expected_head:
             raise RuntimeError("fetched protected-main object does not match expected head")
+        if locked.get("target_object_present") is False:
+            observed_effect_evidence = _origin_main_fetch_effect_evidence(
+                plan=plan,
+                pre_fetch_snapshot=locked,
+                expected_head=expected_head,
+                resolved_target=resolved_target,
+                fetch_result=fetch_result,
+                public_before_fetch=public_before_fetch,
+            )
+        after_fetch = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if _canonical_main_refresh_state(after_fetch) != _canonical_main_refresh_state(
+            initial_snapshot
+        ):
+            raise RuntimeError(
+                "canonical checkout or origin/main changed during exact object fetch"
+            )
         if initial_snapshot.get("current_branch") == "main":
             head_ancestor = _git_result(
                 canonical,
