@@ -8,6 +8,7 @@ become a way around the gate for anything else.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 from pathlib import Path
 import stat
@@ -781,6 +782,89 @@ class TrustAnchorTests(unittest.TestCase):
 
 
 class PendingPromotionRecoveryTests(unittest.TestCase):
+    def test_real_initial_gates_reach_bound_recheck_only_with_independent_authority(self) -> None:
+        for lane in ("repair", "resume"):
+            for state in ("identical", "stale", "competitor", "unreadable", "kill_switch", "blockade", "audit"):
+                with self.subTest(lane=lane, state=state), tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(provenance_recovery.Path, "home", return_value=Path(temporary)))
+                    identity = _source_identity(ROOT)
+                    unit = "grabowski-job-abcdef012345"
+                    match = {"unit": unit, "argv_sha256": "a" * 64}
+                    binding = {
+                        "cutover_id": "bgc-initial", "resumed_receipt_sha256": "cd" * 32,
+                        "binding_sha256": "ab" * 32,
+                        "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+                    }
+                    reconciliation = {
+                        "schema_version": 1,
+                        "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+                        "unit": unit, "dispatch_outcome": "not_started",
+                        "deploy_index_updated": True, "audit_recorded": True,
+                        "index_updated_at_unix": 1,
+                    }
+                    reconciliation["evidence_sha256"] = hashlib.sha256(
+                        json.dumps(reconciliation, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest()
+
+                    def indexed(command=None, *, prune=False, reconcile_stale_pending=False):
+                        recheck = command is not None
+                        if recheck:
+                            self.assertTrue(prune)
+                            self.assertTrue(reconcile_stale_pending)
+                        return {
+                            "blocking_units": [] if recheck and state in {"identical", "stale"} else [unit],
+                            "inflight_units": [] if recheck and state == "stale" else [unit],
+                            "idempotent_match": match if recheck and state == "identical" else None,
+                            "pruned_units": [],
+                            "stale_pending_reconciliation": reconciliation if recheck and state == "stale" else None,
+                            "error": "unreadable index" if state == "unreadable" else None,
+                        }
+
+                    reader = stack.enter_context(patch.object(
+                        provenance_recovery.self_deploy, "inflight_runtime_job_evidence",
+                        side_effect=indexed, create=True,
+                    ))
+                    stack.enter_context(patch.object(provenance_recovery.base, "_verify_audit_log", return_value={
+                        "valid": state != "audit", "audit_writable": True,
+                    }))
+                    stack.enter_context(patch.object(provenance_recovery.base, "_kill_switch_state", return_value={"engaged": state == "kill_switch"}))
+                    stack.enter_context(patch.object(provenance_recovery, "_blockade_evidence", return_value={"allows_mutation": state != "blockade"}))
+                    stack.enter_context(patch.object(provenance_recovery.privileged, "grabowski_privileged_broker_status", return_value={"ready": True}))
+                    stack.enter_context(patch.object(provenance_recovery, "_integrity_evidence", return_value={"repair_warranted": True, "failed_integrity_flags": ["provenance_valid"]}))
+                    stack.enter_context(patch.object(provenance_recovery.recovery, "_fresh_text_marker", return_value={"valid": True}))
+                    stack.enter_context(patch.object(provenance_recovery, "_target_contract_evidence", return_value={"contract_valid": True, "validator_is_deployed": True}))
+                    stack.enter_context(patch.object(provenance_recovery, "_recovery_lane", return_value={
+                        "lane": provenance_recovery.midcutover.LANE_SCHEDULED_DEPLOY if lane == "repair" else provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+                        "resume_binding": binding,
+                    }))
+                    stack.enter_context(patch.object(provenance_recovery.self_deploy, "_deployment_source_preflight", return_value=(ROOT, ROOT / "tools/run_scheduled_deploy.py", identity)))
+                    stack.enter_context(patch.object(provenance_recovery, "_resume_source_preflight", return_value=(ROOT, ROOT / "tools/run_midcutover_resume.py", identity)))
+                    stack.enter_context(patch.object(provenance_recovery, "_resume_effect_repository", return_value=ROOT))
+                    stack.enter_context(patch.object(provenance_recovery.base, "_require_valid_audit_chain"))
+                    stack.enter_context(patch.object(provenance_recovery.operator, "_jobs_root", return_value=ROOT))
+                    write = stack.enter_context(patch.object(provenance_recovery.self_deploy, "_write_deploy_index"))
+                    start = stack.enter_context(patch.object(provenance_recovery.operator, "_start_job", return_value=match))
+                    run = (lambda: provenance_recovery._repair_under_schedule_lock(HEAD, None, None, 8)) if lane == "repair" else (lambda: provenance_recovery._resume_under_schedule_lock(HEAD))
+                    if state in {"identical", "stale"}:
+                        result = run()
+                        self.assertFalse(result["gate"]["allowed"])
+                        self.assertEqual(result["recheck"]["reasons"], [])
+                        if state == "identical":
+                            self.assertTrue(result["already_dispatched"])
+                            start.assert_not_called()
+                            write.assert_not_called()
+                        else:
+                            start.assert_called_once()
+                            self.assertEqual(result["local_mutation_evidence"], reconciliation)
+                    else:
+                        with self.assertRaises(provenance_recovery.ProvenanceRecoveryDenied):
+                            run()
+                        start.assert_not_called()
+                        write.assert_not_called()
+                    self.assertEqual(reader.call_args_list[0].args, (None,))
+                    self.assertFalse(reader.call_args_list[0].kwargs["reconcile_stale_pending"])
+                    self.assertEqual(reader.call_count, 2 if state in {"identical", "stale", "competitor"} else 1)
+
     def _promotion(self) -> dict:
         from tests.test_self_deploy import SELF_DEPLOY
 

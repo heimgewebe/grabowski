@@ -981,6 +981,30 @@ def grabowski_recovery_provenance_repair(
         )
 
 
+def _initial_gate_admits_locked_recheck(gate: dict[str, Any]) -> bool:
+    """Defer only clean competition to the command-bound locked recheck.
+
+    An assessment cannot identify our command or clear stale reservations. Every
+    independent authority check must already pass before that recheck may run.
+    """
+    if gate["allowed"]:
+        return True
+    checks = gate.get("checks", {})
+    competing = gate.get("competing_deployment", {})
+    return bool(
+        gate.get("reasons") == ["no_competing_deployment"]
+        and len(checks) > 1
+        and checks.get("no_competing_deployment") is False
+        and all(
+            passed is True
+            for name, passed in checks.items()
+            if name != "no_competing_deployment"
+        )
+        and competing.get("deploy_lock_free") is True
+        and competing.get("error") is None
+    )
+
+
 def _resume_under_schedule_lock(
     expected_head: str,
     source_repository: str | None = None,
@@ -988,7 +1012,7 @@ def _resume_under_schedule_lock(
 ) -> dict[str, Any]:
     """Gate, source-bind and dispatch the mid-cutover resume under the deploy lock."""
     gate = evaluate_resume_gate(expected_head)
-    if not gate["allowed"]:
+    if not _initial_gate_admits_locked_recheck(gate):
         base._append_audit(
             {
                 "timestamp_unix": int(time.time()),
@@ -1086,6 +1110,7 @@ def _resume_under_schedule_lock(
             "expected_head": expected_head,
             "cutover_id": resume_binding["cutover_id"],
             "gate": gate,
+            "recheck": volatile,
             "job": already_running,
             "already_dispatched": True,
             "stale_pending_reconciliation": stale_pending_reconciliation,
@@ -1234,6 +1259,7 @@ def _resume_under_schedule_lock(
         "resume_binding_sha256": resume_binding["binding_sha256"],
         "source_identity_sha256": source_identity["identity_sha256"],
         "gate": gate,
+        "recheck": volatile,
         "job": job,
         "intent_sha256": intent_sha256,
         "scheduled_sha256": scheduled_sha256,
@@ -1262,7 +1288,7 @@ def _repair_under_schedule_lock(
 ) -> dict[str, Any]:
     """Gate, reserve and dispatch, all under the deploy schedule lock."""
     gate = evaluate_gate(expected_head, source_repository, source_lease_owner_id)
-    if not gate["allowed"]:
+    if not _initial_gate_admits_locked_recheck(gate):
         base._append_audit(
             {
                 "timestamp_unix": int(time.time()),
@@ -1360,6 +1386,7 @@ def _repair_under_schedule_lock(
             "kind": "grabowski_provenance_recovery_receipt",
             "expected_head": expected_head,
             "gate": gate,
+            "recheck": volatile,
             "job": already_running,
             "already_dispatched": True,
             "stale_pending_reconciliation": stale_pending_reconciliation,
@@ -1514,6 +1541,7 @@ def _repair_under_schedule_lock(
         "kind": "grabowski_provenance_recovery_receipt",
         "expected_head": expected_head,
         "gate": gate,
+        "recheck": volatile,
         "job": job,
         "intent_sha256": intent_sha256,
         "scheduled_sha256": scheduled_sha256,
