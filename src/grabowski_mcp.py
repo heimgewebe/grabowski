@@ -15184,7 +15184,7 @@ def _grip_run_core(
                     "status": "durable_pending",
                     "reason": "captain_audit_completion_persisted",
                     "captain_audit_completion_sha256": completion_sha256,
-                    "reconciler": "grabowski-reconcile-tasks.timer",
+                    "reconciler": "grabowski-repoground-post-merge-reconcile.timer",
                     "does_not_establish": [
                         "job_started",
                         "freshness_converged",

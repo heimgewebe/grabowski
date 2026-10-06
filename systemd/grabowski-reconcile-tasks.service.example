@@ -5,7 +5,6 @@ After=default.target
 [Service]
 Type=oneshot
 ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python -m grabowski_task_reconcile --mode refresh --batch-size 100
-ExecStartPost=%h/.local/share/grabowski-mcp/.venv/bin/python -I -m grabowski_repoground_post_merge --reconcile-audit-followups --reconcile-lookback-seconds 900
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

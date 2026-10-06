@@ -34,6 +34,7 @@ DEFAULT_CONVERGENCE_RUNTIME_RESERVE_SECONDS = int(
 DEFAULT_QUEUE_WATCH_SECONDS = float(
     DEFAULT_JOB_RUNTIME_SECONDS - DEFAULT_CONVERGENCE_RUNTIME_RESERVE_SECONDS
 )
+DEFAULT_RECONCILE_LOOKBACK_SECONDS = DEFAULT_JOB_RUNTIME_SECONDS + 3_600
 QUEUE_OBSERVATION_LIMIT = 20
 
 PublisherRunner = Callable[[list[str], int], dict[str, Any]]
@@ -1492,7 +1493,7 @@ def schedule_from_captain_audit_completion(
 
 def reconcile_recent_captain_audit_followups(
     *,
-    lookback_seconds: int = 900,
+    lookback_seconds: int = DEFAULT_RECONCILE_LOOKBACK_SECONDS,
     limit: int = 64,
 ) -> dict[str, Any]:
     if type(lookback_seconds) is not int or not 60 <= lookback_seconds <= 86_400:
@@ -1581,7 +1582,11 @@ def _parser() -> argparse.ArgumentParser:
     mode.add_argument("--merge-sha")
     mode.add_argument("--pr", type=int)
     mode.add_argument("--reconcile-audit-followups", action="store_true")
-    parser.add_argument("--reconcile-lookback-seconds", type=int, default=900)
+    parser.add_argument(
+        "--reconcile-lookback-seconds",
+        type=int,
+        default=DEFAULT_RECONCILE_LOOKBACK_SECONDS,
+    )
     parser.add_argument("--expected-head")
     parser.add_argument("--expected-base")
     parser.add_argument("--target-branch", default="main")

@@ -658,6 +658,12 @@ class RepoGroundCaptainAuditFollowupTests(unittest.TestCase):
 
 
 class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
+    def test_default_reconcile_lookback_outlives_durable_job_runtime(self) -> None:
+        self.assertGreater(
+            post_merge.DEFAULT_RECONCILE_LOOKBACK_SECONDS,
+            post_merge.DEFAULT_JOB_RUNTIME_SECONDS,
+        )
+
     def test_reconcile_scans_newest_captain_audits_first(self) -> None:
         calls: list[dict[str, object]] = []
 
