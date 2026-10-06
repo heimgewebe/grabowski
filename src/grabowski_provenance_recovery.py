@@ -987,8 +987,8 @@ def _initial_gate_admits_locked_recheck(gate: dict[str, Any]) -> bool:
     An assessment cannot identify our command or clear stale reservations. Every
     independent authority check must already pass before that recheck may run.
     """
-    if gate["allowed"]:
-        return True
+    if gate.get("allowed") is True:
+        return not gate.get("reasons")
     checks = gate.get("checks", {})
     competing = gate.get("competing_deployment", {})
     return bool(
