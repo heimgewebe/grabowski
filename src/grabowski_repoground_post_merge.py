@@ -47,7 +47,14 @@ QueueConverger = Callable[[str, str], dict[str, Any]]
 
 
 POST_MERGE_TERMINAL_JOB_STATUSES = frozenset(
-    {"succeeded", "failed", "launch_failed"}
+    {
+        "succeeded",
+        "failed",
+        "timed_out",
+        "signalled",
+        "terminated_unclear",
+        "launch_failed",
+    }
 )
 POST_MERGE_JOB_SLOT_LIMIT = 16
 
@@ -1002,19 +1009,12 @@ def _schedule_request_identity(request: dict[str, Any]) -> dict[str, Any]:
     return identity
 
 
-def schedule_from_captain_result(
-    result: dict[str, Any],
+def schedule_followup_request(
+    request: dict[str, Any],
     *,
     job_starter: JobStarter,
-    python_executable: str,
-    script_path: Path,
     runtime_seconds: int = DEFAULT_JOB_RUNTIME_SECONDS,
 ) -> dict[str, Any]:
-    request = captain_followup_request(
-        result,
-        python_executable=python_executable,
-        script_path=script_path,
-    )
     request_status = request.get("status")
     if request_status not in {"ready", "ready_queue_watch"}:
         return request
@@ -1172,6 +1172,26 @@ def schedule_from_captain_result(
             "future_branch_freshness",
         ],
     }
+
+def schedule_from_captain_result(
+    result: dict[str, Any],
+    *,
+    job_starter: JobStarter,
+    python_executable: str,
+    script_path: Path,
+    runtime_seconds: int = DEFAULT_JOB_RUNTIME_SECONDS,
+) -> dict[str, Any]:
+    request = captain_followup_request(
+        result,
+        python_executable=python_executable,
+        script_path=script_path,
+    )
+    return schedule_followup_request(
+        request,
+        job_starter=job_starter,
+        runtime_seconds=runtime_seconds,
+    )
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(

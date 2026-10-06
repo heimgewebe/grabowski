@@ -8473,6 +8473,25 @@ def grabowski_job_start(
     return result
 
 
+@mcp.tool(name="grabowski_repoground_post_merge_schedule", annotations=MUTATING)
+def grabowski_repoground_post_merge_schedule(
+    followup_request: dict[str, Any],
+) -> dict[str, Any]:
+    """Start one Captain-produced RepoGround follow-up as a separate mutation."""
+
+    import grabowski_repoground_post_merge as repoground_post_merge
+
+    starter = repoground_post_merge.resolve_job_starter(
+        {"grabowski_operator": sys.modules[__name__]}
+    )
+    if starter is None:
+        raise RuntimeError("durable RepoGround post-merge job starter is unavailable")
+    return repoground_post_merge.schedule_followup_request(
+        followup_request,
+        job_starter=starter,
+    )
+
+
 @mcp.tool(name="grabowski_job_status", annotations=READ_ONLY)
 def grabowski_job_status(
     unit: str,

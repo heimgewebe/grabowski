@@ -669,6 +669,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_agent_competition_compare": ("durable_job",),
     "grabowski_terminal_run": ("terminal_execute",),
     "grabowski_job_start": ("durable_job",),
+    "grabowski_repoground_post_merge_schedule": ("durable_job",),
     "grabowski_job_status": ("durable_job",),
     "grabowski_job_notification_list": ("durable_job",),
     "grabowski_job_notification_ack": ("durable_job",),
@@ -842,6 +843,7 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_agent_competition_compare",
     "grabowski_terminal_run",
     "grabowski_job_start",
+    "grabowski_repoground_post_merge_schedule",
     "grabowski_job_status",
     "grabowski_job_notification_list",
     "grabowski_job_notification_ack",
@@ -15159,13 +15161,9 @@ def _grip_run_core(
             try:
                 import grabowski_repoground_post_merge as repoground_post_merge
 
-                job_starter = repoground_post_merge.resolve_job_starter(sys.modules)
-                if job_starter is None:
-                    raise RuntimeError("durable Grabowski job starter is unavailable")
                 result["repoground_freshness_followup"] = (
-                    repoground_post_merge.schedule_from_captain_result(
+                    repoground_post_merge.captain_followup_request(
                         result,
-                        job_starter=job_starter,
                         python_executable=sys.executable,
                         script_path=Path(repoground_post_merge.__file__).resolve(),
                     )

@@ -732,6 +732,84 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
         self.assertNotEqual(first["unit"], second["unit"])
         self.assertFalse(second["reused"])
 
+    def test_all_terminal_live_statuses_allow_replacement_job(self) -> None:
+        for terminal_status in (
+            "succeeded",
+            "failed",
+            "timed_out",
+            "signalled",
+            "terminated_unclear",
+            "launch_failed",
+        ):
+            with self.subTest(terminal_status=terminal_status):
+                jobs: dict[str, dict[str, object]] = {}
+                live_status: dict[str, str] = {}
+                starts: list[str] = []
+
+                def argv_hash(_argv: list[str]) -> str:
+                    return "e" * 64
+
+                def read_metadata(unit: str) -> dict[str, object]:
+                    if unit not in jobs:
+                        raise ValueError("missing")
+                    return jobs[unit]
+
+                def read_status(unit: str) -> dict[str, object]:
+                    metadata = read_metadata(unit)
+                    return {
+                        "unit": unit,
+                        "metadata": metadata,
+                        "final_status": live_status[unit],
+                    }
+
+                def private_start(
+                    argv: list[str],
+                    *,
+                    cwd: str,
+                    runtime_seconds: int,
+                    reserved_unit: str,
+                ) -> dict[str, object]:
+                    starts.append(reserved_unit)
+                    job: dict[str, object] = {
+                        "unit": reserved_unit,
+                        "job_id": reserved_unit.removeprefix("grabowski-job-"),
+                        "argv_sha256": argv_hash(argv),
+                        "cwd": cwd,
+                        "runtime_seconds": runtime_seconds,
+                        "final_status": "launch_submitted",
+                    }
+                    jobs[reserved_unit] = job
+                    live_status[reserved_unit] = "running"
+                    return job
+
+                operator = types.SimpleNamespace(
+                    grabowski_job_start=lambda *_args, **_kwargs: {},
+                    grabowski_job_status=read_status,
+                    _argv_hash=argv_hash,
+                    _read_job_metadata=read_metadata,
+                    _require_operator_mutation=lambda *_args, **_kwargs: None,
+                    _start_job=private_start,
+                )
+                starter = post_merge.resolve_job_starter({"grabowski_operator": operator})
+                self.assertIsNotNone(starter)
+                first = post_merge.schedule_from_captain_result(
+                    captain_result(completed=False, queued=True),
+                    job_starter=starter,
+                    python_executable="/usr/bin/python3",
+                    script_path=Path(post_merge.__file__),
+                )
+                live_status[first["unit"]] = terminal_status
+                second = post_merge.schedule_from_captain_result(
+                    captain_result(completed=False, queued=True),
+                    job_starter=starter,
+                    python_executable="/usr/bin/python3",
+                    script_path=Path(post_merge.__file__),
+                )
+                self.assertEqual(len(starts), 2)
+                self.assertNotEqual(first["unit"], second["unit"])
+                self.assertFalse(second["reused"])
+
+
     def test_uncertain_live_queue_job_fails_closed_without_duplicate(self) -> None:
         jobs: dict[str, dict[str, object]] = {}
         live_status: dict[str, str] = {}
