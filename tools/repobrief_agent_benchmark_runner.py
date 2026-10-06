@@ -1376,6 +1376,23 @@ def _authorized_manifest_paths(
     return frozenset(paths)
 
 
+def _repoground_manifest_binding(
+    request: Mapping[str, Any],
+) -> tuple[str, str, str | None, frozenset[str]]:
+    (
+        manifest_path,
+        manifest_sha256,
+        manifest_commit,
+        manifest_repo_root,
+    ) = _bound_repoground_manifest(request)
+    return (
+        manifest_sha256,
+        manifest_commit,
+        manifest_repo_root,
+        _authorized_manifest_paths(request, manifest_path=manifest_path),
+    )
+
+
 def _snapshot_ref_matches_manifest(
     snapshot_ref: Mapping[str, Any],
     *,
@@ -1458,18 +1475,17 @@ def _live_snapshot_commit(
 
 def _repoground_evidence_from_payload(
     *,
-    request: Mapping[str, Any],
+    manifest_binding: tuple[str, str, str | None, frozenset[str]],
     tool_name: str,
     sequence: int,
     payload: Mapping[str, Any],
 ) -> tuple[str, dict[str, Any]] | None:
     (
-        manifest_path,
         manifest_sha256,
         manifest_commit,
         manifest_repo_root,
-    ) = _bound_repoground_manifest(request)
-    manifest_paths = _authorized_manifest_paths(request, manifest_path=manifest_path)
+        manifest_paths,
+    ) = manifest_binding
     if tool_name == "ask_context":
         live_freshness = payload.get("live_freshness")
         live_commit = (
@@ -1568,6 +1584,16 @@ def _repoground_evidence_from_payload(
             return None
         verdict = payload.get("verdict")
         live_freshness = payload.get("live_freshness")
+        live_commit = (
+            _live_snapshot_commit(
+                live_freshness,
+                manifest_paths=manifest_paths,
+                manifest_commit=manifest_commit,
+                manifest_repo_root=manifest_repo_root,
+            )
+            if isinstance(live_freshness, Mapping)
+            else None
+        )
         if (
             not isinstance(verdict, Mapping)
             or verdict.get("kind") != "repobrief.answer_grounding_verdict"
@@ -1579,12 +1605,7 @@ def _repoground_evidence_from_payload(
             or live_freshness.get("version") != "v1"
             or live_freshness.get("status") not in _REPOGROUND_LIVE_FRESHNESS
             or live_freshness.get("bundle_manifest") not in manifest_paths
-            or _live_snapshot_commit(
-                live_freshness,
-                manifest_paths=manifest_paths,
-                manifest_commit=manifest_commit,
-                manifest_repo_root=manifest_repo_root,
-            ) is None
+            or live_commit is None
         ):
             return None
         snapshot_ref = verdict.get("snapshot_ref")
@@ -1601,16 +1622,17 @@ def _repoground_evidence_from_payload(
         commit = _snapshot_ref_commit(
             snapshot_ref, manifest_commit=manifest_commit
         )
-        if commit is None:
+        if commit is None or commit != live_commit:
             return None
         grounding = verdict.get("status")
+        live_status = live_freshness.get("status")
         raw_freshness = snapshot_ref.get("freshness_status")
-        if raw_freshness is None:
-            freshness_status = "not_applicable"
-        elif raw_freshness in _REPOGROUND_FRESHNESS:
-            freshness_status = str(raw_freshness)
-        else:
+        if raw_freshness is not None and (
+            raw_freshness not in _REPOGROUND_FRESHNESS
+            or raw_freshness != live_status
+        ):
             return None
+        freshness_status = str(live_status)
         return commit, {
             "sequence": sequence,
             "tool": "grounding_verify",
@@ -1622,31 +1644,11 @@ def _repoground_evidence_from_payload(
     return None
 
 
-def _repoground_evidence_call(
+def _repoground_resource_read_payload(
     *,
-    request: Mapping[str, Any],
-    tool_name: str,
-    sequence: int,
-    result: Mapping[str, Any],
-) -> tuple[str, dict[str, Any]] | None:
-    payload = _decoded_repoground_payload(result)
-    if payload is None:
-        return None
-    return _repoground_evidence_from_payload(
-        request=request,
-        tool_name=tool_name,
-        sequence=sequence,
-        payload=payload,
-    )
-
-
-def _repoground_resource_read_evidence(
-    *,
-    request: Mapping[str, Any],
-    sequence: int,
     result: Mapping[str, Any],
     expected_uri: str | None,
-) -> tuple[str, dict[str, Any]] | None:
+) -> tuple[Mapping[str, Any], int] | None:
     decoded = _decoded_resource_read_result(result)
     if decoded is None:
         return None
@@ -1681,13 +1683,25 @@ def _repoground_resource_read_evidence(
     live_freshness = repoground.get("liveFreshness")
     if not isinstance(live_freshness, Mapping):
         return None
+    content_bytes = len(text_value.encode("utf-8"))
+    if content_bytes <= 0:
+        return None
+    return live_freshness, content_bytes
+
+
+def _repoground_resource_read_evidence(
+    *,
+    manifest_binding: tuple[str, str, str | None, frozenset[str]],
+    sequence: int,
+    live_freshness: Mapping[str, Any],
+    content_bytes: int,
+) -> tuple[str, dict[str, Any]] | None:
     (
-        manifest_path,
         _manifest_sha256,
         manifest_commit,
         manifest_repo_root,
-    ) = _bound_repoground_manifest(request)
-    manifest_paths = _authorized_manifest_paths(request, manifest_path=manifest_path)
+        manifest_paths,
+    ) = manifest_binding
     commit = _live_snapshot_commit(
         live_freshness,
         manifest_paths=manifest_paths,
@@ -1695,9 +1709,6 @@ def _repoground_resource_read_evidence(
         manifest_repo_root=manifest_repo_root,
     )
     if commit is None:
-        return None
-    content_bytes = len(text_value.encode("utf-8"))
-    if content_bytes <= 0:
         return None
     return commit, {
         "sequence": sequence,
@@ -1722,6 +1733,7 @@ def normalize_repoground_evidence(
     ]
     evidence_calls: list[dict[str, Any]] = []
     commits: set[str] = set()
+    manifest_binding: tuple[str, str, str | None, frozenset[str]] | None = None
     for sequence, use in enumerate(benchmark_uses, start=1):
         concrete = str(use.get("name", ""))
         abstract = ABSTRACT_TOOL_MAP.get(concrete)
@@ -1742,18 +1754,32 @@ def normalize_repoground_evidence(
             expected_uri = (
                 arguments.get("uri") if isinstance(arguments, Mapping) else None
             )
-            normalized = _repoground_resource_read_evidence(
-                request=request,
-                sequence=sequence,
+            prepared_resource = _repoground_resource_read_payload(
                 result=result,
                 expected_uri=expected_uri,
             )
+            if prepared_resource is None:
+                continue
+            if manifest_binding is None:
+                manifest_binding = _repoground_manifest_binding(request)
+            live_freshness, content_bytes = prepared_resource
+            normalized = _repoground_resource_read_evidence(
+                manifest_binding=manifest_binding,
+                sequence=sequence,
+                live_freshness=live_freshness,
+                content_bytes=content_bytes,
+            )
         else:
-            normalized = _repoground_evidence_call(
-                request=request,
+            payload = _decoded_repoground_payload(result)
+            if payload is None:
+                continue
+            if manifest_binding is None:
+                manifest_binding = _repoground_manifest_binding(request)
+            normalized = _repoground_evidence_from_payload(
+                manifest_binding=manifest_binding,
                 tool_name=str(abstract),
                 sequence=sequence,
-                result=result,
+                payload=payload,
             )
         if normalized is None:
             continue

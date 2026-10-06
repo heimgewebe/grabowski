@@ -5654,6 +5654,7 @@ def _repoground_evidence_from_codex_events(
     sequence = 0
     evidence_calls: list[dict[str, Any]] = []
     commits: set[str] = set()
+    manifest_binding: tuple[str, str, str | None, frozenset[str]] | None = None
     for event in events:
         if event.get("type") != "item.completed":
             continue
@@ -5689,11 +5690,20 @@ def _repoground_evidence_from_codex_events(
                 or arguments.get("action") != "read"
             ):
                 continue
-            normalized = base._repoground_resource_read_evidence(
-                request=request,
-                sequence=sequence,
+            prepared_resource = base._repoground_resource_read_payload(
                 result=result_value,
                 expected_uri=arguments.get("uri"),
+            )
+            if prepared_resource is None:
+                continue
+            if manifest_binding is None:
+                manifest_binding = base._repoground_manifest_binding(request)
+            live_freshness, content_bytes = prepared_resource
+            normalized = base._repoground_resource_read_evidence(
+                manifest_binding=manifest_binding,
+                sequence=sequence,
+                live_freshness=live_freshness,
+                content_bytes=content_bytes,
             )
         else:
             structured = result_value.get("structured_content")
@@ -5708,8 +5718,10 @@ def _repoground_evidence_from_codex_events(
                 )
             except RunnerError:
                 continue
+            if manifest_binding is None:
+                manifest_binding = base._repoground_manifest_binding(request)
             normalized = base._repoground_evidence_from_payload(
-                request=request,
+                manifest_binding=manifest_binding,
                 tool_name=str(tool_name),
                 sequence=sequence,
                 payload=payload,

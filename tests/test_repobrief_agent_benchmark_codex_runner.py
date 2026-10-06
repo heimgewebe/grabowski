@@ -4332,6 +4332,88 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 },
             )
 
+            events_twice = [events[0], json.loads(json.dumps(events[0]))]
+            calls_twice = [calls[0], {**calls[0], "sequence": 2}]
+            with (
+                patch.object(
+                    runner.base,
+                    "_bound_repoground_manifest",
+                    wraps=runner.base._bound_repoground_manifest,
+                ) as bound_manifest,
+                patch.object(
+                    runner,
+                    "_validated_treatment_structured_payload",
+                    return_value=payload,
+                ),
+            ):
+                repeated = runner._repoground_evidence_from_codex_events(
+                    value, events_twice, calls_twice
+                )
+            self.assertEqual(bound_manifest.call_count, 1)
+            self.assertEqual(len(repeated["calls"]), 2)
+
+    def test_codex_rejects_conflicting_grounding_freshness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory), commit=COMMIT)
+            payload = {
+                "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+                "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+                "tool": "grounding_verify",
+                "status": "pass",
+                "verdict": {
+                    "kind": "repobrief.answer_grounding_verdict",
+                    "version": "1.0",
+                    "status": "pass",
+                    "snapshot_ref": {
+                        "manifest_path": str(manifest),
+                        "git_commit": COMMIT,
+                        "freshness_status": "fresh",
+                    },
+                },
+                "live_freshness": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v1",
+                    "status": "stale",
+                    "reason": "git_head_differs_from_snapshot",
+                    "bundle_manifest": str(manifest),
+                    "repo_root": "/tmp/repo",
+                    "read_only_git_probe": True,
+                    "implicit_refresh": False,
+                    "snapshot_provenance": {"git_commit": COMMIT},
+                },
+            }
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "grounding_verify",
+                    "arguments": {},
+                    "result": {"structured_content": payload},
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{
+                "sequence": 1,
+                "name": "grounding_verify",
+                "status": "success",
+                "duration_ms": 0,
+                "input_bytes": 1,
+                "output_bytes": 1,
+            }]
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                self.assertIsNone(
+                    runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                )
+
     def test_codex_projects_bound_not_comparable_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")

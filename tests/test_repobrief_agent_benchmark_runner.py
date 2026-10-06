@@ -905,6 +905,67 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                         )
                     )
 
+    def test_treatment_binds_manifest_once_for_multiple_evidence_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="mcp__repobrief__live_freshness")
+            )
+            tool_use = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_use"
+            )
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            payload = {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "fresh",
+                "reason": "git_head_matches_snapshot",
+                "bundle_manifest": str(manifest),
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+                "snapshot_provenance": {"git_commit": COMMIT},
+            }
+            tool_result["content"] = json.dumps(
+                {"structuredContent": payload}, sort_keys=True
+            )
+            second_use = copy.deepcopy(tool_use)
+            second_use["id"] = "tool-2"
+            second_result = copy.deepcopy(tool_result)
+            second_result["tool_use_id"] = "tool-2"
+            next(message for message in messages if message.get("type") == "assistant")[
+                "message"
+            ]["content"].append(second_use)
+            next(message for message in messages if message.get("type") == "user")[
+                "message"
+            ]["content"].append(second_result)
+            calls = runner.normalize_tool_calls(value, messages)
+
+            with patch.object(
+                runner,
+                "_bound_repoground_manifest",
+                wraps=runner._bound_repoground_manifest,
+            ) as bound_manifest:
+                evidence = runner.normalize_repoground_evidence(
+                    value, messages, calls
+                )
+
+            self.assertEqual(bound_manifest.call_count, 1)
+            self.assertEqual(len(evidence["calls"]), 2)
+
     def test_treatment_projects_revision_bound_resource_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
@@ -1194,6 +1255,20 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                         "grounding_status": "pass",
                     }],
                 },
+            )
+
+            conflicting = copy.deepcopy(payload)
+            conflicting["live_freshness"]["status"] = "stale"
+            tool_result["content"] = json.dumps(
+                {"structuredContent": conflicting}, sort_keys=True
+            )
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
+            tool_result["content"] = json.dumps(
+                {"structuredContent": payload}, sort_keys=True
             )
 
             payload["verdict"]["snapshot_ref"]["manifest_path"] = str(
