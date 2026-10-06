@@ -60,6 +60,10 @@ POST_MERGE_JOB_SLOT_LIMIT = 16
 POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS = 300
 
 
+class _ReusableJobSlotsExhausted(RuntimeError):
+    pass
+
+
 def _post_merge_job_starter(
     operator_module: Any,
     public_starter: JobStarter,
@@ -228,7 +232,7 @@ def _post_merge_job_starter(
                 )
             return {**started, "reused": False}
 
-        raise RuntimeError("RepoGround post-merge reusable job slots exhausted")
+        raise _ReusableJobSlotsExhausted("RepoGround post-merge reusable job slots exhausted")
 
     return start_reusable_job
 
@@ -1164,6 +1168,25 @@ def schedule_followup_request(
             cwd=str(request["cwd"]),
             runtime_seconds=runtime_seconds,
         )
+    except _ReusableJobSlotsExhausted:
+        return {
+            **_followup_base(
+                status="not_scheduled",
+                reason="durable_freshness_job_slots_exhausted",
+                repository=identity["repository"],
+                merge_sha=identity.get("merge_sha"),
+            ),
+            **(
+                {"pull_request": identity["pull_request"]}
+                if "pull_request" in identity
+                else {}
+            ),
+            "does_not_establish": [
+                "freshness_converged",
+                "freshness_failed",
+                "future_branch_freshness",
+            ],
+        }
     except Exception as exc:
         unit = getattr(exc, "unit", None)
         return {

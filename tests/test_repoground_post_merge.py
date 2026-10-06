@@ -886,6 +886,84 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
             ["retry_deferred", "scheduled"],
         )
 
+    def test_reconcile_exhausted_newest_allows_older_pending_merge_to_progress(self) -> None:
+        items = [
+            {
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp_unix": 9_950,
+                },
+                "evidence": {"record_sha256": "1" * 64},
+            },
+            {
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp_unix": 9_940,
+                },
+                "evidence": {"record_sha256": "2" * 64},
+            },
+        ]
+        audit_query = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=100,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter(items),
+        )
+        scheduled: list[str] = []
+
+        def schedule(record_sha256: str, **_kwargs: object) -> dict[str, object]:
+            scheduled.append(record_sha256)
+            if record_sha256 == "1" * 64:
+                return {
+                    "status": "not_scheduled",
+                    "reason": "durable_freshness_job_slots_exhausted",
+                    "repository": REPO,
+                    "merge_sha": MERGE,
+                    "reused": False,
+                }
+            return {
+                "status": "scheduled",
+                "reason": "durable_freshness_job_started",
+                "repository": REPO,
+                "merge_sha": MERGE,
+                "unit": "grabowski-job-older",
+                "reused": False,
+            }
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "grabowski_audit_query": audit_query,
+                    "grabowski_operator": types.SimpleNamespace(),
+                },
+            ),
+            patch.object(post_merge.time, "time", return_value=10_000),
+            patch.object(
+                post_merge,
+                "resolve_job_starter",
+                return_value=lambda *_args, **_kwargs: {},
+            ),
+            patch.object(
+                post_merge,
+                "schedule_from_captain_audit_completion",
+                side_effect=schedule,
+            ),
+        ):
+            result = post_merge.reconcile_recent_captain_audit_followups()
+
+        self.assertEqual(scheduled, ["1" * 64, "2" * 64])
+        self.assertEqual(result["processed"], 2)
+        self.assertEqual(
+            [item["status"] for item in result["outcomes"]],
+            ["not_scheduled", "scheduled"],
+        )
+        self.assertEqual(
+            result["outcomes"][0]["reason"],
+            "durable_freshness_job_slots_exhausted",
+        )
+
     def test_reconcile_fails_before_mutation_when_scan_limit_hides_horizon(self) -> None:
         items = [
             {
@@ -1390,6 +1468,91 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
         self.assertEqual(
             second["retry_after_unix"],
             created_at + post_merge.POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS,
+        )
+
+    def test_exhausted_retry_slots_are_read_only_not_scheduled(self) -> None:
+        jobs: dict[str, dict[str, object]] = {}
+        live_status: dict[str, str] = {}
+        starts: list[str] = []
+        created_at = 10_000
+
+        def argv_hash(_argv: list[str]) -> str:
+            return "e" * 64
+
+        def read_metadata(unit: str) -> dict[str, object]:
+            if unit not in jobs:
+                raise ValueError("missing")
+            return jobs[unit]
+
+        def read_status(unit: str) -> dict[str, object]:
+            metadata = read_metadata(unit)
+            return {
+                "unit": unit,
+                "metadata": metadata,
+                "final_status": live_status[unit],
+            }
+
+        def private_start(
+            argv: list[str],
+            *,
+            cwd: str,
+            runtime_seconds: int,
+            reserved_unit: str,
+        ) -> dict[str, object]:
+            starts.append(reserved_unit)
+            job: dict[str, object] = {
+                "unit": reserved_unit,
+                "job_id": reserved_unit.removeprefix("grabowski-job-"),
+                "argv_sha256": argv_hash(argv),
+                "cwd": cwd,
+                "runtime_seconds": runtime_seconds,
+                "created_at_unix": created_at,
+                "final_status": "launch_submitted",
+            }
+            jobs[reserved_unit] = job
+            live_status[reserved_unit] = "running"
+            return job
+
+        operator = types.SimpleNamespace(
+            grabowski_job_start=lambda *_args, **_kwargs: {},
+            grabowski_job_status=read_status,
+            _argv_hash=argv_hash,
+            _read_job_metadata=read_metadata,
+            _require_operator_mutation=lambda *_args, **_kwargs: None,
+            _start_job=private_start,
+        )
+        starter = post_merge.resolve_job_starter({"grabowski_operator": operator})
+        self.assertIsNotNone(starter)
+
+        with patch.object(
+            post_merge.time,
+            "time",
+            return_value=created_at
+            + post_merge.POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS
+            + 1,
+        ):
+            for _index in range(post_merge.POST_MERGE_JOB_SLOT_LIMIT):
+                result = post_merge.schedule_from_captain_result(
+                    captain_result(completed=False, queued=True),
+                    job_starter=starter,
+                    python_executable="/usr/bin/python3",
+                    script_path=Path(post_merge.__file__),
+                )
+                self.assertEqual(result["status"], "scheduled")
+                live_status[result["unit"]] = "failed"
+
+            exhausted = post_merge.schedule_from_captain_result(
+                captain_result(completed=False, queued=True),
+                job_starter=starter,
+                python_executable="/usr/bin/python3",
+                script_path=Path(post_merge.__file__),
+            )
+
+        self.assertEqual(len(starts), post_merge.POST_MERGE_JOB_SLOT_LIMIT)
+        self.assertEqual(exhausted["status"], "not_scheduled")
+        self.assertEqual(
+            exhausted["reason"],
+            "durable_freshness_job_slots_exhausted",
         )
 
     def test_uncertain_live_queue_job_fails_closed_without_duplicate(self) -> None:
