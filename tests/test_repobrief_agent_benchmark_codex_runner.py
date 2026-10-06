@@ -2490,6 +2490,29 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 str(logical_manifest),
             )
 
+    def test_rebind_resource_read_manifest_rejects_non_staged_freshness_path(self) -> None:
+        staged_manifest = Path("/private/staged.bundle.manifest.json")
+        logical_manifest = Path("/logical/repo.bundle.manifest.json")
+        value = {
+            "_meta": {
+                "repoground": {
+                    "liveFreshness": {
+                        "bundle_manifest": str(logical_manifest),
+                    }
+                }
+            }
+        }
+
+        with self.assertRaisesRegex(
+            runner.RunnerError,
+            "resource live freshness manifest does not match staged manifest",
+        ):
+            runner._rebind_resource_read_manifest(
+                value,
+                staged_manifest=staged_manifest,
+                external_manifest=logical_manifest,
+            )
+
     def test_mcp_proxy_rejects_malformed_resource_read_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

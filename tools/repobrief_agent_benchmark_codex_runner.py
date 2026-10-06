@@ -1188,11 +1188,13 @@ def _rebind_resource_read_manifest(
     meta = rebound.get("_meta")
     repoground = meta.get("repoground") if isinstance(meta, dict) else None
     freshness = repoground.get("liveFreshness") if isinstance(repoground, dict) else None
-    if (
-        isinstance(freshness, dict)
-        and freshness.get("bundle_manifest") == str(staged_manifest)
-    ):
-        freshness["bundle_manifest"] = str(external_manifest)
+    if not isinstance(freshness, dict):
+        return rebound
+    if freshness.get("bundle_manifest") != str(staged_manifest):
+        raise RunnerError(
+            "RepoGround resource live freshness manifest does not match staged manifest"
+        )
+    freshness["bundle_manifest"] = str(external_manifest)
     return rebound
 
 
