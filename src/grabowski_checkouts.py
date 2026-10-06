@@ -3810,6 +3810,9 @@ def _reconcile_materialize_uncertainty(
             completed_source_expired = True
         repo = _resolve_repo(str(evidence["repo"]))
         checkout = Path(str(evidence["checkout_path"]))
+        operator._require_operator_mutation(
+            "git_cli", path=str(checkout), repo=str(repo)
+        )
         physical_identity = physical_checkout.capture_physical_checkout_identity(
             checkout
         )

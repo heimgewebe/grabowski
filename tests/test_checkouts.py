@@ -2571,6 +2571,43 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertFalse(obligation_status["continuation_required"])
         self.assertEqual(obligation_status["resolution_disposition"], "resolved")
 
+    def test_materialize_uncertainty_reconcile_respects_git_mutation_freeze(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        mutation_gate = checkouts.operator._require_operator_mutation
+        mutation_gate.reset_mock()
+
+        def reject_git_mutation(capability: str, **_kwargs) -> None:
+            if capability == "git_cli":
+                raise PermissionError("git mutation frozen")
+
+        mutation_gate.side_effect = reject_git_mutation
+        try:
+            with self.assertRaisesRegex(PermissionError, "git mutation frozen"):
+                checkouts.grabowski_checkout_uncertainty_reconcile(
+                    fence["fence_id"],
+                    "reconcile-checkout-operation-outcome",
+                )
+        finally:
+            mutation_gate.side_effect = None
+
+        self.assertEqual(
+            [item.args[0] for item in mutation_gate.call_args_list],
+            ["resource_lease", "git_cli"],
+        )
+        git_gate = mutation_gate.call_args_list[1]
+        self.assertEqual(git_gate.kwargs["path"], str(target))
+        self.assertEqual(git_gate.kwargs["repo"], str(self.repo.resolve()))
+        self.assertTrue(target.exists())
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
     def _materialize_uncertainty_retention(
         self,
         target: Path,
