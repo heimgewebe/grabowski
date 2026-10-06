@@ -2683,12 +2683,13 @@ def _schedule_result(
     effective_delay_seconds: int,
     job: dict[str, Any],
     intent: dict[str, Any] | None,
-    scheduled: dict[str, Any],
+    scheduled: dict[str, Any] | None,
     already_scheduled: bool,
     source_identity: dict[str, Any],
     automatic_source: dict[str, Any] | None = None,
     local_mutation_evidence: dict[str, Any] | None = None,
     deployment_observer_capability: str | None = None,
+    post_dispatch_warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     contract = job.get("deployment_observer_contract")
     observer_available = (
@@ -2698,6 +2699,7 @@ def _schedule_result(
     return {
         "scheduled": True,
         "already_scheduled": already_scheduled,
+        "post_dispatch_warnings": list(post_dispatch_warnings or []),
         "expected_head": expected_head,
         "requested_delay_seconds": requested_delay_seconds,
         "delay_seconds": effective_delay_seconds,
@@ -5806,11 +5808,19 @@ def _grabowski_runtime_deploy_schedule_impl(
                 ) from exc
             raise
         assert jobs_root is not None and index is not None and reserved_unit is not None
-        _write_deploy_index(
-            jobs_root,
-            units=[*index["units"], reserved_unit],
-            pending_unit=None,
-        )
+        # A returned job is registered. Later bookkeeping must retain its
+        # identity and source authority instead of reporting a failed dispatch.
+        post_dispatch_warnings = list(job.get("post_dispatch_warnings") or [])
+        try:
+            _write_deploy_index(
+                jobs_root,
+                units=[*index["units"], reserved_unit],
+                pending_unit=None,
+            )
+        except Exception as exc:  # noqa: BLE001 - effect already dispatched
+            post_dispatch_warnings.append(
+                f"deploy index bookkeeping failed, pending_unit may be stale: {exc}"
+            )
         scheduled = {
             "timestamp_unix": int(time.time()),
             "operation": "runtime-deploy-scheduled",
@@ -5820,7 +5830,11 @@ def _grabowski_runtime_deploy_schedule_impl(
             "argv_sha256": job["argv_sha256"],
             "source_identity_sha256": source_identity["identity_sha256"],
         }
-        _append_deploy_audit(scheduled)
+        try:
+            _append_deploy_audit(scheduled)
+        except Exception as exc:  # noqa: BLE001 - effect already dispatched
+            post_dispatch_warnings.append(f"scheduled audit append failed: {exc}")
+            scheduled = None
         return _schedule_result(
             expected_head=expected_head,
             requested_delay_seconds=delay_seconds,
@@ -5835,6 +5849,7 @@ def _grabowski_runtime_deploy_schedule_impl(
                 local_mutation_tracker
             ),
             deployment_observer_capability=observer_capability,
+            post_dispatch_warnings=post_dispatch_warnings,
         )
 
 @mcp.tool(name="grabowski_runtime_deploy_schedule", annotations=DEPLOY_MUTATING)

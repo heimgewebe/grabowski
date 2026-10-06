@@ -5977,7 +5977,13 @@ class SelfDeployToolTests(unittest.TestCase):
         identity = _source_identity(source, expected, kind="detached-worktree", canonical=canonical)
         owner = "runtime-deploy-source:" + expected[:24]
         materialization = {"owner_id": owner, "receipt_sha256": "7" * 64}
-        job = {"unit": "grabowski-job-indexfail001", "argv_sha256": "8" * 64}
+        unit = "grabowski-job-abcdef012345"
+        job = {
+            "unit": unit, "argv_sha256": "8" * 64,
+            **{key: str(Path("/state") / unit / filename) for key, filename in (
+                ("metadata_path", "metadata.json"), ("stdout_path", "stdout.log"), ("stderr_path", "stderr.log"),
+            )},
+        }
         writes = Mock(side_effect=[None, RuntimeError("final index failed")])
         with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
             SELF_DEPLOY,
@@ -6019,10 +6025,71 @@ class SelfDeployToolTests(unittest.TestCase):
         ), patch.object(
             SELF_DEPLOY.operator, "_start_job", return_value=job
         ):
-            with self.assertRaisesRegex(RuntimeError, "final index failed"):
-                SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+            result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
         self.assertEqual(writes.call_count, 2)
         cleanup.assert_not_called()
+        self.assertTrue(result["scheduled"])
+        self.assertEqual(result["unit"], unit)
+        self.assertIn("final index failed", result["post_dispatch_warnings"][0])
+
+    def test_schedule_preserves_registered_canonical_job_across_bookkeeping_failures(self) -> None:
+        repo = Path("/home/alex/repos/grabowski")
+        expected = "c" * 40
+        identity = _source_identity(repo, expected)
+        unit = "grabowski-job-abcdef012345"
+        command = SELF_DEPLOY._deploy_command(
+            repo, repo / SELF_DEPLOY.RUNNER_RELATIVE_PATH, expected, 8,
+            canonical_repository=repo, source_kind="canonical-main",
+            source_identity_sha256=identity["identity_sha256"],
+        )
+        job = {
+            "unit": unit, "argv_sha256": SELF_DEPLOY.operator._argv_hash(command),
+            "metadata_path": f"/state/{unit}/metadata.json",
+            "stdout_path": f"/state/{unit}/stdout.log",
+            "stderr_path": f"/state/{unit}/stderr.log",
+            "post_dispatch_warnings": ["job metadata warning"],
+        }
+        for failure in ("index", "audit", "both", "intent"):
+            with self.subTest(failure=failure), ExitStack() as stack:
+                stack.enter_context(patch.object(SELF_DEPLOY, "_deployment_source_preflight", return_value=(repo, repo / SELF_DEPLOY.RUNNER_RELATIVE_PATH, identity)))
+                stack.enter_context(patch.object(SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()))
+                stack.enter_context(patch.object(SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=None))
+                stack.enter_context(patch.object(SELF_DEPLOY, "inflight_runtime_job_evidence", return_value={"error": None, "inflight_units": []}))
+                stack.enter_context(patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/state")))
+                stack.enter_context(patch.object(SELF_DEPLOY, "_deploy_index", return_value={"units": []}))
+                stack.enter_context(patch.object(SELF_DEPLOY.uuid, "uuid4", return_value=Mock(hex="abcdef012345ffffffffffffffffffff")))
+                writes = stack.enter_context(patch.object(SELF_DEPLOY, "_write_deploy_index", side_effect=[None, OSError("index failed") if failure in {"index", "both"} else None]))
+                stack.enter_context(patch.object(SELF_DEPLOY, "_append_deploy_audit", side_effect=[
+                    OSError("intent failed") if failure == "intent" else None,
+                    OSError("audit failed") if failure in {"audit", "both"} else None,
+                ]))
+                start = stack.enter_context(patch.object(SELF_DEPLOY.operator, "_start_job", return_value=job))
+                cleanup = stack.enter_context(patch.object(SELF_DEPLOY, "_cleanup_auto_deploy_source_before_dispatch"))
+                if failure == "intent":
+                    with self.assertRaisesRegex(OSError, "intent failed"):
+                        SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+                    start.assert_not_called()
+                    writes.assert_not_called()
+                    continue
+                result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(expected, 8)
+                self.assertTrue(result["scheduled"])
+                self.assertFalse(result["already_scheduled"])
+                self.assertEqual(result["unit"], unit)
+                self.assertEqual(result["metadata_path"], job["metadata_path"])
+                self.assertIsNone(result["local_mutation_evidence"])
+                self.assertIn("job metadata warning", result["post_dispatch_warnings"])
+                if failure in {"index", "both"}:
+                    self.assertTrue(any("index failed" in item for item in result["post_dispatch_warnings"]))
+                if failure in {"audit", "both"}:
+                    self.assertTrue(any("audit failed" in item for item in result["post_dispatch_warnings"]))
+                    self.assertIsNone(result["audit"]["scheduled"])
+                else:
+                    self.assertEqual(result["audit"]["scheduled"]["unit"], unit)
+                start.assert_called_once()
+                cleanup.assert_not_called()
+                self.assertEqual(writes.call_count, 2)
+                self.assertEqual(writes.call_args_list[0].kwargs["pending_unit"], unit)
+                self.assertEqual(writes.call_args_list[1].kwargs["units"], [unit])
 
     def test_schedule_uses_fixed_delayed_runner(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
