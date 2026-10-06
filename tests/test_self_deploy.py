@@ -727,6 +727,47 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(result["deploy_index_mutation"], promotion)
         self.assertIsNone(result["stale_pending_reconciliation"])
 
+    def test_default_inflight_assessment_keeps_existing_pending_directory_reserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            unit = "grabowski-job-abcdef012345"
+            (jobs / unit).mkdir(mode=0o700)
+            SELF_DEPLOY._write_deploy_index(jobs, units=[], pending_unit=unit)
+            index_path = SELF_DEPLOY._deploy_index_path(jobs)
+            before = index_path.read_bytes()
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=jobs), patch.object(
+                SELF_DEPLOY, "_write_deploy_index"
+            ) as write, patch.object(SELF_DEPLOY, "_classify_indexed_job") as classify:
+                result = SELF_DEPLOY.inflight_runtime_job_evidence()
+            write.assert_not_called()
+            classify.assert_not_called()
+            self.assertEqual(result["blocking_units"], [unit])
+            self.assertIsNone(result["deploy_index_mutation"])
+            self.assertEqual(index_path.read_bytes(), before)
+
+    def test_default_inflight_assessment_bootstraps_in_memory_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            unit = "grabowski-job-abcdef012345"
+            (jobs / unit).mkdir(mode=0o700)
+            metadata = {
+                "argv": ["/usr/bin/python3", "/repo/tools/run_scheduled_deploy.py"],
+                "final_status": "running",
+            }
+            classified = {"terminal": False, "reusable": False}
+            with patch.object(SELF_DEPLOY.operator, "_jobs_root", return_value=jobs), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(SELF_DEPLOY, "_write_deploy_index") as write, patch.object(
+                SELF_DEPLOY, "_classify_indexed_job", return_value=classified
+            ):
+                result = SELF_DEPLOY.inflight_runtime_job_evidence()
+            write.assert_not_called()
+            self.assertFalse(SELF_DEPLOY._deploy_index_path(jobs).exists())
+            self.assertEqual(result["blocking_units"], [unit])
+            self.assertIsNone(result["error"])
+
     def test_preflight_requires_clean_synchronized_main(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()

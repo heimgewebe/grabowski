@@ -1508,6 +1508,8 @@ def _references_runtime_runner(command: list[str], runner: Path) -> bool:
 def _bootstrap_deploy_index(
     jobs_root: Path,
     _repository: Path | None = None,
+    *,
+    read_only: bool = False,
 ) -> dict[str, Any]:
     entries = sorted(
         (entry for entry in jobs_root.iterdir() if _durable_job_unit(entry.name)),
@@ -1552,6 +1554,15 @@ def _bootstrap_deploy_index(
             or metadata.get("final_status") not in TERMINAL_JOB_STATUSES
         ):
             units.append(entry.name)
+    if read_only:
+        if len(units) > MAX_DEPLOY_INDEX_ENTRIES:
+            raise RuntimeError("runtime deploy index exceeds its bounded entry count")
+        return {
+            "schema_version": 1,
+            "units": units,
+            "pending_unit": None,
+            "updated_at_unix": int(time.time()),
+        }
     return _write_deploy_index(jobs_root, units=units, pending_unit=None)
 
 
@@ -1590,7 +1601,14 @@ def _deploy_index_with_pending_promotion_evidence(
 def _deploy_index(
     jobs_root: Path,
     _repository: Path | None = None,
+    *,
+    read_only: bool = False,
 ) -> dict[str, Any]:
+    if read_only:
+        index = _read_deploy_index(jobs_root)
+        return index if index is not None else _bootstrap_deploy_index(
+            jobs_root, _repository, read_only=True
+        )
     index, _promotion = _deploy_index_with_pending_promotion_evidence(
         jobs_root,
         _repository,
@@ -2437,7 +2455,10 @@ def inflight_runtime_job_evidence(
             evidence["deploy_index_mutation"] = index_mutation
             evidence["stale_pending_reconciliation"] = reconciliation
         else:
-            index = _deploy_index(jobs_root)
+            # Assessments must not normalize reservations or persist a bootstrap
+            # before an authorized, locked recheck can track those effects.
+            # A pending reservation remains blocking even if its directory exists.
+            index = _deploy_index(jobs_root, read_only=True)
     except DeployScheduleFailureAfterLocalMutation as exc:
         evidence["stale_pending_reconciliation"] = dict(
             exc.local_mutation_evidence

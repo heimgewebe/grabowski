@@ -1171,8 +1171,6 @@ def _resume_under_schedule_lock(
                 }
             )
         except Exception as audit_exc:
-            if local_mutation_evidence is None:
-                raise
             dispatch_evidence["audit_append_error"] = (
                 f"{type(audit_exc).__name__}: {audit_exc}"
             )
@@ -1450,8 +1448,6 @@ def _repair_under_schedule_lock(
                 }
             )
         except Exception as audit_exc:
-            if local_mutation_evidence is None:
-                raise
             dispatch_evidence["audit_append_error"] = (
                 f"{type(audit_exc).__name__}: {audit_exc}"
             )

@@ -811,16 +811,18 @@ class PendingPromotionRecoveryTests(unittest.TestCase):
         self.assertEqual(result["deploy_index_mutation"], promotion)
         self.assertEqual(result["local_mutation_evidence"]["effects"], [promotion, reconciliation])
 
-    def test_both_recovery_lanes_preserve_promotion_on_every_dispatch_exit(self) -> None:
+    def test_both_recovery_lanes_preserve_effects_and_dispatch_outcomes_on_every_exit(self) -> None:
         outcomes = (
             "coalesced", "coalesced_audit_failure", "denied", "denied_audit_failure",
             "setup_failure", "start_failure", "unknown", "unknown_audit_failure",
             "scheduled", "scheduled_audit_failure",
+            "unknown_without_mutation", "unknown_without_mutation_audit_failure",
         )
         for lane in ("repair", "resume"):
             for outcome in outcomes:
                 with self.subTest(lane=lane, outcome=outcome), contextlib.ExitStack() as stack:
                     promotion = self._promotion()
+                    local_evidence = None if "without_mutation" in outcome else promotion
                     identity = _source_identity(ROOT)
                     binding = {
                         "cutover_id": "bgc-promotion", "resumed_receipt_sha256": "cd" * 32,
@@ -839,7 +841,7 @@ class PendingPromotionRecoveryTests(unittest.TestCase):
                         "checks": {},
                         "competing_deployment": {
                             "idempotent_match": match if outcome.startswith("coalesced") else None,
-                            "deploy_index_mutation": promotion,
+                            "deploy_index_mutation": local_evidence,
                         },
                     }
                     stack.enter_context(patch.object(provenance_recovery, "evaluate_gate", return_value=gate))
@@ -886,7 +888,11 @@ class PendingPromotionRecoveryTests(unittest.TestCase):
                     if outcome.startswith("unknown"):
                         with self.assertRaises(provenance_recovery.operator.JobDispatchUnknown) as raised:
                             run()
-                        self.assertEqual(raised.exception.evidence["local_mutation_evidence"], promotion)
+                        self.assertEqual(raised.exception.unit, promotion["unit"])
+                        self.assertEqual(raised.exception.evidence["dispatch_outcome"], "unknown")
+                        self.assertEqual(raised.exception.evidence.get("local_mutation_evidence"), local_evidence)
+                        if outcome.endswith("audit_failure"):
+                            self.assertIn("audit failed", raised.exception.evidence["audit_append_error"])
                     elif outcome == "denied":
                         with self.assertRaises(provenance_recovery.ProvenanceRecoveryDenied) as raised:
                             run()
@@ -911,7 +917,7 @@ class PendingPromotionRecoveryTests(unittest.TestCase):
                     observed = [record for record in records if "local_mutation_evidence" in record]
                     if outcome not in {"setup_failure", "start_failure"}:
                         self.assertTrue(observed)
-                        self.assertTrue(all(record["local_mutation_evidence"] == promotion for record in observed))
+                        self.assertTrue(all(record["local_mutation_evidence"] == local_evidence for record in observed))
 
 
 class DispatchOutcomeTests(unittest.TestCase):
