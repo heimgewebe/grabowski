@@ -11,4 +11,4 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%h/.local/state/grabowski
 UMask=0077
-TimeoutStartSec=30s
+TimeoutStartSec=120s

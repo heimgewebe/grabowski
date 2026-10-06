@@ -664,61 +664,44 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
             post_merge.DEFAULT_JOB_RUNTIME_SECONDS,
         )
 
-    def test_reconcile_scans_newest_captain_audits_first(self) -> None:
-        calls: list[dict[str, object]] = []
-
-        def query_audit(filters, *, limit, order):
-            calls.append({"filters": filters, "limit": limit, "order": order})
-            return {
-                "items": [],
-                "matched": 0,
-                "truncated": False,
-            }
-
-        audit_query = types.SimpleNamespace(query_audit=query_audit)
-        operator = types.SimpleNamespace()
-        with (
-            patch.dict(
-                sys.modules,
-                {
-                    "grabowski_audit_query": audit_query,
-                    "grabowski_operator": operator,
-                },
-            ),
-            patch.object(
-                post_merge,
-                "resolve_job_starter",
-                return_value=lambda *_args, **_kwargs: {},
-            ),
-        ):
-            result = post_merge.reconcile_recent_captain_audit_followups(
-                lookback_seconds=900,
-                limit=64,
-            )
-
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["matched"], 0)
-        self.assertEqual(result["processed"], 0)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["order"], "desc")
-
-    def test_reconcile_stops_after_first_new_job_mutation(self) -> None:
+    def test_reconcile_scans_full_lookback_before_scheduling(self) -> None:
+        now = 10_000
         items = [
             {
-                "record": {"action": "pr-merge"},
-                "evidence": {"record_sha256": "1" * 64},
-            },
-            {
-                "record": {"action": "pr-merge"},
-                "evidence": {"record_sha256": "2" * 64},
-            },
-        ]
-        audit_query = types.SimpleNamespace(
-            query_audit=lambda *_args, **_kwargs: {
-                "items": items,
-                "matched": 2,
-                "truncated": False,
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "runtime-deploy",
+                    "timestamp_unix": 9_950,
+                },
+                "evidence": {"record_sha256": f"{index:064x}"},
             }
+            for index in range(1, 70)
+        ]
+        merge_sha256 = "f" * 64
+        items.extend(
+            [
+                {
+                    "record": {
+                        "operation": "captain-run-audit-completion",
+                        "action": "pr-merge",
+                        "timestamp_unix": 9_940,
+                    },
+                    "evidence": {"record_sha256": merge_sha256},
+                },
+                {
+                    "record": {
+                        "operation": "captain-run-audit-completion",
+                        "action": "runtime-deploy",
+                        "timestamp_unix": 8_000,
+                    },
+                    "evidence": {"record_sha256": "e" * 64},
+                },
+            ]
+        )
+        audit_query = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=1_000,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter(items),
         )
         scheduled: list[str] = []
 
@@ -741,6 +724,75 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                     "grabowski_operator": types.SimpleNamespace(),
                 },
             ),
+            patch.object(post_merge.time, "time", return_value=now),
+            patch.object(
+                post_merge,
+                "resolve_job_starter",
+                return_value=lambda *_args, **_kwargs: {},
+            ),
+            patch.object(
+                post_merge,
+                "schedule_from_captain_audit_completion",
+                side_effect=schedule,
+            ),
+        ):
+            result = post_merge.reconcile_recent_captain_audit_followups(
+                lookback_seconds=100,
+                limit=64,
+            )
+
+        self.assertEqual(scheduled, [merge_sha256])
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["processed"], 1)
+        self.assertTrue(result["lookback_horizon_reached"])
+        self.assertGreater(result["scanned_records"], 64)
+
+    def test_reconcile_stops_after_first_new_job_mutation(self) -> None:
+        items = [
+            {
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp_unix": 9_950,
+                },
+                "evidence": {"record_sha256": "1" * 64},
+            },
+            {
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp_unix": 9_940,
+                },
+                "evidence": {"record_sha256": "2" * 64},
+            },
+        ]
+        audit_query = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=100,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter(items),
+        )
+        scheduled: list[str] = []
+
+        def schedule(record_sha256: str, **_kwargs: object) -> dict[str, object]:
+            scheduled.append(record_sha256)
+            return {
+                "status": "scheduled",
+                "reason": "durable_freshness_job_started",
+                "repository": REPO,
+                "merge_sha": MERGE,
+                "unit": "grabowski-job-one",
+                "reused": False,
+            }
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "grabowski_audit_query": audit_query,
+                    "grabowski_operator": types.SimpleNamespace(),
+                },
+            ),
+            patch.object(post_merge.time, "time", return_value=10_000),
             patch.object(
                 post_merge,
                 "resolve_job_starter",
@@ -763,20 +815,26 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
     def test_reconcile_retry_backoff_allows_older_pending_merge_to_progress(self) -> None:
         items = [
             {
-                "record": {"action": "pr-merge"},
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp_unix": 9_950,
+                },
                 "evidence": {"record_sha256": "1" * 64},
             },
             {
-                "record": {"action": "pr-merge"},
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp_unix": 9_940,
+                },
                 "evidence": {"record_sha256": "2" * 64},
             },
         ]
         audit_query = types.SimpleNamespace(
-            query_audit=lambda *_args, **_kwargs: {
-                "items": items,
-                "matched": 2,
-                "truncated": False,
-            }
+            MAX_SCAN_RECORDS=100,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter(items),
         )
         scheduled: list[str] = []
 
@@ -807,6 +865,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                     "grabowski_operator": types.SimpleNamespace(),
                 },
             ),
+            patch.object(post_merge.time, "time", return_value=10_000),
             patch.object(
                 post_merge,
                 "resolve_job_starter",
@@ -826,6 +885,47 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
             [item["status"] for item in result["outcomes"]],
             ["retry_deferred", "scheduled"],
         )
+
+    def test_reconcile_fails_before_mutation_when_scan_limit_hides_horizon(self) -> None:
+        items = [
+            {
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "runtime-deploy",
+                    "timestamp_unix": 9_950 - index,
+                },
+                "evidence": {"record_sha256": f"{index + 1:064x}"},
+            }
+            for index in range(4)
+        ]
+        audit_query = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=3,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter(items),
+        )
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "grabowski_audit_query": audit_query,
+                    "grabowski_operator": types.SimpleNamespace(),
+                },
+            ),
+            patch.object(post_merge.time, "time", return_value=10_000),
+            patch.object(
+                post_merge,
+                "resolve_job_starter",
+                side_effect=AssertionError("mutation path must not be reached"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                post_merge.RepoGroundPostMergeError,
+                "scan truncated before lookback horizon",
+            ):
+                post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100,
+                )
+
 
     def test_verified_completion_record_uses_verified_snapshot_contract(self) -> None:
         snapshot = object()

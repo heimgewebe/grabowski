@@ -284,6 +284,7 @@ class DurableSystemdContractTests(unittest.TestCase):
 
         self.assertIn("--reconcile-audit-followups", service)
         self.assertIn("--reconcile-lookback-seconds 25200", service)
+        self.assertIn("TimeoutStartSec=120s", service)
         self.assertIn("ReadWritePaths=%h/.local/state/grabowski", service)
         self.assertNotIn("PartOf=", service)
         self.assertIn("OnActiveSec=15s", timer)

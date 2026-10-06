@@ -1505,32 +1505,63 @@ def reconcile_recent_captain_audit_followups(
     import grabowski_operator
 
     since_unix = int(time.time()) - lookback_seconds
-    queried = grabowski_audit_query.query_audit(
-        {
-            "operation": "captain-run-audit-completion",
-            "since_unix": since_unix,
-        },
-        limit=limit,
-        order="desc",
-    )
-    items = queried.get("items")
-    if not isinstance(items, list):
-        raise RepoGroundPostMergeError("Captain audit reconciliation query is invalid")
+    snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
+    max_scan_records = grabowski_audit_query.MAX_SCAN_RECORDS
+    if (
+        type(max_scan_records) is not int
+        or max_scan_records < 1
+    ):
+        raise RepoGroundPostMergeError("Captain audit reconciliation scan bound is invalid")
+
+    # Discover the complete verified lookback before starting any mutation.
+    # The legacy `limit` argument remains input-compatible but must never
+    # truncate discovery: otherwise newer non-merge Captain completions could
+    # permanently hide an older pending PR merge.
+    completion_record_sha256s: list[str] = []
+    scanned_records = 0
+    lookback_horizon_reached = False
+    iterator = grabowski_audit_query._iter_snapshot_items(snapshot, order="desc")
+    for item in iterator:
+        if scanned_records >= max_scan_records:
+            raise RepoGroundPostMergeError(
+                "Captain audit reconciliation scan truncated before lookback horizon"
+            )
+        scanned_records += 1
+        evidence = item.get("evidence") if isinstance(item, dict) else None
+        record = item.get("record") if isinstance(item, dict) else None
+        if not isinstance(evidence, dict) or not isinstance(record, dict):
+            raise RepoGroundPostMergeError(
+                "Captain audit reconciliation snapshot item is invalid"
+            )
+        timestamp_unix = record.get("timestamp_unix")
+        if type(timestamp_unix) is not int:
+            raise RepoGroundPostMergeError(
+                "Captain audit reconciliation timestamp is invalid"
+            )
+        if timestamp_unix < since_unix:
+            lookback_horizon_reached = True
+            break
+        if (
+            record.get("operation") != "captain-run-audit-completion"
+            or record.get("action") != "pr-merge"
+        ):
+            continue
+        record_sha256 = evidence.get("record_sha256")
+        if (
+            not isinstance(record_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", record_sha256) is None
+        ):
+            raise RepoGroundPostMergeError(
+                "Captain audit reconciliation record identity is invalid"
+            )
+        completion_record_sha256s.append(record_sha256)
+
     starter = resolve_job_starter({"grabowski_operator": grabowski_operator})
     if starter is None:
         raise RepoGroundPostMergeError("durable Grabowski job starter is unavailable")
 
     outcomes: list[dict[str, Any]] = []
-    for item in items:
-        evidence = item.get("evidence") if isinstance(item, dict) else None
-        record = item.get("record") if isinstance(item, dict) else None
-        if not isinstance(evidence, dict) or not isinstance(record, dict):
-            continue
-        if record.get("action") != "pr-merge":
-            continue
-        record_sha256 = evidence.get("record_sha256")
-        if not isinstance(record_sha256, str):
-            continue
+    for record_sha256 in completion_record_sha256s:
         outcome = schedule_from_captain_audit_completion(
             record_sha256,
             job_starter=starter,
@@ -1563,12 +1594,13 @@ def reconcile_recent_captain_audit_followups(
         "schema_version": 1,
         "status": "ok",
         "lookback_seconds": lookback_seconds,
-        "matched": queried.get("matched"),
+        "matched": len(completion_record_sha256s),
         "processed": len(outcomes),
         "outcomes": outcomes,
-        "audit_query_truncated": queried.get("truncated") is True,
+        "audit_query_truncated": False,
+        "scanned_records": scanned_records,
+        "lookback_horizon_reached": lookback_horizon_reached,
     }
-
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
