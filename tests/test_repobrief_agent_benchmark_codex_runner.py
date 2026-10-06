@@ -87,11 +87,20 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
 
 
 
-def bind_manifest(value: dict, root: Path, *, commit: str = COMMIT) -> Path:
+def bind_manifest(
+    value: dict,
+    root: Path,
+    *,
+    commit: str = COMMIT,
+    repo_root: str | None = None,
+) -> Path:
+    repository = {"git_commit": commit}
+    if repo_root is not None:
+        repository["repo_root"] = repo_root
     manifest = {
         "kind": "repoground.bundle.manifest",
         "version": "2.0",
-        "snapshotProvenance": {"repositories": [{"git_commit": commit}]},
+        "snapshotProvenance": {"repositories": [repository]},
     }
     raw = json.dumps(
         manifest, sort_keys=True, separators=(",", ":")
@@ -4395,7 +4404,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
     def test_codex_projects_strict_unknown_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
-            manifest = bind_manifest(value, Path(directory))
+            manifest = bind_manifest(
+                value, Path(directory), repo_root="/tmp/repo"
+            )
             payload = {
                 "kind": "repobrief.live_freshness",
                 "version": "v1",
@@ -4436,6 +4447,19 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 )
             self.assertEqual(evidence["calls"][0]["freshness_status"], "unknown")
 
+            payload["repo_root"] = "/tmp/other-repo"
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                self.assertIsNone(
+                    runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                )
+
+            payload["repo_root"] = "/tmp/repo"
             payload["implicit_refresh"] = True
             with patch.object(
                 runner,
@@ -4451,7 +4475,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
     def test_codex_projects_revision_bound_resource_read_not_list(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
-            manifest = bind_manifest(value, Path(directory))
+            manifest = bind_manifest(
+                value, Path(directory), repo_root="/tmp/repo"
+            )
             uri = "repoground://snapshot/demo/canonical"
             live_freshness = {
                 "kind": "repobrief.live_freshness",
@@ -4524,6 +4550,43 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 },
             )
 
+            unknown = json.loads(json.dumps(resource))
+            unknown_freshness = unknown["_meta"]["repoground"]["liveFreshness"]
+            unknown_freshness.update({
+                "status": "unknown",
+                "reason": "git_probe_failed",
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+            })
+            unknown_freshness.pop("snapshot_provenance")
+            events[0]["item"]["result"] = {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(unknown, sort_keys=True),
+                }]
+            }
+            unknown_evidence = runner._repoground_evidence_from_codex_events(
+                value, events, calls
+            )
+            self.assertEqual(
+                unknown_evidence["calls"][0]["freshness_status"], "unknown"
+            )
+
+            unknown_freshness["repo_root"] = "/tmp/other-repo"
+            events[0]["item"]["result"] = {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(unknown, sort_keys=True),
+                }]
+            }
+            self.assertIsNone(
+                runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                )
+            )
+
+            events[0]["item"]["result"] = result
             for name, updates, removals in [
                 ("implicit_refresh_true", {"implicit_refresh": True}, ()),
                 ("missing_implicit_refresh", {}, ("implicit_refresh",)),

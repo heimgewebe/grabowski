@@ -908,7 +908,11 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
     def test_treatment_projects_revision_bound_resource_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
-            manifest = bind_manifest(value, Path(directory))
+            manifest = bind_manifest(
+                value,
+                Path(directory),
+                repositories=[{"git_commit": COMMIT, "repo_root": "/tmp/repo"}],
+            )
             logical_parent = Path(directory) / "sub"
             logical_parent.mkdir()
             logical_manifest = logical_parent / ".." / manifest.name
@@ -979,6 +983,37 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 },
             )
 
+            unknown_resource = copy.deepcopy(resource)
+            unknown_freshness = unknown_resource["_meta"]["repoground"]["liveFreshness"]
+            unknown_freshness.update({
+                "status": "unknown",
+                "reason": "git_probe_failed",
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+            })
+            unknown_freshness.pop("snapshot_provenance")
+            tool_result["content"] = json.dumps(unknown_resource, sort_keys=True)
+            unknown_evidence = runner.normalize_repoground_evidence(
+                value,
+                messages,
+                runner.normalize_tool_calls(value, messages),
+            )
+            self.assertEqual(
+                unknown_evidence["calls"][0]["freshness_status"], "unknown"
+            )
+
+            unknown_freshness["repo_root"] = "/tmp/other-repo"
+            tool_result["content"] = json.dumps(unknown_resource, sort_keys=True)
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value,
+                    messages,
+                    runner.normalize_tool_calls(value, messages),
+                )
+            )
+
+            tool_result["content"] = json.dumps(resource, sort_keys=True)
             invalid_variants = [
                 ("implicit_refresh_true", {"implicit_refresh": True}, ()),
                 ("missing_implicit_refresh", {}, ("implicit_refresh",)),
@@ -1031,13 +1066,18 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 provenance_key="snapshotProvenance",
                 repositories=[
                     {"repository": "other/repo", "git_commit": "b" * 40},
-                    {"repository": "heimgewebe/repo", "git_commit": COMMIT},
+                    {
+                        "repository": "heimgewebe/repo",
+                        "git_commit": COMMIT,
+                        "repo_root": "/tmp/repo",
+                    },
                 ],
             )
-            path, sha256, commit = runner._bound_repoground_manifest(value)
+            path, sha256, commit, repo_root = runner._bound_repoground_manifest(value)
             self.assertEqual(path, manifest.resolve())
             self.assertEqual(sha256, value["repobrief"]["manifest_sha256"])
             self.assertEqual(commit, COMMIT)
+            self.assertEqual(repo_root, "/tmp/repo")
 
     def test_bound_manifest_accepts_supported_commit_fields(self) -> None:
         for field in ("git_commit", "commit", "head"):
@@ -1048,7 +1088,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     Path(directory),
                     repositories=[{field: COMMIT}],
                 )
-                _, _, commit = runner._bound_repoground_manifest(value)
+                _, _, commit, _ = runner._bound_repoground_manifest(value)
                 self.assertEqual(commit, COMMIT)
 
     def test_bound_manifest_normalizes_uppercase_commit(self) -> None:
@@ -1056,7 +1096,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             with self.subTest(length=len(raw_commit)), tempfile.TemporaryDirectory() as directory:
                 value = request(condition="treatment")
                 bind_manifest(value, Path(directory), commit=raw_commit)
-                _, _, commit = runner._bound_repoground_manifest(value)
+                _, _, commit, _ = runner._bound_repoground_manifest(value)
                 self.assertEqual(commit, raw_commit.lower())
 
     def test_bound_manifest_rejects_oversized_before_unbounded_read(self) -> None:
@@ -1314,7 +1354,11 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
     def test_treatment_projects_strict_unknown_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
-            manifest = bind_manifest(value, Path(directory))
+            manifest = bind_manifest(
+                value,
+                Path(directory),
+                repositories=[{"git_commit": COMMIT, "repo_root": "/tmp/repo"}],
+            )
             messages = runner.parse_jsonl(
                 stream(value, tool_name="mcp__repobrief__live_freshness")
             )
@@ -1343,6 +1387,17 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             evidence = runner.normalize_repoground_evidence(value, messages, calls)
             self.assertEqual(evidence["calls"][0]["freshness_status"], "unknown")
 
+            payload["repo_root"] = "/tmp/other-repo"
+            tool_result["content"] = json.dumps(
+                {"structuredContent": payload}, sort_keys=True
+            )
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
+
+            payload["repo_root"] = "/tmp/repo"
             payload["implicit_refresh"] = True
             tool_result["content"] = json.dumps(
                 {"structuredContent": payload}, sort_keys=True
