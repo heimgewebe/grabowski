@@ -269,30 +269,5 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("Persistent=true", timer)
 
 
-    def test_repoground_post_merge_reconcile_timer_is_operator_lifecycle_bound(self) -> None:
-        service = (
-            ROOT / "systemd" / "grabowski-repoground-post-merge-reconcile.service.example"
-        ).read_text(encoding="utf-8")
-        timer = (
-            ROOT / "systemd" / "grabowski-repoground-post-merge-reconcile.timer.example"
-        ).read_text(encoding="utf-8")
-        dropin = (
-            ROOT
-            / "systemd"
-            / "grabowski-operator.service.d"
-            / "95-repoground-post-merge-reconcile.conf.example"
-        ).read_text(encoding="utf-8")
-        self.assertIn("PartOf=grabowski-operator.service", service)
-        self.assertIn("PartOf=grabowski-operator.service", timer)
-        self.assertIn("OnActiveSec=15s", timer)
-        self.assertIn("OnUnitInactiveSec=1min", timer)
-        self.assertIn("--reconcile-audit-followups", service)
-        self.assertIn("ReadWritePaths=%h/.local/state/grabowski", service)
-        self.assertIn(
-            "Wants=grabowski-repoground-post-merge-reconcile.timer",
-            dropin,
-        )
-
-
 if __name__ == "__main__":
     unittest.main()

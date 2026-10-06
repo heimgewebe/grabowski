@@ -13908,6 +13908,22 @@ def _captain_audit_execution_result_material(
         if merge_completion_verified and isinstance(viewed, dict)
         else None
     )
+    post_merge_reconciliation = execution.get("post_merge_reconciliation")
+    if (
+        observed_merge_sha is None
+        and merge_completion_verified
+        and isinstance(post_merge_reconciliation, dict)
+        and post_merge_reconciliation.get("status")
+        == "verified_base_mutation_pr_metadata_unsettled"
+        and post_merge_reconciliation.get("errors") in (None, [])
+    ):
+        reconciled_merge_sha = post_merge_reconciliation.get("merge_sha")
+        if (
+            isinstance(reconciled_merge_sha, str)
+            and re.fullmatch(r"[0-9a-f]{40}", reconciled_merge_sha.lower())
+            is not None
+        ):
+            observed_merge_sha = reconciled_merge_sha.lower()
     external = execution.get("external_merge_reconciliation")
     external_merge_observed = (
         isinstance(external, dict)
@@ -15168,7 +15184,7 @@ def _grip_run_core(
                     "status": "durable_pending",
                     "reason": "captain_audit_completion_persisted",
                     "captain_audit_completion_sha256": completion_sha256,
-                    "reconciler": "grabowski-repoground-post-merge-reconcile.timer",
+                    "reconciler": "grabowski-reconcile-tasks.timer",
                     "does_not_establish": [
                         "job_started",
                         "freshness_converged",

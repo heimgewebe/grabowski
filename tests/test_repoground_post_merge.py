@@ -209,10 +209,13 @@ class RepoGroundPostMergeConvergenceTests(unittest.TestCase):
 
 
     def test_conventional_checkout_requires_remote_exactness_only_in_post_merge(self) -> None:
-        with patch.object(post_merge, "_read_remote_main_head", return_value=HEAD):
+        with patch.object(
+            post_merge, "_read_remote_branch_head", return_value=HEAD
+        ) as remote_head:
             result = post_merge.converge(
                 repository=REPO,
                 merge_sha=MERGE,
+                target_branch="release/v1",
                 publisher_runner=lambda _argv, _timeout: publisher_result(),
                 freshness_reader=lambda _repo: freshness(
                     state="fresh_exact",
@@ -226,16 +229,19 @@ class RepoGroundPostMergeConvergenceTests(unittest.TestCase):
             )
         self.assertEqual(result["status"], "fresh_exact")
         self.assertEqual(result["final"]["remote_head"], HEAD)
+        self.assertEqual(result["final"]["target_branch"], "release/v1")
+        remote_head.assert_called_once_with("/tmp/repo", "release/v1")
 
     def test_conventional_checkout_remote_unavailable_is_explicit_failure(self) -> None:
         with patch.object(
             post_merge,
-            "_read_remote_main_head",
+            "_read_remote_branch_head",
             side_effect=post_merge.RepoGroundPostMergeError("synthetic unavailable"),
         ):
             result = post_merge.converge(
                 repository=REPO,
                 merge_sha=MERGE,
+                target_branch="develop",
                 publisher_runner=lambda _argv, _timeout: publisher_result(),
                 freshness_reader=lambda _repo: freshness(
                     state="fresh_exact",
@@ -330,7 +336,7 @@ class RepoGroundMergeQueueWatchTests(unittest.TestCase):
         sleeps: list[float] = []
         converged: list[tuple[str, str]] = []
 
-        def converge_queue(repository: str, merge_sha: str) -> dict[str, object]:
+        def converge_queue(repository: str, merge_sha: str, _target_branch: str) -> dict[str, object]:
             converged.append((repository, merge_sha))
             return {"status": "fresh_exact"}
 
@@ -353,6 +359,34 @@ class RepoGroundMergeQueueWatchTests(unittest.TestCase):
         self.assertEqual(converged, [(REPO, MERGE)])
         self.assertEqual(sleeps, [2])
 
+    def test_queue_convergence_uses_verified_base_branch(self) -> None:
+        with patch.object(
+            post_merge,
+            "converge",
+            return_value={"status": "fresh_exact"},
+        ) as converge_call:
+            result = post_merge.watch_merge_queue(
+                repository=REPO,
+                pull_request=PR,
+                expected_head=HEAD,
+                expected_base="release/v2",
+                max_attempts=1,
+                poll_seconds=0,
+                queue_reader=lambda _repo, _pr: self._view(
+                    "MERGED",
+                    base="release/v2",
+                    merge_sha=MERGE,
+                ),
+                sleep_fn=lambda _seconds: None,
+            )
+
+        self.assertEqual(result["status"], "fresh_exact")
+        converge_call.assert_called_once_with(
+            repository=REPO,
+            merge_sha=MERGE,
+            target_branch="release/v2",
+        )
+
     def test_transient_queue_read_error_is_retried(self) -> None:
         calls = 0
 
@@ -371,7 +405,7 @@ class RepoGroundMergeQueueWatchTests(unittest.TestCase):
             max_attempts=2,
             poll_seconds=0,
             queue_reader=read_queue,
-            queue_converger=lambda _repo, _sha: {"status": "fresh_exact"},
+            queue_converger=lambda _repo, _sha, _base: {"status": "fresh_exact"},
             sleep_fn=lambda _seconds: None,
         )
 
@@ -382,7 +416,7 @@ class RepoGroundMergeQueueWatchTests(unittest.TestCase):
     def test_identity_drift_fails_before_convergence(self) -> None:
         converged = False
 
-        def converge_queue(_repository: str, _merge_sha: str) -> dict[str, object]:
+        def converge_queue(_repository: str, _merge_sha: str, _target_branch: str) -> dict[str, object]:
             nonlocal converged
             converged = True
             return {"status": "fresh_exact"}
@@ -429,7 +463,7 @@ class RepoGroundMergeQueueWatchTests(unittest.TestCase):
             poll_seconds=5,
             watch_seconds=12,
             queue_reader=read_queue,
-            queue_converger=lambda _repo, _sha: (_ for _ in ()).throw(
+            queue_converger=lambda _repo, _sha, _base: (_ for _ in ()).throw(
                 AssertionError("deadline exhaustion must not start convergence")
             ),
             sleep_fn=sleep,
@@ -470,7 +504,7 @@ class RepoGroundMergeQueueWatchTests(unittest.TestCase):
             max_attempts=1,
             poll_seconds=0,
             queue_reader=lambda _repo, _pr: self._view("CLOSED"),
-            queue_converger=lambda _repo, _sha: (_ for _ in ()).throw(
+            queue_converger=lambda _repo, _sha, _base: (_ for _ in ()).throw(
                 AssertionError("closed PR must not converge")
             ),
             sleep_fn=lambda _seconds: None,
@@ -550,9 +584,10 @@ class RepoGroundCaptainAuditFollowupTests(unittest.TestCase):
         self.assertEqual(request["status"], "ready")
         self.assertEqual(request["repository"], REPO)
         self.assertEqual(request["merge_sha"], MERGE)
+        self.assertEqual(request["target_branch"], BASE)
         self.assertEqual(
-            request["argv"][-4:],
-            ["--repo", REPO, "--merge-sha", MERGE],
+            request["argv"][-6:],
+            ["--repo", REPO, "--merge-sha", MERGE, "--target-branch", BASE],
         )
 
     def test_audit_bound_queue_reconstructs_identity_without_caller_argv(self) -> None:
@@ -719,6 +754,73 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
         self.assertEqual(result["outcomes"][0]["status"], "scheduled")
         self.assertFalse(result["outcomes"][0]["reused"])
 
+    def test_reconcile_retry_backoff_allows_older_pending_merge_to_progress(self) -> None:
+        items = [
+            {
+                "record": {"action": "pr-merge"},
+                "evidence": {"record_sha256": "1" * 64},
+            },
+            {
+                "record": {"action": "pr-merge"},
+                "evidence": {"record_sha256": "2" * 64},
+            },
+        ]
+        audit_query = types.SimpleNamespace(
+            query_audit=lambda *_args, **_kwargs: {
+                "items": items,
+                "matched": 2,
+                "truncated": False,
+            }
+        )
+        scheduled: list[str] = []
+
+        def schedule(record_sha256: str, **_kwargs: object) -> dict[str, object]:
+            scheduled.append(record_sha256)
+            if record_sha256 == "1" * 64:
+                return {
+                    "status": "retry_deferred",
+                    "reason": "durable_freshness_job_retry_backoff",
+                    "repository": REPO,
+                    "unit": "grabowski-job-newest",
+                    "reused": True,
+                }
+            return {
+                "status": "scheduled",
+                "reason": "durable_freshness_job_started",
+                "repository": REPO,
+                "merge_sha": MERGE,
+                "unit": "grabowski-job-older",
+                "reused": False,
+            }
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "grabowski_audit_query": audit_query,
+                    "grabowski_operator": types.SimpleNamespace(),
+                },
+            ),
+            patch.object(
+                post_merge,
+                "resolve_job_starter",
+                return_value=lambda *_args, **_kwargs: {},
+            ),
+            patch.object(
+                post_merge,
+                "schedule_from_captain_audit_completion",
+                side_effect=schedule,
+            ),
+        ):
+            result = post_merge.reconcile_recent_captain_audit_followups()
+
+        self.assertEqual(scheduled, ["1" * 64, "2" * 64])
+        self.assertEqual(result["processed"], 2)
+        self.assertEqual(
+            [item["status"] for item in result["outcomes"]],
+            ["retry_deferred", "scheduled"],
+        )
+
     def test_verified_completion_record_uses_verified_snapshot_contract(self) -> None:
         snapshot = object()
         completion_sha = "1" * 64
@@ -790,7 +892,10 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
         self.assertEqual(
             calls[0]["runtime_seconds"], post_merge.DEFAULT_JOB_RUNTIME_SECONDS
         )
-        self.assertEqual(calls[0]["argv"][-4:], ["--repo", REPO, "--merge-sha", MERGE])
+        self.assertEqual(
+            calls[0]["argv"][-6:],
+            ["--repo", REPO, "--merge-sha", MERGE, "--target-branch", BASE],
+        )
 
     def test_exact_base_reconciliation_merge_sha_can_schedule(self) -> None:
         result = post_merge.schedule_from_captain_result(
@@ -1103,6 +1208,83 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
                 self.assertNotEqual(first["unit"], second["unit"])
                 self.assertFalse(second["reused"])
 
+
+    def test_recent_failed_job_defers_retry_without_new_mutation(self) -> None:
+        jobs: dict[str, dict[str, object]] = {}
+        live_status: dict[str, str] = {}
+        starts: list[str] = []
+        created_at = 10_000
+
+        def argv_hash(_argv: list[str]) -> str:
+            return "9" * 64
+
+        def read_metadata(unit: str) -> dict[str, object]:
+            if unit not in jobs:
+                raise ValueError("missing")
+            return jobs[unit]
+
+        def read_status(unit: str) -> dict[str, object]:
+            metadata = read_metadata(unit)
+            return {
+                "unit": unit,
+                "metadata": metadata,
+                "final_status": live_status[unit],
+            }
+
+        def private_start(
+            argv: list[str],
+            *,
+            cwd: str,
+            runtime_seconds: int,
+            reserved_unit: str,
+        ) -> dict[str, object]:
+            starts.append(reserved_unit)
+            job: dict[str, object] = {
+                "unit": reserved_unit,
+                "job_id": reserved_unit.removeprefix("grabowski-job-"),
+                "argv_sha256": argv_hash(argv),
+                "cwd": cwd,
+                "runtime_seconds": runtime_seconds,
+                "created_at_unix": created_at,
+                "final_status": "launch_submitted",
+            }
+            jobs[reserved_unit] = job
+            live_status[reserved_unit] = "running"
+            return job
+
+        operator = types.SimpleNamespace(
+            grabowski_job_start=lambda *_args, **_kwargs: {},
+            grabowski_job_status=read_status,
+            _argv_hash=argv_hash,
+            _read_job_metadata=read_metadata,
+            _require_operator_mutation=lambda *_args, **_kwargs: None,
+            _start_job=private_start,
+        )
+        starter = post_merge.resolve_job_starter({"grabowski_operator": operator})
+        self.assertIsNotNone(starter)
+
+        first = post_merge.schedule_from_captain_result(
+            captain_result(completed=False, queued=True),
+            job_starter=starter,
+            python_executable="/usr/bin/python3",
+            script_path=Path(post_merge.__file__),
+        )
+        live_status[first["unit"]] = "failed"
+        with patch.object(post_merge.time, "time", return_value=created_at + 60):
+            second = post_merge.schedule_from_captain_result(
+                captain_result(completed=False, queued=True),
+                job_starter=starter,
+                python_executable="/usr/bin/python3",
+                script_path=Path(post_merge.__file__),
+            )
+
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(second["status"], "retry_deferred")
+        self.assertTrue(second["reused"])
+        self.assertEqual(
+            second["retry_after_unix"],
+            created_at + post_merge.POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS,
+        )
 
     def test_uncertain_live_queue_job_fails_closed_without_duplicate(self) -> None:
         jobs: dict[str, dict[str, object]] = {}

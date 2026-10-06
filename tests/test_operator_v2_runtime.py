@@ -3897,6 +3897,44 @@ class CaptainAuditTrailTests(unittest.TestCase):
         self.assertFalse(material["execution_invoked"])
         self.assertTrue(material["external_merge_observed"])
 
+    def test_completion_material_preserves_exact_base_reconciled_merge_sha(self) -> None:
+        merge_sha = "d" * 40
+        result = {
+            "status": "passed",
+            "receipt": {
+                "status": "passed",
+                "receipt_sha256": "a" * 64,
+                "output_sha256": "b" * 64,
+            },
+            "output": {
+                "executions": [
+                    {
+                        "action": "pr-merge",
+                        "execution_invoked": True,
+                        "execution_attempted": True,
+                        "command_returned": True,
+                        "merge_returncode": 0,
+                        "verification_passed": True,
+                        "remote_mutation_observed": True,
+                        "merge_completion_verified": True,
+                        "verified_pr": {"mergeCommit": None},
+                        "post_merge_reconciliation": {
+                            "status": "verified_base_mutation_pr_metadata_unsettled",
+                            "errors": [],
+                            "merge_sha": merge_sha,
+                        },
+                    }
+                ]
+            },
+        }
+
+        material = grabowski_mcp._captain_audit_execution_result_material(
+            result, action="pr-merge"
+        )
+
+        self.assertEqual("captain_dispatch_verified", material["provenance_mode"])
+        self.assertEqual(merge_sha, material["observed_merge_sha"])
+
     def test_completion_material_rejects_pr_merge_without_canonical_execution(self) -> None:
         result = {
             "status": "passed",

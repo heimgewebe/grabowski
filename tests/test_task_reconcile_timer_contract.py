@@ -29,6 +29,14 @@ class TaskReconcileTimerContractTests(unittest.TestCase):
 
         self.assertIn("Type=oneshot", source)
         self.assertIn("--mode refresh --batch-size 100", source)
+        self.assertIn(
+            "ExecStartPost=%h/.local/share/grabowski-mcp/.venv/bin/python -I "
+            "-m grabowski_repoground_post_merge --reconcile-audit-followups "
+            "--reconcile-lookback-seconds 900",
+            source,
+        )
+        self.assertEqual(source.count("ExecStartPost="), 1)
+        self.assertIn("ReadWritePaths=%h/.local/state/grabowski", source)
         self.assertIn("TimeoutStartSec=120s", source)
 
 

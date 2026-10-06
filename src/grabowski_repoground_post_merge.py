@@ -43,7 +43,7 @@ MonotonicFn = Callable[[], float]
 AncestryChecker = Callable[[str, str, str], bool]
 JobStarter = Callable[..., dict[str, Any]]
 QueueReader = Callable[[str, int], dict[str, Any]]
-QueueConverger = Callable[[str, str], dict[str, Any]]
+QueueConverger = Callable[[str, str, str], dict[str, Any]]
 
 
 POST_MERGE_TERMINAL_JOB_STATUSES = frozenset(
@@ -56,6 +56,7 @@ POST_MERGE_TERMINAL_JOB_STATUSES = frozenset(
     }
 )
 POST_MERGE_JOB_SLOT_LIMIT = 16
+POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS = 300
 
 
 def _post_merge_job_starter(
@@ -150,6 +151,23 @@ def _post_merge_job_starter(
                     "observed_final_status": "succeeded",
                 }
             if final_status in POST_MERGE_TERMINAL_JOB_STATUSES:
+                created_at_unix = observed_metadata.get("created_at_unix")
+                if (
+                    isinstance(created_at_unix, int)
+                    and not isinstance(created_at_unix, bool)
+                    and created_at_unix >= 0
+                ):
+                    retry_after_unix = (
+                        created_at_unix + POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS
+                    )
+                    if int(time.time()) < retry_after_unix:
+                        return {
+                            **observed_metadata,
+                            "reused": True,
+                            "reuse_retry_deferred": True,
+                            "observed_final_status": final_status,
+                            "retry_after_unix": retry_after_unix,
+                        }
                 return None
             return uncertain(observed_metadata, final_status=final_status)
 
@@ -421,7 +439,9 @@ def _freshness_projection(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _read_remote_main_head(repo_path: str) -> str:
+def _read_remote_branch_head(repo_path: str, target_branch: str) -> str:
+    target_branch = _validate_base_ref(target_branch)
+    full_ref = f"refs/heads/{target_branch}"
     completed = subprocess.run(
         [
             "git",
@@ -432,7 +452,7 @@ def _read_remote_main_head(repo_path: str) -> str:
             "--refs",
             "--",
             "origin",
-            "refs/heads/main",
+            full_ref,
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -442,17 +462,23 @@ def _read_remote_main_head(repo_path: str) -> str:
         timeout=DEFAULT_ANCESTRY_TIMEOUT_SECONDS,
     )
     if completed.returncode != 0:
-        raise RepoGroundPostMergeError("authoritative remote main head is unavailable")
+        raise RepoGroundPostMergeError(
+            "authoritative remote target branch head is unavailable"
+        )
     lines = [line for line in completed.stdout.splitlines() if line.strip()]
     if len(lines) != 1:
-        raise RepoGroundPostMergeError("authoritative remote main head is ambiguous")
+        raise RepoGroundPostMergeError(
+            "authoritative remote target branch head is ambiguous"
+        )
     fields = lines[0].split()
     if (
         len(fields) != 2
-        or fields[1] != "refs/heads/main"
+        or fields[1] != full_ref
         or SHA40_RE.fullmatch(fields[0].lower()) is None
     ):
-        raise RepoGroundPostMergeError("authoritative remote main head is invalid")
+        raise RepoGroundPostMergeError(
+            "authoritative remote target branch head is invalid"
+        )
     return fields[0].lower()
 
 
@@ -460,6 +486,7 @@ def _fresh_exact(
     freshness: dict[str, Any],
     *,
     merge_sha: str,
+    target_branch: str,
     ancestry_checker: AncestryChecker,
 ) -> tuple[bool, dict[str, Any]]:
     projection = _freshness_projection(freshness)
@@ -474,8 +501,9 @@ def _fresh_exact(
         and repo_path
     ):
         try:
-            remote_head = _read_remote_main_head(repo_path)
+            remote_head = _read_remote_branch_head(repo_path, target_branch)
             projection["remote_head"] = remote_head
+            projection["target_branch"] = target_branch
             projection["remote_head_status"] = "observed"
             projection["remote_head_basis"] = "git_ls_remote_origin"
         except (OSError, RepoGroundPostMergeError, subprocess.SubprocessError):
@@ -505,6 +533,7 @@ def converge(
     *,
     repository: str,
     merge_sha: str,
+    target_branch: str = "main",
     publisher: Path = DEFAULT_PUBLISHER,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     busy_sleep_seconds: float = DEFAULT_BUSY_SLEEP_SECONDS,
@@ -516,6 +545,7 @@ def converge(
 ) -> dict[str, Any]:
     repository = _validate_repository(repository)
     merge_sha = _validate_sha(merge_sha)
+    target_branch = _validate_base_ref(target_branch)
     if type(max_attempts) is not int or max_attempts < 1 or max_attempts > 32:
         raise RepoGroundPostMergeError("max_attempts must be between 1 and 32")
     if busy_sleep_seconds < 0 or busy_sleep_seconds > 300:
@@ -579,6 +609,7 @@ def converge(
         exact, projection = _fresh_exact(
             freshness,
             merge_sha=merge_sha,
+            target_branch=target_branch,
             ancestry_checker=ancestry_checker,
         )
         attempt_record["freshness"] = projection
@@ -673,8 +704,14 @@ def _read_queue_pr(repository: str, pull_request: int) -> dict[str, Any]:
     return payload
 
 
-def _queue_converge(repository: str, merge_sha: str) -> dict[str, Any]:
-    return converge(repository=repository, merge_sha=merge_sha)
+def _queue_converge(
+    repository: str, merge_sha: str, target_branch: str
+) -> dict[str, Any]:
+    return converge(
+        repository=repository,
+        merge_sha=merge_sha,
+        target_branch=target_branch,
+    )
 
 
 def watch_merge_queue(
@@ -828,7 +865,7 @@ def watch_merge_queue(
                 sleep_fn(min(poll_seconds, max(0.0, remaining)))
                 continue
             merge_sha = merge_sha.lower()
-            convergence = queue_converger(repository, merge_sha)
+            convergence = queue_converger(repository, merge_sha, expected_base)
             if not isinstance(convergence, dict):
                 raise RepoGroundPostMergeError(
                     "queue convergence returned a non-object"
@@ -1047,6 +1084,15 @@ def captain_followup_request(
             reason="verified_merge_sha_unavailable",
             repository=repository,
         )
+    try:
+        target_branch = _validate_base_ref(execution.get("expected_base"))
+    except RepoGroundPostMergeError:
+        return _followup_base(
+            status="not_scheduled",
+            reason="merge_target_branch_invalid",
+            repository=repository,
+            merge_sha=merge_sha,
+        )
 
     return {
         **_followup_base(
@@ -1055,6 +1101,7 @@ def captain_followup_request(
             repository=repository,
             merge_sha=merge_sha,
         ),
+        "target_branch": target_branch,
         "argv": [
             executable,
             "-B",
@@ -1063,6 +1110,8 @@ def captain_followup_request(
             repository,
             "--merge-sha",
             merge_sha,
+            "--target-branch",
+            target_branch,
         ],
         "cwd": str(script.parent),
     }
@@ -1202,6 +1251,29 @@ def schedule_followup_request(
             "does_not_establish": ["future_branch_freshness"],
         }
 
+    if job.get("reuse_retry_deferred") is True:
+        return {
+            **_followup_base(
+                status="retry_deferred",
+                reason="durable_freshness_job_retry_backoff",
+                repository=identity["repository"],
+                merge_sha=identity.get("merge_sha"),
+            ),
+            **(
+                {"pull_request": identity["pull_request"]}
+                if "pull_request" in identity
+                else {}
+            ),
+            "unit": unit,
+            "reused": True,
+            "observed_final_status": job.get("observed_final_status"),
+            "retry_after_unix": job.get("retry_after_unix"),
+            "does_not_establish": [
+                "freshness_converged",
+                "future_branch_freshness",
+            ],
+        }
+
     if job.get("reuse_uncertain") is True:
         return {
             **_followup_base(
@@ -1337,6 +1409,7 @@ def captain_followup_request_from_audit(
     provenance_mode = execution.get("provenance_mode")
     if provenance_mode == "captain_dispatch_verified":
         merge_sha = _validate_sha(execution.get("observed_merge_sha"))
+        target_branch = _validate_base_ref(record.get("expected_base"))
         return {
             **_followup_base(
                 status="ready",
@@ -1345,6 +1418,7 @@ def captain_followup_request_from_audit(
                 merge_sha=merge_sha,
             ),
             "captain_audit_completion_sha256": completion_record_sha256,
+            "target_branch": target_branch,
             "argv": [
                 executable,
                 "-B",
@@ -1353,6 +1427,8 @@ def captain_followup_request_from_audit(
                 repository,
                 "--merge-sha",
                 merge_sha,
+                "--target-branch",
+                target_branch,
             ],
             "cwd": str(script.parent),
         }
@@ -1476,7 +1552,7 @@ def reconcile_recent_captain_audit_followups(
         # we stop so a single reconcile pass can never create two jobs.
         status = outcome.get("status")
         safe_read_only = (
-            status in {"already_satisfied", "not_scheduled"}
+            status in {"already_satisfied", "not_scheduled", "retry_deferred"}
             or (status == "scheduled" and outcome.get("reused") is True)
         )
         if not safe_read_only:
@@ -1508,6 +1584,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--reconcile-lookback-seconds", type=int, default=900)
     parser.add_argument("--expected-head")
     parser.add_argument("--expected-base")
+    parser.add_argument("--target-branch", default="main")
     parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
     parser.add_argument(
         "--busy-sleep-seconds", type=float, default=DEFAULT_BUSY_SLEEP_SECONDS
@@ -1567,6 +1644,7 @@ def main(argv: list[str] | None = None) -> int:
             result = converge(
                 repository=args.repo,
                 merge_sha=args.merge_sha,
+                target_branch=args.target_branch,
                 max_attempts=args.max_attempts,
                 busy_sleep_seconds=args.busy_sleep_seconds,
                 publish_timeout_seconds=args.publish_timeout_seconds,
