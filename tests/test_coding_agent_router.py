@@ -1340,11 +1340,35 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertRegex(admission["admission_sha256"], r"^[0-9a-f]{64}$")
         self.assertNotIn("prompt", json.dumps(admission, sort_keys=True))
 
-    def test_pre_dispatch_admission_rejects_advisory_only_execution_pool(self) -> None:
+    def test_pre_dispatch_admission_allows_advisory_only_pool_for_read_only_execution(self) -> None:
         route = next(
             item for item in self.catalog["routes"] if item["id"] == "codex-sol-high"
         )
         argv = [*route["argv_prefix"], "exec", "--sandbox", "read-only", "prompt"]
+        with mock.patch.object(
+            router,
+            "_pool_gate",
+            return_value=(True, ["quota is opaque"], 0.55, False),
+        ):
+            admission = router.coding_agent_pre_dispatch_admission(
+                argv, read_only_execution=True
+            )
+
+        self.assertTrue(admission["applicable"])
+        self.assertTrue(admission["admitted"])
+        self.assertEqual(admission["reason_code"], "admitted")
+        self.assertTrue(admission["read_only_execution"])
+        pool = admission["quota_pools"][0]
+        self.assertTrue(pool["allowed"])
+        self.assertFalse(pool["execution_eligible"])
+        self.assertEqual(pool["reasons"], ["quota is opaque"])
+        self.assertEqual(admission["reservation"]["status"], "not_reserved")
+
+    def test_pre_dispatch_admission_rejects_advisory_only_pool_for_writer_execution(self) -> None:
+        route = next(
+            item for item in self.catalog["routes"] if item["id"] == "codex-sol-high"
+        )
+        argv = [*route["argv_prefix"], "exec", "--sandbox", "workspace-write", "prompt"]
         with mock.patch.object(
             router,
             "_pool_gate",
@@ -1355,11 +1379,29 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertTrue(admission["applicable"])
         self.assertFalse(admission["admitted"])
         self.assertEqual(admission["reason_code"], "quota_pool_blocked")
+        self.assertFalse(admission["read_only_execution"])
         pool = admission["quota_pools"][0]
         self.assertTrue(pool["allowed"])
         self.assertFalse(pool["execution_eligible"])
         self.assertEqual(pool["reasons"], ["quota is opaque"])
-        self.assertEqual(admission["reservation"]["status"], "not_reserved")
+
+    def test_pre_dispatch_read_only_still_rejects_hard_pool_denial(self) -> None:
+        route = next(
+            item for item in self.catalog["routes"] if item["id"] == "codex-sol-high"
+        )
+        argv = [*route["argv_prefix"], "exec", "--sandbox", "read-only", "prompt"]
+        with mock.patch.object(
+            router,
+            "_pool_gate",
+            return_value=(False, ["pool concurrency is saturated"], 0.0, False),
+        ):
+            admission = router.coding_agent_pre_dispatch_admission(
+                argv, read_only_execution=True
+            )
+
+        self.assertFalse(admission["admitted"])
+        self.assertEqual(admission["reason_code"], "quota_pool_blocked")
+        self.assertTrue(admission["read_only_execution"])
 
     def test_pre_dispatch_admission_rechecks_capacity_after_route_was_ready(self) -> None:
         route = next(

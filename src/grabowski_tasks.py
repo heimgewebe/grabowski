@@ -9112,7 +9112,10 @@ def grabowski_task_start(
         import grabowski_coding_agent_router as coding_agent_router
 
         candidate_admission = coding_agent_router.coding_agent_pre_dispatch_admission(
-            command
+            command,
+            read_only_execution=(
+                task_effect_classification["effect_profile"] == "read_only"
+            ),
         )
         if candidate_admission.get("admitted") is not True:
             denial_audit = {
@@ -9973,7 +9976,11 @@ def grabowski_task_resume(
         import grabowski_coding_agent_router as coding_agent_router
 
         candidate_admission = coding_agent_router.coding_agent_pre_dispatch_admission(
-            command
+            command,
+            read_only_execution=(
+                task_effect_classification is not None
+                and task_effect_classification.get("effect_profile") == "read_only"
+            ),
         )
         if candidate_admission.get("admitted") is not True:
             denial_audit = {

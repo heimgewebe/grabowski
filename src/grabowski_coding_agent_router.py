@@ -2301,7 +2301,11 @@ def _pre_dispatch_admission_receipt(material: dict[str, Any]) -> dict[str, Any]:
     return {**material, "admission_sha256": _canonical_sha256(material)}
 
 
-def coding_agent_pre_dispatch_admission(argv: list[str]) -> dict[str, Any]:
+def coding_agent_pre_dispatch_admission(
+    argv: list[str],
+    *,
+    read_only_execution: bool = False,
+) -> dict[str, Any]:
     """Revalidate one catalogued coding-agent command immediately before release.
 
     This observation-only gate narrows route-to-launch TOCTOU. It deliberately
@@ -2314,11 +2318,14 @@ def coding_agent_pre_dispatch_admission(argv: list[str]) -> dict[str, Any]:
     ):
         raise CodingAgentRouterError("coding-agent admission argv is invalid")
 
+    if type(read_only_execution) is not bool:
+        raise CodingAgentRouterError("read_only_execution must be boolean")
     catalog, validation = _load_catalog()
     base = {
         "schema_version": 1,
         "kind": "coding_agent_pre_dispatch_admission",
         "policy_scope": "hard_execution_gates_only",
+        "read_only_execution": read_only_execution,
         "argv_sha256": _canonical_sha256(argv),
         "catalog_sha256": validation["catalog_sha256"],
         "reservation": {
@@ -2456,7 +2463,9 @@ def coding_agent_pre_dispatch_admission(argv: list[str]) -> dict[str, Any]:
                 "state_error": effective.get("_state_error"),
             }
         )
-        blocked = blocked or not allowed or not execution_eligible
+        blocked = blocked or not allowed or (
+            not execution_eligible and not read_only_execution
+        )
 
     return _pre_dispatch_admission_receipt(
         {

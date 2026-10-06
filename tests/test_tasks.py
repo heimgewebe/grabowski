@@ -2625,7 +2625,9 @@ class TaskTests(unittest.TestCase):
             ):
                 tasks.grabowski_task_resume(task_id)
 
-        admission.assert_called_once_with(argv)
+        admission.assert_called_once_with(
+            argv, read_only_execution=False
+        )
         renew.assert_not_called()
         acquire.assert_not_called()
         launch.assert_not_called()
@@ -3511,7 +3513,9 @@ class TaskTests(unittest.TestCase):
                 tasks.grabowski_task_start(
                     "local", argv, cwd=str(self.root), runtime_seconds=60
                 )
-        admission.assert_called_once_with(argv)
+        admission.assert_called_once_with(
+            argv, read_only_execution=False
+        )
         dispatch.assert_not_called()
         acquire.assert_not_called()
         denial_audits = [
@@ -4721,16 +4725,31 @@ class TaskTests(unittest.TestCase):
 
     def test_read_only_codex_task_does_not_lease_workspace(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "read-only"]
+        admitted = {
+            "schema_version": 1,
+            "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True,
+            "admitted": True,
+            "reason_code": "admitted",
+            "argv_sha256": "1" * 64,
+            "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
         ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
             tasks.base, "_append_audit"
         ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 153}
-        ):
+        ), patch.object(
+            coding_agent_router,
+            "coding_agent_pre_dispatch_admission",
+            return_value=admitted,
+        ) as admission:
             result = tasks.grabowski_task_start(
                 "local", argv, cwd=str(self.root), runtime_seconds=60
             )
+        admission.assert_called_once_with(argv, read_only_execution=True)
         self.assertEqual(result["task"]["resource_keys"], [])
         self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
         self.assertEqual(result["task_effect_classification"]["effect_profile"], "read_only")
