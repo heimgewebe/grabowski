@@ -600,6 +600,18 @@ def _database() -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS operation_uncertainty_active_idx "
         "ON operation_uncertainty(cleared_at_unix, checkout_key)"
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS operation_uncertainty_intents (
+            fence_id TEXT NOT NULL,
+            intent_kind TEXT NOT NULL,
+            intent_json TEXT NOT NULL,
+            intent_sha256 TEXT NOT NULL,
+            created_at_unix INTEGER NOT NULL,
+            PRIMARY KEY(fence_id, intent_kind)
+        )
+        """
+    )
     current = connection.execute(
         "SELECT value FROM metadata WHERE key='schema_version'"
     ).fetchone()
@@ -3397,6 +3409,169 @@ def _materialize_completed_obligation_matches_fence(
     return len(matches) == 1
 
 
+_MATERIALIZE_RECOVERY_REMOVAL_INTENT = (
+    "checkout-operation-uncertainty-materialize-removal-intent"
+)
+
+
+def _checkout_operation_intent(
+    fence_id: str,
+    intent_kind: str,
+) -> dict[str, Any] | None:
+    if not isinstance(fence_id, str) or re.fullmatch(r"[0-9a-f]{32}", fence_id) is None:
+        raise ValueError("fence_id must be a 32-character lowercase hex identifier")
+    if not isinstance(intent_kind, str) or not intent_kind or len(intent_kind) > 128:
+        raise ValueError("checkout operation intent kind is invalid")
+    connection = _readonly_connection(CHECKOUT_DB)
+    if connection is None:
+        return None
+    try:
+        try:
+            row = connection.execute(
+                """
+                SELECT intent_json, intent_sha256, created_at_unix
+                FROM operation_uncertainty_intents
+                WHERE fence_id=? AND intent_kind=?
+                """,
+                (fence_id, intent_kind),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table: operation_uncertainty_intents" in str(exc):
+                return None
+            raise
+    finally:
+        connection.close()
+    if row is None:
+        return None
+    intent = json.loads(row["intent_json"])
+    if _sha256_json(intent) != row["intent_sha256"]:
+        raise RuntimeError("Checkout operation intent integrity failed")
+    return {
+        "intent": intent,
+        "intent_sha256": row["intent_sha256"],
+        "created_at_unix": row["created_at_unix"],
+    }
+
+
+def _persist_checkout_operation_intent(
+    fence: dict[str, Any],
+    intent_kind: str,
+    *,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    fence_id = str(fence["fence_id"])
+    if re.fullmatch(r"[0-9a-f]{32}", fence_id) is None:
+        raise ValueError("fence_id must be a 32-character lowercase hex identifier")
+    if not isinstance(intent_kind, str) or not intent_kind or len(intent_kind) > 128:
+        raise ValueError("checkout operation intent kind is invalid")
+    intent = {
+        "schema_version": 1,
+        "kind": intent_kind,
+        "fence_id": fence_id,
+        "evidence": dict(evidence),
+    }
+    intent_sha256 = _sha256_json(intent)
+    created_at_unix = _now()
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        fence_row = connection.execute(
+            "SELECT * FROM operation_uncertainty WHERE fence_id=?",
+            (fence_id,),
+        ).fetchone()
+        if fence_row is None:
+            raise ValueError(f"Unknown checkout uncertainty fence: {fence_id}")
+        current = _operation_uncertainty_public(fence_row)
+        if current["cleared_at_unix"] is not None:
+            raise RuntimeError("Checkout operation uncertainty is already cleared")
+        if (
+            current["evidence_sha256"] != fence.get("evidence_sha256")
+            or current["operation"] != fence.get("operation")
+            or current["operation_id"] != fence.get("operation_id")
+        ):
+            raise RuntimeError(
+                "Checkout operation uncertainty changed before intent persistence"
+            )
+        existing = connection.execute(
+            """
+            SELECT intent_json, intent_sha256, created_at_unix
+            FROM operation_uncertainty_intents
+            WHERE fence_id=? AND intent_kind=?
+            """,
+            (fence_id, intent_kind),
+        ).fetchone()
+        if existing is not None:
+            existing_intent = json.loads(existing["intent_json"])
+            if (
+                existing["intent_sha256"] != _sha256_json(existing_intent)
+                or existing["intent_sha256"] != intent_sha256
+                or existing_intent != intent
+            ):
+                raise RuntimeError(
+                    "Checkout operation intent conflicts with existing record"
+                )
+            return {
+                "intent": existing_intent,
+                "intent_sha256": existing["intent_sha256"],
+                "created_at_unix": existing["created_at_unix"],
+            }
+        connection.execute(
+            """
+            INSERT INTO operation_uncertainty_intents(
+                fence_id, intent_kind, intent_json, intent_sha256, created_at_unix
+            ) VALUES(?, ?, ?, ?, ?)
+            """,
+            (
+                fence_id,
+                intent_kind,
+                _canonical_json(intent),
+                intent_sha256,
+                created_at_unix,
+            ),
+        )
+        row = connection.execute(
+            """
+            SELECT intent_json, intent_sha256, created_at_unix
+            FROM operation_uncertainty_intents
+            WHERE fence_id=? AND intent_kind=?
+            """,
+            (fence_id, intent_kind),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Checkout operation intent insert readback is missing")
+        persisted = json.loads(row["intent_json"])
+        if row["intent_sha256"] != intent_sha256 or persisted != intent:
+            raise RuntimeError("Checkout operation intent insert readback mismatch")
+        connection.commit()
+    return {
+        "intent": persisted,
+        "intent_sha256": intent_sha256,
+        "created_at_unix": row["created_at_unix"],
+    }
+
+
+def _materialize_recovery_removal_intent(
+    fence: dict[str, Any],
+) -> dict[str, Any] | None:
+    stored = _checkout_operation_intent(
+        str(fence["fence_id"]),
+        _MATERIALIZE_RECOVERY_REMOVAL_INTENT,
+    )
+    if stored is None:
+        return None
+    evidence = fence["evidence"]
+    intent = stored["intent"]
+    intent_evidence = intent.get("evidence")
+    if (
+        intent.get("kind") != _MATERIALIZE_RECOVERY_REMOVAL_INTENT
+        or intent.get("fence_id") != fence["fence_id"]
+        or not isinstance(intent_evidence, dict)
+        or intent_evidence.get("path") != str(evidence["checkout_path"])
+        or intent_evidence.get("repo") != str(evidence["repo"])
+        or intent_evidence.get("head") != str(evidence["expected_head"])
+    ):
+        raise RuntimeError("Materialize recovery removal intent does not match fence")
+    return stored
+
 
 def _materialize_uncertainty_readback(
     fence: dict[str, Any],
@@ -3426,6 +3601,23 @@ def _materialize_uncertainty_readback(
             return {
                 "state": "still_fenced",
                 "reason": f"materialize-lifecycle-readback-mismatch:{type(exc).__name__}",
+            }
+        try:
+            removal_intent = _materialize_recovery_removal_intent(fence)
+        except Exception as exc:
+            return {
+                "state": "still_fenced",
+                "reason": (
+                    "materialize-recovery-removal-intent-readback-failed:"
+                    f"{type(exc).__name__}"
+                ),
+            }
+        if removal_intent is not None:
+            return {
+                "state": "recoverable_removed",
+                "checkout_key": evidence["checkout_key"],
+                "expected_head": expected_head,
+                "recovery_removal_intent": removal_intent,
             }
         return {
             "state": "confirmed_no_effect",
@@ -3744,7 +3936,7 @@ def _reconcile_materialize_uncertainty(
                     "readback": readback,
                 }
             return {**readback, "obligation_recovery": obligation_recovery}
-        if state != "recoverable_created":
+        if state not in {"recoverable_created", "recoverable_removed"}:
             return readback
         evidence = fence["evidence"]
         try:
@@ -3771,12 +3963,6 @@ def _reconcile_materialize_uncertainty(
                     "reason": "materialize-completed-obligation-still-requires-continuation",
                     "readback": readback,
                 }
-            if retention is None:
-                return {
-                    "state": "still_fenced",
-                    "reason": "materialize-completed-retention-missing",
-                    "readback": readback,
-                }
             if not _materialize_completed_obligation_matches_fence(
                 fence, obligation_status
             ):
@@ -3785,51 +3971,85 @@ def _reconcile_materialize_uncertainty(
                     "reason": "materialize-completed-obligation-evidence-mismatch",
                     "readback": readback,
                 }
-            retention_until_unix = retention.get("retention_until_unix")
-            if (
-                not isinstance(retention_until_unix, int)
-                or isinstance(retention_until_unix, bool)
-            ):
-                return {
-                    "state": "still_fenced",
-                    "reason": "materialize-completed-retention-deadline-invalid",
-                    "readback": readback,
-                }
-            if retention_until_unix > _now():
-                return {
-                    "state": "confirmed_success",
-                    "checkout_key": evidence["checkout_key"],
-                    "expected_head": evidence["expected_head"],
-                    "completed_obligation": {
-                        "obligation_id": obligation_status.get("obligation_id"),
-                        "state": obligation_status.get("state"),
-                        "close_file_sha256": obligation_status.get("close_file_sha256"),
-                    },
-                    "retention": retention,
-                }
-            completed_source_expired = True
+            if retention is None:
+                if state != "recoverable_removed":
+                    return {
+                        "state": "still_fenced",
+                        "reason": "materialize-completed-retention-missing",
+                        "readback": readback,
+                    }
+                completed_source_expired = True
+            else:
+                retention_until_unix = retention.get("retention_until_unix")
+                if (
+                    not isinstance(retention_until_unix, int)
+                    or isinstance(retention_until_unix, bool)
+                ):
+                    return {
+                        "state": "still_fenced",
+                        "reason": "materialize-completed-retention-deadline-invalid",
+                        "readback": readback,
+                    }
+                if state == "recoverable_created" and retention_until_unix > _now():
+                    return {
+                        "state": "confirmed_success",
+                        "checkout_key": evidence["checkout_key"],
+                        "expected_head": evidence["expected_head"],
+                        "completed_obligation": {
+                            "obligation_id": obligation_status.get("obligation_id"),
+                            "state": obligation_status.get("state"),
+                            "close_file_sha256": obligation_status.get("close_file_sha256"),
+                        },
+                        "retention": retention,
+                    }
+                completed_source_expired = True
         repo = _resolve_repo(str(evidence["repo"]))
         checkout = Path(str(evidence["checkout_path"]))
-        operator._require_operator_mutation(
-            "git_cli", path=str(checkout), repo=str(repo)
-        )
-        physical_identity = physical_checkout.capture_physical_checkout_identity(
-            checkout
-        )
-        result = _git_mutate(
-            repo,
-            ["worktree", "remove", str(checkout)],
-            timeout_seconds=120,
-            expected_physical_identity=physical_identity,
-            expected_physical_checkout=checkout,
-        )
-        after = _materialize_uncertainty_readback(fence)
-        if after.get("state") != "confirmed_no_effect":
+        result: dict[str, Any] | None = None
+        if state == "recoverable_created":
+            operator._require_operator_mutation(
+                "git_cli", path=str(checkout), repo=str(repo)
+            )
+            physical_identity = physical_checkout.capture_physical_checkout_identity(
+                checkout
+            )
+            removal_intent = _persist_checkout_operation_intent(
+                fence,
+                _MATERIALIZE_RECOVERY_REMOVAL_INTENT,
+                evidence={
+                    "path": str(checkout),
+                    "repo": str(evidence["repo"]),
+                    "head": str(evidence["expected_head"]),
+                },
+            )
+            base._append_audit(
+                {
+                    "timestamp_unix": _now(),
+                    "operation": _MATERIALIZE_RECOVERY_REMOVAL_INTENT,
+                    "transaction_id": fence["fence_id"],
+                    "path": str(checkout),
+                    "repo": str(evidence["repo"]),
+                    "head": str(evidence["expected_head"]),
+                    "intent_sha256": removal_intent["intent_sha256"],
+                }
+            )
+            result = _git_mutate(
+                repo,
+                ["worktree", "remove", str(checkout)],
+                timeout_seconds=120,
+                expected_physical_identity=physical_identity,
+                expected_physical_checkout=checkout,
+            )
+            after = _materialize_uncertainty_readback(fence)
+        else:
+            after = readback
+        if after.get("state") != "recoverable_removed":
             return {
                 "state": "still_fenced",
                 "reason": "materialize-recovery-postcondition-failed",
                 "readback": after,
             }
+        git_returncode = result.get("returncode") if result is not None else None
         if retention is not None:
             try:
                 if not _release_retention_exact(retention):
@@ -3877,7 +4097,8 @@ def _reconcile_materialize_uncertainty(
                 "expected_head": evidence["expected_head"],
                 "removed_recovery_worktree": True,
                 "expired_completed_source_removed": True,
-                "git_returncode": result.get("returncode"),
+                "git_returncode": git_returncode,
+                "recovery_removal_intent": after.get("recovery_removal_intent"),
                 "completed_obligation": {
                     "obligation_id": obligation_status.get("obligation_id"),
                     "state": obligation_status.get("state"),
@@ -3903,7 +4124,8 @@ def _reconcile_materialize_uncertainty(
             "checkout_key": evidence["checkout_key"],
             "expected_head": evidence["expected_head"],
             "removed_recovery_worktree": True,
-            "git_returncode": result.get("returncode"),
+            "git_returncode": git_returncode,
+            "recovery_removal_intent": after.get("recovery_removal_intent"),
             "obligation_recovery": obligation_recovery,
         }
     finally:

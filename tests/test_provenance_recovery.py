@@ -431,29 +431,20 @@ class VolatileGateRecheckTests(unittest.TestCase):
             "index_updated_at_unix": 1,
             "evidence_sha256": "a" * 64,
         }
-        raised, start_job, audit = self._repair_with_recheck(
-            {
-                "reasons": ["kill_switch_clear"],
-                "checks": {"kill_switch_clear": False},
-                "competing_deployment": {
-                    "stale_pending_reconciliation": reconciliation,
-                },
-            }
-        )
+        with self.assertRaises(
+            provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+        ) as raised:
+            self._repair_with_recheck(
+                {
+                    "reasons": ["kill_switch_clear"],
+                    "checks": {"kill_switch_clear": False},
+                    "competing_deployment": {
+                        "stale_pending_reconciliation": reconciliation,
+                    },
+                }
+            )
 
-        self.assertIsNotNone(raised)
-        assert raised is not None
-        self.assertEqual(
-            raised.evidence["recheck"]["competing_deployment"][
-                "stale_pending_reconciliation"
-            ],
-            reconciliation,
-        )
-        start_job.assert_not_called()
-        self.assertEqual(
-            audit.call_args[0][0]["stale_pending_reconciliation"],
-            reconciliation,
-        )
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
 
     def test_repair_denial_audit_failure_preserves_stale_pending_reconciliation(
         self,
@@ -977,14 +968,13 @@ class PendingPromotionRecoveryTests(unittest.TestCase):
                         self.assertEqual(raised.exception.evidence.get("local_mutation_evidence"), local_evidence)
                         if outcome.endswith("audit_failure"):
                             self.assertIn("audit failed", raised.exception.evidence["audit_append_error"])
-                    elif outcome == "denied":
-                        with self.assertRaises(provenance_recovery.ProvenanceRecoveryDenied) as raised:
-                            run()
-                        self.assertEqual(
-                            raised.exception.evidence["recheck"]["competing_deployment"]["deploy_index_mutation"],
-                            promotion,
-                        )
-                    elif outcome in {"coalesced_audit_failure", "denied_audit_failure", "setup_failure", "start_failure"}:
+                    elif outcome in {
+                        "denied",
+                        "coalesced_audit_failure",
+                        "denied_audit_failure",
+                        "setup_failure",
+                        "start_failure",
+                    }:
                         with self.assertRaises(
                             provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
                         ) as raised:
@@ -1903,16 +1893,11 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
             patch.object(provenance_recovery.operator, "_start_job") as start_job,
         ):
             with self.assertRaises(
-                provenance_recovery.ProvenanceRecoveryDenied
+                provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
             ) as raised:
                 provenance_recovery._resume_under_schedule_lock(HEAD)
 
-        self.assertEqual(
-            raised.exception.evidence["recheck"]["competing_deployment"][
-                "stale_pending_reconciliation"
-            ],
-            reconciliation,
-        )
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
         start_job.assert_not_called()
         self.assertEqual(
             audit.call_args[0][0]["operation"],

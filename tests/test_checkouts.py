@@ -2860,10 +2860,13 @@ class CheckoutLifecycleTests(unittest.TestCase):
             )
 
         self.assertEqual(retry["state"], "reconciled")
-        self.assertEqual(retry["outcome"], "confirmed_no_effect")
+        self.assertEqual(retry["outcome"], "reconciled_success")
+        self.assertTrue(retry["readback"]["removed_recovery_worktree"])
+        self.assertTrue(retry["readback"]["expired_completed_source_removed"])
+        self.assertIsNotNone(retry["readback"]["recovery_removal_intent"])
         self.assertEqual(
-            retry["readback"]["obligation_recovery"]["obligation_state"],
-            "completed_preserved",
+            retry["readback"]["completed_obligation"]["state"],
+            "completed",
         )
         self.assertEqual(
             checkouts._retention_records([str(lifecycle["checkout_key"])]),
@@ -2941,7 +2944,9 @@ class CheckoutLifecycleTests(unittest.TestCase):
             "reconcile-checkout-operation-outcome",
         )
         self.assertEqual(retry["state"], "reconciled")
-        self.assertEqual(retry["outcome"], "confirmed_no_effect")
+        self.assertEqual(retry["outcome"], "reconciled_success")
+        self.assertTrue(retry["readback"]["removed_recovery_worktree"])
+        self.assertIsNotNone(retry["readback"]["recovery_removal_intent"])
         self.assertEqual(
             checkouts._retention_records([str(lifecycle["checkout_key"])]),
             {},

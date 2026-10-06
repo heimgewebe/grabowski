@@ -1147,6 +1147,12 @@ def _resume_under_schedule_lock(
                     local_mutation_evidence=local_mutation_evidence,
                 ) from exc
             raise
+        if local_mutation_evidence is not None:
+            raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                "provenance recovery denied after local mutation: "
+                + ",".join(volatile["reasons"]),
+                local_mutation_evidence=local_mutation_evidence,
+            )
         raise ProvenanceRecoveryDenied(
             volatile["reasons"], {**gate, "recheck": volatile}
         )
@@ -1423,6 +1429,12 @@ def _repair_under_schedule_lock(
                     local_mutation_evidence=local_mutation_evidence,
                 ) from exc
             raise
+        if local_mutation_evidence is not None:
+            raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                "provenance recovery denied after local mutation: "
+                + ",".join(volatile["reasons"]),
+                local_mutation_evidence=local_mutation_evidence,
+            )
         raise ProvenanceRecoveryDenied(volatile["reasons"], {**gate, "recheck": volatile})
 
     try:
