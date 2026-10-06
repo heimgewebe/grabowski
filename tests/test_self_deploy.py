@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import hashlib
 import importlib.util
 import json
@@ -3458,7 +3458,7 @@ class SelfDeployToolTests(unittest.TestCase):
             "expires_at_unix": 100,
             "metadata_sha256": "3" * 64,
         }
-        timed_out = _result("timed out", 1)
+        timed_out = _result("timed out", None)
         timed_out["timed_out"] = True
         with patch.object(
             SELF_DEPLOY,
@@ -3869,9 +3869,9 @@ class SelfDeployToolTests(unittest.TestCase):
         resolve_obligation.assert_not_called()
         clear_uncertainty.assert_not_called()
 
-    def test_auto_deploy_source_timeout_never_proves_no_effect(self) -> None:
+    def test_auto_deploy_source_running_timeout_never_proves_no_effect(self) -> None:
         f = self._auto_deploy_uncertain_fixture()
-        timed_out = _result("timed out", 1)
+        timed_out = _result("timed out", None)
         timed_out["timed_out"] = True
         with patch.object(
             SELF_DEPLOY, "_canonical_stale_main_snapshot", side_effect=[f["stale"], f["stale"]]
@@ -3905,6 +3905,73 @@ class SelfDeployToolTests(unittest.TestCase):
         release_resources.assert_called_once_with(
             f["owner"], [f["operation_key"]], [f["operation_lease"]]
         )
+
+    def test_auto_deploy_source_absent_after_stopped_or_refused_git_releases_fence(self) -> None:
+        stopped = _result("timed out", -9)
+        stopped["timed_out"] = True
+        refused = SELF_DEPLOY.DeploySchedulePreEffectRefusal("fresh policy refused")
+        for outcome in (stopped, refused):
+            with self.subTest(outcome=type(outcome).__name__), ExitStack() as stack:
+                f = self._auto_deploy_uncertain_fixture()
+                common_key = f"path:{f['canonical'] / '.git'}"
+                common = {**f["path_lease"], "resource_key": common_key}
+                leases = [f["operation_lease"], f["path_lease"], common]
+                fence = {"fence_id": "f" * 32}
+                fixtures = {
+                    "_canonical_stale_main_snapshot": f["stale"],
+                    "_auto_deploy_source_plan": f["plan"],
+                    "_acquire_auto_deploy_source_resources": {
+                        "leases": leases,
+                        "common_dir_key": common_key,
+                        "checkout_uncertainty_fence": fence,
+                    },
+                    "_open_auto_deploy_source_obligation": {
+                        "state": "open", "obligation_id": f["plan"]["obligation_id"]
+                    },
+                    "_reserve_auto_deploy_source_lifecycle": f["lifecycle"],
+                    "_worktree_registration_present": False,
+                    "_block_auto_deploy_source_obligation": {"state": "blocked"},
+                    "_release_auto_deploy_source_lifecycle": True,
+                    "_release_auto_deploy_source_resources": {"released": leases},
+                    "_resolve_auto_deploy_source_obligation_no_effect": {},
+                    "_clear_auto_deploy_source_uncertainty": {},
+                }
+                mocks = {
+                    name: stack.enter_context(patch.object(SELF_DEPLOY, name, return_value=value))
+                    for name, value in fixtures.items()
+                }
+                stack.enter_context(patch.object(SELF_DEPLOY.os.path, "lexists", return_value=False))
+                mutation_args = {"side_effect": outcome} if isinstance(outcome, Exception) else {"return_value": outcome}
+                stack.enter_context(patch.object(SELF_DEPLOY, "_mutating_git_result", **mutation_args))
+                ordering = Mock()
+                for name in (
+                    "_release_auto_deploy_source_lifecycle",
+                    "_release_auto_deploy_source_resources",
+                    "_resolve_auto_deploy_source_obligation_no_effect",
+                    "_clear_auto_deploy_source_uncertainty",
+                ):
+                    ordering.attach_mock(mocks[name], name)
+                with self.assertRaisesRegex(SELF_DEPLOY.DeploySchedulePreEffectRefusal, "no observed effect"):
+                    SELF_DEPLOY._materialize_auto_deploy_source(f["expected"])
+                self.assertEqual(len(ordering.mock_calls), 4)
+                self.assertEqual(ordering.mock_calls[-1][0], "_clear_auto_deploy_source_uncertainty")
+                mocks["_release_auto_deploy_source_resources"].assert_called_once_with(
+                    f["owner"], [f["operation_key"], common_key, f["path_key"]],
+                    [f["operation_lease"], common, f["path_lease"]],
+                )
+                mocks["_clear_auto_deploy_source_uncertainty"].assert_called_once_with(
+                    fence, outcome="confirmed_no_effect",
+                    reason="automatic deployment source mutation had no observed effect",
+                )
+
+    def test_mutating_git_policy_refusal_is_classified_before_process_start(self) -> None:
+        with patch.object(
+            SELF_DEPLOY.operator, "_require_operator_mutation",
+            side_effect=PermissionError("fresh policy refused"),
+        ), patch.object(SELF_DEPLOY.operator, "_run", create=True) as run:
+            with self.assertRaises(SELF_DEPLOY.DeploySchedulePreEffectRefusal):
+                SELF_DEPLOY._mutating_git_result(Path("/tmp/repo"), "worktree", "add")
+        run.assert_not_called()
 
     def test_auto_deploy_source_timeout_rejects_even_exact_momentary_poststate(self) -> None:
         f = self._auto_deploy_uncertain_fixture()
@@ -5952,6 +6019,10 @@ class SelfDeployToolTests(unittest.TestCase):
         ), patch.object(SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=None), patch.object(
             SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/state")
         ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": []},
+        ), patch.object(
             SELF_DEPLOY, "_deploy_index", return_value={"units": [], "pending_unit": None}
         ), patch.object(SELF_DEPLOY, "_write_deploy_index") as write_index, patch.object(
             SELF_DEPLOY.uuid, "uuid4", return_value=fixed_uuid
@@ -6010,6 +6081,10 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=None
         ), patch.object(
             SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/state")
+        ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": []},
         ), patch.object(
             SELF_DEPLOY, "_deploy_index", return_value={"units": [], "pending_unit": None}
         ), patch.object(SELF_DEPLOY, "_write_deploy_index"), patch.object(

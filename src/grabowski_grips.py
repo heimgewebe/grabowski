@@ -15513,6 +15513,39 @@ def _captain_runtime_deploy_target_errors(
     return errors
 
 
+def _runtime_deploy_pending_unit_promotion_valid(
+    evidence: Any,
+    *,
+    expected_job_prefix: str,
+) -> bool:
+    fields = {
+        "schema_version",
+        "kind",
+        "unit",
+        "deploy_index_updated",
+        "index_updated_at_unix",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    material = {
+        key: value for key, value in evidence.items() if key != "evidence_sha256"
+    }
+    return bool(
+        type(evidence.get("schema_version")) is int
+        and evidence["schema_version"] == 1
+        and evidence.get("kind") == "grabowski_runtime_deploy_pending_unit_promotion"
+        and evidence.get("deploy_index_updated") is True
+        and type(evidence.get("index_updated_at_unix")) is int
+        and evidence["index_updated_at_unix"] >= 0
+        and isinstance(evidence.get("unit"), str)
+        and re.fullmatch(
+            rf"{re.escape(expected_job_prefix)}[0-9a-f]{{12}}", evidence["unit"]
+        ) is not None
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
+
+
 def _runtime_deploy_stale_pending_reconciliation_valid(
     evidence: Any,
     *,
@@ -15866,6 +15899,11 @@ def _runtime_deploy_local_mutation_evidence_valid(
     expected_job_prefix: str,
     expected_head: str,
 ) -> bool:
+    if _runtime_deploy_pending_unit_promotion_valid(
+        evidence,
+        expected_job_prefix=expected_job_prefix,
+    ):
+        return True
     if _runtime_deploy_stale_pending_reconciliation_valid(
         evidence,
         expected_job_prefix=expected_job_prefix,
@@ -15905,9 +15943,10 @@ def _runtime_deploy_local_mutation_evidence_valid(
     ):
         return False
     effects = evidence.get("effects")
-    if not isinstance(effects, list) or not 2 <= len(effects) <= 4:
+    if not isinstance(effects, list) or not 2 <= len(effects) <= 5:
         return False
     expected_order = {
+        "grabowski_runtime_deploy_pending_unit_promotion": -1,
         "grabowski_runtime_deploy_stale_pending_reconciliation": 0,
         "grabowski_runtime_deploy_origin_main_refresh": 1,
         "grabowski_runtime_deploy_origin_main_refresh_effect": 1,
@@ -15921,7 +15960,12 @@ def _runtime_deploy_local_mutation_evidence_valid(
         if order is None:
             return False
         observed_order.append(order)
-        if kind == "grabowski_runtime_deploy_stale_pending_reconciliation":
+        if kind == "grabowski_runtime_deploy_pending_unit_promotion":
+            valid = _runtime_deploy_pending_unit_promotion_valid(
+                effect,
+                expected_job_prefix=expected_job_prefix,
+            )
+        elif kind == "grabowski_runtime_deploy_stale_pending_reconciliation":
             valid = _runtime_deploy_stale_pending_reconciliation_valid(
                 effect,
                 expected_job_prefix=expected_job_prefix,

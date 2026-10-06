@@ -2797,9 +2797,14 @@ def _resource_inspect(resource_key: str) -> dict[str, Any]:
 
 
 def _mutating_git_result(repository: Path, *arguments: str) -> dict[str, Any]:
-    operator._require_operator_mutation(
-        "git_cli", path=str(repository), repo=str(repository), fresh_preflight=True
-    )
+    try:
+        operator._require_operator_mutation(
+            "git_cli", path=str(repository), repo=str(repository), fresh_preflight=True
+        )
+    except Exception as exc:
+        # No process has been launched. Preserve this known boundary for callers
+        # that must release source reservations after a fresh policy refusal.
+        raise DeploySchedulePreEffectRefusal(str(exc)) from exc
     command = [
         "/usr/bin/git",
         "-c",
@@ -4183,8 +4188,19 @@ def _materialize_auto_deploy_source(
                 and mutation_result.get("timed_out") is True
             )
         )
+        effect_may_still_be_running = bool(
+            (
+                mutation_error is not None
+                and not isinstance(mutation_error, DeploySchedulePreEffectRefusal)
+            )
+            or (
+                mutation_result is not None
+                and mutation_result.get("timed_out") is True
+                and mutation_result.get("returncode") is None
+            )
+        )
         recovery_asset_present = bool(
-            uncertain_mutation_outcome
+            effect_may_still_be_running
             or target_present_after_mutation
             or registration_present_after_mutation
         )
@@ -4222,6 +4238,11 @@ def _materialize_auto_deploy_source(
                     observed_effect_evidence
                 )
         if uncertain_mutation_outcome:
+            if not recovery_asset_present:
+                raise DeploySchedulePreEffectRefusal(
+                    "automatic deployment source mutation had no observed effect "
+                    "after the Git invocation stopped or was refused before launch"
+                ) from mutation_error
             raise RuntimeError(
                 "automatic deployment source mutation outcome is uncertain; "
                 "retain lifecycle and leases for recovery"

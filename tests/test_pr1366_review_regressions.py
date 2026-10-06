@@ -12,6 +12,36 @@ from tests.test_self_deploy import SELF_DEPLOY, _result, _source_identity
 
 
 class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
+    def _promotion_evidence(self) -> dict:
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_pending_unit_promotion",
+            "unit": "grabowski-job-123456abcdef",
+            "deploy_index_updated": True,
+            "index_updated_at_unix": 1,
+        }
+        return {**material, "evidence_sha256": grips.sha256_json(material)}
+
+    def test_captain_accepts_promotion_and_rejects_tampered_evidence(self) -> None:
+        promotion = self._promotion_evidence()
+        kwargs = {"expected_job_prefix": "grabowski-job-", "expected_head": CAPTAIN_HEAD}
+        self.assertTrue(grips._runtime_deploy_local_mutation_evidence_valid(promotion, **kwargs))
+        for changes in (
+            {"schema_version": True},
+            {"unit": "foreign-job-123456abcdef"},
+            {"deploy_index_updated": False},
+            {"index_updated_at_unix": True},
+            {"index_updated_at_unix": -1},
+            {"extra": "unexpected"},
+        ):
+            with self.subTest(changes=changes):
+                material = {key: value for key, value in promotion.items() if key != "evidence_sha256"}
+                material.update(changes)
+                forged = {**material, "evidence_sha256": grips.sha256_json(material)}
+                self.assertFalse(grips._runtime_deploy_local_mutation_evidence_valid(forged, **kwargs))
+        tampered = {**promotion, "unit": "grabowski-job-fedcba654321"}
+        self.assertFalse(grips._runtime_deploy_local_mutation_evidence_valid(tampered, **kwargs))
+
     def test_materialization_lease_guard_rejects_missing_or_changed_snapshot(self) -> None:
         owner = "runtime-deploy-source:bbbbbbbbbbbb:abc123def456"
         first = {
@@ -692,6 +722,24 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
                 expected_head=CAPTAIN_HEAD,
             )
         )
+        five_material = {**bundle_material, "effects": [self._promotion_evidence(), *bundle_material["effects"]]}
+        five = {**five_material, "evidence_sha256": grips.sha256_json(five_material)}
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                five, expected_job_prefix="grabowski-job-", expected_head=CAPTAIN_HEAD
+            )
+        )
+        for effects in (
+            [*five_material["effects"][1:], five_material["effects"][0]],
+            [five_material["effects"][0], five_material["effects"][0]],
+        ):
+            invalid_material = {**five_material, "effects": effects}
+            invalid = {**invalid_material, "evidence_sha256": grips.sha256_json(invalid_material)}
+            self.assertFalse(
+                grips._runtime_deploy_local_mutation_evidence_valid(
+                    invalid, expected_job_prefix="grabowski-job-", expected_head=CAPTAIN_HEAD
+                )
+            )
     def test_origin_main_refresh_post_cas_failure_reports_observed_effect(self) -> None:
         canonical = Path("/tmp/pr1366-origin-main-effect")
         common = canonical / ".git"

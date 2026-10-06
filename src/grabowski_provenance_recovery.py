@@ -359,6 +359,8 @@ def _competing_deployment_evidence(
         "idempotent_match": None,
         "pruned_units": [],
         "stale_pending_reconciliation": None,
+        "deploy_index_mutation": None,
+        "local_mutation_evidence": None,
         "error": None,
     }
     lock_path = Path.home() / ".local/state/grabowski/deploy.lock"
@@ -389,9 +391,23 @@ def _competing_deployment_evidence(
     evidence["stale_pending_reconciliation"] = indexed.get(
         "stale_pending_reconciliation"
     )
+    evidence["deploy_index_mutation"] = indexed.get("deploy_index_mutation")
+    evidence["local_mutation_evidence"] = _recovery_local_mutation_evidence(evidence)
     if indexed["error"] is not None:
         evidence["error"] = indexed["error"]
     return evidence
+
+
+def _recovery_local_mutation_evidence(
+    competing: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Use the scheduler's ordered evidence bundle for both recovery lanes."""
+    return self_deploy._tracked_runtime_deploy_local_mutation_evidence(
+        {
+            "deploy_index_mutation": competing.get("deploy_index_mutation"),
+            "stale_pending_reconciliation": competing.get("stale_pending_reconciliation"),
+        }
+    )
 
 
 def _blockade_evidence(repository: Path | None) -> dict[str, Any]:
@@ -1041,6 +1057,7 @@ def _resume_under_schedule_lock(
     stale_pending_reconciliation = competing_deployment.get(
         "stale_pending_reconciliation"
     )
+    local_mutation_evidence = _recovery_local_mutation_evidence(competing_deployment)
     if already_running is not None and not volatile["reasons"]:
         try:
             base._append_audit(
@@ -1051,14 +1068,15 @@ def _resume_under_schedule_lock(
                     "cutover_id": resume_binding["cutover_id"],
                     "unit": already_running["unit"],
                     "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "local_mutation_evidence": local_mutation_evidence,
                     "intent_sha256": intent_sha256,
                 }
             )
         except Exception as exc:
-            if stale_pending_reconciliation is not None:
+            if local_mutation_evidence is not None:
                 raise self_deploy.DeployScheduleFailureAfterLocalMutation(
                     f"{type(exc).__name__}: {exc}",
-                    local_mutation_evidence=stale_pending_reconciliation,
+                    local_mutation_evidence=local_mutation_evidence,
                 ) from exc
             raise
         return {
@@ -1071,6 +1089,7 @@ def _resume_under_schedule_lock(
             "job": already_running,
             "already_dispatched": True,
             "stale_pending_reconciliation": stale_pending_reconciliation,
+            "local_mutation_evidence": local_mutation_evidence,
             "intent_sha256": intent_sha256,
             "source_identity_sha256": source_identity["identity_sha256"],
             "post_state_readback_required": True,
@@ -1093,13 +1112,14 @@ def _resume_under_schedule_lock(
                     "reasons": volatile["reasons"],
                     "intent_sha256": intent_sha256,
                     "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "local_mutation_evidence": local_mutation_evidence,
                 }
             )
         except Exception as exc:
-            if stale_pending_reconciliation is not None:
+            if local_mutation_evidence is not None:
                 raise self_deploy.DeployScheduleFailureAfterLocalMutation(
                     f"{type(exc).__name__}: {exc}",
-                    local_mutation_evidence=stale_pending_reconciliation,
+                    local_mutation_evidence=local_mutation_evidence,
                 ) from exc
             raise
         raise ProvenanceRecoveryDenied(
@@ -1115,10 +1135,10 @@ def _resume_under_schedule_lock(
             pending_unit=reserved_unit,
         )
     except Exception as exc:
-        if stale_pending_reconciliation is not None:
+        if local_mutation_evidence is not None:
             raise self_deploy.DeployScheduleFailureAfterLocalMutation(
                 f"{type(exc).__name__}: {exc}",
-                local_mutation_evidence=stale_pending_reconciliation,
+                local_mutation_evidence=local_mutation_evidence,
             ) from exc
         raise
     try:
@@ -1132,8 +1152,10 @@ def _resume_under_schedule_lock(
         )
     except operator.JobDispatchUnknown as exc:
         dispatch_evidence = dict(exc.evidence)
-        if stale_pending_reconciliation is not None:
-            dispatch_evidence["stale_pending_reconciliation"] = stale_pending_reconciliation
+        if local_mutation_evidence is not None:
+            dispatch_evidence["local_mutation_evidence"] = local_mutation_evidence
+            if stale_pending_reconciliation is not None:
+                dispatch_evidence["stale_pending_reconciliation"] = stale_pending_reconciliation
         try:
             base._append_audit(
                 {
@@ -1144,18 +1166,19 @@ def _resume_under_schedule_lock(
                     "unit": exc.unit,
                     "evidence": dispatch_evidence,
                     "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "local_mutation_evidence": local_mutation_evidence,
                     "intent_sha256": intent_sha256,
                 }
             )
         except Exception as audit_exc:
-            if stale_pending_reconciliation is None:
+            if local_mutation_evidence is None:
                 raise
             dispatch_evidence["audit_append_error"] = (
                 f"{type(audit_exc).__name__}: {audit_exc}"
             )
             exc.evidence = dispatch_evidence
             raise exc from audit_exc
-        if stale_pending_reconciliation is not None:
+        if local_mutation_evidence is not None:
             exc.evidence = dispatch_evidence
         raise
     except Exception as exc:
@@ -1167,10 +1190,10 @@ def _resume_under_schedule_lock(
             )
         except Exception:  # noqa: BLE001 - the start failure is the real error
             pass
-        if stale_pending_reconciliation is not None:
+        if local_mutation_evidence is not None:
             raise self_deploy.DeployScheduleFailureAfterLocalMutation(
                 f"{type(exc).__name__}: {exc}",
-                local_mutation_evidence=stale_pending_reconciliation,
+                local_mutation_evidence=local_mutation_evidence,
             ) from exc
         raise
 
@@ -1186,6 +1209,7 @@ def _resume_under_schedule_lock(
                 "argv_sha256": job["argv_sha256"],
                 "source_identity_sha256": source_identity["identity_sha256"],
                 "stale_pending_reconciliation": stale_pending_reconciliation,
+                "local_mutation_evidence": local_mutation_evidence,
             }
         )
     except Exception as exc:  # noqa: BLE001 - effect already dispatched
@@ -1216,6 +1240,7 @@ def _resume_under_schedule_lock(
         "intent_sha256": intent_sha256,
         "scheduled_sha256": scheduled_sha256,
         "stale_pending_reconciliation": stale_pending_reconciliation,
+        "local_mutation_evidence": local_mutation_evidence,
         "post_dispatch_warnings": post_dispatch_warnings,
         "post_state_readback_required": True,
         "next_action": (
@@ -1308,6 +1333,7 @@ def _repair_under_schedule_lock(
     stale_pending_reconciliation = competing_deployment.get(
         "stale_pending_reconciliation"
     )
+    local_mutation_evidence = _recovery_local_mutation_evidence(competing_deployment)
     if already_running is not None and not volatile["reasons"]:
         # This exact intent is already in flight.  Starting a second job would
         # be the historically observed double dispatch, so the existing one is
@@ -1320,14 +1346,15 @@ def _repair_under_schedule_lock(
                     "expected_head": expected_head,
                     "unit": already_running["unit"],
                     "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "local_mutation_evidence": local_mutation_evidence,
                     "intent_sha256": intent_sha256,
                 }
             )
         except Exception as exc:
-            if stale_pending_reconciliation is not None:
+            if local_mutation_evidence is not None:
                 raise self_deploy.DeployScheduleFailureAfterLocalMutation(
                     f"{type(exc).__name__}: {exc}",
-                    local_mutation_evidence=stale_pending_reconciliation,
+                    local_mutation_evidence=local_mutation_evidence,
                 ) from exc
             raise
         return {
@@ -1338,6 +1365,7 @@ def _repair_under_schedule_lock(
             "job": already_running,
             "already_dispatched": True,
             "stale_pending_reconciliation": stale_pending_reconciliation,
+            "local_mutation_evidence": local_mutation_evidence,
             "intent_sha256": intent_sha256,
             "repair_intent_id": repair_intent_id,
             "post_state_readback_required": True,
@@ -1360,13 +1388,14 @@ def _repair_under_schedule_lock(
                     "reasons": volatile["reasons"],
                     "intent_sha256": intent_sha256,
                     "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "local_mutation_evidence": local_mutation_evidence,
                 }
             )
         except Exception as exc:
-            if stale_pending_reconciliation is not None:
+            if local_mutation_evidence is not None:
                 raise self_deploy.DeployScheduleFailureAfterLocalMutation(
                     f"{type(exc).__name__}: {exc}",
-                    local_mutation_evidence=stale_pending_reconciliation,
+                    local_mutation_evidence=local_mutation_evidence,
                 ) from exc
             raise
         raise ProvenanceRecoveryDenied(volatile["reasons"], {**gate, "recheck": volatile})
@@ -1380,10 +1409,10 @@ def _repair_under_schedule_lock(
             pending_unit=reserved_unit,
         )
     except Exception as exc:
-        if stale_pending_reconciliation is not None:
+        if local_mutation_evidence is not None:
             raise self_deploy.DeployScheduleFailureAfterLocalMutation(
                 f"{type(exc).__name__}: {exc}",
-                local_mutation_evidence=stale_pending_reconciliation,
+                local_mutation_evidence=local_mutation_evidence,
             ) from exc
         raise
     try:
@@ -1402,8 +1431,10 @@ def _repair_under_schedule_lock(
         # be a lie about an effect that may already exist.  Keep the
         # reservation, record the ambiguity, and make the operator read back.
         dispatch_evidence = dict(exc.evidence)
-        if stale_pending_reconciliation is not None:
-            dispatch_evidence["stale_pending_reconciliation"] = stale_pending_reconciliation
+        if local_mutation_evidence is not None:
+            dispatch_evidence["local_mutation_evidence"] = local_mutation_evidence
+            if stale_pending_reconciliation is not None:
+                dispatch_evidence["stale_pending_reconciliation"] = stale_pending_reconciliation
         try:
             base._append_audit(
                 {
@@ -1414,18 +1445,19 @@ def _repair_under_schedule_lock(
                     "unit": exc.unit,
                     "evidence": dispatch_evidence,
                     "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "local_mutation_evidence": local_mutation_evidence,
                     "intent_sha256": intent_sha256,
                 }
             )
         except Exception as audit_exc:
-            if stale_pending_reconciliation is None:
+            if local_mutation_evidence is None:
                 raise
             dispatch_evidence["audit_append_error"] = (
                 f"{type(audit_exc).__name__}: {audit_exc}"
             )
             exc.evidence = dispatch_evidence
             raise exc from audit_exc
-        if stale_pending_reconciliation is not None:
+        if local_mutation_evidence is not None:
             exc.evidence = dispatch_evidence
         raise
     except Exception as exc:
@@ -1441,10 +1473,10 @@ def _repair_under_schedule_lock(
             )
         except Exception:  # noqa: BLE001 - the start failure is the real error
             pass
-        if stale_pending_reconciliation is not None:
+        if local_mutation_evidence is not None:
             raise self_deploy.DeployScheduleFailureAfterLocalMutation(
                 f"{type(exc).__name__}: {exc}",
-                local_mutation_evidence=stale_pending_reconciliation,
+                local_mutation_evidence=local_mutation_evidence,
             ) from exc
         raise
 
@@ -1462,6 +1494,7 @@ def _repair_under_schedule_lock(
         "argv_sha256": job["argv_sha256"],
         "source_identity_sha256": source_identity["identity_sha256"],
         "stale_pending_reconciliation": stale_pending_reconciliation,
+        "local_mutation_evidence": local_mutation_evidence,
     }
     post_dispatch_warnings: list[str] = list(job.get("post_dispatch_warnings") or [])
     try:
@@ -1490,6 +1523,7 @@ def _repair_under_schedule_lock(
         "scheduled_sha256": scheduled_sha256,
         "repair_intent_id": repair_intent_id,
         "stale_pending_reconciliation": stale_pending_reconciliation,
+        "local_mutation_evidence": local_mutation_evidence,
         "post_dispatch_warnings": post_dispatch_warnings,
         "post_state_readback_required": True,
         "next_action": (

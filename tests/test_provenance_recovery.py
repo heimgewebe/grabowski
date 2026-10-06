@@ -100,6 +100,10 @@ def _load_provenance_recovery():
     self_deploy._deploy_index = lambda root: {"units": [], "pending_unit": None}
     self_deploy._write_deploy_index = lambda *args, **kwargs: None
     self_deploy._deploy_schedule_lock = contextlib.nullcontext
+    from tests.test_self_deploy import SELF_DEPLOY
+    self_deploy._tracked_runtime_deploy_local_mutation_evidence = (
+        SELF_DEPLOY._tracked_runtime_deploy_local_mutation_evidence
+    )
 
     class _DeployScheduleFailureAfterLocalMutation(RuntimeError):
         def __init__(self, message, *, local_mutation_evidence):
@@ -774,6 +778,140 @@ class TrustAnchorTests(unittest.TestCase):
                 Path(directory) / "absent"
             )
             self.assertFalse(missing["verified"])
+
+
+class PendingPromotionRecoveryTests(unittest.TestCase):
+    def _promotion(self) -> dict:
+        from tests.test_self_deploy import SELF_DEPLOY
+
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_pending_unit_promotion",
+            "unit": "grabowski-job-123456abcdef",
+            "deploy_index_updated": True,
+            "index_updated_at_unix": 12,
+        }
+        return {**material, "evidence_sha256": SELF_DEPLOY._source_identity_sha256(material)}
+
+    def test_competing_projection_preserves_promotion_and_ordered_bundle(self) -> None:
+        promotion = self._promotion()
+        reconciliation = {"kind": "grabowski_runtime_deploy_stale_pending_reconciliation"}
+        indexed = {
+            "inflight_units": [], "blocking_units": [], "idempotent_match": None,
+            "pruned_units": [], "error": None, "deploy_index_mutation": promotion,
+            "stale_pending_reconciliation": reconciliation,
+        }
+        with patch.object(
+            provenance_recovery.self_deploy, "inflight_runtime_job_evidence",
+            return_value=indexed, create=True,
+        ):
+            result = provenance_recovery._competing_deployment_evidence(
+                ["argv"], reconcile_stale_pending=True
+            )
+        self.assertEqual(result["deploy_index_mutation"], promotion)
+        self.assertEqual(result["local_mutation_evidence"]["effects"], [promotion, reconciliation])
+
+    def test_both_recovery_lanes_preserve_promotion_on_every_dispatch_exit(self) -> None:
+        outcomes = (
+            "coalesced", "coalesced_audit_failure", "denied", "denied_audit_failure",
+            "setup_failure", "start_failure", "unknown", "unknown_audit_failure",
+            "scheduled", "scheduled_audit_failure",
+        )
+        for lane in ("repair", "resume"):
+            for outcome in outcomes:
+                with self.subTest(lane=lane, outcome=outcome), contextlib.ExitStack() as stack:
+                    promotion = self._promotion()
+                    identity = _source_identity(ROOT)
+                    binding = {
+                        "cutover_id": "bgc-promotion", "resumed_receipt_sha256": "cd" * 32,
+                        "binding_sha256": "ab" * 32,
+                        "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+                    }
+                    gate = {
+                        "allowed": True, "reasons": [], "source_identity": identity,
+                        "runtime_integrity": {"failed_integrity_flags": ["provenance_valid"]},
+                        "resume_binding": binding,
+                        "recovery_lane": {"classification_sha256": "ef" * 32},
+                    }
+                    match = {"unit": promotion["unit"], "argv_sha256": "a" * 64}
+                    volatile = {
+                        "reasons": ["competing_deployment"] if outcome.startswith("denied") else [],
+                        "checks": {},
+                        "competing_deployment": {
+                            "idempotent_match": match if outcome.startswith("coalesced") else None,
+                            "deploy_index_mutation": promotion,
+                        },
+                    }
+                    stack.enter_context(patch.object(provenance_recovery, "evaluate_gate", return_value=gate))
+                    stack.enter_context(patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate))
+                    stack.enter_context(patch.object(provenance_recovery, "_volatile_gate_recheck", return_value=volatile))
+                    stack.enter_context(patch.object(provenance_recovery, "_resume_effect_repository", return_value=ROOT))
+                    stack.enter_context(patch.object(
+                        provenance_recovery, "_resume_source_preflight",
+                        return_value=(ROOT, ROOT / "tools/run_midcutover_resume.py", identity),
+                    ))
+                    stack.enter_context(patch.object(provenance_recovery.base, "_require_valid_audit_chain"))
+                    stack.enter_context(patch.object(provenance_recovery.operator, "_jobs_root", return_value=ROOT))
+                    stack.enter_context(patch.object(provenance_recovery.self_deploy, "_write_deploy_index"))
+                    if outcome == "setup_failure":
+                        stack.enter_context(patch.object(
+                            provenance_recovery.operator, "_jobs_root", side_effect=OSError("setup failed")
+                        ))
+                    start_effect = None
+                    if outcome == "start_failure":
+                        start_effect = OSError("start failed")
+                    elif outcome.startswith("unknown"):
+                        start_effect = provenance_recovery.operator.JobDispatchUnknown(
+                            "dispatch unknown", unit=promotion["unit"], evidence={"dispatch_outcome": "unknown"}
+                        )
+                    start = stack.enter_context(patch.object(
+                        provenance_recovery.operator, "_start_job", return_value=match, side_effect=start_effect
+                    ))
+
+                    def audit_effect(record):
+                        if outcome.endswith("audit_failure") and not record["operation"].endswith("-intent"):
+                            raise OSError("audit failed")
+                        return "d" * 64
+
+                    audit = stack.enter_context(patch.object(
+                        provenance_recovery.base, "_append_audit", side_effect=audit_effect
+                    ))
+                    digest_audit = stack.enter_context(patch.object(
+                        provenance_recovery.base, "_append_audit_with_digest", side_effect=audit_effect
+                    ))
+                    if lane == "repair":
+                        run = lambda: provenance_recovery._repair_under_schedule_lock(HEAD, None, None, 8)
+                    else:
+                        run = lambda: provenance_recovery._resume_under_schedule_lock(HEAD)
+                    if outcome.startswith("unknown"):
+                        with self.assertRaises(provenance_recovery.operator.JobDispatchUnknown) as raised:
+                            run()
+                        self.assertEqual(raised.exception.evidence["local_mutation_evidence"], promotion)
+                    elif outcome == "denied":
+                        with self.assertRaises(provenance_recovery.ProvenanceRecoveryDenied) as raised:
+                            run()
+                        self.assertEqual(
+                            raised.exception.evidence["recheck"]["competing_deployment"]["deploy_index_mutation"],
+                            promotion,
+                        )
+                    elif outcome in {"coalesced_audit_failure", "denied_audit_failure", "setup_failure", "start_failure"}:
+                        with self.assertRaises(
+                            provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+                        ) as raised:
+                            run()
+                        self.assertEqual(raised.exception.local_mutation_evidence, promotion)
+                    else:
+                        result = run()
+                        self.assertEqual(result["local_mutation_evidence"], promotion)
+                        if outcome == "scheduled_audit_failure":
+                            self.assertTrue(result["post_dispatch_warnings"])
+                    if outcome.startswith(("coalesced", "denied")) or outcome == "setup_failure":
+                        start.assert_not_called()
+                    records = [call.args[0] for call in [*audit.call_args_list, *digest_audit.call_args_list]]
+                    observed = [record for record in records if "local_mutation_evidence" in record]
+                    if outcome not in {"setup_failure", "start_failure"}:
+                        self.assertTrue(observed)
+                        self.assertTrue(all(record["local_mutation_evidence"] == promotion for record in observed))
 
 
 class DispatchOutcomeTests(unittest.TestCase):
