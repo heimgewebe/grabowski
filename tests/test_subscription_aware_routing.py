@@ -112,9 +112,11 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertIn("gpt-6-astra", self.catalog["policy"]["quality_classes"]["S"]["models"])
 
         routes = [route for route in self.catalog["routes"] if route.get("model") == "gpt-6-astra"]
-        self.assertEqual({route["id"] for route in routes}, {"codex-astra-high", "codex-astra-xhigh"})
+        self.assertEqual({route["id"] for route in routes}, {"codex-astra-high", "codex-astra-review-high", "codex-astra-xhigh"})
         self.assertEqual({route["effort"] for route in routes}, {"high", "xhigh"})
-        self.assertTrue(all(route.get("contrast_only") is True for route in routes))
+        self.assertTrue(self.routes["codex-astra-high"]["contrast_only"])
+        self.assertTrue(self.routes["codex-astra-xhigh"]["contrast_only"])
+        self.assertTrue(self.routes["codex-astra-review-high"]["review_only"])
         self.assertEqual(self.routes["codex-astra-high"]["quota_pools"], ["openai-agentic"])
         self.assertTrue(self.routes["codex-astra-xhigh"]["escalation_only"])
         self.assertGreater(
@@ -197,7 +199,7 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         frontier = self.catalog["policy"]["frontier_model_policy"]
         self.assertEqual(frontier["escalation_route"], "codex-sol-xhigh")
         self.assertEqual(frontier["top_contrast_routes"], ["codex-sol-high"])
-        self.assertIn("codex-sol-review-high", frontier["upper_review_or_contrast_routes"])
+        self.assertIn("codex-astra-review-high", frontier["upper_review_or_contrast_routes"])
         self.assertNotIn("claude-opus-5.5-writer-high", frontier["upper_review_or_contrast_routes"])
         grok_writer = self.routes["grok-4.6-high"]
         grok_reviewer = self.routes["grok-4.6-review-high"]
@@ -216,13 +218,13 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         self.assertEqual(["openai-codex-spark"], spark["quota_pools"])
         self.assertEqual(["mechanical", "triage", "docs", "tests"], spark["task_classes"])
 
-        reviewer = self.routes["codex-sol-review-high"]
+        reviewer = self.routes["codex-astra-review-high"]
         self.assertTrue(reviewer["enabled"])
         self.assertTrue(reviewer["review_only"])
         self.assertFalse(reviewer.get("contrast_only", False))
         self.assertTrue(reviewer["critical_eligible"])
-        self.assertEqual("gpt-5.6-sol", reviewer["model"])
-        self.assertEqual("openai-gpt-5.6", reviewer["independence_group"])
+        self.assertEqual("gpt-6-astra", reviewer["model"])
+        self.assertEqual("openai-gpt-6", reviewer["independence_group"])
         self.assertEqual(
             ["--sandbox", "read-only", "--ask-for-approval", "never"],
             reviewer["argv_prefix"][-4:],
@@ -236,7 +238,7 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
         contrast_routes = [
             route
             for route in routes
-            if route["id"] not in {"codex-spark-low", "codex-sol-review-high"}
+            if route["id"] not in {"codex-spark-low", "codex-sol-review-high", "codex-astra-review-high"}
         ]
         self.assertTrue(contrast_routes)
         self.assertTrue(

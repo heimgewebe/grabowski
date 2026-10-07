@@ -807,7 +807,7 @@
         "codex-sol-high"
       ],
       "upper_review_or_contrast_routes": [
-        "codex-sol-review-high",
+        "codex-astra-review-high",
         "codex-sol-medium",
         "claude-opus-5.5-high",
         "codex-terra-high",
@@ -1711,6 +1711,55 @@
       ],
       "tier": "critical",
       "contrast_only": true
+    },
+    {
+      "argv_prefix": [
+        "codex",
+        "--model",
+        "gpt-6-astra",
+        "-c",
+        "model_reasoning_effort=\"high\"",
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "never"
+      ],
+      "base_quality_rank": 100,
+      "burn_weight": 2.5,
+      "delegation_overhead_minutes": 6,
+      "effort": "high",
+      "enabled": true,
+      "harness": "codex",
+      "harness_quality": 10,
+      "id": "codex-astra-review-high",
+      "independence_group": "openai-gpt-6",
+      "min_duration_minutes": 20,
+      "model": "gpt-6-astra",
+      "priority": 111,
+      "quality_class": "S",
+      "quota_pools": [
+        "openai-agentic"
+      ],
+      "risk_affinity": {
+        "judgment-critical": 14,
+        "root-cause": 10,
+        "security-sensitive": 14,
+        "uncertainty-heavy": 12
+      },
+      "task_affinity": {
+        "critical-review": 28,
+        "independent-review": 24,
+        "security-review": 26
+      },
+      "task_classes": [
+        "independent-review",
+        "critical-review",
+        "security-review"
+      ],
+      "tier": "critical",
+      "contrast_only": false,
+      "review_only": true,
+      "critical_eligible": true
     },
     {
       "argv_prefix": [
