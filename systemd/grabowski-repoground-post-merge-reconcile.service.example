@@ -11,6 +11,8 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%h/.local/state/grabowski
 UMask=0077
-# Worst case: 16 reusable-slot status reads at 30s each plus a 60s launch.
-# Keep additional margin for audit verification and launch ambiguity readback.
+# The reconciler keeps a 720s internal pass budget, reserves 540s before
+# entering a new 16-slot identity, and persists a round-robin cursor so a slow
+# read-only identity cannot starve later merge obligations across timer runs.
+# The outer limit leaves additional margin for audit verification and shutdown.
 TimeoutStartSec=900s

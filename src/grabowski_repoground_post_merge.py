@@ -59,10 +59,29 @@ POST_MERGE_TERMINAL_JOB_STATUSES = frozenset(
 )
 POST_MERGE_JOB_SLOT_LIMIT = 16
 POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS = 300
+POST_MERGE_MISSING_UNIT_RECOVERY_GRACE_SECONDS = 300
+POST_MERGE_STATUS_READ_TIMEOUT_SECONDS = 30
+POST_MERGE_START_TIMEOUT_SECONDS = 60
+POST_MERGE_SINGLE_IDENTITY_BUDGET_SECONDS = (
+    POST_MERGE_JOB_SLOT_LIMIT * POST_MERGE_STATUS_READ_TIMEOUT_SECONDS
+    + POST_MERGE_START_TIMEOUT_SECONDS
+)
+DEFAULT_RECONCILE_PASS_BUDGET_SECONDS = 720
+RECONCILE_CURSOR_METADATA_KEY = "repoground_post_merge_reconcile_cursor_v1"
 
 
 class _ReusableJobSlotsExhausted(RuntimeError):
     pass
+
+
+def _post_merge_semantic_argv(argv: list[str]) -> tuple[str, ...] | None:
+    if (
+        len(argv) >= 4
+        and argv[1] == "-B"
+        and Path(argv[2]).name == "grabowski_repoground_post_merge.py"
+    ):
+        return tuple(argv[3:])
+    return None
 
 
 def _post_merge_job_starter(
@@ -94,23 +113,42 @@ def _post_merge_job_starter(
     ) -> dict[str, Any]:
         working_directory = str(Path(cwd).expanduser().resolve())
         expected_argv_sha256 = argv_hash(list(argv))
-        identity_sha256 = hashlib.sha256(
-            json.dumps(
+        semantic_argv = _post_merge_semantic_argv(argv)
+        identity_material: dict[str, Any] = {
+            "runtime_seconds": runtime_seconds,
+        }
+        if semantic_argv is None:
+            identity_material.update(
                 {
                     "argv_sha256": expected_argv_sha256,
                     "cwd": working_directory,
-                    "runtime_seconds": runtime_seconds,
-                },
+                }
+            )
+        else:
+            identity_material["post_merge_argv"] = list(semantic_argv)
+        identity_sha256 = hashlib.sha256(
+            json.dumps(
+                identity_material,
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
 
         def exact(metadata: dict[str, Any]) -> bool:
-            return bool(
+            if metadata.get("runtime_seconds") != runtime_seconds:
+                return False
+            if (
                 metadata.get("argv_sha256") == expected_argv_sha256
                 and metadata.get("cwd") == working_directory
-                and metadata.get("runtime_seconds") == runtime_seconds
+            ):
+                return True
+            if semantic_argv is None:
+                return False
+            observed_argv = metadata.get("argv")
+            return bool(
+                isinstance(observed_argv, list)
+                and all(isinstance(item, str) for item in observed_argv)
+                and _post_merge_semantic_argv(observed_argv) == semantic_argv
             )
 
         def uncertain(
@@ -156,6 +194,35 @@ def _post_merge_job_starter(
                     "reuse_satisfied": True,
                     "observed_final_status": "succeeded",
                 }
+            if final_status == "missing_finalization_evidence":
+                terminalization = status.get("terminalization_evidence")
+                created_at_unix = observed_metadata.get("created_at_unix")
+                missing_unit_is_verified = bool(
+                    isinstance(terminalization, dict)
+                    and terminalization.get("query_valid") is True
+                    and terminalization.get("systemd_visible") is False
+                    and terminalization.get("load_state") == "not-found"
+                )
+                if (
+                    missing_unit_is_verified
+                    and isinstance(created_at_unix, int)
+                    and not isinstance(created_at_unix, bool)
+                    and created_at_unix >= 0
+                ):
+                    retry_after_unix = (
+                        created_at_unix
+                        + POST_MERGE_MISSING_UNIT_RECOVERY_GRACE_SECONDS
+                    )
+                    if int(time.time()) >= retry_after_unix:
+                        return None
+                    return {
+                        **observed_metadata,
+                        "reused": True,
+                        "reuse_retry_deferred": True,
+                        "observed_final_status": final_status,
+                        "retry_after_unix": retry_after_unix,
+                    }
+                return uncertain(observed_metadata, final_status=final_status)
             if final_status in POST_MERGE_TERMINAL_JOB_STATUSES:
                 retry_anchor_unix: int | None = None
                 finalization_receipt = status.get("finalization_receipt")
@@ -1571,6 +1638,68 @@ def _reconcile_record_timestamp_unix(record: Mapping[str, Any]) -> int:
     return parsed_unix
 
 
+def _load_reconcile_cursor(tasks_module: Any) -> str | None:
+    with tasks_module._database_connection() as connection:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (RECONCILE_CURSOR_METADATA_KEY,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        value = json.loads(str(row[0]))
+    except json.JSONDecodeError as exc:
+        raise RepoGroundPostMergeError(
+            "RepoGround post-merge reconcile cursor is malformed"
+        ) from exc
+    if not isinstance(value, dict) or set(value) != {"schema_version", "cursor"}:
+        raise RepoGroundPostMergeError(
+            "RepoGround post-merge reconcile cursor shape is invalid"
+        )
+    if value.get("schema_version") != 1:
+        raise RepoGroundPostMergeError(
+            "RepoGround post-merge reconcile cursor schema is invalid"
+        )
+    cursor = value.get("cursor")
+    if cursor is not None and (
+        not isinstance(cursor, str)
+        or re.fullmatch(r"[0-9a-f]{64}", cursor) is None
+    ):
+        raise RepoGroundPostMergeError(
+            "RepoGround post-merge reconcile cursor identity is invalid"
+        )
+    return cursor
+
+
+def _save_reconcile_cursor(tasks_module: Any, cursor: str) -> None:
+    if not isinstance(cursor, str) or re.fullmatch(r"[0-9a-f]{64}", cursor) is None:
+        raise RepoGroundPostMergeError(
+            "RepoGround post-merge reconcile cursor identity is invalid"
+        )
+    payload = json.dumps(
+        {"schema_version": 1, "cursor": cursor},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with tasks_module._database_connection() as connection:
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (RECONCILE_CURSOR_METADATA_KEY, payload),
+        )
+
+
+def _cursor_ordered_completion_records(
+    record_sha256s: list[str],
+    cursor: str | None,
+) -> list[str]:
+    ordered = list(record_sha256s)
+    if cursor is None or cursor not in ordered:
+        return ordered
+    start = ordered.index(cursor) + 1
+    return ordered[start:] + ordered[:start]
+
+
 def reconcile_recent_captain_audit_followups(
     *,
     lookback_seconds: int = DEFAULT_RECONCILE_LOOKBACK_SECONDS,
@@ -1581,8 +1710,21 @@ def reconcile_recent_captain_audit_followups(
     if type(limit) is not int or not 1 <= limit <= 100:
         raise RepoGroundPostMergeError("reconcile limit is out of bounds")
 
+    pass_started_monotonic = time.monotonic()
+    pass_deadline_monotonic = (
+        pass_started_monotonic + DEFAULT_RECONCILE_PASS_BUDGET_SECONDS
+    )
+
     import grabowski_audit_query
     import grabowski_operator
+
+    cursor_tasks: Any | None = None
+    cursor_before: str | None = None
+    if isinstance(getattr(grabowski_operator, "STATE_DIR", None), Path):
+        import grabowski_tasks
+
+        cursor_tasks = grabowski_tasks
+        cursor_before = _load_reconcile_cursor(cursor_tasks)
 
     since_unix = int(time.time()) - lookback_seconds
     snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
@@ -1643,7 +1785,17 @@ def reconcile_recent_captain_audit_followups(
         raise RepoGroundPostMergeError("durable Grabowski job starter is unavailable")
 
     outcomes: list[dict[str, Any]] = []
-    for record_sha256 in completion_record_sha256s:
+    budget_exhausted = False
+    cursor_after = cursor_before
+    processing_record_sha256s = _cursor_ordered_completion_records(
+        completion_record_sha256s,
+        cursor_before,
+    )
+    for record_sha256 in processing_record_sha256s:
+        remaining_seconds = pass_deadline_monotonic - time.monotonic()
+        if remaining_seconds < POST_MERGE_SINGLE_IDENTITY_BUDGET_SECONDS:
+            budget_exhausted = True
+            break
         outcome = schedule_from_captain_audit_completion(
             record_sha256,
             job_starter=starter,
@@ -1669,6 +1821,13 @@ def reconcile_recent_captain_audit_followups(
             status in {"already_satisfied", "not_scheduled", "retry_deferred"}
             or (status == "scheduled" and outcome.get("reused") is True)
         )
+        cursor_advance_allowed = safe_read_only or (
+            status == "scheduled" and outcome.get("reused") is not True
+        )
+        if cursor_advance_allowed:
+            if cursor_tasks is not None:
+                _save_reconcile_cursor(cursor_tasks, record_sha256)
+            cursor_after = record_sha256
         if not safe_read_only:
             break
     return {
@@ -1682,6 +1841,13 @@ def reconcile_recent_captain_audit_followups(
         "audit_query_truncated": False,
         "scanned_records": scanned_records,
         "lookback_horizon_reached": lookback_horizon_reached,
+        "processing_order": "cursor_round_robin_newest_seed",
+        "cursor_before": cursor_before,
+        "cursor_after": cursor_after,
+        "cursor_persisted": cursor_tasks is not None,
+        "pass_budget_seconds": DEFAULT_RECONCILE_PASS_BUDGET_SECONDS,
+        "budget_exhausted": budget_exhausted,
+        "remaining": len(completion_record_sha256s) - len(outcomes),
     }
 
 def _parser() -> argparse.ArgumentParser:
