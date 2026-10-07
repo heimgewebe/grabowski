@@ -68,6 +68,7 @@ POST_MERGE_SINGLE_IDENTITY_BUDGET_SECONDS = (
 )
 DEFAULT_RECONCILE_PASS_BUDGET_SECONDS = 720
 RECONCILE_CURSOR_METADATA_KEY = "repoground_post_merge_reconcile_cursor_v1"
+RECONCILE_DISCOVERY_METADATA_KEY = "repoground_post_merge_reconcile_discovery_v1"
 
 
 class _ReusableJobSlotsExhausted(RuntimeError):
@@ -1671,22 +1672,110 @@ def _load_reconcile_cursor(tasks_module: Any) -> str | None:
     return cursor
 
 
-def _save_reconcile_cursor(tasks_module: Any, cursor: str) -> None:
-    if not isinstance(cursor, str) or re.fullmatch(r"[0-9a-f]{64}", cursor) is None:
-        raise RepoGroundPostMergeError(
-            "RepoGround post-merge reconcile cursor identity is invalid"
-        )
-    payload = json.dumps(
-        {"schema_version": 1, "cursor": cursor},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+def _load_reconcile_discovery_ordinal(tasks_module: Any) -> int | None:
     with tasks_module._database_connection() as connection:
-        connection.execute(
-            "INSERT INTO metadata(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (RECONCILE_CURSOR_METADATA_KEY, payload),
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (RECONCILE_DISCOVERY_METADATA_KEY,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        value = json.loads(str(row[0]))
+    except json.JSONDecodeError as exc:
+        raise RepoGroundPostMergeError(
+            "RepoGround post-merge discovery watermark is malformed"
+        ) from exc
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "global_ordinal",
+    }:
+        raise RepoGroundPostMergeError(
+            "RepoGround post-merge discovery watermark shape is invalid"
         )
+    if value.get("schema_version") != 1:
+        raise RepoGroundPostMergeError(
+            "RepoGround post-merge discovery watermark schema is invalid"
+        )
+    global_ordinal = value.get("global_ordinal")
+    if (
+        isinstance(global_ordinal, bool)
+        or not isinstance(global_ordinal, int)
+        or global_ordinal < 1
+    ):
+        raise RepoGroundPostMergeError(
+            "RepoGround post-merge discovery watermark ordinal is invalid"
+        )
+    return global_ordinal
+
+
+def _save_reconcile_progress(
+    tasks_module: Any,
+    *,
+    cursor: str | None,
+    discovery_ordinal: int | None,
+) -> None:
+    payloads: list[tuple[str, str]] = []
+    if cursor is not None:
+        if (
+            not isinstance(cursor, str)
+            or re.fullmatch(r"[0-9a-f]{64}", cursor) is None
+        ):
+            raise RepoGroundPostMergeError(
+                "RepoGround post-merge reconcile cursor identity is invalid"
+            )
+        payloads.append(
+            (
+                RECONCILE_CURSOR_METADATA_KEY,
+                json.dumps(
+                    {"schema_version": 1, "cursor": cursor},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        )
+    if discovery_ordinal is not None:
+        if (
+            isinstance(discovery_ordinal, bool)
+            or not isinstance(discovery_ordinal, int)
+            or discovery_ordinal < 1
+        ):
+            raise RepoGroundPostMergeError(
+                "RepoGround post-merge discovery watermark ordinal is invalid"
+            )
+        payloads.append(
+            (
+                RECONCILE_DISCOVERY_METADATA_KEY,
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "global_ordinal": discovery_ordinal,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        )
+    if not payloads:
+        return
+
+    # Cursor rotation and audit discovery progress are one metadata mutation:
+    # commit both keys in the same SQLite transaction.
+    with tasks_module._database_connection() as connection:
+        for key, payload in payloads:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, payload),
+            )
+
+
+def _save_reconcile_cursor(tasks_module: Any, cursor: str) -> None:
+    _save_reconcile_progress(
+        tasks_module,
+        cursor=cursor,
+        discovery_ordinal=None,
+    )
 
 
 def _cursor_ordered_completion_records(
@@ -1720,11 +1809,13 @@ def reconcile_recent_captain_audit_followups(
 
     cursor_tasks: Any | None = None
     cursor_before: str | None = None
+    discovery_ordinal_before: int | None = None
     if isinstance(getattr(grabowski_operator, "STATE_DIR", None), Path):
         import grabowski_tasks
 
         cursor_tasks = grabowski_tasks
         cursor_before = _load_reconcile_cursor(cursor_tasks)
+        discovery_ordinal_before = _load_reconcile_discovery_ordinal(cursor_tasks)
 
     since_unix = int(time.time()) - lookback_seconds
     snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
@@ -1735,18 +1826,19 @@ def reconcile_recent_captain_audit_followups(
     ):
         raise RepoGroundPostMergeError("Captain audit reconciliation scan bound is invalid")
 
-    # Discover the complete verified lookback before starting any mutation.
-    # The legacy `limit` argument remains input-compatible but must never
-    # truncate discovery: otherwise newer non-merge Captain completions could
-    # permanently hide an older pending PR merge.
+    # Bootstrap with the bounded wall-clock lookback, then resume from a durable
+    # audit ordinal. Once the watermark exists, outages cannot age an unseen
+    # Captain merge out of discovery.
     completion_record_sha256s: list[str] = []
     scanned_records = 0
     lookback_horizon_reached = False
+    newest_global_ordinal: int | None = None
+    discovery_watermark_reached = discovery_ordinal_before is None
     iterator = grabowski_audit_query._iter_snapshot_items(snapshot, order="desc")
     for item in iterator:
         if scanned_records >= max_scan_records:
             raise RepoGroundPostMergeError(
-                "Captain audit reconciliation scan truncated before lookback horizon"
+                "Captain audit reconciliation scan truncated before discovery boundary"
             )
         scanned_records += 1
         evidence = item.get("evidence") if isinstance(item, dict) else None
@@ -1755,6 +1847,34 @@ def reconcile_recent_captain_audit_followups(
             raise RepoGroundPostMergeError(
                 "Captain audit reconciliation snapshot item is invalid"
             )
+
+        global_ordinal = evidence.get("global_ordinal")
+        if global_ordinal is not None and (
+            isinstance(global_ordinal, bool)
+            or not isinstance(global_ordinal, int)
+            or global_ordinal < 1
+        ):
+            raise RepoGroundPostMergeError(
+                "Captain audit reconciliation global ordinal is invalid"
+            )
+        if newest_global_ordinal is None and isinstance(global_ordinal, int):
+            newest_global_ordinal = global_ordinal
+            if (
+                discovery_ordinal_before is not None
+                and newest_global_ordinal < discovery_ordinal_before
+            ):
+                raise RepoGroundPostMergeError(
+                    "Captain audit reconciliation discovery watermark is ahead of audit"
+                )
+        if discovery_ordinal_before is not None:
+            if not isinstance(global_ordinal, int):
+                raise RepoGroundPostMergeError(
+                    "Captain audit reconciliation global ordinal is unavailable"
+                )
+            if global_ordinal <= discovery_ordinal_before:
+                discovery_watermark_reached = True
+                break
+
         is_pr_merge_completion = bool(
             record.get("operation") == "captain-run-audit-completion"
             and record.get("action") == "pr-merge"
@@ -1767,7 +1887,9 @@ def reconcile_recent_captain_audit_followups(
             continue
         if timestamp_unix < since_unix:
             lookback_horizon_reached = True
-            break
+            # A moving wall-clock horizon cannot prove that initial discovery
+            # is complete after an outage. With no durable ordinal, exhaust
+            # the verified stream or fail closed at MAX_SCAN_RECORDS.
         if not is_pr_merge_completion:
             continue
         record_sha256 = evidence.get("record_sha256")
@@ -1780,13 +1902,19 @@ def reconcile_recent_captain_audit_followups(
             )
         completion_record_sha256s.append(record_sha256)
 
+    if discovery_ordinal_before is not None and not discovery_watermark_reached:
+        raise RepoGroundPostMergeError(
+            "Captain audit reconciliation discovery watermark was not reached"
+        )
+
     starter = resolve_job_starter({"grabowski_operator": grabowski_operator})
     if starter is None:
         raise RepoGroundPostMergeError("durable Grabowski job starter is unavailable")
 
     outcomes: list[dict[str, Any]] = []
     budget_exhausted = False
-    cursor_after = cursor_before
+    cursor_candidate = cursor_before
+    scheduling_mutation_attempted = False
     processing_record_sha256s = _cursor_ordered_completion_records(
         completion_record_sha256s,
         cursor_before,
@@ -1821,15 +1949,59 @@ def reconcile_recent_captain_audit_followups(
             status in {"already_satisfied", "not_scheduled", "retry_deferred"}
             or (status == "scheduled" and outcome.get("reused") is True)
         )
-        cursor_advance_allowed = safe_read_only or (
-            status == "scheduled" and outcome.get("reused") is not True
+        if safe_read_only:
+            cursor_candidate = record_sha256
+            continue
+
+        # A new or uncertain schedule is the mutation attempt for this pass.
+        # Cursor persistence must therefore wait for a later read-only pass.
+        scheduling_mutation_attempted = True
+        break
+
+    cursor_after = cursor_before
+    discovery_ordinal_after = discovery_ordinal_before
+    cursor_persisted = False
+    discovery_watermark_persisted = False
+    progress_persisted = False
+    if not scheduling_mutation_attempted:
+        cursor_after = cursor_candidate
+        # A watermark may skip older records on the next pass. Only advance
+        # it once every newly discovered completion is terminally satisfied.
+        # Deferred, reused-running and budget-limited completions remain
+        # discoverable, even when the timer is interrupted for hours.
+        discovery_complete = (
+            not budget_exhausted
+            and len(outcomes) == len(completion_record_sha256s)
+            and all(
+                outcome["status"] == "already_satisfied"
+                for outcome in outcomes
+            )
         )
-        if cursor_advance_allowed:
-            if cursor_tasks is not None:
-                _save_reconcile_cursor(cursor_tasks, record_sha256)
-            cursor_after = record_sha256
-        if not safe_read_only:
-            break
+        discovery_ordinal_candidate = (
+            newest_global_ordinal
+            if discovery_complete and newest_global_ordinal is not None
+            else discovery_ordinal_before
+        )
+        discovery_ordinal_after = discovery_ordinal_candidate
+        cursor_changed = (
+            cursor_candidate is not None and cursor_candidate != cursor_before
+        )
+        discovery_changed = (
+            discovery_ordinal_candidate is not None
+            and discovery_ordinal_candidate != discovery_ordinal_before
+        )
+        if cursor_tasks is not None and (cursor_changed or discovery_changed):
+            _save_reconcile_progress(
+                cursor_tasks,
+                cursor=cursor_candidate if cursor_changed else None,
+                discovery_ordinal=(
+                    discovery_ordinal_candidate if discovery_changed else None
+                ),
+            )
+            cursor_persisted = cursor_changed
+            discovery_watermark_persisted = discovery_changed
+            progress_persisted = True
+
     return {
         "kind": "grabowski.repoground_post_merge_reconcile",
         "schema_version": 1,
@@ -1844,7 +2016,13 @@ def reconcile_recent_captain_audit_followups(
         "processing_order": "cursor_round_robin_newest_seed",
         "cursor_before": cursor_before,
         "cursor_after": cursor_after,
-        "cursor_persisted": cursor_tasks is not None,
+        "cursor_persisted": cursor_persisted,
+        "cursor_persistence_available": cursor_tasks is not None,
+        "discovery_ordinal_before": discovery_ordinal_before,
+        "discovery_ordinal_after": discovery_ordinal_after,
+        "discovery_watermark_reached": discovery_watermark_reached,
+        "discovery_watermark_persisted": discovery_watermark_persisted,
+        "progress_persisted": progress_persisted,
         "pass_budget_seconds": DEFAULT_RECONCILE_PASS_BUDGET_SECONDS,
         "budget_exhausted": budget_exhausted,
         "remaining": len(completion_record_sha256s) - len(outcomes),
