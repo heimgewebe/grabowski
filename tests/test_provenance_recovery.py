@@ -8,6 +8,7 @@ become a way around the gate for anything else.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 from pathlib import Path
 import stat
@@ -100,6 +101,19 @@ def _load_provenance_recovery():
     self_deploy._deploy_index = lambda root: {"units": [], "pending_unit": None}
     self_deploy._write_deploy_index = lambda *args, **kwargs: None
     self_deploy._deploy_schedule_lock = contextlib.nullcontext
+    from tests.test_self_deploy import SELF_DEPLOY
+    self_deploy._tracked_runtime_deploy_local_mutation_evidence = (
+        SELF_DEPLOY._tracked_runtime_deploy_local_mutation_evidence
+    )
+
+    class _DeployScheduleFailureAfterLocalMutation(RuntimeError):
+        def __init__(self, message, *, local_mutation_evidence):
+            super().__init__(message)
+            self.local_mutation_evidence = dict(local_mutation_evidence)
+
+    self_deploy.DeployScheduleFailureAfterLocalMutation = (
+        _DeployScheduleFailureAfterLocalMutation
+    )
 
     name = "grabowski_provenance_recovery_test"
     spec = importlib.util.spec_from_file_location(
@@ -367,7 +381,7 @@ class ProvenanceRecoveryGateTests(unittest.TestCase):
 class VolatileGateRecheckTests(unittest.TestCase):
     """Gates that can flip between assessment and dispatch are re-read."""
 
-    def _repair_with_recheck(self, recheck: dict):
+    def _repair_with_recheck(self, recheck: dict, *, audit_side_effect=None):
         allowed_gate = {
             "allowed": True,
             "reasons": [],
@@ -379,7 +393,11 @@ class VolatileGateRecheckTests(unittest.TestCase):
             patch.object(
                 provenance_recovery, "_volatile_gate_recheck", return_value=recheck
             ),
-            patch.object(provenance_recovery.base, "_append_audit") as audit,
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit",
+                side_effect=audit_side_effect,
+            ) as audit,
             patch.object(provenance_recovery.operator, "_start_job") as start_job,
         ):
             raised = None
@@ -401,6 +419,66 @@ class VolatileGateRecheckTests(unittest.TestCase):
             audit.call_args[0][0]["operation"],
             "provenance-recovery-aborted-before-dispatch",
         )
+
+    def test_repair_denial_preserves_stale_pending_reconciliation(self) -> None:
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000001",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+            "evidence_sha256": "a" * 64,
+        }
+        with self.assertRaises(
+            provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+        ) as raised:
+            self._repair_with_recheck(
+                {
+                    "reasons": ["kill_switch_clear"],
+                    "checks": {"kill_switch_clear": False},
+                    "competing_deployment": {
+                        "stale_pending_reconciliation": reconciliation,
+                    },
+                }
+            )
+
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
+
+    def test_repair_denial_audit_failure_preserves_stale_pending_reconciliation(
+        self,
+    ) -> None:
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale-denied-audit",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 9,
+            "evidence_sha256": "9" * 64,
+        }
+
+        def fail_aborted_audit(record):
+            if record.get("operation") == "provenance-recovery-aborted-before-dispatch":
+                raise RuntimeError("aborted audit unavailable")
+
+        with self.assertRaises(
+            provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+        ) as raised:
+            self._repair_with_recheck(
+                {
+                    "reasons": ["no_competing_deployment"],
+                    "checks": {"no_competing_deployment": False},
+                    "competing_deployment": {
+                        "stale_pending_reconciliation": reconciliation,
+                    },
+                },
+                audit_side_effect=fail_aborted_audit,
+            )
+
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
 
     def test_competing_deployment_appearing_late_aborts_dispatch(self) -> None:
         raised, start_job, _audit = self._repair_with_recheck(
@@ -694,6 +772,228 @@ class TrustAnchorTests(unittest.TestCase):
             self.assertFalse(missing["verified"])
 
 
+class PendingPromotionRecoveryTests(unittest.TestCase):
+    def test_real_initial_gates_reach_bound_recheck_only_with_independent_authority(self) -> None:
+        for lane in ("repair", "resume"):
+            for state in ("identical", "stale", "competitor", "unreadable", "kill_switch", "blockade", "audit"):
+                with self.subTest(lane=lane, state=state), tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.object(provenance_recovery.Path, "home", return_value=Path(temporary)))
+                    identity = _source_identity(ROOT)
+                    unit = "grabowski-job-abcdef012345"
+                    match = {"unit": unit, "argv_sha256": "a" * 64}
+                    binding = {
+                        "cutover_id": "bgc-initial", "resumed_receipt_sha256": "cd" * 32,
+                        "binding_sha256": "ab" * 32,
+                        "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+                    }
+                    reconciliation = {
+                        "schema_version": 1,
+                        "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+                        "unit": unit, "dispatch_outcome": "not_started",
+                        "deploy_index_updated": True, "audit_recorded": True,
+                        "index_updated_at_unix": 1,
+                    }
+                    reconciliation["evidence_sha256"] = hashlib.sha256(
+                        json.dumps(reconciliation, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+                    ).hexdigest()
+
+                    def indexed(command=None, *, prune=False, reconcile_stale_pending=False):
+                        recheck = command is not None
+                        if recheck:
+                            self.assertTrue(prune)
+                            self.assertTrue(reconcile_stale_pending)
+                        return {
+                            "blocking_units": [] if recheck and state in {"identical", "stale"} else [unit],
+                            "inflight_units": [] if recheck and state == "stale" else [unit],
+                            "idempotent_match": match if recheck and state == "identical" else None,
+                            "pruned_units": [],
+                            "stale_pending_reconciliation": reconciliation if recheck and state == "stale" else None,
+                            "error": "unreadable index" if state == "unreadable" else None,
+                        }
+
+                    reader = stack.enter_context(patch.object(
+                        provenance_recovery.self_deploy, "inflight_runtime_job_evidence",
+                        side_effect=indexed, create=True,
+                    ))
+                    stack.enter_context(patch.object(provenance_recovery.base, "_verify_audit_log", return_value={
+                        "valid": state != "audit", "audit_writable": True,
+                    }))
+                    stack.enter_context(patch.object(provenance_recovery.base, "_kill_switch_state", return_value={"engaged": state == "kill_switch"}))
+                    stack.enter_context(patch.object(provenance_recovery, "_blockade_evidence", return_value={"allows_mutation": state != "blockade"}))
+                    stack.enter_context(patch.object(provenance_recovery.privileged, "grabowski_privileged_broker_status", return_value={"ready": True}))
+                    stack.enter_context(patch.object(provenance_recovery, "_integrity_evidence", return_value={"repair_warranted": True, "failed_integrity_flags": ["provenance_valid"]}))
+                    stack.enter_context(patch.object(provenance_recovery.recovery, "_fresh_text_marker", return_value={"valid": True}))
+                    stack.enter_context(patch.object(provenance_recovery, "_target_contract_evidence", return_value={"contract_valid": True, "validator_is_deployed": True}))
+                    stack.enter_context(patch.object(provenance_recovery, "_recovery_lane", return_value={
+                        "lane": provenance_recovery.midcutover.LANE_SCHEDULED_DEPLOY if lane == "repair" else provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+                        "resume_binding": binding,
+                    }))
+                    stack.enter_context(patch.object(provenance_recovery.self_deploy, "_deployment_source_preflight", return_value=(ROOT, ROOT / "tools/run_scheduled_deploy.py", identity)))
+                    stack.enter_context(patch.object(provenance_recovery, "_resume_source_preflight", return_value=(ROOT, ROOT / "tools/run_midcutover_resume.py", identity)))
+                    stack.enter_context(patch.object(provenance_recovery, "_resume_effect_repository", return_value=ROOT))
+                    stack.enter_context(patch.object(provenance_recovery.base, "_require_valid_audit_chain"))
+                    stack.enter_context(patch.object(provenance_recovery.operator, "_jobs_root", return_value=ROOT))
+                    write = stack.enter_context(patch.object(provenance_recovery.self_deploy, "_write_deploy_index"))
+                    start = stack.enter_context(patch.object(provenance_recovery.operator, "_start_job", return_value=match))
+                    run = (lambda: provenance_recovery._repair_under_schedule_lock(HEAD, None, None, 8)) if lane == "repair" else (lambda: provenance_recovery._resume_under_schedule_lock(HEAD))
+                    if state in {"identical", "stale"}:
+                        result = run()
+                        self.assertFalse(result["gate"]["allowed"])
+                        self.assertEqual(result["recheck"]["reasons"], [])
+                        if state == "identical":
+                            self.assertTrue(result["already_dispatched"])
+                            start.assert_not_called()
+                            write.assert_not_called()
+                        else:
+                            start.assert_called_once()
+                            self.assertEqual(result["local_mutation_evidence"], reconciliation)
+                    else:
+                        with self.assertRaises(provenance_recovery.ProvenanceRecoveryDenied):
+                            run()
+                        start.assert_not_called()
+                        write.assert_not_called()
+                    self.assertEqual(reader.call_args_list[0].args, (None,))
+                    self.assertFalse(reader.call_args_list[0].kwargs["reconcile_stale_pending"])
+                    self.assertEqual(reader.call_count, 2 if state in {"identical", "stale", "competitor"} else 1)
+
+    def _promotion(self) -> dict:
+        from tests.test_self_deploy import SELF_DEPLOY
+
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_pending_unit_promotion",
+            "unit": "grabowski-job-123456abcdef",
+            "deploy_index_updated": True,
+            "index_updated_at_unix": 12,
+        }
+        return {**material, "evidence_sha256": SELF_DEPLOY._source_identity_sha256(material)}
+
+    def test_competing_projection_preserves_promotion_and_ordered_bundle(self) -> None:
+        promotion = self._promotion()
+        reconciliation = {"kind": "grabowski_runtime_deploy_stale_pending_reconciliation"}
+        indexed = {
+            "inflight_units": [], "blocking_units": [], "idempotent_match": None,
+            "pruned_units": [], "error": None, "deploy_index_mutation": promotion,
+            "stale_pending_reconciliation": reconciliation,
+        }
+        with patch.object(
+            provenance_recovery.self_deploy, "inflight_runtime_job_evidence",
+            return_value=indexed, create=True,
+        ):
+            result = provenance_recovery._competing_deployment_evidence(
+                ["argv"], reconcile_stale_pending=True
+            )
+        self.assertEqual(result["deploy_index_mutation"], promotion)
+        self.assertEqual(result["local_mutation_evidence"]["effects"], [promotion, reconciliation])
+
+    def test_both_recovery_lanes_preserve_effects_and_dispatch_outcomes_on_every_exit(self) -> None:
+        outcomes = (
+            "coalesced", "coalesced_audit_failure", "denied", "denied_audit_failure",
+            "setup_failure", "start_failure", "unknown", "unknown_audit_failure",
+            "scheduled", "scheduled_audit_failure",
+            "unknown_without_mutation", "unknown_without_mutation_audit_failure",
+        )
+        for lane in ("repair", "resume"):
+            for outcome in outcomes:
+                with self.subTest(lane=lane, outcome=outcome), contextlib.ExitStack() as stack:
+                    promotion = self._promotion()
+                    local_evidence = None if "without_mutation" in outcome else promotion
+                    identity = _source_identity(ROOT)
+                    binding = {
+                        "cutover_id": "bgc-promotion", "resumed_receipt_sha256": "cd" * 32,
+                        "binding_sha256": "ab" * 32,
+                        "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+                    }
+                    gate = {
+                        "allowed": True, "reasons": [], "source_identity": identity,
+                        "runtime_integrity": {"failed_integrity_flags": ["provenance_valid"]},
+                        "resume_binding": binding,
+                        "recovery_lane": {"classification_sha256": "ef" * 32},
+                    }
+                    match = {"unit": promotion["unit"], "argv_sha256": "a" * 64}
+                    volatile = {
+                        "reasons": ["competing_deployment"] if outcome.startswith("denied") else [],
+                        "checks": {},
+                        "competing_deployment": {
+                            "idempotent_match": match if outcome.startswith("coalesced") else None,
+                            "deploy_index_mutation": local_evidence,
+                        },
+                    }
+                    stack.enter_context(patch.object(provenance_recovery, "evaluate_gate", return_value=gate))
+                    stack.enter_context(patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate))
+                    stack.enter_context(patch.object(provenance_recovery, "_volatile_gate_recheck", return_value=volatile))
+                    stack.enter_context(patch.object(provenance_recovery, "_resume_effect_repository", return_value=ROOT))
+                    stack.enter_context(patch.object(
+                        provenance_recovery, "_resume_source_preflight",
+                        return_value=(ROOT, ROOT / "tools/run_midcutover_resume.py", identity),
+                    ))
+                    stack.enter_context(patch.object(provenance_recovery.base, "_require_valid_audit_chain"))
+                    stack.enter_context(patch.object(provenance_recovery.operator, "_jobs_root", return_value=ROOT))
+                    stack.enter_context(patch.object(provenance_recovery.self_deploy, "_write_deploy_index"))
+                    if outcome == "setup_failure":
+                        stack.enter_context(patch.object(
+                            provenance_recovery.operator, "_jobs_root", side_effect=OSError("setup failed")
+                        ))
+                    start_effect = None
+                    if outcome == "start_failure":
+                        start_effect = OSError("start failed")
+                    elif outcome.startswith("unknown"):
+                        start_effect = provenance_recovery.operator.JobDispatchUnknown(
+                            "dispatch unknown", unit=promotion["unit"], evidence={"dispatch_outcome": "unknown"}
+                        )
+                    start = stack.enter_context(patch.object(
+                        provenance_recovery.operator, "_start_job", return_value=match, side_effect=start_effect
+                    ))
+
+                    def audit_effect(record):
+                        if outcome.endswith("audit_failure") and not record["operation"].endswith("-intent"):
+                            raise OSError("audit failed")
+                        return "d" * 64
+
+                    audit = stack.enter_context(patch.object(
+                        provenance_recovery.base, "_append_audit", side_effect=audit_effect
+                    ))
+                    digest_audit = stack.enter_context(patch.object(
+                        provenance_recovery.base, "_append_audit_with_digest", side_effect=audit_effect
+                    ))
+                    if lane == "repair":
+                        run = lambda: provenance_recovery._repair_under_schedule_lock(HEAD, None, None, 8)
+                    else:
+                        run = lambda: provenance_recovery._resume_under_schedule_lock(HEAD)
+                    if outcome.startswith("unknown"):
+                        with self.assertRaises(provenance_recovery.operator.JobDispatchUnknown) as raised:
+                            run()
+                        self.assertEqual(raised.exception.unit, promotion["unit"])
+                        self.assertEqual(raised.exception.evidence["dispatch_outcome"], "unknown")
+                        self.assertEqual(raised.exception.evidence.get("local_mutation_evidence"), local_evidence)
+                        if outcome.endswith("audit_failure"):
+                            self.assertIn("audit failed", raised.exception.evidence["audit_append_error"])
+                    elif outcome in {
+                        "denied",
+                        "coalesced_audit_failure",
+                        "denied_audit_failure",
+                        "setup_failure",
+                        "start_failure",
+                    }:
+                        with self.assertRaises(
+                            provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+                        ) as raised:
+                            run()
+                        self.assertEqual(raised.exception.local_mutation_evidence, promotion)
+                    else:
+                        result = run()
+                        self.assertEqual(result["local_mutation_evidence"], promotion)
+                        if outcome == "scheduled_audit_failure":
+                            self.assertTrue(result["post_dispatch_warnings"])
+                    if outcome.startswith(("coalesced", "denied")) or outcome == "setup_failure":
+                        start.assert_not_called()
+                    records = [call.args[0] for call in [*audit.call_args_list, *digest_audit.call_args_list]]
+                    observed = [record for record in records if "local_mutation_evidence" in record]
+                    if outcome not in {"setup_failure", "start_failure"}:
+                        self.assertTrue(observed)
+                        self.assertTrue(all(record["local_mutation_evidence"] == local_evidence for record in observed))
+
+
 class DispatchOutcomeTests(unittest.TestCase):
     """A started deployment must never be reported as not-having-happened."""
 
@@ -739,35 +1039,240 @@ class DispatchOutcomeTests(unittest.TestCase):
         self.assertTrue(receipt["post_dispatch_warnings"])
         self.assertIn("bookkeeping", receipt["post_dispatch_warnings"][0])
 
-    def test_unknown_dispatch_outcome_keeps_the_reservation(self) -> None:
-        """A job that may be running must not have its reservation released."""
+    def test_success_receipt_preserves_stale_pending_reconciliation(self) -> None:
         gate = {
-            "allowed": True, "reasons": [],
+            "allowed": True,
+            "reasons": [],
             "runtime_integrity": {"failed_integrity_flags": ["provenance_valid"]},
             "source_identity": _source_identity(ROOT),
         }
-        unknown = provenance_recovery.operator.JobDispatchUnknown(
-            "unresolved", unit="grabowski-job-abc", evidence={"outcome": "outcome_unknown"}
-        )
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale-success",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 11,
+            "evidence_sha256": "b" * 64,
+        }
+        volatile = {
+            "reasons": [],
+            "checks": {},
+            "competing_deployment": {
+                "idempotent_match": None,
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
         with (
             patch.object(provenance_recovery, "evaluate_gate", return_value=gate),
-            patch.object(provenance_recovery, "_volatile_gate_recheck",
-                         return_value={"reasons": [], "checks": {}}),
-            patch.object(provenance_recovery.base, "_append_audit_with_digest",
-                         return_value="d" * 64),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="d" * 64,
+            ) as audit,
             patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
-            patch.object(provenance_recovery.base, "_append_audit") as audit,
+            patch.object(provenance_recovery.self_deploy, "_write_deploy_index"),
+            patch.object(
+                provenance_recovery.operator,
+                "_start_job",
+                return_value={"unit": "u", "argv_sha256": "b" * 64},
+            ),
+        ):
+            receipt = provenance_recovery.grabowski_recovery_provenance_repair(HEAD)
+
+        self.assertEqual(receipt["stale_pending_reconciliation"], reconciliation)
+        self.assertEqual(
+            audit.call_args_list[-1].args[0]["stale_pending_reconciliation"],
+            reconciliation,
+        )
+
+    def test_definitive_start_failure_preserves_stale_pending_reconciliation(
+        self,
+    ) -> None:
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "runtime_integrity": {"failed_integrity_flags": ["provenance_valid"]},
+            "source_identity": _source_identity(ROOT),
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale-start-failure",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 12,
+            "evidence_sha256": "c" * 64,
+        }
+        volatile = {
+            "reasons": [],
+            "checks": {},
+            "competing_deployment": {
+                "idempotent_match": None,
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+        with (
+            patch.object(provenance_recovery, "evaluate_gate", return_value=gate),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="d" * 64,
+            ),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(provenance_recovery.self_deploy, "_write_deploy_index"),
+            patch.object(
+                provenance_recovery.operator,
+                "_start_job",
+                side_effect=RuntimeError("definitive start failure"),
+            ),
+        ):
+            with self.assertRaises(
+                provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                provenance_recovery.grabowski_recovery_provenance_repair(HEAD)
+
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
+
+    def test_reservation_setup_failure_preserves_stale_pending_reconciliation(
+        self,
+    ) -> None:
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "runtime_integrity": {"failed_integrity_flags": ["provenance_valid"]},
+            "source_identity": _source_identity(ROOT),
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale-reservation-setup",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 14,
+            "evidence_sha256": "f" * 64,
+        }
+        volatile = {
+            "reasons": [],
+            "checks": {},
+            "competing_deployment": {
+                "idempotent_match": None,
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+        with (
+            patch.object(provenance_recovery, "evaluate_gate", return_value=gate),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="d" * 64,
+            ),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_write_deploy_index",
+                side_effect=OSError("reservation setup failed"),
+            ),
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+        ):
+            with self.assertRaises(
+                provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                provenance_recovery.grabowski_recovery_provenance_repair(HEAD)
+
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
+        start_job.assert_not_called()
+
+    def test_unknown_dispatch_outcome_keeps_reservation_and_reconciliation(self) -> None:
+        """Unknown dispatch remains authoritative and keeps prior local mutation evidence."""
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "runtime_integrity": {"failed_integrity_flags": ["provenance_valid"]},
+            "source_identity": _source_identity(ROOT),
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale-unknown",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 13,
+            "evidence_sha256": "e" * 64,
+        }
+        volatile = {
+            "reasons": [],
+            "checks": {},
+            "competing_deployment": {
+                "idempotent_match": None,
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+        unknown = provenance_recovery.operator.JobDispatchUnknown(
+            "unresolved",
+            unit="grabowski-job-abc",
+            evidence={"outcome": "outcome_unknown"},
+        )
+
+        def fail_unknown_audit(record):
+            if record.get("operation") == "provenance-recovery-dispatch-outcome-unknown":
+                raise RuntimeError("unknown audit unavailable")
+
+        with (
+            patch.object(provenance_recovery, "evaluate_gate", return_value=gate),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="d" * 64,
+            ),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit",
+                side_effect=fail_unknown_audit,
+            ) as audit,
             patch.object(provenance_recovery.self_deploy, "_write_deploy_index") as index,
             patch.object(provenance_recovery.operator, "_start_job", side_effect=unknown),
         ):
-            with self.assertRaises(provenance_recovery.operator.JobDispatchUnknown):
+            with self.assertRaises(
+                provenance_recovery.operator.JobDispatchUnknown
+            ) as raised:
                 provenance_recovery.grabowski_recovery_provenance_repair(HEAD)
 
         # Exactly one index write: the reservation.  It is never cleared.
         self.assertEqual(index.call_count, 1)
+        self.assertEqual(raised.exception.evidence["stale_pending_reconciliation"], reconciliation)
+        self.assertIn(
+            "RuntimeError: unknown audit unavailable",
+            raised.exception.evidence["audit_append_error"],
+        )
         self.assertEqual(
-            audit.call_args[0][0]["operation"],
-            "provenance-recovery-dispatch-outcome-unknown",
+            audit.call_args[0][0]["stale_pending_reconciliation"],
+            reconciliation,
         )
 
     def test_receipt_carries_a_deterministic_correlation_id(self) -> None:
@@ -1123,6 +1628,571 @@ class MidCutoverCompletionWarrantTests(unittest.TestCase):
                     result["source_identity_sha256"], source_identity["identity_sha256"]
                 )
 
+    def test_midcutover_resume_coalescing_preserves_stale_pending_reconciliation(self) -> None:
+        binding = {
+            "cutover_id": "bgc-coalesced-stale-pending",
+            "resumed_receipt_sha256": "cd" * 32,
+            "binding_sha256": "ab" * 32,
+            "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+        }
+        lane = {
+            "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+            "resume_binding": binding,
+            "classification_sha256": "ef" * 32,
+            "reasons": [],
+        }
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "resume_binding": binding,
+            "recovery_lane": lane,
+        }
+        source_identity = {
+            **_source_identity(ROOT),
+            "identity_sha256": "12" * 32,
+        }
+        match = {
+            "unit": "grabowski-job-resume-coalesced",
+            "kind": "deploy",
+            "argv_sha256": "34" * 32,
+            "final_status": "running",
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000003",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 3,
+            "evidence_sha256": "c" * 64,
+        }
+        volatile = {
+            "reasons": [],
+            "checks": {},
+            "competing_deployment": {
+                "idempotent_match": match,
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+        with (
+            patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery,
+                "_resume_source_preflight",
+                return_value=(
+                    ROOT,
+                    ROOT / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+                    source_identity,
+                ),
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_midcutover_resume_command",
+                return_value=["python3"],
+            ),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="de" * 32,
+            ),
+            patch.object(provenance_recovery.base, "_append_audit") as audit,
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+            patch.object(
+                provenance_recovery.self_deploy, "_write_deploy_index"
+            ) as write_index,
+        ):
+            result = provenance_recovery._resume_under_schedule_lock(HEAD)
+
+        start_job.assert_not_called()
+        write_index.assert_not_called()
+        self.assertTrue(result["already_dispatched"])
+        self.assertEqual(result["stale_pending_reconciliation"], reconciliation)
+        coalesced = [
+            call.args[0]
+            for call in audit.call_args_list
+            if call.args
+            and call.args[0].get("operation") == "midcutover-resume-coalesced"
+        ]
+        self.assertEqual(coalesced[-1]["stale_pending_reconciliation"], reconciliation)
+
+    def test_midcutover_resume_coalesced_audit_failure_preserves_stale_pending_reconciliation(
+        self,
+    ) -> None:
+        binding = {
+            "cutover_id": "bgc-coalesced-audit-failure",
+            "resumed_receipt_sha256": "cd" * 32,
+            "binding_sha256": "ab" * 32,
+            "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+        }
+        lane = {
+            "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+            "resume_binding": binding,
+            "classification_sha256": "ef" * 32,
+            "reasons": [],
+        }
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "resume_binding": binding,
+            "recovery_lane": lane,
+        }
+        source_identity = {
+            **_source_identity(ROOT),
+            "identity_sha256": "12" * 32,
+        }
+        match = {
+            "unit": "grabowski-job-resume-coalesced-audit",
+            "kind": "deploy",
+            "argv_sha256": "34" * 32,
+            "final_status": "running",
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000004",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 4,
+            "evidence_sha256": "d" * 64,
+        }
+        volatile = {
+            "reasons": [],
+            "checks": {},
+            "competing_deployment": {
+                "idempotent_match": match,
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+
+        def fail_coalesced_audit(record):
+            if record.get("operation") == "midcutover-resume-coalesced":
+                raise RuntimeError("coalesced audit unavailable")
+
+        with (
+            patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery,
+                "_resume_source_preflight",
+                return_value=(
+                    ROOT,
+                    ROOT / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+                    source_identity,
+                ),
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_midcutover_resume_command",
+                return_value=["python3"],
+            ),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="de" * 32,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit",
+                side_effect=fail_coalesced_audit,
+            ),
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+            patch.object(
+                provenance_recovery.self_deploy, "_write_deploy_index"
+            ) as write_index,
+        ):
+            with self.assertRaises(
+                provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                provenance_recovery._resume_under_schedule_lock(HEAD)
+
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
+        start_job.assert_not_called()
+        write_index.assert_not_called()
+
+    def test_midcutover_resume_denial_preserves_stale_pending_reconciliation(self) -> None:
+        binding = {
+            "cutover_id": "bgc-stale-pending",
+            "resumed_receipt_sha256": "cd" * 32,
+            "binding_sha256": "ab" * 32,
+            "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+        }
+        lane = {
+            "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+            "resume_binding": binding,
+            "classification_sha256": "ef" * 32,
+            "reasons": [],
+        }
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "resume_binding": binding,
+            "recovery_lane": lane,
+        }
+        source_identity = {
+            **_source_identity(ROOT),
+            "identity_sha256": "12" * 32,
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000001",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+            "evidence_sha256": "a" * 64,
+        }
+        volatile = {
+            "reasons": ["kill_switch_clear"],
+            "checks": {"kill_switch_clear": False},
+            "competing_deployment": {
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+        with (
+            patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery,
+                "_resume_source_preflight",
+                return_value=(
+                    ROOT,
+                    ROOT / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+                    source_identity,
+                ),
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_midcutover_resume_command",
+                return_value=["python3"],
+            ),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="de" * 32,
+            ),
+            patch.object(provenance_recovery.base, "_append_audit") as audit,
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+        ):
+            with self.assertRaises(
+                provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                provenance_recovery._resume_under_schedule_lock(HEAD)
+
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
+        start_job.assert_not_called()
+        self.assertEqual(
+            audit.call_args[0][0]["operation"],
+            "midcutover-resume-aborted-before-dispatch",
+        )
+        self.assertEqual(
+            audit.call_args[0][0]["stale_pending_reconciliation"],
+            reconciliation,
+        )
+
+    def test_midcutover_resume_denial_audit_failure_preserves_stale_pending_reconciliation(
+        self,
+    ) -> None:
+        binding = {
+            "cutover_id": "bgc-denied-audit-failure",
+            "resumed_receipt_sha256": "cd" * 32,
+            "binding_sha256": "ab" * 32,
+            "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+        }
+        lane = {
+            "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+            "resume_binding": binding,
+            "classification_sha256": "ef" * 32,
+            "reasons": [],
+        }
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "resume_binding": binding,
+            "recovery_lane": lane,
+        }
+        source_identity = {
+            **_source_identity(ROOT),
+            "identity_sha256": "12" * 32,
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale-resume-denied",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 10,
+            "evidence_sha256": "a" * 64,
+        }
+        volatile = {
+            "reasons": ["no_competing_deployment"],
+            "checks": {"no_competing_deployment": False},
+            "competing_deployment": {
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+
+        def fail_aborted_audit(record):
+            if record.get("operation") == "midcutover-resume-aborted-before-dispatch":
+                raise RuntimeError("aborted audit unavailable")
+
+        with (
+            patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery,
+                "_resume_source_preflight",
+                return_value=(
+                    ROOT,
+                    ROOT / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+                    source_identity,
+                ),
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_midcutover_resume_command",
+                return_value=["python3"],
+            ),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="de" * 32,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit",
+                side_effect=fail_aborted_audit,
+            ),
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+        ):
+            with self.assertRaises(
+                provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                provenance_recovery._resume_under_schedule_lock(HEAD)
+
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
+        start_job.assert_not_called()
+
+    def test_midcutover_resume_reservation_setup_failure_preserves_stale_pending_reconciliation(
+        self,
+    ) -> None:
+        binding = {
+            "cutover_id": "bgc-reservation-setup-failure",
+            "resumed_receipt_sha256": "cd" * 32,
+            "binding_sha256": "ab" * 32,
+            "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+        }
+        lane = {
+            "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+            "resume_binding": binding,
+            "classification_sha256": "ef" * 32,
+            "reasons": [],
+        }
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "resume_binding": binding,
+            "recovery_lane": lane,
+        }
+        source_identity = {
+            **_source_identity(ROOT),
+            "identity_sha256": "12" * 32,
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale-resume-reservation-setup",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 15,
+            "evidence_sha256": "1" * 64,
+        }
+        volatile = {
+            "reasons": [],
+            "checks": {},
+            "competing_deployment": {
+                "idempotent_match": None,
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+        with (
+            patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery,
+                "_resume_source_preflight",
+                return_value=(
+                    ROOT,
+                    ROOT / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+                    source_identity,
+                ),
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_midcutover_resume_command",
+                return_value=["python3"],
+            ),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="de" * 32,
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_write_deploy_index",
+                side_effect=OSError("reservation setup failed"),
+            ),
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+        ):
+            with self.assertRaises(
+                provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                provenance_recovery._resume_under_schedule_lock(HEAD)
+
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
+        start_job.assert_not_called()
+
+    def test_midcutover_resume_unknown_dispatch_preserves_stale_reconciliation(
+        self,
+    ) -> None:
+        binding = {
+            "cutover_id": "bgc-unknown-dispatch",
+            "resumed_receipt_sha256": "cd" * 32,
+            "binding_sha256": "ab" * 32,
+            "resume_phase": provenance_recovery.midcutover.PHASE_CLOSEOUT,
+        }
+        lane = {
+            "lane": provenance_recovery.midcutover.LANE_MID_CUTOVER_RESUME,
+            "resume_binding": binding,
+            "classification_sha256": "ef" * 32,
+            "reasons": [],
+        }
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "resume_binding": binding,
+            "recovery_lane": lane,
+        }
+        source_identity = {
+            **_source_identity(ROOT),
+            "identity_sha256": "12" * 32,
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale-resume-unknown",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 14,
+            "evidence_sha256": "f" * 64,
+        }
+        volatile = {
+            "reasons": [],
+            "checks": {},
+            "competing_deployment": {
+                "idempotent_match": None,
+                "stale_pending_reconciliation": reconciliation,
+            },
+        }
+        unknown = provenance_recovery.operator.JobDispatchUnknown(
+            "resume unresolved",
+            unit="grabowski-job-resume-unknown",
+            evidence={"outcome": "outcome_unknown"},
+        )
+
+        def fail_unknown_audit(record):
+            if record.get("operation") == "midcutover-resume-dispatch-outcome-unknown":
+                raise RuntimeError("resume unknown audit unavailable")
+
+        with (
+            patch.object(provenance_recovery, "evaluate_resume_gate", return_value=gate),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery,
+                "_resume_source_preflight",
+                return_value=(
+                    ROOT,
+                    ROOT / provenance_recovery.MIDCUTOVER_RESUME_RUNNER_RELATIVE_PATH,
+                    source_identity,
+                ),
+            ),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_midcutover_resume_command",
+                return_value=["python3"],
+            ),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value=volatile,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit_with_digest",
+                return_value="de" * 32,
+            ),
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit",
+                side_effect=fail_unknown_audit,
+            ) as audit,
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_write_deploy_index",
+            ) as index,
+            patch.object(
+                provenance_recovery.operator,
+                "_start_job",
+                side_effect=unknown,
+            ),
+        ):
+            with self.assertRaises(
+                provenance_recovery.operator.JobDispatchUnknown
+            ) as raised:
+                provenance_recovery._resume_under_schedule_lock(HEAD)
+
+        self.assertEqual(index.call_count, 1)
+        self.assertEqual(raised.exception.evidence["stale_pending_reconciliation"], reconciliation)
+        self.assertIn(
+            "RuntimeError: resume unknown audit unavailable",
+            raised.exception.evidence["audit_append_error"],
+        )
+        self.assertEqual(
+            audit.call_args[0][0]["stale_pending_reconciliation"],
+            reconciliation,
+        )
+
     def test_midcutover_resume_rejects_source_drift_before_dispatch(self) -> None:
         binding = {
             "cutover_id": "bgc-source-drift",
@@ -1285,6 +2355,107 @@ class IndexedInflightJobEvidenceGateTests(unittest.TestCase):
         )
         self.assertIsNone(evidence["idempotent_match"])
 
+    def test_gate_preserves_stale_pending_reconciliation_evidence(self) -> None:
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000001",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+            "evidence_sha256": "a" * 64,
+        }
+        with patch.object(
+            provenance_recovery.self_deploy,
+            "inflight_runtime_job_evidence",
+            return_value={
+                "inflight_units": [],
+                "blocking_units": [],
+                "idempotent_match": None,
+                "pruned_units": [],
+                "stale_pending_reconciliation": reconciliation,
+                "error": None,
+            },
+            create=True,
+        ):
+            evidence = provenance_recovery._competing_deployment_evidence(
+                ["argv"], reconcile_stale_pending=True
+            )
+        self.assertEqual(
+            evidence["stale_pending_reconciliation"],
+            reconciliation,
+        )
+
+    def test_volatile_recheck_requests_lock_bound_stale_pending_reconciliation(self) -> None:
+        projection = {
+            "deploy_lock_free": True,
+            "inflight_deploy_jobs": [],
+            "idempotent_match": None,
+            "pruned_units": [],
+            "error": None,
+        }
+        with patch.object(
+            provenance_recovery.base, "_kill_switch_state", return_value={"engaged": False}
+        ), patch.object(
+            provenance_recovery,
+            "_blockade_evidence",
+            return_value={"allows_mutation": True, "error": None},
+        ), patch.object(
+            provenance_recovery, "_competing_deployment_evidence", return_value=projection
+        ) as competing:
+            result = provenance_recovery._volatile_gate_recheck(ROOT, ["argv"])
+        self.assertEqual(result["reasons"], [])
+        competing.assert_called_once_with(
+            ["argv"], prune=True, reconcile_stale_pending=True
+        )
+
+    def test_volatile_recheck_short_circuits_deploy_index_when_kill_switch_is_active(self) -> None:
+        with patch.object(
+            provenance_recovery.base,
+            "_kill_switch_state",
+            return_value={"engaged": True},
+        ), patch.object(
+            provenance_recovery,
+            "_blockade_evidence",
+            return_value={"allows_mutation": True, "error": None},
+        ), patch.object(
+            provenance_recovery,
+            "_competing_deployment_evidence",
+            side_effect=AssertionError("stop-gate path must not inspect the deploy index"),
+        ) as competing:
+            result = provenance_recovery._volatile_gate_recheck(ROOT, ["argv"])
+        self.assertEqual(result["reasons"], ["kill_switch_clear"])
+        self.assertEqual(
+            result["competing_deployment"]["state"],
+            "not_evaluated_due_to_stop_gate",
+        )
+        self.assertIsNone(result["checks"]["no_competing_deployment"])
+        competing.assert_not_called()
+
+    def test_volatile_recheck_short_circuits_deploy_index_when_blockade_denies(self) -> None:
+        with patch.object(
+            provenance_recovery.base,
+            "_kill_switch_state",
+            return_value={"engaged": False},
+        ), patch.object(
+            provenance_recovery,
+            "_blockade_evidence",
+            return_value={"allows_mutation": False, "error": "blocked"},
+        ), patch.object(
+            provenance_recovery,
+            "_competing_deployment_evidence",
+            side_effect=AssertionError("stop-gate path must not inspect the deploy index"),
+        ) as competing:
+            result = provenance_recovery._volatile_gate_recheck(ROOT, ["argv"])
+        self.assertEqual(result["reasons"], ["no_blocking_operator_blockade"])
+        self.assertEqual(
+            result["competing_deployment"]["state"],
+            "not_evaluated_due_to_stop_gate",
+        )
+        self.assertIsNone(result["checks"]["no_competing_deployment"])
+        competing.assert_not_called()
+
     def test_identical_running_intent_is_reported_as_idempotent(self) -> None:
         match = {"unit": "grabowski-job-555555555555", "kind": "deploy"}
         with patch.object(
@@ -1314,7 +2485,7 @@ class DispatchCoalescingTests(unittest.TestCase):
     projection could have said so.
     """
 
-    def _repair(self, recheck: dict):
+    def _repair(self, recheck: dict, *, audit_side_effect=None):
         allowed_gate = {
             "allowed": True,
             "reasons": [],
@@ -1326,7 +2497,11 @@ class DispatchCoalescingTests(unittest.TestCase):
             patch.object(
                 provenance_recovery, "_volatile_gate_recheck", return_value=recheck
             ),
-            patch.object(provenance_recovery.base, "_append_audit") as audit,
+            patch.object(
+                provenance_recovery.base,
+                "_append_audit",
+                side_effect=audit_side_effect,
+            ) as audit,
             patch.object(provenance_recovery.operator, "_start_job") as start_job,
             patch.object(
                 provenance_recovery.self_deploy, "_write_deploy_index"
@@ -1359,6 +2534,86 @@ class DispatchCoalescingTests(unittest.TestCase):
             call.args[0].get("operation") for call in audit.call_args_list if call.args
         ]
         self.assertIn("provenance-recovery-coalesced", operations)
+
+    def test_identical_running_repair_preserves_stale_pending_reconciliation(self) -> None:
+        match = {
+            "unit": "grabowski-job-888888888888",
+            "kind": "deploy",
+            "argv_sha256": "ef" * 32,
+            "final_status": "running",
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000002",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 2,
+            "evidence_sha256": "b" * 64,
+        }
+        result, start_job, audit, write_index = self._repair(
+            {
+                "reasons": [],
+                "checks": {},
+                "competing_deployment": {
+                    "idempotent_match": match,
+                    "stale_pending_reconciliation": reconciliation,
+                },
+            }
+        )
+        start_job.assert_not_called()
+        write_index.assert_not_called()
+        self.assertTrue(result["already_dispatched"])
+        self.assertEqual(result["stale_pending_reconciliation"], reconciliation)
+        coalesced = [
+            call.args[0]
+            for call in audit.call_args_list
+            if call.args
+            and call.args[0].get("operation") == "provenance-recovery-coalesced"
+        ]
+        self.assertEqual(coalesced[-1]["stale_pending_reconciliation"], reconciliation)
+
+    def test_identical_running_repair_audit_failure_preserves_stale_pending_reconciliation(
+        self,
+    ) -> None:
+        match = {
+            "unit": "grabowski-job-999999999999",
+            "kind": "deploy",
+            "argv_sha256": "ab" * 32,
+            "final_status": "running",
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000005",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 5,
+            "evidence_sha256": "e" * 64,
+        }
+
+        def fail_coalesced_audit(record):
+            if record.get("operation") == "provenance-recovery-coalesced":
+                raise RuntimeError("coalesced audit unavailable")
+
+        with self.assertRaises(
+            provenance_recovery.self_deploy.DeployScheduleFailureAfterLocalMutation
+        ) as raised:
+            self._repair(
+                {
+                    "reasons": [],
+                    "checks": {},
+                    "competing_deployment": {
+                        "idempotent_match": match,
+                        "stale_pending_reconciliation": reconciliation,
+                    },
+                },
+                audit_side_effect=fail_coalesced_audit,
+            )
+
+        self.assertEqual(raised.exception.local_mutation_evidence, reconciliation)
 
     def test_absent_match_still_dispatches_normally(self) -> None:
         result, start_job, _audit, _write = self._repair(
