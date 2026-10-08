@@ -415,6 +415,34 @@ int main(void) {
             ' return 9;\n'
             '}\n'
         )
+        # Landlock restricts filesystem exec, not anonymous executable memfd.
+        # This alternate route must remain explicitly NON-ADMITTING.
+        sources["memfd_exec"] = (
+            '#define _GNU_SOURCE\n'
+            '#include <unistd.h>\n#include <sys/mman.h>\n'
+            '#include <fcntl.h>\n#include <stdio.h>\n'
+            'int main(void) {\n'
+            f' const char *path = {json.dumps(str(cls.tmp / "second_stage"))};\n'
+            ' int input = open(path, O_RDONLY);\n'
+            ' int output = memfd_create("nonadmitted-stage", 0);\n'
+            ' if (input < 0 || output < 0) return 80;\n'
+            ' char buf[8192]; ssize_t count;\n'
+            ' while ((count = read(input, buf, sizeof(buf))) > 0) {\n'
+            '   ssize_t offset = 0;\n'
+            '   while (offset < count) {\n'
+            '     ssize_t wrote = write(output, buf + offset, count - offset);\n'
+            '     if (wrote < 1) return 81;\n'
+            '     offset += wrote;\n'
+            '   }\n'
+            ' }\n'
+            ' if (count < 0) return 82;\n'
+            ' char name[80];\n'
+            ' if (snprintf(name, sizeof(name), "/proc/self/fd/%d", output) < 0) return 83;\n'
+            ' char *const args[] = {name, 0};\n'
+            ' execv(name, args);\n'
+            ' return 84;\n'
+            '}\n'
+        )
         for name, source in sources.items():
             sourcepath = cls.tmp / f"{name}.c"
             binary = cls.tmp / name
@@ -513,6 +541,57 @@ int main(void) {
         self.assertTrue((self.dest / cap.ATTEMPT_MARKER).exists())
         self.assertEqual([], list(self.dest.glob("prototype-*")))
         self.assertEqual([], list(self.dest.glob(".incomplete-*")))
+
+    def test_memfd_exec_bypass_is_signed_but_never_admitted(self) -> None:
+        # Explicitly demonstrate a residual same-PID code-closure gap where
+        # the host permits executable anonymous memfd objects. The signature
+        # authenticates the *nonadmitting prototype claim*, not the code tree.
+        setting = Path("/proc/sys/vm/memfd_noexec")
+        if not setting.is_file() or setting.read_text().strip() != "0":
+            self.skipTest("anonymous memfd execution disabled by host policy")
+        initial = self.programs["memfd_exec"]
+        second = self.programs["second_stage"]
+        self.assertNotEqual(sha(initial.read_bytes()), sha(second.read_bytes()))
+        self.active_binary = initial
+        self.policy_file = Path(self.temp.name) / "policy"
+        self.policy_file.write_bytes(cap._json_bytes(
+            example_policy(initial.read_bytes())
+        ))
+        def fake_dir(_path, *, private=False):
+            return os.open(self.dest, os.O_RDONLY | os.O_DIRECTORY)
+        with (
+            patch.object(cap.os, "geteuid", return_value=0),
+            patch.object(cap, "SIGNING_KEY_PATH", self.key),
+            patch.object(cap, "_open_root_file", side_effect=self.fake_root_file),
+            patch.object(cap, "_open_root_directory", side_effect=fake_dir),
+            patch.object(cap, "_check_staging_root_owned", return_value=None),
+            patch.object(cap, "_validate_signer_static", return_value=None),
+            patch.object(cap, "_separate_child_identity",
+                         return_value=(os.getuid(), os.getgid())),
+            patch.object(cap, "_drop_to_child", return_value=None),
+            patch.object(cap, "_assert_cgroup_drained", return_value=None),
+        ):
+            outcome = cap.run()
+        bundle = self.dest / outcome["bundle_name"]
+        self.assertEqual(b"SECOND_EXEC_NOT_PINNED\n", (bundle / "stdout.bin").read_bytes())
+        proofbytes = (bundle / "proof.json").read_bytes()
+        proof = json.loads(proofbytes)
+        self.assertEqual(sha(initial.read_bytes()), proof["initial_executable_sha256"])
+        self.assertNotEqual(sha(second.read_bytes()), proof["initial_executable_sha256"])
+        for field in (
+            "execution_closure_verified", "collector_process_tree_verified",
+            "actual_task_binding_verified", "day1_admission_authorized",
+        ):
+            self.assertIs(proof[field], False)
+        self.assertFalse(outcome["day1_admission_authorized"])
+        self.assertNotIn("execution_closure_sha256", proof)
+        checked = subprocess.run(
+            ["/usr/bin/ssh-keygen", "-Y", "verify", "-f", str(self.signers),
+             "-I", cap.PROOF_ISSUER, "-n", cap.PROOF_NAMESPACE, "-s",
+             str(bundle / "proof.sshsig")],
+            input=proofbytes, capture_output=True, timeout=15,
+        )
+        self.assertEqual(0, checked.returncode, checked.stderr.decode(errors="replace"))
 
     def test_missing_landlock_fails_before_any_capture(self) -> None:
         # The read-only fixture mocks UID drop, never Landlock success.
