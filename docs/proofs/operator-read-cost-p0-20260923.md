@@ -16,7 +16,9 @@ One actual production audit projection took 84.177 s for 1,315,325 records. This
 - Isolated lane: `7d41a3b75189c8623a67398ecb034e61`.
 - Worktree: `operator-read-cost-p0-20260923` (isolated worktree name).
 - Initial probe SHA-256: `b06219a0794b9bcf928a4e5e15fbf1b519ea341d62157ca4717dd880e60d8ba8`.
-- Strengthened warm/contender probe SHA-256: `520db81f00922079296797716edf5eb385252412fa1d5d35f18c8cd76ecfe207`.
+- Strengthened warm/contender probe SHA-256: `520db81f00922079296797716edf5eb385252412fa1d5d35f18c8cd76ecfe207` (historical runner at commit `7f133a55e8fd7adc8dc1aad0a2554a5225da8b64`; its exact file SHA-256 was independently checked against that Git commit; the tables belong to this version, not the updated code in the present PR).
+- Current PR runner: SHA-256 `e97a5097a79d0da96ffe900e6fdabee7bccb7773cf8963dc6274e927adcf4f0e` (unlike the historical version, subject to current-head review; no 100k/1M remeasurement).
+- Later PR versions added source and loader hashes, worker input checks, isolation flags, symlink/native-module validation, resource budgets and measurement counter separation. These changes were **not** present in the recorded 100k/1M sweeps, which have not been repeated on the new runner. For any new run, bind the live `head` and `runner_sha256` from its JSON output; do not treat the historical runner hash as the current one.
 - Interpreter for the recorded warm run: `/usr/bin/python3`, Python 3.10.12. Initial task explicitly used system Python as well; no runtime virtualenv was used.
 - Cold task: `fcc72382e9ff410f8a3a6ce6`, completed; terminal outcome receipt `afeb73ec15b4b40ee499e5021eb0d94523ae663f2dcd93ea1d7dc785cc432a6d`.
 - Warm/contender task: `88a2d623bb0c41979c06e677`, completed; terminal outcome receipt `c1208f51ec527367a4fb42332c1bc19680ebff2b2b06327f22276edc79f1bc6c`.
@@ -29,7 +31,7 @@ Raw bounded JSON results remain in the existing Grabowski task-output contract. 
 
 [The probe](../../tools/operator_read_cost_probe.py) reuses the existing test loaders, audit record hashing, segment rotation, and verification. Every generated fixture is private and temporary; it contains only neutral synthetic records with 768-byte payloads. The real 16-MiB segment size is unchanged. Fixture creation and initial verification are outside the measured interval. Each case executes in a fresh system interpreter.
 
-The strengthened runner requires system Python and an absent source deployment manifest before importing the test loader. It binds task, friction, deployment and kill-switch providers to synthetic data and fixes the projection observation time. It verifies `total_records == payload_records + archived_segment_count`. The initial runner lacked those explicit import guards and additional count assertions; its actual system-Python invocation and the valid observed counts are recorded above. Do not rerun that initial version under the runtime interpreter.
+The historical strengthened runner required system Python and an absent source deployment manifest before importing the test loader. For new runs the updated runner requires `/usr/bin/python3 -I -S -B tools/operator_read_cost_probe.py`, uses isolated `-I -S -B -X pycache_prefix=<private-empty-dir>` workers, hashes all regular files in `src/` and `tests/` while refusing symlink inputs, and caps total records, per-fixture bytes and available scratch space. This is not a replay of the historical numbers. It binds task, friction, deployment and kill-switch providers to synthetic data and fixes the projection observation time. It verifies `total_records == payload_records + archived_segment_count`. The initial runner lacked those explicit import guards and additional count assertions; its actual system-Python invocation and the valid observed counts are recorded above. Do not rerun that initial version under the runtime interpreter.
 
 Fixture sizes:
 
@@ -44,10 +46,10 @@ Metrics:
 
 - Wall time: `perf_counter_ns`; CPU: `process_time_ns`.
 - RSS: own `/proc/self/status`, before/after call and after collection.
-- Process lifetime peak: `ru_maxrss`; the strengthened runner also records its pre-call floor and `VmHWM`. `VmHWM` is the resident-memory high-water mark, exposed as `rss_hwm_before_kib` / `rss_hwm_after_kib`. The recorded historical runner used the misleading `address_space_hwm_*` labels for these same RSS values; only the field names were corrected after review. These are **not isolated call peaks**, and peaks are never subtracted to fabricate one.
+- Process lifetime peak: `ru_maxrss`; the strengthened runner also records its pre-call floor and `VmHWM`. `VmHWM` is the resident-memory high-water mark, exposed as `rss_hwm_before_kib` / `rss_hwm_after_kib`. The recorded historical runner used the misleading `address_space_hwm_*` labels for these same RSS values; the label-only historical correction did not change the measurement method. Subsequent versions added separate input-binding and execution controls; the tables were not remeasured using those versions. These are **not isolated call peaks**, and peaks are never subtracted to fabricate one.
 - Logical audit bytes: values returned by `_read_audit_descriptor`, including repeated reads. These are not physical disk-I/O bytes.
 - Coordination hold: body of the real `_audit_coordination_lock`; acquisition timings aggregate real flock calls, including file locks. Separate file-lock hold times are not measured.
-- The contender uses the real exclusive coordination lock in a second thread. It writes no audit record. This proves lock acquisition contention, not whole-append latency, writer fairness, or rotation safety.
+- The contender uses the real exclusive coordination lock in a second thread. It writes no audit record. This proves lock acquisition contention, not whole-append latency, writer fairness, or rotation safety. The historical runner's flock-acquisition counters could include the contender's wait; the current probe counts only the measuring thread, without retroactively correcting the historical tables.
 - The optional decoder counter counts actual V2 JSON decodes, including repeated decoding. It changes runtime and is reserved for separate instrumented trials.
 - Deployment, task-store, registry, transport and UI cost are excluded from the synthetic audit-only measurements. Synthetic projection shape validity is not a full semantic regression suite.
 

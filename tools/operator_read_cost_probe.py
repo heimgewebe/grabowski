@@ -17,6 +17,8 @@ import json
 import os
 from pathlib import Path
 import resource
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,21 +36,42 @@ TEST_LOADER_BINDING_FILES = ("test_operator_v2_runtime.py", "test_audit_segments
 
 
 def python_tree_sha256(directory):
-    """Bind Python modules, including transitive imports and added files."""
+    """Bind every regular import/input file, refusing symlinked source trees."""
     root = ROOT / directory
-    if not root.is_dir():
-        raise RuntimeError("synthetic benchmark Python source tree is missing")
-    paths = sorted(root.rglob("*.py"))
-    if not paths:
-        raise RuntimeError("synthetic benchmark Python source tree is empty")
+    if root.is_symlink() or not root.is_dir():
+        raise RuntimeError("synthetic benchmark Python source tree is unsafe")
     digest = hashlib.sha256()
-    for path in paths:
-        if path.is_symlink() or not path.is_file():
-            raise RuntimeError("synthetic benchmark Python source path is unsafe")
-        relative = path.relative_to(root).as_posix().encode("utf-8")
-        digest.update(len(relative).to_bytes(4, "big"))
-        digest.update(relative)
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    count = total = 0
+
+    def fail_walk(error):
+        raise RuntimeError("synthetic benchmark source tree enumeration failed") from error
+
+    for base, directories, files in os.walk(root, topdown=True, followlinks=False, onerror=fail_walk):
+        current = Path(base)
+        if not stat.S_ISDIR(current.lstat().st_mode):
+            raise RuntimeError("synthetic benchmark Python source directory is unsafe")
+        for name in sorted(directories):
+            child = current / name
+            if not stat.S_ISDIR(child.lstat().st_mode):
+                raise RuntimeError("synthetic benchmark Python source directory is unsafe")
+        # Cached bytecode is deliberately ignored; isolated -B/-X workers
+        # cannot execute it from these paths.
+        directories[:] = sorted(name for name in directories if name != "__pycache__")
+        for name in sorted(files):
+            path = current / name
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError("synthetic benchmark Python source file is unsafe")
+            total += metadata.st_size
+            count += 1
+            if count > 10000 or total > 256 * 1024 * 1024:
+                raise RuntimeError("synthetic benchmark source tree exceeds bounded input budget")
+            relative = path.relative_to(root).as_posix().encode("utf-8")
+            digest.update(len(relative).to_bytes(4, "big"))
+            digest.update(relative)
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+    if count == 0:
+        raise RuntimeError("synthetic benchmark Python source tree is empty")
     return digest.hexdigest()
 
 
@@ -77,6 +100,8 @@ def require_benchmark_inputs(expected):
 
 
 def modules():
+    if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
+        raise RuntimeError("run the synthetic benchmark with system Python -I -S -B")
     if sys.prefix != sys.base_prefix or Path(sys.executable).parent.parent.name == ".venv":
         raise RuntimeError("use system Python; runtime deployment imports are excluded")
     if (ROOT / "src" / "deployment-manifest.json").exists():
@@ -208,6 +233,7 @@ def instrument(base, query, surface, decode, contend=False):
     counts = defaultdict(int)
     original_read, original_acquire = base._read_audit_descriptor, base._acquire_flock
     original_coordination = base._audit_coordination_lock
+    measuring_thread = threading.get_ident()
     contender = None
     contention = {}
 
@@ -224,8 +250,9 @@ def instrument(base, query, surface, decode, contend=False):
 
     def read(descriptor, path):
         data = original_read(descriptor, path)
-        counts["audit_descriptor_reads"] += 1
-        counts["audit_descriptor_bytes"] += len(data)
+        if threading.get_ident() == measuring_thread:
+            counts["audit_descriptor_reads"] += 1
+            counts["audit_descriptor_bytes"] += len(data)
         return data
 
     def acquire(descriptor, *, exclusive):
@@ -233,10 +260,11 @@ def instrument(base, query, surface, decode, contend=False):
         try:
             return original_acquire(descriptor, exclusive=exclusive)
         finally:
-            elapsed = time.perf_counter_ns() - started
-            counts["flock_acquire_count"] += 1
-            counts["flock_acquire_ns_total"] += elapsed
-            counts["flock_acquire_ns_max"] = max(counts["flock_acquire_ns_max"], elapsed)
+            if threading.get_ident() == measuring_thread:
+                elapsed = time.perf_counter_ns() - started
+                counts["flock_acquire_count"] += 1
+                counts["flock_acquire_ns_total"] += elapsed
+                counts["flock_acquire_ns_max"] = max(counts["flock_acquire_ns_max"], elapsed)
 
     @contextmanager
     def coordination(path, *, exclusive):
@@ -249,10 +277,11 @@ def instrument(base, query, surface, decode, contend=False):
             try:
                 yield
             finally:
-                elapsed = time.perf_counter_ns() - started
-                counts["coordination_hold_count"] += 1
-                counts["coordination_hold_ns_total"] += elapsed
-                counts["coordination_hold_ns_max"] = max(counts["coordination_hold_ns_max"], elapsed)
+                if threading.get_ident() == measuring_thread:
+                    elapsed = time.perf_counter_ns() - started
+                    counts["coordination_hold_count"] += 1
+                    counts["coordination_hold_ns_total"] += elapsed
+                    counts["coordination_hold_ns_max"] = max(counts["coordination_hold_ns_max"], elapsed)
 
     with ExitStack() as stack:
         for name, replacement in (
@@ -323,7 +352,45 @@ def run_case(state, case, warm, decode, contend=False):
             "rss_after_gc_kib": rss(), "synthetic_contention": contend,
             "counters": dict(counts), "semantics": semantics,
             "scope": "synthetic_library_call",
+            "worker_python_flags": {
+                "isolated": sys.flags.isolated,
+                "no_site": sys.flags.no_site,
+                "dont_write_bytecode": sys.flags.dont_write_bytecode,
+            },
         }
+
+
+MAX_SWEEP_RECORDS = 1_500_000
+MAX_SWEEP_SIZES = 5
+MAX_ESTIMATED_FIXTURE_BYTES = 1536 * 1024 * 1024
+
+
+def validate_sweep(records, cases, payload_bytes):
+    try:
+        sizes = [int(value) for value in records.split(",")]
+    except ValueError as exc:
+        raise ValueError("record list must contain integers") from exc
+    selected = cases.split(",")
+    if (
+        not sizes or len(sizes) > MAX_SWEEP_SIZES
+        or len(set(sizes)) != len(sizes)
+        or any(size < 1 or size > 1_500_000 for size in sizes)
+        or sum(sizes) > MAX_SWEEP_RECORDS
+    ):
+        raise ValueError("record sizes must be unique, 1..1500000, at most 5 and total <=1500000")
+    if not selected or len(selected) > len(CASES) or len(set(selected)) != len(selected) or any(item not in CASES for item in selected):
+        raise ValueError("benchmark cases must be distinct supported operations")
+    if not 0 <= payload_bytes <= 4096:
+        raise ValueError("payload bytes must be in 0..4096")
+    if any(size * (payload_bytes + 512) > MAX_ESTIMATED_FIXTURE_BYTES for size in sizes):
+        raise ValueError("estimated fixture exceeds 1.5 GiB budget")
+    return sizes, selected
+
+
+def require_fixture_space(directory, records, payload_bytes):
+    estimate = records * (payload_bytes + 512)
+    if shutil.disk_usage(directory).free < 2 * estimate + 512 * 1024 * 1024:
+        raise RuntimeError("insufficient temporary disk space for bounded synthetic fixture")
 
 
 def main():
@@ -352,44 +419,55 @@ def main():
         return
     if args.expected_input_hashes is not None:
         parser.error("--expected-input-hashes is worker-only")
-    sizes = [int(value) for value in args.records.split(",")]
-    cases = args.cases.split(",")
-    if not sizes or any(n < 1 or n > 1_500_000 for n in sizes):
-        parser.error("record count must be 1..1500000")
-    if any(case not in CASES for case in cases) or not 0 <= args.payload_bytes <= 4096:
-        parser.error("unknown case or excessive payload")
+    try:
+        sizes, cases = validate_sweep(args.records, args.cases, args.payload_bytes)
+    except ValueError as exc:
+        parser.error(str(exc))
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     pinned = benchmark_input_hashes()
     binding = {
         "head": head, **pinned,
         "interpreter": sys.executable, "python": sys.version.split()[0],
+        "parent_python_flags": {
+            "isolated": sys.flags.isolated,
+            "no_site": sys.flags.no_site,
+            "dont_write_bytecode": sys.flags.dont_write_bytecode,
+        },
     }
     with tempfile.TemporaryDirectory(prefix="operator-read-cost-p0-") as directory:
         parent = Path(directory)
         (parent / "synthetic-probe-owner.json").write_text(json.dumps({"kind": "synthetic-audit-probe-v1"}))
+        cache = parent / "worker-bytecode"
+        cache.mkdir(mode=0o700)
         for count in sizes:
             require_benchmark_inputs(pinned)
             state = parent / str(count)
-            fixture = make_fixture(state, count, args.payload_bytes)
-            require_benchmark_inputs(pinned)
-            print(json.dumps({"event": "fixture_verified", **binding, **fixture}), flush=True)
-            for case in cases:
+            require_fixture_space(parent, count, args.payload_bytes)
+            try:
+                fixture = make_fixture(state, count, args.payload_bytes)
                 require_benchmark_inputs(pinned)
-                argv = [
-                    sys.executable, "-B", str(Path(__file__).resolve()),
-                    "--worker-state", str(state), "--worker-case", case,
-                    "--expected-input-hashes", json.dumps(pinned, sort_keys=True, separators=(",", ":")),
-                ]
-                if args.warm:
-                    argv.append("--warm")
-                if args.count_decodes:
-                    argv.append("--count-decodes")
-                if args.contend:
-                    argv.append("--contend")
-                completed = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True, timeout=300, check=True)
-                require_benchmark_inputs(pinned)
-                result = json.loads(completed.stdout)
-                print(json.dumps({**binding, "fixture": fixture, **result}), flush=True)
+                print(json.dumps({"event": "fixture_verified", **binding, **fixture}), flush=True)
+                for case in cases:
+                    require_benchmark_inputs(pinned)
+                    argv = [
+                        sys.executable, "-I", "-S", "-B", "-X", f"pycache_prefix={cache}",
+                        str(Path(__file__).resolve()),
+                        "--worker-state", str(state), "--worker-case", case,
+                        "--expected-input-hashes", json.dumps(pinned, sort_keys=True, separators=(",", ":")),
+                    ]
+                    if args.warm:
+                        argv.append("--warm")
+                    if args.count_decodes:
+                        argv.append("--count-decodes")
+                    if args.contend:
+                        argv.append("--contend")
+                    completed = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True, timeout=300, check=True)
+                    require_benchmark_inputs(pinned)
+                    result = json.loads(completed.stdout)
+                    print(json.dumps({**binding, "fixture": fixture, **result}), flush=True)
+            finally:
+                if state.is_dir():
+                    shutil.rmtree(state)
 
 
 if __name__ == "__main__":

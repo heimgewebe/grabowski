@@ -103,6 +103,83 @@ class BenchmarkInputsTests(unittest.TestCase):
                     probe.main()
             self.assertEqual(output.getvalue(), "")
 
+    def test_sweep_budget_rejects_repeated_and_aggregate_sizes(self):
+        self.assertEqual(probe.validate_sweep("1000,100000,1000000", "verify,snapshot", 768)[0], [1000, 100000, 1000000])
+        for numbers in ("10,10", "1,2,3,4,5,6", "1500000,1", "0", "10000000"):
+            with self.subTest(numbers=numbers), self.assertRaises(ValueError):
+                probe.validate_sweep(numbers, "verify", 64)
+        with self.assertRaises(ValueError):
+            probe.validate_sweep("1000000", "verify", 4096)
+        with self.assertRaises(ValueError):
+            probe.validate_sweep("1000", "verify,verify", 64)
+
+    def test_disk_budget_preflight(self):
+        from types import SimpleNamespace
+        with mock.patch.object(probe.shutil, "disk_usage", return_value=SimpleNamespace(free=10)):
+            with self.assertRaisesRegex(RuntimeError, "insufficient temporary disk"):
+                probe.require_fixture_space(self.root, 1000, 768)
+
+    def test_root_symlink_and_transitive_symlink_directory_rejected(self):
+        with mock.patch.object(probe, "ROOT", self.root):
+            (self.root / "src" / "unsafe-package").symlink_to(self.root / "tests", target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "source directory is unsafe"):
+                probe.python_tree_sha256("src")
+            (self.root / "src" / "unsafe-package").unlink()
+            (self.root / "src").rename(self.root / "src-actual")
+            (self.root / "src").symlink_to(self.root / "src-actual", target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "source tree is unsafe"):
+                probe.python_tree_sha256("src")
+
+    def test_unreadable_source_tree_walk_fails_closed(self):
+        def unreadable(_root, **kwargs):
+            kwargs["onerror"](PermissionError("inaccessible subdirectory"))
+            return iter(())
+        with mock.patch.object(probe, "ROOT", self.root), mock.patch.object(
+            probe.os, "walk", side_effect=unreadable
+        ):
+            with self.assertRaisesRegex(RuntimeError, "enumeration failed"):
+                probe.python_tree_sha256("src")
+
+    def test_native_extension_and_new_non_python_file_change_hash(self):
+        with mock.patch.object(probe, "ROOT", self.root):
+            pinned = probe.benchmark_input_hashes()
+            (self.root / "src" / "grabowski_audit_signal.cpython-310-x86_64-linux-gnu.so").write_bytes(b"shadowing-extension")
+            with self.assertRaisesRegex(RuntimeError, "input hashes changed"):
+                probe.require_benchmark_inputs(pinned)
+
+    def test_cache_directory_ignored_but_symlink_cache_rejected(self):
+        with mock.patch.object(probe, "ROOT", self.root):
+            pinned = probe.benchmark_input_hashes()
+            cache = self.root / "src" / "__pycache__"
+            cache.mkdir()
+            (cache / "old.pyc").write_bytes(b"stale-bytecode-not-executable-in-isolated-worker")
+            probe.require_benchmark_inputs(pinned)
+            import shutil
+            shutil.rmtree(cache)
+            cache.symlink_to(self.root / "tests", target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "source directory is unsafe"):
+                probe.require_benchmark_inputs(pinned)
+
+    def test_counter_excludes_contender_lock_wait(self):
+        from contextlib import contextmanager
+        class FakeAudit:
+            def _read_audit_descriptor(self, descriptor, path):
+                return b"x"
+            def _acquire_flock(self, descriptor, *, exclusive):
+                return None
+            @contextmanager
+            def _audit_coordination_lock(self, path, *, exclusive):
+                self._acquire_flock(None, exclusive=exclusive)
+                yield
+        base = FakeAudit()
+        with probe.instrument(base, None, None, False, contend=True) as counts:
+            with base._audit_coordination_lock("synthetic-lock", exclusive=False):
+                base._read_audit_descriptor(None, "synthetic")
+        self.assertEqual(counts["flock_acquire_count"], 1)
+        self.assertEqual(counts["coordination_hold_count"], 1)
+        self.assertEqual(counts["audit_descriptor_reads"], 1)
+        self.assertEqual(counts["exclusive_contender"]["outcome"], "acquired")
+
     def test_worker_denies_stale_input_before_measurement(self):
         with mock.patch.object(probe, "ROOT", self.root):
             pinned = probe.benchmark_input_hashes()
