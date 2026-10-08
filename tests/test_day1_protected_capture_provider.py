@@ -720,6 +720,46 @@ int main(void) {
             ):
                 self.capture("success")
 
+    def test_landlock_abi_marshalling_and_prebound_libc_symbols(self) -> None:
+        # Synthetic boundary: no kernel Landlock calls or no_new_privs here.
+        # Real-kernel behavior is exercised by the two opt-in integration tests.
+        self._landlock_unit_patch.stop()
+        self.assertEqual(8, cap.ctypes.sizeof(cap._LandlockRulesetAttr))
+        self.assertEqual(12, cap.ctypes.sizeof(cap._LandlockPathBeneathAttr))
+        self.assertEqual(8, cap._LandlockPathBeneathAttr.parent_fd.offset)
+        fd = os.open(self.programs["success"], os.O_RDONLY | os.O_CLOEXEC)
+        calls = []
+
+        def fake_syscall(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                return os.dup(fd)  # Fake, valid ruleset FD, closed by child helper.
+            return 0
+
+        try:
+            with (
+                patch.object(cap.ctypes, "CDLL", side_effect=AssertionError(
+                    "child must not resolve a new libc handle"
+                )),
+                patch.object(cap, "_LANDLOCK_SYSCALL", side_effect=fake_syscall),
+                patch.object(cap, "_LANDLOCK_PRCTL", return_value=0) as prctl,
+            ):
+                cap._confine_child_filesystem_exec(fd)
+            self.assertEqual(3, len(calls))
+            self.assertEqual(
+                [cap._LANDLOCK_CREATE_RULESET, cap._LANDLOCK_ADD_RULE,
+                 cap._LANDLOCK_RESTRICT_SELF],
+                [args[0].value for args in calls],
+            )
+            self.assertIsInstance(calls[0][2], cap.ctypes.c_size_t)
+            self.assertEqual(8, calls[0][2].value)
+            self.assertIsInstance(calls[1][1], cap.ctypes.c_int)
+            self.assertEqual(cap._LANDLOCK_RULE_PATH_BENEATH, calls[1][2].value)
+            self.assertEqual(1, prctl.call_count)
+            self.assertEqual(cap._PR_SET_NO_NEW_PRIVS, prctl.call_args.args[0].value)
+        finally:
+            os.close(fd)
+
     def test_execute_allowlist_requires_a_regular_verified_fd(self) -> None:
         # Validation occurs before the Landlock syscall and must remain
         # testable without kernel privileges.
