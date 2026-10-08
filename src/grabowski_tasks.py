@@ -3745,8 +3745,10 @@ def _resource_keys(values: list[str] | None) -> list[str]:
 
 def _argument_value(argv: list[str], *names: str) -> str | None:
     for index, item in enumerate(argv):
+        if item == "--":
+            break
         if item in names:
-            if index + 1 >= len(argv):
+            if index + 1 >= len(argv) or argv[index + 1] == "--":
                 return None
             return argv[index + 1]
         for name in names:
@@ -3813,13 +3815,11 @@ def _mutating_agent_workspace(
         return None
     executable = Path(argv[0]).name.lower()
     if executable == "codex":
-        sandbox = _argument_value(argv, "--sandbox", "-s")
-        if sandbox in READ_ONLY_AGENT_MODES:
+        if _agent_read_only(argv, executable):
             return None
         return _local_workspace_path(_argument_value(argv, "-C", "--cd"), cwd=cwd)
     if executable in MUTATING_AGENT_EXECUTABLES - {"codex"}:
-        permission_mode = _argument_value(argv, "--permission-mode")
-        if permission_mode in READ_ONLY_AGENT_MODES:
+        if _agent_read_only(argv, executable):
             return None
         return _local_workspace_path(None, cwd=cwd)
     # Framework-managed writers already hold a workspace-level lease owned by
@@ -3839,11 +3839,34 @@ def _validate_task_effect_profile(value: str | None) -> str | None:
 
 
 def _agent_read_only(argv: list[str], executable: str) -> bool:
-    if "--read-only" in argv:
-        return True
-    if executable == "codex":
-        return _argument_value(argv, "--sandbox", "-s") in READ_ONLY_AGENT_MODES
-    return _argument_value(argv, "--permission-mode") in READ_ONLY_AGENT_MODES
+    """Exempt only one unambiguous CLI mode, never payload tokens or overrides."""
+    controls = argv[1:]
+    if "--" in controls:
+        controls = controls[:controls.index("--")]
+    if any(
+        item in {
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-skip-permissions",
+            "--yolo",
+            "--full-auto",
+        }
+        for item in controls
+    ):
+        return False
+    names = ("--sandbox", "-s") if executable == "codex" else ("--permission-mode",)
+    modes: list[str] = []
+    for index, item in enumerate(controls):
+        if item in names:
+            if index + 1 >= len(controls) or controls[index + 1].startswith("-"):
+                return False
+            modes.append(controls[index + 1])
+        else:
+            for name in names:
+                if item.startswith(f"{name}="):
+                    modes.append(item[len(name) + 1 :])
+                    break
+    # Duplicate/conflicting modes are never accepted as read-only.
+    return len(modes) == 1 and modes[0] in READ_ONLY_AGENT_MODES
 
 
 def _classify_task_effect(
@@ -9969,6 +9992,14 @@ def grabowski_task_resume(
         if task_effect_classification is not None
         else Path(command[0]).name.lower()
     )
+    # Legacy persisted classification must not re-authorize a writable replay.
+    if (
+        task_effect_classification is not None
+        and task_effect_classification.get("effect_profile") == "read_only"
+        and agent_executable in MUTATING_AGENT_EXECUTABLES
+        and not _agent_read_only(command, agent_executable)
+    ):
+        raise RuntimeError("persisted read-only mode disagrees with current agent argv")
     if (
         agent_executable in MUTATING_AGENT_EXECUTABLES
         and fleet.fleet_host(str(record["host"]))["transport"] == "local"

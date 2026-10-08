@@ -3592,6 +3592,80 @@ class TaskTests(unittest.TestCase):
         remote = tasks._classify_task_effect(transport="ssh", argv=["/opt/codex", "exec", "--sandbox", "workspace-write"], mutating_workspace=None)
         self.assertEqual("remote_write", remote["effect_profile"])
 
+    def test_read_only_classification_rejects_payload_flags_conflicts_and_overrides(self) -> None:
+        write_commands = [
+            ["/opt/codex", "exec", "--sandbox", "workspace-write", "--", "--read-only"],
+            ["/opt/codex", "exec", "--", "--sandbox", "read-only"],
+            ["/opt/codex", "exec", "--sandbox", "read-only", "--sandbox", "workspace-write"],
+            ["/opt/codex", "exec", "--sandbox", "read-only", "--dangerously-bypass-approvals-and-sandbox"],
+            ["/opt/codex", "exec", "--sandbox", "workspace-write", "--read-only"],
+            ["/opt/claude", "--permission-mode", "acceptEdits", "--", "--read-only"],
+            ["/opt/claude", "--permission-mode", "plan", "--dangerously-skip-permissions"],
+        ]
+        for argv in write_commands:
+            with self.subTest(argv=argv), patch.object(
+                tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+            ):
+                workspace = tasks._mutating_agent_workspace("local", argv, cwd=str(self.root))
+                self.assertEqual(workspace, str(self.root))
+                classification = tasks._classify_task_effect(
+                    transport="local", argv=argv, mutating_workspace=workspace
+                )
+                self.assertEqual(classification["effect_profile"], "workspace_write")
+
+        for argv in (
+            ["/opt/codex", "exec", "--sandbox", "read-only", "--", "--read-only"],
+            ["/opt/codex", "exec", "--sandbox=read-only", "prompt"],
+            ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"],
+        ):
+            with self.subTest(argv=argv), patch.object(
+                tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+            ):
+                self.assertIsNone(
+                    tasks._mutating_agent_workspace("local", argv, cwd=str(self.root))
+                )
+                classification = tasks._classify_task_effect(
+                    transport="local", argv=argv, mutating_workspace=None
+                )
+                self.assertEqual(classification["effect_profile"], "read_only")
+
+    def test_payload_read_only_token_does_not_bypass_writer_admission(self) -> None:
+        argv = [
+            "/opt/codex", "exec", "--sandbox", "workspace-write",
+            "--", "--read-only",
+        ]
+        denial = {
+            "schema_version": 1,
+            "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True,
+            "admitted": False,
+            "reason_code": "quota_pool_blocked",
+            "argv_sha256": "1" * 64,
+            "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+        with patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 150}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=denial,
+        ) as admission, patch.object(
+            tasks, "_dispatch"
+        ) as dispatch, patch.object(tasks.base, "_append_audit"):
+            with self.assertRaisesRegex(
+                RuntimeError, "coding-agent pre-dispatch admission denied"
+            ):
+                tasks.grabowski_task_start(
+                    "local", argv, cwd=str(self.root), runtime_seconds=60
+                )
+        admission.assert_called_once_with(argv, read_only_execution=False)
+        dispatch.assert_not_called()
+        self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
+
     def test_legacy_task_effect_classification_projects_to_native_schema(self) -> None:
         fallback = tasks._classify_task_effect(transport="local", argv=["/opt/codex", "exec", "--sandbox", "workspace-write"], mutating_workspace=str(self.root))
         legacy = {**fallback, "policy_version": 3, "reposkop_policy": "required", "reposkop_cohort": "risk_required"}
