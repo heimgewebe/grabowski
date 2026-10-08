@@ -29,6 +29,30 @@ ROOT = Path(__file__).resolve().parents[1]
 CASES = ("verify", "snapshot", "query_limit1", "projection", "health_audit_only")
 
 
+SOURCE_BINDING_FILES = ("grabowski_mcp.py", "grabowski_audit_query.py", "grabowski_read_surface.py")
+TEST_LOADER_BINDING_FILES = ("test_operator_v2_runtime.py", "test_audit_segments.py", "test_read_surface.py")
+
+
+def benchmark_input_hashes():
+    """Pin every direct source/test loader imported by the synthetic benchmark."""
+    return {
+        "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "source_sha256": {
+            name: hashlib.sha256((ROOT / "src" / name).read_bytes()).hexdigest()
+            for name in SOURCE_BINDING_FILES
+        },
+        "test_loader_sha256": {
+            name: hashlib.sha256((ROOT / "tests" / name).read_bytes()).hexdigest()
+            for name in TEST_LOADER_BINDING_FILES
+        },
+    }
+
+
+def require_benchmark_inputs(expected):
+    if not isinstance(expected, dict) or benchmark_input_hashes() != expected:
+        raise RuntimeError("synthetic benchmark input hashes changed during run")
+
+
 def modules():
     if sys.prefix != sys.base_prefix or Path(sys.executable).parent.parent.name == ".venv":
         raise RuntimeError("use system Python; runtime deployment imports are excluded")
@@ -289,10 +313,22 @@ def main():
     parser.add_argument("--contend", action="store_true")
     parser.add_argument("--worker-state")
     parser.add_argument("--worker-case", choices=CASES)
+    parser.add_argument("--expected-input-hashes")
     args = parser.parse_args()
     if args.worker_state:
-        print(json.dumps(run_case(Path(args.worker_state), args.worker_case, args.warm, args.count_decodes, args.contend)), flush=True)
+        if args.expected_input_hashes is None:
+            parser.error("worker must receive parent input hashes")
+        try:
+            pinned = json.loads(args.expected_input_hashes)
+        except ValueError as exc:
+            raise RuntimeError("synthetic benchmark input binding is invalid") from exc
+        require_benchmark_inputs(pinned)
+        result = run_case(Path(args.worker_state), args.worker_case, args.warm, args.count_decodes, args.contend)
+        require_benchmark_inputs(pinned)
+        print(json.dumps(result), flush=True)
         return
+    if args.expected_input_hashes is not None:
+        parser.error("--expected-input-hashes is worker-only")
     sizes = [int(value) for value in args.records.split(",")]
     cases = args.cases.split(",")
     if not sizes or any(n < 1 or n > 1_500_000 for n in sizes):
@@ -300,21 +336,27 @@ def main():
     if any(case not in CASES for case in cases) or not 0 <= args.payload_bytes <= 4096:
         parser.error("unknown case or excessive payload")
     head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    pinned = benchmark_input_hashes()
     binding = {
-        "head": head, "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "head": head, **pinned,
         "interpreter": sys.executable, "python": sys.version.split()[0],
-        "source_sha256": {name: hashlib.sha256((ROOT / "src" / name).read_bytes()).hexdigest()
-                          for name in ("grabowski_mcp.py", "grabowski_audit_query.py", "grabowski_read_surface.py")},
     }
     with tempfile.TemporaryDirectory(prefix="operator-read-cost-p0-") as directory:
         parent = Path(directory)
         (parent / "synthetic-probe-owner.json").write_text(json.dumps({"kind": "synthetic-audit-probe-v1"}))
         for count in sizes:
+            require_benchmark_inputs(pinned)
             state = parent / str(count)
             fixture = make_fixture(state, count, args.payload_bytes)
+            require_benchmark_inputs(pinned)
             print(json.dumps({"event": "fixture_verified", **binding, **fixture}), flush=True)
             for case in cases:
-                argv = [sys.executable, "-B", str(Path(__file__).resolve()), "--worker-state", str(state), "--worker-case", case]
+                require_benchmark_inputs(pinned)
+                argv = [
+                    sys.executable, "-B", str(Path(__file__).resolve()),
+                    "--worker-state", str(state), "--worker-case", case,
+                    "--expected-input-hashes", json.dumps(pinned, sort_keys=True, separators=(",", ":")),
+                ]
                 if args.warm:
                     argv.append("--warm")
                 if args.count_decodes:
@@ -322,6 +364,7 @@ def main():
                 if args.contend:
                     argv.append("--contend")
                 completed = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True, timeout=300, check=True)
+                require_benchmark_inputs(pinned)
                 result = json.loads(completed.stdout)
                 print(json.dumps({**binding, "fixture": fixture, **result}), flush=True)
 
