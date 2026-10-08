@@ -1974,6 +1974,13 @@ def reconcile_recent_captain_audit_followups(
             and len(outcomes) == len(completion_record_sha256s)
             and all(
                 outcome["status"] == "already_satisfied"
+                or (
+                    outcome["status"] == "not_scheduled"
+                    and outcome["reason"] in {
+                        "merge_verification_not_passed",
+                        "captain_merge_not_fast_path_eligible",
+                    }
+                )
                 for outcome in outcomes
             )
         )

@@ -1000,6 +1000,81 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
         self.assertFalse(result["discovery_watermark_persisted"])
         self.assertEqual(saved, [(merge_sha256, None)])
 
+    def test_reconcile_terminal_ineligibility_advances_discovery_but_exhaustion_does_not(self) -> None:
+        sha = "a" * 64
+        items = [
+            {
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp_unix": 9_950,
+                },
+                "evidence": {"record_sha256": sha, "global_ordinal": 13},
+            },
+            {
+                "record": {"operation": "routine-event", "timestamp_unix": 9_940},
+                "evidence": {"record_sha256": "b" * 64, "global_ordinal": 12},
+            },
+        ]
+        audit_query = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=100,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter(items),
+        )
+        modules = {
+            "grabowski_audit_query": audit_query,
+            "grabowski_operator": types.SimpleNamespace(STATE_DIR=Path("/state")),
+            "grabowski_tasks": types.SimpleNamespace(),
+        }
+        cases = (
+            ("merge_verification_not_passed", True),
+            ("captain_merge_not_fast_path_eligible", True),
+            ("durable_freshness_job_slots_exhausted", False),
+            ("unrecognized_not_scheduled_reason", False),
+        )
+        for reason, terminal in cases:
+            with self.subTest(reason=reason):
+                progress = []
+                with (
+                    patch.dict(sys.modules, modules),
+                    patch.object(post_merge.time, "time", return_value=10_000),
+                    patch.object(
+                        post_merge, "resolve_job_starter",
+                        return_value=lambda *_args, **_kwargs: {},
+                    ),
+                    patch.object(
+                        post_merge, "schedule_from_captain_audit_completion",
+                        return_value={
+                            "status": "not_scheduled",
+                            "reason": reason,
+                            "repository": REPO,
+                            "reused": False,
+                        },
+                    ),
+                    patch.object(
+                        post_merge, "_load_reconcile_cursor", return_value=None,
+                    ),
+                    patch.object(
+                        post_merge, "_load_reconcile_discovery_ordinal",
+                        return_value=12,
+                    ),
+                    patch.object(
+                        post_merge, "_save_reconcile_progress",
+                        side_effect=lambda _tasks, *, cursor, discovery_ordinal: progress.append(
+                            (cursor, discovery_ordinal)
+                        ),
+                    ),
+                ):
+                    result = post_merge.reconcile_recent_captain_audit_followups(
+                        lookback_seconds=100,
+                    )
+
+                self.assertEqual(result["processed"], 1)
+                self.assertEqual(result["matched"], 1)
+                self.assertEqual(result["discovery_ordinal_after"], 13 if terminal else 12)
+                self.assertEqual(result["discovery_watermark_persisted"], terminal)
+                self.assertEqual(progress, [(sha, 13 if terminal else None)])
+
     def test_reconcile_partial_pass_does_not_skip_unprocessed_audits(self) -> None:
         items = [
             {
