@@ -1301,6 +1301,136 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 self.assertEqual(second["scanned_records"], 2)
                 self.assertFalse(second["progress_persisted"])
 
+    def test_exhausted_mixed_with_deferred_is_not_exposed_until_checkpoint(self) -> None:
+        exhausted, deferred, newer = "a" * 64, "b" * 64, "c" * 64
+        records = [
+            {
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp_unix": 9_960,
+                },
+                "evidence": {"record_sha256": exhausted, "global_ordinal": 14},
+            },
+            {
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp_unix": 9_950,
+                },
+                "evidence": {"record_sha256": deferred, "global_ordinal": 13},
+            },
+            {
+                "record": {"operation": "routine-event", "timestamp_unix": 9_940},
+                "evidence": {"record_sha256": "d" * 64, "global_ordinal": 12},
+            },
+        ]
+        query = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=4,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter(records),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(database)
+            )
+            post_merge._save_reconcile_progress(
+                tasks, cursor=None, discovery_ordinal=12
+            )
+            outcomes = {
+                exhausted: {
+                    "status": "not_scheduled",
+                    "reason": "durable_freshness_job_slots_exhausted",
+                    "repository": REPO,
+                },
+                deferred: {
+                    "status": "retry_deferred",
+                    "reason": "durable_freshness_job_retry_backoff",
+                    "repository": REPO,
+                    "reused": True,
+                },
+            }
+            modules = {
+                "grabowski_audit_query": query,
+                "grabowski_operator": types.SimpleNamespace(STATE_DIR=Path("/state")),
+                "grabowski_tasks": tasks,
+            }
+            with (
+                patch.dict(sys.modules, modules),
+                patch.object(post_merge.time, "time", return_value=10_000),
+                patch.object(
+                    post_merge, "resolve_job_starter",
+                    return_value=lambda *_args, **_kwargs: {},
+                ),
+                patch.object(
+                    post_merge, "schedule_from_captain_audit_completion",
+                    side_effect=lambda sha, **_kwargs: outcomes[sha],
+                ),
+            ):
+                blocked = post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100
+                )
+                self.assertEqual(blocked["processed"], 2)
+                self.assertFalse(blocked["discovery_watermark_persisted"])
+                self.assertEqual(blocked["discovery_ordinal_after"], 12)
+                self.assertEqual(blocked["exhausted_obligations_recorded"], [])
+                self.assertEqual(post_merge._load_reconcile_discovery_ordinal(tasks), 12)
+                with self.assertRaisesRegex(
+                    post_merge.RepoGroundPostMergeError, "not durably registered"
+                ):
+                    post_merge._require_exhausted_record(tasks, exhausted)
+
+                # Only a later fully settled read-only pass may publish the
+                # exhausted obligation together with the verified audit tip.
+                outcomes[deferred] = {
+                    "status": "already_satisfied",
+                    "reason": "durable_freshness_already_converged",
+                    "repository": REPO,
+                    "reused": True,
+                }
+                settled = post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100
+                )
+                self.assertTrue(settled["discovery_watermark_persisted"])
+                self.assertEqual(settled["discovery_ordinal_after"], 14)
+                self.assertEqual(settled["exhausted_obligations_recorded"], [exhausted])
+                post_merge._require_exhausted_record(tasks, exhausted)
+
+                # A newer merge is discovered without reopening the older one.
+                records.insert(
+                    0,
+                    {
+                        "record": {
+                            "operation": "captain-run-audit-completion",
+                            "action": "pr-merge",
+                            "timestamp_unix": 9_970,
+                        },
+                        "evidence": {
+                            "record_sha256": newer, "global_ordinal": 15
+                        },
+                    },
+                )
+                outcomes[newer] = {
+                    "status": "scheduled",
+                    "reason": "durable_freshness_job_started",
+                    "repository": REPO,
+                    "reused": False,
+                }
+                later = post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100
+                )
+                self.assertEqual(later["matched"], 1)
+                self.assertEqual(later["processed"], 1)
+                self.assertEqual(
+                    later["outcomes"][0]["captain_audit_completion_sha256"], newer
+                )
+                self.assertFalse(later["discovery_watermark_persisted"])
+
     def test_reconcile_partial_pass_does_not_skip_unprocessed_audits(self) -> None:
         items = [
             {
@@ -1910,6 +2040,210 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 "cursor identity is invalid",
             ):
                 post_merge._load_reconcile_cursor(tasks_module)
+
+    def test_exhausted_recovery_inventory_is_bounded_and_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            first_sha, second_sha = "a" * 64, "b" * 64
+            post_merge._save_reconcile_progress(
+                tasks, cursor=None, discovery_ordinal=12,
+                exhausted_completion_record_sha256s=(first_sha, second_sha),
+            )
+            with patch.dict(sys.modules, {"grabowski_tasks": tasks}):
+                first = post_merge.list_exhausted_audit_followups(limit=1)
+                self.assertTrue(first["truncated"])
+                self.assertEqual(first["returned"], 1)
+                self.assertEqual(
+                    first["items"],
+                    [{"captain_audit_completion_sha256": first_sha}],
+                )
+                second = post_merge.list_exhausted_audit_followups(
+                    limit=1, after_sha256=first["next_after_sha256"],
+                )
+                self.assertFalse(second["truncated"])
+                self.assertEqual(
+                    second["items"],
+                    [{"captain_audit_completion_sha256": second_sha}],
+                )
+                with self.assertRaises(post_merge.RepoGroundPostMergeError):
+                    post_merge.list_exhausted_audit_followups(after_sha256="invalid")
+                with sqlite3.connect(db) as connection:
+                    connection.execute(
+                        "UPDATE metadata SET value=? WHERE key=?",
+                        ('{"schema_version":999}',
+                         post_merge._exhausted_record_key(second_sha)),
+                    )
+                with self.assertRaisesRegex(
+                    post_merge.RepoGroundPostMergeError, "invalid"
+                ):
+                    post_merge.list_exhausted_audit_followups(
+                        limit=1, after_sha256=first_sha
+                    )
+
+    def test_manual_exhausted_recovery_uses_only_existing_publisher(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            sha = "a" * 64
+            post_merge._save_reconcile_progress(
+                tasks, cursor=None, discovery_ordinal=12,
+                exhausted_completion_record_sha256s=(sha,),
+            )
+            request = {
+                "status": "ready", "repository": REPO,
+                "merge_sha": MERGE, "target_branch": BASE,
+            }
+            with (
+                patch.dict(sys.modules, {"grabowski_tasks": tasks}),
+                patch.object(
+                    post_merge, "captain_followup_request_from_audit",
+                    return_value=request,
+                ),
+                patch.object(
+                    post_merge, "converge",
+                    return_value={"status": "fresh_exact"},
+                ) as publisher,
+                patch.object(
+                    post_merge, "watch_merge_queue",
+                    side_effect=AssertionError("queue watcher not requested"),
+                ),
+            ):
+                result = post_merge.recover_exhausted_audit_followup(sha)
+                self.assertEqual(result["status"], "fresh_exact")
+                self.assertTrue(result["ledger_retained"])
+                self.assertTrue(result["acknowledgement_required"])
+                publisher.assert_called_once_with(
+                    repository=REPO, merge_sha=MERGE, target_branch=BASE
+                )
+                post_merge._require_exhausted_record(tasks, sha)
+
+    def test_exhausted_ack_requires_fresh_remote_and_is_a_separate_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            sha = "a" * 64
+            post_merge._save_reconcile_progress(
+                tasks, cursor=None, discovery_ordinal=12,
+                exhausted_completion_record_sha256s=(sha,),
+            )
+            request = {
+                "status": "ready", "repository": REPO,
+                "merge_sha": MERGE, "target_branch": BASE,
+            }
+            with (
+                patch.dict(sys.modules, {"grabowski_tasks": tasks}),
+                patch.object(
+                    post_merge, "captain_followup_request_from_audit",
+                    return_value=request,
+                ),
+                patch.object(
+                    post_merge, "_read_freshness",
+                    return_value=freshness(
+                        state="fresh_exact", bundle=HEAD, live=HEAD, remote=HEAD
+                    ),
+                ),
+                patch.object(post_merge, "_check_ancestry", return_value=True),
+                patch.object(
+                    post_merge, "_read_remote_branch_head",
+                    side_effect=["c" * 40, HEAD],
+                ),
+                patch.object(
+                    post_merge, "converge",
+                    side_effect=AssertionError("ACK must not publish"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    post_merge.RepoGroundPostMergeError, "newer origin branch"
+                ):
+                    post_merge.acknowledge_exhausted_audit_followup(sha)
+                post_merge._require_exhausted_record(tasks, sha)
+                ack = post_merge.acknowledge_exhausted_audit_followup(sha)
+                self.assertEqual(ack["status"], "ok")
+                self.assertEqual(ack["authoritative_head"], HEAD)
+                self.assertTrue(ack["ledger_removed"])
+                with self.assertRaisesRegex(
+                    post_merge.RepoGroundPostMergeError, "not durably registered"
+                ):
+                    post_merge.acknowledge_exhausted_audit_followup(sha)
+
+    def test_queue_exhausted_recovery_checks_verified_identity_before_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            sha = "a" * 64
+            post_merge._save_reconcile_progress(
+                tasks, cursor=None, discovery_ordinal=12,
+                exhausted_completion_record_sha256s=(sha,),
+            )
+            request = {
+                "status": "ready_queue_watch", "repository": REPO,
+                "pull_request": PR, "expected_head": HEAD, "expected_base": BASE,
+            }
+            observed = {
+                "number": PR, "state": "MERGED", "headRefOid": HEAD,
+                "baseRefName": BASE, "mergeCommit": {"oid": MERGE},
+            }
+            with (
+                patch.dict(sys.modules, {"grabowski_tasks": tasks}),
+                patch.object(
+                    post_merge, "captain_followup_request_from_audit",
+                    return_value=request,
+                ),
+                patch.object(
+                    post_merge, "watch_merge_queue",
+                    return_value={"status": "fresh_exact"},
+                ) as watch,
+                patch.object(post_merge, "_read_queue_pr", return_value=observed) as read_pr,
+                patch.object(
+                    post_merge, "_read_freshness",
+                    return_value=freshness(
+                        state="fresh_exact", bundle=HEAD, live=HEAD, remote=HEAD
+                    ),
+                ),
+                patch.object(post_merge, "_check_ancestry", return_value=True),
+                patch.object(post_merge, "_read_remote_branch_head", return_value=HEAD),
+            ):
+                recovered = post_merge.recover_exhausted_audit_followup(sha)
+                self.assertEqual(recovered["status"], "fresh_exact")
+                watch.assert_called_once_with(
+                    repository=REPO, pull_request=PR,
+                    expected_head=HEAD, expected_base=BASE,
+                )
+                observed["headRefOid"] = "f" * 40
+                with self.assertRaisesRegex(
+                    post_merge.RepoGroundPostMergeError, "verified merged identity"
+                ):
+                    post_merge.acknowledge_exhausted_audit_followup(sha)
+                post_merge._require_exhausted_record(tasks, sha)
+                observed["headRefOid"] = HEAD
+                result = post_merge.acknowledge_exhausted_audit_followup(sha)
+                self.assertTrue(result["ledger_removed"])
+                self.assertEqual(read_pr.call_count, 2)
 
     def test_exhausted_debt_and_watermark_commit_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

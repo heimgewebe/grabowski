@@ -1714,6 +1714,210 @@ def _load_reconcile_discovery_ordinal(tasks_module: Any) -> int | None:
     return global_ordinal
 
 
+
+def _exhausted_record_key(record_sha256: str) -> str:
+    if (
+        not isinstance(record_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", record_sha256) is None
+    ):
+        raise RepoGroundPostMergeError("Exhausted RepoGround audit SHA-256 is invalid")
+    return RECONCILE_EXHAUSTED_METADATA_PREFIX + record_sha256
+
+
+def _exhausted_record_payload(record_sha256: str) -> str:
+    _exhausted_record_key(record_sha256)
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "captain_audit_completion_sha256": record_sha256,
+            "status": "manual_recovery_required",
+            "reason": "durable_freshness_job_slots_exhausted",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _require_exhausted_record(tasks_module: Any, record_sha256: str) -> None:
+    key = _exhausted_record_key(record_sha256)
+    with tasks_module._database_connection() as connection:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key=?", (key,)
+        ).fetchone()
+    if row is None:
+        raise RepoGroundPostMergeError(
+            "Exhausted RepoGround audit is not durably registered"
+        )
+    if str(row[0]) != _exhausted_record_payload(record_sha256):
+        raise RepoGroundPostMergeError("Exhausted RepoGround audit record is invalid")
+
+
+def list_exhausted_audit_followups(
+    *, limit: int = 50, after_sha256: str | None = None
+) -> dict[str, Any]:
+    """Report only bounded, persisted manual recovery obligations."""
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise RepoGroundPostMergeError("Exhausted audit list limit is invalid")
+    if after_sha256 is not None:
+        _exhausted_record_key(after_sha256)
+    import grabowski_tasks
+
+    lower = (
+        RECONCILE_EXHAUSTED_METADATA_PREFIX
+        if after_sha256 is None
+        else _exhausted_record_key(after_sha256)
+    )
+    with grabowski_tasks._database_connection() as connection:
+        rows = connection.execute(
+            "SELECT key, value FROM metadata WHERE key>? AND key<? "
+            "ORDER BY key LIMIT ?",
+            (lower, RECONCILE_EXHAUSTED_METADATA_PREFIX + "g", limit + 1),
+        ).fetchall()
+    entries: list[dict[str, Any]] = []
+    for row in rows[:limit]:
+        key, payload = row[0], row[1]
+        if not isinstance(key, str) or not key.startswith(
+            RECONCILE_EXHAUSTED_METADATA_PREFIX
+        ):
+            raise RepoGroundPostMergeError("Exhausted audit inventory key is invalid")
+        sha = key[len(RECONCILE_EXHAUSTED_METADATA_PREFIX):]
+        if key != _exhausted_record_key(sha) or str(payload) != (
+            _exhausted_record_payload(sha)
+        ):
+            raise RepoGroundPostMergeError("Exhausted audit inventory entry is invalid")
+        entries.append({"captain_audit_completion_sha256": sha})
+    return {
+        "kind": "grabowski.repoground_post_merge_exhausted_audits",
+        "schema_version": 1,
+        "status": "ok",
+        "items": entries,
+        "returned": len(entries),
+        "truncated": len(rows) > limit,
+        "next_after_sha256": (
+            entries[-1]["captain_audit_completion_sha256"] if entries else None
+        ),
+        "does_not_establish": ["freshness_converged", "recovery_started"],
+    }
+
+
+def _exhausted_recovery_request(record_sha256: str) -> dict[str, Any]:
+    import grabowski_tasks
+
+    _require_exhausted_record(grabowski_tasks, record_sha256)
+    request = captain_followup_request_from_audit(
+        record_sha256,
+        python_executable=__import__("sys").executable,
+        script_path=Path(__file__).resolve(),
+    )
+    if request.get("status") not in {"ready", "ready_queue_watch"}:
+        raise RepoGroundPostMergeError(
+            "Exhausted audit does not identify a recoverable verified Captain merge"
+        )
+    return request
+
+
+def recover_exhausted_audit_followup(record_sha256: str) -> dict[str, Any]:
+    """Explicit manual retry via the existing publisher, without new job slots.
+
+    The durable debt remains until a different invocation proves fresh_exact
+    and atomically acknowledges it. This call never edits task metadata.
+    """
+    request = _exhausted_recovery_request(record_sha256)
+    if request["status"] == "ready":
+        convergence = converge(
+            repository=request["repository"],
+            merge_sha=request["merge_sha"],
+            target_branch=request["target_branch"],
+        )
+    else:
+        convergence = watch_merge_queue(
+            repository=request["repository"],
+            pull_request=request["pull_request"],
+            expected_head=request["expected_head"],
+            expected_base=request["expected_base"],
+        )
+    if not isinstance(convergence, dict):
+        raise RepoGroundPostMergeError("Exhausted recovery result is invalid")
+    return {
+        "kind": "grabowski.repoground_post_merge_exhausted_recovery",
+        "schema_version": 1,
+        "status": "fresh_exact" if convergence.get("status") == "fresh_exact" else "failed",
+        "captain_audit_completion_sha256": record_sha256,
+        "ledger_retained": True,
+        "acknowledgement_required": True,
+        "convergence": convergence,
+        "does_not_establish": ["debt_acknowledged", "future_branch_freshness"],
+    }
+
+
+def acknowledge_exhausted_audit_followup(record_sha256: str) -> dict[str, Any]:
+    """Single CAS metadata mutation, only after live exactness is reverified."""
+    import grabowski_tasks
+
+    request = _exhausted_recovery_request(record_sha256)
+    repository = request["repository"]
+    if request["status"] == "ready":
+        merge_sha = request["merge_sha"]
+        target_branch = request["target_branch"]
+    else:
+        observed = _read_queue_pr(repository, request["pull_request"])
+        if (
+            observed.get("number") != request["pull_request"]
+            or observed.get("headRefOid") != request["expected_head"]
+            or observed.get("baseRefName") != request["expected_base"]
+            or observed.get("state") != "MERGED"
+        ):
+            raise RepoGroundPostMergeError(
+                "Exhausted queue audit has no verified merged identity"
+            )
+        merge_commit = observed.get("mergeCommit")
+        merge_sha = _validate_sha(
+            merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+        )
+        target_branch = request["expected_base"]
+
+    exact, projection = _fresh_exact(
+        _read_freshness(repository),
+        merge_sha=merge_sha,
+        target_branch=target_branch,
+        ancestry_checker=_check_ancestry,
+    )
+    repo_path = projection.get("repo_path")
+    bundle_commit = projection.get("bundle_commit")
+    if not exact or not isinstance(repo_path, str) or not repo_path:
+        raise RepoGroundPostMergeError(
+            "Exhausted audit acknowledgement requires live fresh_exact"
+        )
+    # Re-read origin directly, even if the freshness source supplied an older
+    # previously observed remote head. A stale publication is not an ACK.
+    authoritative_head = _read_remote_branch_head(repo_path, target_branch)
+    if authoritative_head != bundle_commit:
+        raise RepoGroundPostMergeError(
+            "Exhausted audit acknowledgement detected a newer origin branch"
+        )
+    key = _exhausted_record_key(record_sha256)
+    payload = _exhausted_record_payload(record_sha256)
+    with grabowski_tasks._database_connection() as connection:
+        deleted = connection.execute(
+            "DELETE FROM metadata WHERE key=? AND value=?", (key, payload)
+        ).rowcount
+        if deleted != 1:
+            raise RepoGroundPostMergeError(
+                "Exhausted audit changed before acknowledgement"
+            )
+    return {
+        "kind": "grabowski.repoground_post_merge_exhausted_ack",
+        "schema_version": 1,
+        "status": "ok",
+        "captain_audit_completion_sha256": record_sha256,
+        "recovered_merge_sha": merge_sha,
+        "authoritative_head": authoritative_head,
+        "freshness": projection,
+        "ledger_removed": True,
+        "does_not_establish": ["future_branch_freshness"],
+    }
+
+
 def _save_reconcile_progress(
     tasks_module: Any,
     *,
@@ -1765,24 +1969,10 @@ def _save_reconcile_progress(
     if len(exhausted_completion_record_sha256s) > 100:
         raise RepoGroundPostMergeError("Exhausted RepoGround obligations exceed pass bound")
     for record_sha256 in exhausted_completion_record_sha256s:
-        if (
-            not isinstance(record_sha256, str)
-            or re.fullmatch(r"[0-9a-f]{64}", record_sha256) is None
-        ):
-            raise RepoGroundPostMergeError("Exhausted RepoGround audit SHA-256 is invalid")
         payloads.append(
             (
-                RECONCILE_EXHAUSTED_METADATA_PREFIX + record_sha256,
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "captain_audit_completion_sha256": record_sha256,
-                        "status": "manual_recovery_required",
-                        "reason": "durable_freshness_job_slots_exhausted",
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ),
+                _exhausted_record_key(record_sha256),
+                _exhausted_record_payload(record_sha256),
             )
         )
     if not payloads:
@@ -2111,8 +2301,12 @@ def reconcile_recent_captain_audit_followups(
             discovery_ordinal_candidate is not None
             and discovery_ordinal_candidate != discovery_ordinal_before
         )
+        # Only expose exhausted work for manual recovery once the verified
+        # discovery boundary can advance in this same SQLite transaction.
+        # Otherwise the next pass could resurrect an already-acknowledged debt.
+        exhausted_to_record = exhausted_pending if discovery_changed else ()
         if cursor_tasks is not None and (
-            cursor_changed or discovery_changed or exhausted_pending
+            cursor_changed or discovery_changed or exhausted_to_record
         ):
             progress_args: dict[str, Any] = {
                 "cursor": cursor_candidate if cursor_changed else None,
@@ -2120,12 +2314,12 @@ def reconcile_recent_captain_audit_followups(
                     discovery_ordinal_candidate if discovery_changed else None
                 ),
             }
-            if exhausted_pending:
-                progress_args["exhausted_completion_record_sha256s"] = exhausted_pending
+            if exhausted_to_record:
+                progress_args["exhausted_completion_record_sha256s"] = exhausted_to_record
             _save_reconcile_progress(cursor_tasks, **progress_args)
             cursor_persisted = cursor_changed
             discovery_watermark_persisted = discovery_changed
-            exhausted_obligations_recorded = exhausted_pending
+            exhausted_obligations_recorded = exhausted_to_record
             progress_persisted = True
 
     return {
@@ -2168,6 +2362,11 @@ def _parser() -> argparse.ArgumentParser:
     mode.add_argument("--pr", type=int)
     mode.add_argument("--reconcile-audit-followups", action="store_true")
     mode.add_argument("--initialize-reconcile-watermark", action="store_true")
+    mode.add_argument("--list-exhausted-audits", action="store_true")
+    mode.add_argument("--recover-exhausted-audit")
+    mode.add_argument("--ack-exhausted-audit")
+    parser.add_argument("--exhausted-limit", type=int, default=50)
+    parser.add_argument("--exhausted-after-sha256")
     parser.add_argument(
         "--reconcile-lookback-seconds",
         type=int,
@@ -2207,7 +2406,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        if args.initialize_reconcile_watermark:
+        if args.list_exhausted_audits:
+            if args.repo is not None:
+                parser.error("--list-exhausted-audits does not accept --repo")
+            result = list_exhausted_audit_followups(
+                limit=args.exhausted_limit,
+                after_sha256=args.exhausted_after_sha256,
+            )
+        elif args.recover_exhausted_audit is not None:
+            if args.repo is not None or args.exhausted_after_sha256 is not None:
+                parser.error("--recover-exhausted-audit does not accept --repo or pagination")
+            result = recover_exhausted_audit_followup(args.recover_exhausted_audit)
+        elif args.ack_exhausted_audit is not None:
+            if args.repo is not None or args.exhausted_after_sha256 is not None:
+                parser.error("--ack-exhausted-audit does not accept --repo or pagination")
+            result = acknowledge_exhausted_audit_followup(args.ack_exhausted_audit)
+        elif args.initialize_reconcile_watermark:
             if args.repo is not None:
                 parser.error("--initialize-reconcile-watermark does not accept --repo")
             result = initialize_reconcile_discovery_watermark()
