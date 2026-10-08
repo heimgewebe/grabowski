@@ -420,11 +420,14 @@ int main(void) {
         sources["memfd_exec"] = (
             '#define _GNU_SOURCE\n'
             '#include <unistd.h>\n#include <sys/mman.h>\n'
-            '#include <fcntl.h>\n#include <stdio.h>\n'
+            '#include <fcntl.h>\n#include <stdio.h>\n#include <errno.h>\n'
+            '#ifndef MFD_EXEC\n#define MFD_EXEC 0x0010U\n#endif\n'
             'int main(void) {\n'
             f' const char *path = {json.dumps(str(cls.tmp / "second_stage"))};\n'
             ' int input = open(path, O_RDONLY);\n'
-            ' int output = memfd_create("nonadmitted-stage", 0);\n'
+            ' int output = memfd_create("nonadmitted-stage", MFD_EXEC);\n'
+            ' if (output < 0 && errno == EINVAL)\n'
+            '   output = memfd_create("nonadmitted-stage", 0);\n'
             ' if (input < 0 || output < 0) return 80;\n'
             ' char buf[8192]; ssize_t count;\n'
             ' while ((count = read(input, buf, sizeof(buf))) > 0) {\n'
@@ -475,6 +478,27 @@ int main(void) {
         self.signers = Path(self.temp.name) / "signers"
         self.signers.write_text(cap.PROOF_ISSUER+" "+pub+"\n")
 
+        # Unrelated collector/receipt unit fixtures do not depend on the
+        # CI runner's Landlock syscall exposure. Real-kernel tests opt in.
+        # This is NEVER a production runtime fallback.
+        self._landlock_unit_patch = patch.object(
+            cap, "_confine_child_filesystem_exec", return_value=None,
+        )
+        self._landlock_unit_patch.start()
+        self.addCleanup(self._landlock_unit_patch.stop)
+
+    def require_kernel_landlock(self) -> None:
+        # Probe the actual kernel in an isolated child, never by restricting
+        # the test runner. Unsupported CI sandboxes skip *only* the integration.
+        self._landlock_unit_patch.stop()
+        try:
+            stdout, *_ = self.capture("success")
+        except cap.CaptureDenied as exc:
+            if "collector child could not start" in str(exc):
+                self.skipTest("Landlock unavailable in kernel/test sandbox")
+            raise
+        self.assertEqual(OBSERVED_STDOUT, stdout)
+
     def fake_root_file(self, path: Path, **_kwargs):
         # EXPLICIT test-only substitute for absent UID0/root installed files.
         files = {
@@ -513,6 +537,11 @@ int main(void) {
         initial = self.programs["second_exec"]
         second = self.programs["second_stage"]
         self.assertNotEqual(sha(initial.read_bytes()), sha(second.read_bytes()))
+        # Unconfined control must prove that this particular second ELF
+        # succeeds and produces the exact bytes before relying on denial.
+        unconfined_stdout, *_ = self.capture("second_exec")
+        self.assertEqual(b"SECOND_EXEC_NOT_PINNED\n", unconfined_stdout)
+        self.require_kernel_landlock()
         self.active_binary = initial
         self.policy_file = Path(self.temp.name) / "policy"
         self.policy_file.write_bytes(cap._json_bytes(
@@ -547,11 +576,18 @@ int main(void) {
         # the host permits executable anonymous memfd objects. The signature
         # authenticates the *nonadmitting prototype claim*, not the code tree.
         setting = Path("/proc/sys/vm/memfd_noexec")
-        if not setting.is_file() or setting.read_text().strip() != "0":
-            self.skipTest("anonymous memfd execution disabled by host policy")
+        # Scope 1 only changes the default: explicit MFD_EXEC still works.
+        # Missing sysctl may mean a legacy executable-memfd kernel.
+        if setting.is_file() and setting.read_text().strip() == "2":
+            self.skipTest("kernel enforces no executable memfds (scope 2)")
         initial = self.programs["memfd_exec"]
         second = self.programs["second_stage"]
         self.assertNotEqual(sha(initial.read_bytes()), sha(second.read_bytes()))
+        # The unconfined control must execute the copied second ELF.
+        # Do not treat a nonzero or unavailable sysctl as safety evidence.
+        unconfined_stdout, *_ = self.capture("memfd_exec")
+        self.assertEqual(b"SECOND_EXEC_NOT_PINNED\n", unconfined_stdout)
+        self.require_kernel_landlock()
         self.active_binary = initial
         self.policy_file = Path(self.temp.name) / "policy"
         self.policy_file.write_bytes(cap._json_bytes(
@@ -605,6 +641,9 @@ int main(void) {
                 self.capture("success")
 
     def test_execute_allowlist_requires_a_regular_verified_fd(self) -> None:
+        # Validation occurs before the Landlock syscall and must remain
+        # testable without kernel privileges.
+        self._landlock_unit_patch.stop()
         with tempfile.TemporaryDirectory() as tmp:
             fd = os.open(tmp, os.O_RDONLY | os.O_DIRECTORY)
             try:
