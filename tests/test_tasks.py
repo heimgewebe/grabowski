@@ -13972,6 +13972,90 @@ class TaskTests(unittest.TestCase):
 
 
 class RuntimeContractTests(unittest.TestCase):
+    def test_day1_task_output_not_attested_by_same_uid_receipt_fields(self) -> None:
+        for backend in ("systemd-user", "systemd-root-broker"):
+            with self.subTest(backend=backend):
+                candidate = {
+                    "execution_backend": backend,
+                    "state": "completed",
+                    "captured_stdout_sha256": "a" * 64,
+                    "captured_stdout_bytes": 32,
+                    "lifecycle_receipt_sha256": "b" * 64,
+                    "executed_source_sha256": "c" * 64,
+                }
+                diagnostic = tasks._day1_task_output_attestation_diagnostic(
+                    candidate
+                )
+                self.assertEqual("unavailable", diagnostic["status"])
+                self.assertEqual("none", diagnostic["authority"])
+                self.assertFalse(diagnostic["day1_admission_authorized"])
+                self.assertFalse(diagnostic["protected_stdout_capture_verified"])
+                self.assertFalse(diagnostic["executed_source_bytes_verified"])
+                self.assertIn(
+                    "captured_stdout_authenticity",
+                    diagnostic["does_not_establish"],
+                )
+
+    def test_legacy_unkeyed_receipt_rehash_still_not_an_attestation(self) -> None:
+        # An attacker can rewrite all same-UID fields and recompute a self-hash.
+        # The existing receipt checker verifies internal consistency, NOT UID-
+        # separated output authenticity.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "receipt.json"
+            unsigned = {
+                "schema_version": 2,
+                "task_id": "a" * 24,
+                "terminalization": {"transition_sha256": "b" * 64},
+                "captured_stdout_sha256": "c" * 64,
+                "captured_stdout_bytes": 7,
+            }
+            first = tasks._sha256_json(unsigned)
+            path.write_text(
+                json.dumps({**unsigned, "receipt_sha256": first}),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                first,
+                tasks._read_existing_outcome_receipt(
+                    path, transition_sha256="b" * 64, allow_legacy=False
+                ),
+            )
+            unsigned["captured_stdout_sha256"] = "d" * 64
+            unsigned["captured_stdout_bytes"] = 15
+            second = tasks._sha256_json(unsigned)
+            path.write_text(
+                json.dumps({**unsigned, "receipt_sha256": second}),
+                encoding="utf-8",
+            )
+            self.assertNotEqual(first, second)
+            self.assertEqual(
+                second,
+                tasks._read_existing_outcome_receipt(
+                    path, transition_sha256="b" * 64, allow_legacy=False
+                ),
+            )
+            self.assertFalse(
+                tasks._day1_task_output_attestation_diagnostic(
+                    {"execution_backend": "systemd-user", **unsigned}
+                )["day1_admission_authorized"]
+            )
+
+    def test_day1_diagnostic_only_on_explicit_evidence_view(self) -> None:
+        with patch.object(tasks, "_public", return_value={"task_id": "a" * 24}):
+            evidence = tasks._public_for_view(
+                {"execution_backend": "systemd-user"}, "evidence"
+            )
+        self.assertEqual(
+            "unavailable", evidence["day1_output_attestation"]["status"]
+        )
+        self.assertFalse(
+            evidence["day1_output_attestation"]["day1_admission_authorized"]
+        )
+        with self.assertRaises(ValueError):
+            tasks._day1_task_output_attestation_diagnostic(
+                {"execution_backend": "made-up-attested-backend"}
+            )
+
     def test_task_output_root_is_managed_state_with_explicit_legacy_home(self) -> None:
         self.assertEqual(
             tasks.TASK_OUTPUT_ROOT,
