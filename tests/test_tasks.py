@@ -2648,6 +2648,60 @@ class TaskTests(unittest.TestCase):
             denial_audits[0]["no_resource_lease_renewed_or_reacquired"]
         )
 
+    def test_legacy_read_only_agent_resume_uses_effective_argv_mode(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "read-only"]
+        admitted = {
+            "schema_version": 1,
+            "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True, "admitted": True,
+            "reason_code": "admitted",
+            "argv_sha256": "1" * 64, "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission", return_value=admitted
+        ), patch.object(tasks.base, "_append_audit"):
+            started = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root),
+                runtime_seconds=60, resume_policy="verify-then-retry",
+            )
+        task_id = str(started["task"]["task_id"])
+        with tasks._database_connection() as connection:
+            row = connection.execute(
+                "SELECT launcher_json FROM tasks WHERE task_id=?", (task_id,),
+            ).fetchone()
+            assert row is not None
+            launcher = json.loads(str(row["launcher_json"]))
+            launcher.pop("task_effect_classification", None)
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (tasks._canonical_json(launcher), task_id),
+            )
+        self.assertIsNone(
+            tasks._record_task_effect_classification(tasks._row_raw(task_id))
+        )
+        observation = {
+            "state": "failed", "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1), "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with patch.object(tasks, "_observe", return_value=observation), patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 148}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission", return_value=admitted
+        ) as admission, patch.object(
+            tasks, "_launch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"):
+            resumed = tasks.grabowski_task_resume(task_id)
+        admission.assert_called_once_with(argv, read_only_execution=True)
+        self.assertEqual(resumed["task"]["attempt"], 2)
+
     def test_legacy_local_resume_binds_managed_output_from_next_attempt(self) -> None:
         started = self._start()
         task_id = str(started["task"]["task_id"])

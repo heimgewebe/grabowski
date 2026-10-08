@@ -10009,8 +10009,9 @@ def grabowski_task_resume(
         candidate_admission = coding_agent_router.coding_agent_pre_dispatch_admission(
             command,
             read_only_execution=(
-                task_effect_classification is not None
-                and task_effect_classification.get("effect_profile") == "read_only"
+                task_effect_classification.get("effect_profile") == "read_only"
+                if task_effect_classification is not None
+                else _agent_read_only(command, agent_executable)
             ),
         )
         if candidate_admission.get("admitted") is not True:
