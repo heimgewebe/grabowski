@@ -266,6 +266,24 @@ def _sealed_memfd(name: str, data: bytes) -> int:
         )
         if observed & seal != seal:
             raise ValidationError("kernel did not seal verifier inputs")
+        # F_GET_SEALS alone does not prove that the bytes sealed were the
+        # originally verified root-owned policy/signature. A same-UID writer
+        # may race the pre-seal window through /proc/<pid>/fd/<descriptor>.
+        # After the kernel has prevented all future writes, re-read exactly
+        # the sealed bytes and reject any different content.
+        if os.fstat(descriptor).st_size != len(data):
+            raise ValidationError("sealed verifier input size differs")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = len(data)
+        while remaining:
+            part = os.read(descriptor, min(remaining, 65536))
+            if not part:
+                break
+            chunks.append(part)
+            remaining -= len(part)
+        if remaining or b"".join(chunks) != data:
+            raise ValidationError("sealed verifier input bytes differ")
         os.lseek(descriptor, 0, os.SEEK_SET)
         return descriptor
     except OSError as exc:

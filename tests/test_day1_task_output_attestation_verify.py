@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -247,6 +248,28 @@ class SignedTaskProofTests(unittest.TestCase):
         with patch.object(verifier, "ROOT_SIGNERS_PATH", link):
             with self.assertRaises(verifier.ValidationError):
                 verifier._read_root_owned_signers()
+
+    def test_rejects_signer_policy_modified_just_before_kernel_seal(self) -> None:
+        # A same-UID attacker changes the trusted key data through the open
+        # memfd before F_ADD_SEALS. A successful seal alone would preserve
+        # those forged bytes. The post-seal content readback must reject it.
+        actual_fcntl = verifier.fcntl.fcntl
+        modified = [False]
+        add_seals_command = getattr(verifier.fcntl, "F_ADD_SEALS", 1033)
+
+        def attack_before_seal(fd, command, *args):
+            if command == add_seals_command and not modified[0]:
+                modified[0] = True
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, b"X")
+            return actual_fcntl(fd, command, *args)
+
+        with patch.object(verifier.fcntl, "fcntl", side_effect=attack_before_seal):
+            with self.assertRaisesRegex(
+                verifier.ValidationError, "sealed verifier input bytes differ"
+            ):
+                self.check()
+        self.assertTrue(modified[0])
 
     def test_linux_libc_memfd_fallback_verifies_real_signature(self) -> None:
         # CPython distributions may omit os.memfd_create despite a working
