@@ -639,6 +639,51 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.root.isError)
         self.assertEqual(self.exporter.get_finished_spans(), ())
 
+    async def test_missing_client_session_reports_once_without_private_data(self) -> None:
+        mcp = self.server(verified_resolver=lambda _ctx: {"id": "verified-test-user"})
+        arguments = {
+            "value": "private-value-do-not-log",
+            "reason": "Reason contains private-reason-do-not-log",
+            "user_intent": "private-intent-do-not-log",
+        }
+        with self.assertLogs(flowlines.LOGGER, level="WARNING") as records:
+            for _ in range(2):
+                result = await self.call(
+                    mcp,
+                    arguments=arguments,
+                    meta={"user.id": "spoofed-test-user", "user.email": "private@example.invalid"},
+                )
+                self.assertFalse(result.root.isError)
+        self.assertEqual(self.exporter.get_finished_spans(), ())
+        self.assertEqual(len(records.output), 1)
+        self.assertIn("client_session_id_missing", records.output[0])
+        for secret in (
+            "private-value-do-not-log",
+            "private-reason-do-not-log",
+            "private-intent-do-not-log",
+            "spoofed-test-user",
+            "private@example.invalid",
+        ):
+            self.assertNotIn(secret, records.output[0])
+
+    async def test_verified_identity_failure_reports_bounded_reason_once(self) -> None:
+        mcp = self.server(verified_resolver=lambda _ctx: (_ for _ in ()).throw(RuntimeError("private-transport-detail")))
+        with self.assertLogs(flowlines.LOGGER, level="WARNING") as records:
+            result = await self.call(
+                mcp,
+                arguments={
+                    "value": "private-value",
+                    "reason": "Check identity",
+                    "user_intent": "Verify Flowlines diagnostic",
+                },
+                meta=self.meta(),
+            )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(self.exporter.get_finished_spans(), ())
+        self.assertEqual(len(records.output), 1)
+        self.assertIn("verified_connector_identity_unavailable", records.output[0])
+        self.assertNotIn("private-transport-detail", records.output[0])
+
     async def test_span_setup_failure_is_fail_open_and_calls_domain_once(self) -> None:
         calls = 0
         mcp = FastMCP("grabowski-test", instructions="fixture")

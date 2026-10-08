@@ -830,6 +830,15 @@ def _install_lowlevel_handler(
     if getattr(original, _HANDLER_MARKER, False):
         return
 
+    skip_reasons_logged: set[str] = set()
+
+    def log_skip_once(reason: str) -> None:
+        # Only fixed labels: never include client metadata, arguments or credentials.
+        if tracer is None or reason in skip_reasons_logged:
+            return
+        skip_reasons_logged.add(reason)
+        LOGGER.warning("Flowlines telemetry span skipped: %s", reason)
+
     async def flowlines_call_tool_handler(req: Any) -> Any:
         arguments = getattr(getattr(req, "params", None), "arguments", None) or {}
         tool_name = getattr(getattr(req, "params", None), "name", None)
@@ -840,11 +849,13 @@ def _install_lowlevel_handler(
         tool = manager.get_tool(tool_name) if manager is not None else None
         public = _validate_public_arguments(tool, tool_name, arguments)
         if tool is None or public is None or not _validate_domain_arguments(tool, tool_name, arguments):
+            log_skip_once("tool_input_not_validated")
             return await original(req)
 
         try:
             request_context = server.request_context
         except LookupError:
+            log_skip_once("request_context_unavailable")
             return await original(req)
         meta = _meta_mapping(request_context)
         verified: Mapping[str, Any] | None = None
@@ -857,9 +868,18 @@ def _install_lowlevel_handler(
             except Exception:
                 verified_identity_failed = True
         if verified_identity_failed:
+            log_skip_once("verified_connector_identity_unavailable")
+            return await original(req)
+        if tracer is None:
             return await original(req)
         identity = _identity_from_meta(meta, verified)
-        if tracer is None or identity is None:
+        if identity is None:
+            label = (
+                "client_session_id_missing"
+                if _nonempty_text(meta.get("session.id"), maximum=512) is None
+                else "user_id_missing"
+            )
+            log_skip_once(label)
             return await original(req)
 
         reason, user_intent = public
