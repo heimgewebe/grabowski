@@ -859,6 +859,7 @@ class ClientSnapshotTests(unittest.TestCase):
         declarations: list[dict[str, object]] = []
         request_metas: list[dict[str, object] | None] = []
         transport_headers: list[dict[str, str] | None] = []
+        transport_urls: list[str] = []
         connector_capability = "C" * 43
 
         class Client:
@@ -878,6 +879,12 @@ class ClientSnapshotTests(unittest.TestCase):
                 meta: dict[str, object] | None = None,
             ) -> object:
                 request_metas.append(meta)
+                # The Flowlines-enabled MCP boundary requires these metadata
+                # fields on every tool call, including nested roundtrips.
+                for field in ("reason", "user_intent"):
+                    value = arguments.get(field)
+                    if not isinstance(value, str) or not value.strip():
+                        raise AssertionError(f"{name} is missing {field}")
                 if name == "grip_run":
                     declarations.append(arguments)
                 return object()
@@ -894,26 +901,6 @@ class ClientSnapshotTests(unittest.TestCase):
                         "registered_tool_count": len(names),
                         "registered_names_sha256": metadata["names_sha256"],
                         "runtime_matches_deployment_contract": True,
-                    },
-                }
-            if label == "transport roundtrip begin grip":
-                return {
-                    "status": "passed",
-                    "output": {
-                        "state": "challenge_pending",
-                        "mutation_gate_open": False,
-                        "challenge_receipt_sha256": "e" * 64,
-                    },
-                }
-            if label == "transport roundtrip execute grip":
-                return {
-                    "status": "passed",
-                    "output": {
-                        "state": "executed",
-                        "mutation_gate_open": False,
-                        "verification_receipt_sha256": "f" * 64,
-                        "target_result": {"isError": False, "structuredContent": {}},
-                        "target_error": None,
                     },
                 }
             return {
@@ -934,7 +921,8 @@ class ClientSnapshotTests(unittest.TestCase):
         streamable_http_module = types.ModuleType("mcp.client.streamable_http")
         streamable_http_module.streamablehttp_client = (
             lambda _url, *, headers=None: (
-                transport_headers.append(headers)
+                transport_urls.append(_url)
+                or transport_headers.append(headers)
                 or AsyncContext((object(), object(), None))
             )
         )
@@ -964,7 +952,7 @@ class ClientSnapshotTests(unittest.TestCase):
                 transport_headers,
                 [
                     {
-                        snapshot.TRANSPORT_CONNECTOR_CAPABILITY_HEADER: (
+                        snapshot.TRANSPORT_INGRESS_AUTH_HEADER: (
                             connector_capability
                         )
                     }
@@ -972,34 +960,21 @@ class ClientSnapshotTests(unittest.TestCase):
             )
             self.assertNotIn(connector_capability, json.dumps(result))
             self.assertEqual(
-                result["transport_verification_receipt_sha256"],
-                "f" * 64,
+                transport_urls, [snapshot._SIGNED_SNAPSHOT_INGRESS_MCP_URL]
             )
+            self.assertIsNone(result["transport_verification_receipt_sha256"])
+            self.assertEqual(result["binding_route"], "signed_ingress")
             self.assertEqual(
-                request_metas[:3],
-                [{"client_id": snapshot.AUTO_REFRESH_CLIENT_ID}] * 3,
+                request_metas, [{"client_id": snapshot.AUTO_REFRESH_CLIENT_ID}] * 2
             )
-            self.assertEqual(len(declarations), 2)
-            self.assertEqual(
-                [entry["name"] for entry in declarations],
-                ["transport-roundtrip", "transport-roundtrip"],
-            )
-            # Atomic execute stays bound to the exact binder declared by begin;
-            # a second direct binder call would duplicate the effect.
-            begin_parameters = declarations[-2]["parameters"]
-            self.assertEqual(begin_parameters["action"], "begin")
-            self.assertEqual(begin_parameters["target_tool_name"], "grip_run")
-            bind_arguments = begin_parameters["target_arguments"]
-            self.assertEqual(
-                declarations[-1]["parameters"],
-                {
-                    "action": "execute",
-                    "challenge_receipt_sha256": "e" * 64,
-                    "target_tool_name": "grip_run",
-                    "target_arguments": bind_arguments,
-                },
-            )
+            self.assertEqual(len(declarations), 1)
+            bind_arguments = declarations[0]
             self.assertEqual(bind_arguments["name"], "connector-snapshot-bind")
+            self.assertEqual(
+                bind_arguments["user_intent"],
+                snapshot._SNAPSHOT_OBSERVER_USER_INTENT,
+            )
+            self.assertIn("reason", bind_arguments)
             declaration = bind_arguments["parameters"]
             self.assertEqual(declaration["observed_tools"], artifact)
             self.assertEqual(declaration["observed_tool_count"], len(names))
@@ -1017,6 +992,29 @@ class ClientSnapshotTests(unittest.TestCase):
                         timeout_seconds=1.0,
                     )
                 )
+
+    def test_nested_exception_diagnostics_emit_types_without_private_text(self) -> None:
+        class SyntheticGroup(Exception):
+            def __init__(self) -> None:
+                super().__init__("secret-credential-do-not-log")
+                self.exceptions = tuple(
+                    RuntimeError(f"private-{index}") for index in range(20)
+                )
+
+        classes = snapshot._bounded_exception_types(SyntheticGroup())
+        self.assertEqual(classes[0], "SyntheticGroup")
+        self.assertEqual(classes[1], "RuntimeError")
+        self.assertEqual(len(classes), 8)
+        self.assertNotIn("secret", json.dumps(classes))
+        self.assertNotIn("private", json.dumps(classes))
+
+    def test_observer_status_arguments_include_required_telemetry_metadata(self) -> None:
+        params = snapshot._SNAPSHOT_STATUS_ARGUMENTS
+        self.assertEqual(params["view"], "minimal")
+        for field in ("reason", "user_intent"):
+            self.assertIsInstance(params.get(field), str)
+            self.assertTrue(params[field].strip())
+        self.assertEqual(params["user_intent"], snapshot._SNAPSHOT_OBSERVER_USER_INTENT)
 
     def test_auto_refresh_capability_is_bound_to_operator_endpoint(self) -> None:
         self.assertEqual(
