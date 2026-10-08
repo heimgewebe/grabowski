@@ -1,0 +1,48 @@
+# SOURCE TEMPLATE ONLY. Do not install, enable, start or deploy from this PR.
+# The controller's existing root-task broker allowlist is deliberately untouched.
+# Requires separately reviewed root-owned /usr/local/libexec/grabowski code,
+# policy, static collector, 0600 private key, and a dedicated non-login UID.
+[Unit]
+Description=Grabowski protected Day-1 collector capture (opt-in, no admission)
+Documentation=https://github.com/heimgewebe/grabowski/issues/1387
+RefuseManualStart=yes
+ConditionPathExists=/etc/grabowski/day1-capture-policy-v1.json
+ConditionPathExists=/etc/grabowski/day1-capture-signing-key
+ConditionPathExists=/usr/local/libexec/grabowski/day1-collector-static
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/grabowski/day1-protected-capture-provider.py
+WorkingDirectory=/
+UMask=0077
+StateDirectory=grabowski/day1-capture
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/grabowski/day1-capture
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=invisible
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+LimitCORE=0
+TasksMax=32
+MemoryMax=384M
+TimeoutStartSec=360s
+KillMode=control-group
+
+# Intentionally no install section or timer. No automatic activation.
