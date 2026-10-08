@@ -6,6 +6,7 @@ boundary, deployed key custody, an authenticated Grabowski unit, or admission.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -27,6 +28,21 @@ OBSERVED_STDERR = b"STDERR_FD\n"
 
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _probe_landlock_abi_version() -> tuple[int | None, int]:
+    """Read only the kernel Landlock ABI version; never install restrictions.
+
+    Unlike a failed collector launch, this query preserves ENOSYS (absent)
+    and EOPNOTSUPP (disabled at boot) without masking unrelated runtime bugs.
+    """
+    libc = cap.ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = cap.ctypes.c_long
+    cap.ctypes.set_errno(0)
+    version = libc.syscall(cap._LANDLOCK_CREATE_RULESET, None, 0, 1)
+    if version < 0:
+        return None, cap.ctypes.get_errno()
+    return version, 0
 
 
 def example_policy(binary: bytes, *, host: str | None = None) -> dict:
@@ -488,16 +504,73 @@ int main(void) {
         self.addCleanup(self._landlock_unit_patch.stop)
 
     def require_kernel_landlock(self) -> None:
-        # Probe the actual kernel in an isolated child, never by restricting
-        # the test runner. Unsupported CI sandboxes skip *only* the integration.
+        # A read-only ABI query does not launch a child or restrict this test
+        # process. Only exact documented kernel unavailability may skip an
+        # integration case; *any* subsequent child-start failure is a bug.
+        abi, unavailable_errno = _probe_landlock_abi_version()
+        if abi is None:
+            if unavailable_errno in (errno.ENOSYS, errno.EOPNOTSUPP):
+                self.skipTest(f"Landlock ABI unavailable (errno={unavailable_errno})")
+            self.fail(f"Landlock ABI query unexpectedly failed (errno={unavailable_errno})")
+        self.assertGreaterEqual(abi, 1)
         self._landlock_unit_patch.stop()
-        try:
-            stdout, *_ = self.capture("success")
-        except cap.CaptureDenied as exc:
-            if "collector child could not start" in str(exc):
-                self.skipTest("Landlock unavailable in kernel/test sandbox")
-            raise
+        stdout, *_ = self.capture("success")
         self.assertEqual(OBSERVED_STDOUT, stdout)
+
+    def test_kernel_abi_probe_preserves_syscall_errno(self) -> None:
+        class FakeSyscall:
+            restype = None
+
+            def __init__(self, result: int, error: int) -> None:
+                self.result = result
+                self.error = error
+                self.args = None
+
+            def __call__(self, *args) -> int:
+                self.args = args
+                cap.ctypes.set_errno(self.error)
+                return self.result
+
+        for result, error in ((9, 0), (-1, errno.ENOSYS),
+                              (-1, errno.EOPNOTSUPP), (-1, errno.EPERM)):
+            with self.subTest(result=result, errno=error):
+                syscall = FakeSyscall(result, error)
+                with patch.object(cap.ctypes, "CDLL",
+                                  return_value=types.SimpleNamespace(syscall=syscall)):
+                    self.assertEqual(
+                        (result if result >= 0 else None,
+                         0 if result >= 0 else error),
+                        _probe_landlock_abi_version(),
+                    )
+                self.assertEqual(
+                    (cap._LANDLOCK_CREATE_RULESET, None, 0, 1), syscall.args
+                )
+
+    def test_kernel_abi_skip_never_hides_child_launch_error(self) -> None:
+        for unsupported in (errno.ENOSYS, errno.EOPNOTSUPP):
+            with self.subTest(unsupported=unsupported), patch(
+                __name__ + "._probe_landlock_abi_version",
+                return_value=(None, unsupported),
+            ):
+                with self.assertRaises(unittest.SkipTest):
+                    self.require_kernel_landlock()
+        for unexpected in (errno.EPERM, errno.EINVAL):
+            with self.subTest(unexpected=unexpected), patch(
+                __name__ + "._probe_landlock_abi_version",
+                return_value=(None, unexpected),
+            ):
+                with self.assertRaisesRegex(AssertionError, "unexpectedly failed"):
+                    self.require_kernel_landlock()
+        with patch(
+            __name__ + "._probe_landlock_abi_version", return_value=(9, 0)
+        ), patch.object(
+            self, "capture",
+            side_effect=cap.CaptureDenied("protected collector child could not start"),
+        ):
+            with self.assertRaisesRegex(
+                cap.CaptureDenied, "collector child could not start"
+            ):
+                self.require_kernel_landlock()
 
     def fake_root_file(self, path: Path, **_kwargs):
         # EXPLICIT test-only substitute for absent UID0/root installed files.
