@@ -123,11 +123,11 @@ def _assert_unchanged_snapshot(
     original_leaves: dict[str, bytes],
     original_leaf_identities: dict[str, tuple[int, ...]],
 ) -> None:
-    """Detect replacement or in-place modification after earlier leaf reads.
+    """Best-effort detection of drift across bounded sequential leaf reads.
 
-    This verifies one bounded read interval. Even a successful diagnostic
-    cannot promise these paths remain immutable after it returns; no signature
-    verification, attempt retry, or Day-1 admission is granted.
+    A second-pass writer can still modify a previously checked leaf or write
+    immediately after the final check. This never establishes an atomic,
+    immutable or current-path-consistent snapshot, nor admission or retry.
     """
     try:
         current_leaves = set(os.listdir(directory_fd))
@@ -226,9 +226,11 @@ def _verify_nonadmitting_proof(
 def inspect_reserved_prototype(root_fd: int) -> dict[str, Any]:
     """Describe persisted material without cryptographic admission or retry.
 
-    The only positive classification means *byte consistency*, NOT a signature
-    verification, actual task authority, durability proof, or host attestation.
-    Every result explicitly forbids admission and another capture attempt.
+    All classifications are non-authoritative observations. Sequential file
+    reads cannot prove one atomic snapshot or ongoing path consistency against
+    a privileged concurrent writer, even with repeated checks. No result
+    verifies a signature, task authority, durability, or admission; every result
+    forbids retry and another capture attempt.
     """
     provider._check_staging_root_owned(root_fd)
     original_root_identity = provider._file_identity(os.fstat(root_fd))
@@ -257,6 +259,12 @@ def inspect_reserved_prototype(root_fd: int) -> dict[str, Any]:
         "signature_verified": False,
         "retry_authorized": False,
         "recovery_complete": False,
+        # Root-owned paths can still be mutated by another privileged actor
+        # during or immediately after the final verification pass. These
+        # properties are NEVER upgraded by an observational classifier.
+        "atomic_snapshot_verified": False,
+        "current_path_integrity_verified": False,
+        "artifact_immutability_verified": False,
     }
     if published not in entries and staging not in entries:
         return {**result, "status": "reserved_without_publication"}
@@ -311,9 +319,11 @@ def inspect_reserved_prototype(root_fd: int) -> dict[str, Any]:
         _require_current_directory(root_fd, name, fd)
         return {
             **result,
-            "status": "published_prototype_bytes_consistent_signature_unverified",
-            "proof_sha256": hashlib.sha256(proof_raw).hexdigest(),
-            "signature_sha256": hashlib.sha256(signature).hexdigest(),
+            "status": "published_prototype_material_observed_unverified",
+            # Hashes of bytes actually read, NOT hashes of an authenticated
+            # atomic or immutable on-disk bundle.
+            "observed_proof_sha256": hashlib.sha256(proof_raw).hexdigest(),
+            "observed_signature_sha256": hashlib.sha256(signature).hexdigest(),
         }
     finally:
         os.close(fd)

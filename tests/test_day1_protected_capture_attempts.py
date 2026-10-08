@@ -101,15 +101,90 @@ class ProtectedAttemptReadbackTests(unittest.TestCase):
             self.publish(fd, capture_id, nonce, stdout=b"true source bytes")
             view = rec.inspect_reserved_prototype(fd)
             self.assertEqual(
-                "published_prototype_bytes_consistent_signature_unverified",
+                "published_prototype_material_observed_unverified",
                 view["status"],
             )
             self.assertEqual(capture_id, view["capture_id"])
-            self.assertEqual(64, len(view["proof_sha256"]))
+            self.assertEqual(64, len(view["observed_proof_sha256"]))
             self.assertFalse(view["signature_verified"])
             self.assertFalse(view["day1_admission_authorized"])
             self.assertFalse(view["recovery_complete"])
             self.assertFalse(view["retry_authorized"])
+            self.assertIs(view["atomic_snapshot_verified"], False)
+            self.assertIs(view["current_path_integrity_verified"], False)
+            self.assertIs(view["artifact_immutability_verified"], False)
+
+    def test_second_pass_inplace_mutation_never_claims_atomic_consistency(self) -> None:
+        # This is the exact unresolved Codex P2: the second stderr read
+        # modifies stdout *after* its own second-pass identity check.
+        # The diagnostic cannot prove current-path consistency and must not
+        # report it, whether it detects the write or not.
+        with self.fixture() as fd:
+            capture_id, nonce = self.reserve(fd)
+            path = self.publish(fd, capture_id, nonce)
+            original_read = rec._read_leaf
+            count = {"stderr.bin": 0}
+            injected = [False]
+
+            def rewrite_after_stdout_recheck(directory_fd, name, maximum):
+                data = original_read(directory_fd, name, maximum)
+                if name == "stderr.bin":
+                    count["stderr.bin"] += 1
+                    if count["stderr.bin"] == 2:
+                        with (path / "stdout.bin").open("r+b") as target:
+                            target.seek(0)
+                            target.write(b"X")
+                        injected[0] = True
+                return data
+
+            with patch.object(rec, "_read_leaf", side_effect=rewrite_after_stdout_recheck):
+                result = rec.inspect_reserved_prototype(fd)
+            self.assertTrue(injected[0])
+            self.assertTrue((path / "stdout.bin").read_bytes().startswith(b"X"))
+            self.assertEqual(
+                "published_prototype_material_observed_unverified",
+                result["status"],
+            )
+            for field in (
+                "atomic_snapshot_verified", "current_path_integrity_verified",
+                "artifact_immutability_verified", "signature_verified",
+                "day1_admission_authorized", "retry_authorized",
+                "recovery_complete", "task_binding_verified",
+            ):
+                self.assertIs(result[field], False)
+
+    def test_modification_at_final_path_check_never_claims_immutability(self) -> None:
+        # A privileged writer can change a leaf even AFTER the last
+        # snapshot re-read. No finite number of checks can prevent it.
+        with self.fixture() as fd:
+            capture_id, nonce = self.reserve(fd)
+            path = self.publish(fd, capture_id, nonce)
+            original_check = rec._require_current_directory
+            calls = [0]
+
+            def inject_at_last_check(parent_fd, name, directory_fd):
+                calls[0] += 1
+                checked = original_check(parent_fd, name, directory_fd)
+                if calls[0] == 2:
+                    with (path / "stdout.bin").open("r+b") as out:
+                        out.seek(0)
+                        out.write(b"Y")
+                return checked
+
+            with patch.object(rec, "_require_current_directory",
+                              side_effect=inject_at_last_check):
+                result = rec.inspect_reserved_prototype(fd)
+            self.assertEqual(2, calls[0])
+            self.assertTrue((path / "stdout.bin").read_bytes().startswith(b"Y"))
+            self.assertEqual(
+                "published_prototype_material_observed_unverified", result["status"],
+            )
+            for field in (
+                "atomic_snapshot_verified", "current_path_integrity_verified",
+                "artifact_immutability_verified", "day1_admission_authorized",
+                "signature_verified", "retry_authorized",
+            ):
+                self.assertIs(result[field], False)
 
     def test_mismatched_stdout_and_forged_admission_are_rejected(self) -> None:
         with self.fixture() as fd:
