@@ -248,8 +248,16 @@ class SignedTaskProofTests(unittest.TestCase):
             with self.assertRaises(verifier.ValidationError):
                 verifier._read_root_owned_signers()
 
+    def test_linux_libc_memfd_fallback_verifies_real_signature(self) -> None:
+        # CPython distributions may omit os.memfd_create despite a working
+        # Linux kernel; the fallback is still sealed, never a pathname.
+        with patch.object(verifier.os, "memfd_create", None, create=True):
+            result = self.check()
+        self.assertTrue(result["cryptographic_binding_checked"])
+        self.assertFalse(result["day1_admission_authorized"])
+
     def test_signature_requires_strictly_sealed_kernel_descriptors(self) -> None:
         with patch.object(verifier.os, "memfd_create",
-                          side_effect=OSError("unavailable")):
+                          side_effect=OSError("unavailable"), create=True):
             with self.assertRaises(verifier.ValidationError):
                 self.check()

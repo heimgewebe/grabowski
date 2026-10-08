@@ -8,6 +8,7 @@ claim does not prove that the signer observed the actual executed closure.
 
 from __future__ import annotations
 
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -210,16 +211,39 @@ def _read_root_owned_signers() -> bytes:
         raise ValidationError("root-protected signing policy is unavailable") from exc
 
 
+def _create_linux_memfd(name: str) -> int:
+    """Use Linux memfd with sealing, even on Python builds hiding os wrappers.
+
+    0x0001/0x0002 are the kernel's MFD_CLOEXEC/MFD_ALLOW_SEALING flags.
+    If glibc or the kernel does not support the call, refuse verification.
+    This is never a fallback to a user-replaceable filesystem path.
+    """
+    if os.name != "posix" or not hasattr(fcntl, "fcntl"):
+        raise ValidationError("Linux sealed verifier FDs are unavailable")
+    flags = getattr(os, "MFD_CLOEXEC", 0x0001) | getattr(
+        os, "MFD_ALLOW_SEALING", 0x0002
+    )
+    native = getattr(os, "memfd_create", None)
+    try:
+        if callable(native):
+            return native(name, flags)
+        libc = ctypes.CDLL(None, use_errno=True)
+        create = getattr(libc, "memfd_create", None)
+        if create is None:
+            raise ValidationError("Linux libc memfd_create is unavailable")
+        create.argtypes = [ctypes.c_char_p, ctypes.c_uint]
+        create.restype = ctypes.c_int
+        descriptor = create(name.encode("ascii"), flags)
+        if descriptor < 0:
+            raise OSError(ctypes.get_errno(), "Linux memfd_create failed")
+        return descriptor
+    except (OSError, UnicodeEncodeError) as exc:
+        raise ValidationError("sealed verifier inputs cannot be created") from exc
+
+
 def _sealed_memfd(name: str, data: bytes) -> int:
     """Freeze verifier inputs in kernel-sealed anonymous FDs, not /tmp."""
-    if not hasattr(os, "memfd_create") or not hasattr(os, "MFD_ALLOW_SEALING"):
-        raise ValidationError("sealed verifier input descriptors are unavailable")
-    try:
-        descriptor = os.memfd_create(
-            name, os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
-        )
-    except OSError as exc:
-        raise ValidationError("sealed verifier inputs cannot be created") from exc
+    descriptor = _create_linux_memfd(name)
     try:
         view = memoryview(data)
         while view:
@@ -227,9 +251,21 @@ def _sealed_memfd(name: str, data: bytes) -> int:
             if written <= 0:
                 raise ValidationError("cannot freeze verifier input")
             view = view[written:]
-        seal = (fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
-                fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
-        fcntl.fcntl(descriptor, fcntl.F_ADD_SEALS, seal)
+        # Linux F_ADD_SEALS=1033, F_GET_SEALS=1034. Some Python 3.12
+        # distributions do not expose the named constants; use stable ABI
+        # values and verify the kernel actually installed every seal.
+        seal = (
+            getattr(fcntl, "F_SEAL_WRITE", 8)
+            | getattr(fcntl, "F_SEAL_GROW", 4)
+            | getattr(fcntl, "F_SEAL_SHRINK", 2)
+            | getattr(fcntl, "F_SEAL_SEAL", 1)
+        )
+        fcntl.fcntl(descriptor, getattr(fcntl, "F_ADD_SEALS", 1033), seal)
+        observed = fcntl.fcntl(
+            descriptor, getattr(fcntl, "F_GET_SEALS", 1034)
+        )
+        if observed & seal != seal:
+            raise ValidationError("kernel did not seal verifier inputs")
         os.lseek(descriptor, 0, os.SEEK_SET)
         return descriptor
     except OSError as exc:

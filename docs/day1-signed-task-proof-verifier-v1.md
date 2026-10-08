@@ -18,6 +18,8 @@ The detached signature is SSHSIG with fixed principal `grabowski-day1-capture@he
 
 The verifier snapshots proof, signature, stdout and stderr as bounded **bytes** before checking; it does not follow mutable output paths. The signature and allowed-signers policy are presented to `ssh-keygen` via Linux `memfd_create` FDs after applying `F_SEAL_WRITE`, `F_SEAL_GROW`, `F_SEAL_SHRINK`, `F_SEAL_SEAL`, not via replaceable temporary pathnames. Signature failure, no sealed FDs, missing protected trust policy, mismatched nonce/context, altered streams, missing completion, truncation, oversized output, stale/future observation and failed exit all fail closed.
 
+Linux compatibility: use CPython's native `os.memfd_create` and named `fcntl` seals when exported, otherwise the glibc `memfd_create` symbol with the stable Linux ABI flags and kernel `F_GET_SEALS` readback. In both paths the kernel must confirm every required seal. No filesystem fallback exists; an unavailable libc symbol, sealing error or missing `/proc/self/fd` results in denial.
+
 ## Explicit non-claims
 
 **A valid signature authenticates a statement from the allowed signer, not the truth of that statement's capture/process claims.** This verifier **does not establish**:
