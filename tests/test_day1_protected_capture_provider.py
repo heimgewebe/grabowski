@@ -396,6 +396,25 @@ int main(void) {char data[65536]={0}; (void)write(1,data,sizeof(data)); return 0
 int main(void) {sleep(3);return 0;}
 ''',
         }
+        sources["second_stage"] = r'''
+#include <unistd.h>
+int main(void) {
+ const char msg[]="SECOND_EXEC_NOT_PINNED\n";
+ (void)write(1,msg,sizeof(msg)-1);
+ return 0;
+}
+'''
+        # Compile second_stage before second_exec. Neither may run outside
+        # the disposable fixture; the second exec does not allocate a PID.
+        sources["second_exec"] = (
+            '#include <unistd.h>\n'
+            'int main(void) {\n'
+            f' const char *path = {json.dumps(str(cls.tmp / "second_stage"))};\n'
+            ' char *const args[] = {(char *)path, 0};\n'
+            ' execv(path, args);\n'
+            ' return 9;\n'
+            '}\n'
+        )
         for name, source in sources.items():
             sourcepath = cls.tmp / f"{name}.c"
             binary = cls.tmp / name
@@ -459,6 +478,59 @@ int main(void) {sleep(3);return 0;}
         self.assertEqual(1, len(argv))
         self.assertRegex(argv[0], r"^/proc/self/fd/\d+$")
         self.assertGreaterEqual(end, begin)
+
+    def test_second_execve_yields_only_nonadmitting_signed_prototype(self) -> None:
+        # A reviewed initial static ELF may execve another ELF in the same
+        # PID. Root/UID/cgroup ownership gates are mocked in this fixture.
+        initial = self.programs["second_exec"]
+        second = self.programs["second_stage"]
+        self.assertNotEqual(sha(initial.read_bytes()), sha(second.read_bytes()))
+        self.active_binary = initial
+        self.policy_file = Path(self.temp.name) / "policy"
+        self.policy_file.write_bytes(cap._json_bytes(
+            example_policy(initial.read_bytes())
+        ))
+        def fake_dir(_path, *, private=False):
+            return os.open(self.dest, os.O_RDONLY | os.O_DIRECTORY)
+        with (
+            patch.object(cap.os, "geteuid", return_value=0),
+            patch.object(cap, "SIGNING_KEY_PATH", self.key),
+            patch.object(cap, "_open_root_file", side_effect=self.fake_root_file),
+            patch.object(cap, "_open_root_directory", side_effect=fake_dir),
+            patch.object(cap, "_check_staging_root_owned", return_value=None),
+            patch.object(cap, "_validate_signer_static", return_value=None),
+            patch.object(cap, "_separate_child_identity",
+                         return_value=(os.getuid(), os.getgid())),
+            patch.object(cap, "_drop_to_child", return_value=None),
+            patch.object(cap, "_assert_cgroup_drained", return_value=None),
+        ):
+            outcome = cap.run()
+        bundle = self.dest / outcome["bundle_name"]
+        stdout = (bundle / "stdout.bin").read_bytes()
+        proofbytes = (bundle / "proof.json").read_bytes()
+        proof = json.loads(proofbytes)
+        self.assertEqual(b"SECOND_EXEC_NOT_PINNED\n", stdout)
+        self.assertEqual(sha(stdout), proof["captured_stdout_sha256"])
+        self.assertEqual(sha(initial.read_bytes()), proof["initial_executable_sha256"])
+        self.assertNotEqual(sha(second.read_bytes()), proof["initial_executable_sha256"])
+        self.assertEqual("primary_exited_zero_pipes_closed_tree_unverified", proof["state"])
+        for field in (
+            "execution_closure_verified", "collector_process_tree_verified",
+            "actual_task_binding_verified", "day1_admission_authorized",
+        ):
+            self.assertIs(proof[field], False)
+        self.assertFalse(outcome["day1_admission_authorized"])
+        self.assertNotIn("execution_closure_sha256", proof)
+        signature = bundle / "proof.sshsig"
+        checked = subprocess.run(
+            ["/usr/bin/ssh-keygen", "-Y", "verify",
+             "-f", str(self.signers), "-I", cap.PROOF_ISSUER,
+             "-n", cap.PROOF_NAMESPACE, "-s", str(signature)],
+            input=proofbytes, capture_output=True, timeout=15,
+        )
+        self.assertEqual(
+            0, checked.returncode, checked.stderr.decode(errors="replace")
+        )
 
     def test_genuinely_empty_stdout_can_be_captured(self) -> None:
         stdout, stderr, code, *_ = self.capture("empty")
