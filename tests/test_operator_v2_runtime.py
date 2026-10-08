@@ -3897,6 +3897,99 @@ class CaptainAuditTrailTests(unittest.TestCase):
         self.assertFalse(material["execution_invoked"])
         self.assertTrue(material["external_merge_observed"])
 
+    def test_verified_preexisting_queue_entries_keep_durable_pending_followups(self) -> None:
+        import grabowski_repoground_post_merge as post_merge
+
+        for reconciliation in (
+            "already_queued_before_dispatch",
+            "queued_during_dispatch_guard",
+        ):
+            canonical = {
+                "action": "pr-merge",
+                "execution_invoked": False,
+                "execution_attempted": False,
+                "preflight_passed": True,
+                "duplicate_dispatch_prevented": True,
+                "verification_passed": True,
+                "remote_mutation_observed": False,
+                "merge_queued": True,
+                "merge_completion_verified": False,
+                "merge_queue_reconciliation": reconciliation,
+                "merge_queue_entry": {"id": "MQE_verified", "position": 1},
+            }
+            result = {
+                "status": "passed",
+                "receipt": {
+                    "status": "passed",
+                    "receipt_sha256": "a" * 64,
+                    "output_sha256": "b" * 64,
+                },
+                "output": {"executions": [canonical]},
+            }
+            with self.subTest(reconciliation=reconciliation):
+                material = grabowski_mcp._captain_audit_execution_result_material(
+                    result, action="pr-merge"
+                )
+                self.assertEqual(
+                    material["provenance_mode"],
+                    "captain_queue_dispatch_pending",
+                )
+                self.assertFalse(material["execution_invoked"])
+                self.assertTrue(material["verification_passed"])
+                self.assertTrue(material["merge_queued"])
+                record = {
+                    "operation": "captain-run-audit-completion",
+                    "kind": "grabowski_captain_run_audit",
+                    "schema_version": 1,
+                    "phase": "completion",
+                    "action": "pr-merge",
+                    "target_repo": "heimgewebe/grabowski",
+                    "target_pr": 1382,
+                    "expected_head": "c" * 40,
+                    "expected_base": "main",
+                    "execution_result": material,
+                }
+                with patch.object(
+                    post_merge, "_verified_captain_completion_record",
+                    return_value=record,
+                ):
+                    followup = post_merge.captain_followup_request_from_audit(
+                        "d" * 64,
+                        python_executable="/usr/bin/python3",
+                        script_path=Path(post_merge.__file__),
+                    )
+                self.assertEqual(followup["status"], "ready_queue_watch")
+                self.assertIn("--pr", followup["argv"])
+                self.assertEqual(followup["pull_request"], 1382)
+
+            # A lookalike without trusted queue verification must not acquire
+            # durable scheduling authority merely by setting merge_queued.
+            for override in (
+                {"preflight_passed": False},
+                {"merge_queue_entry": None},
+                {"duplicate_dispatch_prevented": False},
+                {"verification_passed": False},
+                {"merge_queue_reconciliation": "unknown"},
+                {"merge_queued": False},
+                {
+                    "external_merge_reconciliation": {
+                        "external_merge_observed": True,
+                        "dispatch_called": False,
+                    },
+                },
+            ):
+                hostile = dict(canonical, **override)
+                hostile_result = {
+                    **result, "output": {"executions": [hostile]}
+                }
+                with self.subTest(
+                    reconciliation=reconciliation, override=override
+                ):
+                    invalid = grabowski_mcp._captain_audit_execution_result_material(
+                        hostile_result, action="pr-merge"
+                    )
+                    self.assertEqual(invalid["provenance_mode"], "unverified")
+
     def test_completion_material_preserves_exact_base_reconciled_merge_sha(self) -> None:
         merge_sha = "d" * 40
         result = {

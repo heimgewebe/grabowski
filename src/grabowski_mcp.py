@@ -13950,13 +13950,25 @@ def _captain_audit_execution_result_material(
     ):
         provenance_mode = "external_merge_reconciled"
     elif (
-        execution_invoked
-        and verification_passed
+        verification_passed
         and merge_queued
         and not merge_completion_verified
         and observed_merge_sha is None
         and not external_merge_observed
+        and (
+            execution_invoked
+            or (
+                execution.get("preflight_passed") is True
+                and execution.get("duplicate_dispatch_prevented") is True
+                and isinstance(execution.get("merge_queue_entry"), dict)
+                and execution.get("merge_queue_reconciliation")
+                in {"already_queued_before_dispatch", "queued_during_dispatch_guard"}
+            )
+        )
     ):
+        # A verified queue that Captain deliberately did not dispatch again
+        # still needs the same durable completion watcher. Do not permit an
+        # unverified queue, an external merge, or an ambiguous guard outcome.
         provenance_mode = "captain_queue_dispatch_pending"
     else:
         provenance_mode = "unverified"
