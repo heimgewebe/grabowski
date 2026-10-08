@@ -5934,7 +5934,9 @@ def _initialize_post_merge_discovery_before_activation(
         command,
         check=False,
         capture=True,
-        timeout=max(timeout_seconds, 240),
+        # Verified audit discovery can consume up to 900s on cold history.
+        # Keep startup fail-closed, but do not impose the former 240s cap.
+        timeout=max(timeout_seconds, 960),
     )
     if result.returncode != 0:
         core.fail(

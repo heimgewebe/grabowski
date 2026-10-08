@@ -384,21 +384,27 @@ def _post_merge_job_starter(
                 if isinstance(readback, dict) and exact(readback):
                     reusable = reuse(unit, readback)
                     if reusable is not None:
-                        return reusable
-                    if isinstance(exc, FileExistsError):
-                        continue
-                    return uncertain(
-                        readback,
-                        final_status="terminal_after_ambiguous_start",
-                        error_class=type(exc).__name__,
-                    )
+                        return {**reusable, "start_attempted": True}
+                    # We cannot prove whether the attempt changed on-disk job
+                    # artifacts; stop this pass rather than trying another slot.
+                    return {
+                        **uncertain(
+                            readback,
+                            final_status="terminal_after_ambiguous_start",
+                            error_class=type(exc).__name__,
+                        ),
+                        "start_attempted": True,
+                    }
                 if isinstance(exc, FileExistsError) and readback is None:
                     # First observation is always ambiguous. A start may be
                     # concurrently writing metadata; do not try another unit.
-                    return uncertain(
-                        {"unit": unit, "reused": True},
-                        error_class="MetadataFreeReservedSlot",
-                    )
+                    return {
+                        **uncertain(
+                            {"unit": unit, "reused": True},
+                            error_class="MetadataFreeReservedSlot",
+                        ),
+                        "start_attempted": True,
+                    }
                 raise
 
             if (
@@ -1433,6 +1439,29 @@ def schedule_followup_request(
             ],
         }
 
+    if job.get("start_attempted") is True:
+        # Even a later positive readback cannot undo this pass's ambiguous
+        # start attempt. Do not dispatch another job before the next pass.
+        return {
+            **_followup_base(
+                status="schedule_unknown",
+                reason="durable_job_start_outcome_unknown",
+                repository=identity["repository"],
+                merge_sha=identity.get("merge_sha"),
+            ),
+            **(
+                {"pull_request": identity["pull_request"]}
+                if "pull_request" in identity else {}
+            ),
+            "unit": unit,
+            "reused": False,
+            "does_not_establish": [
+                "job_not_started",
+                "freshness_failed",
+                "merge_failure",
+            ],
+        }
+
     if job.get("reuse_satisfied") is True:
         return {
             **_followup_base(
@@ -1481,9 +1510,13 @@ def schedule_followup_request(
         }
 
     if job.get("reuse_uncertain") is True:
+        # An observation-only reuse never launches a job: defer it while
+        # rotating the cursor. A failed or ambiguous _start_job invocation
+        # remains a possible mutation and stops this reconcile pass.
+        read_only_reuse = job.get("reused") is True
         return {
             **_followup_base(
-                status="schedule_unknown",
+                status="retry_deferred" if read_only_reuse else "schedule_unknown",
                 reason="durable_job_reuse_outcome_unknown",
                 repository=identity["repository"],
                 merge_sha=identity.get("merge_sha"),
@@ -1497,6 +1530,7 @@ def schedule_followup_request(
             "job_id": job.get("job_id"),
             "argv_sha256": job.get("argv_sha256"),
             "expected_receipt": job.get("expected_receipt"),
+            "reused": read_only_reuse,
             "does_not_establish": [
                 "job_not_started",
                 "freshness_failed",
@@ -1564,6 +1598,8 @@ def schedule_from_captain_result(
 
 def _verified_captain_completion_record(
     completion_record_sha256: str,
+    *,
+    verified_snapshot: Any | None = None,
 ) -> dict[str, Any]:
     if (
         not isinstance(completion_record_sha256, str)
@@ -1573,7 +1609,13 @@ def _verified_captain_completion_record(
     import grabowski_audit_query
     import grabowski_grip_orchestration
 
-    snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
+    # Reconciliation already captured a verified immutable chain. Recapturing
+    # on every completion would consume the separately reserved job budget.
+    snapshot = (
+        verified_snapshot
+        if verified_snapshot is not None
+        else grabowski_audit_query.capture_verified_audit_snapshot()
+    )
     record = grabowski_grip_orchestration._verified_captain_audit_record(
         completion_record_sha256,
         snapshot=snapshot,
@@ -1596,8 +1638,11 @@ def captain_followup_request_from_audit(
     *,
     python_executable: str,
     script_path: Path,
+    verified_snapshot: Any | None = None,
 ) -> dict[str, Any]:
-    record = _verified_captain_completion_record(completion_record_sha256)
+    record = _verified_captain_completion_record(
+        completion_record_sha256, verified_snapshot=verified_snapshot
+    )
     repository = _validate_repository(record.get("target_repo"))
     execution = record.get("execution_result")
     if not isinstance(execution, dict):
@@ -1681,11 +1726,13 @@ def schedule_from_captain_audit_completion(
     python_executable: str,
     script_path: Path,
     runtime_seconds: int = DEFAULT_JOB_RUNTIME_SECONDS,
+    verified_snapshot: Any | None = None,
 ) -> dict[str, Any]:
     request = captain_followup_request_from_audit(
         completion_record_sha256,
         python_executable=python_executable,
         script_path=script_path,
+        verified_snapshot=verified_snapshot,
     )
     result = schedule_followup_request(
         request,
@@ -2639,6 +2686,7 @@ def reconcile_recent_captain_audit_followups(
                 job_starter=starter,
                 python_executable=__import__("sys").executable,
                 script_path=Path(__file__).resolve(),
+                verified_snapshot=snapshot,
             )
         outcome_summary = {
             "captain_audit_completion_sha256": record_sha256,
@@ -2656,8 +2704,8 @@ def reconcile_recent_captain_audit_followups(
         # we stop so a single reconcile pass can never create two jobs.
         status = outcome.get("status")
         safe_read_only = (
-            status in {"already_satisfied", "not_scheduled", "retry_deferred"}
-            or (status == "scheduled" and outcome.get("reused") is True)
+            status in {"already_satisfied", "not_scheduled"}
+            or (status in {"scheduled", "retry_deferred"} and outcome.get("reused") is True)
         )
         if safe_read_only:
             cursor_candidate = record_sha256

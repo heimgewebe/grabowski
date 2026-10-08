@@ -4583,6 +4583,23 @@ class DeploymentSequenceTests(unittest.TestCase):
         install_watchdogs.assert_not_called()
         install.assert_not_called()
 
+    def test_post_merge_bootstrap_allows_verified_audit_discovery_budget(self) -> None:
+        result = SimpleNamespace(returncode=0, stdout=json.dumps({
+            "kind": "grabowski.repoground_post_merge_discovery_bootstrap",
+            "schema_version": 1,
+            "status": "ok",
+            "initialized": True,
+            "global_ordinal": 1_675_780,
+        }))
+        with mock.patch.object(core, "run", return_value=result) as runner:
+            summary = dual._initialize_post_merge_discovery_before_activation(
+                Path("/release/exact"), timeout_seconds=60,
+            )
+        self.assertEqual(summary["global_ordinal"], 1_675_780)
+        self.assertGreaterEqual(runner.call_args.kwargs["timeout"], 900)
+        self.assertIn("--initialize-reconcile-watermark",
+                      runner.call_args.args[0])
+
     def test_legacy_stdio_post_merge_reconciler_fails_before_deploy(self) -> None:
         snapshot = self.snapshot()
         snapshot.supporting_source_bytes = {

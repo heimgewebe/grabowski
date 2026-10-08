@@ -660,6 +660,173 @@ class RepoGroundCaptainAuditFollowupTests(unittest.TestCase):
 
 
 class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
+    def test_reconcile_reuses_original_verified_snapshot_for_audit_completion(self) -> None:
+        sha = "a" * 64
+        snapshot = types.SimpleNamespace(total_records=1, segments=())
+        captures: list[object] = []
+        scanned = [{
+            "record": {
+                "operation": "captain-run-audit-completion",
+                "action": "pr-merge",
+                "timestamp_unix": 9_950,
+            },
+            "evidence": {"record_sha256": sha, "global_ordinal": 1},
+        }]
+        full_record = {
+            "operation": "captain-run-audit-completion",
+            "kind": "grabowski_captain_run_audit",
+            "schema_version": 1,
+            "phase": "completion",
+            "action": "pr-merge",
+            "target_repo": REPO,
+            "target_pr": PR,
+            "expected_head": HEAD,
+            "expected_base": BASE,
+            "execution_result": {
+                "verification_passed": True,
+                "provenance_mode": "captain_dispatch_verified",
+                "observed_merge_sha": MERGE,
+            },
+        }
+
+        def verify(record_sha: str, *, snapshot: object, audit_query_module: object) -> dict:
+            self.assertEqual(record_sha, sha)
+            self.assertIs(snapshot, observed_snapshot)
+            self.assertIs(audit_query_module, audit)
+            return full_record
+
+        observed_snapshot = snapshot
+        audit = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=10,
+            capture_verified_audit_snapshot=lambda: (
+                captures.append(snapshot) or snapshot
+            ),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter(scanned),
+        )
+        starter_calls: list[tuple] = []
+        def starter(argv: list[str], **kwargs: object) -> dict:
+            starter_calls.append((tuple(argv), kwargs))
+            return {"unit": "grabowski-job-test", "reused": False}
+
+        with (
+            patch.dict(sys.modules, {
+                "grabowski_audit_query": audit,
+                "grabowski_grip_orchestration": types.SimpleNamespace(
+                    _verified_captain_audit_record=verify,
+                ),
+                "grabowski_operator": types.SimpleNamespace(),
+            }),
+            patch.object(post_merge.time, "time", return_value=10_000),
+            patch.object(post_merge, "resolve_job_starter", return_value=starter),
+        ):
+            result = post_merge.reconcile_recent_captain_audit_followups(
+                lookback_seconds=100,
+            )
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(len(starter_calls), 1)
+        self.assertEqual(len(captures), 1, "the verified audit chain was recaptured")
+
+    def test_uncertain_reused_job_does_not_claim_a_new_launch_attempt(self) -> None:
+        request = {
+            "status": "ready",
+            "repository": REPO,
+            "merge_sha": MERGE,
+            "argv": ["/usr/bin/python3", "-B", str(Path(post_merge.__file__))],
+            "cwd": str(Path(post_merge.__file__).parent),
+        }
+        returned = post_merge.schedule_followup_request(
+            request,
+            job_starter=lambda *_args, **_kwargs: {
+                "unit": "grabowski-job-uncertain",
+                "reused": True,
+                "reuse_uncertain": True,
+            },
+        )
+        self.assertEqual(returned["status"], "retry_deferred")
+        self.assertEqual(returned["reason"], "durable_job_reuse_outcome_unknown")
+        self.assertTrue(returned["reused"])
+        self.assertEqual(returned["unit"], "grabowski-job-uncertain")
+        self.assertNotIn("freshness_converged", returned)
+
+    def test_prior_mutation_remains_unknown_even_when_readback_is_positive(self) -> None:
+        request = {
+            "status": "ready",
+            "repository": REPO,
+            "merge_sha": MERGE,
+            "argv": ["/usr/bin/python3", "-B", str(Path(post_merge.__file__))],
+            "cwd": str(Path(post_merge.__file__).parent),
+        }
+        for flags in (
+            {"reuse_satisfied": True},
+            {"reuse_retry_deferred": True},
+            {"reuse_uncertain": True},
+        ):
+            with self.subTest(flags=flags):
+                returned = post_merge.schedule_followup_request(
+                    request,
+                    job_starter=lambda *_args, **_kwargs: {
+                        "unit": "grabowski-job-ambiguous",
+                        "reused": True,
+                        "start_attempted": True,
+                        **flags,
+                    },
+                )
+                self.assertEqual(returned["status"], "schedule_unknown")
+                self.assertFalse(returned["reused"])
+                self.assertIn("job_not_started", returned["does_not_establish"])
+
+    def test_uncertain_reused_slot_rotates_cursor_without_advancing_watermark(self) -> None:
+        first, second = "a" * 64, "b" * 64
+        rows = [{
+            "record": {
+                "operation": "captain-run-audit-completion",
+                "action": "pr-merge",
+                "timestamp_unix": 9_950,
+            },
+            "evidence": {"record_sha256": sha, "global_ordinal": i},
+        } for i, sha in ((14, first), (13, second))]
+        rows.append({
+            "record": {"operation": "runtime-observation", "timestamp_unix": 9_940},
+            "evidence": {"record_sha256": "c"*64, "global_ordinal": 12},
+        })
+        audit = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=100,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snap, *, order: iter(rows),
+        )
+        scheduled: list[str] = []
+        saved: list[tuple[str | None, int | None]] = []
+        def schedule(sha: str, **kwargs: object) -> dict:
+            scheduled.append(sha)
+            return (
+                {"status": "retry_deferred", "reason": "durable_job_reuse_outcome_unknown", "reused": True}
+                if sha == first else
+                {"status": "already_satisfied", "reason": "durable_freshness_already_converged", "reused": True}
+            )
+        with (
+            patch.dict(sys.modules, {
+                "grabowski_audit_query": audit,
+                "grabowski_operator": types.SimpleNamespace(STATE_DIR=Path("/state")),
+                "grabowski_tasks": types.SimpleNamespace(),
+            }),
+            patch.object(post_merge.time, "time", return_value=10_000),
+            patch.object(post_merge, "resolve_job_starter", return_value=lambda *a, **k: {}),
+            patch.object(post_merge, "schedule_from_captain_audit_completion", side_effect=schedule),
+            patch.object(post_merge, "_load_reconcile_cursor", return_value=None),
+            patch.object(post_merge, "_load_reconcile_discovery_ordinal", return_value=12),
+            patch.object(post_merge, "_save_reconcile_progress",
+                side_effect=lambda _tasks, *, cursor, discovery_ordinal: saved.append(
+                    (cursor, discovery_ordinal)
+                )),
+        ):
+            result = post_merge.reconcile_recent_captain_audit_followups(lookback_seconds=100)
+        self.assertEqual(scheduled, [first, second])
+        self.assertEqual(result["cursor_after"], second)
+        self.assertEqual(result["discovery_ordinal_after"], 12)
+        self.assertFalse(result["discovery_watermark_persisted"])
+        self.assertEqual(saved, [(second, None)])
+
     def test_default_reconcile_lookback_outlives_durable_job_runtime(self) -> None:
         self.assertGreater(
             post_merge.DEFAULT_RECONCILE_LOOKBACK_SECONDS,
@@ -4350,7 +4517,8 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
             # Newly created files might still be written by a concurrent
             # actor. Deferral is read-only; it must not launch another unit.
             recent = schedule()
-            self.assertEqual(recent["status"], "schedule_unknown")
+            self.assertEqual(recent["status"], "retry_deferred")
+            self.assertTrue(recent["reused"])
             self.assertEqual(len(starts), 1)
             self.assertEqual(mutation_checks, ["durable_job"])
 
@@ -4499,7 +4667,7 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
                 )
 
             self.assertEqual(schedule()["status"], "schedule_unknown")
-            self.assertEqual(schedule()["status"], "schedule_unknown")
+            self.assertEqual(schedule()["status"], "retry_deferred")
             self.assertEqual(len(starts), 1)
             future_ns = time.time_ns() + (
                 post_merge.POST_MERGE_METADATA_FREE_SLOT_GRACE_SECONDS + 10
@@ -4776,8 +4944,9 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
 
         self.assertEqual(jobs[first["unit"]]["final_status"], "launch_submitted")
         self.assertEqual(len(starts), 1)
-        self.assertEqual(second["status"], "schedule_unknown")
+        self.assertEqual(second["status"], "retry_deferred")
         self.assertEqual(second["reason"], "durable_job_reuse_outcome_unknown")
+        self.assertTrue(second["reused"])
         self.assertEqual(second["unit"], first["unit"])
 
     def test_queue_watch_rejects_runtime_without_convergence_reserve(self) -> None:
