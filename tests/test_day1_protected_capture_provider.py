@@ -222,6 +222,129 @@ class StrictContractTests(unittest.TestCase):
             "primary_exited_zero_pipes_closed_tree_unverified", proof["state"]
         )
 
+    def test_cgroup_kernel_gate_denies_missing_or_surviving_process_tree(self) -> None:
+        # Mocked root-owned cgroup values: not a deployed host attestation.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            expected = f"0::{cap.UNIT_CGROUP}\n".encode("ascii")
+            baseline = {
+                "pids.max": b"2\n",
+                "pids.current": b"1\n",
+                "cgroup.procs": f"{os.getpid()}\n".encode("ascii"),
+            }
+            values = dict(baseline)
+            def open_fixture(_path):
+                return os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            def read_fixture(_fd, name):
+                return values[name]
+            with (
+                patch.object(cap, "_open_root_directory", side_effect=open_fixture),
+                patch.object(cap, "_read_cgroup_leaf", side_effect=read_fixture),
+                patch.object(cap, "_read_proc_cgroup", return_value=expected),
+            ):
+                cap._assert_cgroup_drained()
+                for name, wrong in (
+                    ("pids.max", b"max\n"),
+                    ("pids.max", b"3\n"),
+                    ("pids.current", b"2\n"),  # Escaped child/nested cgroup.
+                    ("pids.current", b"0\n"),
+                    ("cgroup.procs", f"{os.getpid()}\n999999\n".encode()),
+                    ("cgroup.procs", b"999999\n"),
+                ):
+                    with self.subTest(name=name, value=wrong):
+                        values[name] = wrong
+                        with self.assertRaisesRegex(
+                            cap.CaptureDenied, "cgroup limit or process tree"
+                        ):
+                            cap._assert_cgroup_drained()
+                        values[name] = baseline[name]
+            with patch.object(cap, "_read_proc_cgroup", return_value=(
+                b"0::/user.slice/user-1000.slice/attacker.service\n"
+            )):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "outside its fixed systemd cgroup"
+                ):
+                    cap._assert_cgroup_drained()
+
+    def test_cgroup_kernel_readback_drift_blocks_signing(self) -> None:
+        expected = f"0::{cap.UNIT_CGROUP}\n".encode("ascii")
+        with tempfile.TemporaryDirectory() as temp:
+            values = {
+                "pids.max": b"2\n",
+                "pids.current": b"1\n",
+                "cgroup.procs": f"{os.getpid()}\n".encode("ascii"),
+            }
+            reads = [0]
+            def race(_fd, name):
+                if name == "pids.current":
+                    reads[0] += 1
+                    if reads[0] == 2:
+                        return b"2\n"
+                return values[name]
+            with (
+                patch.object(cap, "_read_proc_cgroup", return_value=expected),
+                patch.object(cap, "_open_root_directory",
+                             side_effect=lambda _path: os.open(
+                                 temp, os.O_RDONLY | os.O_DIRECTORY)),
+                patch.object(cap, "_read_cgroup_leaf", side_effect=race),
+            ):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "cgroup limit or process tree"
+                ):
+                    cap._assert_cgroup_drained()
+            self.assertEqual(2, reads[0])
+            with (
+                patch.object(cap, "_read_proc_cgroup", side_effect=[
+                    expected, b"0::/system.slice/other.service\n"
+                ]),
+                patch.object(cap, "_open_root_directory",
+                             side_effect=lambda _path: os.open(
+                                 temp, os.O_RDONLY | os.O_DIRECTORY)),
+                patch.object(cap, "_read_cgroup_leaf",
+                             side_effect=lambda _fd, name: values[name]),
+            ):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "changed cgroup"
+                ):
+                    cap._assert_cgroup_drained()
+
+    def test_cgroup_leaf_rejects_symlink_and_untrusted_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "pids.max").symlink_to("/etc/hosts")
+            (root / "pids.current").write_bytes(b"1\n")
+            fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "unapproved cgroup control"
+                ):
+                    cap._read_cgroup_leaf(fd, "arbitrary")
+                with self.assertRaises(cap.CaptureDenied):
+                    cap._read_cgroup_leaf(fd, "pids.max")
+                # Only test-doubles grant root metadata to a user-owned temp file.
+                for mode, uid, passes in (
+                    (0o100644, 0, True),
+                    (0o100666, 0, False),
+                    (0o100644, os.getuid() or 1000, False),
+                ):
+                    with self.subTest(mode=mode, uid=uid):
+                        with patch.object(
+                            cap.os, "fstat", return_value=types.SimpleNamespace(
+                                st_mode=mode, st_uid=uid,
+                            ),
+                        ):
+                            if passes:
+                                self.assertEqual(
+                                    b"1\n", cap._read_cgroup_leaf(fd, "pids.current")
+                                )
+                            else:
+                                with self.assertRaisesRegex(
+                                    cap.CaptureDenied, "not root-controlled"
+                                ):
+                                    cap._read_cgroup_leaf(fd, "pids.current")
+            finally:
+                os.close(fd)
+
     def test_unit_example_is_inert_and_keeps_root_broker_unchanged(self) -> None:
         root = Path(__file__).resolve().parents[1]
         unit = (root / "systemd" /
@@ -238,6 +361,9 @@ class StrictContractTests(unittest.TestCase):
         # Kernel pids controller permits the root parent + one collector,
         # not a detached forked process (source-only unit template).
         self.assertRegex(unit, r"(?m)^TasksMax=2$")
+        self.assertIn("Slice=system.slice", unit)
+        self.assertIn("TasksAccounting=yes", unit)
+        self.assertIn("ProtectControlGroups=yes", unit)
 
 
 @unittest.skipUnless(shutil.which("gcc") and Path("/usr/lib/x86_64-linux-gnu/libc.a").exists(),
@@ -644,10 +770,49 @@ int main(void) {sleep(3);return 0;}
              patch.object(cap, "_open_root_directory", side_effect=fake_open_dir), \
              patch.object(cap, "_separate_child_identity", return_value=(os.getuid(), os.getgid())), \
              patch.object(cap, "_drop_to_child", return_value=None), \
+             patch.object(cap, "_assert_cgroup_drained", return_value=None), \
              patch.object(cap, "_sign_receipt", side_effect=cap.CaptureDenied("missing signer")):
             with self.assertRaisesRegex(cap.CaptureDenied, "missing signer"):
                 cap.run()
         self.assertEqual([], list(self.dest.glob("prototype-*")))
+
+    def test_cgroup_denial_before_launch_or_after_exit_never_signs(self) -> None:
+        self.active_binary = self.programs["success"]
+        self.policy_file = Path(self.temp.name) / "policy"
+        self.policy_file.write_bytes(cap._json_bytes(
+            example_policy(self.active_binary.read_bytes())
+        ))
+        def fake_dir(_path, *, private=False):
+            return os.open(self.dest, os.O_RDONLY | os.O_DIRECTORY)
+        for failed_gate in (1, 2, 3):
+            with self.subTest(failed_gate=failed_gate):
+                calls = [0]
+                def gate():
+                    calls[0] += 1
+                    if calls[0] == failed_gate:
+                        raise cap.CaptureDenied("simulated cgroup gate failure")
+                def fake_sign(_payload, *, expected_signer_sha256):
+                    if failed_gate < 3:
+                        raise AssertionError("MUST NOT SIGN")
+                    return b"synthetic-signature-not-for-admission"
+                with (
+                    patch.object(cap.os, "geteuid", return_value=0),
+                    patch.object(cap, "_open_root_file", side_effect=self.fake_root_file),
+                    patch.object(cap, "_open_root_directory", side_effect=fake_dir),
+                    patch.object(cap, "_separate_child_identity",
+                                 return_value=(os.getuid(), os.getgid())),
+                    patch.object(cap, "_drop_to_child", return_value=None),
+                    patch.object(cap, "_assert_cgroup_drained", side_effect=gate),
+                    patch.object(cap, "_sign_receipt", side_effect=fake_sign),
+                    patch.object(cap, "_publish_bundle",
+                                 side_effect=AssertionError("MUST NOT PUBLISH")),
+                ):
+                    with self.assertRaisesRegex(
+                        cap.CaptureDenied, "simulated cgroup gate failure"
+                    ):
+                        cap.run()
+                self.assertEqual(failed_gate, calls[0])
+                self.assertEqual([], list(self.dest.glob("prototype-*")))
 
     def test_end_to_end_simulated_static_capture_is_signed_but_not_admitted(self) -> None:
         # The root/uid/path checks are replaced in this user-UID fixture ONLY.
@@ -664,7 +829,8 @@ int main(void) {sleep(3);return 0;}
              patch.object(cap, "_check_staging_root_owned", return_value=None), \
              patch.object(cap, "_validate_signer_static", return_value=None), \
              patch.object(cap, "_separate_child_identity", return_value=(os.getuid(), os.getgid())), \
-             patch.object(cap, "_drop_to_child", return_value=None):
+             patch.object(cap, "_drop_to_child", return_value=None), \
+             patch.object(cap, "_assert_cgroup_drained", return_value=None):
             outcome = cap.run()
         self.assertEqual("root_owned_prototype_bundle_published_not_admitted", outcome["status"])
         self.assertFalse(outcome["day1_admission_authorized"])
@@ -773,6 +939,7 @@ int main(void) {sleep(3);return 0;}
              patch.object(cap, "_open_root_directory", side_effect=fake_open_dir), \
              patch.object(cap, "_separate_child_identity", return_value=(os.getuid(), os.getgid())), \
              patch.object(cap, "_drop_to_child", return_value=None), \
+             patch.object(cap, "_assert_cgroup_drained", return_value=None), \
              patch.object(cap, "_capture_from_pipes", side_effect=flip_source_after_execution), \
              patch.object(cap, "_sign_receipt", side_effect=AssertionError("MUST NOT SIGN")):
             with self.assertRaisesRegex(cap.CaptureDenied, "executable FD changed"):
@@ -793,6 +960,7 @@ int main(void) {sleep(3);return 0;}
              patch.object(cap, "_open_root_directory", side_effect=fake_open_dir), \
              patch.object(cap, "_separate_child_identity", return_value=(os.getuid(), os.getgid())), \
              patch.object(cap, "_drop_to_child", return_value=None), \
+             patch.object(cap, "_assert_cgroup_drained", return_value=None), \
              patch.object(cap, "_sign_receipt", side_effect=AssertionError("MUST NOT SIGN")):
             with self.assertRaises(cap.CaptureDenied):
                 cap.run()

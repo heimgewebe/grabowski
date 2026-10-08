@@ -258,6 +258,74 @@ def _kill_group(pid: int) -> None:
         pass
 
 
+
+UNIT_CGROUP = "/system.slice/grabowski-day1-protected-capture.service"
+UNIT_CGROUP_ROOT = Path("/sys/fs/cgroup" + UNIT_CGROUP)
+MAX_CGROUP_CONTROL_BYTES = 128
+
+
+def _read_proc_cgroup() -> bytes:
+    """Read the parent's kernel cgroup identity, never a caller-chosen path."""
+    try:
+        fd = os.open("/proc/self/cgroup", os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            value = os.read(fd, 1025)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise CaptureDenied("protected parent cgroup identity is unavailable") from exc
+    if not value or len(value) > 1024:
+        raise CaptureDenied("protected parent cgroup identity is invalid")
+    return value
+
+
+def _read_cgroup_leaf(directory_fd: int, name: str) -> bytes:
+    """Read fixed root-controlled cgroup kernel files via pinned directory FD."""
+    if name not in {"pids.max", "pids.current", "cgroup.procs"}:
+        raise CaptureDenied("unapproved cgroup control requested")
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                     dir_fd=directory_fd)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+                or (stat.S_IMODE(info.st_mode) & 0o022) != 0):
+                raise CaptureDenied("cgroup control is not root-controlled")
+            raw = os.read(fd, MAX_CGROUP_CONTROL_BYTES + 1)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise CaptureDenied("cgroup control is unavailable") from exc
+    if not raw or len(raw) > MAX_CGROUP_CONTROL_BYTES:
+        raise CaptureDenied("cgroup control is unbounded or empty")
+    return raw
+
+
+def _assert_cgroup_drained() -> None:
+    """Require only root parent remains in the exact protected systemd cgroup.
+
+    pids.current counts threads and descendants in nested child cgroups;
+    cgroup.procs alone does not. Secondary execve is still NOT confined.
+    """
+    expected = f"0::{UNIT_CGROUP}\n".encode("ascii")
+    if _read_proc_cgroup() != expected:
+        raise CaptureDenied("collector is outside its fixed systemd cgroup")
+    fd = _open_root_directory(UNIT_CGROUP_ROOT)
+    try:
+        for _ in range(2):
+            if (_read_cgroup_leaf(fd, "pids.max") != b"2\n"
+                or _read_cgroup_leaf(fd, "pids.current") != b"1\n"
+                or _read_cgroup_leaf(fd, "cgroup.procs")
+                    != f"{os.getpid()}\n".encode("ascii")):
+                raise CaptureDenied(
+                    "protected collector cgroup limit or process tree is unverified"
+                )
+    finally:
+        os.close(fd)
+    if _read_proc_cgroup() != expected:
+        raise CaptureDenied("protected parent changed cgroup during capture")
+
+
 def _capture_from_pipes(
     program_fd: int, *, uid: int, gid: int, seconds: int,
     stdout_cap: int, stderr_cap: int,
@@ -560,6 +628,7 @@ def run() -> dict[str, Any]:
         root_fd = _open_root_directory(EVIDENCE_ROOT, private=True)
         try:
             task_id, nonce = secrets.token_hex(12), secrets.token_hex(32)
+            _assert_cgroup_drained()  # Kernel pids limit before child launch.
             stdout, stderr, code, started, stopped, argv = _capture_from_pipes(
                 collector_fd, uid=uid, gid=gid,
                 seconds=policy["runtime_seconds"],
@@ -571,6 +640,7 @@ def run() -> dict[str, Any]:
             # The opened root-owned executable inode is the process's execve
             # target; only root may change it. Detect any unexpected FD drift.
             _recheck_executable_fd(collector_fd, executable)
+            _assert_cgroup_drained()  # No surviving descendants before signing.
             receipt = _canonical_receipt(
                 policy, hostname=hostname, code_hash=actual_sha,
                 task_id=task_id, nonce=nonce, argv=argv, stdout=stdout,
@@ -579,6 +649,7 @@ def run() -> dict[str, Any]:
             signed = _sign_receipt(
                 receipt, expected_signer_sha256=policy["signer_sha256"]
             )
+            _assert_cgroup_drained()  # No new descendant before publication.
             name = _publish_bundle(
                 root_fd, task_id=task_id, nonce=nonce,
                 stdout=stdout, stderr=stderr, receipt=receipt, signature=signed,
