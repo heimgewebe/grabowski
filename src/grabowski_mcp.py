@@ -41,6 +41,7 @@ except ImportError:
     Context = Any  # Isolated tests install an intentionally minimal module double.
 from mcp.types import ToolAnnotations
 
+import grabowski_redaction
 import grabowski_capabilities
 import grabowski_consumer_surface as consumer_surface
 import grabowski_runtime_contract
@@ -74,11 +75,14 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "narrowest-typed-read-first",
-        "Use the narrowest typed read that answers the question; no connectivity-only health ping when that read can serve as the probe.",
+        "grabowski_systemkatalog_query: system=system;repo=repository;domain=truth-owner;"
+        "relation=relations;entry=entrypoints;else=authority-matrix;Decision=>hash-bound "
+        "tools/systemkatalog_usage_receipt.py; fixed fields/no prose. Narrowest read; "
+        "no extra health ping if read probes.",
     ),
     (
         "host-capability-resolution",
-        "Native typed first. Host-local/no native: grabowski_host_capability_resolve. Host not_found/non-host: declared route; host blocked: stop. Follow selected authority; reread live policy/readiness at execution; not-ready!=not-found. Reuse before new infra. No execution/setup authority or provider/model pinning.",
+        "Native typed first. Host-local/no native: grabowski_host_capability_resolve. Host not_found/non-host: declared route; host blocked: stop. Follow selected authority; reread live policy/readiness at execution; not-ready!=not-found; reuse before new infra. Discovery: no execution/setup authority/provider/model pinning.",
     ),
     (
         "mutation-preconditions",
@@ -90,7 +94,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "pre-runtime-platform-denial",
-        "If ChatGPT or another upstream platform refuses a call before host dispatch and no Grabowski receipt exists, classify it as platform_filter and do not attribute it to the Grabowski runtime; do not retry the blocked call unchanged, and resume from existing lane or task receipts in a supported conversation when present.",
+        "Before host dispatch + no Grabowski receipt => platform_filter; do not attribute it to Grabowski runtime or retry unchanged. Resume lane/task receipts in a supported conversation.",
     ),
     (
         "platform-filter-narrowing",
@@ -98,15 +102,15 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "publication-pending-is-local",
-        "Treat platform_publication_pending as operation-local: proceed unless required tool/schema is absent from active catalog; otherwise seek fresh request-bound evidence.",
+        "platform_publication_pending is operation-local: proceed if required tool/schema active; else seek fresh request-bound evidence.",
     ),
     (
         "transport-roundtrip-before-mutation",
-        "Invoke mutations normally. For fresh shared_unlabeled challenge, call grip_run transport-roundtrip action=execute with challenge_receipt_sha256, exact target_tool_name, exact unchanged target_arguments; retention is a same-process optimization. Stable scope may action=ack then invoke unchanged target once. action=begin requires exact target_tool_name/target_arguments. Read back ambiguous effects before retry.",
+        "Mutations normally. Fresh shared_unlabeled challenge: grip_run transport-roundtrip action=execute with challenge_receipt_sha256, exact target_tool_name, exact unchanged target_arguments; retention=same-process optimization. Stable scope may action=ack then invoke unchanged target once. action=begin requires exact target_tool_name/target_arguments. Read back ambiguous effects before retry.",
     ),
     (
         "typed-operation-preference",
-        "Prefer typed operations to generic terminal, Git, or GitHub calls when both can express the effect.",
+        "Typed operations first; ranges: grabowski_read_text, not terminal_run/sed; Git/GitHub last.",
     ),
     (
         "github-connector-first",
@@ -114,19 +118,19 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "goal-fidelity-before-continuation",
-        "At material choices, user outcome outranks strategy. Use the minimum sufficient mechanism; persistent complexity needs proof of benefit. Compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. A tool failure is not strategic evidence.",
+        "User outcome outranks strategy. Use minimum sufficient mechanism; persistent complexity requires proof of benefit. Compare a simpler path with fresh evidence; choose CONTINUE/CHANGE/PARK-STOP. A tool failure alone is not strategic evidence. Managed dirty checkout after ensure: continue only from exact lane/lifecycle/checkout evidence with fresh Git preimage; never reset/clean/stash merely to satisfy ensure.",
     ),
     (
         "operator-obligation-lifecycle",
-        "For nontrivial work use grip_run/operator-obligation-list, operator-obligation-open and before ending operator-obligation-status. End only when operator-obligation-close is completed, explicitly blocked or durably delegated, or operator-obligation-resolve defers/supersedes open work with continuation_required=false and work_complete=false. Resume with a new obligation.",
+        "Nontrivial: grip_run operator-obligation-list+operator-obligation-open; before end operator-obligation-status. End only if operator-obligation-close completed/explicitly blocked/durably delegated, or operator-obligation-resolve defers/supersedes with continuation_required=false/work_complete=false. Resume with new obligation.",
     ),
     (
         "convergence-before-high-risk-closure",
-        "At admission bind risk-adaptive system_convergence_plan when classification evidence exists. Work/delivery closeout is not systemic convergence. Before claiming it, resolve criticality if classification_required; if systemic_closure_gate=hard, grip_run convergence-assess a hash-bound request, require terminally_closed, and bind its receipt into completion evidence. A nonterminal assessment blocks only that claim and grants no mutation authority.",
+        "Bind risk-adaptive system_convergence_plan at admission when classified. Completion != systemic convergence. Before claim resolve required criticality; hard gate: hash-bound grip_run convergence-assess must be terminally_closed and receipt-bound. Nonterminal blocks only claim; no mutation authority.",
     ),
     (
         "no-authority-escalation",
-        "These instructions grant no action, merge, deploy, secret, or retry authority.",
+        "No action/merge/deploy/secret/retry authority granted. Calls need reason+user_intent. report_outcome once as final tool call before every final answer; read-only/partial/failed/blocked included.",
     ),
 )
 
@@ -175,6 +179,7 @@ _RETAINED_TRANSPORT_TARGET_LOCK = threading.Lock()
 _RETAINED_TRANSPORT_TARGETS: dict[str, dict[str, Any]] = {}
 
 _TRANSPORT_CONNECTOR_CAPABILITY_HEADER = "x-grabowski-connector-capability"
+_TRANSPORT_MCP_SESSION_ID_HEADER = "mcp-session-id"
 _TRANSPORT_INGRESS_VERSION_HEADER = "x-grabowski-ingress-version"
 _TRANSPORT_REQUEST_ID_HEADER = "x-grabowski-request-id"
 _TRANSPORT_REQUEST_TIMESTAMP_HEADER = "x-grabowski-request-timestamp"
@@ -499,6 +504,7 @@ AUDIT_SEGMENT_CACHE_LOCK = threading.RLock()
 AUDIT_SEGMENT_VERIFICATION_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 AUDIT_LOCK_TIMEOUT_SECONDS = 5.0
 AUDIT_LOCK_POLL_SECONDS = 0.02
+AUDIT_APPEND_CONTENTION_TIMEOUT_SECONDS = 10.0
 CAPTAIN_AUDIT_LOCK_TIMEOUT_ERROR = "Audit lock acquisition timed out"
 CAPTAIN_AUDIT_COMPLETION_LOCK_RETRY_DELAYS = (0.05, 0.20)
 BASE_CAPABILITIES = (
@@ -561,6 +567,7 @@ STAGED_UNPUBLISHED_TOOL_NAMES = grabowski_capabilities.STAGED_UNPUBLISHED_TOOL_N
 TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_status": (),
     "grabowski_context": (),
+    "report_outcome": (),
     "grip_list": ("file_read",),
     "grip_run": (),
     "grabowski_list_directory": ("file_read",),
@@ -697,6 +704,8 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_process_signal": ("process_signal",),
     "grabowski_ports": ("port_inspect",),
     "grabowski_privileged_action_reference": ("privileged_reference",),
+    "grabowski_critical_user_data_inventory": ("power_execute",),
+    "grabowski_critical_user_data_inventory_read": (),
     "grabowski_power_run": ("power_execute",),
     "grabowski_fleet_list": (),
     "grabowski_fleet_run": ("terminal_execute",),
@@ -785,6 +794,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_gui_worker_status": ("gui_worker",),
     "grabowski_gui_worker_stop": ("gui_worker",),
     "grabowski_gui_worker_list": ("gui_worker",),
+    "grabowski_bureau_acceptance_authenticate": ("bureau_mutation",),
     "grabowski_bureau_candidate_record": ("bureau_mutation",),
     "grabowski_bureau_candidate_assess": (),
     "grabowski_bureau_task_propose": ("bureau_mutation",),
@@ -799,6 +809,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
 OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_service_logs",
     "grabowski_work_acquire",
+    "grabowski_bureau_acceptance_authenticate",
     "grabowski_bureau_candidate_record",
     "grabowski_bureau_task_propose",
     "grabowski_bureau_task_review",
@@ -856,6 +867,7 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_process_signal",
     "grabowski_ports",
     "grabowski_privileged_action_reference",
+    "grabowski_critical_user_data_inventory",
     "grabowski_power_run",
     "grabowski_fleet_run",
     "grabowski_juno_status",
@@ -957,6 +969,44 @@ SENSITIVE_ENV_PARTS = (
     "API_KEY",
     "APIKEY",
 )
+SERVER_ONLY_CHILD_ENV_KEYS = frozenset(
+    {
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_METRICS_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_LOGS_CREDENTIAL_PROVIDER",
+        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+    }
+)
+
+
+def _server_child_environment(**updates: str) -> dict[str, str]:
+    environment = dict(os.environ)
+    for key in SERVER_ONLY_CHILD_ENV_KEYS:
+        environment.pop(key, None)
+    environment.update(updates)
+    return environment
+
+
 TOP_LEVEL_POLICY_FIELDS = {
     "version",
     "mode",
@@ -1024,54 +1074,8 @@ LIMIT_FIELDS = {
     "max_secret_use_output_bytes",
     "max_secret_use_seconds",
 }
-_SECRET_KEY_PREFIX = "s" + "k-"
-_OPENAI_SECRET_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])"
-    + re.escape(_SECRET_KEY_PREFIX)
-    + r"(?:(?:proj|svcacct|admin)-[A-Za-z0-9._-]{20,}|[A-Za-z0-9]{24,})(?![A-Za-z0-9._-])"
-)
-_ANTHROPIC_SECRET_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])"
-    + re.escape(_SECRET_KEY_PREFIX)
-    + r"ant-[A-Za-z0-9._-]{20,}(?![A-Za-z0-9._-])"
-)
-SECRET_REDACTIONS = (
-    (_OPENAI_SECRET_PATTERN, "<REDACTED_OPENAI_KEY>"),
-    (_ANTHROPIC_SECRET_PATTERN, "<REDACTED_ANTHROPIC_KEY>"),
-    (
-        re.compile(r"Bearer\s+[A-Za-z0-9._~+/-]{12,}=*", re.I),
-        "Bearer <REDACTED>",
-    ),
-    (
-        re.compile(
-            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?"
-            r"-----END [A-Z0-9 ]*PRIVATE KEY-----",
-            re.S,
-        ),
-        "<REDACTED_PRIVATE_KEY>",
-    ),
-    (
-        re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-        "<REDACTED_AWS_ACCESS_KEY_ID>",
-    ),
-    (
-        re.compile(
-            r"(?im)^(\s*[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|APIKEY|"
-            r"PRIVATE_KEY|CLIENT_KEY_DATA|AWS_ACCESS_KEY_ID|"
-            r"AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)"
-            r"[A-Z0-9_]*\s*[:=]\s*).+$"
-        ),
-        r"\1<REDACTED>",
-    ),
-    (
-        re.compile(
-            r"(?im)^(\s*(?:token|password|client-key-data|client-certificate-data|"
-            r"aws_access_key_id|aws_secret_access_key|aws_session_token)"
-            r"\s*[:=]\s*).+$"
-        ),
-        r"\1<REDACTED>",
-    ),
-)
+SECRET_REDACTIONS = grabowski_redaction.SECRET_REDACTIONS
+_redact_sensitive_text = grabowski_redaction.redact_sensitive_text
 
 
 def _deployment_manifest_path() -> Path:
@@ -2585,27 +2589,6 @@ def _validate_sha256(value: str, label: str = "sha256") -> str:
     return value
 
 
-def _redact_sensitive_text(
-    text: str,
-    extra_secrets: list[str] | None = None,
-) -> tuple[str, int]:
-    result = text
-    redactions = 0
-    for pattern, replacement in SECRET_REDACTIONS:
-        result, count = pattern.subn(replacement, result)
-        redactions += count
-
-    for secret in sorted(set(extra_secrets or []), key=len, reverse=True):
-        if not secret:
-            continue
-        count = result.count(secret)
-        if count:
-            result = result.replace(secret, "<REDACTED>")
-            redactions += count
-
-    return result, redactions
-
-
 def _nofollow_kind_and_size(path: Path) -> tuple[str, int | None]:
     info = os.stat(path, follow_symlinks=False)
     mode = info.st_mode
@@ -3358,6 +3341,17 @@ def _read_audit_descriptor(descriptor: int, path: Path) -> bytes:
     return data
 
 
+
+def _audit_descriptor_identity(descriptor: int, path: Path) -> tuple[int, ...]:
+    opened = os.fstat(descriptor)
+    linked = os.stat(path, follow_symlinks=False)
+    _validate_audit_file_contract(opened, linked)
+    opened_identity = _audit_file_identity(opened)
+    linked_identity = _audit_file_identity(linked)
+    if opened_identity != linked_identity:
+        raise RuntimeError("Audit log changed while being observed")
+    return opened_identity
+
 def _audit_parent(path: Path) -> Path:
     parent = path.parent
     if parent == STATE_DIR:
@@ -3679,16 +3673,29 @@ def _verify_audit_descriptor(path: Path, descriptor: int) -> dict[str, Any]:
     return _verify_audit_bytes(path, data, exists=True)
 
 
-def _read_audit_file_bytes(path: Path) -> tuple[bytes, bool]:
-    """Read one audit file through the hardened descriptor contract without parsing it."""
+
+def _read_audit_file_snapshot(
+    path: Path,
+) -> tuple[bytes, bool, tuple[int, ...] | None]:
+    """Copy the mutable audit head under its file lock, then release it.
+
+    Expensive JSON/hash verification is deliberately left to the caller so the
+    coordination lock never needs to cover active-segment parsing.
+    """
     descriptor = _open_audit_read_target(path)
     if descriptor is None:
-        return b"", False
+        return b"", False, None
     try:
-        return _read_audit_descriptor(descriptor, path), True
+        data = _read_audit_descriptor(descriptor, path)
+        return data, True, _audit_descriptor_identity(descriptor, path)
     finally:
         _close_audit_descriptor(descriptor)
 
+
+def _read_audit_file_bytes(path: Path) -> tuple[bytes, bool]:
+    """Read one audit file through the hardened descriptor contract without parsing it."""
+    data, exists, _identity = _read_audit_file_snapshot(path)
+    return data, exists
 
 def _read_audit_file(path: Path) -> tuple[bytes, dict[str, Any]]:
     data, exists = _read_audit_file_bytes(path)
@@ -4029,23 +4036,33 @@ def _validate_segment_manifest(
     raise ValueError("audit-segment-manifest-kind-invalid")
 
 
-def _read_audit_head_unlocked(
-    path: Path,
-) -> tuple[tuple[Path, bytes, dict[str, Any]], dict[str, Any] | None]:
-    """Verify the mutable audit head and return its predecessor binding.
 
-    Callers that need a stable snapshot can hold the coordination lock only for
-    this active segment, then verify immutable predecessors after releasing it.
-    """
-    data, status = _read_audit_file(path)
+
+def _capture_verified_audit_head(
+    path: Path,
+) -> tuple[
+    tuple[Path, bytes, dict[str, Any]],
+    dict[str, Any] | None,
+    tuple[int, ...] | None,
+]:
+    """Capture stable head bytes, then verify them outside the coordination lock."""
+    with _audit_coordination_lock(path, exclusive=False):
+        data, exists, identity = _read_audit_file_snapshot(path)
+    status = _verify_audit_bytes(path, data, exists=exists)
     if not status["valid"]:
         raise ValueError(str(status["error"]))
     observed_sha = hashlib.sha256(data).hexdigest()
     component_status = dict(status)
     component_status["segment_sha256"] = observed_sha
     predecessor = _audit_predecessor_binding(path, _first_audit_record(data))
-    return (path, data, component_status), predecessor
+    return (path, data, component_status), predecessor, identity
 
+def _read_audit_head_unlocked(
+    path: Path,
+) -> tuple[tuple[Path, bytes, dict[str, Any]], dict[str, Any] | None]:
+    """Compatibility helper returning one fully verified mutable audit head."""
+    head, predecessor, _identity = _capture_verified_audit_head(path)
+    return head, predecessor
 
 def _read_audit_chain_unlocked(
     path: Path,
@@ -4296,14 +4313,15 @@ def _verify_audit_log_unlocked(path: Path = AUDIT_LOG) -> dict[str, Any]:
         return status
 
 
+
+
 def _read_audit_status_snapshot(path: Path = AUDIT_LOG) -> dict[str, Any]:
     """Verify one coherent head plus its bound immutable predecessor history."""
     lock_path = _audit_storage_paths(path)["coordination_lock"]
     if not path.exists() and not lock_path.exists():
         return _verify_audit_log_unlocked(path)
     for _snapshot_attempt in range(4):
-        with _audit_coordination_lock(path, exclusive=False):
-            head, predecessor = _read_audit_head_unlocked(path)
+        head, predecessor, head_identity = _capture_verified_audit_head(path)
         head_path = head[0]
         head_status = head[2]
         del head
@@ -4323,27 +4341,29 @@ def _read_audit_status_snapshot(path: Path = AUDIT_LOG) -> dict[str, Any]:
             [(head_path, b"", head_status), *predecessors],
             compatibility_evidence,
         )
-        with _audit_coordination_lock(path, exclusive=False):
-            current_head, current_predecessor = _read_audit_head_unlocked(path)
+        try:
+            current_identity = _private_evidence_path_identity(
+                path,
+                max_bytes=MAX_AUDIT_BYTES,
+            )
+        except FileNotFoundError:
+            current_identity = None
+        if current_identity == head_identity:
+            return status
+
+        current_head, current_predecessor, _current_identity = (
+            _capture_verified_audit_head(path)
+        )
         current_head_path = current_head[0]
         current_head_status = current_head[2]
         del current_head
-
-        if current_predecessor != predecessor:
-            continue
-        if (
-            current_head_status.get("segment_sha256")
-            == head_status.get("segment_sha256")
-        ):
-            return status
-
-        return _audit_status_from_components(
-            path,
-            [(current_head_path, b"", current_head_status), *predecessors],
-            compatibility_evidence,
-        )
+        if current_predecessor == predecessor:
+            return _audit_status_from_components(
+                path,
+                [(current_head_path, b"", current_head_status), *predecessors],
+                compatibility_evidence,
+            )
     raise RuntimeError("audit-head-raced")
-
 
 def _verify_audit_log(path: Path = AUDIT_LOG) -> dict[str, Any]:
     try:
@@ -4695,17 +4715,37 @@ def _verify_audit_predecessor_snapshot(
         _raise_audit_verification_failure(exc)
 
 
+
 def _append_audit_with_digest(record: dict[str, Any]) -> str:
     with AUDIT_APPEND_LOCK:
         if AUDIT_LOG.is_symlink():
             raise PermissionError(f"Audit log may not be a symlink: {AUDIT_LOG}")
-        for _predecessor_attempt in range(4):
+        contention_deadline = (
+            time.monotonic() + AUDIT_APPEND_CONTENTION_TIMEOUT_SECONDS
+        )
+        contention_attempt = 0
+        while True:
+            if contention_attempt:
+                remaining = contention_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Audit append contention retry timed out"
+                    )
+                delay = min(
+                    AUDIT_LOCK_POLL_SECONDS
+                    * (2 ** min(contention_attempt - 1, 2)),
+                    remaining,
+                )
+                time.sleep(delay)
+            contention_attempt += 1
             try:
-                with _audit_coordination_lock(AUDIT_LOG, exclusive=False):
-                    head, predecessor = _read_audit_head_unlocked(AUDIT_LOG)
-                del head
+                head, predecessor, head_identity = _capture_verified_audit_head(
+                    AUDIT_LOG
+                )
             except (OSError, PermissionError, RuntimeError, ValueError) as exc:
                 _raise_audit_verification_failure(exc)
+            head_status = head[2]
+            del head
 
             predecessor_snapshot = _verify_bound_audit_predecessors(
                 AUDIT_LOG,
@@ -4713,35 +4753,33 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
             )
 
             with _audit_coordination_lock(AUDIT_LOG, exclusive=True):
-                try:
-                    current_head, current_predecessor = (
-                        _read_audit_head_unlocked(AUDIT_LOG)
-                    )
-                    del current_head
-                except (OSError, PermissionError, RuntimeError, ValueError) as exc:
-                    _raise_audit_verification_failure(exc)
-
-                if current_predecessor != predecessor:
-                    continue
-
-                # The full predecessor walk happened outside the coordination
-                # lock. Revalidate only the per-call verified identities here;
-                # correctness must not depend on the smaller global cache.
-                _verify_audit_predecessor_snapshot(
-                    predecessor,
-                    predecessor_snapshot,
-                )
-
                 descriptor: int | None = None
                 try:
-                    descriptor, _created = _open_audit_append_target(AUDIT_LOG)
-                    status = _verify_audit_descriptor(AUDIT_LOG, descriptor)
-                    if not status["valid"]:
-                        raise RuntimeError(
-                            f"Audit log verification failed: {status['error']}"
-                        )
+                    descriptor, created = _open_audit_append_target(AUDIT_LOG)
+                    current_identity = _audit_descriptor_identity(
+                        descriptor,
+                        AUDIT_LOG,
+                    )
+                    if head_identity is None:
+                        if not created:
+                            continue
+                    elif created or current_identity != head_identity:
+                        continue
+
+                    # Full active-head and predecessor verification happened
+                    # outside the coordination lock. The exact mutable-file
+                    # identity plus immutable predecessor identities are the
+                    # cheap CAS readback immediately before the effect.
+                    _verify_audit_predecessor_snapshot(
+                        predecessor,
+                        predecessor_snapshot,
+                    )
+
+                    status = dict(head_status)
                     _enriched, payload = _enriched_audit_record(record, status)
                     current_size = os.fstat(descriptor).st_size
+                    if current_size != int(status.get("active_bytes") or 0):
+                        continue
                     needs_rotation = (
                         current_size > 0
                         and current_size
@@ -4813,8 +4851,6 @@ def _append_audit_with_digest(record: dict[str, Any]) -> str:
                 finally:
                     if descriptor is not None:
                         _close_audit_descriptor(descriptor)
-        raise RuntimeError("Audit predecessor changed repeatedly during append")
-
 
 def _append_audit(record: dict[str, Any]) -> None:
     _append_audit_with_digest(record)
@@ -4849,16 +4885,22 @@ def _audit_records_from_components(
     return records
 
 
+
 def _audit_records_snapshot() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    with _audit_coordination_lock(AUDIT_LOG, exclusive=False):
-        components, compatibility = _read_audit_chain_unlocked(
+    head, predecessor, _identity = _capture_verified_audit_head(AUDIT_LOG)
+    predecessors: list[tuple[Path, bytes, dict[str, Any]]] = []
+    compatibility = False
+    if predecessor is not None:
+        predecessors, compatibility = _read_audit_chain_unlocked(
             AUDIT_LOG,
             use_segment_cache=False,
+            retain_verified_segment_data=True,
+            initial_expected=predecessor,
         )
-        status = _audit_status_from_components(AUDIT_LOG, components, compatibility)
-        records = _audit_records_from_components(components)
-        return records, status
-
+    components = [head, *predecessors]
+    status = _audit_status_from_components(AUDIT_LOG, components, compatibility)
+    records = _audit_records_from_components(components)
+    return records, status
 
 def _audit_records() -> list[dict[str, Any]]:
     records, _status = _audit_records_snapshot()
@@ -5640,6 +5682,26 @@ def _transport_connector_identity(ctx: Context | None) -> str | None:
     return matches[0]
 
 
+def _flowlines_verified_identity(request_context: Any) -> dict[str, str] | None:
+    """Return the server-enrolled connector identity for telemetry when present."""
+    class _ContextAdapter:
+        def __init__(self, request_context: Any) -> None:
+            self.request_context = request_context
+
+    connector_id = _transport_connector_identity(_ContextAdapter(request_context))
+    if connector_id is None:
+        # Streamable HTTP/SSE attach the transport request to RequestContext.
+        # A transport request without an enrolled connector must never fall back
+        # to client-supplied telemetry identity. Stdio/local contexts keep the
+        # existing metadata fallback because their transport request is absent.
+        if getattr(request_context, "request", None) is not None:
+            raise RuntimeError(
+                "Flowlines transport telemetry requires an enrolled connector identity"
+            )
+        return None
+    return {"id": connector_id}
+
+
 def _transport_registered_tool_names() -> list[str]:
     manager = getattr(mcp, "_tool_manager", None)
     raw_registered = getattr(manager, "_tools", {})
@@ -5797,6 +5859,7 @@ def _transport_signed_one_call_evidence(
     issued_raw = _transport_context_header(ctx, _TRANSPORT_REQUEST_TIMESTAMP_HEADER)
     audience = _transport_context_header(ctx, _TRANSPORT_REQUEST_AUDIENCE_HEADER)
     body_sha256 = _transport_context_header(ctx, _TRANSPORT_REQUEST_BODY_SHA256_HEADER)
+    session_id = _transport_context_header(ctx, _TRANSPORT_MCP_SESSION_ID_HEADER) or ""
     asserted_runtime_binding_sha256 = _transport_context_header(
         ctx, _TRANSPORT_RUNTIME_BINDING_SHA256_HEADER
     )
@@ -5830,6 +5893,7 @@ def _transport_signed_one_call_evidence(
             arguments_sha256=arguments_sha256,
             body_sha256=str(body_sha256),
             mac_sha256=str(mac_sha256),
+            session_id=session_id,
         )
     except grabowski_transport_assertion.TransportAssertionReplay:
         # A durable replay is materially different from a malformed or invalid
@@ -6740,8 +6804,7 @@ def grabowski_status(
     )
     transport_roundtrip = _transport_roundtrip_status(ctx)
     normal_mutation_path_ready = (
-        transport_roundtrip.get("state") == "unavailable"
-        or transport_roundtrip.get("normal_mutation_path_ready") is True
+        transport_roundtrip.get("normal_mutation_path_ready") is True
     )
     if not bool(tool_contract.get("client_snapshot_observable")):
         snapshot_state = str(client_snapshot.get("state", "unavailable"))
@@ -6927,6 +6990,7 @@ def grabowski_status(
         compact_tool_contract_keys = (
             "expected_tool_count",
             "registered_tool_count",
+            "registered_names_sha256",
             "runtime_matches_deployment_contract",
             "client_snapshot_observable",
             "platform_evidence_state",
@@ -6969,6 +7033,13 @@ def grabowski_status(
             for key in compact_transport_keys
             if key in transport_roundtrip
         }
+        # Schema 3 preserves the published selected-path readiness field when
+        # the transport status exposes it, and adds one always-present,
+        # fail-closed effective mutation gate. Schema-2 standard/evidence retain
+        # the raw legacy roundtrip gate.
+        base_payload["transport_roundtrip"]["mutation_gate_open"] = (
+            normal_mutation_path_ready
+        )
 
     if selected_view in {"standard", "evidence"}:
         assert system_overview is not None
@@ -8186,6 +8257,7 @@ class _RepoGroundPinnedPublication:
     manifest_sha256: str
     stem: str
     publication_run_id: str | None
+    expected_commits: tuple[str, ...] = ()
 
 
 def _repoground_pin_publication_record(
@@ -8453,7 +8525,7 @@ def _repoground_manifest_snapshot_provenance(
     commit = (
         fallback.get("git_commit") or fallback.get("commit") or fallback.get("head")
     )
-    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+    if not isinstance(commit, str) or not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", commit):
         return {
             "available": False,
             "reason": "snapshot_repository_commit_absent",
@@ -8714,11 +8786,10 @@ def _repoground_git(
         stderr=subprocess.PIPE,
         text=True,
         timeout=10,
-        env={
-            **os.environ,
-            "GIT_TERMINAL_PROMPT": "0",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        },
+        env=_server_child_environment(
+            GIT_TERMINAL_PROMPT="0",
+            PYTHONDONTWRITEBYTECODE="1",
+        ),
     )
     stdout = completed.stdout if preserve_stdout else completed.stdout.strip()
     return completed.returncode, stdout, completed.stderr.strip()
@@ -9565,11 +9636,10 @@ print(json.dumps(result, sort_keys=True))
         stderr=subprocess.PIPE,
         text=True,
         timeout=timeout,
-        env={
-            **os.environ,
-            "GIT_TERMINAL_PROMPT": "0",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        },
+        env=_server_child_environment(
+            GIT_TERMINAL_PROMPT="0",
+            PYTHONDONTWRITEBYTECODE="1",
+        ),
     )
     stdout = completed.stdout[:500_000]
     stderr = completed.stderr[:20_000]
@@ -10145,12 +10215,101 @@ def _repoground_context_citation_ids(snippets: list[dict[str, Any]]) -> list[str
     return ids
 
 
+_REPOGROUND_EXACT_AGENT_FRESHNESS = ("fresh", "fresh_exact")
+
+
+def _repoground_normalize_expected_commits(
+    expected_commits: str | tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    if expected_commits is None or expected_commits == ():
+        return ()
+    raw = (expected_commits,) if isinstance(expected_commits, str) else expected_commits
+    if not isinstance(raw, tuple):
+        raise ValueError("expected RepoGround commits must be a tuple or Git object id")
+    normalized: list[str] = []
+    for commit in raw:
+        if (
+            not isinstance(commit, str)
+            or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit) is None
+        ):
+            raise ValueError(
+                "expected RepoGround commits must be lowercase Git object ids"
+            )
+        if commit not in normalized:
+            normalized.append(commit)
+    return tuple(normalized)
+
+
+def _repoground_agent_freshness_admission_error(
+    repo: str,
+    stem: str | None,
+    freshness: dict[str, Any],
+    *,
+    expected_commits: str | tuple[str, ...] | None = None,
+) -> dict[str, Any] | None:
+    freshness_status = str(freshness.get("freshness_status") or "unknown")
+    freshness_identity = str(freshness.get("freshness") or "unknown")
+    bundle = freshness.get("bundle")
+    bundle_commit = bundle.get("git_commit") if isinstance(bundle, dict) else None
+    bundle_dirty = bundle.get("git_dirty") if isinstance(bundle, dict) else None
+    expected = _repoground_normalize_expected_commits(expected_commits)
+    if expected:
+        if bundle_commit in expected and bundle_dirty is False:
+            return None
+    elif (
+        freshness_status == _REPOGROUND_EXACT_AGENT_FRESHNESS[0]
+        and freshness_identity == _REPOGROUND_EXACT_AGENT_FRESHNESS[1]
+        and bundle_dirty is False
+    ):
+        return None
+
+    if freshness_status == "stale":
+        reason = "stale_context_refused"
+    elif freshness_status == "dirty_overlay":
+        reason = "dirty_context_refused"
+    elif freshness_status == "publication_unavailable":
+        reason = "publication_unavailable"
+    else:
+        reason = "freshness_unverified"
+
+    return {
+        "kind": "grabowski.repoground_selection",
+        "schema_version": 2,
+        "repo": repo,
+        "stem": stem,
+        "available": False,
+        "freshness": freshness,
+        "reason": reason,
+        "freshness_status": freshness_status,
+        "freshness_identity": freshness_identity,
+        "freshness_reason": freshness.get("reason"),
+        "expected_commits": list(expected),
+        "bundle_commit": bundle_commit,
+        "route": "targeted_build_or_live_fallback",
+        "targeted_build_recommended": True,
+        "live_fallback_allowed": True,
+        "mutation_boundary": {
+            "writes": [],
+            "read_paths_do_not_refresh": True,
+        },
+    }
+
+
 def _repoground_selected_manifest_for_repo(
     repo: str,
     stem: str | None | _RepoGroundPinnedPublication,
+    *,
+    expected_commits: str | tuple[str, ...] | None = None,
 ) -> tuple[dict[str, Any], str | None, Path | None, dict[str, Any] | None]:
+    expected = _repoground_normalize_expected_commits(expected_commits)
     if isinstance(stem, _RepoGroundPinnedPublication):
         pinned = stem
+        pinned_expected = _repoground_normalize_expected_commits(
+            pinned.expected_commits
+        )
+        if expected and pinned_expected and set(expected) != set(pinned_expected):
+            raise ValueError("conflicting RepoGround expected commit bindings")
+        expected = expected or pinned_expected
     else:
         resolution = _repoground_catalog_resolution(repo, stem)
         selected = resolution.get("selected")
@@ -10287,6 +10446,14 @@ def _repoground_selected_manifest_for_repo(
             },
         )
     freshness = _repoground_freshness_from_status(repo, status)
+    admission_error = _repoground_agent_freshness_admission_error(
+        repo,
+        pinned.stem,
+        freshness,
+        expected_commits=expected,
+    )
+    if admission_error is not None:
+        return freshness, pinned.stem, None, admission_error
     return freshness, pinned.stem, pinned.manifest_path, None
 
 
@@ -12221,7 +12388,7 @@ def _repoground_working_repo(
 
 def _repoground_resolve_commit(repo_path: Path, revision: str) -> str:
     rc, out, _err = _repoground_git(repo_path, ["rev-parse", "--verify", f"{revision}^{{commit}}"])
-    if rc != 0 or not re.fullmatch(r"[a-f0-9]{40}", out):
+    if rc != 0 or re.fullmatch(r"(?:[a-f0-9]{40}|[a-f0-9]{64})", out) is None:
         raise ValueError(f"Git revision could not be resolved: {revision}")
     return out
 
@@ -12952,11 +13119,80 @@ def repoground_context_compose(
             "does_not_establish": ["truth", "completeness", "patch_correctness", "test_sufficiency", "merge_readiness", "runtime_behavior"],
         }
 
+    if dirty_overlay.get("dirty") is not False:
+        dirty_reason = (
+            "dirty_worktree_unbound"
+            if dirty_overlay.get("dirty") is True
+            else "dirty_worktree_status_unavailable"
+        )
+        return {
+            "kind": "grabowski.repoground_context_compose",
+            "schema_version": 1,
+            "available": False,
+            "status": "unavailable",
+            "reason": dirty_reason,
+            "change_identity": change_identity,
+            "dirty_overlay": dirty_overlay,
+            "context": blocked_context,
+            "context_budget": {
+                "requested_bytes": context_budget_bytes,
+                "effective_limit_bytes": context_budget_bytes,
+                "used_bytes": blocked_used_bytes,
+                "remaining_bytes": max(
+                    0, context_budget_bytes - blocked_used_bytes
+                ),
+                "hard_limit_applies_to": "context",
+                "lane_counts": blocked_lane_counts,
+            },
+            "retrieval_lanes": {
+                "used": ["direct_changes"],
+                "skipped": [
+                    "agent_impact",
+                    "query_context",
+                    "entry_manifest",
+                    "pr_delta_cards",
+                    "diff_locality",
+                    "symbol_navigation",
+                    "call_graph",
+                    "citation",
+                    "live_evidence",
+                ],
+            },
+            "fallback": {
+                "mode": "live_fallback",
+                "targeted_build_recommended": False,
+                "live_fallback_allowed": True,
+                "live_fallback_required": True,
+            },
+            "stop_criteria": {
+                "triggered": [dirty_reason],
+                "available": [
+                    "diff_sha256_mismatch",
+                    "publication_unavailable",
+                    "impact_context_blocked",
+                    "budget_exhausted",
+                ],
+            },
+            "does_not_establish": [
+                "dirty_worktree_identity",
+                "truth",
+                "completeness",
+                "patch_correctness",
+                "test_sufficiency",
+                "merge_readiness",
+                "runtime_behavior",
+            ],
+        }
+
     selection_token = (
         pinned_publication if pinned_publication is not None else stem
     )
     freshness, selected_stem, manifest_path, selection_error = (
-        _repoground_selected_manifest_for_repo(repo, selection_token)
+        _repoground_selected_manifest_for_repo(
+            repo,
+            selection_token,
+            expected_commits=(base_commit, target_commit),
+        )
     )
     if selection_error is not None or manifest_path is None:
         return {
@@ -12987,6 +13223,13 @@ def repoground_context_compose(
         else _repoground_pin_publication_from_selection(
             manifest_path, selected_stem, freshness
         )
+    )
+    selected_publication = _RepoGroundPinnedPublication(
+        manifest_path=selected_publication.manifest_path,
+        manifest_sha256=selected_publication.manifest_sha256,
+        stem=selected_publication.stem,
+        publication_run_id=selected_publication.publication_run_id,
+        expected_commits=(base_commit, target_commit),
     )
     changed_paths = [str(item["path"]) for item in changes]
     diff_local_symbols, diff_locality = _repoground_diff_local_symbols(
@@ -13665,6 +13908,22 @@ def _captain_audit_execution_result_material(
         if merge_completion_verified and isinstance(viewed, dict)
         else None
     )
+    post_merge_reconciliation = execution.get("post_merge_reconciliation")
+    if (
+        observed_merge_sha is None
+        and merge_completion_verified
+        and isinstance(post_merge_reconciliation, dict)
+        and post_merge_reconciliation.get("status")
+        == "verified_base_mutation_pr_metadata_unsettled"
+        and post_merge_reconciliation.get("errors") in (None, [])
+    ):
+        reconciled_merge_sha = post_merge_reconciliation.get("merge_sha")
+        if (
+            isinstance(reconciled_merge_sha, str)
+            and re.fullmatch(r"[0-9a-f]{40}", reconciled_merge_sha.lower())
+            is not None
+        ):
+            observed_merge_sha = reconciled_merge_sha.lower()
     external = execution.get("external_merge_reconciliation")
     external_merge_observed = (
         isinstance(external, dict)
@@ -13691,13 +13950,29 @@ def _captain_audit_execution_result_material(
     ):
         provenance_mode = "external_merge_reconciled"
     elif (
-        execution_invoked
-        and verification_passed
+        verification_passed
         and merge_queued
         and not merge_completion_verified
         and observed_merge_sha is None
         and not external_merge_observed
+        and (
+            execution_invoked
+            or (
+                execution.get("preflight_passed") is True
+                and execution.get("duplicate_dispatch_prevented") is True
+                and isinstance(execution.get("merge_queue_entry"), dict)
+                and isinstance(execution["merge_queue_entry"].get("id"), str)
+                and 1 <= len(execution["merge_queue_entry"]["id"]) <= 256
+                and execution.get("execution_attempted") is False
+                and not remote_mutation_observed
+                and execution.get("merge_queue_reconciliation")
+                in {"already_queued_before_dispatch", "queued_during_dispatch_guard"}
+            )
+        )
     ):
+        # A verified queue that Captain deliberately did not dispatch again
+        # still needs the same durable completion watcher. Do not permit an
+        # unverified queue, an external merge, or an ambiguous guard outcome.
         provenance_mode = "captain_queue_dispatch_pending"
     else:
         provenance_mode = "unverified"
@@ -13716,6 +13991,16 @@ def _captain_audit_execution_result_material(
             "provenance_mode": provenance_mode,
         }
     )
+    if provenance_mode == "captain_queue_dispatch_pending" and not execution_invoked:
+        # Preserve the concrete verified duplicate-prevention evidence in
+        # the immutable digest-bound completion audit. The Saga validator
+        # must not infer it from a queue flag alone.
+        material["verified_duplicate_queue"] = {
+            "preflight_passed": True,
+            "duplicate_dispatch_prevented": True,
+            "queue_entry_id": execution["merge_queue_entry"]["id"],
+            "merge_queue_reconciliation": execution["merge_queue_reconciliation"],
+        }
     return material
 
 
@@ -14896,6 +15181,54 @@ def _grip_run_core(
                 "error_code": _captain_audit_completion_error_code(exc),
                 "does_not_establish": ["audited_execution_completion"],
             }
+    if name == "captain-run" and allow_mutation:
+        actions = dispatch_parameters.get("actions")
+        captain_pr_merge = (
+            isinstance(actions, list)
+            and len(actions) == 1
+            and isinstance(actions[0], dict)
+            and actions[0].get("action") == "pr-merge"
+        )
+        if captain_pr_merge:
+            completion = (
+                result.get("captain_audit", {}).get("completion")
+                if isinstance(result.get("captain_audit"), dict)
+                else None
+            )
+            completion_sha256 = (
+                completion.get("audit_record_sha256")
+                if isinstance(completion, dict)
+                else None
+            )
+            if (
+                isinstance(completion_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", completion_sha256) is not None
+            ):
+                result["repoground_freshness_followup"] = {
+                    "kind": "grabowski.repoground_post_merge_followup",
+                    "schema_version": 1,
+                    "status": "durable_pending",
+                    "reason": "captain_audit_completion_persisted",
+                    "captain_audit_completion_sha256": completion_sha256,
+                    "reconciler": "grabowski-repoground-post-merge-reconcile.timer",
+                    "does_not_establish": [
+                        "job_started",
+                        "freshness_converged",
+                        "future_branch_freshness",
+                    ],
+                }
+            else:
+                result["repoground_freshness_followup"] = {
+                    "kind": "grabowski.repoground_post_merge_followup",
+                    "schema_version": 1,
+                    "status": "schedule_error",
+                    "reason": "captain_audit_completion_unavailable",
+                    "does_not_establish": [
+                        "job_started",
+                        "freshness_failed",
+                        "merge_failure",
+                    ],
+                }
     return result
 
 
@@ -15418,4 +15751,11 @@ _freeze_serving_process_identity()
 
 
 if __name__ == "__main__":
+    import grabowski_flowlines
+
+    grabowski_flowlines.configure_flowlines_observability(
+        mcp,
+        READ_ANNOTATIONS,
+        load_environment_exporter=False,
+    )
     mcp.run()

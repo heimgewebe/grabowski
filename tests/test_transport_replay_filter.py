@@ -53,6 +53,51 @@ def _evidence(index: int, *, now: int = 100) -> dict[str, object]:
     }
 
 
+def _task_start_evidence(
+    *,
+    now: int,
+    session_id: str,
+    secret: str = SECRET,
+    runtime: str = RUNTIME,
+    rpc_request_id: str = "task-start-rpc",
+    body: str | None = None,
+) -> dict[str, object]:
+    body_sha256 = (
+        hashlib.sha256(b"task-start-body").hexdigest()
+        if body is None
+        else body
+    )
+    request_id = assertion.derive_request_id(
+        secret=secret,
+        session_id=session_id,
+        rpc_request_id=rpc_request_id,
+        body_sha256=body_sha256,
+    )
+    mac = assertion.assertion_mac(
+        secret=secret,
+        request_id=request_id,
+        issued_at_unix=now,
+        audience=assertion.ASSERTION_AUDIENCE,
+        tool_name="grabowski_task_start",
+        arguments_sha256=ARGS,
+        body_sha256=body_sha256,
+        runtime_binding_sha256=runtime,
+    )
+    return {
+        "secret": secret,
+        "client_scope_sha256": SCOPE,
+        "runtime_binding_sha256": runtime,
+        "asserted_runtime_binding_sha256": runtime,
+        "request_id": request_id,
+        "issued_at_unix": now,
+        "audience": assertion.ASSERTION_AUDIENCE,
+        "tool_name": "grabowski_task_start",
+        "arguments_sha256": ARGS,
+        "body_sha256": body_sha256,
+        "mac_sha256": mac,
+    }
+
+
 class ReplayFilterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -97,6 +142,327 @@ class ReplayFilterTests(unittest.TestCase):
         )
         with self.assertRaises(assertion.TransportAssertionReplay):
             assertion.consume_assertion(**restarted, now_unix=5001)
+
+    def test_task_start_exact_request_is_single_use_while_fresh_retry_is_delegated(
+        self,
+    ) -> None:
+        session_id = "task-start-session-a"
+        item = _task_start_evidence(now=100, session_id=session_id)
+
+        first = assertion.consume_assertion(
+            **item,
+            session_id=session_id,
+            now_unix=100,
+        )
+        self.assertEqual(first["state"], "consumed")
+        self.assertTrue(first["single_use"])
+        self.assertEqual(first["replay_policy"], "domain_delegated")
+        self.assertRegex(
+            str(first["consumption_receipt_sha256"]),
+            r"^[0-9a-f]{64}$",
+        )
+
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            assertion.consume_assertion(
+                **item,
+                session_id=session_id,
+                now_unix=101,
+            )
+
+        fresh_session = "task-start-session-b"
+        fresh = _task_start_evidence(
+            now=101,
+            session_id=fresh_session,
+            body=str(item["body_sha256"]),
+        )
+        self.assertNotEqual(item["request_id"], fresh["request_id"])
+        retried = assertion.consume_assertion(
+            **fresh,
+            session_id=fresh_session,
+            now_unix=101,
+        )
+        self.assertEqual(retried["state"], "consumed")
+        self.assertTrue(retried["single_use"])
+        self.assertEqual(retried["replay_policy"], "domain_delegated")
+
+    def test_task_start_replay_state_contains_only_exact_request_identity(self) -> None:
+        session_id = "task-start-exact-only-session"
+        item = _task_start_evidence(now=100, session_id=session_id)
+        assertion.consume_assertion(
+            **item,
+            session_id=session_id,
+            now_unix=100,
+        )
+
+        self.assertTrue(assertion.STATE_ROOT.exists())
+        self.assertTrue(
+            assertion._replay_filter_contains(
+                assertion._replay_scope_sha256(SECRET),
+                str(item["request_id"]),
+            )
+        )
+        self.assertFalse(
+            assertion._replay_filter_contains(
+                SCOPE,
+                assertion._stable_scope_replay_id(
+                    str(item["body_sha256"]),
+                    session_id=session_id,
+                ),
+            )
+        )
+
+    def test_task_start_ignores_historical_body_quarantine_for_fresh_request(
+        self,
+    ) -> None:
+        session_id = "task-start-migration-session"
+        item = _task_start_evidence(now=100, session_id=session_id)
+        assertion.STATE_ROOT.mkdir(mode=0o700)
+        assertion._consume_replay_filter(
+            (
+                (
+                    SCOPE,
+                    assertion._stable_scope_replay_id(
+                        str(item["body_sha256"]),
+                        session_id=session_id,
+                    ),
+                ),
+            )
+        )
+
+        evidence = assertion.consume_assertion(
+            **item,
+            session_id=session_id,
+            now_unix=100,
+        )
+        self.assertEqual(evidence["state"], "consumed")
+        self.assertTrue(evidence["single_use"])
+        self.assertEqual(evidence["replay_policy"], "domain_delegated")
+
+    def test_sessionless_task_start_exact_request_is_single_use(self) -> None:
+        item = _task_start_evidence(now=100, session_id="")
+        first = assertion.consume_assertion(**item, now_unix=100)
+        self.assertEqual(first["state"], "consumed")
+        self.assertTrue(first["single_use"])
+
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            assertion.consume_assertion(**item, now_unix=101)
+
+        fresh = _task_start_evidence(
+            now=101,
+            session_id="",
+            rpc_request_id="task-start-rpc-fresh",
+            body=str(item["body_sha256"]),
+        )
+        self.assertNotEqual(item["request_id"], fresh["request_id"])
+        retried = assertion.consume_assertion(**fresh, now_unix=101)
+        self.assertEqual(retried["state"], "consumed")
+        self.assertTrue(retried["single_use"])
+        self.assertEqual(retried["replay_policy"], "domain_delegated")
+
+    def test_non_task_mutation_replay_remains_durable_after_time(self) -> None:
+        first = _evidence(44, now=100)
+        assertion.consume_assertion(**first, now_unix=100)
+        later = _evidence(44, now=5000)
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            assertion.consume_assertion(**later, now_unix=5000)
+
+    def test_same_body_is_independent_across_mcp_sessions(self) -> None:
+        body = hashlib.sha256(b"same-logical-tool-body").hexdigest()
+
+        def evidence_for(session_id: str) -> dict[str, object]:
+            item = _evidence(30)
+            item["body_sha256"] = body
+            item["request_id"] = assertion.derive_request_id(
+                secret=SECRET,
+                session_id=session_id,
+                rpc_request_id="1",
+                body_sha256=body,
+            )
+            item["mac_sha256"] = assertion.assertion_mac(
+                secret=SECRET,
+                request_id=str(item["request_id"]),
+                issued_at_unix=int(item["issued_at_unix"]),
+                audience=assertion.ASSERTION_AUDIENCE,
+                tool_name=str(item["tool_name"]),
+                arguments_sha256=str(item["arguments_sha256"]),
+                body_sha256=body,
+                runtime_binding_sha256=RUNTIME,
+            )
+            return item
+
+        first = evidence_for("mcp-session-a")
+        second = evidence_for("mcp-session-b")
+        self.assertNotEqual(first["request_id"], second["request_id"])
+        assertion.consume_assertion(
+            **first, session_id="mcp-session-a", now_unix=101
+        )
+        consumed = assertion.consume_assertion(
+            **second, session_id="mcp-session-b", now_unix=101
+        )
+        self.assertEqual(consumed["state"], "consumed")
+
+    def test_long_mcp_session_id_preserves_replay_semantics(self) -> None:
+        body = hashlib.sha256(b"long-mcp-session-replay").hexdigest()
+        session_id = "session-" + "x" * 600
+
+        first = _evidence(33)
+        first["body_sha256"] = body
+        first["request_id"] = assertion.derive_request_id(
+            secret=SECRET,
+            session_id=session_id,
+            rpc_request_id="1",
+            body_sha256=body,
+        )
+        first["mac_sha256"] = assertion.assertion_mac(
+            secret=SECRET,
+            request_id=str(first["request_id"]),
+            issued_at_unix=int(first["issued_at_unix"]),
+            audience=assertion.ASSERTION_AUDIENCE,
+            tool_name=str(first["tool_name"]),
+            arguments_sha256=str(first["arguments_sha256"]),
+            body_sha256=body,
+            runtime_binding_sha256=RUNTIME,
+        )
+        consumed = assertion.consume_assertion(
+            **first, session_id=session_id, now_unix=101
+        )
+        self.assertEqual(consumed["state"], "consumed")
+
+        replay = dict(first)
+        replay["request_id"] = assertion.derive_request_id(
+            secret=SECRET,
+            session_id=session_id,
+            rpc_request_id="2",
+            body_sha256=body,
+        )
+        replay["mac_sha256"] = assertion.assertion_mac(
+            secret=SECRET,
+            request_id=str(replay["request_id"]),
+            issued_at_unix=int(replay["issued_at_unix"]),
+            audience=assertion.ASSERTION_AUDIENCE,
+            tool_name=str(replay["tool_name"]),
+            arguments_sha256=str(replay["arguments_sha256"]),
+            body_sha256=body,
+            runtime_binding_sha256=RUNTIME,
+        )
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            assertion.consume_assertion(
+                **replay, session_id=session_id, now_unix=101
+            )
+
+    def test_same_session_replay_survives_secret_rotation(self) -> None:
+        body = hashlib.sha256(b"same-session-rotated-secret").hexdigest()
+        session_id = "stable-mcp-session"
+
+        first = _evidence(31)
+        first["body_sha256"] = body
+        first["request_id"] = assertion.derive_request_id(
+            secret=SECRET,
+            session_id=session_id,
+            rpc_request_id="1",
+            body_sha256=body,
+        )
+        first["mac_sha256"] = assertion.assertion_mac(
+            secret=SECRET,
+            request_id=str(first["request_id"]),
+            issued_at_unix=int(first["issued_at_unix"]),
+            audience=assertion.ASSERTION_AUDIENCE,
+            tool_name=str(first["tool_name"]),
+            arguments_sha256=str(first["arguments_sha256"]),
+            body_sha256=body,
+            runtime_binding_sha256=RUNTIME,
+        )
+        assertion.consume_assertion(
+            **first, session_id=session_id, now_unix=101
+        )
+
+        rotated = dict(first)
+        rotated_secret = "B" * 43
+        rotated["secret"] = rotated_secret
+        rotated["request_id"] = assertion.derive_request_id(
+            secret=rotated_secret,
+            session_id=session_id,
+            rpc_request_id="1",
+            body_sha256=body,
+        )
+        self.assertNotEqual(first["request_id"], rotated["request_id"])
+        rotated["mac_sha256"] = assertion.assertion_mac(
+            secret=rotated_secret,
+            request_id=str(rotated["request_id"]),
+            issued_at_unix=int(rotated["issued_at_unix"]),
+            audience=assertion.ASSERTION_AUDIENCE,
+            tool_name=str(rotated["tool_name"]),
+            arguments_sha256=str(rotated["arguments_sha256"]),
+            body_sha256=body,
+            runtime_binding_sha256=RUNTIME,
+        )
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            assertion.consume_assertion(
+                **rotated, session_id=session_id, now_unix=101
+            )
+
+    def test_pre_upgrade_v1_replay_survives_secret_rotation(self) -> None:
+        body = hashlib.sha256(b"pre-upgrade-v1-session-replay").hexdigest()
+        session_id = "stable-pre-upgrade-session"
+        rpc_request_id = "rpc-pre-upgrade"
+
+        first = _evidence(32)
+        first["body_sha256"] = body
+        first["request_id"] = assertion.derive_request_id(
+            secret=SECRET,
+            session_id=session_id,
+            rpc_request_id=rpc_request_id,
+            body_sha256=body,
+        )
+        first["mac_sha256"] = assertion.assertion_mac(
+            secret=SECRET,
+            request_id=str(first["request_id"]),
+            issued_at_unix=int(first["issued_at_unix"]),
+            audience=assertion.ASSERTION_AUDIENCE,
+            tool_name=str(first["tool_name"]),
+            arguments_sha256=str(first["arguments_sha256"]),
+            body_sha256=body,
+            runtime_binding_sha256=RUNTIME,
+        )
+
+        # Exact pre-upgrade key set: the token-dependent request-id key plus
+        # the stable v1 body key. No v2 session/body key existed yet.
+        assertion.STATE_ROOT.mkdir(mode=0o700)
+        assertion._consume_replay_filter(
+            (
+                (
+                    assertion._replay_scope_sha256(SECRET),
+                    str(first["request_id"]),
+                ),
+                (SCOPE, assertion._stable_scope_replay_id(body)),
+            )
+        )
+
+        rotated_secret = "B" * 43
+        rotated = dict(first)
+        rotated["secret"] = rotated_secret
+        rotated["request_id"] = assertion.derive_request_id(
+            secret=rotated_secret,
+            session_id=session_id,
+            rpc_request_id=rpc_request_id,
+            body_sha256=body,
+        )
+        self.assertNotEqual(first["request_id"], rotated["request_id"])
+        rotated["mac_sha256"] = assertion.assertion_mac(
+            secret=rotated_secret,
+            request_id=str(rotated["request_id"]),
+            issued_at_unix=int(rotated["issued_at_unix"]),
+            audience=assertion.ASSERTION_AUDIENCE,
+            tool_name=str(rotated["tool_name"]),
+            arguments_sha256=str(rotated["arguments_sha256"]),
+            body_sha256=body,
+            runtime_binding_sha256=RUNTIME,
+        )
+
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            assertion.consume_assertion(
+                **rotated, session_id=session_id, now_unix=101
+            )
 
     def test_legacy_tombstone_remains_authoritative(self) -> None:
         item = _evidence(2)

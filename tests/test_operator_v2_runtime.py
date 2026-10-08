@@ -1881,6 +1881,32 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             {"grabowski_agent_workspace_adopt"},
         )
 
+    def test_runtime_report_outcome_has_only_supported_statuses(self) -> None:
+        source = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        report = next(
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "report_outcome"
+        )
+        status_index = [argument.arg for argument in report.args.args].index("status")
+        annotation = report.args.args[status_index].annotation
+        self.assertIsInstance(annotation, ast.Subscript)
+        literal_values = {
+            node.value
+            for node in ast.walk(annotation)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertEqual(
+            literal_values,
+            {"accomplished", "partial", "failed"},
+        )
+        description = ast.get_docstring(report) or ""
+        self.assertIn("For blocked work, report partial", description)
+        self.assertIn("otherwise report failed", description)
+        self.assertIn("unmet_needs", description)
+
     def test_staged_workspace_adopt_remains_implemented_but_not_public(self) -> None:
         contract = json.loads(
             (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
@@ -1992,11 +2018,15 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 198)
-        self.assertEqual(summary["known_tool_requirements"], 199)
+        self.assertEqual(summary["registered_tool_requirements"], 202)
+        self.assertEqual(summary["known_tool_requirements"], 203)
         self.assertEqual(
             summary["staged_unpublished_tools"],
             ["grabowski_agent_workspace_adopt"],
+        )
+        self.assertEqual(
+            missing["grabowski_bureau_acceptance_authenticate"],
+            ["bureau_mutation"],
         )
         self.assertEqual(missing["grabowski_remove_path"], ["file_delete"])
         self.assertEqual(missing["grabowski_restore_removed_path"], ["file_delete"])
@@ -3866,6 +3896,173 @@ class CaptainAuditTrailTests(unittest.TestCase):
         self.assertEqual(merge_sha, material["observed_merge_sha"])
         self.assertFalse(material["execution_invoked"])
         self.assertTrue(material["external_merge_observed"])
+
+    def test_verified_preexisting_queue_entries_keep_durable_pending_followups(self) -> None:
+        import grabowski_repoground_post_merge as post_merge
+        import grabowski_grip_orchestration as saga
+
+        for reconciliation in (
+            "already_queued_before_dispatch",
+            "queued_during_dispatch_guard",
+        ):
+            canonical = {
+                "action": "pr-merge",
+                "execution_invoked": False,
+                "execution_attempted": False,
+                "preflight_passed": True,
+                "duplicate_dispatch_prevented": True,
+                "verification_passed": True,
+                "remote_mutation_observed": False,
+                "merge_queued": True,
+                "merge_completion_verified": False,
+                "merge_queue_reconciliation": reconciliation,
+                "merge_queue_entry": {"id": "MQE_verified", "position": 1},
+            }
+            result = {
+                "status": "passed",
+                "receipt": {
+                    "status": "passed",
+                    "receipt_sha256": "a" * 64,
+                    "output_sha256": "b" * 64,
+                },
+                "output": {"executions": [canonical]},
+            }
+            with self.subTest(reconciliation=reconciliation):
+                material = grabowski_mcp._captain_audit_execution_result_material(
+                    result, action="pr-merge"
+                )
+                self.assertEqual(
+                    material["provenance_mode"],
+                    "captain_queue_dispatch_pending",
+                )
+                self.assertFalse(material["execution_invoked"])
+                self.assertTrue(material["verification_passed"])
+                self.assertTrue(material["merge_queued"])
+                verified = saga._captain_merge_provenance_from_execution_result(material)
+                self.assertEqual(verified["provenance_mode"], "captain_queue_dispatch_pending")
+                self.assertEqual(
+                    verified["verified_duplicate_queue"]["merge_queue_reconciliation"],
+                    reconciliation,
+                )
+                self.assertEqual(
+                    verified["verified_duplicate_queue"]["queue_entry_id"],
+                    "MQE_verified",
+                )
+                for corrupted in (
+                    None,
+                    {},
+                    {**material["verified_duplicate_queue"], "preflight_passed": False},
+                    {**material["verified_duplicate_queue"], "queue_entry_id": ""},
+                    {**material["verified_duplicate_queue"], "merge_queue_reconciliation": "unverified"},
+                    {**material["verified_duplicate_queue"], "unbound_extra": True},
+                ):
+                    with self.subTest(corrupted=corrupted), self.assertRaises(saga.SagaError):
+                        saga._captain_merge_provenance_from_execution_result(
+                            {**material, "verified_duplicate_queue": corrupted}
+                        )
+                without_proof = dict(material)
+                without_proof.pop("verified_duplicate_queue")
+                with self.assertRaisesRegex(saga.SagaError, "mode is internally inconsistent"):
+                    saga._captain_merge_provenance_from_execution_result(
+                        without_proof
+                    )
+                record = {
+                    "operation": "captain-run-audit-completion",
+                    "kind": "grabowski_captain_run_audit",
+                    "schema_version": 1,
+                    "phase": "completion",
+                    "action": "pr-merge",
+                    "target_repo": "heimgewebe/grabowski",
+                    "target_pr": 1382,
+                    "expected_head": "c" * 40,
+                    "expected_base": "main",
+                    "execution_result": material,
+                }
+                with patch.object(
+                    post_merge, "_verified_captain_completion_record",
+                    return_value=record,
+                ):
+                    followup = post_merge.captain_followup_request_from_audit(
+                        "d" * 64,
+                        python_executable="/usr/bin/python3",
+                        script_path=Path(post_merge.__file__),
+                    )
+                self.assertEqual(followup["status"], "ready_queue_watch")
+                self.assertIn("--pr", followup["argv"])
+                self.assertEqual(followup["pull_request"], 1382)
+
+            # A lookalike without trusted queue verification must not acquire
+            # durable scheduling authority merely by setting merge_queued.
+            for override in (
+                {"preflight_passed": False},
+                {"merge_queue_entry": None},
+                {"merge_queue_entry": {}},
+                {"execution_attempted": True},
+                {"remote_mutation_observed": True},
+                {"duplicate_dispatch_prevented": False},
+                {"verification_passed": False},
+                {"merge_queue_reconciliation": "unknown"},
+                {"merge_queued": False},
+                {
+                    "external_merge_reconciliation": {
+                        "external_merge_observed": True,
+                        "dispatch_called": False,
+                    },
+                },
+            ):
+                hostile = dict(canonical, **override)
+                hostile_result = {
+                    **result, "output": {"executions": [hostile]}
+                }
+                with self.subTest(
+                    reconciliation=reconciliation, override=override
+                ):
+                    invalid = grabowski_mcp._captain_audit_execution_result_material(
+                        hostile_result, action="pr-merge"
+                    )
+                    self.assertEqual(invalid["provenance_mode"], "unverified")
+                    normalized = saga._captain_merge_provenance_from_execution_result(
+                        invalid
+                    )
+                    self.assertEqual(normalized["provenance_mode"], "unverified")
+
+    def test_completion_material_preserves_exact_base_reconciled_merge_sha(self) -> None:
+        merge_sha = "d" * 40
+        result = {
+            "status": "passed",
+            "receipt": {
+                "status": "passed",
+                "receipt_sha256": "a" * 64,
+                "output_sha256": "b" * 64,
+            },
+            "output": {
+                "executions": [
+                    {
+                        "action": "pr-merge",
+                        "execution_invoked": True,
+                        "execution_attempted": True,
+                        "command_returned": True,
+                        "merge_returncode": 0,
+                        "verification_passed": True,
+                        "remote_mutation_observed": True,
+                        "merge_completion_verified": True,
+                        "verified_pr": {"mergeCommit": None},
+                        "post_merge_reconciliation": {
+                            "status": "verified_base_mutation_pr_metadata_unsettled",
+                            "errors": [],
+                            "merge_sha": merge_sha,
+                        },
+                    }
+                ]
+            },
+        }
+
+        material = grabowski_mcp._captain_audit_execution_result_material(
+            result, action="pr-merge"
+        )
+
+        self.assertEqual("captain_dispatch_verified", material["provenance_mode"])
+        self.assertEqual(merge_sha, material["observed_merge_sha"])
 
     def test_completion_material_rejects_pr_merge_without_canonical_execution(self) -> None:
         result = {

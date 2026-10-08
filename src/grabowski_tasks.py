@@ -114,6 +114,7 @@ JUST_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])just(?:$|[^A-Za-z0-9_])")
 MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
 MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
 MANAGED_CARGO_ATTENTION_MATCH_LIMIT = 50_000
+EXECUTION_ATTENTION_MATCH_LIMIT = 50_000
 DEFAULT_TASK_LIST_LIMIT = 20
 TASK_OUTPUT_ROOT = Path(operator.STATE_DIR) / "task-output"
 TASK_OUTPUT_LEGACY_ROOT = Path(operator.HOME)
@@ -1368,6 +1369,41 @@ _sqlite_integrity = sqlite_store.sqlite_integrity
 _sqlite_fingerprint = sqlite_store.sqlite_fingerprint
 _database_tables = sqlite_store.database_tables
 
+TaskStorePersistenceIdentity = tuple[
+    str,
+    sqlite_store.FileIdentity,
+    sqlite_store.FileIdentity | None,
+]
+_TASK_INTEGRITY_CACHE_LOCK = threading.Lock()
+_TASK_VERIFIED_PERSISTENCE_IDENTITY: TaskStorePersistenceIdentity | None = None
+_TASK_INTEGRITY_MAX_IDENTITY_ATTEMPTS = 3
+
+
+def _task_store_persistence_identity() -> TaskStorePersistenceIdentity:
+    database_status = TASK_DB.lstat()
+    if not stat.S_ISREG(database_status.st_mode):
+        raise PermissionError(f"Task database must be a regular file: {TASK_DB}")
+    wal_path = Path(f"{TASK_DB}-wal")
+    try:
+        wal_status = wal_path.lstat()
+    except FileNotFoundError:
+        wal_identity = None
+    else:
+        if not stat.S_ISREG(wal_status.st_mode):
+            raise PermissionError(f"Task database WAL must be a regular file: {wal_path}")
+        # A WAL contains only its 32-byte header until the first frame exists.
+        # Empty/header-only WAL lifecycle churn carries no database content.
+        wal_identity = (
+            None
+            if wal_status.st_size <= 32
+            else sqlite_store.status_identity(wal_status)
+        )
+    return (
+        str(TASK_DB.absolute()),
+        sqlite_store.status_identity(database_status),
+        wal_identity,
+    )
+
 
 def _metadata_shape(connection: sqlite3.Connection) -> tuple[tuple[str, str, int, int], ...]:
     return tuple(
@@ -1820,30 +1856,57 @@ def _verified_task_migration_backup(
                 pass
 
 
-def _preflight_task_store() -> str | None:
+def _preflight_task_store(*, verify_integrity: bool = True) -> str | None:
+    global _TASK_VERIFIED_PERSISTENCE_IDENTITY
+
     if not TASK_DB.exists():
         return None
     if TASK_DB.is_symlink() or not TASK_DB.is_file():
         raise PermissionError(f"Task database must be a regular file: {TASK_DB}")
     if TASK_DB.stat().st_size == 0:
         return None
-    with _readonly_sqlite(TASK_DB) as connection:
-        _sqlite_integrity(connection, "Task database", quick=True)
-        version = _task_schema_version(connection)
-        if version not in {"1", "2", "3", "4", "5"}:
-            raise RuntimeError(
-                "Unsupported task database schema; use a runtime that explicitly supports it"
+
+    force_integrity = verify_integrity
+    with _TASK_INTEGRITY_CACHE_LOCK:
+        for _attempt in range(_TASK_INTEGRITY_MAX_IDENTITY_ATTEMPTS):
+            identity_before = _task_store_persistence_identity()
+            integrity_required = (
+                force_integrity
+                or _TASK_VERIFIED_PERSISTENCE_IDENTITY != identity_before
             )
-        if version == "5":
-            _validate_task_schema_current(connection)
-            if _task_reconcile_revision_contract(
-                connection,
-                required=False,
-            ) is None:
-                return "5:reconcile-revision-contract-missing"
-        else:
-            _validate_task_schema_legacy(connection, version)
-        return version
+            with _readonly_sqlite(TASK_DB) as connection:
+                if integrity_required:
+                    _sqlite_integrity(connection, "Task database", quick=True)
+                version = _task_schema_version(connection)
+                if version not in {"1", "2", "3", "4", "5"}:
+                    raise RuntimeError(
+                        "Unsupported task database schema; use a runtime that explicitly supports it"
+                    )
+                reconcile_contract_missing = False
+                if version == "5":
+                    _validate_task_schema_current(connection)
+                    reconcile_contract_missing = (
+                        _task_reconcile_revision_contract(
+                            connection,
+                            required=False,
+                        )
+                        is None
+                    )
+                else:
+                    _validate_task_schema_legacy(connection, version)
+            identity_after = _task_store_persistence_identity()
+            if identity_after == identity_before:
+                if integrity_required:
+                    _TASK_VERIFIED_PERSISTENCE_IDENTITY = identity_after
+                if version == "5" and reconcile_contract_missing:
+                    return "5:reconcile-revision-contract-missing"
+                return version
+            _TASK_VERIFIED_PERSISTENCE_IDENTITY = None
+            force_integrity = True
+
+    raise RuntimeError(
+        "Task database changed repeatedly during integrity preflight; retry after the active writer completes"
+    )
 
 
 def _create_task_schema_v5(connection: sqlite3.Connection) -> None:
@@ -1983,12 +2046,12 @@ def _database() -> sqlite3.Connection:
     if TASK_DB.is_symlink():
         raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
 
-    observed = _preflight_task_store()
+    observed = _preflight_task_store(verify_integrity=False)
     if observed == "5":
         return _open_current_task_database()
 
     with _schema_directory_lock(parent):
-        observed = _preflight_task_store()
+        observed = _preflight_task_store(verify_integrity=False)
         if observed == "5":
             return _open_current_task_database()
         connection = (
@@ -4431,17 +4494,99 @@ def _record_execution_identity(record: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+CHRONIK_RETRY_MUTABLE_PROJECTION_FIELDS = frozenset(
+    {"subject_scope", "host", "repo"}
+)
+
+
+def _chronik_retry_match_context(
+    context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if context is None:
+        return None
+    if not isinstance(context, dict):
+        raise RuntimeError("task Chronik retry context is invalid")
+    return {
+        key: value
+        for key, value in context.items()
+        if key not in CHRONIK_RETRY_MUTABLE_PROJECTION_FIELDS
+    }
+
+
+CHRONIK_RETRY_CONTEXT_SQL_PREDICATE = (
+    "json_remove(chronik_context_json, '$.subject_scope', '$.host', '$.repo') IS ?"
+)
+
+
+def _chronik_retry_match_context_json(identity: dict[str, Any]) -> str | None:
+    context = _chronik_retry_match_context(identity.get("chronik_context"))
+    return _canonical_json(context) if context is not None else None
+
+
+def _execution_retry_match_projection(
+    identity: dict[str, Any],
+    *,
+    include_command: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(identity, dict):
+        raise RuntimeError("task execution retry identity is invalid")
+    projection = {
+        key: value
+        for key, value in identity.items()
+        if key != "identity_sha256"
+        and (include_command or key != "argv_sha256")
+    }
+    projection["chronik_context"] = _chronik_retry_match_context(
+        identity.get("chronik_context")
+    )
+    return projection
+
+
+def _record_matches_execution_retry_identity(
+    record: dict[str, Any],
+    identity: dict[str, Any],
+    *,
+    include_command: bool = True,
+) -> bool:
+    stored_identity = _record_execution_identity(record)
+    stored_projection = _execution_retry_match_projection(
+        stored_identity,
+        include_command=include_command,
+    )
+    requested_projection = _execution_retry_match_projection(
+        identity,
+        include_command=include_command,
+    )
+    stored_stable = {
+        key: value
+        for key, value in stored_projection.items()
+        if key != "chronik_context"
+    }
+    requested_stable = {
+        key: value
+        for key, value in requested_projection.items()
+        if key != "chronik_context"
+    }
+    if stored_stable != requested_stable:
+        raise RuntimeError("stored task execution identity is inconsistent")
+    return (
+        stored_projection.get("chronik_context")
+        == requested_projection.get("chronik_context")
+    )
+
+
 def _latest_matching_execution_record(
     identity: dict[str, Any],
 ) -> dict[str, Any] | None:
     with _database_connection() as connection:
-        row = connection.execute(
+        rows = connection.execute(
             "SELECT * FROM tasks WHERE host=? AND argv_sha256=? AND cwd=? "
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
-            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
-            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 1",
+            f"AND {CHRONIK_RETRY_CONTEXT_SQL_PREDICATE} "
+            "AND execution_backend=? AND systemd_scope=? "
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
             (
                 identity["host"],
                 identity["argv_sha256"],
@@ -4453,24 +4598,20 @@ def _latest_matching_execution_record(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
-                (
-                    _canonical_json(identity["chronik_context"])
-                    if identity["chronik_context"] is not None
-                    else None
-                ),
+                _chronik_retry_match_context_json(identity),
                 identity["execution_backend"],
                 identity["systemd_scope"],
             ),
-        ).fetchone()
-    if row is None:
-        return None
-    record = dict(row)
-    if (
-        _record_execution_identity(record)["identity_sha256"]
-        != identity["identity_sha256"]
-    ):
-        raise RuntimeError("stored task execution identity is inconsistent")
-    return record
+        ).fetchall()
+    skipped = 0
+    for row in rows:
+        record = dict(row)
+        if _record_matches_execution_retry_identity(record, identity):
+            return record
+        skipped += 1
+        if skipped > 50000:
+            raise RuntimeError("execution retry identity scan limit exceeded")
+    return None
 
 
 def _latest_matching_active_execution_record(
@@ -4484,7 +4625,8 @@ def _latest_matching_active_execution_record(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
-            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            f"AND {CHRONIK_RETRY_CONTEXT_SQL_PREDICATE} "
+            "AND execution_backend=? AND systemd_scope=? "
             f"AND state IN ({placeholders}) "
             "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
             (
@@ -4498,11 +4640,7 @@ def _latest_matching_active_execution_record(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
-                (
-                    _canonical_json(identity["chronik_context"])
-                    if identity["chronik_context"] is not None
-                    else None
-                ),
+                _chronik_retry_match_context_json(identity),
                 identity["execution_backend"],
                 identity["systemd_scope"],
                 *active_states,
@@ -4515,11 +4653,8 @@ def _latest_matching_active_execution_record(
         record = dict(row)
         if _persisted_task_operation_identity(record) is not None:
             continue
-        if (
-            _record_execution_identity(record)["identity_sha256"]
-            != identity["identity_sha256"]
-        ):
-            raise RuntimeError("stored active task execution identity is inconsistent")
+        if not _record_matches_execution_retry_identity(record, identity):
+            continue
         matching.append(record)
     if len(matching) > 1:
         raise RuntimeError(
@@ -4528,10 +4663,41 @@ def _latest_matching_active_execution_record(
     return matching[0] if matching else None
 
 
+def _refresh_active_execution_reuse_record(
+    latest: dict[str, Any],
+    *,
+    allow_active_reuse: bool,
+) -> dict[str, Any]:
+    now = _now()
+    resource_bound = bool(_record_resource_keys(latest))
+    if (
+        resource_bound
+        or not allow_active_reuse
+        or not _task_has_fresh_active_observation(latest, now=now)
+    ):
+        status = grabowski_task_status(str(latest["task_id"]))
+        latest = _row_raw(str(latest["task_id"]))
+        if (
+            resource_bound
+            and str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]
+        ):
+            lease_maintenance = status.get("lease_maintenance")
+            if (
+                not isinstance(lease_maintenance, dict)
+                or lease_maintenance.get("maintained") is not True
+            ):
+                raise RuntimeError(
+                    "active execution resource lease maintenance failed; "
+                    f"reconcile task {latest['task_id']} before reuse"
+                )
+    return latest
+
+
 def _resolve_active_execution_reuse(
     identity: dict[str, Any],
     *,
     resume_policy: ResumePolicy,
+    allow_active_reuse: bool = True,
 ) -> dict[str, Any] | None:
     latest = _latest_matching_active_execution_record(identity)
     if latest is None:
@@ -4546,13 +4712,115 @@ def _resolve_active_execution_reuse(
             "active execution identity has a different resume policy; "
             f"reconcile task {latest['task_id']} before another start"
         )
-    now = _now()
-    if not _task_has_fresh_active_observation(latest, now=now):
-        grabowski_task_status(str(latest["task_id"]))
-        latest = _row_raw(str(latest["task_id"]))
+    latest = _refresh_active_execution_reuse_record(
+        latest,
+        allow_active_reuse=allow_active_reuse,
+    )
     if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
-        return latest
+        return latest if allow_active_reuse else None
     return None
+
+
+def _execution_record_is_unbound(record: dict[str, Any]) -> bool:
+    return (
+        _persisted_task_operation_identity(record) is None
+        and _persisted_retry_binding_or_raise(record) is None
+        and _persisted_interrupted_recovery_binding_or_raise(record) is None
+    )
+
+
+def _latest_matching_unbound_execution_record(
+    identity: dict[str, Any],
+) -> dict[str, Any] | None:
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM tasks WHERE host=? AND argv_sha256=? AND cwd=? "
+            "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
+            "AND io_weight=? AND memory_max_bytes IS ? "
+            "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            f"AND {CHRONIK_RETRY_CONTEXT_SQL_PREDICATE} "
+            "AND execution_backend=? AND systemd_scope=? "
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
+            (
+                identity["host"],
+                identity["argv_sha256"],
+                identity["cwd"],
+                _canonical_json(identity["resource_keys"]),
+                identity["runtime_seconds"],
+                identity["cpu_weight"],
+                identity["io_weight"],
+                identity["memory_max_bytes"],
+                int(identity["chronik_outbox_enabled"]),
+                identity["chronik_outbox_state_root"],
+                _chronik_retry_match_context_json(identity),
+                identity["execution_backend"],
+                identity["systemd_scope"],
+            ),
+        ).fetchall()
+    skipped = 0
+    for row in rows:
+        record = dict(row)
+        if (
+            _execution_record_is_unbound(record)
+            and _record_matches_execution_retry_identity(record, identity)
+        ):
+            return record
+        skipped += 1
+        if skipped > 50000:
+            raise RuntimeError("unbound execution identity scan limit exceeded")
+    return None
+
+
+def _resolve_recent_completed_record_reuse(
+    latest: dict[str, Any] | None,
+    *,
+    resume_policy: ResumePolicy,
+) -> dict[str, Any] | None:
+    if latest is None:
+        return None
+    if _persisted_task_operation_identity(latest) is not None:
+        return None
+    if (
+        _persisted_retry_binding_or_raise(latest) is not None
+        or _persisted_interrupted_recovery_binding_or_raise(latest) is not None
+    ):
+        return None
+    if str(latest["state"]) != "completed":
+        return None
+    if str(latest["resume_policy"]) != resume_policy:
+        raise RuntimeError(
+            "recent completed execution identity has a different resume policy; "
+            "use a distinct operation identity for intentional new work"
+        )
+    now = _now()
+    completed_at = latest.get("terminalized_at_unix")
+    if not isinstance(completed_at, int) or isinstance(completed_at, bool):
+        completed_at = latest.get("updated_at_unix")
+    if not isinstance(completed_at, int) or isinstance(completed_at, bool):
+        raise RuntimeError("recent completed execution identity timestamp is invalid")
+    age = now - completed_at
+    if age < 0:
+        raise RuntimeError("recent completed execution identity timestamp is in the future")
+    if age > TASK_OPERATION_REUSE_WINDOW_SECONDS:
+        return None
+    receipt = latest.get("lifecycle_receipt_sha256")
+    if not isinstance(receipt, str) or SHA256.fullmatch(receipt) is None:
+        raise RuntimeError(
+            "recent completed execution identity lacks a valid lifecycle receipt; "
+            f"reconcile task {latest['task_id']} before another start"
+        )
+    return latest
+
+
+def _resolve_recent_completed_execution_reuse(
+    identity: dict[str, Any],
+    *,
+    resume_policy: ResumePolicy,
+) -> dict[str, Any] | None:
+    return _resolve_recent_completed_record_reuse(
+        _latest_matching_unbound_execution_record(identity),
+        resume_policy=resume_policy,
+    )
 
 
 def _matching_attention_execution_records(
@@ -4566,9 +4834,10 @@ def _matching_attention_execution_records(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
-            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            f"AND {CHRONIK_RETRY_CONTEXT_SQL_PREDICATE} "
+            "AND execution_backend=? AND systemd_scope=? "
             f"AND state IN ({placeholders}) "
-            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT ?",
             (
                 identity["host"],
                 identity["argv_sha256"],
@@ -4580,26 +4849,22 @@ def _matching_attention_execution_records(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
-                (
-                    _canonical_json(identity["chronik_context"])
-                    if identity["chronik_context"] is not None
-                    else None
-                ),
+                _chronik_retry_match_context_json(identity),
                 identity["execution_backend"],
                 identity["systemd_scope"],
                 *attention_states,
+                EXECUTION_ATTENTION_MATCH_LIMIT + 1,
             ),
         ).fetchall()
-    if len(rows) > 50000:
+    if len(rows) > EXECUTION_ATTENTION_MATCH_LIMIT:
         raise RuntimeError("matching attention execution scan limit exceeded")
-    records = [dict(row) for row in rows]
-    if any(
-        _record_execution_identity(record)["identity_sha256"]
-        != identity["identity_sha256"]
-        for record in records
-    ):
-        raise RuntimeError("stored task execution identity is inconsistent")
-    return records
+    return [
+        record
+        for row in rows
+        if _record_matches_execution_retry_identity(
+            record := dict(row), identity
+        )
+    ]
 
 
 def _build_terminal_retry_context(
@@ -5143,6 +5408,8 @@ def _managed_cargo_command_sql_predicate(
 def _latest_matching_unprepared_managed_cargo_record(
     identity: dict[str, Any],
     command: list[str],
+    *,
+    unbound_only: bool = False,
 ) -> dict[str, Any] | None:
     argv_predicate, argv_parameters = _managed_cargo_command_sql_predicate(command)
     with _database_connection() as connection:
@@ -5151,7 +5418,8 @@ def _latest_matching_unprepared_managed_cargo_record(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
-            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            f"AND {CHRONIK_RETRY_CONTEXT_SQL_PREDICATE} "
+            "AND execution_backend=? AND systemd_scope=? "
             f"AND {argv_predicate} "
             "ORDER BY created_at_unix DESC, rowid DESC",
             (
@@ -5164,30 +5432,109 @@ def _latest_matching_unprepared_managed_cargo_record(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
-                (
-                    _canonical_json(identity["chronik_context"])
-                    if identity["chronik_context"] is not None
-                    else None
-                ),
+                _chronik_retry_match_context_json(identity),
                 identity["execution_backend"],
                 identity["systemd_scope"],
                 *argv_parameters,
             ),
         )
+        scanned_rows = 0
         while True:
             rows = cursor.fetchmany(256)
             if not rows:
                 return None
             for row in rows:
+                scanned_rows += 1
+                if scanned_rows > 50000:
+                    raise RuntimeError(
+                        "unprepared managed Cargo unbound scan limit exceeded"
+                        if unbound_only
+                        else "unprepared managed Cargo retry scan limit exceeded"
+                    )
                 record = dict(row)
-                if _record_matches_unprepared_managed_cargo_command(
+                if not _record_matches_unprepared_managed_cargo_command(
                     record, command
                 ):
-                    return record
+                    continue
+                if not _record_matches_execution_retry_identity(
+                    record,
+                    identity,
+                    include_command=False,
+                ):
+                    continue
+                if unbound_only and not _execution_record_is_unbound(record):
+                    continue
+                return record
+
+
+def _resolve_unprepared_managed_cargo_execution_reuse(
+    identity: dict[str, Any],
+    command: list[str],
+    *,
+    resume_policy: ResumePolicy,
+    allow_active_reuse: bool = True,
+) -> tuple[dict[str, Any] | None, str | None]:
+    latest = _latest_matching_unprepared_managed_cargo_record(
+        identity,
+        command,
+        unbound_only=True,
+    )
+    if latest is None:
+        return None, None
+    if (
+        _execution_retry_match_projection(
+            _record_execution_identity(latest),
+            include_command=False,
+        )
+        != _execution_retry_match_projection(
+            identity,
+            include_command=False,
+        )
+    ):
+        raise RuntimeError("stored managed Cargo execution identity is inconsistent")
+    if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
+        if str(latest["resume_policy"]) != resume_policy:
+            raise RuntimeError(
+                "active execution identity has a different resume policy; "
+                f"reconcile task {latest['task_id']} before another start"
+            )
+        latest = _refresh_active_execution_reuse_record(
+            latest,
+            allow_active_reuse=allow_active_reuse,
+        )
+        if (
+            _execution_retry_match_projection(
+                _record_execution_identity(latest),
+                include_command=False,
+            )
+            != _execution_retry_match_projection(
+                identity,
+                include_command=False,
+            )
+        ):
+            raise RuntimeError(
+                "stored managed Cargo execution identity is inconsistent"
+            )
+        _guard_direct_terminal_retry_record(latest)
+        if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
+            return (
+                (latest, "active_unprepared_managed_cargo_identity")
+                if allow_active_reuse
+                else (None, None)
+            )
+    completed = _resolve_recent_completed_record_reuse(
+        latest,
+        resume_policy=resume_policy,
+    )
+    if completed is not None:
+        return completed, "recent_completed_unprepared_managed_cargo_identity"
+    return None, None
 
 def _matching_attention_unprepared_managed_cargo_records(
     identity: dict[str, Any],
     command: list[str],
+    *,
+    unbound_only: bool = False,
 ) -> list[dict[str, Any]]:
     attention_states = tuple(TASK_STATE_PROJECTIONS["attention"])
     placeholders = ",".join("?" for _ in attention_states)
@@ -5205,7 +5552,8 @@ def _matching_attention_unprepared_managed_cargo_records(
             "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
-            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            f"AND {CHRONIK_RETRY_CONTEXT_SQL_PREDICATE} "
+            "AND execution_backend=? AND systemd_scope=? "
             f"AND {argv_predicate} "
             f"AND state IN ({placeholders}) "
             "ORDER BY created_at_unix DESC, rowid DESC LIMIT ?",
@@ -5219,11 +5567,7 @@ def _matching_attention_unprepared_managed_cargo_records(
                 identity["memory_max_bytes"],
                 int(identity["chronik_outbox_enabled"]),
                 identity["chronik_outbox_state_root"],
-                (
-                    _canonical_json(identity["chronik_context"])
-                    if identity["chronik_context"] is not None
-                    else None
-                ),
+                _chronik_retry_match_context_json(identity),
                 identity["execution_backend"],
                 identity["systemd_scope"],
                 *argv_parameters,
@@ -5239,7 +5583,14 @@ def _matching_attention_unprepared_managed_cargo_records(
         if _record_matches_unprepared_managed_cargo_command(
             record := dict(row), command
         )
+        and _record_matches_execution_retry_identity(
+            record,
+            identity,
+            include_command=False,
+        )
+        and (not unbound_only or _execution_record_is_unbound(record))
     ]
+
 
 def _guard_direct_terminal_retry_record(record: dict[str, Any] | None) -> None:
     if record is None:
@@ -5276,7 +5627,8 @@ def _guard_unprepared_managed_cargo_retry(
     execution_backend: str,
     identity: dict[str, Any],
     retry_context: dict[str, Any] | None,
-) -> None:
+    unbound_only: bool = False,
+) -> bool:
     local_systemd = (
         target["transport"] == "local" and execution_backend == "systemd-user"
     )
@@ -5290,20 +5642,26 @@ def _guard_unprepared_managed_cargo_retry(
         _explicit_managed_cargo_target_dir(command) if local_systemd else None
     )
     if request_root is None and explicit_managed_target is None:
-        return
+        return False
     if retry_context is None:
-        latest = _latest_matching_unprepared_managed_cargo_record(identity, command)
+        latest = _latest_matching_unprepared_managed_cargo_record(
+            identity,
+            command,
+            unbound_only=unbound_only,
+        )
         _guard_direct_terminal_retry_record(latest)
         latest_task_id = str(latest["task_id"]) if latest is not None else None
         for source in _matching_attention_unprepared_managed_cargo_records(
-            identity, command
+            identity,
+            command,
+            unbound_only=unbound_only,
         ):
             if str(source["task_id"]) == latest_task_id:
                 continue
             if _retained_retry_successor_for_source(str(source["task_id"])) is not None:
                 continue
             _guard_direct_terminal_retry_record(source)
-        return
+        return True
     source_task_id = retry_context.get("source_task_id")
     if not isinstance(source_task_id, str):
         raise ValueError("terminal retry context source task is invalid")
@@ -5316,6 +5674,7 @@ def _guard_unprepared_managed_cargo_retry(
     if not _record_matches_unprepared_managed_cargo_command(source, command):
         raise ValueError("terminal retry context command binding is stale")
     _guard_unchanged_terminal_retry(source_identity, retry_context)
+    return True
 
 
 def _guard_unchanged_terminal_retry(
@@ -7186,6 +7545,85 @@ def _subtract_projected_task_counts(
     return current_exact, current_projections, current_unknown
 
 
+_TASK_ATTENTION_INVALID_LAUNCHER_JSON = "{invalid-task-launcher}"
+_TASK_ATTENTION_MAX_RETRY_BINDING_BYTES = 8 * 1024
+
+
+_TASK_ATTENTION_PROJECTED_COLUMNS = (
+    "task_id", "host", "unit", "authoritative_unit", "execution_backend",
+    "systemd_scope", "attempt", "state", "resume_policy", "argv_sha256",
+    "cwd", "resource_keys_json", "runtime_seconds", "cpu_weight", "io_weight",
+    "memory_max_bytes", "created_at_unix", "updated_at_unix",
+    "execution_envelope_sha256", "chronik_outbox_enabled",
+    "chronik_outbox_state_root", "chronik_context_json",
+    "terminalization_sha256", "terminalized_at_unix",
+    "lifecycle_receipt_sha256",
+)
+
+
+def _task_attention_retry_launcher(binding: Any) -> Any:
+    if not isinstance(binding, dict):
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    try:
+        binding_bytes = _canonical_json(binding).encode("utf-8")
+    except UnicodeEncodeError:
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    if len(binding_bytes) > _TASK_ATTENTION_MAX_RETRY_BINDING_BYTES:
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    try:
+        validated = terminal_convergence.persisted_retry_binding(
+            {"launcher_json": {"retry_binding": binding}}
+        )
+    except terminal_convergence.TerminalConvergenceError:
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    if validated is None:
+        return _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+    return {"retry_binding": validated}
+
+
+def _task_attention_record(record: dict[str, Any]) -> dict[str, Any]:
+    task_projection = {
+        "task_id": record["task_id"],
+        "state": record["state"],
+        "updated_at_unix": record["updated_at_unix"],
+        "launcher_json": record["launcher_json"],
+        "last_observation_json": record.get("last_observation_json"),
+        "unit": record["unit"],
+        "authoritative_unit": _authoritative_unit(record),
+        "attempt": int(record["attempt"]),
+    }
+    raw_launcher = record.get("launcher_json")
+    compact_launcher: Any = None
+    if raw_launcher is not None:
+        if not isinstance(raw_launcher, str):
+            raise RuntimeError("Stored task launcher is not text")
+        try:
+            launcher = json.loads(raw_launcher)
+        except json.JSONDecodeError:
+            compact_launcher = _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+        else:
+            if not isinstance(launcher, dict):
+                compact_launcher = _TASK_ATTENTION_INVALID_LAUNCHER_JSON
+            elif "retry_binding" in launcher:
+                compact_launcher = _task_attention_retry_launcher(
+                    launcher["retry_binding"]
+                )
+    projected = {
+        column: record.get(column)
+        for column in _TASK_ATTENTION_PROJECTED_COLUMNS
+    }
+    projected["launcher_json"] = compact_launcher
+    projected["_task_projection_sha256"] = _sha256_json(task_projection)
+    return projected
+
+
+def _task_attention_records(rows: Any) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        records.append(_task_attention_record(dict(row)))
+    return records
+
+
 def _task_current_records_for_states(
     connection: sqlite3.Connection,
     *,
@@ -7197,17 +7635,23 @@ def _task_current_records_for_states(
         f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
         "ORDER BY created_at_unix DESC, task_id DESC",
         states,
-    ).fetchall()
-    raw_records = [dict(row) for row in rows]
-    archive_records = [_task_archive_record(record) for record in raw_records]
+    )
+    records: list[dict[str, Any]] = []
+    archive_records: list[dict[str, Any]] = []
+    for row in rows:
+        raw = dict(row)
+        archive_records.append(_task_archive_record(raw))
+        records.append(_task_attention_record(raw))
     current_archive_records = lifecycle_projection.bounded_current_task_projection(
         archive_records,
         projection=projection,
     )
-    current_task_ids = {str(record["task_id"]) for record in current_archive_records}
+    current_task_ids = {
+        str(record["task_id"]) for record in current_archive_records
+    }
     return [
         record
-        for record in raw_records
+        for record in records
         if str(record["task_id"]) in current_task_ids
     ]
 
@@ -7248,15 +7692,17 @@ def _task_retry_successor_records(
             '"retry_binding"',
             limit + 1,
         ),
-    ).fetchall()
-    if len(rows) > limit:
-        raise RuntimeError("retry successor convergence scan limit exceeded")
+    )
     records: list[dict[str, Any]] = []
+    row_count = 0
     for row in rows:
+        row_count += 1
+        if row_count > limit:
+            raise RuntimeError("retry successor convergence scan limit exceeded")
         record = dict(row)
         binding = terminal_convergence.persisted_retry_binding(record)
         if binding is not None:
-            records.append(record)
+            records.append(_task_attention_record(record))
     return records
 
 
@@ -8161,7 +8607,11 @@ def grabowski_task_start(
     deterministic; it does not invoke an external checkout sensor. Every task-owned broad
     repository lease carries a complete whole-repository scope manifest.
     An exact already-active execution identity is reused instead of launching
-    another process, even when no explicit operation identity was supplied. For
+    another process, even when no explicit operation identity was supplied.
+    A recently completed unbound execution identity is also reused within the
+    existing successful-operation reuse window so response-loss retries cannot
+    relaunch a fast completed effect. After that bounded window, the same
+    execution may start again. For
     short effect-free direct reads, prefer an existing typed read surface. A
     server-verified local Git read classified as avoidable_bounded_read returns
     before task persistence with a structured reroute to grabowski_git; task_start
@@ -8443,99 +8893,6 @@ def grabowski_task_start(
         host=host,
         opaque_command=True,
     )
-    unprepared_identity = _task_execution_identity(
-        host=host,
-        argv_sha256=command_identity.argv_sha256(command),
-        cwd=working_directory,
-        resource_keys=task_resources,
-        runtime_seconds=runtime,
-        cpu_weight=cpu,
-        io_weight=io,
-        memory_max_bytes=memory,
-        chronik_outbox_enabled=bool(chronik_enabled),
-        chronik_outbox_state_root=chronik_state_root,
-        chronik_context_json=chronik_context_json,
-        execution_backend=execution_backend,
-        systemd_scope=systemd_scope,
-    )
-    _guard_unprepared_managed_cargo_retry(
-        command,
-        target=target,
-        cwd=working_directory,
-        execution_backend=execution_backend,
-        identity=unprepared_identity,
-        retry_context=_retry_context,
-    )
-    command = _bind_managed_cargo_environment(
-        command,
-        target=target,
-        cwd=working_directory,
-        execution_backend=execution_backend,
-    )
-    argv_sha256 = command_identity.argv_sha256(command)
-    execution_identity = _task_execution_identity(
-        host=host,
-        argv_sha256=argv_sha256,
-        cwd=working_directory,
-        resource_keys=task_resources,
-        runtime_seconds=runtime,
-        cpu_weight=cpu,
-        io_weight=io,
-        memory_max_bytes=memory,
-        chronik_outbox_enabled=bool(chronik_enabled),
-        chronik_outbox_state_root=chronik_state_root,
-        chronik_context_json=chronik_context_json,
-        execution_backend=execution_backend,
-        systemd_scope=systemd_scope,
-    )
-    active_execution_reuse = None
-    if (
-        normalized_operation_identity is None
-        and operation_retry_binding is None
-        and _retry_context is None
-        and not task_resources
-    ):
-        active_execution_reuse = _resolve_active_execution_reuse(
-            execution_identity,
-            resume_policy=policy,
-        )
-    if active_execution_reuse is not None:
-        reused_classification = _project_task_effect_classification(
-            _record_task_effect_classification(active_execution_reuse),
-            fallback=task_effect_classification,
-        )
-        reuse_audit = {
-            "timestamp_unix": _now(),
-            "operation": "task-start-execution-deduplicated",
-            "requested_task_id": task_id,
-            "reused_task_id": str(active_execution_reuse["task_id"]),
-            "reuse_reason": "active_execution_identity",
-            "execution_identity_sha256": execution_identity["identity_sha256"],
-            "effect_profile": reused_classification["effect_profile"],
-            "surface": reused_classification["surface"],
-            "agent_executable": reused_classification.get("agent_executable"),
-            "classification_source": reused_classification["classification_source"],
-            "policy_version": reused_classification["policy_version"],
-            "no_process_started": True,
-        }
-        base._append_audit(reuse_audit)
-        return {
-            "task": _public(active_execution_reuse),
-            "audit": reuse_audit,
-            "execution_identity": execution_identity,
-            "retry_binding": _persisted_retry_binding_or_raise(
-                active_execution_reuse
-            ),
-            "routing_shadow_capture": None,
-            "operation_identity": None,
-            "operation_retry_binding": None,
-            "task_effect_classification": reused_classification,
-            "deduplicated_reuse": {
-                "reused": True,
-                "task_id": str(active_execution_reuse["task_id"]),
-                "reason": "active_execution_identity",
-            },
-        }
     read_routing_advisory = (
         _task_read_routing_advisory(
             target=target,
@@ -8557,6 +8914,130 @@ def grabowski_task_start(
         )
         else None
     )
+    unprepared_identity = _task_execution_identity(
+        host=host,
+        argv_sha256=command_identity.argv_sha256(command),
+        cwd=working_directory,
+        resource_keys=task_resources,
+        runtime_seconds=runtime,
+        cpu_weight=cpu,
+        io_weight=io,
+        memory_max_bytes=memory,
+        chronik_outbox_enabled=bool(chronik_enabled),
+        chronik_outbox_state_root=chronik_state_root,
+        chronik_context_json=chronik_context_json,
+        execution_backend=execution_backend,
+        systemd_scope=systemd_scope,
+    )
+    execution_reuse_eligible = (
+        normalized_operation_identity is None
+        and operation_retry_binding is None
+        and _retry_context is None
+    )
+    managed_cargo_request = _guard_unprepared_managed_cargo_retry(
+        command,
+        target=target,
+        cwd=working_directory,
+        execution_backend=execution_backend,
+        identity=unprepared_identity,
+        retry_context=_retry_context,
+        unbound_only=execution_reuse_eligible,
+    )
+    execution_reuse = None
+    execution_reuse_reason = None
+    if execution_reuse_eligible and managed_cargo_request:
+        execution_reuse, execution_reuse_reason = (
+            _resolve_unprepared_managed_cargo_execution_reuse(
+                unprepared_identity,
+                command,
+                resume_policy=policy,
+                allow_active_reuse=mutating_agent_workspace is None,
+            )
+        )
+    if execution_reuse is not None:
+        execution_identity = _record_execution_identity(execution_reuse)
+    else:
+        command = _bind_managed_cargo_environment(
+            command,
+            target=target,
+            cwd=working_directory,
+            execution_backend=execution_backend,
+        )
+        argv_sha256 = command_identity.argv_sha256(command)
+        execution_identity = _task_execution_identity(
+            host=host,
+            argv_sha256=argv_sha256,
+            cwd=working_directory,
+            resource_keys=task_resources,
+            runtime_seconds=runtime,
+            cpu_weight=cpu,
+            io_weight=io,
+            memory_max_bytes=memory,
+            chronik_outbox_enabled=bool(chronik_enabled),
+            chronik_outbox_state_root=chronik_state_root,
+            chronik_context_json=chronik_context_json,
+            execution_backend=execution_backend,
+            systemd_scope=systemd_scope,
+        )
+        if execution_reuse_eligible:
+            execution_reuse = _resolve_active_execution_reuse(
+                execution_identity,
+                resume_policy=policy,
+                allow_active_reuse=mutating_agent_workspace is None,
+            )
+            if execution_reuse is not None:
+                execution_reuse_reason = "active_execution_identity"
+            if (
+                execution_reuse is None
+                and (
+                    read_routing_advisory is None
+                    or read_routing_advisory.get("classification")
+                    != "avoidable_bounded_read"
+                )
+            ):
+                execution_reuse = _resolve_recent_completed_execution_reuse(
+                    execution_identity,
+                    resume_policy=policy,
+                )
+                if execution_reuse is not None:
+                    execution_reuse_reason = "recent_completed_execution_identity"
+    if execution_reuse is not None:
+        if execution_reuse_reason is None:
+            raise RuntimeError("execution reuse reason is missing")
+        reused_classification = _project_task_effect_classification(
+            _record_task_effect_classification(execution_reuse),
+            fallback=task_effect_classification,
+        )
+        reuse_audit = {
+            "timestamp_unix": _now(),
+            "operation": "task-start-execution-deduplicated",
+            "requested_task_id": task_id,
+            "reused_task_id": str(execution_reuse["task_id"]),
+            "reuse_reason": execution_reuse_reason,
+            "execution_identity_sha256": execution_identity["identity_sha256"],
+            "effect_profile": reused_classification["effect_profile"],
+            "surface": reused_classification["surface"],
+            "agent_executable": reused_classification.get("agent_executable"),
+            "classification_source": reused_classification["classification_source"],
+            "policy_version": reused_classification["policy_version"],
+            "no_process_started": True,
+        }
+        base._append_audit(reuse_audit)
+        return {
+            "task": _public(execution_reuse),
+            "audit": reuse_audit,
+            "execution_identity": execution_identity,
+            "retry_binding": _persisted_retry_binding_or_raise(execution_reuse),
+            "routing_shadow_capture": None,
+            "operation_identity": None,
+            "operation_retry_binding": None,
+            "task_effect_classification": reused_classification,
+            "deduplicated_reuse": {
+                "reused": True,
+                "task_id": str(execution_reuse["task_id"]),
+                "reason": execution_reuse_reason,
+            },
+        }
     if (
         read_routing_advisory is not None
         and read_routing_advisory.get("classification") == "avoidable_bounded_read"
@@ -9366,11 +9847,22 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
             timeout_seconds=60,
         )
     else:
-        result = _dispatch(
-            record["host"],
-            ["systemctl", "--user", "stop", _authoritative_unit(record)],
-            timeout_seconds=60,
+        resolved_host, target, _legacy_local_alias = _resolve_task_dispatch_host(
+            str(record["host"])
         )
+        if target["transport"] == "local":
+            result = operator._run_mutating_user_systemd_unit(
+                _authoritative_unit(record),
+                "stop",
+                mutation_timeout_seconds=60,
+                max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+            )
+        else:
+            result = _dispatch(
+                resolved_host,
+                ["systemctl", "--user", "stop", _authoritative_unit(record)],
+                timeout_seconds=60,
+            )
     if result.get("outcome_unknown"):
         state = "outcome_unknown"
     else:

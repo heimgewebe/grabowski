@@ -677,6 +677,328 @@ class OperatorSignedTransportTests(unittest.TestCase):
         self.assertEqual(evidence["transport_mode"], assertion.ASSERTION_VERSION)
         self.assertEqual(evidence["client_scope_kind"], "connector_capability")
 
+    def _signed_headers_for_arguments(
+        self,
+        arguments: dict[str, object],
+        *,
+        session_id: str,
+        request_id: int,
+    ) -> dict[str, str]:
+        body = _tool_body(arguments, request_id=request_id)
+        signed = ingress.signed_tool_headers(
+            token=SECRET,
+            body=body,
+            session_id=session_id,
+            runtime_binding_sha256=_runtime_sha256(),
+            now_unix=int(__import__("time").time()),
+        )
+        return {
+            base._TRANSPORT_CONNECTOR_CAPABILITY_HEADER: SECRET,
+            base._TRANSPORT_INGRESS_VERSION_HEADER: assertion.ASSERTION_VERSION,
+            base._TRANSPORT_MCP_SESSION_ID_HEADER: session_id,
+            base._TRANSPORT_REQUEST_ID_HEADER: signed[ingress.REQUEST_ID_HEADER],
+            base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: signed[
+                ingress.REQUEST_TIMESTAMP_HEADER
+            ],
+            base._TRANSPORT_REQUEST_AUDIENCE_HEADER: signed[
+                ingress.REQUEST_AUDIENCE_HEADER
+            ],
+            base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: signed[
+                ingress.REQUEST_BODY_SHA256_HEADER
+            ],
+            base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: signed[
+                ingress.RUNTIME_BINDING_SHA256_HEADER
+            ],
+            base._TRANSPORT_REQUEST_MAC_HEADER: signed[ingress.REQUEST_MAC_HEADER],
+        }
+
+    def test_operator_signed_one_call_accepts_flowlines_augmented_public_arguments(
+        self,
+    ) -> None:
+        domain_arguments = {"argv": ["true"]}
+        public_arguments = {
+            **domain_arguments,
+            "reason": "Run bounded verification",
+            "user_intent": "Verify the requested repository change",
+        }
+        headers = self._signed_headers_for_arguments(
+            public_arguments,
+            session_id="flowlines-analytics-accepted",
+            request_id=71,
+        )
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with mock.patch.object(
+            roundtrip,
+            "consume_verified",
+            side_effect=AssertionError("legacy roundtrip must not run"),
+        ):
+            evidence = operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_terminal_run",
+                arguments=domain_arguments,
+                transport_arguments=public_arguments,
+                context=_ctx(headers),
+                tool=tool,
+            )
+        self.assertEqual(evidence["transport_mode"], assertion.ASSERTION_VERSION)
+        self.assertNotEqual(
+            assertion.canonical_arguments_sha256(public_arguments),
+            roundtrip.canonical_arguments_sha256(domain_arguments),
+        )
+
+    def test_operator_signed_one_call_rejects_domain_tamper_after_signature(
+        self,
+    ) -> None:
+        original_public_arguments = {
+            "argv": ["true"],
+            "reason": "Run bounded verification",
+            "user_intent": "Verify the requested repository change",
+        }
+        headers = self._signed_headers_for_arguments(
+            original_public_arguments,
+            session_id="flowlines-domain-tamper",
+            request_id=72,
+        )
+        tampered_domain_arguments = {"argv": ["false"]}
+        tampered_public_arguments = {
+            **tampered_domain_arguments,
+            "reason": original_public_arguments["reason"],
+            "user_intent": original_public_arguments["user_intent"],
+        }
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with self.assertRaisesRegex(RuntimeError, "MAC mismatch"):
+            operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_terminal_run",
+                arguments=tampered_domain_arguments,
+                transport_arguments=tampered_public_arguments,
+                context=_ctx(headers),
+                tool=tool,
+            )
+
+    def test_operator_signed_one_call_rejects_analytics_tamper_without_resigning(
+        self,
+    ) -> None:
+        domain_arguments = {"argv": ["true"]}
+        original_public_arguments = {
+            **domain_arguments,
+            "reason": "Original reason",
+            "user_intent": "Original intent",
+        }
+        headers = self._signed_headers_for_arguments(
+            original_public_arguments,
+            session_id="flowlines-analytics-tamper",
+            request_id=73,
+        )
+        tampered_public_arguments = {
+            **original_public_arguments,
+            "reason": "Changed reason",
+        }
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with self.assertRaisesRegex(RuntimeError, "MAC mismatch"):
+            operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_terminal_run",
+                arguments=domain_arguments,
+                transport_arguments=tampered_public_arguments,
+                context=_ctx(headers),
+                tool=tool,
+            )
+
+    def test_resigned_analytics_variants_keep_identical_domain_policy(
+        self,
+    ) -> None:
+        domain_arguments = {"argv": ["true"]}
+        tool = SimpleNamespace(
+            fn_metadata=SimpleNamespace(
+                arg_model=SimpleNamespace(model_fields={"argv": object()})
+            ),
+            annotations=SimpleNamespace(readOnlyHint=False),
+        )
+        raw_digests: list[str] = []
+        for request_id, (reason, user_intent) in enumerate(
+            (
+                ("First reason", "First intent"),
+                ("Second reason", "Second intent"),
+            ),
+            start=74,
+        ):
+            public_arguments = {
+                **domain_arguments,
+                "reason": reason,
+                "user_intent": user_intent,
+            }
+            policy_arguments = operator._operator_policy_arguments(
+                "grabowski_terminal_run",
+                public_arguments,
+                tool,
+            )
+            self.assertEqual(policy_arguments, domain_arguments)
+            headers = self._signed_headers_for_arguments(
+                public_arguments,
+                session_id=f"flowlines-resigned-{request_id}",
+                request_id=request_id,
+            )
+            evidence = operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_terminal_run",
+                arguments=policy_arguments,
+                transport_arguments=public_arguments,
+                context=_ctx(headers),
+                tool=tool,
+            )
+            self.assertEqual(evidence["transport_mode"], assertion.ASSERTION_VERSION)
+            raw_digests.append(
+                assertion.canonical_arguments_sha256(public_arguments)
+            )
+        self.assertNotEqual(raw_digests[0], raw_digests[1])
+
+    def test_legacy_roundtrip_stays_bound_to_domain_arguments(
+        self,
+    ) -> None:
+        domain_arguments = {"argv": ["true"]}
+        public_arguments = {
+            **domain_arguments,
+            "reason": "Analytics only",
+            "user_intent": "Analytics only",
+        }
+        expected_domain_digest = roundtrip.canonical_arguments_sha256(
+            domain_arguments
+        )
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with (
+            mock.patch.object(
+                base, "_transport_signed_one_call_evidence", return_value=None
+            ),
+            mock.patch.object(
+                base, "_transport_roundtrip_client_scope", return_value=SCOPE
+            ),
+            mock.patch.object(
+                roundtrip,
+                "consume_verified",
+                return_value={"state": "consumed", "transport_mode": "legacy-test"},
+            ) as consume_verified,
+        ):
+            evidence = operator._require_transport_roundtrip_for_tool(
+                tool_name="grabowski_terminal_run",
+                arguments=domain_arguments,
+                transport_arguments=public_arguments,
+                context=_ctx({}),
+                tool=tool,
+            )
+        self.assertEqual(evidence["transport_mode"], "legacy-test")
+        self.assertEqual(
+            consume_verified.call_args.kwargs["arguments_sha256"],
+            expected_domain_digest,
+        )
+        self.assertNotEqual(
+            expected_domain_digest,
+            roundtrip.canonical_arguments_sha256(public_arguments),
+        )
+
+    def test_mcp_task_start_exact_request_is_single_use_and_fresh_retry_delegates(self) -> None:
+        arguments = {"host": "heim-pc", "argv": ["true"]}
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "tools/call",
+                "params": {
+                    "name": "grabowski_task_start",
+                    "arguments": arguments,
+                },
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        now = int(__import__("time").time())
+        session_id = "task-domain-session"
+        signed = ingress.signed_tool_headers(
+            token=SECRET,
+            body=body,
+            session_id=session_id,
+            runtime_binding_sha256=_runtime_sha256(),
+            now_unix=now,
+        )
+        headers = {
+            base._TRANSPORT_CONNECTOR_CAPABILITY_HEADER: SECRET,
+            base._TRANSPORT_INGRESS_VERSION_HEADER: assertion.ASSERTION_VERSION,
+            base._TRANSPORT_MCP_SESSION_ID_HEADER: session_id,
+            base._TRANSPORT_REQUEST_ID_HEADER: signed[ingress.REQUEST_ID_HEADER],
+            base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: signed[
+                ingress.REQUEST_TIMESTAMP_HEADER
+            ],
+            base._TRANSPORT_REQUEST_AUDIENCE_HEADER: signed[
+                ingress.REQUEST_AUDIENCE_HEADER
+            ],
+            base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: signed[
+                ingress.REQUEST_BODY_SHA256_HEADER
+            ],
+            base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: signed[
+                ingress.RUNTIME_BINDING_SHA256_HEADER
+            ],
+            base._TRANSPORT_REQUEST_MAC_HEADER: signed[ingress.REQUEST_MAC_HEADER],
+        }
+        digest = assertion.canonical_arguments_sha256(arguments)
+
+        first = base._transport_signed_one_call_evidence(
+            _ctx(headers),
+            tool_name="grabowski_task_start",
+            arguments_sha256=digest,
+            runtime_binding=BINDING,
+        )
+        self.assertEqual(first["state"], "consumed")
+        self.assertTrue(first["single_use"])
+        self.assertEqual(first["replay_policy"], "domain_delegated")
+
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            base._transport_signed_one_call_evidence(
+                _ctx(headers),
+                tool_name="grabowski_task_start",
+                arguments_sha256=digest,
+                runtime_binding=BINDING,
+            )
+
+        fresh_session_id = "task-domain-session-fresh"
+        fresh_signed = ingress.signed_tool_headers(
+            token=SECRET,
+            body=body,
+            session_id=fresh_session_id,
+            runtime_binding_sha256=_runtime_sha256(),
+            now_unix=now,
+        )
+        fresh_headers = dict(headers)
+        fresh_headers.update(
+            {
+                base._TRANSPORT_MCP_SESSION_ID_HEADER: fresh_session_id,
+                base._TRANSPORT_REQUEST_ID_HEADER: fresh_signed[
+                    ingress.REQUEST_ID_HEADER
+                ],
+                base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: fresh_signed[
+                    ingress.REQUEST_TIMESTAMP_HEADER
+                ],
+                base._TRANSPORT_REQUEST_AUDIENCE_HEADER: fresh_signed[
+                    ingress.REQUEST_AUDIENCE_HEADER
+                ],
+                base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: fresh_signed[
+                    ingress.REQUEST_BODY_SHA256_HEADER
+                ],
+                base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: fresh_signed[
+                    ingress.RUNTIME_BINDING_SHA256_HEADER
+                ],
+                base._TRANSPORT_REQUEST_MAC_HEADER: fresh_signed[
+                    ingress.REQUEST_MAC_HEADER
+                ],
+            }
+        )
+        fresh = base._transport_signed_one_call_evidence(
+            _ctx(fresh_headers),
+            tool_name="grabowski_task_start",
+            arguments_sha256=digest,
+            runtime_binding=BINDING,
+        )
+        self.assertNotEqual(first["request_id"], fresh["request_id"])
+        self.assertEqual(fresh["state"], "consumed")
+        self.assertTrue(fresh["single_use"])
+        self.assertEqual(fresh["replay_policy"], "domain_delegated")
+
     def test_mcp_preserves_typed_signed_one_call_replay(self) -> None:
         arguments = {"argv": ["true"]}
         body = _tool_body(arguments)
@@ -720,6 +1042,60 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 arguments_sha256=arguments_sha256,
                 runtime_binding=BINDING,
             )
+
+    def test_mcp_allows_same_body_in_new_mcp_session(self) -> None:
+        arguments = {"argv": ["true"]}
+        body = _tool_body(arguments)
+        arguments_sha256 = roundtrip.canonical_arguments_sha256(arguments)
+
+        def headers_for(session_id: str) -> dict[str, str]:
+            signed = ingress.signed_tool_headers(
+                token=SECRET,
+                body=body,
+                session_id=session_id,
+                runtime_binding_sha256=_runtime_sha256(),
+                now_unix=int(__import__("time").time()),
+            )
+            return {
+                base._TRANSPORT_CONNECTOR_CAPABILITY_HEADER: SECRET,
+                base._TRANSPORT_MCP_SESSION_ID_HEADER: session_id,
+                base._TRANSPORT_INGRESS_VERSION_HEADER: assertion.ASSERTION_VERSION,
+                base._TRANSPORT_REQUEST_ID_HEADER: signed[ingress.REQUEST_ID_HEADER],
+                base._TRANSPORT_REQUEST_TIMESTAMP_HEADER: signed[
+                    ingress.REQUEST_TIMESTAMP_HEADER
+                ],
+                base._TRANSPORT_REQUEST_AUDIENCE_HEADER: signed[
+                    ingress.REQUEST_AUDIENCE_HEADER
+                ],
+                base._TRANSPORT_REQUEST_BODY_SHA256_HEADER: signed[
+                    ingress.REQUEST_BODY_SHA256_HEADER
+                ],
+                base._TRANSPORT_RUNTIME_BINDING_SHA256_HEADER: signed[
+                    ingress.RUNTIME_BINDING_SHA256_HEADER
+                ],
+                base._TRANSPORT_REQUEST_MAC_HEADER: signed[ingress.REQUEST_MAC_HEADER],
+            }
+
+        first_headers = headers_for("session-a")
+        second_headers = headers_for("session-b")
+        self.assertNotEqual(
+            first_headers[base._TRANSPORT_REQUEST_ID_HEADER],
+            second_headers[base._TRANSPORT_REQUEST_ID_HEADER],
+        )
+        first = base._transport_signed_one_call_evidence(
+            _ctx(first_headers),
+            tool_name="grabowski_terminal_run",
+            arguments_sha256=arguments_sha256,
+            runtime_binding=BINDING,
+        )
+        second = base._transport_signed_one_call_evidence(
+            _ctx(second_headers),
+            tool_name="grabowski_terminal_run",
+            arguments_sha256=arguments_sha256,
+            runtime_binding=BINDING,
+        )
+        self.assertEqual(first["transport_mode"], assertion.ASSERTION_VERSION)
+        self.assertEqual(second["transport_mode"], assertion.ASSERTION_VERSION)
 
     def test_publisher_replay_recovery_preflight_requires_safe_state_store_preview(
         self,
@@ -818,6 +1194,228 @@ class OperatorSignedTransportTests(unittest.TestCase):
             "domain_reconciled_preverified_exact_roundtrip",
         )
         self.assertEqual(evidence["recovery_preflight"], preflight)
+
+    def test_post_merge_sync_apply_replay_preflight_requires_exact_intrinsic_contract(
+        self,
+    ) -> None:
+        arguments = {
+            "name": "post-merge-sync-apply",
+            "parameters": {
+                "repo": "/home/alex/repos/grabowski",
+                "target_branch": "main",
+                "expected_local_head": "1" * 40,
+                "expected_remote_head": "2" * 40,
+                "expected_physical_identity_sha256": "f" * 64,
+                "confirmation": "apply-protected-post-merge-sync",
+            },
+            "profile": "operator",
+            "allow_mutation": True,
+        }
+        with mock.patch.object(
+            operator.grabowski_physical_checkout,
+            "capture_physical_checkout_identity",
+            return_value={"physical_identity_sha256": "f" * 64},
+        ):
+            evidence = operator._signed_replay_recovery_preflight(
+                tool_name="grip_run",
+                arguments=arguments,
+            )
+        self.assertIsInstance(evidence, dict)
+        assert evidence is not None
+        self.assertEqual(
+            evidence["reentry_mode"],
+            "intrinsic_idempotent_domain",
+        )
+        self.assertEqual(evidence["grip_name"], "post-merge-sync-apply")
+        self.assertRegex(evidence["grip_contract_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(evidence["parameters_sha256"], r"^[0-9a-f]{64}$")
+
+        uppercase_heads = {
+            **arguments,
+            "parameters": {
+                **arguments["parameters"],
+                "expected_local_head": "A" * 40,
+                "expected_remote_head": "B" * 40,
+            },
+        }
+        with mock.patch.object(
+            operator.grabowski_physical_checkout,
+            "capture_physical_checkout_identity",
+            return_value={"physical_identity_sha256": "f" * 64},
+        ):
+            uppercase_evidence = operator._signed_replay_recovery_preflight(
+                tool_name="grip_run",
+                arguments=uppercase_heads,
+            )
+        self.assertIsInstance(uppercase_evidence, dict)
+
+        current_spec = operator.grabowski_grips.GRIP_SPECS["post-merge-sync-apply"]
+        drifted_spec = SimpleNamespace(
+            name=current_spec.name,
+            version="1.2",
+            required_parameters=current_spec.required_parameters,
+            effect=current_spec.effect,
+            runner=current_spec.runner,
+            operation_effect_class=current_spec.operation_effect_class,
+            operation_class=current_spec.operation_class,
+            acceptance_ids=current_spec.acceptance_ids,
+        )
+        with mock.patch.dict(
+            operator.grabowski_grips.GRIP_SPECS,
+            {"post-merge-sync-apply": drifted_spec},
+        ):
+            self.assertIsNone(
+                operator._signed_replay_recovery_preflight(
+                    tool_name="grip_run",
+                    arguments=arguments,
+                )
+            )
+
+        mismatched_identity = {
+            **arguments,
+            "parameters": {
+                **arguments["parameters"],
+                "expected_physical_identity_sha256": "e" * 64,
+            },
+        }
+        with mock.patch.object(
+            operator.grabowski_physical_checkout,
+            "capture_physical_checkout_identity",
+            return_value={"physical_identity_sha256": "f" * 64},
+        ):
+            self.assertIsNone(
+                operator._signed_replay_recovery_preflight(
+                    tool_name="grip_run",
+                    arguments=mismatched_identity,
+                )
+            )
+
+        unsafe = dict(arguments)
+        unsafe["allow_mutation"] = False
+        self.assertIsNone(
+            operator._signed_replay_recovery_preflight(
+                tool_name="grip_run",
+                arguments=unsafe,
+            )
+        )
+
+        wrong_confirmation = {
+            **arguments,
+            "parameters": {
+                **arguments["parameters"],
+                "confirmation": "not-authorized",
+            },
+        }
+        self.assertIsNone(
+            operator._signed_replay_recovery_preflight(
+                tool_name="grip_run",
+                arguments=wrong_confirmation,
+            )
+        )
+
+    def test_post_merge_sync_apply_replay_preflight_expands_home_relative_repo(
+        self,
+    ) -> None:
+        home_relative = "~/repos/grabowski"
+        expected_path = Path(home_relative).expanduser()
+        arguments = {
+            "name": "post-merge-sync-apply",
+            "parameters": {
+                "repo": home_relative,
+                "target_branch": "main",
+                "expected_local_head": "1" * 40,
+                "expected_remote_head": "2" * 40,
+                "expected_physical_identity_sha256": "f" * 64,
+                "confirmation": "apply-protected-post-merge-sync",
+            },
+            "profile": "operator",
+            "allow_mutation": True,
+        }
+        with mock.patch.object(
+            operator.grabowski_physical_checkout,
+            "capture_physical_checkout_identity",
+            return_value={"physical_identity_sha256": "f" * 64},
+        ) as capture:
+            evidence = operator._signed_replay_recovery_preflight(
+                tool_name="grip_run",
+                arguments=arguments,
+            )
+
+        self.assertIsInstance(evidence, dict)
+        capture.assert_called_once_with(expected_path)
+
+    def test_operator_allows_intrinsic_post_merge_replay_without_roundtrip(
+        self,
+    ) -> None:
+        arguments = {
+            "name": "post-merge-sync-apply",
+            "parameters": {
+                "repo": "/home/alex/repos/grabowski",
+                "target_branch": "main",
+                "expected_local_head": "1" * 40,
+                "expected_remote_head": "2" * 40,
+                "expected_physical_identity_sha256": "f" * 64,
+                "confirmation": "apply-protected-post-merge-sync",
+            },
+            "profile": "operator",
+            "allow_mutation": True,
+        }
+        expected_arguments_sha256 = roundtrip.canonical_arguments_sha256(arguments)
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        replay_message = "signed one-call transport request was already consumed"
+        with (
+            mock.patch.object(
+                base,
+                "_transport_signed_one_call_evidence",
+                side_effect=assertion.TransportAssertionReplay(replay_message),
+            ),
+            mock.patch.object(roundtrip, "consume_verified") as consume_verified,
+            mock.patch.object(roundtrip, "begin") as begin,
+        ):
+            with mock.patch.object(
+                operator.grabowski_physical_checkout,
+                "capture_physical_checkout_identity",
+                return_value={"physical_identity_sha256": "f" * 64},
+            ):
+                evidence = operator._require_transport_roundtrip_for_tool(
+                    tool_name="grip_run",
+                    arguments=arguments,
+                    context=_ctx({}),
+                    tool=tool,
+                )
+        consume_verified.assert_not_called()
+        begin.assert_not_called()
+        self.assertTrue(evidence["signed_one_call_replay_recovery"])
+        self.assertTrue(evidence["effect_admission_transport_exempt"])
+        self.assertEqual(
+            evidence["recovery_basis"],
+            "authenticated_signed_replay_intrinsic_domain_idempotency",
+        )
+        self.assertEqual(evidence["arguments_sha256"], expected_arguments_sha256)
+        self.assertEqual(
+            evidence["runtime_binding_sha256"],
+            assertion.runtime_binding_sha256(BINDING),
+        )
+
+    def test_effect_admission_transport_inputs_keep_replay_runtime_bound(self) -> None:
+        replay = {
+            "signed_one_call_replay_recovery": True,
+            "effect_admission_transport_exempt": True,
+            "recovery_basis": "authenticated_signed_replay_intrinsic_domain_idempotency",
+            "runtime_binding_sha256": "a" * 64,
+        }
+        transport, runtime = operator._effect_admission_transport_inputs(replay)
+        self.assertIsNone(transport)
+        self.assertEqual(runtime, "a" * 64)
+
+        ordinary = {
+            "transport_mode": "signed-one-call-v1",
+            "runtime_binding_sha256": "b" * 64,
+            "consumption_receipt_sha256": "c" * 64,
+        }
+        transport, runtime = operator._effect_admission_transport_inputs(ordinary)
+        self.assertIs(transport, ordinary)
+        self.assertIsNone(runtime)
 
     def test_operator_generic_signed_replay_cannot_use_roundtrip_recovery(self) -> None:
         arguments = {"argv": ["true"]}
@@ -1064,6 +1662,246 @@ class OperatorSignedTransportTests(unittest.TestCase):
                 "grabowski_terminal_run", {"argv": ["true"]}
             )
         )
+
+    def test_simple_terminal_sed_range_read_redirects_before_replay_state(self) -> None:
+        arguments = {
+            "argv": ["sed", "-n", "10,20p", "src/grabowski_operator.py"],
+            "cwd": str(ROOT),
+        }
+        redirect = operator._terminal_typed_read_redirect(
+            "grabowski_terminal_run", arguments
+        )
+        self.assertEqual(
+            redirect,
+            {
+                "schema_version": 1,
+                "code": "typed_read_route_required",
+                "source_tool": "grabowski_terminal_run",
+                "typed_tool": "grabowski_read_text",
+                "typed_arguments": {
+                    "path": str(ROOT / "src/grabowski_operator.py"),
+                    "start_line": 10,
+                    "max_lines": 11,
+                },
+                "reason": "exact simple sed range read has an existing typed read surface",
+                "transport_consumed": False,
+                "does_not_establish": [
+                    "typed read success",
+                    "path authorization",
+                    "permission to retry the terminal command",
+                ],
+            },
+        )
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        with mock.patch.object(
+            base,
+            "_transport_signed_one_call_evidence",
+            side_effect=AssertionError(
+                "typed read redirect must happen before signed replay state"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "typed read route required before mutation transport"
+            ):
+                operator._require_transport_roundtrip_for_tool(
+                    tool_name="grabowski_terminal_run",
+                    arguments=arguments,
+                    context=None,
+                    tool=tool,
+                )
+
+    def test_terminal_sed_read_redirect_is_exact_and_fail_closed(self) -> None:
+        unsafe = [
+            {"argv": ["sed", "-i", "10,20d", "file.txt"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "10,20w /tmp/out", "file.txt"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "10,20e id", "file.txt"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "20,10p", "file.txt"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "1,2001p", "file.txt"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "10,20p", "-i"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "10,20p", "file.txt", "extra"], "cwd": "/tmp"},
+            {"argv": ["cat", "file.txt"], "cwd": "/tmp"},
+            {"argv": ["sed", "-n", "1p", "file.txt"], "cwd": 123},
+            {"argv": ["sed", "-n", "1p", "file.txt"], "cwd": []},
+        ]
+        for arguments in unsafe:
+            with self.subTest(arguments=arguments):
+                self.assertIsNone(
+                    operator._terminal_typed_read_redirect(
+                        "grabowski_terminal_run", arguments
+                    )
+                )
+
+        with mock.patch.object(
+            operator,
+            "int",
+            side_effect=ValueError("simulated integer conversion limit"),
+            create=True,
+        ):
+            self.assertIsNone(
+                operator._terminal_typed_read_redirect(
+                    "grabowski_terminal_run",
+                    {
+                        "argv": ["sed", "-n", "999p", "file.txt"],
+                        "cwd": "/tmp",
+                    },
+                )
+            )
+
+        single_line = operator._terminal_typed_read_redirect(
+            "grabowski_terminal_run",
+            {
+                "argv": ["sed", "-n", "7p", "src/grabowski_operator.py"],
+                "cwd": str(ROOT),
+            },
+        )
+        self.assertIsNotNone(single_line)
+        assert single_line is not None
+        self.assertEqual(single_line["typed_arguments"]["start_line"], 7)
+        self.assertEqual(single_line["typed_arguments"]["max_lines"], 1)
+
+        bin_sed = operator._terminal_typed_read_redirect(
+            "grabowski_terminal_run",
+            {
+                "argv": ["/bin/sed", "-n", "7p", "src/grabowski_operator.py"],
+                "cwd": str(ROOT),
+            },
+        )
+        self.assertIsNotNone(bin_sed)
+        assert bin_sed is not None
+        self.assertEqual(
+            bin_sed["typed_arguments"]["path"],
+            str(ROOT / "src/grabowski_operator.py"),
+        )
+        self.assertEqual(bin_sed["typed_arguments"]["start_line"], 7)
+        self.assertEqual(bin_sed["typed_arguments"]["max_lines"], 1)
+
+        literal_tilde = operator._terminal_typed_read_redirect(
+            "grabowski_terminal_run",
+            {
+                "argv": ["sed", "-n", "1p", "~/literal.txt"],
+                "cwd": "/tmp",
+            },
+        )
+        self.assertIsNotNone(literal_tilde)
+        assert literal_tilde is not None
+        self.assertEqual(
+            literal_tilde["typed_arguments"]["path"],
+            "/tmp/~/literal.txt",
+        )
+
+        unknown_tilde = operator._terminal_typed_read_redirect(
+            "grabowski_terminal_run",
+            {
+                "argv": ["sed", "-n", "1p", "~definitely-no-such-user/literal.txt"],
+                "cwd": "/tmp",
+            },
+        )
+        self.assertIsNotNone(unknown_tilde)
+        assert unknown_tilde is not None
+        self.assertEqual(
+            unknown_tilde["typed_arguments"]["path"],
+            "/tmp/~definitely-no-such-user/literal.txt",
+        )
+
+        default_cwd = operator._terminal_typed_read_redirect(
+            "grabowski_terminal_run",
+            {"argv": ["sed", "-n", "1p", "~/literal.txt"]},
+        )
+        self.assertIsNotNone(default_cwd)
+        assert default_cwd is not None
+        self.assertEqual(
+            default_cwd["typed_arguments"]["path"],
+            str(operator._resolve_cwd(None) / "~" / "literal.txt"),
+        )
+
+        with mock.patch.object(
+            operator, "_resolve_cwd", return_value=operator.Path("/resolved/cwd")
+        ) as resolve_cwd:
+            relative_cwd = operator._terminal_typed_read_redirect(
+                "grabowski_terminal_run",
+                {
+                    "argv": ["sed", "-n", "1p", "literal.txt"],
+                    "cwd": "relative",
+                },
+            )
+        self.assertIsNotNone(relative_cwd)
+        assert relative_cwd is not None
+        self.assertEqual(
+            relative_cwd["typed_arguments"]["path"],
+            "/resolved/cwd/literal.txt",
+        )
+        resolve_cwd.assert_called_once_with("relative")
+
+        absolute_path = str(ROOT / "src/grabowski_operator.py")
+        with mock.patch.object(
+            operator,
+            "_resolve_cwd",
+            side_effect=AssertionError("absolute paths must not resolve cwd"),
+        ) as resolve_cwd:
+            absolute_cwd_ignored = operator._terminal_typed_read_redirect(
+                "grabowski_terminal_run",
+                {
+                    "argv": ["sed", "-n", "1p", absolute_path],
+                    "cwd": "/definitely/missing/cwd",
+                },
+            )
+        self.assertIsNotNone(absolute_cwd_ignored)
+        assert absolute_cwd_ignored is not None
+        self.assertEqual(
+            absolute_cwd_ignored["typed_arguments"]["path"],
+            absolute_path,
+        )
+        resolve_cwd.assert_not_called()
+
+    def test_typed_read_can_repeat_without_signed_replay_state(self) -> None:
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=True))
+        arguments = {"path": "/tmp/example.txt", "start_line": 1, "max_lines": 5}
+        with mock.patch.object(
+            base,
+            "_transport_signed_one_call_evidence",
+            side_effect=AssertionError(
+                "explicit typed reads must not consume signed replay state"
+            ),
+        ):
+            for _ in range(2):
+                self.assertIsNone(
+                    operator._require_transport_roundtrip_for_tool(
+                        tool_name="grabowski_read_text",
+                        arguments=arguments,
+                        context=None,
+                        tool=tool,
+                    )
+                )
+
+    def test_server_verified_git_status_can_repeat_without_signed_replay_state(self) -> None:
+        tool = SimpleNamespace(annotations=SimpleNamespace(readOnlyHint=False))
+        arguments = {
+            "repo": "/tmp/repo",
+            "arguments": [
+                "status",
+                "--short",
+                "--branch",
+                "--untracked-files=normal",
+            ],
+            "timeout_seconds": 60,
+            "branch_attempt": None,
+        }
+        with mock.patch.object(
+            base,
+            "_transport_signed_one_call_evidence",
+            side_effect=AssertionError(
+                "server-verified git status must not consume signed replay state"
+            ),
+        ):
+            for _ in range(2):
+                self.assertIsNone(
+                    operator._require_transport_roundtrip_for_tool(
+                        tool_name="grabowski_git",
+                        arguments=arguments,
+                        context=None,
+                        tool=tool,
+                    )
+                )
 
     def test_captain_preflight_exact_read_only_shape_is_transport_exempt(self) -> None:
         arguments = {
@@ -1740,7 +2578,6 @@ class OperatorSignedTransportTests(unittest.TestCase):
             ),
             "ghe.example.internal",
         )
-
     def test_isolated_github_repo_like_option_value_is_not_a_selector(self) -> None:
         source = {"GH_HOST": "github.com"}
         self.assertEqual(

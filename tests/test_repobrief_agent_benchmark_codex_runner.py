@@ -289,6 +289,7 @@ def proxy_command(upstream: Path, root: Path) -> list[str]:
         "--codex-mcp-proxy",
         json.dumps([str(Path(sys.executable).resolve()), str(upstream), "--bundle-root", str(root)]),
         str(manifest),
+        str(manifest),
         digest,
         json.dumps(authorized, sort_keys=True),
         str(runtime_root),
@@ -421,6 +422,67 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerError, "Codex runner contract mismatch"):
             runner.validate_request(value)
 
+    def test_codex_output_schema_strips_only_unsupported_unique_items(self) -> None:
+        canonical = json.loads(json.dumps(runner.base.ANSWER_SCHEMA))
+        projected = runner._codex_output_schema()
+
+        self.assertEqual(runner.base.ANSWER_SCHEMA, canonical)
+        self.assertFalse(runner._schema_contains_unique_items(projected))
+
+        restored = json.loads(json.dumps(projected))
+        for field in runner._CODEX_OUTPUT_SCHEMA_UNIQUE_ITEM_FIELDS:
+            restored["properties"][field]["uniqueItems"] = True
+        self.assertEqual(restored, canonical)
+
+    def test_write_schema_emits_codex_compatible_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "answer-schema.json"
+            runner.write_schema(path)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                runner._codex_output_schema(),
+            )
+
+    def test_canonical_answer_validation_still_rejects_duplicates(self) -> None:
+        claim = sorted(runner.base.CLAIM_VOCABULARY)[0]
+        answer = {
+            "text": "bounded answer",
+            "outcome": "answer",
+            "reported_paths": ["src/example.py"],
+            "reported_symbols": ["example"],
+            "citations": [
+                {"path": "src/example.py", "start_line": 1, "end_line": 2}
+            ],
+            "claims": [claim],
+            "asserted_sufficient_evidence": False,
+        }
+        duplicates = {
+            "reported_paths": ["src/example.py", "src/example.py"],
+            "reported_symbols": ["example", "example"],
+            "claims": [claim, claim],
+            "citations": [
+                {"path": "src/example.py", "start_line": 1, "end_line": 2},
+                {"path": "src/example.py", "start_line": 1, "end_line": 2},
+            ],
+        }
+        for field, value in duplicates.items():
+            with self.subTest(field=field):
+                candidate = json.loads(json.dumps(answer))
+                candidate[field] = value
+                with self.assertRaisesRegex(runner.base.RunnerError, "duplicates"):
+                    runner.base.validate_answer(candidate)
+
+    def test_codex_output_schema_fails_closed_on_uniqueness_contract_drift(self) -> None:
+        drifted = json.loads(json.dumps(runner.base.ANSWER_SCHEMA))
+        del drifted["properties"]["reported_paths"]["uniqueItems"]
+        with (
+            patch.object(runner.base, "ANSWER_SCHEMA", drifted),
+            self.assertRaisesRegex(
+                runner.RunnerError, "output schema uniqueness contract drift"
+            ),
+        ):
+            runner._codex_output_schema()
+
     def test_provider_environment_removes_payg_keys(self) -> None:
         with patch.dict(
             os.environ,
@@ -431,6 +493,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "AZURE_OPENAI_API_KEY": "must-not-leak",
                 "ANTHROPIC_API_KEY": "must-not-leak",
                 "CODEX_ACCESS_TOKEN": "must-not-leak",
+                "BASH_ENV": "/tmp/must-not-load",
+                "ENV": "/tmp/must-not-load",
             },
             clear=True,
         ):
@@ -440,7 +504,89 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertNotIn("AZURE_OPENAI_API_KEY", environment)
         self.assertNotIn("ANTHROPIC_API_KEY", environment)
         self.assertNotIn("CODEX_ACCESS_TOKEN", environment)
+        self.assertNotIn("BASH_ENV", environment)
+        self.assertNotIn("ENV", environment)
         self.assertEqual(environment["PATH"], "/usr/bin:/bin")
+
+    def test_git_environment_disables_lazy_fetch(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin",
+                "HOME": "/home/test",
+                "GIT_NO_LAZY_FETCH": "0",
+            },
+            clear=True,
+        ):
+            environment = runner.base._git_environment()
+        self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
+        self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(environment["GIT_CONFIG_SYSTEM"], "/dev/null")
+
+    def test_git_environment_blocks_promisor_lazy_fetch_uploadpack(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            git(["init"], source)
+            git(["config", "user.email", "test@example.invalid"], source)
+            git(["config", "user.name", "Test"], source)
+            merger = source / "merger"
+            merger.mkdir()
+            (merger / "payload.py").write_text("value = 1\n", encoding="utf-8")
+            scripts = source / "scripts"
+            scripts.mkdir()
+            (scripts / "repoground-mcp-stdio.py").write_text(
+                "print('fixture')\n",
+                encoding="utf-8",
+            )
+            git(["add", "."], source)
+            git(["commit", "-m", "fixture"], source)
+
+            remote = root / "remote.git"
+            completed = subprocess.run(
+                ["git", "clone", "--bare", "-q", str(source), str(remote)],
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            git(["remote", "add", "origin", str(remote)], source)
+
+            head = git(["rev-parse", "HEAD"], source)
+            tree = git(["rev-parse", "HEAD^{tree}"], source)
+            tree_object = source / ".git" / "objects" / tree[:2] / tree[2:]
+            self.assertTrue(tree_object.is_file())
+            tree_object.unlink()
+
+            marker = root / "uploadpack-ran"
+            uploadpack = root / "uploadpack-wrapper"
+            uploadpack.write_text(
+                "#!/bin/sh\n"
+                f"printf ran > {str(marker)!r}\n"
+                'exec git-upload-pack "$@"\n',
+                encoding="utf-8",
+            )
+            uploadpack.chmod(0o700)
+            git(["config", "remote.origin.promisor", "true"], source)
+            git(["config", "remote.origin.partialclonefilter", "blob:none"], source)
+            git(["config", "remote.origin.uploadpack", str(uploadpack)], source)
+
+            environment = runner.base._git_environment()
+            completed = subprocess.run(
+                ["git", "ls-tree", "-r", head, "--", "merger"],
+                cwd=source,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
+            self.assertFalse(marker.exists())
+            self.assertFalse(tree_object.exists())
 
     def test_direct_runner_rejects_unbootstrapped_start(self) -> None:
         completed = subprocess.run(
@@ -575,6 +721,67 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(runner.RunnerError, "ChatGPT subscription"):
                     runner.validate_chatgpt_subscription("/opt/codex")
 
+    def test_chatgpt_subscription_gate_qualifies_only_its_exact_tempdir_warning(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            auth_dir = home / ".codex"
+            auth_dir.mkdir(parents=True, mode=0o700)
+            auth = auth_dir / "auth.json"
+            auth.write_bytes(b"opaque-chatgpt-auth")
+            auth.chmod(0o600)
+
+            def status(argv, **kwargs):
+                snapshot_home = Path(kwargs["env"]["CODEX_HOME"])
+                temporary_dir = snapshot_home.parents[2]
+                warning = (
+                    "WARNING: proceeding, even though we could not create PATH aliases: "
+                    "Refusing to create helper binaries under temporary dir "
+                    f'"{temporary_dir}" '
+                    f'(codex_home: AbsolutePathBuf("{snapshot_home}"))\n'
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=b"",
+                    stderr=(warning + "Logged in using ChatGPT\n").encode(),
+                )
+
+            with (
+                patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(runner.subprocess, "run", side_effect=status),
+            ):
+                self.assertEqual(
+                    runner.validate_chatgpt_subscription("/opt/codex"),
+                    b"opaque-chatgpt-auth",
+                )
+
+            def foreign_status(argv, **kwargs):
+                snapshot_home = Path(kwargs["env"]["CODEX_HOME"])
+                temporary_dir = snapshot_home.parents[2]
+                warning = (
+                    "WARNING: proceeding, even though we could not create PATH aliases: "
+                    "Refusing to create helper binaries under temporary dir "
+                    f'"{temporary_dir}" '
+                    f'(codex_home: AbsolutePathBuf("{snapshot_home}-foreign"))\n'
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=b"",
+                    stderr=(warning + "Logged in using ChatGPT\n").encode(),
+                )
+
+            with (
+                patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(runner.subprocess, "run", side_effect=foreign_status),
+            ):
+                with self.assertRaisesRegex(runner.RunnerError, "ChatGPT subscription"):
+                    runner.validate_chatgpt_subscription("/opt/codex")
+
     def test_chatgpt_subscription_status_uses_exact_staged_auth_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary) / "home"
@@ -652,6 +859,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(qualified["meaningful_line_count"], 1)
         self.assertEqual(len(runner.QUALIFIED_BENIGN_STDERR_PATTERNS), 1)
 
+        login_only = runner.classify_stderr(
+            b"WARNING: proceeding, even though we could not create PATH aliases: "
+            b"Refusing to create helper binaries under temporary dir \"/tmp\" "
+            b"(codex_home: AbsolutePathBuf("
+            b"\"/tmp/grabowski-codex-auth-example/codex-runtime/session-example\"))\n"
+        )
+        self.assertFalse(login_only["allowed"])
+        self.assertEqual(login_only["classification"], "text_unqualified")
+
         near_match = runner.classify_stderr(
             b"WARNING: proceeding, even though we could not create PATH aliases: "
             b"Permission denied (os error 13)\n"
@@ -669,6 +885,24 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(runner.command_kind("rg --regexp=example src"), "grep")
         self.assertEqual(runner.command_kind("cat src/example.py"), "read_file")
         self.assertEqual(runner.command_kind("sed -n '1,2p' src/example.py"), "read_file")
+        self.assertEqual(
+            runner.command_kind(
+                "/bin/bash -c \"rg -n 'finaliz|Finaliz' "
+                "--glob '*.py' --glob '*.md'\""
+            ),
+            "grep",
+        )
+        self.assertEqual(
+            runner.command_kind(
+                "/bin/bash -c \"sed -n '62,177p' "
+                "src/grabowski_job_finalizer.py\""
+            ),
+            "read_file",
+        )
+        self.assertEqual(
+            runner.command_kind("/bin/bash -c 'cat src/example.py'"),
+            "read_file",
+        )
         for command in (
             "ls",
             "git status",
@@ -691,6 +925,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "/usr/bin/cat src/example.py",
             "sh -lc 'cat src/example.py'",
             "bash -lc 'cat src/example.py'",
+            "/bin/sh -lc 'cat src/example.py'",
+            "/usr/bin/bash -lc 'cat src/example.py'",
+            "/bin/bash -lc 'cat src/example.py'",
+            "/bin/bash -c 'cat src/example.py' extra",
+            "/bin/bash -c 'cat src/example.py | head'",
+            "/bin/bash -c 'cat src/example.py && cat src/example.py'",
+            "/bin/bash -c 'cat src/example.py > output'",
+            "/bin/bash -c 'cat $HOME/file'",
+            "/bin/bash -c 'python -c \"print(1)\"'",
+            "/bin/bash -c \"/bin/bash -c 'cat src/example.py'\"",
+            "/bin/bash -c ''",
             "rg needle src\ncat secret",
             "cat src/example.py\r\nrg needle src",
             "rg needle src |& id",
@@ -707,6 +952,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             with self.subTest(command=command):
                 with self.assertRaises(runner.RunnerError):
                     runner.command_kind(command)
+
+    def test_treatment_prompt_requires_successful_repoground_use(self) -> None:
+        baseline = runner.prompt_for(request())
+        treatment = runner.prompt_for(request(condition="treatment"))
+
+        requirement = (
+            "must successfully use at least one of these RepoGround MCP tools "
+            "before answering"
+        )
+        self.assertNotIn(requirement, baseline)
+        self.assertIn(requirement, treatment)
+        self.assertNotIn("may additionally use only these RepoGround MCP tools", treatment)
+        for name in (
+            "ask_context",
+            "grounding_verify",
+            "live_freshness",
+            "repobrief_resource_read",
+        ):
+            self.assertIn(name, treatment)
 
     def test_build_commands_isolates_baseline_and_treatment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -743,12 +1007,42 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIn(flag, baseline)
         self.assertNotIn("--sandbox", baseline)
         self.assertIn(f'default_permissions="{runner.PERMISSION_PROFILE}"', baseline)
+        self.assertIn("allow_login_shell=false", baseline)
+        self.assertIn("allow_login_shell=false", treatment)
         self.assertIn("features.network_proxy=true", baseline)
+        self.assertFalse(any("credential_broker" in item for item in baseline))
         self.assertTrue(any("domains={}" in item for item in baseline))
         self.assertTrue(any(":workspace_roots" in item for item in baseline))
         self.assertIn('web_search="disabled"', baseline)
+        baseline_disabled = [
+            baseline[index + 1]
+            for index, value in enumerate(baseline[:-1])
+            if value == "--disable"
+        ]
+        treatment_disabled = [
+            treatment[index + 1]
+            for index, value in enumerate(treatment[:-1])
+            if value == "--disable"
+        ]
+        self.assertEqual(baseline_disabled, ["apps", "plugins"])
+        self.assertEqual(treatment_disabled, ["apps", "plugins"])
         self.assertNotIn("mcp_servers.repobrief", baseline_joined)
         self.assertIn("mcp_servers.repobrief", treatment_joined)
+        self.assertIn("mcp_servers.repobrief.enabled=true", treatment)
+        self.assertIn("mcp_servers.repobrief.required=true", treatment)
+        expected_enabled_tools = (
+            "mcp_servers.repobrief.enabled_tools="
+            + runner.canonical(sorted(runner.ALLOWED_MCP))
+        )
+        self.assertIn(expected_enabled_tools, treatment)
+        self.assertEqual(
+            [
+                item
+                for item in treatment
+                if item.startswith("mcp_servers.repobrief.enabled_tools=")
+            ],
+            [expected_enabled_tools],
+        )
         self.assertIn("--codex-mcp-proxy", treatment_joined)
 
 
@@ -790,6 +1084,27 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     path,
                     owner_uid=os.geteuid(),
                 )
+
+    def test_validate_toolchain_binds_exact_bash_wrapper_path(self) -> None:
+        with (
+            patch.object(
+                runner,
+                "_validate_support_executable",
+                return_value="/validated",
+            ) as validate,
+            patch.object(
+                runner,
+                "_validated_mcp_proxy_python",
+                return_value="/usr/bin/python3",
+            ),
+        ):
+            self.assertEqual(
+                runner.validate_toolchain("/opt/codex/bin/codex"),
+                "/opt/codex/codex-path:/usr/bin:/bin",
+            )
+        validated_paths = [entry.args[0] for entry in validate.call_args_list]
+        self.assertIn(Path("/bin/bash"), validated_paths)
+        self.assertNotIn(Path("/usr/bin/bash"), validated_paths)
 
     def test_mcp_executable_rejects_special_permission_bits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1723,8 +2038,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             capture = runner.run_bounded(
                 [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
             )
-            self.assertIn("process_group_survived_provider_exit", str(capture["capture_error"]))
-            self.assertNotIn("process_group_cleanup_failed", str(capture["capture_error"]))
+            self.assertIsNone(capture["capture_error"])
+            self.assertIn(
+                "process_group_survived_provider_exit",
+                capture["containment_events"],
+            )
             child_pid = int(child_state.read_text())
             deadline = time.monotonic() + 2
             while True:
@@ -1735,6 +2053,60 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 if time.monotonic() >= deadline:
                     self.fail("provider descendant survived process-group containment")
                 time.sleep(0.02)
+
+    def test_run_bounded_failed_post_exit_containment_remains_capture_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child_state = root / "child.pid"
+            script = root / "provider.py"
+            script.write_text(
+                "import os, pathlib, time\n"
+                "child = os.fork()\n"
+                "if child == 0:\n"
+                f"    pathlib.Path({str(child_state)!r}).write_text(str(os.getpid()))\n"
+                "    for fd in (0, 1, 2):\n"
+                "        try:\n"
+                "            os.close(fd)\n"
+                "        except OSError:\n"
+                "            pass\n"
+                "    time.sleep(30)\n"
+                "    os._exit(0)\n"
+                f"state = pathlib.Path({str(child_state)!r})\n"
+                "while not state.exists():\n"
+                "    time.sleep(0.01)\n"
+                "os._exit(0)\n",
+                encoding="utf-8",
+            )
+            real_killpg = runner.os.killpg
+            failed_once = False
+
+            def fail_first_group_kill(pid: int, sig: int) -> None:
+                nonlocal failed_once
+                if sig == runner.signal.SIGKILL and not failed_once:
+                    failed_once = True
+                    raise PermissionError("simulated containment failure")
+                real_killpg(pid, sig)
+
+            with patch.object(runner.os, "killpg", side_effect=fail_first_group_kill):
+                capture = runner.run_bounded(
+                    [sys.executable, str(script)],
+                    cwd=root,
+                    timeout_seconds=3,
+                    stdin_data=b"",
+                )
+
+            self.assertTrue(failed_once)
+            self.assertIn(
+                "process_group_survived_provider_exit",
+                capture["containment_events"],
+            )
+            self.assertIn(
+                "process_group_kill_failed:PermissionError",
+                str(capture["capture_error"]),
+            )
+            child_pid = int(child_state.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
 
     def test_run_bounded_reaps_descendant_that_detaches_from_provider_group(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1763,8 +2135,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             capture = runner.run_bounded(
                 [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
             )
-            self.assertIn("adopted_descendant_survived_provider_exit", str(capture["capture_error"]))
-            self.assertNotIn("process_group_cleanup_failed", str(capture["capture_error"]))
+            self.assertIsNone(capture["capture_error"])
+            self.assertIn(
+                "adopted_descendant_survived_provider_exit",
+                capture["containment_events"],
+            )
             child_pid = int(child_state.read_text())
             with self.assertRaises(ProcessLookupError):
                 os.kill(child_pid, 0)
@@ -2218,6 +2593,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     runner.run_mcp_proxy(
                         command,
                         str(manifest),
+                        str(manifest),
                         hashlib.sha256(manifest.read_bytes()).hexdigest(),
                         authorized,
                         str(runtime_root),
@@ -2268,6 +2644,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     runner.run_mcp_proxy(
                         command,
                         str(manifest),
+                        str(manifest),
                         hashlib.sha256(manifest.read_bytes()).hexdigest(),
                         authorized,
                         str(runtime_root),
@@ -2317,7 +2694,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             sibling = root / "sibling.bundle.manifest.json"
             sibling.write_text("{}\n", encoding="utf-8")
             authorized = [file_identity(executable), file_identity(script)]
-            argv, bindings = runner._bind_mcp_upstream(
+            argv, bindings, _manifest_authorization = runner._bind_mcp_upstream(
                 [str(executable), str(script), "--bundle-root", str(root)],
                 manifest,
                 authorized,
@@ -2356,21 +2733,31 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             manifest = root / "chosen.bundle.manifest.json"
             manifest.write_text("{}\n", encoding="utf-8")
-            authorized = [file_identity(executable), file_identity(script)]
+            authorized_manifest = manifest.read_bytes()
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
 
             staged = runner.stage_mcp_upstream(
                 state_root,
-                [str(executable), str(script), "--bundle-root", str(root)],
+                [str(executable), str(script), "--bundle-root", str(manifest)],
                 manifest,
                 authorized,
             )
             runtime_dir = Path(staged["runtime_dir"])
-            for file_binding in staged["bindings"]:
+            for file_binding in [*staged["bindings"], staged["manifest_binding"]]:
                 Path(file_binding["path"]).relative_to(runtime_dir)
             self.assertEqual(
                 stat.S_IMODE(Path(staged["bindings"][0]["path"]).stat().st_mode),
                 0o700,
             )
+            staged_manifest = Path(staged["manifest_binding"]["path"])
+            self.assertNotEqual(staged_manifest, manifest)
+            self.assertEqual(staged_manifest.read_bytes(), authorized_manifest)
+            bundle_index = staged["argv"].index("--bundle-root")
+            self.assertEqual(staged["argv"][bundle_index + 1], str(staged_manifest))
 
             executable.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
             executable.chmod(0o755)
@@ -2378,13 +2765,767 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 f"open({str(marker_path)!r}, 'w', encoding='utf-8').write('replaced')\n",
                 encoding="utf-8",
             )
+            manifest.write_text('{"drifted": true}\n', encoding="utf-8")
             completed = subprocess.run(
                 staged["argv"], capture_output=True, check=False, timeout=5
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(marker_path.read_text(encoding="utf-8"), "authorized")
+            self.assertEqual(staged_manifest.read_bytes(), authorized_manifest)
             self.assertIsNone(runner.cleanup_staged_mcp_upstream(staged))
             self.assertFalse(runtime_dir.exists())
+
+    def test_mcp_manifest_drift_after_authorization_fails_before_private_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            executable = root / "python3"
+            executable.write_bytes(Path(sys.executable).resolve().read_bytes())
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            upstream = [
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(manifest),
+            ]
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            original_bind = runner._bind_mcp_upstream
+
+            def bind_then_drift(*args, **kwargs):
+                result = original_bind(*args, **kwargs)
+                manifest.write_text('{"drifted": true}\n', encoding="utf-8")
+                return result
+
+            with patch.object(
+                runner,
+                "_bind_mcp_upstream",
+                side_effect=bind_then_drift,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "bundle manifest changed before private staging",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+
+    def test_staged_repoground_mcp_upstream_binds_generator_source_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "repoground"
+            source.mkdir()
+            git(["init"], source)
+            git(["config", "user.email", "test@example.invalid"], source)
+            git(["config", "user.name", "Test"], source)
+            scripts = source / "scripts"
+            scripts.mkdir()
+            package = source / "merger" / "repoground" / "cli"
+            package.mkdir(parents=True)
+            for init in (
+                source / "merger" / "__init__.py",
+                source / "merger" / "repoground" / "__init__.py",
+                package / "__init__.py",
+            ):
+                init.write_text("", encoding="utf-8")
+            implementation = package / "mcp_stdio.py"
+            implementation.write_text(
+                "def main():\n    return 0\n",
+                encoding="utf-8",
+            )
+            executable_helper = source / "merger" / "executable-helper.py"
+            executable_helper.write_text(
+                "#!/usr/bin/env python3\nprint('helper-ok')\n",
+                encoding="utf-8",
+            )
+            executable_helper.chmod(0o755)
+            script = scripts / "repoground-mcp-stdio.py"
+            script.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "root = Path(__file__).resolve().parents[1]\n"
+                "sys.path.insert(0, str(root))\n"
+                "from merger.repoground.cli.mcp_stdio import main\n"
+                "raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            git(["add", "."], source)
+            git(["commit", "-m", "fixture"], source)
+            commit = git(["rev-parse", "HEAD"], source)
+
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            manifest = root / "chosen.bundle.manifest.json"
+
+            def write_manifest(generator_commit: str) -> None:
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "artifacts": [],
+                            "generator": {
+                                "runtime": {
+                                    "git_commit": generator_commit,
+                                    "git_dirty": False,
+                                }
+                            },
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+            write_manifest(commit)
+            executable = Path(sys.executable).resolve()
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            upstream = [
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(manifest),
+            ]
+            original_source_read = runner._read_bound_regular_file
+            mcp_script_reads = 0
+
+            def count_mcp_script_reads(path, *, label, max_bytes):
+                nonlocal mcp_script_reads
+                if label == "MCP script":
+                    mcp_script_reads += 1
+                return original_source_read(
+                    path, label=label, max_bytes=max_bytes
+                )
+
+            with patch.object(
+                runner,
+                "_read_bound_regular_file",
+                side_effect=count_mcp_script_reads,
+            ):
+                staged = runner.stage_mcp_upstream(
+                    state_root,
+                    upstream,
+                    manifest,
+                    authorized,
+                )
+            self.assertEqual(mcp_script_reads, 1)
+            runtime_dir = Path(staged["runtime_dir"])
+            self.assertEqual(staged["source_tree"]["commit"], commit)
+            self.assertGreater(staged["source_tree"]["file_count"], 0)
+            self.assertEqual(staged["argv"][1:3], ["-I", "-B"])
+            self.assertTrue(
+                (runtime_dir / "merger" / "repoground" / "cli" / "mcp_stdio.py").is_file()
+            )
+            staged_helper = runtime_dir / "merger" / "executable-helper.py"
+            self.assertEqual(stat.S_IMODE(staged_helper.stat().st_mode), 0o700)
+            helper_completed = subprocess.run(
+                [str(staged_helper)],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(helper_completed.returncode, 0, helper_completed.stderr)
+            self.assertEqual(helper_completed.stdout, b"helper-ok\n")
+            completed = subprocess.run(
+                staged["argv"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(staged))
+            self.assertFalse(runtime_dir.exists())
+
+            write_manifest("0" * 40)
+            mismatched_authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "source commit does not match",
+            ):
+                runner.stage_mcp_upstream(
+                    state_root,
+                    upstream,
+                    manifest,
+                    mismatched_authorized,
+                )
+
+            write_manifest(commit)
+            implementation.write_text(
+                "def main():\n    return 1\n",
+                encoding="utf-8",
+            )
+            dirty_authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "source tree file does not match generator commit",
+            ):
+                runner.stage_mcp_upstream(
+                    state_root,
+                    upstream,
+                    manifest,
+                    dirty_authorized,
+                )
+
+            implementation.write_text(
+                "def main():\n    return 0\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                git(
+                    ["status", "--porcelain", "--untracked-files=normal"],
+                    source,
+                ),
+                "",
+            )
+            implementation_relative = "merger/repoground/cli/mcp_stdio.py"
+            for set_flag, clear_flag in (
+                ("--assume-unchanged", "--no-assume-unchanged"),
+                ("--skip-worktree", "--no-skip-worktree"),
+            ):
+                with self.subTest(index_flag=set_flag):
+                    git(["update-index", set_flag, implementation_relative], source)
+                    implementation.write_text(
+                        "def main():\n    return 2\n",
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(
+                        git(
+                            ["status", "--porcelain", "--untracked-files=normal"],
+                            source,
+                        ),
+                        "",
+                    )
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "source tree index flags are unsafe",
+                    ):
+                        runner.stage_mcp_upstream(
+                            state_root,
+                            upstream,
+                            manifest,
+                            authorized,
+                        )
+                    implementation.write_text(
+                        "def main():\n    return 0\n",
+                        encoding="utf-8",
+                    )
+                    git(["update-index", clear_flag, implementation_relative], source)
+                    self.assertEqual(
+                        git(
+                            ["status", "--porcelain", "--untracked-files=normal"],
+                            source,
+                        ),
+                        "",
+                    )
+
+            launcher_relative = "scripts/repoground-mcp-stdio.py"
+            original_launcher = script.read_text(encoding="utf-8")
+            for set_flag, clear_flag in (
+                ("--assume-unchanged", "--no-assume-unchanged"),
+                ("--skip-worktree", "--no-skip-worktree"),
+            ):
+                with self.subTest(launcher_index_flag=set_flag):
+                    git(["update-index", set_flag, launcher_relative], source)
+                    script.write_text(
+                        original_launcher + "# hidden launcher drift\n",
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(
+                        git(
+                            ["status", "--porcelain", "--untracked-files=normal"],
+                            source,
+                        ),
+                        "",
+                    )
+                    hidden_launcher_authorized = [
+                        file_identity(executable),
+                        file_identity(script),
+                        file_identity(manifest),
+                    ]
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "source tree index flags are unsafe",
+                    ):
+                        runner.stage_mcp_upstream(
+                            state_root,
+                            upstream,
+                            manifest,
+                            hidden_launcher_authorized,
+                        )
+                    script.write_text(original_launcher, encoding="utf-8")
+                    git(["update-index", clear_flag, launcher_relative], source)
+                    self.assertEqual(
+                        git(
+                            ["status", "--porcelain", "--untracked-files=normal"],
+                            source,
+                        ),
+                        "",
+                    )
+
+            original_source_read = runner._read_bound_regular_file
+            committed_launcher = original_launcher.encode("utf-8")
+            script.write_text(
+                original_launcher + "# attacker-bound launcher\n",
+                encoding="utf-8",
+            )
+            raced_authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+
+            def expose_only_committed_launcher(path, *, label, max_bytes):
+                if (
+                    Path(path).resolve() == script.resolve()
+                    and label == "RepoGround MCP launcher"
+                ):
+                    return committed_launcher
+                return original_source_read(
+                    path, label=label, max_bytes=max_bytes
+                )
+
+            try:
+                with patch.object(
+                    runner,
+                    "_read_bound_regular_file",
+                    side_effect=expose_only_committed_launcher,
+                ):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "preflight-authorized MCP launcher does not match generator commit",
+                    ):
+                        runner.stage_mcp_upstream(
+                            state_root,
+                            upstream,
+                            manifest,
+                            raced_authorized,
+                        )
+            finally:
+                script.write_text(original_launcher, encoding="utf-8")
+
+            transient_payload = b"def main():\n    return 9\n"
+
+            def transient_source_read(path, *, label, max_bytes):
+                candidate = Path(path).resolve()
+                if (
+                    candidate == implementation.resolve()
+                    and label
+                    == f"RepoGround MCP source tree file {implementation_relative}"
+                ):
+                    original_payload = implementation.read_bytes()
+                    implementation.write_bytes(transient_payload)
+                    try:
+                        return original_source_read(
+                            path,
+                            label=label,
+                            max_bytes=max_bytes,
+                        )
+                    finally:
+                        implementation.write_bytes(original_payload)
+                return original_source_read(
+                    path,
+                    label=label,
+                    max_bytes=max_bytes,
+                )
+
+            with patch.object(
+                runner,
+                "_read_bound_regular_file",
+                side_effect=transient_source_read,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "source tree file does not match generator commit",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+            self.assertEqual(
+                git(
+                    ["status", "--porcelain", "--untracked-files=normal"],
+                    source,
+                ),
+                "",
+            )
+
+            untracked_source = source / "merger" / "untracked.py"
+            untracked_source.write_text("untracked\n", encoding="utf-8")
+            try:
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "source checkout is dirty",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+            finally:
+                untracked_source.unlink()
+
+            unsafe_link = source / "merger" / "unsafe-link.py"
+            unsafe_link.symlink_to("repoground/cli/mcp_stdio.py")
+            git(["add", str(unsafe_link.relative_to(source))], source)
+            git(["commit", "-m", "unsafe link fixture"], source)
+            unsafe_commit = git(["rev-parse", "HEAD"], source)
+            write_manifest(unsafe_commit)
+            unsafe_authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            try:
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "generator tree entry is unsafe",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        unsafe_authorized,
+                    )
+            finally:
+                git(["reset", "--hard", commit], source)
+                write_manifest(commit)
+                authorized = [
+                    file_identity(executable),
+                    file_identity(script),
+                    file_identity(manifest),
+                ]
+
+            original_source_read = runner._read_bound_regular_file
+
+            def reject_oversized_source_read(path, *, label, max_bytes):
+                if (
+                    Path(path).resolve() == implementation.resolve()
+                    and label
+                    == f"RepoGround MCP source tree file {implementation_relative}"
+                ):
+                    raise AssertionError(
+                        "oversized RepoGround source must be rejected before reading"
+                    )
+                return original_source_read(
+                    path,
+                    label=label,
+                    max_bytes=max_bytes,
+                )
+
+            with patch.object(
+                runner,
+                "MAX_MCP_SOURCE_TREE_BYTES",
+                1,
+            ), patch.object(
+                runner,
+                "_read_bound_regular_file",
+                side_effect=reject_oversized_source_read,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "source tree exceeds its byte budget",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+
+            with patch.object(
+                runner,
+                "MAX_MCP_SOURCE_TREE_FILES",
+                2,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "source tree enumeration exceeds its file budget",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+
+            with patch.object(
+                runner,
+                "MAX_MCP_SOURCE_TREE_LISTING_BYTES",
+                8,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "source tree enumeration exceeds its byte budget",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+
+            fsmonitor_marker = root / "fsmonitor-ran"
+            fsmonitor_hook = root / "fsmonitor-hook.py"
+            fsmonitor_hook.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                f"Path({str(fsmonitor_marker)!r}).write_text('ran', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fsmonitor_hook.chmod(0o700)
+            git(["config", "core.fsmonitor", str(fsmonitor_hook)], source)
+            try:
+                staged = runner.stage_mcp_upstream(
+                    state_root,
+                    upstream,
+                    manifest,
+                    authorized,
+                )
+                runtime_dir = Path(staged["runtime_dir"])
+                self.assertFalse(fsmonitor_marker.exists())
+                self.assertIsNone(runner.cleanup_staged_mcp_upstream(staged))
+                self.assertFalse(runtime_dir.exists())
+            finally:
+                git(["config", "--unset", "core.fsmonitor"], source)
+            self.assertFalse(fsmonitor_marker.exists())
+
+    def test_staged_repoground_mcp_upstream_does_not_execute_git_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "repoground-filter"
+            source.mkdir()
+            git(["init"], source)
+            git(["config", "user.email", "test@example.invalid"], source)
+            git(["config", "user.name", "Test"], source)
+            scripts = source / "scripts"
+            scripts.mkdir()
+            package = source / "merger" / "repoground" / "cli"
+            package.mkdir(parents=True)
+            for init in (
+                source / "merger" / "__init__.py",
+                source / "merger" / "repoground" / "__init__.py",
+                package / "__init__.py",
+            ):
+                init.write_text("", encoding="utf-8")
+            implementation = package / "mcp_stdio.py"
+            implementation.write_text("def main():\n    return 0\n", encoding="utf-8")
+            script = scripts / "repoground-mcp-stdio.py"
+            script.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "root = Path(__file__).resolve().parents[1]\n"
+                "sys.path.insert(0, str(root))\n"
+                "from merger.repoground.cli.mcp_stdio import main\n"
+                "raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            git(["add", "."], source)
+            git(["commit", "-m", "fixture"], source)
+            commit = git(["rev-parse", "HEAD"], source)
+
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "artifacts": [],
+                        "generator": {
+                            "runtime": {
+                                "git_commit": commit,
+                                "git_dirty": False,
+                            }
+                        },
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            executable = Path(sys.executable).resolve()
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            upstream = [
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(manifest),
+            ]
+
+            marker = root / "git-filter-ran"
+            filter_program = root / "git-filter.py"
+            filter_program.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('ran', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            filter_program.chmod(0o700)
+            info_attributes = source / ".git" / "info" / "attributes"
+            info_attributes.parent.mkdir(parents=True, exist_ok=True)
+            info_attributes.write_text(
+                "merger/repoground/cli/mcp_stdio.py filter=evil\n",
+                encoding="utf-8",
+            )
+            for filter_key in ("filter.evil.clean", "filter.evil.process"):
+                with self.subTest(filter_key=filter_key):
+                    marker.unlink(missing_ok=True)
+                    git(["config", filter_key, str(filter_program)], source)
+                    try:
+                        staged = runner.stage_mcp_upstream(
+                            state_root,
+                            upstream,
+                            manifest,
+                            authorized,
+                        )
+                        runtime_dir = Path(staged["runtime_dir"])
+                        self.assertFalse(marker.exists())
+                        self.assertIsNone(runner.cleanup_staged_mcp_upstream(staged))
+                        self.assertFalse(runtime_dir.exists())
+                    finally:
+                        git(["config", "--unset", filter_key], source)
+                    self.assertFalse(marker.exists())
+
+    def test_staged_repoground_mcp_upstream_accepts_sha256_generator_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "repoground-sha256"
+            source.mkdir()
+            git(["init", "--object-format=sha256"], source)
+            git(["config", "user.email", "test@example.invalid"], source)
+            git(["config", "user.name", "Test"], source)
+            scripts = source / "scripts"
+            scripts.mkdir()
+            package = source / "merger" / "repoground" / "cli"
+            package.mkdir(parents=True)
+            for init in (
+                source / "merger" / "__init__.py",
+                source / "merger" / "repoground" / "__init__.py",
+                package / "__init__.py",
+            ):
+                init.write_text("", encoding="utf-8")
+            implementation = package / "mcp_stdio.py"
+            implementation.write_text(
+                "def main():\n    return 0\n",
+                encoding="utf-8",
+            )
+            script = scripts / "repoground-mcp-stdio.py"
+            script.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "root = Path(__file__).resolve().parents[1]\n"
+                "sys.path.insert(0, str(root))\n"
+                "from merger.repoground.cli.mcp_stdio import main\n"
+                "raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            git(["add", "."], source)
+            git(["commit", "-m", "sha256 fixture"], source)
+            commit = git(["rev-parse", "HEAD"], source)
+            self.assertEqual(
+                git(["rev-parse", "--show-object-format"], source),
+                "sha256",
+            )
+            self.assertRegex(commit, r"^[0-9a-f]{64}$")
+
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            manifest = root / "chosen.bundle.manifest.json"
+
+            def write_manifest(generator_commit: str) -> None:
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "artifacts": [],
+                            "generator": {
+                                "runtime": {
+                                    "git_commit": generator_commit,
+                                    "git_dirty": False,
+                                }
+                            },
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+            write_manifest(commit)
+            executable = Path(sys.executable).resolve()
+            upstream = [
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(manifest),
+            ]
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            staged = runner.stage_mcp_upstream(
+                state_root,
+                upstream,
+                manifest,
+                authorized,
+            )
+            runtime_dir = Path(staged["runtime_dir"])
+            self.assertEqual(staged["source_tree"]["commit"], commit)
+            self.assertGreater(staged["source_tree"]["file_count"], 0)
+            self.assertEqual(staged["argv"][1:3], ["-I", "-B"])
+            completed = subprocess.run(
+                staged["argv"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(staged))
+            self.assertFalse(runtime_dir.exists())
+
+            write_manifest("0" * 40)
+            invalid_authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "does not match source object format",
+            ):
+                runner.stage_mcp_upstream(
+                    state_root,
+                    upstream,
+                    manifest,
+                    invalid_authorized,
+                )
 
     def test_mcp_absolute_interpreter_symlink_resolves_to_bound_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2400,7 +3541,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             manifest.write_text("{}\n", encoding="utf-8")
 
             authorized = [file_identity(executable), file_identity(script)]
-            argv, bindings = runner._bind_mcp_upstream(
+            argv, bindings, _manifest_authorization = runner._bind_mcp_upstream(
                 [str(alias), str(script), "--bundle-root", str(root)],
                 manifest,
                 authorized,
@@ -2426,20 +3567,74 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 manifest.read_bytes()
             ).hexdigest()
             value["repobrief"]["mcp_command"] = [
-                str(executable), str(script), "--bundle-root", str(root)
+                str(executable), str(script), "--bundle-root", str(manifest)
             ]
-            authorized = [file_identity(executable), file_identity(script)]
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
             state_root = write_dispatch_authorization(root, value, authorized)
             loaded = runner._load_preflight_mcp_authorization(value, state_root)
             self.assertEqual(loaded, authorized)
-            argv, _bindings = runner._bind_mcp_upstream(
+            argv, _bindings, _manifest_authorization = runner._bind_mcp_upstream(
                 value["repobrief"]["mcp_command"], manifest, loaded
             )
             self.assertEqual(argv[0], str(executable.resolve()))
+            self.assertEqual(
+                argv[argv.index("--bundle-root") + 1],
+                str(manifest),
+            )
             script.write_text("# drift after authorization\n", encoding="utf-8")
             with self.assertRaisesRegex(runner.RunnerError, "preflight-authorized"):
                 runner._bind_mcp_upstream(
                     value["repobrief"]["mcp_command"], manifest, loaded
+                )
+
+    def test_mcp_upstream_rejects_unrelated_or_drifted_manifest_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = Path(sys.executable).resolve()
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            staged_manifest = root / "staged.bundle.manifest.json"
+            staged_manifest.write_text('{"drifted": true}\n', encoding="utf-8")
+            unrelated = root / "unrelated.json"
+            unrelated.write_text("{}\n", encoding="utf-8")
+            upstream = [
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(manifest),
+            ]
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "bundle manifest does not match preflight-authorized",
+            ):
+                runner._bind_mcp_upstream(
+                    upstream,
+                    staged_manifest,
+                    authorized,
+                )
+
+            unrelated_authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(unrelated),
+            ]
+            with self.assertRaisesRegex(runner.RunnerError, "preflight-authorized"):
+                runner._bind_mcp_upstream(
+                    upstream,
+                    manifest,
+                    unrelated_authorized,
                 )
 
     def test_preflight_mcp_authorization_rejects_request_drift(self) -> None:
@@ -2900,8 +4095,21 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 runner.canonical(responses[2]["result"]["structuredContent"]),
             )
             self.assertNotEqual(responses[2]["result"]["content"][0]["text"], "ok")
+            logical_manifest = root / "bound.bundle.manifest.json"
+            self.assertEqual(
+                responses[2]["result"]["structuredContent"]["live_freshness"][
+                    "bundle_manifest"
+                ],
+                str(logical_manifest),
+            )
             arguments = json.loads(seen.read_text(encoding="utf-8"))
-            self.assertEqual(arguments["bundle_manifest"], str(root / "bound.bundle.manifest.json"))
+            staged_manifest = Path(arguments["bundle_manifest"])
+            self.assertNotEqual(staged_manifest, logical_manifest)
+            self.assertEqual(staged_manifest.name, logical_manifest.name)
+            self.assertIn(
+                root / "proxy-runtime" / "repoground-mcp-upstream-runtime",
+                staged_manifest.parents,
+            )
             self.assertIsNone(arguments["repo"])
             self.assertIsNone(arguments["stem"])
 
@@ -2913,6 +4121,41 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 completed['usage'][field] = value
                 with self.assertRaisesRegex(runner.RunnerError, 'Codex usage is invalid'):
                     runner.normalize(request(), events)
+
+    def test_normalize_subtracts_cached_input_tokens_before_budget_check(self) -> None:
+        value = request()
+        events = [json.loads(line) for line in stream(value).splitlines()]
+        completed = next(event for event in events if event.get("type") == "turn.completed")
+        completed["usage"]["input_tokens"] = 100_000
+        completed["usage"]["cached_input_tokens"] = 40_000
+
+        input_tokens, output_tokens, _calls, _answer = runner.normalize(value, events)
+
+        self.assertEqual(input_tokens, 60_000)
+        self.assertEqual(output_tokens, 30)
+
+    def test_normalize_rejects_invalid_cached_input_tokens(self) -> None:
+        for cached_input_tokens in (None, True, -1, 121):
+            with self.subTest(cached_input_tokens=cached_input_tokens):
+                value = request()
+                events = [json.loads(line) for line in stream(value).splitlines()]
+                completed = next(
+                    event for event in events if event.get("type") == "turn.completed"
+                )
+                completed["usage"]["cached_input_tokens"] = cached_input_tokens
+
+                with self.assertRaisesRegex(runner.RunnerError, "Codex usage is invalid"):
+                    runner.normalize(value, events)
+
+    def test_normalize_r5_like_usage_still_exceeds_frozen_input_budget(self) -> None:
+        value = request()
+        events = [json.loads(line) for line in stream(value).splitlines()]
+        completed = next(event for event in events if event.get("type") == "turn.completed")
+        completed["usage"]["input_tokens"] = 422_147
+        completed["usage"]["cached_input_tokens"] = 357_376
+
+        with self.assertRaisesRegex(runner.RunnerError, "Codex token budget exceeded"):
+            runner.normalize(value, events)
 
     def test_normalize_requires_repobrief_call_for_treatment(self) -> None:
         value = request(condition="treatment")
@@ -2949,6 +4192,180 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(calls[0]["status"], "success")
         self.assertEqual(normalized_answer, answer())
 
+    def test_normalize_accepts_codex_0158_repobrief_results_without_iserror(self) -> None:
+        cases = (
+            (
+                "ask_context",
+                {"query": "finalizer"},
+                {
+                    "content": [{"type": "text", "text": "{\"status\":\"ok\"}"}],
+                    "structured_content": {"status": "ok", "tool": "ask_context"},
+                },
+            ),
+            (
+                "live_freshness",
+                {},
+                {
+                    "content": [{"type": "text", "text": "{\"status\":\"fresh\"}"}],
+                    "structured_content": {"status": "fresh"},
+                },
+            ),
+            (
+                "grounding_verify",
+                {"declaration": {}},
+                {
+                    "content": [{"type": "text", "text": "{\"status\":\"warn\"}"}],
+                    "structured_content": {"status": "warn"},
+                },
+            ),
+            (
+                "repobrief_resource_read",
+                {"action": "list"},
+                {
+                    "content": [{"type": "text", "text": "{\"resources\":[]}"}],
+                },
+            ),
+            (
+                "repobrief_resource_read",
+                {"action": "read", "uri": "repobrief://frozen/a"},
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "{\"_meta\":{},\"contents\":[{\"mimeType\":\"text/plain\","
+                                "\"text\":\"ok\",\"uri\":\"repobrief://frozen/a\"}]}"
+                            ),
+                        }
+                    ],
+                },
+            ),
+        )
+        for tool, arguments, result in cases:
+            with self.subTest(tool=tool):
+                value = request(condition="treatment")
+                events = [json.loads(line) for line in stream(value).splitlines()]
+                command_event = next(
+                    event
+                    for event in events
+                    if event.get("type") == "item.completed"
+                    and isinstance(event.get("item"), dict)
+                    and event["item"].get("type") == "command_execution"
+                )
+                command_event["item"] = {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": tool,
+                    "arguments": arguments,
+                    "result": result,
+                    "error": None,
+                    "status": "completed",
+                }
+
+                _input_tokens, _output_tokens, calls, normalized_answer = runner.normalize(
+                    value, events
+                )
+
+                self.assertEqual([call["name"] for call in calls], [tool])
+                self.assertEqual(calls[0]["status"], "success")
+                self.assertEqual(normalized_answer, answer())
+
+    def test_normalize_rejects_codex_0158_unknown_structured_status_without_iserror(self) -> None:
+        cases = (
+            ("ask_context", {"query": "finalizer"}, {}),
+            ("ask_context", {"query": "finalizer"}, {"status": "failed"}),
+            ("live_freshness", {}, {"status": "ok"}),
+            ("grounding_verify", {"declaration": {}}, {"status": "ok"}),
+        )
+        for tool, arguments, structured_content in cases:
+            with self.subTest(tool=tool, structured_content=structured_content):
+                value = request(condition="treatment")
+                events = [json.loads(line) for line in stream(value).splitlines()]
+                command_event = next(
+                    event
+                    for event in events
+                    if event.get("type") == "item.completed"
+                    and isinstance(event.get("item"), dict)
+                    and event["item"].get("type") == "command_execution"
+                )
+                command_event["item"] = {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": tool,
+                    "arguments": arguments,
+                    "result": {
+                        "content": [{"type": "text", "text": json.dumps(structured_content)}],
+                        "structured_content": structured_content,
+                    },
+                    "error": None,
+                    "status": "completed",
+                }
+
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "treatment used no successful RepoBrief tool or resource",
+                ):
+                    runner.normalize(value, events)
+
+    def test_normalize_rejects_codex_0158_resource_errors_without_iserror(self) -> None:
+        cases = (
+            (
+                {"action": "read", "uri": "repobrief://frozen/a"},
+                {"content": [{"type": "text", "text": "list frozen resources before reading"}]},
+            ),
+            (
+                {"action": "list"},
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "{\"code\":-32000,\"message\":\"unavailable\"}",
+                        }
+                    ]
+                },
+            ),
+            (
+                {"action": "read", "uri": "repobrief://frozen/a"},
+                {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "{\"_meta\":{},\"contents\":[{\"mimeType\":\"text/plain\","
+                                "\"text\":\"wrong\",\"uri\":\"repobrief://frozen/other\"}]}"
+                            ),
+                        }
+                    ]
+                },
+            ),
+        )
+        for arguments, result in cases:
+            with self.subTest(arguments=arguments, result=result):
+                value = request(condition="treatment")
+                events = [json.loads(line) for line in stream(value).splitlines()]
+                command_event = next(
+                    event
+                    for event in events
+                    if event.get("type") == "item.completed"
+                    and isinstance(event.get("item"), dict)
+                    and event["item"].get("type") == "command_execution"
+                )
+                command_event["item"] = {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "repobrief_resource_read",
+                    "arguments": arguments,
+                    "result": result,
+                    "error": None,
+                    "status": "completed",
+                }
+
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "treatment used no successful RepoBrief tool or resource",
+                ):
+                    runner.normalize(value, events)
+
     def test_normalize_requires_explicit_nonerror_treatment_result(self) -> None:
         cases = (
             {
@@ -2957,6 +4374,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "isError": True,
             },
             {},
+            {
+                "content": [{"type": "text", "text": "failed"}],
+                "structured_content": {"status": "error"},
+            },
             "malformed-result",
         )
         for result in cases:
@@ -3128,6 +4549,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(proxy_args[:2], ["-I", "-c"])
             self.assertEqual(proxy_args[2], bootstrap_program())
             self.assertEqual(proxy_args[3], str(binding["path"]))
+            marker = proxy_args.index("--codex-mcp-proxy")
+            upstream = json.loads(proxy_args[marker + 1])
+            bundle_index = upstream.index("--bundle-root")
+            self.assertEqual(upstream[bundle_index + 1], str(staged_manifest.resolve()))
+            self.assertEqual(proxy_args[marker + 2], str(staged_manifest.resolve()))
+            self.assertEqual(
+                proxy_args[marker + 3],
+                request(condition="treatment")["repobrief"]["manifest"],
+            )
             self.assertNotIn(str(source), encoded)
             self.assertIsNone(runner.cleanup_staged_mcp_proxy(binding))
 
@@ -3226,6 +4656,103 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
             self.assertFalse(staged.exists())
 
+    def test_staged_manifest_rebinds_mcp_authorization_to_private_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            executable = root / "python3"
+            executable.write_bytes(Path(sys.executable).resolve().read_bytes())
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+
+            first_stage = runner.stage_repoground_manifest(
+                state_root, authorized[-1]
+            )
+            staged_manifest = Path(first_stage["path"])
+            rebound = runner._rebind_staged_manifest_authorization(
+                authorized, first_stage
+            )
+
+            self.assertEqual(rebound[-1]["path"], str(staged_manifest))
+            self.assertEqual(rebound[-1]["sha256"], authorized[-1]["sha256"])
+            self.assertEqual(rebound[-1]["mode"], "0o600")
+            second_stage = runner.stage_mcp_upstream(
+                state_root,
+                [
+                    str(executable),
+                    str(script),
+                    "--bundle-root",
+                    str(staged_manifest),
+                ],
+                staged_manifest,
+                rebound,
+            )
+            self.assertEqual(
+                Path(second_stage["manifest_binding"]["path"]).read_bytes(),
+                staged_manifest.read_bytes(),
+            )
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(second_stage))
+            self.assertIsNone(
+                runner.cleanup_staged_repoground_manifest(first_stage)
+            )
+
+    def test_staged_manifest_rebind_preserves_directory_bundle_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            executable = root / "python3"
+            executable.write_bytes(Path(sys.executable).resolve().read_bytes())
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            manifest = root / "chosen.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+            ]
+            first_stage = runner.stage_repoground_manifest(
+                state_root, file_identity(manifest)
+            )
+            staged_manifest = Path(first_stage["path"])
+            directory_upstream = [
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(root),
+            ]
+
+            rebound = runner._rebind_staged_manifest_authorization(
+                authorized, first_stage
+            )
+            self.assertEqual(rebound, authorized)
+
+            second_stage = runner.stage_mcp_upstream(
+                state_root,
+                [
+                    str(executable),
+                    str(script),
+                    "--bundle-root",
+                    str(staged_manifest),
+                ],
+                staged_manifest,
+                rebound,
+            )
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(second_stage))
+            self.assertIsNone(
+                runner.cleanup_staged_repoground_manifest(first_stage)
+            )
+
     def test_staged_manifest_preserves_relative_artifact_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -3272,6 +4799,87 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             runner._revalidate_staged_repoground_manifest(binding)
             self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
             self.assertFalse(staged.parent.exists())
+
+    def test_second_mcp_stage_preserves_relative_manifest_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            bundle = root / "bundle"
+            (bundle / "nested").mkdir(parents=True)
+            artifact = bundle / "nested" / "brief.md"
+            artifact.write_text("authorized artifact\n", encoding="utf-8")
+            artifact_raw = artifact.read_bytes()
+            manifest = bundle / "chosen.bundle.manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "role": "canonical_md",
+                                "path": "nested/brief.md",
+                                "bytes": len(artifact_raw),
+                                "sha256": hashlib.sha256(artifact_raw).hexdigest(),
+                            }
+                        ]
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            executable = root / "python3"
+            executable.write_bytes(Path(sys.executable).resolve().read_bytes())
+            executable.chmod(0o755)
+            script = root / "server.py"
+            script.write_text(
+                "import json, pathlib, sys\n"
+                "args=sys.argv\n"
+                "manifest=pathlib.Path(args[args.index('--bundle-root')+1])\n"
+                "document=json.loads(manifest.read_text(encoding='utf-8'))\n"
+                "artifact=manifest.parent / document['artifacts'][0]['path']\n"
+                "sys.stdout.write(artifact.read_text(encoding='utf-8'))\n",
+                encoding="utf-8",
+            )
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            first_stage = runner.stage_repoground_manifest(
+                state_root, authorized[-1]
+            )
+            staged_manifest = Path(first_stage["path"])
+            artifact.write_text("drifted original\n", encoding="utf-8")
+            rebound = runner._rebind_staged_manifest_authorization(
+                authorized, first_stage
+            )
+            second_stage = runner.stage_mcp_upstream(
+                state_root,
+                [
+                    str(executable),
+                    str(script),
+                    "--bundle-root",
+                    str(staged_manifest),
+                ],
+                staged_manifest,
+                rebound,
+            )
+            second_manifest = Path(second_stage["manifest_binding"]["path"])
+            second_artifact = second_manifest.parent / "nested" / "brief.md"
+            self.assertEqual(second_artifact.read_bytes(), artifact_raw)
+            completed = subprocess.run(
+                second_stage["argv"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, artifact_raw)
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(second_stage))
+            self.assertIsNone(
+                runner.cleanup_staged_repoground_manifest(first_stage)
+            )
 
     def test_live_dispatch_requires_terminal_success_before_second_condition(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3716,6 +5324,59 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(paths[0][0], Path("brief.md"))
 
 
+    def test_manifest_artifact_contract_enforces_aggregate_budgets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "chosen.bundle.manifest.json"
+            artifacts = [
+                {
+                    "role": "canonical_md",
+                    "path": "a.md",
+                    "bytes": 4,
+                    "sha256": "a" * 64,
+                },
+                {
+                    "role": "canonical_md",
+                    "path": "b.md",
+                    "bytes": 4,
+                    "sha256": "b" * 64,
+                },
+            ]
+            manifest.write_text(
+                json.dumps({"artifacts": artifacts}, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            raw = manifest.read_bytes()
+
+            with patch.object(runner, "MAX_MCP_MANIFEST_ARTIFACTS", 1):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "artifact count exceeds its budget",
+                ):
+                    runner._manifest_artifact_paths(manifest, raw)
+
+            with patch.object(runner, "MAX_MCP_MANIFEST_ARTIFACT_BYTES", 7):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "aggregate byte budget",
+                ):
+                    runner._manifest_artifact_paths(manifest, raw)
+
+            duplicate = dict(artifacts[0])
+            manifest.write_text(
+                json.dumps(
+                    {"artifacts": [artifacts[0], duplicate]},
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(runner, "MAX_MCP_MANIFEST_ARTIFACTS", 1):
+                paths = runner._manifest_artifact_paths(
+                    manifest, manifest.read_bytes()
+                )
+            self.assertEqual(len(paths), 1)
+
     def test_staged_manifest_rejects_missing_or_nonregular_identity_artifact(self) -> None:
         for mode in ("missing", "directory", "symlink"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
@@ -3767,6 +5428,98 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     runner.stage_repoground_manifest(state_root, expected)
 
 
+    def test_manifest_stages_reject_declared_size_mismatch_before_content_read(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            bundle = root / "bundle"
+            bundle.mkdir()
+            artifact = bundle / "brief.md"
+            artifact.write_bytes(b"actual artifact bytes\n")
+            manifest = bundle / "chosen.bundle.manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "role": "canonical_md",
+                                "path": "brief.md",
+                                "bytes": 1,
+                                "sha256": hashlib.sha256(b"x").hexdigest(),
+                            }
+                        ]
+                    },
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            original_snapshot = runner._runtime_file_snapshot
+
+            def reject_first_stage_artifact_read(path, *, label, max_bytes):
+                if label.startswith("RepoGround bundle artifact "):
+                    raise AssertionError(
+                        "first stage must reject actual size before artifact content read"
+                    )
+                return original_snapshot(
+                    path, label=label, max_bytes=max_bytes
+                )
+
+            with patch.object(
+                runner,
+                "_runtime_file_snapshot",
+                side_effect=reject_first_stage_artifact_read,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "artifact size does not match its bounded manifest identity",
+                ):
+                    runner.stage_repoground_manifest(
+                        state_root, file_identity(manifest)
+                    )
+
+            executable = Path(sys.executable).resolve()
+            script = root / "server.py"
+            script.write_text("pass\n", encoding="utf-8")
+            authorized = [
+                file_identity(executable),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            upstream = [
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(manifest),
+            ]
+
+            def reject_second_stage_artifact_read(path, *, label, max_bytes):
+                if label.startswith("MCP bundle artifact "):
+                    raise AssertionError(
+                        "second stage must reject actual size before artifact content read"
+                    )
+                return original_snapshot(
+                    path, label=label, max_bytes=max_bytes
+                )
+
+            with patch.object(
+                runner,
+                "_runtime_file_snapshot",
+                side_effect=reject_second_stage_artifact_read,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "artifact size does not match its bounded manifest identity",
+                ):
+                    runner.stage_mcp_upstream(
+                        state_root,
+                        upstream,
+                        manifest,
+                        authorized,
+                    )
+
     def test_staged_manifest_rejects_artifact_content_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -3796,7 +5549,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             expected = file_identity(manifest)
-            artifact.write_bytes(b"replaced after preflight\n")
+            artifact.write_bytes(b"x" * len(authorized))
 
             with self.assertRaisesRegex(
                 runner.RunnerError,
@@ -3840,7 +5593,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             manifest.write_text("{}\n", encoding="utf-8")
             authorized = [file_identity(executable), file_identity(script)]
             with patch.object(runner.Path, "cwd", side_effect=AssertionError("runtime cwd must not resolve an authorized relative script")):
-                argv, bindings = runner._bind_mcp_upstream(
+                argv, bindings, _manifest_authorization = runner._bind_mcp_upstream(
                     [str(executable), "server.py", "--bundle-root", str(root)],
                     manifest,
                     authorized,

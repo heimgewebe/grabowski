@@ -473,6 +473,10 @@ class RuntimeDeployScheduleObserverTests(unittest.TestCase):
         ), patch.object(
             SELF_DEPLOY.operator, "_jobs_root", return_value=Path("/state")
         ), patch.object(
+            SELF_DEPLOY,
+            "inflight_runtime_job_evidence",
+            return_value={"error": None, "inflight_units": []},
+        ), patch.object(
             SELF_DEPLOY, "_deploy_index", return_value={"units": [], "pending_unit": None}
         ), patch.object(
             SELF_DEPLOY, "_write_deploy_index"

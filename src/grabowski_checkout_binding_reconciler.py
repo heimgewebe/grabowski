@@ -635,6 +635,10 @@ def collect_lifecycle_bindings_from_db(
                     "ORDER BY retention.checkout_key LIMIT ?",
                     (MAX_BINDINGS + 1,),
                 ).fetchall()
+                all_retention_rows = connection.execute(
+                    "SELECT * FROM retention ORDER BY checkout_key LIMIT ?",
+                    (MAX_BINDINGS + 1,),
+                ).fetchall()
                 archive_rows = connection.execute(
                     "SELECT archives.* FROM archives "
                     "INNER JOIN lifecycle_bindings "
@@ -653,13 +657,20 @@ def collect_lifecycle_bindings_from_db(
                 raise CheckoutBindingDatabaseError(
                     "checkout binding snapshot cannot be read"
                 ) from exc
-            if len(retention_rows) > MAX_BINDINGS or len(archive_rows) > MAX_BINDINGS:
+            if (
+                len(retention_rows) > MAX_BINDINGS
+                or len(all_retention_rows) > MAX_BINDINGS
+                or len(archive_rows) > MAX_BINDINGS
+            ):
                 raise CheckoutBindingDatabaseError(
                     "checkout evidence exceeds the bounded binding maximum"
                 )
             retentions = {
                 str(row["checkout_key"]): dict(row) for row in retention_rows
             }
+            retention_inventory = [
+                checkouts._retention_public(row) for row in all_retention_rows
+            ]
             archives = {
                 str(row["checkout_key"]): dict(row) for row in archive_rows
             }
@@ -673,6 +684,7 @@ def collect_lifecycle_bindings_from_db(
             snapshot_material = {
                 "database_schema_version": CHECKOUT_DATABASE_SCHEMA_VERSION,
                 "bindings": bindings,
+                "retentions": retention_inventory,
             }
             snapshot_sha256 = hashlib.sha256(
                 consumer_surface.canonical_json_bytes(snapshot_material)
@@ -682,6 +694,7 @@ def collect_lifecycle_bindings_from_db(
                 "database_schema_version": CHECKOUT_DATABASE_SCHEMA_VERSION,
                 "snapshot_sha256": snapshot_sha256,
                 "bindings": bindings,
+                "retentions": retention_inventory,
                 "read_only": True,
                 "snapshot_mode": (
                     "immutable-file"
@@ -775,6 +788,43 @@ def _normalize_filters(repository_filters: list[str] | None) -> list[str] | None
     return normalized
 
 
+def _validated_database_snapshot(
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        raise CheckoutBindingDatabaseError(
+            "checkout binding database snapshot is invalid"
+        )
+    bindings = snapshot.get("bindings")
+    retentions = snapshot.get("retentions")
+    schema_version = snapshot.get("database_schema_version")
+    snapshot_sha256 = snapshot.get("snapshot_sha256")
+    if (
+        schema_version != CHECKOUT_DATABASE_SCHEMA_VERSION
+        or not isinstance(bindings, list)
+        or not isinstance(retentions, list)
+        or snapshot.get("read_only") is not True
+        or not isinstance(snapshot_sha256, str)
+    ):
+        raise CheckoutBindingDatabaseError(
+            "checkout binding database snapshot is incomplete"
+        )
+    expected_sha256 = hashlib.sha256(
+        consumer_surface.canonical_json_bytes(
+            {
+                "database_schema_version": schema_version,
+                "bindings": bindings,
+                "retentions": retentions,
+            }
+        )
+    ).hexdigest()
+    if snapshot_sha256 != expected_sha256:
+        raise CheckoutBindingDatabaseError(
+            "checkout binding database snapshot hash is invalid"
+        )
+    return snapshot
+
+
 def reconcile_checkout_bindings(
     *,
     db_path: Path | str | None = None,
@@ -784,12 +834,17 @@ def reconcile_checkout_bindings(
     git_timeout_seconds: int | float = (
         checkouts.DEFAULT_GIT_READ_TIMEOUT_SECONDS
     ),
+    _database_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compare the pinned durable binding snapshot with current Git observations."""
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_PAGE_LIMIT:
         raise ValueError(f"limit must be between 1 and {MAX_PAGE_LIMIT}")
     filters = _normalize_filters(repository_filters)
-    database = collect_lifecycle_bindings_from_db(db_path)
+    database = (
+        collect_lifecycle_bindings_from_db(db_path)
+        if _database_snapshot is None
+        else _validated_database_snapshot(_database_snapshot)
+    )
     bindings = list(database["bindings"])
     if filters is not None:
         allowed = set(filters)

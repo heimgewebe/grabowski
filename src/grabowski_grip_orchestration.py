@@ -1265,6 +1265,7 @@ def _captain_merge_provenance_from_execution_result(
         set(execution_result)
         - _CAPTAIN_AUDIT_RESULT_IDENTITY_KEYS
         - _CAPTAIN_MERGE_PROVENANCE_KEYS
+        - {"verified_duplicate_queue"}
     )
     if unknown:
         raise SagaError("Captain audit reference execution result shape is not canonical")
@@ -1275,6 +1276,25 @@ def _captain_merge_provenance_from_execution_result(
         raise SagaError("Captain audit merge provenance is incomplete")
 
     provenance = {key: execution_result.get(key) for key in _CAPTAIN_MERGE_PROVENANCE_KEYS}
+    duplicate_queue = execution_result.get("verified_duplicate_queue")
+    if "verified_duplicate_queue" in execution_result:
+        if (
+            not isinstance(duplicate_queue, dict)
+            or set(duplicate_queue) != {
+                "preflight_passed",
+                "duplicate_dispatch_prevented",
+                "queue_entry_id",
+                "merge_queue_reconciliation",
+            }
+            or duplicate_queue.get("preflight_passed") is not True
+            or duplicate_queue.get("duplicate_dispatch_prevented") is not True
+            or not isinstance(duplicate_queue.get("queue_entry_id"), str)
+            or not 1 <= len(duplicate_queue["queue_entry_id"]) <= 256
+            or duplicate_queue.get("merge_queue_reconciliation")
+            not in {"already_queued_before_dispatch", "queued_during_dispatch_guard"}
+        ):
+            raise SagaError("Captain audit verified duplicate queue proof is invalid")
+        provenance["verified_duplicate_queue"] = dict(duplicate_queue)
     if provenance["provenance_schema_version"] != 2:
         raise SagaError("Captain audit merge provenance schema is unsupported")
     for key in (
@@ -1322,16 +1342,26 @@ def _captain_merge_provenance_from_execution_result(
     ):
         expected_mode = "external_merge_reconciled"
     elif (
-        provenance["execution_invoked"]
-        and provenance["verification_passed"]
+        provenance["verification_passed"]
         and provenance["merge_queued"]
         and not provenance["merge_completion_verified"]
         and merge_sha is None
         and not provenance["external_merge_observed"]
+        and (
+            (provenance["execution_invoked"] and duplicate_queue is None)
+            or (
+                not provenance["execution_invoked"]
+                and not provenance["dispatch_succeeded"]
+                and not provenance["remote_mutation_observed"]
+                and duplicate_queue is not None
+            )
+        )
     ):
         expected_mode = "captain_queue_dispatch_pending"
     else:
         expected_mode = "unverified"
+    if duplicate_queue is not None and expected_mode != "captain_queue_dispatch_pending":
+        raise SagaError("Captain audit duplicate queue proof is incompatible with provenance")
     if provenance["provenance_mode"] != expected_mode:
         raise SagaError("Captain audit merge provenance mode is internally inconsistent")
     return provenance

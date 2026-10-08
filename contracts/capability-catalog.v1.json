@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "d372f005e8d2c10ab43eca49832071b32d24a2d4bbbc9e7c13829d21913db2e4",
+  "capability_source_sha256": "3d3685376352e7a8b8c36145aa88d614b16f0f9f865450a9a522b02a088921b1",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "03ebb6191f56cf3eaf8e966ab4208fc6dabeb1d63c1c2c8ec587b688245d0f46",
+  "contract_sha256": "043c579e8d0717ea00226965d77d1a0555aed91fe587402d6c7472d60914678e",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -41,6 +41,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_context"
+    },
+    {
+      "category": "operations-observability",
+      "description": "REQUIRED final call in every conversation before the assistant gives its final answer.\n\nAccepts the agent's outcome self-report without mutating product data.\nWhen Flowlines export is enabled, this tool call is the telemetry report.\nFor blocked work, report partial if any of the user goal was accomplished;\notherwise report failed, and describe the blocker in unmet_needs.",
+      "effects": [],
+      "id": "report_outcome",
+      "purpose": "Accept the required final agent outcome self-report for Flowlines telemetry when export is enabled, without product mutation.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "report_outcome"
     },
     {
       "category": "grip-surface",
@@ -515,7 +526,7 @@
     },
     {
       "category": "work-coordination",
-      "description": "Acquire a work lane, persist terminal closeout, or repair only its missing audit.",
+      "description": "Acquire a work lane, persist terminal closeout, or repair only its missing audit.\n\nNew acquisitions accept source_kind only from bureau_task, github_issue,\noperator_obligation, thread_focus, work_lane, direct, or direct-user.\nDirect sources bind checkout lifecycle evidence to the Work Lane itself.",
       "effects": [
         "resource-lease",
         "git-worktree-create",
@@ -1028,6 +1039,32 @@
       "reversibility": "not-applicable",
       "risk_class": "medium",
       "tool": "grabowski_privileged_action_reference"
+    },
+    {
+      "category": "privileged-execution",
+      "description": "Start one fixed SHA-pinned authoritative critical-user-data inventory.",
+      "effects": [
+        "root-read-only-home-traversal",
+        "root-systemd-task-start",
+        "root-owned-inventory-evidence-write"
+      ],
+      "id": "grabowski_critical_user_data_inventory",
+      "purpose": "Start one fixed SHA-pinned authoritative critical-user-data inventory through the root-owned broker without arbitrary argv or paths; sealed result evidence is root-owned but transient and must be captured before reboot.",
+      "read_only": false,
+      "reversibility": "no-user-data-mutation-root-owned-evidence-transient",
+      "risk_class": "high",
+      "tool": "grabowski_critical_user_data_inventory"
+    },
+    {
+      "category": "privileged-reference",
+      "description": "Read status or result for the fixed SHA-pinned critical-data inventory.",
+      "effects": [],
+      "id": "grabowski_critical_user_data_inventory_read",
+      "purpose": "Read status or a sealed result for the fixed SHA-pinned critical-user-data inventory without dispatching a new scan.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_critical_user_data_inventory_read"
     },
     {
       "category": "privileged-execution",
@@ -1789,7 +1826,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Run one typed, revision-bound Systemkatalog v2 query without write authority.",
+      "description": "Prefer this typed read for cross-repository stable Systemkatalog truth.\n\nThis includes truth ownership, system roles, responsibility boundaries, canonical\nentrypoints and stable relations. Use operation=system for a known system,\noperation=repository for a known repository, operation=truth-owner for a known\nauthority-domain key, and operation=relations or operation=entrypoints for those\nquery classes. Use operation=authority-matrix only when no targeted identifier\napplies and a broader authority map is required. Use RepoGround for local\nrepository/implementation/free-text content; current runtime, PR and CI truth\nstays with its owning live source. If the result changes or confirms a decision,\nrecord a hash-bound usage receipt via tools/systemkatalog_usage_receipt.py using\nfixed metadata categories and no free prose. Grants no write authority.",
       "effects": [],
       "id": "grabowski_systemkatalog_query",
       "purpose": "Run one bounded, revision-bound Systemkatalog v2 semantic query without catalog, task, runtime or merge authority.",
@@ -1808,6 +1845,19 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_operational_guidance"
+    },
+    {
+      "category": "bureau",
+      "description": "Authenticate one exact manual Bureau acceptance item through Bureau's canonical contract.",
+      "effects": [
+        "bureau_acceptance_authentication_event"
+      ],
+      "id": "grabowski_bureau_acceptance_authenticate",
+      "purpose": "Authenticate one exact digest- and revision-bound manual Bureau acceptance item through Bureau's canonical StateStore journal contract.",
+      "read_only": false,
+      "reversibility": "append-only-idempotent-attestation",
+      "risk_class": "medium",
+      "tool": "grabowski_bureau_acceptance_authenticate"
     },
     {
       "category": "bureau",
@@ -1975,7 +2025,7 @@
     },
     {
       "category": "resource",
-      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest.\nEmergency-recovery mode is derived only from a validated Bureau recovery\ncontract; caller-supplied lease-mode metadata is not an authority surface.\nSelf-scoped branch and operation keys are authoritative and reject scope\nmanifests. Work Lane identity metadata is server-owned and can only be\ncreated through the Work Lane acquisition path.",
+      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest.\nEmergency-recovery mode is derived only from a validated Bureau recovery\ncontract; caller-supplied lease-mode metadata is not an authority surface.\nSelf-scoped branch and operation keys are authoritative and reject scope\nmanifests. Work Lane identity metadata and user-systemd subtree authority\nmetadata are server-owned and can only be created through their internal\nacquisition paths.",
       "effects": [
         "lease-create",
         "possible-expired-lease-reclaim"

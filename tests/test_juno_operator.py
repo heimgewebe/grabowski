@@ -139,7 +139,14 @@ class CollectorTests(unittest.TestCase):
                     "x",
                     encoding="utf-8",
                 )
-            with mock.patch.object(paths.glob, "glob", return_value=[]):
+            with (
+                mock.patch.object(paths.glob, "glob", return_value=[]),
+                mock.patch.object(
+                    collectors.shutil,
+                    "disk_usage",
+                    return_value=mock.Mock(total=1000, used=500, free=500),
+                ),
+            ):
                 result = collectors.collect_storage(project)
             self.assertEqual(result.status, "healthy")
             observed = result.data["roots"][0]

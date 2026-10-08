@@ -18,9 +18,12 @@ ASSERTION_VERSION = "signed-one-call-v1"
 ASSERTION_AUDIENCE = "grabowski-mcp"
 ASSERTION_MAX_AGE_SECONDS = 90
 ASSERTION_CLOCK_SKEW_SECONDS = 30
-# Kept as a public compatibility constant for tests/documentation that refer to
-# the original short replay window. The durable replay filter never expires.
+# Historical compatibility constant. Durable replay remains monotone for
+# opaque mutation surfaces. Domain-delegated task starts consume the exact
+# signed request id once, while fresh logical retries skip body/session replay
+# quarantine and reconcile in the task layer.
 REPLAY_RETENTION_SECONDS = 900
+DOMAIN_REPLAY_DELEGATED_TO_SEMANTICS = frozenset({"grabowski_task_start"})
 CONSUMPTION_KIND = "grabowski_transport_one_call_consumption"
 STATE_ROOT = Path.home() / ".local/state/grabowski/transport-one-call"
 LOCK_PATH = STATE_ROOT / ".lock"
@@ -524,11 +527,28 @@ def _replay_filter_positions(scope_sha256: str, request_id: str) -> tuple[int, .
     )
 
 
-def _stable_scope_replay_id(body_sha256: str) -> str:
+def _stable_scope_replay_id(body_sha256: str, session_id: str = "") -> str:
     body = bytes.fromhex(_sha256(body_sha256, "transport assertion body hash"))
-    return hashlib.sha256(
-        b"grabowski-stable-client-scope-body-replay-id-v1\x00" + body
-    ).hexdigest()[:32]
+    if session_id:
+        if not isinstance(session_id, str):
+            raise TransportAssertionError("transport MCP session id is invalid")
+        try:
+            session = session_id.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise TransportAssertionError(
+                "transport MCP session id is invalid"
+            ) from exc
+        material = (
+            b"grabowski-stable-client-scope-session-body-replay-id-v2\x00"
+            + session
+            + b"\x00"
+            + body
+        )
+    else:
+        # Sessionless callers retain the historical fail-closed body identity.
+        # This also preserves all existing durable replay bits for that path.
+        material = b"grabowski-stable-client-scope-body-replay-id-v1\x00" + body
+    return hashlib.sha256(material).hexdigest()[:32]
 
 
 def _pread_exact(fd: int, size: int, offset: int, label: str) -> bytes:
@@ -951,6 +971,38 @@ def _open_replay_filter() -> tuple[int, int, int]:
         raise
 
 
+def _replay_filter_contains(scope_sha256: str, replay_id: str) -> bool:
+    masks: dict[tuple[int, int], int] = {}
+    for bit in _replay_filter_positions(scope_sha256, replay_id):
+        byte_index = bit // 8
+        page_index = byte_index // REPLAY_FILTER_PAGE_BYTES
+        page_byte_index = byte_index % REPLAY_FILTER_PAGE_BYTES
+        key = (page_index, page_byte_index)
+        mask = 1 << (bit % 8)
+        masks[key] = masks.get(key, 0) | mask
+
+    fd, integrity_fd, integrity_root_fd = _open_replay_filter()
+    try:
+        pages = {
+            page_index: bytearray(
+                _validate_replay_page(fd, integrity_fd, page_index)
+            )
+            for page_index in sorted({key[0] for key in masks})
+        }
+        return all(
+            pages[page_index][page_byte_index] & mask == mask
+            for (page_index, page_byte_index), mask in masks.items()
+        )
+    finally:
+        try:
+            os.close(integrity_root_fd)
+        finally:
+            try:
+                os.close(integrity_fd)
+            finally:
+                os.close(fd)
+
+
 def _consume_replay_filter(
     scope_replay_ids: tuple[tuple[str, str], ...],
 ) -> None:
@@ -1039,6 +1091,7 @@ def consume_assertion(
     arguments_sha256: str,
     body_sha256: str,
     mac_sha256: str,
+    session_id: str = "",
     now_unix: int | None = None,
 ) -> dict[str, Any]:
     scope_hash = _sha256(client_scope_sha256, "transport client scope hash")
@@ -1071,6 +1124,11 @@ def consume_assertion(
     if not hmac.compare_digest(asserted_runtime_hash, runtime_hash):
         raise TransportAssertionError("transport assertion runtime binding mismatch")
 
+    replay_policy = (
+        "domain_delegated"
+        if material["tool_name"] in DOMAIN_REPLAY_DELEGATED_TO_SEMANTICS
+        else "durable_transport_replay"
+    )
     with _state_lock():
         for legacy_scope_hash, legacy_path in _legacy_tombstone_inventory(
             scope_hash, material["request_id"]
@@ -1088,31 +1146,55 @@ def consume_assertion(
                 and legacy["runtime_binding_sha256"]
                 == material["runtime_binding_sha256"]
             )
-            if legacy["request_id"] == material["request_id"] and not same_target:
-                raise TransportAssertionError(
-                    "transport request id was reused for different evidence"
-                )
-            if legacy["body_sha256"] == material["body_sha256"]:
+            if legacy["request_id"] == material["request_id"]:
                 if not same_target:
                     raise TransportAssertionError(
-                        "transport request body was rebound to different legacy evidence"
+                        "transport request id was reused for different evidence"
                     )
-                # Legacy receipts predate stable connector identities, so token
-                # rotation cannot be linked back to one connector scope. Exact
-                # body-and-target evidence is conservatively authoritative
-                # across the bounded legacy inventory.
                 raise TransportAssertionReplay(
                     "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
                 )
-        _consume_replay_filter(
-            (
-                (legacy_replay_scope_hash, material["request_id"]),
-                (
-                    scope_hash,
-                    _stable_scope_replay_id(material["body_sha256"]),
-                ),
+            if (
+                replay_policy == "durable_transport_replay"
+                and legacy["body_sha256"] == material["body_sha256"]
+            ):
+                same_intent = (
+                    legacy["tool_name"] == material["tool_name"]
+                    and legacy["arguments_sha256"] == material["arguments_sha256"]
+                )
+                if not same_intent:
+                    raise TransportAssertionError(
+                        "transport request body was rebound to different legacy evidence"
+                    )
+                raise TransportAssertionReplay(
+                    "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
+                )
+
+        if replay_policy == "domain_delegated":
+            # Keep the signed packet single-use even though a newly signed
+            # logical retry is delegated to normalized task semantics.
+            _consume_replay_filter(
+                ((legacy_replay_scope_hash, material["request_id"]),)
             )
-        )
+        else:
+            if session_id and _replay_filter_contains(
+                scope_hash,
+                _stable_scope_replay_id(material["body_sha256"]),
+            ):
+                raise TransportAssertionReplay(
+                    "signed one-call transport request was already consumed or conservatively rejected by the durable replay filter; do not repeat the mutation; reconcile target state"
+                )
+            _consume_replay_filter(
+                (
+                    (legacy_replay_scope_hash, material["request_id"]),
+                    (
+                        scope_hash,
+                        _stable_scope_replay_id(
+                            material["body_sha256"], session_id=session_id
+                        ),
+                    ),
+                )
+            )
 
     receipt = {
         "schema_version": SCHEMA_VERSION,
@@ -1126,12 +1208,14 @@ def consume_assertion(
         "tool_name": material["tool_name"],
         "arguments_sha256": material["arguments_sha256"],
         "body_sha256": material["body_sha256"],
+        "replay_policy": replay_policy,
     }
     receipt["receipt_sha256"] = _sha256_json(receipt)
     return {
         "schema_version": SCHEMA_VERSION,
         "state": "consumed",
         "single_use": True,
+        "replay_policy": replay_policy,
         "transport_mode": ASSERTION_VERSION,
         "client_scope_sha256": scope_hash,
         "runtime_binding_sha256": material["runtime_binding_sha256"],
@@ -1141,7 +1225,14 @@ def consume_assertion(
         "consumption_receipt_sha256": receipt["receipt_sha256"],
         "does_not_establish": [
             "application-level success of the admitted mutation",
-            "safe replay after response loss",
             "human identity behind the authenticated connector",
+            *(
+                [
+                    "application-level duplicate suppression",
+                    "safe retry authority outside the durable task semantics",
+                ]
+                if replay_policy == "domain_delegated"
+                else ["safe replay after response loss"]
+            ),
         ],
     }

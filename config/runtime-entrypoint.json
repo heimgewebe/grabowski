@@ -2,6 +2,7 @@
   "expected_tools": [
     "grabowski_status",
     "grabowski_context",
+    "report_outcome",
     "grip_list",
     "grip_run",
     "grabowski_list_directory",
@@ -83,6 +84,8 @@
     "grabowski_ports",
     "grabowski_tailscale_status",
     "grabowski_privileged_action_reference",
+    "grabowski_critical_user_data_inventory",
+    "grabowski_critical_user_data_inventory_read",
     "grabowski_power_run",
     "grabowski_fleet_list",
     "grabowski_fleet_run",
@@ -143,6 +146,7 @@
     "grabowski_host_capability_resolve",
     "grabowski_systemkatalog_query",
     "grabowski_operational_guidance",
+    "grabowski_bureau_acceptance_authenticate",
     "grabowski_bureau_candidate_record",
     "grabowski_bureau_candidate_assess",
     "grabowski_bureau_task_propose",
@@ -207,6 +211,14 @@
     {
       "module": "grabowski_operator_core",
       "source": "src/grabowski_operator.py"
+    },
+    {
+      "module": "grabowski_flowlines",
+      "source": "src/grabowski_flowlines.py"
+    },
+    {
+      "module": "grabowski_redaction",
+      "source": "src/grabowski_redaction.py"
     },
     {
       "module": "grabowski_bureau_runtime_refresh_executor",
@@ -303,6 +315,10 @@
     {
       "module": "grabowski_post_merge_sync_apply",
       "source": "src/grabowski_post_merge_sync_apply.py"
+    },
+    {
+      "module": "grabowski_repoground_post_merge",
+      "source": "src/grabowski_repoground_post_merge.py"
     },
     {
       "module": "grabowski_forrest_server_exit",

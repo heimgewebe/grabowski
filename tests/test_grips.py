@@ -786,6 +786,17 @@ class FakeGh:
                 payload = state.get("review") if isinstance(state, dict) else None
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
         if argv[:1] == ["api"]:
+            jq = (
+                argv[argv.index("--jq") + 1]
+                if "--jq" in argv and argv.index("--jq") + 1 < len(argv)
+                else None
+            )
+            if jq == ".delete_branch_on_merge":
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps(self.repo_settings.get("delete_branch_on_merge")),
+                    "stderr": "",
+                }
             if self.repo_settings_returncode != 0:
                 return {"returncode": self.repo_settings_returncode, "stdout": "", "stderr": "repo policy failed"}
             if self.repo_settings_invalid_json:
@@ -795,6 +806,9 @@ class FakeGh:
                 if self.repo_settings_sequence
                 else self.repo_settings
             )
+            if isinstance(jq, str) and jq.startswith("{") and jq.endswith("}"):
+                keys = [key for key in jq[1:-1].split(",") if key]
+                settings = {key: settings[key] for key in keys if key in settings}
             return {"returncode": 0, "stdout": json.dumps(settings), "stderr": ""}
         if argv[:2] == ["pr", "create"]:
             return {"returncode": 0, "stdout": str(self.view["url"]), "stderr": ""}
@@ -1497,6 +1511,7 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         cases = {
             "confirmation_mismatch": {
@@ -1541,6 +1556,11 @@ class GripFoundationTests(unittest.TestCase):
                 with (
                     patch.object(
                         grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
                         "_validate_remote_materialization_target",
                         return_value="https://example.invalid/grabowski.git",
                     ),
@@ -1550,6 +1570,7 @@ class GripFoundationTests(unittest.TestCase):
                             "receipt_status": "blocked",
                             "state": state,
                             "retry_authorized": False,
+                            "physical_identity_verified": True,
                         },
                     ),
                 ):
@@ -1564,8 +1585,173 @@ class GripFoundationTests(unittest.TestCase):
                     item["id"]: item["status"]
                     for item in receipt["checks"]
                 }
+                self.assertEqual("pass", statuses["physical-checkout-bound"])
                 for check_id, status in expected.items():
                     self.assertEqual(status, statuses[check_id])
+
+    def test_post_merge_sync_apply_initial_physical_failure_skips_unobserved_canonical_check(
+        self,
+    ) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1318-initial-physical-failure-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
+        }
+        for state in (
+            "invalid_physical_checkout_identity",
+            "physical_checkout_identity_unreadable",
+            "physical_checkout_identity_mismatch",
+        ):
+            with self.subTest(state=state):
+                receipt: dict[str, object] = {"checks": []}
+                with (
+                    patch.object(
+                        grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
+                        "_validate_remote_materialization_target",
+                        return_value="https://example.invalid/grabowski.git",
+                    ),
+                    patch(
+                        "grabowski_post_merge_sync_apply.apply",
+                        return_value={
+                            "receipt_status": "blocked",
+                            "state": state,
+                            "retry_authorized": False,
+                            "physical_identity_verified": False,
+                        },
+                    ),
+                ):
+                    output = grips._run_post_merge_sync_apply(
+                        grips.GRIP_SPECS["post-merge-sync-apply"],
+                        parameters,
+                        receipt,
+                        FakeGit(),
+                    )
+                self.assertEqual(state, output["state"])
+                statuses = {
+                    item["id"]: item["status"]
+                    for item in receipt["checks"]
+                }
+                self.assertEqual("fail", statuses["physical-checkout-bound"])
+                self.assertEqual("skip", statuses["protected-canonical-checkout"])
+                self.assertEqual("skip", statuses["clean-exact-preimage"])
+                self.assertEqual("skip", statuses["remote-head-bound"])
+
+    def test_post_merge_sync_apply_replay_identity_drift_fails_physical_check(
+        self,
+    ) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1318-replay-drift-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
+        }
+        receipt: dict[str, object] = {"checks": []}
+        with (
+            patch.object(
+                grips,
+                "_physical_checkout_identity",
+                return_value={"physical_identity_sha256": "f" * 64},
+            ),
+            patch.object(
+                grips,
+                "_validate_remote_materialization_target",
+                return_value="https://example.invalid/grabowski.git",
+            ),
+            patch(
+                "grabowski_post_merge_sync_apply.apply",
+                return_value={
+                    "receipt_status": "blocked",
+                    "state": "physical_checkout_identity_drift_before_replay_success",
+                    "retry_authorized": False,
+                    "physical_identity_verified": False,
+                    "effect_started": False,
+                },
+            ),
+        ):
+            output = grips._run_post_merge_sync_apply(
+                grips.GRIP_SPECS["post-merge-sync-apply"],
+                parameters,
+                receipt,
+                FakeGit(),
+            )
+
+        self.assertEqual(
+            "physical_checkout_identity_drift_before_replay_success",
+            output["state"],
+        )
+        statuses = {
+            item["id"]: item["status"]
+            for item in receipt["checks"]
+        }
+        self.assertEqual("fail", statuses["physical-checkout-bound"])
+
+    def test_post_merge_sync_apply_bound_checkout_close_failure_fails_physical_check(
+        self,
+    ) -> None:
+        parameters = {
+            "repo": "/tmp/grabowski-pr1318-close-failure-test",
+            "target_branch": "main",
+            "expected_local_head": "1" * 40,
+            "expected_remote_head": "2" * 40,
+            "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
+        }
+        cases = (
+            {
+                "receipt_status": "failed",
+                "state": "bound_checkout_release_failed",
+                "retry_authorized": False,
+                "physical_identity_verified": False,
+                "bound_checkout_release_failed": True,
+            },
+            {
+                "receipt_status": "blocked",
+                "state": "remote_head_drift_after_lease",
+                "retry_authorized": False,
+                "physical_identity_verified": False,
+                "bound_checkout_release_failed": True,
+            },
+        )
+        for output_value in cases:
+            with self.subTest(state=output_value["state"]):
+                receipt: dict[str, object] = {"checks": []}
+                with (
+                    patch.object(
+                        grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
+                        "_validate_remote_materialization_target",
+                        return_value="https://example.invalid/grabowski.git",
+                    ),
+                    patch(
+                        "grabowski_post_merge_sync_apply.apply",
+                        return_value=output_value,
+                    ),
+                ):
+                    grips._run_post_merge_sync_apply(
+                        grips.GRIP_SPECS["post-merge-sync-apply"],
+                        parameters,
+                        receipt,
+                        FakeGit(),
+                    )
+                statuses = {
+                    item["id"]: item["status"]
+                    for item in receipt["checks"]
+                }
+                self.assertEqual("fail", statuses["physical-checkout-bound"])
 
     def test_post_merge_sync_apply_fast_forward_requires_explicit_verification(
         self,
@@ -1576,6 +1762,7 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         cases = (
             ({"state": "outcome_unknown", "resource_keys": ["repo:/tmp/x"]}, "skip"),
@@ -1598,6 +1785,11 @@ class GripFoundationTests(unittest.TestCase):
                     **output_patch,
                 }
                 with (
+                    patch.object(
+                        grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
                     patch.object(
                         grips,
                         "_validate_remote_materialization_target",
@@ -1629,6 +1821,7 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         cases = (
             ({"state": "outcome_unknown", "resource_keys": ["repo:/tmp/x"]}, "skip"),
@@ -1637,6 +1830,15 @@ class GripFoundationTests(unittest.TestCase):
                     "state": "outcome_unknown",
                     "resource_keys": ["repo:/tmp/x"],
                     "remote_head_verified": True,
+                },
+                "pass",
+            ),
+            (
+                {
+                    "state": "synced",
+                    "resource_keys": ["repo:/tmp/x"],
+                    "remote_head_verified": False,
+                    "remote_head_bound_observed": True,
                 },
                 "pass",
             ),
@@ -1693,6 +1895,11 @@ class GripFoundationTests(unittest.TestCase):
                 with (
                     patch.object(
                         grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
                         "_validate_remote_materialization_target",
                         return_value="https://example.invalid/grabowski.git",
                     ),
@@ -1722,6 +1929,7 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         cases = (
             ({"state": "outcome_unknown", "resource_keys": ["repo:/tmp/x"]}, "skip"),
@@ -1764,6 +1972,11 @@ class GripFoundationTests(unittest.TestCase):
                 with (
                     patch.object(
                         grips,
+                        "_physical_checkout_identity",
+                        return_value={"physical_identity_sha256": "f" * 64},
+                    ),
+                    patch.object(
+                        grips,
                         "_validate_remote_materialization_target",
                         return_value="https://example.invalid/grabowski.git",
                     ),
@@ -1792,9 +2005,15 @@ class GripFoundationTests(unittest.TestCase):
             "expected_local_head": "1" * 40,
             "expected_remote_head": "2" * 40,
             "confirmation": "apply-protected-post-merge-sync",
+            "expected_physical_identity_sha256": "f" * 64,
         }
         receipt: dict[str, object] = {"checks": []}
         with (
+            patch.object(
+                grips,
+                "_physical_checkout_identity",
+                return_value={"physical_identity_sha256": "f" * 64},
+            ),
             patch.object(
                 grips,
                 "_validate_remote_materialization_target",
@@ -5456,7 +5675,6 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("blocked", result["receipt"]["status"])
         self.assertIn("profile observer cannot run mutating grips", result["output"]["error"])
-
     def test_mechanic_loop_runs_normal_actions_with_visible_scope_and_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = grips.run_grip(
@@ -6680,6 +6898,71 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("fail", checks["expected_branch"])
         self.assertEqual(64, len(result["receipt"]["receipt_sha256"]))
 
+    def test_post_merge_sync_emits_physical_checkout_binding(self) -> None:
+        physical = {
+            "schema_version": 1,
+            "kind": "grabowski.physical_checkout_identity",
+            "root": {"path": "/tmp/repo", "device": 1, "inode": 2},
+            "git_dir": {"path": "/tmp/repo/.git", "device": 1, "inode": 3},
+            "common_dir": {"path": "/tmp/repo/.git", "device": 1, "inode": 3},
+            "physical_identity_sha256": "f" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "grabowski_physical_checkout.capture_physical_checkout_identity",
+            return_value=physical,
+        ):
+            result = grips.run_grip(
+                "post-merge-sync",
+                {"repo": tmp, "target_branch": "main"},
+                command_runner=FakeGit(branch="main", dirty=False),
+            )
+
+        self.assertEqual("passed", result["status"])
+        self.assertEqual(
+            "f" * 64,
+            result["output"]["expected_physical_identity_sha256"],
+        )
+
+    def test_post_merge_sync_apply_rejects_symlink_repository_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            alias = root / "repo-alias"
+            subprocess.run(
+                ["git", "init", "-q", "-b", "main", str(repo)],
+                check=True,
+            )
+            alias.symlink_to(repo, target_is_directory=True)
+            physical = grips.grabowski_physical_checkout.capture_physical_checkout_identity(
+                repo
+            )
+            fake = FakeGit(branch="main", head="1" * 40)
+            result = grips.run_grip(
+                "post-merge-sync-apply",
+                {
+                    "repo": str(alias),
+                    "target_branch": "main",
+                    "expected_local_head": "1" * 40,
+                    "expected_remote_head": "2" * 40,
+                    "expected_physical_identity_sha256": physical[
+                        "physical_identity_sha256"
+                    ],
+                    "confirmation": "apply-protected-post-merge-sync",
+                },
+                allow_mutation=True,
+                command_runner=fake,
+            )
+
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("preflight", result["receipt"]["phase"])
+        self.assertIn("physical identity", result["output"]["error"])
+        checks = {
+            item["id"]: item["status"]
+            for item in result["receipt"]["checks"]
+        }
+        self.assertEqual("fail", checks["physical-checkout-bound"])
+        self.assertEqual([], fake.calls)
+
     def test_post_merge_sync_validates_target_branch_before_orienting(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fake = FakeGit()
@@ -7653,12 +7936,12 @@ class GripFoundationTests(unittest.TestCase):
             else None
         )
         reviewer = {
-            "route": "claude-opus-5-high",
+            "route": "claude-opus-5.5-high",
             "harness": "claude",
             "argv_prefix": [
                 "claude",
                 "--model",
-                "opus",
+                "claude-opus-5-5",
                 "--effort",
                 "high",
                 "--permission-mode",
@@ -8230,7 +8513,7 @@ class GripFoundationTests(unittest.TestCase):
         contract_path = Path(__file__).resolve().parents[1] / "config" / "runtime-entrypoint.json"
         contract = json.loads(contract_path.read_text())
         self.assertNotIn("agent-execution-happy-path", contract["expected_tools"])
-        self.assertEqual(198, len(contract["expected_tools"]))
+        self.assertEqual(202, len(contract["expected_tools"]))
         self.assertIn("grabowski_operational_guidance", contract["expected_tools"])
         supporting = {
             (item["module"], item["source"])
@@ -11357,6 +11640,29 @@ class RuntimeDeployGripTests(unittest.TestCase):
         self.assertFalse(result["output"]["mutation_attempted"])
         check.assert_called_once_with(expected)
 
+    def test_runtime_deploy_self_preflight_accepts_scheduler_auto_source(self) -> None:
+        expected = "d" * 40
+        plan = {
+            "resolution_mode": "scheduler-auto-source",
+            "repository": None,
+            "runner": None,
+            "source_identity": None,
+            "source_identity_sha256": None,
+            "origin_main_refresh_required": True,
+            "canonical_state": {"current_branch": "feature/active-work"},
+            "ready": True,
+        }
+        import grabowski_self_deploy
+        with patch.object(
+            grabowski_self_deploy,
+            "_deployment_schedule_preflight",
+            return_value=plan,
+        ):
+            result = grips._runtime_deploy_self_preflight(expected)
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["resolution_mode"], "scheduler-auto-source")
+        self.assertIsNone(result["source_identity_sha256"])
+
     def test_runtime_deploy_check_blocks_unknown_adapter_and_failed_preflight(self) -> None:
         unknown = grips.run_grip(
             "runtime-deploy-check",
@@ -13231,7 +13537,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("merge", execution["merge_policy"]["selected_method"])
         self.assertEqual(["merge", "squash", "rebase"], execution["merge_policy"]["allowed_methods"])
         self.assertEqual([], execution["automatic_platform_effects"])
-        self.assertEqual("passed", execution["effect_scope_decision"]["decision"])
+        self.assertEqual("not_evaluated", execution["effect_scope_decision"]["decision"])
 
     def test_captain_run_treats_exact_merge_queue_entry_as_scheduled_after_dispatch(self) -> None:
         parameters = authorized_captain_run_parameters()
@@ -13900,7 +14206,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertIn("--squash", merge_call)
         self.assertNotIn("--merge", merge_call)
 
-    def test_captain_run_blocks_forbidden_automatic_branch_deletion(self) -> None:
+    def test_captain_run_ignores_repository_configured_branch_deletion_for_scope(self) -> None:
         action = captain_action(
             scope={
                 "allowed_effects": ["merge pull request 96 into main"],
@@ -13946,44 +14252,49 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             github_runner=gh,
         )
 
-        self.assertEqual("blocked", result["receipt"]["status"])
-        self.assertEqual("blocked", result["output"]["decision"])
+        self.assertEqual("passed", result["receipt"]["status"])
         execution = result["output"]["executions"][0]
-        self.assertFalse(execution["execution_invoked"])
-        self.assertFalse(execution["execution_attempted"])
+        self.assertTrue(execution["execution_invoked"])
+        configured_effects = execution["configured_automatic_platform_effects"]
         self.assertEqual(
-            ["automatic_effect_forbidden:branch-deletion"],
+            ["branch-deletion"],
+            [effect["effect"] for effect in configured_effects],
+        )
+        self.assertEqual(configured_effects, execution["automatic_platform_effects"])
+        self.assertEqual("not_evaluated", execution["effect_scope_decision"]["decision"])
+        self.assertTrue(
+            execution["automatic_platform_effect_observation"]["observed"]
+        )
+        self.assertTrue(
+            execution["automatic_platform_effect_observation"]["delete_branch_on_merge"]
+        )
+        self.assertEqual(
+            ["repository_configured_automatic_effects_are_observational"],
             execution["effect_scope_decision"]["reasons"],
         )
-        effect_target = execution["automatic_platform_effects"][0]["target"]
         self.assertEqual(
-            {
-                "base_repository": "heimgewebe/grabowski",
-                "pull_request": 96,
-                "repository": "heimgewebe/grabowski",
-                "ref": "refs/heads/feat/captain",
-                "head_branch": "feat/captain",
-                "head_oid": CAPTAIN_HEAD,
-                "cross_repository": False,
-            },
-            effect_target,
+            [],
+            execution["effect_scope_decision"]["required_effect_authorizations"],
         )
-        self.assertEqual(
-            execution["configured_automatic_platform_effects"],
-            execution["automatic_platform_effects"],
+        self.assertNotIn("delete_branch_on_merge", execution["merge_policy"]["settings"])
+        policy_call = next(
+            call
+            for call in gh.calls
+            if call[:2] == ("api", "repos/heimgewebe/grabowski")
+            and call[-1] != ".delete_branch_on_merge"
         )
-        action_receipt = result["output"]["actions"][0]["captain_receipt"]
-        self.assertEqual(
-            execution["automatic_platform_effects"],
-            action_receipt["automatic_platform_effects"],
+        self.assertNotIn("delete_branch_on_merge", " ".join(policy_call))
+        self.assertTrue(
+            any(
+                call[:2] == ("api", "repos/heimgewebe/grabowski")
+                and call[-1] == ".delete_branch_on_merge"
+                for call in gh.calls
+            )
         )
-        self.assertEqual(
-            execution["effect_scope_decision"],
-            action_receipt["effect_scope_decision"],
-        )
-        self.assertFalse(any(call[:2] == ("pr", "merge") for call in gh.calls))
+        self.assertTrue(any(call[:2] == ("pr", "merge") for call in gh.calls))
 
-    def test_captain_run_blocks_unapproved_automatic_branch_deletion(self) -> None:
+
+    def test_captain_run_blocks_relevant_repository_merge_policy_drift_before_dispatch(self) -> None:
         action = captain_action(
             scope={
                 "allowed_effects": ["merge pull request 96 into main"],
@@ -13992,6 +14303,16 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "max_targets": 1,
             }
         )
+        policy_before = {
+            "allow_merge_commit": True,
+            "allow_squash_merge": True,
+            "allow_rebase_merge": True,
+            "delete_branch_on_merge": False,
+        }
+        policy_after = {
+            **policy_before,
+            "allow_squash_merge": False,
+        }
         parameters = captain_parameters(
             [action],
             trusted_owner_mode=True,
@@ -14012,12 +14333,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "mergeable": "MERGEABLE",
                 "mergeStateStatus": "CLEAN",
             },
-            repo_settings={
-                "allow_merge_commit": True,
-                "allow_squash_merge": True,
-                "allow_rebase_merge": True,
-                "delete_branch_on_merge": True,
-            },
+            repo_settings_sequence=[policy_before, policy_after],
         )
 
         result = grips.grip_run(
@@ -14031,25 +14347,39 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertEqual("blocked", result["receipt"]["status"])
         execution = result["output"]["executions"][0]
-        self.assertEqual(
-            ["automatic_effect_authorization_missing:branch-deletion"],
-            execution["effect_scope_decision"]["reasons"],
-        )
         self.assertFalse(execution["execution_invoked"])
+        self.assertFalse(execution["execution_attempted"])
+        self.assertFalse(execution["verification_passed"])
+        self.assertIn(
+            "merge_guard_repository_policy_drift",
+            execution["merge_lease_guard"]["errors"],
+        )
+        self.assertEqual(
+            "blocked_after_guard_revalidation_released",
+            execution["merge_lease_guard"]["status"],
+        )
         self.assertFalse(any(call[:2] == ("pr", "merge") for call in gh.calls))
 
-    def test_captain_run_allows_explicitly_authorized_automatic_branch_deletion(self) -> None:
+
+    def test_captain_run_does_not_block_on_auto_delete_only_repository_drift(self) -> None:
         action = captain_action(
             scope={
-                "allowed_effects": [
-                    "merge pull request 96 into main",
-                    "branch-deletion",
-                ],
-                "forbidden_effects": ["force-push"],
+                "allowed_effects": ["merge pull request 96 into main"],
+                "forbidden_effects": ["force-push", "branch-deletion"],
                 "boundaries": "single pull request in heimgewebe/grabowski",
                 "max_targets": 1,
             }
         )
+        policy_before = {
+            "allow_merge_commit": True,
+            "allow_squash_merge": True,
+            "allow_rebase_merge": True,
+            "delete_branch_on_merge": False,
+        }
+        policy_after = {
+            **policy_before,
+            "delete_branch_on_merge": True,
+        }
         parameters = captain_parameters(
             [action],
             trusted_owner_mode=True,
@@ -14070,12 +14400,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "mergeable": "MERGEABLE",
                 "mergeStateStatus": "CLEAN",
             },
-            repo_settings={
-                "allow_merge_commit": True,
-                "allow_squash_merge": True,
-                "allow_rebase_merge": True,
-                "delete_branch_on_merge": True,
-            },
+            repo_settings=policy_after,
+            repo_settings_sequence=[policy_before, policy_after],
         )
 
         result = grips.grip_run(
@@ -14089,144 +14415,13 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertEqual("passed", result["receipt"]["status"])
         execution = result["output"]["executions"][0]
-        self.assertEqual("passed", execution["effect_scope_decision"]["decision"])
-        self.assertEqual(
-            ["branch-deletion"],
-            execution["effect_scope_decision"]["required_effect_authorizations"],
+        self.assertTrue(execution["execution_invoked"])
+        self.assertEqual("completed", execution["merge_lease_guard"]["status"])
+        self.assertTrue(
+            execution["automatic_platform_effect_observation"]["delete_branch_on_merge"]
         )
         self.assertTrue(any(call[:2] == ("pr", "merge") for call in gh.calls))
 
-    def test_captain_run_blocks_unbound_automatic_branch_deletion_target(self) -> None:
-        action = captain_action(
-            scope={
-                "allowed_effects": [
-                    "merge pull request 96 into main",
-                    "branch-deletion",
-                ],
-                "forbidden_effects": ["force-push"],
-                "boundaries": "single pull request in heimgewebe/grabowski",
-                "max_targets": 1,
-            }
-        )
-        parameters = captain_parameters(
-            [action],
-            trusted_owner_mode=True,
-            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
-            allow_execution=True,
-        )
-        parameters.pop("human_authorization")
-        parameters.pop("execution_authority")
-        parameters["execution_intent"] = captain_execution_intent(parameters)
-        gh = FakeGh(
-            view={
-                "number": 96,
-                "state": "OPEN",
-                "baseRefName": "main",
-                "headRefName": "feat/captain",
-                "headRefOid": CAPTAIN_HEAD,
-                "headRepository": None,
-                "isCrossRepository": False,
-                "isDraft": False,
-                "mergeable": "MERGEABLE",
-                "mergeStateStatus": "CLEAN",
-            },
-            repo_settings={
-                "allow_merge_commit": True,
-                "allow_squash_merge": True,
-                "allow_rebase_merge": True,
-                "delete_branch_on_merge": True,
-            },
-        )
-
-        result = grips.grip_run(
-            "captain-run",
-            parameters,
-            profile="captain",
-            allow_mutation=True,
-            command_runner=FakeGit(),
-            github_runner=gh,
-        )
-
-        self.assertEqual("blocked", result["receipt"]["status"])
-        execution = result["output"]["executions"][0]
-        self.assertIn(
-            "automatic_effect_target_unbound:branch-deletion",
-            execution["effect_scope_decision"]["reasons"],
-        )
-        self.assertFalse(any(call[:2] == ("pr", "merge") for call in gh.calls))
-
-    def test_captain_run_blocks_repository_policy_drift_before_merge_dispatch(self) -> None:
-        action = captain_action(
-            scope={
-                "allowed_effects": [
-                    "merge pull request 96 into main",
-                    "branch-deletion",
-                ],
-                "forbidden_effects": ["force-push"],
-                "boundaries": "single pull request in heimgewebe/grabowski",
-                "max_targets": 1,
-            }
-        )
-        policy_false = {
-            "allow_merge_commit": True,
-            "allow_squash_merge": True,
-            "allow_rebase_merge": True,
-            "delete_branch_on_merge": False,
-        }
-        policy_true = {**policy_false, "delete_branch_on_merge": True}
-        for initial, final in ((policy_false, policy_true), (policy_true, policy_false)):
-            with self.subTest(
-                initial_delete=initial["delete_branch_on_merge"],
-                final_delete=final["delete_branch_on_merge"],
-            ):
-                parameters = captain_parameters(
-                    [action],
-                    trusted_owner_mode=True,
-                    autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
-                    allow_execution=True,
-                )
-                parameters.pop("human_authorization")
-                parameters.pop("execution_authority")
-                parameters["execution_intent"] = captain_execution_intent(parameters)
-                gh = FakeGh(
-                    view={
-                        "number": 96,
-                        "state": "OPEN",
-                        "baseRefName": "main",
-                        "headRefName": "feat/captain",
-                        "headRefOid": CAPTAIN_HEAD,
-                        "isDraft": False,
-                        "mergeable": "MERGEABLE",
-                        "mergeStateStatus": "CLEAN",
-                    },
-                    repo_settings_sequence=[initial, final],
-                )
-
-                result = grips.grip_run(
-                    "captain-run",
-                    parameters,
-                    profile="captain",
-                    allow_mutation=True,
-                    command_runner=FakeGit(),
-                    github_runner=gh,
-                )
-
-                self.assertEqual("blocked", result["receipt"]["status"])
-                execution = result["output"]["executions"][0]
-                self.assertFalse(execution["execution_invoked"])
-                self.assertFalse(execution["execution_attempted"])
-                self.assertFalse(execution["verification_passed"])
-                self.assertIn(
-                    "merge_guard_repository_policy_drift",
-                    execution["merge_lease_guard"]["errors"],
-                )
-                self.assertEqual(
-                    "blocked_after_guard_revalidation_released",
-                    execution["merge_lease_guard"]["status"],
-                )
-                self.assertFalse(
-                    any(call[:2] == ("pr", "merge") for call in gh.calls)
-                )
 
     def test_captain_run_blocks_when_repository_merge_policy_is_unusable(self) -> None:
         matching_view = {
@@ -14367,6 +14562,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         with patch.object(grips, "_runtime_deploy_self_preflight", return_value=preflight) as check, patch.object(
             grips, "_runtime_deploy_self_schedule", return_value=schedule
         ) as scheduler, patch.object(
+            grips, "_runtime_deploy_self_schedule_source_preflight", return_value=preflight
+        ), patch.object(
             grips, "_runtime_deploy_self_expected_argv_sha256", return_value=expected_argv_sha256
         ) as hash_check:
             result = grips.grip_run(
@@ -14394,6 +14591,131 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         check.assert_called_once_with(CAPTAIN_HEAD)
         scheduler.assert_called_once_with(CAPTAIN_HEAD, 8)
         hash_check.assert_called_once_with(preflight, CAPTAIN_HEAD, 8)
+
+    def test_captain_run_binds_scheduler_materialized_auto_source_identity(self) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            scope={
+                "allowed_effects": ["schedule one verified Grabowski self-deployment"],
+                "forbidden_effects": ["arbitrary shell", "other services", "other hosts"],
+                "boundaries": "single local Grabowski runtime",
+                "max_targets": 1,
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "inspect the scheduled job and roll back to the previous release",
+            },
+            receipt_path="receipts/captain/runtime-deploy-auto-source.json",
+        )
+        parameters = captain_parameters(
+            [action],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": None,
+            "runner": None,
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": CAPTAIN_HEAD,
+            "resolution_mode": "scheduler-auto-source",
+            "source_kind": "scheduler-auto-source",
+            "source_identity_sha256": None,
+            "origin_main_refresh_required": True,
+            "canonical_state": {
+                "current_head": "a" * 40,
+                "current_branch": "feature/active-work",
+                "target_head": CAPTAIN_HEAD,
+                "origin_main": "b" * 40,
+                "clean": True,
+                "shallow": False,
+            },
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        source_repository = (
+            "/home/alex/repos/.grabowski-deploy-worktrees/"
+            "auto-current-main-captain-test"
+        )
+        source_sha = "e" * 64
+        source_readback = {
+            "repository": source_repository,
+            "runner": f"{source_repository}/tools/run_scheduled_deploy.py",
+            "source_kind": "detached-worktree",
+            "source_identity_sha256": source_sha,
+            "source_lease_resource_key": f"path:{source_repository}",
+            "source_lease_metadata_sha256": "f" * 64,
+        }
+        unit = "grabowski-job-fedcba654321"
+        job_dir = Path(preflight["job_root"]) / unit
+        expected_argv_sha256 = "d" * 64
+        schedule = {
+            "scheduled": True,
+            "already_scheduled": False,
+            "expected_head": CAPTAIN_HEAD,
+            "requested_delay_seconds": 8,
+            "delay_seconds": 8,
+            "unit": unit,
+            "argv_sha256": expected_argv_sha256,
+            "source_identity_sha256": source_sha,
+            "effective_source_identity_sha256": source_sha,
+            "source_identity": {"identity_sha256": source_sha},
+            "metadata_path": str(job_dir / "metadata.json"),
+            "stdout_path": str(job_dir / "stdout.log"),
+            "stderr_path": str(job_dir / "stderr.log"),
+            "expected_connector_disconnect": True,
+            "status_tool": "grabowski_job_status",
+            "logs_tool": "grabowski_job_logs",
+        }
+
+        with patch.object(
+            grips, "_runtime_deploy_self_preflight", return_value=preflight
+        ) as check, patch.object(
+            grips, "_runtime_deploy_self_schedule", return_value=schedule
+        ) as scheduler, patch.object(
+            grips,
+            "_runtime_deploy_self_schedule_source_preflight",
+            return_value=source_readback,
+        ) as source_check, patch.object(
+            grips,
+            "_runtime_deploy_self_expected_argv_sha256",
+            return_value=expected_argv_sha256,
+        ) as hash_check:
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=FakeGh(),
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertEqual("scheduler-auto-source", execution["preflight"]["resolution_mode"])
+        self.assertEqual(source_readback, execution["source_readback"])
+        self.assertEqual(
+            source_sha,
+            execution["next_verification"]["source_identity_sha256"],
+        )
+        check.assert_called_once_with(CAPTAIN_HEAD)
+        scheduler.assert_called_once_with(CAPTAIN_HEAD, 8)
+        source_check.assert_called_once_with(schedule, CAPTAIN_HEAD)
+        bound_preflight = hash_check.call_args.args[0]
+        self.assertEqual(source_repository, bound_preflight["repository"])
+        self.assertEqual("detached-worktree", bound_preflight["source_kind"])
+        self.assertEqual(source_sha, bound_preflight["source_identity_sha256"])
 
     def test_captain_run_marks_local_mutation_unknown_when_scheduler_receipt_is_invalid(self) -> None:
         action = captain_action(
@@ -14450,6 +14772,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         }
         with patch.object(grips, "_runtime_deploy_self_preflight", return_value=preflight), patch.object(
             grips, "_runtime_deploy_self_schedule", return_value=invalid_schedule
+        ), patch.object(
+            grips, "_runtime_deploy_self_schedule_source_preflight", return_value=preflight
         ), patch.object(
             grips, "_runtime_deploy_self_expected_argv_sha256", return_value="d" * 64
         ):
@@ -14524,6 +14848,489 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertTrue(execution["mutation_outcome_unknown"])
         self.assertTrue(execution["local_mutation_outcome_unknown"])
         self.assertIn("may already have been registered", execution["verification_error"])
+
+    def test_captain_runtime_deploy_pre_effect_refusal_is_definitely_not_scheduled(self) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "retry after the conflicting precondition clears",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": "/home/alex/repos/grabowski",
+            "runner": "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": CAPTAIN_HEAD,
+            "source_kind": "canonical-main",
+            "source_identity_sha256": "e" * 64,
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        with patch.object(
+            grips, "_runtime_deploy_self_preflight", return_value=preflight
+        ), patch.object(
+            grips,
+            "_runtime_deploy_self_schedule",
+            side_effect=grips.RuntimeDeployPreEffectRefusal("common-dir lease busy"),
+        ):
+            execution = grips._run_captain_runtime_deploy(
+                action, {"expected_head": CAPTAIN_HEAD, "delay_seconds": 8}
+            )
+        self.assertTrue(execution["preflight_passed"])
+        self.assertFalse(execution["execution_invoked"])
+        self.assertFalse(execution["execution_attempted"])
+        self.assertTrue(execution["pre_effect_refusal"])
+        self.assertTrue(execution["definitely_not_scheduled"])
+        self.assertNotIn("mutation_outcome_unknown", execution)
+        self.assertNotIn("local_mutation_outcome_unknown", execution)
+        self.assertIn("before job registration", execution["verification_error"])
+
+    def test_runtime_deploy_pre_effect_adapter_preserves_local_mutation_evidence(self) -> None:
+        import grabowski_self_deploy as self_deploy
+
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000001",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+            "evidence_sha256": "a" * 64,
+        }
+        with patch.object(
+            self_deploy,
+            "grabowski_runtime_deploy_schedule",
+            side_effect=self_deploy.DeploySchedulePreEffectRefusal(
+                "common-dir lease busy",
+                local_mutation_evidence=reconciliation,
+            ),
+        ):
+            with self.assertRaises(grips.RuntimeDeployPreEffectRefusal) as blocked:
+                grips._runtime_deploy_self_schedule(CAPTAIN_HEAD, 8)
+        self.assertEqual(
+            blocked.exception.local_mutation_evidence,
+            reconciliation,
+        )
+
+    def test_captain_runtime_deploy_pre_effect_refusal_preserves_known_local_reconciliation(
+        self,
+    ) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "retry after the conflicting precondition clears",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": "/home/alex/repos/grabowski",
+            "runner": "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": CAPTAIN_HEAD,
+            "source_kind": "canonical-main",
+            "source_identity_sha256": "e" * 64,
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-stale000001",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+            "evidence_sha256": "a" * 64,
+        }
+        with patch.object(
+            grips, "_runtime_deploy_self_preflight", return_value=preflight
+        ), patch.object(
+            grips,
+            "_runtime_deploy_self_schedule",
+            side_effect=grips.RuntimeDeployPreEffectRefusal(
+                "common-dir lease busy",
+                local_mutation_evidence=reconciliation,
+            ),
+        ):
+            execution = grips._run_captain_runtime_deploy(
+                action, {"expected_head": CAPTAIN_HEAD, "delay_seconds": 8}
+            )
+        self.assertTrue(execution["preflight_passed"])
+        self.assertTrue(execution["execution_invoked"])
+        self.assertTrue(execution["execution_attempted"])
+        self.assertTrue(execution["pre_effect_refusal"])
+        self.assertTrue(execution["definitely_not_scheduled"])
+        self.assertTrue(execution["local_mutation_observed"])
+        self.assertEqual(execution["local_mutation_evidence"], reconciliation)
+        self.assertNotIn("mutation_outcome_unknown", execution)
+        self.assertNotIn("local_mutation_outcome_unknown", execution)
+        self.assertIn("before job registration", execution["verification_error"])
+
+    def test_captain_schedule_failure_preserves_known_local_reconciliation_and_uncertainty(
+        self,
+    ) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "read back local reconciliation and scheduling state",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": "/home/alex/repos/grabowski",
+            "runner": "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": CAPTAIN_HEAD,
+            "source_kind": "canonical-main",
+            "source_identity_sha256": "e" * 64,
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        reconciliation_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-123456abcdef",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+        }
+        reconciliation = {
+            **reconciliation_material,
+            "evidence_sha256": grips.sha256_json(reconciliation_material),
+        }
+        failure = RuntimeError("authority refresh failed")
+        failure.local_mutation_evidence = reconciliation
+        with patch.object(
+            grips, "_runtime_deploy_self_preflight", return_value=preflight
+        ), patch.object(
+            grips,
+            "_runtime_deploy_self_schedule",
+            side_effect=failure,
+        ):
+            execution = grips._run_captain_runtime_deploy(
+                action, {"expected_head": CAPTAIN_HEAD, "delay_seconds": 8}
+            )
+        self.assertTrue(execution["preflight_passed"])
+        self.assertTrue(execution["execution_invoked"])
+        self.assertTrue(execution["execution_attempted"])
+        self.assertTrue(execution["mutation_outcome_unknown"])
+        self.assertTrue(execution["local_mutation_outcome_unknown"])
+        self.assertTrue(execution["local_mutation_observed"])
+        self.assertEqual(execution["local_mutation_evidence"], reconciliation)
+        self.assertNotIn("definitely_not_scheduled", execution)
+
+    def test_captain_schedule_failure_does_not_trust_forged_local_mutation_evidence(
+        self,
+    ) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "read back scheduling state",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": "/home/alex/repos/grabowski",
+            "runner": "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": CAPTAIN_HEAD,
+            "source_kind": "canonical-main",
+            "source_identity_sha256": "e" * 64,
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        failure = RuntimeError("authority refresh failed")
+        failure.local_mutation_evidence = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-123456abcdef",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+            "evidence_sha256": "0" * 64,
+        }
+        with patch.object(
+            grips, "_runtime_deploy_self_preflight", return_value=preflight
+        ), patch.object(
+            grips,
+            "_runtime_deploy_self_schedule",
+            side_effect=failure,
+        ):
+            execution = grips._run_captain_runtime_deploy(
+                action, {"expected_head": CAPTAIN_HEAD, "delay_seconds": 8}
+            )
+        self.assertTrue(execution["mutation_outcome_unknown"])
+        self.assertTrue(execution["local_mutation_outcome_unknown"])
+        self.assertFalse(execution["local_mutation_observed"])
+        self.assertNotIn("local_mutation_evidence", execution)
+
+    def test_runtime_deploy_local_mutation_evidence_accepts_refresh_and_bundle(self) -> None:
+        reconciliation_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-123456abcdef",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+        }
+        reconciliation = {
+            **reconciliation_material,
+            "evidence_sha256": grips.sha256_json(reconciliation_material),
+        }
+        refresh_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_origin_main_refresh",
+            "canonical_repository": "/home/alex/repos/grabowski",
+            "expected_head": CAPTAIN_HEAD,
+            "previous_head": "a" * 40,
+            "previous_branch": "main",
+            "previous_origin_main": "b" * 40,
+            "observed_origin_main": CAPTAIN_HEAD,
+            "owner_id": "runtime-deploy-ref:captain-test",
+            "operation_resource_key": "repo:/home/alex/repos/grabowski:operation:runtime-deploy-origin-main-refresh",
+            "canonical_resource_key": "path:/home/alex/repos/grabowski",
+            "common_dir_resource_key": "path:/home/alex/repos/grabowski/.git",
+            "objects_resource_key": "path:/home/alex/repos/grabowski/.git/objects",
+            "origin_main_ref_resource_key": "path:/home/alex/repos/grabowski/.git/refs/remotes/origin/main",
+            "fetch": {"returncode": 0, "timed_out": False},
+            "update_ref": {
+                "returncode": 0,
+                "timed_out": False,
+                "reported_success": True,
+            },
+            "public_github_main": {
+                "before_fetch": CAPTAIN_HEAD,
+                "after_fetch": CAPTAIN_HEAD,
+                "after_cas": CAPTAIN_HEAD,
+            },
+        }
+        refresh = {
+            **refresh_material,
+            "receipt_sha256": grips.sha256_json(refresh_material),
+        }
+        bundle_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_local_mutation_bundle",
+            "effects": [reconciliation, refresh],
+        }
+        bundle = {
+            **bundle_material,
+            "evidence_sha256": grips.sha256_json(bundle_material),
+        }
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                refresh,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+        partial_reconciliation_material = {
+            **reconciliation_material,
+            "audit_recorded": False,
+        }
+        partial_reconciliation = {
+            **partial_reconciliation_material,
+            "evidence_sha256": grips.sha256_json(partial_reconciliation_material),
+        }
+        authority_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_rootbroker_authority_effect",
+            "expected_head": CAPTAIN_HEAD,
+            "outcome": "succeeded",
+            "attested_head": CAPTAIN_HEAD,
+            "effect_started": True,
+            "request_id": "rootbroker-test",
+            "reference_sha256": "c" * 64,
+        }
+        authority = {
+            **authority_material,
+            "evidence_sha256": grips.sha256_json(authority_material),
+        }
+        three_effect_bundle_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_local_mutation_bundle",
+            "effects": [partial_reconciliation, refresh, authority],
+        }
+        three_effect_bundle = {
+            **three_effect_bundle_material,
+            "evidence_sha256": grips.sha256_json(three_effect_bundle_material),
+        }
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                partial_reconciliation,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                authority,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                three_effect_bundle,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+        for update_ref in (
+            {"returncode": 1, "timed_out": False, "reported_success": False},
+            {"returncode": None, "timed_out": True, "reported_success": False},
+        ):
+            with self.subTest(update_ref=update_ref):
+                observed_effect_material = {
+                    **refresh_material,
+                    "update_ref": update_ref,
+                }
+                observed_effect = {
+                    **observed_effect_material,
+                    "receipt_sha256": grips.sha256_json(observed_effect_material),
+                }
+                self.assertTrue(
+                    grips._runtime_deploy_local_mutation_evidence_valid(
+                        observed_effect,
+                        expected_job_prefix="grabowski-job-",
+                        expected_head=CAPTAIN_HEAD,
+                    )
+                )
+        self.assertTrue(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                bundle,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+        forged = dict(refresh, receipt_sha256="0" * 64)
+        self.assertFalse(
+            grips._runtime_deploy_local_mutation_evidence_valid(
+                forged,
+                expected_job_prefix="grabowski-job-",
+                expected_head=CAPTAIN_HEAD,
+            )
+        )
+
+    def test_captain_reused_schedule_preserves_known_local_reconciliation(self) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "read back the reused deployment and local reconciliation",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        preflight = {
+            "adapter": "grabowski-self",
+            "repository": "/home/alex/repos/grabowski",
+            "runner": "/home/alex/repos/grabowski/tools/run_scheduled_deploy.py",
+            "job_root": str(Path.home() / ".local/state/grabowski/jobs"),
+            "job_prefix": "grabowski-job-",
+            "expected_head": CAPTAIN_HEAD,
+            "source_kind": "canonical-main",
+            "source_identity_sha256": "e" * 64,
+            "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
+            "ready": True,
+        }
+        unit = "grabowski-job-abcdef012345"
+        job_dir = Path(preflight["job_root"]) / unit
+        reconciliation_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-123456abcdef",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": True,
+            "index_updated_at_unix": 1,
+        }
+        reconciliation = {
+            **reconciliation_material,
+            "evidence_sha256": grips.sha256_json(reconciliation_material),
+        }
+        schedule = {
+            "scheduled": True,
+            "already_scheduled": True,
+            "expected_head": CAPTAIN_HEAD,
+            "requested_delay_seconds": 8,
+            "delay_seconds": 6,
+            "unit": unit,
+            "argv_sha256": "d" * 64,
+            "source_identity_sha256": "e" * 64,
+            "source_identity": {"identity_sha256": "e" * 64},
+            "metadata_path": str(job_dir / "metadata.json"),
+            "stdout_path": str(job_dir / "stdout.log"),
+            "stderr_path": str(job_dir / "stderr.log"),
+            "expected_connector_disconnect": True,
+            "status_tool": "grabowski_job_status",
+            "logs_tool": "grabowski_job_logs",
+            "local_mutation_evidence": reconciliation,
+        }
+        with patch.object(
+            grips, "_runtime_deploy_self_preflight", return_value=preflight
+        ), patch.object(
+            grips, "_runtime_deploy_self_schedule", return_value=schedule
+        ), patch.object(
+            grips, "_runtime_deploy_self_schedule_source_preflight", return_value=preflight
+        ), patch.object(
+            grips, "_runtime_deploy_self_expected_argv_sha256", return_value="d" * 64
+        ):
+            execution = grips._run_captain_runtime_deploy(
+                action,
+                {"expected_head": CAPTAIN_HEAD, "delay_seconds": 8},
+            )
+        self.assertTrue(execution["verification_passed"])
+        self.assertTrue(execution["already_scheduled"])
+        self.assertFalse(execution["new_job_registered"])
+        self.assertTrue(execution["local_mutation_observed"])
+        self.assertEqual(execution["local_mutation_evidence"], reconciliation)
 
     def test_runtime_deploy_schedule_validation_binds_delay_and_unit_namespace(self) -> None:
         unit = "grabowski-job-abcdef012345"
@@ -14600,6 +15407,59 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             expected_source_identity_sha256="e" * 64,
         )
         self.assertIn("runtime_deploy_schedule_argv_hash_mismatch", hash_errors)
+        malformed_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "unit": "grabowski-job-123456abcdef",
+            "dispatch_outcome": "not_started",
+            "deploy_index_updated": True,
+            "audit_recorded": False,
+            "index_updated_at_unix": 1,
+        }
+        malformed_local_mutation = dict(
+            base,
+            local_mutation_evidence={
+                **malformed_material,
+                "evidence_sha256": grips.sha256_json(malformed_material),
+            },
+        )
+        local_mutation_errors = grips._runtime_deploy_schedule_errors(
+            malformed_local_mutation,
+            expected_head=CAPTAIN_HEAD,
+            expected_delay_seconds=8,
+            expected_argv_sha256=expected_argv_sha256,
+            expected_job_root=str(job_root),
+            expected_job_prefix=job_prefix,
+            expected_source_identity_sha256="e" * 64,
+        )
+        self.assertNotIn(
+            "runtime_deploy_schedule_local_mutation_evidence_invalid",
+            local_mutation_errors,
+        )
+        valid_material = {
+            **malformed_material,
+            "audit_recorded": True,
+        }
+        digest_drifted_local_mutation = dict(
+            base,
+            local_mutation_evidence={
+                **valid_material,
+                "evidence_sha256": "0" * 64,
+            },
+        )
+        digest_drift_errors = grips._runtime_deploy_schedule_errors(
+            digest_drifted_local_mutation,
+            expected_head=CAPTAIN_HEAD,
+            expected_delay_seconds=8,
+            expected_argv_sha256=expected_argv_sha256,
+            expected_job_root=str(job_root),
+            expected_job_prefix=job_prefix,
+            expected_source_identity_sha256="e" * 64,
+        )
+        self.assertIn(
+            "runtime_deploy_schedule_local_mutation_evidence_invalid",
+            digest_drift_errors,
+        )
 
 
     def test_captain_run_blocks_runtime_deploy_target_without_registered_adapter(self) -> None:
@@ -17336,6 +18196,139 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "merge_guard_review_findings_changes_requested_present",
             execution["merge_lease_guard"]["errors"],
         )
+
+
+    def test_codex_review_threads_paginate_forward_with_bound(self) -> None:
+        page_one_thread = captain_review_finding_thread(
+            resolved=True, thread_id="PRRT_page_1", comment_id=301
+        )
+        page_two_thread = captain_review_finding_thread(
+            resolved=True, thread_id="PRRT_page_2", comment_id=302
+        )
+        calls: list[tuple[str, ...]] = []
+
+        def github_runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+            calls.append(tuple(argv))
+            after = next(
+                (
+                    item.split("=", 1)[1]
+                    for item in argv
+                    if isinstance(item, str) and item.startswith("after=")
+                ),
+                None,
+            )
+            connection = {
+                "nodes": [deepcopy(page_one_thread if after is None else page_two_thread)],
+                "pageInfo": {
+                    "hasNextPage": after is None,
+                    "endCursor": "cursor-1" if after is None else "cursor-2",
+                },
+            }
+            payload = {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviews": {
+                                "nodes": [{"databaseId": 404}],
+                                "pageInfo": {"hasPreviousPage": False},
+                            },
+                            "reviewThreads": connection,
+                        }
+                    }
+                }
+            }
+            return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
+
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.repo_path = Path.cwd()
+        runner.github_runner = github_runner
+        observations: list[dict[str, object]] = []
+        errors: list[str] = []
+
+        payload = runner._codex_paginated_review_threads(
+            owner="heimgewebe",
+            name="grabowski",
+            pr_number=96,
+            observations=observations,
+            errors=errors,
+        )
+
+        self.assertEqual([], errors)
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        nodes = payload["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+        self.assertEqual(
+            [item["id"] for item in nodes],
+            ["PRRT_page_1", "PRRT_page_2"],
+        )
+        self.assertEqual(2, len(calls))
+        self.assertTrue(any("after=cursor-1" in call for call in calls))
+        self.assertEqual(
+            {
+                "nodes": [{"databaseId": 404}],
+                "pageInfo": {"hasPreviousPage": False},
+            },
+            payload["data"]["repository"]["pullRequest"]["reviews"],
+        )
+
+    def test_codex_review_threads_fail_closed_above_page_bound(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def github_runner(_repo: Path, argv: list[str]) -> dict[str, object]:
+            calls.append(tuple(argv))
+            after = next(
+                (
+                    item.split("=", 1)[1]
+                    for item in argv
+                    if isinstance(item, str) and item.startswith("after=")
+                ),
+                None,
+            )
+            suffix = 1 if after is None else int(after.rsplit("-", 1)[1]) + 1
+            thread = captain_review_finding_thread(
+                resolved=True,
+                thread_id=f"PRRT_page_{suffix}",
+                comment_id=300 + suffix,
+            )
+            payload = {
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "nodes": [thread],
+                                "pageInfo": {
+                                    "hasNextPage": True,
+                                    "endCursor": f"cursor-{suffix}",
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+            return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
+
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.repo_path = Path.cwd()
+        runner.github_runner = github_runner
+        observations: list[dict[str, object]] = []
+        errors: list[str] = []
+
+        with patch.object(
+            merge_guard, "_CODEX_THREAD_MAX_PAGES", 2
+        ), patch.object(
+            merge_guard, "_CODEX_THREAD_MAX_ITEMS", 200
+        ):
+            payload = runner._codex_paginated_review_threads(
+                owner="heimgewebe",
+                name="grabowski",
+                pr_number=96,
+                observations=observations,
+                errors=errors,
+            )
+
+        self.assertIsNone(payload)
+        self.assertEqual(["merge_guard_codex_threads_truncated"], errors)
+        self.assertEqual(2, len(calls))
 
     def test_codex_review_retrieval_stops_at_bounded_sentinel_page(self) -> None:
         view = {

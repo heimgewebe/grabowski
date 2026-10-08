@@ -13,6 +13,7 @@ SCHEMA_VERSION = 1
 KIND = "grabowski.lane_closeout_assessment"
 SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+LANE_ID = re.compile(r"[0-9a-f]{32}\Z")
 TERMINAL_CLOSEOUT_STATES = frozenset(
     {
         "pr_opened",
@@ -20,6 +21,7 @@ TERMINAL_CLOSEOUT_STATES = frozenset(
         "pr_merged",
         "deployed",
         "candidate_adopted",
+        "successor_handoff",
         "no_change_proven",
         "blocked_with_durable_followup",
     }
@@ -92,6 +94,53 @@ def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def _validate_successor_handoff_assessment(value: Mapping[str, Any]) -> None:
+    binding = value.get("successor_handoff")
+    required = {
+        "schema_version",
+        "kind",
+        "predecessor_lane_id",
+        "successor_lane_id",
+        "predecessor_head_sha",
+        "successor_head_sha",
+        "successor_receipt_sha256",
+        "pr_number",
+    }
+    if not isinstance(binding, Mapping) or set(binding) != required:
+        raise LaneCloseoutError("successor handoff assessment binding is invalid")
+    if (
+        binding.get("schema_version") != 1
+        or binding.get("kind") != "grabowski.work_lane_successor_handoff"
+    ):
+        raise LaneCloseoutError("successor handoff assessment binding identity is invalid")
+    predecessor_lane = binding.get("predecessor_lane_id")
+    successor_lane = binding.get("successor_lane_id")
+    predecessor_head = binding.get("predecessor_head_sha")
+    successor_head = binding.get("successor_head_sha")
+    successor_receipt = binding.get("successor_receipt_sha256")
+    pr_number = binding.get("pr_number")
+    if not isinstance(predecessor_lane, str) or LANE_ID.fullmatch(predecessor_lane) is None:
+        raise LaneCloseoutError("successor handoff predecessor lane is invalid")
+    if not isinstance(successor_lane, str) or LANE_ID.fullmatch(successor_lane) is None:
+        raise LaneCloseoutError("successor handoff successor lane is invalid")
+    if predecessor_lane == successor_lane:
+        raise LaneCloseoutError("successor handoff successor must differ from predecessor")
+    if not isinstance(predecessor_head, str) or SHA.fullmatch(predecessor_head) is None:
+        raise LaneCloseoutError("successor handoff predecessor head is invalid")
+    if not isinstance(successor_head, str) or SHA.fullmatch(successor_head) is None:
+        raise LaneCloseoutError("successor handoff successor head is invalid")
+    if not isinstance(successor_receipt, str) or SHA256.fullmatch(successor_receipt) is None:
+        raise LaneCloseoutError("successor handoff successor receipt is invalid")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        raise LaneCloseoutError("successor handoff PR number is invalid")
+    if value.get("lane_id") != predecessor_lane:
+        raise LaneCloseoutError("successor handoff predecessor lane binding drifted")
+    if value.get("terminal_head_sha") != predecessor_head:
+        raise LaneCloseoutError("successor handoff predecessor head binding drifted")
+    if value.get("observation_sha256") != sha256_json(dict(binding)):
+        raise LaneCloseoutError("successor handoff observation digest mismatch")
+
+
 def validate_terminal_assessment(value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate an exact terminal assess() result before durable reuse."""
     if not isinstance(value, Mapping):
@@ -103,6 +152,42 @@ def validate_terminal_assessment(value: Mapping[str, Any]) -> dict[str, Any]:
         not isinstance(terminal_head_sha, str) or SHA.fullmatch(terminal_head_sha) is None
     ):
         raise LaneCloseoutError("terminal closeout assessment head is invalid")
+    durable_followup_id = value.get("durable_followup_id")
+    if durable_followup_id is not None and (
+        not isinstance(durable_followup_id, str)
+        or durable_followup_id != durable_followup_id.strip()
+        or not durable_followup_id
+        or len(durable_followup_id) > MAX_IDENTITY_LENGTH
+        or any(character in durable_followup_id for character in "\r\n\x00")
+    ):
+        raise LaneCloseoutError("terminal closeout durable followup id is invalid")
+    if (
+        durable_followup_id is not None
+        and value.get("closeout_state") != "blocked_with_durable_followup"
+    ):
+        raise LaneCloseoutError(
+            "terminal closeout durable followup id requires blocked followup state"
+        )
+    legacy_observation_sha256 = value.get("legacy_observation_sha256")
+    if legacy_observation_sha256 is not None and (
+        not isinstance(legacy_observation_sha256, str)
+        or SHA256.fullmatch(legacy_observation_sha256) is None
+    ):
+        raise LaneCloseoutError(
+            "terminal closeout legacy observation digest is invalid"
+        )
+    if legacy_observation_sha256 is not None and (
+        value.get("closeout_state") != "blocked_with_durable_followup"
+        or durable_followup_id is None
+    ):
+        raise LaneCloseoutError(
+            "terminal closeout legacy observation digest requires "
+            "blocked followup state with persisted id"
+        )
+    if value.get("closeout_state") == "successor_handoff":
+        _validate_successor_handoff_assessment(value)
+    elif "successor_handoff" in value:
+        raise LaneCloseoutError("non-handoff assessment contains successor handoff binding")
     supplied = value.get("assessment_sha256")
     material = {
         key: item for key, item in value.items()
@@ -264,7 +349,7 @@ def _terminal_result(
 ) -> dict[str, Any]:
     if closeout_state not in TERMINAL_CLOSEOUT_STATES:
         raise ValueError(f"invalid terminal closeout state: {closeout_state}")
-    return {
+    result = {
         "phase": "terminal",
         "closeout_state": closeout_state,
         "action_required": False,
@@ -274,6 +359,9 @@ def _terminal_result(
         "workspace_cleanup_ready": False,
         "lane_id": data["lane_id"],
     }
+    if closeout_state == "blocked_with_durable_followup":
+        result["durable_followup_id"] = data["durable_followup_id"]
+    return result
 
 
 def _rescue_result(
@@ -504,6 +592,98 @@ def classify(observation: LaneCloseoutObservation) -> dict[str, Any]:
     return _rescue_result(data, reasons, actions)
 
 
+def assess_successor_handoff(
+    *,
+    lane_id: str,
+    successor_lane_id: str,
+    predecessor_head_sha: str,
+    successor_head_sha: str,
+    successor_receipt_sha256: str,
+    pr_number: int,
+    observed_at_unix: int | None = None,
+    append_audit: AuditAppender | None = None,
+) -> dict[str, Any]:
+    """Build terminal closeout evidence for one exact verified successor lane.
+
+    This builder validates only the immutable evidence shape. The caller must
+    verify the live successor lane, checkout, ancestry and leases before using
+    the assessment for effects.
+    """
+    predecessor_lane = _identity(lane_id, "lane_id")
+    successor_lane = _identity(successor_lane_id, "successor_lane_id")
+    assert predecessor_lane is not None
+    assert successor_lane is not None
+    if LANE_ID.fullmatch(predecessor_lane) is None:
+        raise ValueError("lane_id must be a 32-character lowercase hex Work Lane id")
+    if LANE_ID.fullmatch(successor_lane) is None:
+        raise ValueError(
+            "successor_lane_id must be a 32-character lowercase hex Work Lane id"
+        )
+    if predecessor_lane == successor_lane:
+        raise ValueError("successor lane must differ from predecessor lane")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        raise ValueError("pr_number must be a positive integer")
+    predecessor_head = _sha(predecessor_head_sha, "predecessor_head_sha")
+    successor_head = _sha(successor_head_sha, "successor_head_sha")
+    successor_receipt = _sha256(
+        successor_receipt_sha256, "successor_receipt_sha256"
+    )
+    assert predecessor_head is not None
+    assert successor_head is not None
+    assert successor_receipt is not None
+    binding = {
+        "schema_version": 1,
+        "kind": "grabowski.work_lane_successor_handoff",
+        "predecessor_lane_id": predecessor_lane,
+        "successor_lane_id": successor_lane,
+        "predecessor_head_sha": predecessor_head,
+        "successor_head_sha": successor_head,
+        "successor_receipt_sha256": successor_receipt,
+        "pr_number": pr_number,
+    }
+    observed_at = _timestamp(observed_at_unix)
+    assessment = _terminal_result(
+        {"lane_id": predecessor_lane},
+        "successor_handoff",
+        ["successor_work_lane_exactly_bound"],
+    )
+    material = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": KIND,
+        "observed_at_unix": observed_at,
+        "observation_sha256": sha256_json(binding),
+        "terminal_head_sha": predecessor_head,
+        **assessment,
+        "successor_handoff": binding,
+    }
+    assessment_sha256 = sha256_json(material)
+    audit_record_sha256: str | None = None
+    if append_audit is not None:
+        value = append_audit(
+            {
+                "timestamp_unix": observed_at,
+                "operation": "lane-closeout-assessment",
+                **material,
+                "assessment_sha256": assessment_sha256,
+            }
+        )
+        if value is not None and (
+            not isinstance(value, str) or SHA256.fullmatch(value) is None
+        ):
+            raise LaneCloseoutError("audit appender returned an invalid digest")
+        audit_record_sha256 = value
+    return {
+        **material,
+        "assessment_sha256": assessment_sha256,
+        "audit_record_sha256": audit_record_sha256,
+        "does_not_establish": [
+            "successor_live_state_without_caller_revalidation",
+            "workspace_cleanup_authority",
+            "merge_or_deployment_authority",
+        ],
+    }
+
+
 def assess(
     observation: LaneCloseoutObservation,
     *,
@@ -523,6 +703,12 @@ def assess(
         ),
         **assessment,
     }
+    if (
+        assessment.get("phase") == "terminal"
+        and assessment.get("closeout_state") == "blocked_with_durable_followup"
+        and data.get("durable_followup_id") is not None
+    ):
+        material["legacy_observation_sha256"] = material["observation_sha256"]
     assessment_sha256 = sha256_json(material)
     audit_record_sha256: str | None = None
     if append_audit is not None:

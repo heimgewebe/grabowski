@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import importlib.util
 from pathlib import Path
 import re
@@ -80,14 +81,50 @@ class AgentInstructionsTests(unittest.TestCase):
             grabowski_mcp.AGENT_INSTRUCTIONS,
         )
 
+    def test_mandatory_outcome_tool_is_available_in_core_profile(self) -> None:
+        profiles = json.loads(
+            (ROOT / "contracts/publication-profiles.v1.json").read_text(encoding="utf-8")
+        )
+        for profile in ("core", "operator", "full"):
+            with self.subTest(profile=profile):
+                self.assertIn("report_outcome", profiles["profiles"][profile])
+
+    def test_direct_module_entrypoint_configures_flowlines_before_run(self) -> None:
+        source = (ROOT / "src/grabowski_mcp.py").read_text(encoding="utf-8")
+        marker = 'if __name__ == "__main__":'
+        self.assertEqual(source.count(marker), 1)
+        direct_entrypoint = source.split(marker, 1)[1]
+        configure = "grabowski_flowlines.configure_flowlines_observability("
+        self.assertIn("import grabowski_flowlines", direct_entrypoint)
+        self.assertIn(configure, direct_entrypoint)
+        self.assertIn("READ_ANNOTATIONS", direct_entrypoint)
+        self.assertIn("load_environment_exporter=False", direct_entrypoint)
+        self.assertLess(
+            direct_entrypoint.index(configure),
+            direct_entrypoint.index("mcp.run()"),
+        )
+
     def test_rules_cover_routing_mutation_retry_and_authority_boundaries(self) -> None:
         rules = dict(grabowski_mcp.AGENT_INSTRUCTION_RULES)
         self.assertEqual(len(rules), len(grabowski_mcp.AGENT_INSTRUCTION_RULES))
         self.assertIn("live runtime state", rules["truth-hierarchy"].lower())
         narrow = rules["narrowest-typed-read-first"].lower()
-        self.assertIn("narrowest typed read", narrow)
-        self.assertIn("connectivity-only health ping", narrow)
-        self.assertIn("serve as the probe", narrow)
+        self.assertIn("narrowest read", narrow)
+        self.assertIn("no extra health ping if read probes", narrow)
+        self.assertNotIn("no health ping.", narrow)
+        for phrase in (
+            "grabowski_systemkatalog_query",
+            "system=system",
+            "repo=repository",
+            "domain=truth-owner",
+            "relation=relations",
+            "entry=entrypoints",
+            "else=authority-matrix",
+            "decision=>hash-bound",
+            "tools/systemkatalog_usage_receipt.py",
+            "fixed fields/no prose",
+        ):
+            self.assertIn(phrase, narrow)
         host_resolution = rules["host-capability-resolution"].lower()
         for phrase in (
             "native typed first",
@@ -99,7 +136,7 @@ class AgentInstructionsTests(unittest.TestCase):
             "reread live policy/readiness at execution",
             "not-ready!=not-found",
             "reuse before new infra",
-            "no execution/setup authority",
+            "discovery: no execution/setup authority",
             "provider/model pinning",
         ):
             self.assertIn(phrase, host_resolution)
@@ -120,9 +157,9 @@ class AgentInstructionsTests(unittest.TestCase):
             "before host dispatch",
             "no grabowski receipt",
             "platform_filter",
-            "do not attribute it to the grabowski runtime",
-            "do not retry the blocked call unchanged",
-            "lane or task receipts",
+            "do not attribute it to grabowski runtime",
+            "retry unchanged",
+            "lane/task receipts",
             "supported conversation",
         ):
             self.assertIn(phrase, pre_runtime)
@@ -137,22 +174,31 @@ class AgentInstructionsTests(unittest.TestCase):
             self.assertIn(phrase, narrowing)
         transport = rules["transport-roundtrip-before-mutation"].lower()
         for phrase in (
+            "fresh shared_unlabeled challenge",
+            "grip_run transport-roundtrip",
             "action=execute",
             "challenge_receipt_sha256",
             "exact target_tool_name",
             "exact unchanged target_arguments",
             "same-process optimization",
-            "action=ack",
+            "stable scope may action=ack",
             "unchanged target once",
-            "action=begin",
-            "target_tool_name/target_arguments",
+            "action=begin requires exact target_tool_name/target_arguments",
             "read back ambiguous effects",
         ):
             self.assertIn(phrase, transport)
         self.assertNotIn("only challenge_receipt_sha256", transport)
         self.assertNotIn("remains for compatibility", transport)
         typed = rules["typed-operation-preference"].lower()
-        for phrase in ("typed operations", "terminal", "git", "github"):
+        for phrase in (
+            "typed operations",
+            "terminal",
+            "git",
+            "github",
+            "ranges",
+            "grabowski_read_text",
+            "terminal_run/sed",
+        ):
             self.assertIn(phrase, typed)
         github = rules["github-connector-first"].lower()
         for phrase in (
@@ -175,7 +221,9 @@ class AgentInstructionsTests(unittest.TestCase):
             "user outcome", "minimum sufficient mechanism",
             "persistent complexity", "proof of benefit", "simpler path",
             "fresh evidence", "continue", "change", "park-stop",
-            "tool failure", "strategic evidence",
+            "tool failure", "strategic evidence", "managed dirty checkout",
+            "lane/lifecycle/checkout evidence", "fresh git preimage",
+            "never reset/clean/stash",
         ):
             self.assertIn(phrase, direction)
         obligation = rules["operator-obligation-lifecycle"].lower()
@@ -197,7 +245,18 @@ class AgentInstructionsTests(unittest.TestCase):
         ):
             self.assertIn(phrase, obligation)
         authority = rules["no-authority-escalation"].lower()
-        for phrase in ("action", "merge", "deploy", "secret", "retry"):
+        for phrase in (
+            "action",
+            "merge",
+            "deploy",
+            "secret",
+            "retry",
+            "reason+user_intent",
+            "report_outcome",
+            "final tool call",
+            "every final answer",
+            "read-only/partial/failed/blocked",
+        ):
             self.assertIn(phrase, authority)
 
     def test_contract_documentation_rule_numbers_are_sequential(self) -> None:

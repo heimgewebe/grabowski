@@ -41,6 +41,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 |---|---|---:|---|---|
 | `grabowski_status` | context | yes | low | Read policy, deployment provenance and the current bounded operating mode. |
 | `grabowski_context` | context | yes | low | Return a task-oriented live operator context and explicit drift findings. |
+| `report_outcome` | operations-observability | yes | low | Accept the required final agent outcome self-report for Flowlines telemetry when export is enabled, without product mutation. |
 | `grip_list` | grip-surface | yes | low | List allowlisted receipt-bound Grabowski grips with profile visibility and expected receipt shape. |
 | `grip_run` | grip-surface | no | medium | Dispatch one allowlisted Grabowski grip and return its receipt-bound result. |
 | `grabowski_list_directory` | filesystem | yes | low | List one allowed directory without recursive traversal. |
@@ -122,6 +123,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_ports` | diagnostics | yes | low | List listening TCP and UDP sockets. |
 | `grabowski_tailscale_status` | diagnostics | yes | low | Read bounded local Tailscale node and peer health without account records or mutation controls. |
 | `grabowski_privileged_action_reference` | privileged-reference | yes | medium | Create a non-executable reference contract for a future external privileged action. |
+| `grabowski_critical_user_data_inventory` | privileged-execution | no | high | Start one fixed SHA-pinned authoritative critical-user-data inventory through the root-owned broker without arbitrary argv or paths; sealed result evidence is root-owned but transient and must be captured before reboot. |
+| `grabowski_critical_user_data_inventory_read` | privileged-reference | yes | low | Read status or a sealed result for the fixed SHA-pinned critical-user-data inventory without dispatching a new scan. |
 | `grabowski_power_run` | privileged-execution | no | critical | Run one audited root command through the canonical root-owned broker. |
 | `grabowski_fleet_list` | fleet | yes | low | Return a bounded projection of the validated local and SSH host registry. |
 | `grabowski_fleet_run` | fleet | no | variable | Run one bounded argv command on one registered local or SSH host. |
@@ -182,6 +185,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_host_capability_resolve` | knowledge | yes | low | Resolve one declared host-local capability intent through the installed byte-identical operator-entry contract without execution authority. |
 | `grabowski_systemkatalog_query` | knowledge | yes | low | Run one bounded, revision-bound Systemkatalog v2 semantic query without catalog, task, runtime or merge authority. |
 | `grabowski_operational_guidance` | knowledge | yes | low | Return bounded, source-cited operational runbook guidance in shadow mode without task, policy, retry, recovery or execution authority. |
+| `grabowski_bureau_acceptance_authenticate` | bureau | no | medium | Authenticate one exact digest- and revision-bound manual Bureau acceptance item through Bureau's canonical StateStore journal contract. |
 | `grabowski_bureau_candidate_record` | bureau | no | medium | Record one source-bound candidate through Bureau's canonical append-only operator intake contract. |
 | `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors. |
 | `grabowski_bureau_task_propose` | bureau | no | medium | Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation. |

@@ -1,19 +1,20 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "03ebb6191f56cf3eaf8e966ab4208fc6dabeb1d63c1c2c8ec587b688245d0f46"
+    "sha256": "043c579e8d0717ea00226965d77d1a0555aed91fe587402d6c7472d60914678e"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "73be709060eba099b2f51ec2a122d28b93bf21f1d5c4e9995f62e237bcd69d32"
+    "sha256": "0d6686a041d35c5b4bcf3a85b896d54fb40ad6baf5797a3e08a0854d6bdd9f71"
   },
   "counts": {
-    "core": 23,
-    "full": 198,
-    "operator": 182
+    "core": 24,
+    "full": 202,
+    "operator": 186
   },
   "profiles": {
     "core": [
+      "report_outcome",
       "grabowski_verify_audit",
       "repoground_bundle_discover",
       "repoground_bundle_status",
@@ -41,6 +42,7 @@
     "full": [
       "grabowski_status",
       "grabowski_context",
+      "report_outcome",
       "grip_list",
       "grip_run",
       "grabowski_list_directory",
@@ -122,6 +124,8 @@
       "grabowski_ports",
       "grabowski_tailscale_status",
       "grabowski_privileged_action_reference",
+      "grabowski_critical_user_data_inventory",
+      "grabowski_critical_user_data_inventory_read",
       "grabowski_power_run",
       "grabowski_fleet_list",
       "grabowski_fleet_run",
@@ -182,6 +186,7 @@
       "grabowski_host_capability_resolve",
       "grabowski_systemkatalog_query",
       "grabowski_operational_guidance",
+      "grabowski_bureau_acceptance_authenticate",
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
@@ -241,6 +246,7 @@
     "operator": [
       "grabowski_status",
       "grabowski_context",
+      "report_outcome",
       "grip_list",
       "grip_run",
       "grabowski_list_directory",
@@ -309,6 +315,8 @@
       "grabowski_process_list",
       "grabowski_process_signal",
       "grabowski_privileged_action_reference",
+      "grabowski_critical_user_data_inventory",
+      "grabowski_critical_user_data_inventory_read",
       "grabowski_power_run",
       "grabowski_fleet_run",
       "grabowski_juno_status",
@@ -366,6 +374,7 @@
       "grabowski_host_capability_resolve",
       "grabowski_systemkatalog_query",
       "grabowski_operational_guidance",
+      "grabowski_bureau_acceptance_authenticate",
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
@@ -455,7 +464,8 @@
         "repoground_bundle_status",
         "repoground_context_compose",
         "repoground_context_pack",
-        "repoground_freshness_check"
+        "repoground_freshness_check",
+        "report_outcome"
       ],
       "read_only": true,
       "risk_classes": [
@@ -475,7 +485,8 @@
         "repoground_bundle_status",
         "repoground_context_compose",
         "repoground_context_pack",
-        "repoground_freshness_check"
+        "repoground_freshness_check",
+        "report_outcome"
       ],
       "selection": "all tools not in core plus orientation tools"
     }

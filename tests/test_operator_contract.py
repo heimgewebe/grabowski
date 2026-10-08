@@ -184,6 +184,7 @@ def _load_operator_module():
     fake_base._transport_authorize_connector_tool = (
         lambda context, tool_name, arguments=None: None
     )
+    fake_base._flowlines_verified_identity = lambda request_context: None
     fake_base._retain_pending_transport_target = (
         lambda challenge_receipt_sha256, **kwargs: {
             "challenge_receipt_sha256": challenge_receipt_sha256,
@@ -277,6 +278,180 @@ class OperatorContractTests(unittest.TestCase):
             "/run/user/1000/grabowski-uv-cache",
             environment["UV_CACHE_DIR"],
         )
+
+    def test_safe_environment_never_exports_or_logs_otlp_boundary_variables(self) -> None:
+        operator = _load_operator_module()
+        boundary_names = frozenset(
+            {
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+                "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+                "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+                "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
+                "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+                "OTEL_PYTHON_EXPORTER_OTLP_HTTP_METRICS_CREDENTIAL_PROVIDER",
+                "OTEL_PYTHON_EXPORTER_OTLP_HTTP_LOGS_CREDENTIAL_PROVIDER",
+                "OTEL_EXPORTER_OTLP_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+                "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+                "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+                "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+                "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+            }
+        )
+        otlp_environment = {
+            name: f"fixture-secret-{index}"
+            for index, name in enumerate(sorted(boundary_names), start=1)
+        }
+        for trusted in (False, True):
+            with (
+                self.subTest(trusted=trusted),
+                patch.dict(
+                    operator.os.environ,
+                    {
+                        "XDG_RUNTIME_DIR": "/run/user/1000",
+                        **otlp_environment,
+                    },
+                    clear=True,
+                ),
+                patch.object(operator, "_trusted_owner_mode", return_value=trusted),
+            ):
+                environment = operator._safe_environment()
+            for name in boundary_names:
+                self.assertNotIn(name, environment)
+
+        for name, value in otlp_environment.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    operator._redact(f"{name}={value}"),
+                    f"{name}=<REDACTED>",
+                )
+                self.assertEqual(
+                    operator._redact_argv([f"{name}={value}"]),
+                    [f"{name}=<REDACTED>"],
+                )
+
+    def test_operator_service_entrypoint_configures_flowlines_before_wrappers(self) -> None:
+        source = SOURCE.read_text(encoding="utf-8")
+        service = (
+            ROOT / "systemd" / "grabowski-operator.service.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "-m grabowski_operator --transport streamable-http",
+            service,
+        )
+        self.assertIn("import grabowski_flowlines", source)
+        main_marker = "def main() -> None:"
+        self.assertEqual(source.count(main_marker), 1)
+        main = source.split(main_marker, 1)[1]
+        configure = "grabowski_flowlines.configure_flowlines_observability("
+        self.assertIn(configure, main)
+        self.assertIn(
+            "verified_identity_resolver=base._flowlines_verified_identity",
+            main,
+        )
+        for later in (
+            "_install_deployment_admission_gate()",
+            "_configure_posthog_mcp_analytics()",
+            "mcp.run(transport=args.transport)",
+        ):
+            with self.subTest(later=later):
+                self.assertIn(later, main)
+                self.assertLess(main.index(configure), main.index(later))
+
+    def test_admission_policy_ignores_only_injected_flowlines_fields(self) -> None:
+        operator = _load_operator_module()
+        injected_tool = types.SimpleNamespace(
+            fn_metadata=types.SimpleNamespace(
+                arg_model=types.SimpleNamespace(model_fields={})
+            ),
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        raw_git = {
+            "repo": "/tmp/repo",
+            "arguments": ["status", "--short", "--branch"],
+            "reason": "Observe repository state",
+            "user_intent": "Verify the current revision",
+        }
+        policy_git = operator._operator_policy_arguments(
+            "grabowski_git",
+            raw_git,
+            injected_tool,
+        )
+        self.assertNotIn("reason", policy_git)
+        self.assertNotIn("user_intent", policy_git)
+        self.assertTrue(operator._grabowski_git_server_verified_read(policy_git))
+
+        read_tool = types.SimpleNamespace(
+            fn_metadata=types.SimpleNamespace(
+                arg_model=types.SimpleNamespace(model_fields={})
+            ),
+            annotations=types.SimpleNamespace(readOnlyHint=True),
+        )
+        raw_status = {
+            "view": "minimal",
+            "reason": "Check readiness",
+            "user_intent": "Observe deployment status",
+        }
+        policy_status = operator._operator_policy_arguments(
+            "grabowski_status",
+            raw_status,
+            read_tool,
+        )
+        self.assertTrue(
+            operator._deployment_readiness_status_call(
+                "grabowski_status",
+                policy_status,
+                read_tool,
+            )
+        )
+
+        raw_recovery_status = {
+            "operation": "maulwurf-recovery-status",
+            "parameters": None,
+            "reason": "Observe recovery state",
+            "user_intent": "Check the recovery controller",
+        }
+        policy_recovery_status = operator._operator_policy_arguments(
+            "grabowski_operation_run",
+            raw_recovery_status,
+            injected_tool,
+        )
+        self.assertNotIn("reason", policy_recovery_status)
+        self.assertNotIn("user_intent", policy_recovery_status)
+        with patch.dict(
+            os.environ,
+            {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+        ):
+            self.assertTrue(
+                operator._transport_roundtrip_exempt_call(
+                    "grabowski_operation_run",
+                    policy_recovery_status,
+                )
+            )
+
+        domain_reason_tool = types.SimpleNamespace(
+            fn_metadata=types.SimpleNamespace(
+                arg_model=types.SimpleNamespace(model_fields={"reason": object()})
+            )
+        )
+        domain_arguments = operator._operator_policy_arguments(
+            "domain_tool",
+            {"reason": "domain-owned", "user_intent": "analytics-only"},
+            domain_reason_tool,
+        )
+        self.assertEqual(domain_arguments["reason"], "domain-owned")
+        self.assertNotIn("user_intent", domain_arguments)
 
     def test_http_recovery_contract_is_loopback_bound(self) -> None:
         operator = _load_operator_module()
@@ -512,6 +687,7 @@ class OperatorContractTests(unittest.TestCase):
 
         fake = types.SimpleNamespace(
             evaluate_resume_gate=lambda _head: gate(),
+            _initial_gate_admits_locked_recheck=lambda value: value.get("allowed") is True and not value.get("reasons"),
             midcutover=types.SimpleNamespace(
                 LANE_MID_CUTOVER_RESUME="mid-cutover",
                 RESUME_PHASES=("resume-phase",),
@@ -530,6 +706,39 @@ class OperatorContractTests(unittest.TestCase):
         self.assertTrue(evidence["allowed"], evidence["reasons"])
         self.assertEqual([], evidence["reasons"])
         self.assertIn("retry_authority", evidence["does_not_establish"])
+
+        from tests.test_provenance_recovery import provenance_recovery
+
+        fake._initial_gate_admits_locked_recheck = provenance_recovery._initial_gate_admits_locked_recheck
+        for state in ("identical", "stale", "kill_switch", "blockade", "audit", "unreadable", "locked"):
+            with self.subTest(state=state):
+                assessment = {
+                    **gate(), "allowed": False, "reasons": ["no_competing_deployment"],
+                    "checks": {
+                        "kill_switch_clear": True, "no_blocking_operator_blockade": True,
+                        "audit_chain_valid": True, "no_competing_deployment": False,
+                    },
+                    "competing_deployment": {
+                        "deploy_lock_free": state != "locked",
+                        "inflight_deploy_jobs": ["grabowski-job-abcdef012345"],
+                        "error": "unreadable" if state == "unreadable" else None,
+                    },
+                }
+                failed = {
+                    "kill_switch": "kill_switch_clear", "blockade": "no_blocking_operator_blockade",
+                    "audit": "audit_chain_valid",
+                }.get(state)
+                if failed:
+                    assessment["checks"][failed] = False
+                    assessment["reasons"] = sorted([failed, "no_competing_deployment"])
+                fake.evaluate_resume_gate = lambda _head: assessment
+                with patch.dict(sys.modules, {"grabowski_provenance_recovery": fake}, clear=False):
+                    evidence = operator._deployment_admission_midcutover_recovery_evidence(
+                        "grabowski_recovery_provenance_repair", {"expected_head": head}, tool, marker,
+                    )
+                self.assertEqual(evidence["allowed"], state in {"identical", "stale"}, evidence)
+                self.assertIn("retry_authority", evidence["does_not_establish"])
+        fake.evaluate_resume_gate = lambda _head: gate()
 
         expired = {**marker, "state": "expired", "active": False}
         with patch.dict(
@@ -597,6 +806,7 @@ class OperatorContractTests(unittest.TestCase):
 
         def evidence_for(binding, *, allowed=True, lane="mid-cutover"):
             fake = types.SimpleNamespace(
+                _initial_gate_admits_locked_recheck=lambda value: value.get("allowed") is True and not value.get("reasons"),
                 evaluate_resume_gate=lambda _head: {
                     "allowed": allowed,
                     "reasons": [] if allowed else ["no_competing_deployment"],
@@ -1118,6 +1328,72 @@ class OperatorContractTests(unittest.TestCase):
                     PermissionError, "untracked generic execution"
                 ):
                     operator._enforce_maulwurf_recovery_mode(name, arguments, tool)
+
+    def test_maulwurf_trusted_owner_bypasses_recovery_restrictions(self) -> None:
+        operator = _load_operator_module()
+        tool = types.SimpleNamespace(
+            is_async=True,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_trusted_owner_mode", return_value=True),
+            patch.object(
+                operator,
+                "_maulwurf_recovery_enabled",
+                side_effect=AssertionError("trusted-owner must not consult recovery mode"),
+            ),
+        ):
+            for name, arguments in (
+                ("grabowski_terminal_run", {"argv": ["true"]}),
+                ("grabowski_tmux_send", {"target": "ops:0", "text": "repair"}),
+                (
+                    "grabowski_user_service",
+                    {"unit": "example.service", "action": "restart"},
+                ),
+            ):
+                with self.subTest(name=name):
+                    operator._enforce_maulwurf_recovery_mode(name, arguments, tool)
+
+    def test_maulwurf_trusted_owner_skips_recovery_guard(self) -> None:
+        operator = _load_operator_module()
+        events: list[str] = []
+        fake_mole = types.SimpleNamespace(
+            acquire_recovery_mutation_guard=lambda: events.append("acquire") or 17,
+            release_recovery_mutation_guard=lambda _fd: events.append("release"),
+        )
+
+        async def domain_call(*_args, **_kwargs):
+            events.append("domain")
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = domain_call
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_MCP_BRANDING_VARIANT": "der-kleine-maulwurf"},
+            ),
+            patch.object(operator, "_trusted_owner_mode", return_value=True),
+            patch.object(operator, "_maulwurf_recovery_module", return_value=fake_mole),
+            patch.object(
+                operator.grabowski_effect_interceptor,
+                "fence_enforcement_required",
+                return_value=False,
+            ),
+            patch.object(operator, "_require_transport_roundtrip_for_tool", return_value=None),
+        ):
+            operator._configure_http_runtime()
+            result = operator.asyncio.run(operator.mcp._tool_manager.call_tool("write", {}))
+        self.assertTrue(result["called"])
+        self.assertEqual(["domain"], events)
 
     def test_maulwurf_mutation_holds_recovery_guard_through_domain_call(self) -> None:
         operator = _load_operator_module()
@@ -2813,7 +3089,7 @@ class OperatorContractTests(unittest.TestCase):
             review_command = [
                 "claude",
                 "--model",
-                "opus",
+                "claude-opus-5-5",
                 "--effort",
                 "high",
                 "--permission-mode",
@@ -2869,7 +3145,7 @@ class OperatorContractTests(unittest.TestCase):
                 provenance["sandbox"],
                 "bubblewrap-minimal-root-read-only-worktree-v1",
             )
-            self.assertEqual(provenance["review_route"]["route_id"], "claude-opus-5-high")
+            self.assertEqual(provenance["review_route"]["route_id"], "claude-opus-5.5-high")
             self.assertEqual(provenance["review_route"]["provider_family"], "anthropic")
             self.assertEqual(
                 provenance,
@@ -6306,6 +6582,8 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
                 ["diff", "--cached", "--check"],
                 ["show", "--stat"],
                 ["log", "-1"],
+                ["status", "--short", "--branch"],
+                ["status", "--short", "--branch", "--untracked-files=normal"],
             ):
                 arguments = {
                     "repo": str(repo),
@@ -6358,6 +6636,294 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
             self.assertIn("--no-textconv", first["argv"])
             self.assertGreaterEqual(capability.call_count, 2)
             mutation.assert_not_called()
+
+    def test_generic_git_status_repeats_without_filter_or_index_effects(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            marker = Path(temporary) / "clean-filter-ran"
+            tracked = repo / "tracked.txt"
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=sentinel\n", encoding="utf-8"
+            )
+            tracked.write_text("aaaa\n", encoding="utf-8")
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "filter.sentinel.clean",
+                    f"sh -c 'touch {marker}; cat'",
+                ],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", ".gitattributes", "tracked.txt"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+            )
+            marker.unlink(missing_ok=True)
+            index_path = repo / ".git" / "index"
+            before = hashlib.sha256(index_path.read_bytes()).hexdigest()
+            original = tracked.stat()
+            tracked.write_text("bbbb\n", encoding="utf-8")
+            os.utime(
+                tracked,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+
+            with (
+                patch.object(operator, "_require_operator_capability") as capability,
+                patch.object(operator, "_require_operator_mutation") as mutation,
+            ):
+                first = operator.grabowski_git(
+                    str(repo),
+                    ["status", "--short", "--branch", "--untracked-files=normal"],
+                )
+                second = operator.grabowski_git(
+                    str(repo),
+                    ["status", "--short", "--branch", "--untracked-files=normal"],
+                )
+
+            after = hashlib.sha256(index_path.read_bytes()).hexdigest()
+            self.assertEqual(first["returncode"], 0)
+            self.assertEqual(second["returncode"], 0)
+            self.assertIn(" M tracked.txt", first["stdout"])
+            self.assertEqual(before, after)
+            self.assertFalse(marker.exists())
+            self.assertEqual(first["read_strategy"], "config-isolated-shadow-status-v1")
+            self.assertGreaterEqual(capability.call_count, 2)
+            mutation.assert_not_called()
+
+    def test_generic_git_status_shadow_ignores_process_filter_configuration(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            marker = Path(temporary) / "process-filter-ran"
+            tracked = repo / "tracked.txt"
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=sentinel\n", encoding="utf-8"
+            )
+            tracked.write_text("aaaa\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", ".gitattributes", "tracked.txt"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "filter.sentinel.process",
+                    f"sh -c 'touch {marker}; exit 1'",
+                ],
+                check=True,
+            )
+            original = tracked.stat()
+            tracked.write_text("bbbb\n", encoding="utf-8")
+            os.utime(tracked, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "status", "--short"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertTrue(marker.exists())
+            marker.unlink()
+
+            result = operator.grabowski_git(
+                str(repo),
+                ["status", "--short", "--branch", "--untracked-files=normal"],
+            )
+            self.assertEqual(result["returncode"], 0)
+            self.assertIn(" M tracked.txt", result["stdout"])
+            self.assertFalse(marker.exists())
+            self.assertEqual(
+                result["read_strategy"], "config-isolated-shadow-status-v1"
+            )
+
+    def test_generic_git_status_shadow_supports_linked_worktree_index(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+            )
+            linked = Path(temporary) / "linked"
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "feature",
+                    str(linked),
+                ],
+                check=True,
+            )
+            (linked / "tracked.txt").write_text("changed\n", encoding="utf-8")
+
+            first = operator.grabowski_git(
+                str(linked),
+                ["status", "--short", "--branch", "--untracked-files=normal"],
+            )
+            second = operator.grabowski_git(
+                str(linked),
+                ["status", "--short", "--branch", "--untracked-files=normal"],
+            )
+            self.assertEqual(first["returncode"], 0)
+            self.assertEqual(second["returncode"], 0)
+            self.assertIn("## feature", first["stdout"])
+            self.assertIn(" M tracked.txt", first["stdout"])
+            self.assertEqual(
+                first["read_strategy"], "config-isolated-shadow-status-v1"
+            )
+
+    def test_generic_git_status_shadow_reports_deleted_tracking_upstream(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = self._repo(operator, temporary)
+            remote = Path(temporary) / "origin.git"
+            operator.subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote)], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Test"], check=True
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            tracked = repo / "tracked.txt"
+            tracked.write_text("base\n", encoding="utf-8")
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"], check=True
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True
+            )
+            branch = operator.subprocess.run(
+                ["git", "-C", str(repo), "branch", "--show-current"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", str(remote)],
+                check=True,
+            )
+            operator.subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-C",
+                    str(repo),
+                    "push",
+                    "-q",
+                    "-u",
+                    "origin",
+                    branch,
+                ],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(remote), "update-ref", "-d", f"refs/heads/{branch}"],
+                check=True,
+            )
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "fetch", "-q", "--prune", "origin"],
+                check=True,
+            )
+            expected = operator.subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "status",
+                    "--short",
+                    "--branch",
+                    "--untracked-files=normal",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "LC_ALL": "C"},
+            ).stdout
+            result = operator.grabowski_git(
+                str(repo),
+                ["status", "--short", "--branch", "--untracked-files=normal"],
+            )
+            self.assertIn("[gone]", expected)
+            self.assertEqual(result["stdout"], expected)
+            self.assertEqual(
+                result["read_strategy"], "config-isolated-shadow-status-v1"
+            )
 
     def test_generic_git_read_strips_inherited_trace_sinks(self) -> None:
         operator = _load_operator_module()
@@ -6585,8 +7151,9 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
                 ["show", "--show-signature"],
                 ["show", "--show-sig"],
                 ["log", "--output=/tmp/log.txt"],
-                ["status", "--short"],
                 ["status", "--porc"],
+                ["status", "--short", "--", "tracked.txt"],
+                ["status", "--short", "--untracked-files=all"],
                 ["diff", "--check"],
                 ["rev-parse", "--parseopt"],
                 ["-c", "diff.external=/tmp/helper", "diff", "--check"],

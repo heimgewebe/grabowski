@@ -841,6 +841,114 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
             self.assertEqual(result["database_schema_version"], "1")
             self.assertEqual(len(result["snapshot_sha256"]), 64)
             self.assertEqual(result["bindings"][0]["retention"]["owner_id"], "operator:test")
+            self.assertEqual(
+                [item["checkout_key"] for item in result["retentions"]],
+                ["key-a"],
+            )
+
+    def test_reconciliation_reuses_validated_database_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkouts.sqlite3"
+            create_checkout_db(path)
+            insert_binding(path, checkout_key="key-a", checkout_path=CHECKOUT)
+            snapshot = collect_lifecycle_bindings_from_db(path)
+
+            with mock.patch(
+                "grabowski_checkout_binding_reconciler.collect_lifecycle_bindings_from_db",
+                side_effect=AssertionError("database snapshot should be reused"),
+            ), mock.patch(
+                "grabowski_checkout_binding_reconciler.collect_git_worktrees_for_repos",
+                return_value={
+                    "worktrees": [worktree()],
+                    "observable_repo_paths": [REPO],
+                    "observations": [
+                        {
+                            "requested_repo_path": REPO,
+                            "repo_path": REPO,
+                            "repo_common_dir": COMMON,
+                            "worktree_count": 1,
+                        }
+                    ],
+                    "errors": [],
+                    "errors_truncated": False,
+                },
+            ):
+                result = reconcile_checkout_bindings(
+                    db_path=path,
+                    repository_filters=[REPO],
+                    limit=20,
+                    _database_snapshot=snapshot,
+                )
+
+            self.assertEqual(1, result["total_count"])
+            self.assertEqual(
+                snapshot["snapshot_sha256"],
+                result["source_snapshot"]["database_snapshot_sha256"],
+            )
+
+    def test_reconciliation_rejects_tampered_database_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkouts.sqlite3"
+            create_checkout_db(path)
+            insert_binding(path, checkout_key="key-a", checkout_path=CHECKOUT)
+            snapshot = collect_lifecycle_bindings_from_db(path)
+            tampered = dict(snapshot)
+            tampered["snapshot_sha256"] = "0" * 64
+
+            with self.assertRaisesRegex(
+                CheckoutBindingDatabaseError,
+                "snapshot hash is invalid",
+            ):
+                reconcile_checkout_bindings(
+                    db_path=path,
+                    repository_filters=[REPO],
+                    limit=20,
+                    _database_snapshot=tampered,
+                )
+
+    def test_database_collection_includes_retention_without_lifecycle_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkouts.sqlite3"
+            create_checkout_db(path)
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO retention(
+                        checkout_key, repo_common_dir, repo_path, checkout_path,
+                        owner_id, purpose, retention_until_unix, expected_head,
+                        expected_branch, created_at_unix, updated_at_unix
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "retention-only",
+                        COMMON,
+                        REPO,
+                        "/tmp/retention-only",
+                        "task:" + "a" * 24,
+                        "test",
+                        9999999999,
+                        HEAD,
+                        "topic",
+                        1,
+                        2,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            result = collect_lifecycle_bindings_from_db(path)
+
+            self.assertEqual(result["bindings"], [])
+            self.assertEqual(
+                [item["checkout_key"] for item in result["retentions"]],
+                ["retention-only"],
+            )
+            self.assertEqual(
+                result["retentions"][0]["owner_id"],
+                "task:" + "a" * 24,
+            )
 
     def test_database_collection_uses_full_integrity_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

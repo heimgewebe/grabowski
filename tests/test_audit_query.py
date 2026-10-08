@@ -306,7 +306,9 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(module.base.read_chain_calls, [
             {"use_segment_cache": True, "retain_verified_segment_data": False}
         ])
-        self.assertEqual(module.base.head_lock_states, [True])
+        # The hardened base helper owns the short active-head lock; audit_query
+        # must not add a coordination lock around _read_audit_head_unlocked().
+        self.assertEqual(module.base.head_lock_states, [False])
         self.assertEqual(module.base.read_chain_lock_states, [False])
         self.assertEqual(projection["source"]["total_records"], 4)
         self.assertEqual(projection["items"][0]["record"]["operation"], "resource-acquire")
@@ -337,6 +339,25 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(len(projection["source"]["chain_content_sha256"]), 64)
         self.assertEqual(len(projection["source"]["chain_materialization_sha256"]), 64)
         self.assertIn("causality", projection["does_not_establish"])
+
+    def test_projection_preserves_captain_action_and_iso_timestamp(self) -> None:
+        records = [
+            {
+                "audit_schema_version": 2,
+                "operation": "captain-run-audit-completion",
+                "action": "pr-merge",
+                "timestamp": "1970-01-01T02:45:50+00:00",
+                "record_sha256": "a" * 64,
+            }
+        ]
+        module = self._load_module(
+            [_component("/tmp/grabowski-audit-test/write-audit.jsonl", records)]
+        )
+
+        projection = module.build_audit_projection()
+        record = projection["items"][0]["record"]
+        self.assertEqual(record["action"], "pr-merge")
+        self.assertEqual(record["timestamp"], "1970-01-01T02:45:50+00:00")
 
     def test_projection_omits_inconsistent_reclamation_evidence(self) -> None:
         components = self._components()

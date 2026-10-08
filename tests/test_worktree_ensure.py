@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -631,6 +632,37 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertTrue(Path(str(second["target_path"])).is_dir())
         self.assertTrue(os.path.lexists(broken_symlink))
 
+    def test_creation_holds_checkout_operation_lock_during_worktree_add(self) -> None:
+        parameters = self._parameters(key="serialized-worktree-add")
+        state = {"held": False}
+        saw_add = {"value": False}
+
+        @contextmanager
+        def operation_lock():
+            self.assertFalse(state["held"])
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+        def runner(cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[:2] == ["worktree", "add"]:
+                saw_add["value"] = True
+                self.assertTrue(state["held"])
+            return grips._default_command_runner(cwd, argv)
+
+        with patch.object(
+            checkouts,
+            "_operation_lock",
+            operation_lock,
+        ):
+            created = self._ensure(parameters, runner=runner)
+
+        self.assertEqual(created["result_state"], "CREATED")
+        self.assertTrue(saw_add["value"])
+        self.assertFalse(state["held"])
+
     def test_creates_and_replays_same_durable_result(self) -> None:
         parameters = self._parameters()
         created = self._ensure(parameters)
@@ -663,6 +695,19 @@ class WorktreeEnsureTests(unittest.TestCase):
         )
         self.assertEqual(lifecycle["expected_head"], self.head)
         self.assertEqual(lifecycle["expected_branch"], "feat/worktree-case")
+        physical = lifecycle["physical_checkout"]
+        self.assertEqual(physical["root"]["path"], str(Path(parameters["target_path"])))
+        self.assertEqual(
+            physical["common_dir"]["path"],
+            str(self.repo / ".git"),
+        )
+        expected_git_dir = self._git(
+            Path(parameters["target_path"]),
+            "rev-parse",
+            "--absolute-git-dir",
+        ).stdout.strip()
+        self.assertEqual(physical["git_dir"]["path"], expected_git_dir)
+        self.assertRegex(physical["physical_identity_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(lifecycle["terminal_decision"], "retain")
         self.assertFalse(lifecycle["automatic_cleanup_authorized"])
         self.assertEqual(replayed["lifecycle"]["checkout_key"], lifecycle["checkout_key"])

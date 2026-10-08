@@ -1646,6 +1646,83 @@ class CodexReviewSettlementTests(unittest.TestCase):
                 settlement._collect_comments(ROOT, "heimgewebe", "grabowski", PR, initial)
 
 
+    def test_collect_review_threads_paginates_forward_windows(self) -> None:
+        first = codex_thread(resolved=True)
+        first["id"] = "PRRT_first"
+        second = codex_thread(resolved=True)
+        second["id"] = "PRRT_second"
+        initial = connection(
+            [first],
+            hasNextPage=True,
+            endCursor="thread-cursor-1",
+        )
+        payload = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": connection(
+                            [second],
+                            hasNextPage=False,
+                            endCursor="thread-cursor-2",
+                        )
+                    }
+                }
+            }
+        }
+        with mock.patch.object(
+            settlement, "_run_json", return_value=payload
+        ) as run_json:
+            result = settlement._collect_review_threads(
+                ROOT, "heimgewebe", "grabowski", PR, initial
+            )
+        self.assertEqual(
+            [item["id"] for item in result["nodes"]],
+            ["PRRT_first", "PRRT_second"],
+        )
+        self.assertEqual(
+            result["pageInfo"],
+            {"hasNextPage": False, "pages_loaded": 2},
+        )
+        self.assertIn("after=thread-cursor-1", run_json.call_args.args[1])
+
+    def test_collect_review_threads_fails_closed_at_page_bound(self) -> None:
+        first = codex_thread(resolved=True)
+        first["id"] = "PRRT_first"
+        second = codex_thread(resolved=True)
+        second["id"] = "PRRT_second"
+        initial = connection(
+            [first],
+            hasNextPage=True,
+            endCursor="thread-cursor-1",
+        )
+        payload = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": connection(
+                            [second],
+                            hasNextPage=True,
+                            endCursor="thread-cursor-2",
+                        )
+                    }
+                }
+            }
+        }
+        with mock.patch.object(
+            settlement, "MAX_THREAD_PAGES", 2
+        ), mock.patch.object(
+            settlement, "MAX_THREAD_ITEMS", 200
+        ), mock.patch.object(
+            settlement, "_run_json", return_value=payload
+        ):
+            with self.assertRaisesRegex(
+                settlement.SettlementError, "bounded 200-item history"
+            ):
+                settlement._collect_review_threads(
+                    ROOT, "heimgewebe", "grabowski", PR, initial
+                )
+
+
 
 if __name__ == "__main__":
     unittest.main()
