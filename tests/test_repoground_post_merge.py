@@ -927,6 +927,61 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
             ),
         )
 
+    def test_discovery_initialization_uses_core_state_dir_in_split_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            db = directory / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            modules = {
+                "grabowski_operator_core": types.SimpleNamespace(STATE_DIR=directory),
+                "grabowski_operator": types.SimpleNamespace(),
+                "grabowski_tasks": tasks,
+                "grabowski_audit_query": types.SimpleNamespace(
+                    capture_verified_audit_snapshot=lambda: types.SimpleNamespace(
+                        total_records=37
+                    ),
+                ),
+            }
+            with patch.dict(sys.modules, modules):
+                result = post_merge.initialize_reconcile_discovery_watermark(
+                    predecessor_module_path=directory / "not-installed.py"
+                )
+            self.assertTrue(result["initialized"])
+            self.assertEqual(result["global_ordinal"], 37)
+            self.assertEqual(
+                post_merge._load_reconcile_discovery_ordinal(tasks), 37
+            )
+
+    def test_discovery_initialization_rejects_missing_core_state_dir(self) -> None:
+        modules = {
+            "grabowski_operator_core": types.SimpleNamespace(),
+            "grabowski_operator": types.SimpleNamespace(STATE_DIR=Path("/state")),
+            "grabowski_tasks": types.SimpleNamespace(
+                _database_connection=lambda: self.fail(
+                    "must not read task DB without core state directory"
+                )
+            ),
+            "grabowski_audit_query": types.SimpleNamespace(
+                capture_verified_audit_snapshot=lambda: self.fail(
+                    "must not scan audit without core state directory"
+                )
+            ),
+        }
+        with patch.dict(sys.modules, modules):
+            with self.assertRaisesRegex(
+                post_merge.RepoGroundPostMergeError,
+                "discovery state store is unavailable",
+            ):
+                post_merge.initialize_reconcile_discovery_watermark(
+                    predecessor_module_path=Path("/not-installed.py")
+                )
+
     def test_discovery_initialization_seeds_verified_tip_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
