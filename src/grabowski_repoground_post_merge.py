@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import hashlib
+import os
+import stat as statmod
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,6 +63,7 @@ POST_MERGE_TERMINAL_JOB_STATUSES = frozenset(
 POST_MERGE_JOB_SLOT_LIMIT = 16
 POST_MERGE_FAILURE_RETRY_BACKOFF_SECONDS = 300
 POST_MERGE_MISSING_UNIT_RECOVERY_GRACE_SECONDS = 300
+POST_MERGE_METADATA_FREE_SLOT_GRACE_SECONDS = 300
 POST_MERGE_STATUS_READ_TIMEOUT_SECONDS = 30
 POST_MERGE_START_TIMEOUT_SECONDS = 60
 POST_MERGE_SINGLE_IDENTITY_BUDGET_SECONDS = (
@@ -275,6 +278,73 @@ def _post_merge_job_starter(
                 return None
             return uncertain(observed_metadata, final_status=final_status)
 
+        def metadata_free_slot_state(unit: str) -> str | None:
+            """Observe partial startup without deleting or retrying artifacts."""
+            root = getattr(operator_module, "JOBS_DIR", None)
+            if not isinstance(root, Path):
+                return None
+            try:
+                root_info = root.lstat()
+            except FileNotFoundError:
+                return None
+            if not statmod.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid():
+                return "uncertain"
+            directory = root / unit
+            try:
+                info = directory.lstat()
+            except FileNotFoundError:
+                return None
+            if (
+                not statmod.S_ISDIR(info.st_mode)
+                or info.st_uid != os.getuid()
+                or statmod.S_IMODE(info.st_mode) & 0o077
+            ):
+                return "uncertain"
+            # A present but unreadable, corrupt or symlinked metadata.json
+            # could belong to a job that actually started. Only a physically
+            # absent metadata file qualifies as a pre-metadata crash window.
+            try:
+                (directory / "metadata.json").lstat()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return "uncertain"
+            else:
+                return "uncertain"
+            # An unreadable, corrupt or symlinked metadata.json is not a
+            # metadata-FREE slot. Keep the identity uncertain, never turn
+            # damaged evidence into an exhausted/manual-recovery record.
+            try:
+                (directory / "metadata.json").lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                return "uncertain"
+            latest_ns = info.st_mtime_ns
+            has_log = False
+            for name in ("stdout.log", "stderr.log"):
+                try:
+                    log = (directory / name).lstat()
+                except FileNotFoundError:
+                    continue
+                if (
+                    not statmod.S_ISREG(log.st_mode)
+                    or log.st_nlink != 1
+                    or log.st_uid != os.getuid()
+                    or statmod.S_IMODE(log.st_mode) & 0o077
+                ):
+                    return "uncertain"
+                has_log = True
+                latest_ns = max(latest_ns, log.st_mtime_ns)
+            if not has_log:
+                return "uncertain"
+            return (
+                "abandoned"
+                if time.time_ns() - latest_ns
+                >= POST_MERGE_METADATA_FREE_SLOT_GRACE_SECONDS * 1_000_000_000
+                else "uncertain"
+            )
+
         for attempt in range(POST_MERGE_JOB_SLOT_LIMIT):
             unit = f"grabowski-job-rgpm-{identity_sha256[:16]}-{attempt:02d}"
             try:
@@ -290,6 +360,19 @@ def _post_merge_job_starter(
                 if reusable is not None:
                     return reusable
                 continue
+
+            # Existing O_EXCL logs with no metadata may be a partially
+            # started job. Inspect only; never retry the same reserved slot.
+            slot_state = metadata_free_slot_state(unit)
+            if slot_state == "uncertain":
+                return uncertain(
+                    {"unit": unit, "reused": True},
+                    error_class="MetadataFreeReservedSlot",
+                )
+            if slot_state == "abandoned":
+                raise _ReusableJobSlotsExhausted(
+                    "RepoGround reserved job slot is metadata-free past grace"
+                )
 
             require_mutation(
                 "durable_job",
@@ -318,6 +401,13 @@ def _post_merge_job_starter(
                         readback,
                         final_status="terminal_after_ambiguous_start",
                         error_class=type(exc).__name__,
+                    )
+                if isinstance(exc, FileExistsError) and readback is None:
+                    # First observation is always ambiguous. A start may be
+                    # concurrently writing metadata; do not try another unit.
+                    return uncertain(
+                        {"unit": unit, "reused": True},
+                        error_class="MetadataFreeReservedSlot",
                     )
                 raise
 
@@ -2383,7 +2473,13 @@ def reconcile_recent_captain_audit_followups(
     window_mode = (
         discovery_ordinal_before is not None
         and type(getattr(snapshot, "total_records", None)) is int
-        and snapshot.total_records - discovery_ordinal_before > max_scan_records
+        and (
+            snapshot.total_records - discovery_ordinal_before >= max_scan_records
+            or (
+                isinstance(getattr(snapshot, "segments", None), tuple)
+                and snapshot.total_records - discovery_ordinal_before >= limit
+            )
+        )
     )
     scan_start: int | None = None
     scan_end: int | None = None
@@ -2482,6 +2578,12 @@ def reconcile_recent_captain_audit_followups(
                 "Captain audit reconciliation record identity is invalid"
             )
         completion_record_sha256s.append(record_sha256)
+        if window_mode and len(completion_record_sha256s) >= limit:
+            # This is a contiguous, ordinal-verified prefix. Never collect
+            # more exhausted obligations than one transaction can persist.
+            scan_end = global_ordinal
+            newest_global_ordinal = scan_end
+            break
 
     if window_mode:
         assert scan_start is not None and scan_end is not None
