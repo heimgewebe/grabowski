@@ -729,6 +729,206 @@ int main(void) {
         finally:
             os.close(fd)
 
+
+    def test_capture_reservation_is_durable_and_never_silently_reissued(self) -> None:
+        # Synthetic user-owned temp root: only root mode is mocked. No host proof.
+        fd = os.open(self.dest, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with patch.object(cap, "_check_staging_root_owned", return_value=None), \
+                 patch.object(cap, "_check_attempt_leaf", return_value=None):
+                capture_id, nonce = cap._reserve_prototype_capture(
+                    fd, host="heim-pc",
+                    policy_sha256="a" * 64,
+                    initial_executable_sha256="b" * 64,
+                )
+                marker = self.dest / cap.ATTEMPT_MARKER
+                raw = marker.read_bytes()
+                value = json.loads(raw)
+                self.assertEqual(raw, cap._json_bytes(value))
+                self.assertEqual((capture_id, nonce),
+                                 (value["capture_id"], value["nonce"]))
+                self.assertEqual(0o600, marker.stat().st_mode & 0o777)
+                with patch.object(cap.secrets, "token_hex",
+                                  side_effect=AssertionError("MUST NOT RESAMPLE")):
+                    with self.assertRaisesRegex(
+                        cap.CaptureDenied, "requires protected recovery"
+                    ):
+                        cap._reserve_prototype_capture(
+                            fd, host="heim-pc", policy_sha256="a"*64,
+                            initial_executable_sha256="b"*64,
+                        )
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "binding changed"
+                ):
+                    cap._reserve_prototype_capture(
+                        fd, host="heim-pc", policy_sha256="c"*64,
+                        initial_executable_sha256="b"*64,
+                    )
+        finally:
+            os.close(fd)
+
+    def test_orphaned_prototype_or_staging_prevents_new_capture_identity(self) -> None:
+        for name in ("prototype-unknown", ".incomplete-unknown"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / name).mkdir()
+                fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with patch.object(cap, "_check_staging_root_owned",
+                                      return_value=None), \
+                         patch.object(cap.secrets, "token_hex",
+                                      side_effect=AssertionError("MUST NOT ISSUE")):
+                        with self.assertRaisesRegex(
+                            cap.CaptureDenied, "unreconciled protected capture root"
+                        ):
+                            cap._reserve_prototype_capture(
+                                fd, host="heim-pc", policy_sha256="a"*64,
+                                initial_executable_sha256="b"*64,
+                            )
+                finally:
+                    os.close(fd)
+
+    def test_capture_reservation_post_fsync_failure_stays_blocked(self) -> None:
+        fd = os.open(self.dest, os.O_RDONLY | os.O_DIRECTORY)
+        actual = cap.os.fsync
+        def fail_root(target: int) -> None:
+            if target == fd:
+                self.assertTrue((self.dest / cap.ATTEMPT_MARKER).exists())
+                raise OSError("simulated reservation root fsync failure")
+            return actual(target)
+        try:
+            with patch.object(cap, "_check_staging_root_owned", return_value=None), \
+                 patch.object(cap.os, "fsync", side_effect=fail_root):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "reservation durability uncertain"
+                ):
+                    cap._reserve_prototype_capture(
+                        fd, host="heim-pc", policy_sha256="a"*64,
+                        initial_executable_sha256="b"*64,
+                    )
+            with patch.object(cap, "_check_staging_root_owned", return_value=None), \
+                 patch.object(cap, "_check_attempt_leaf", return_value=None), \
+                 patch.object(cap.secrets, "token_hex",
+                              side_effect=AssertionError("MUST NOT REISSUE")):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "requires protected recovery"
+                ):
+                    cap._reserve_prototype_capture(
+                        fd, host="heim-pc", policy_sha256="a"*64,
+                        initial_executable_sha256="b"*64,
+                    )
+        finally:
+            os.close(fd)
+
+    def test_competing_reservation_cannot_replace_first_root_identity(self) -> None:
+        # Simulate two privileged callers after both observed an empty root.
+        # Only one O_EXCL create may win; no second nonce can be committed.
+        fd = os.open(self.dest, os.O_RDONLY | os.O_DIRECTORY)
+        actual_write = cap._write_new
+        winner = [None]
+        def interleaving(target_fd, name, data):
+            original = json.loads(data)
+            rival = {**original, "capture_id": "f"*24, "nonce": "e"*64}
+            winner[0] = cap._json_bytes(rival)
+            actual_write(target_fd, name, winner[0])
+            return actual_write(target_fd, name, data)
+        try:
+            with patch.object(cap, "_check_staging_root_owned", return_value=None), \
+                 patch.object(cap, "_write_new", side_effect=interleaving):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "reservation already exists"
+                ):
+                    cap._reserve_prototype_capture(
+                        fd, host="heim-pc", policy_sha256="a"*64,
+                        initial_executable_sha256="b"*64,
+                    )
+            self.assertIsNotNone(winner[0])
+            self.assertEqual(
+                winner[0], (self.dest / cap.ATTEMPT_MARKER).read_bytes()
+            )
+            self.assertFalse(any(self.dest.glob("prototype-*")))
+        finally:
+            os.close(fd)
+
+    def test_capture_reservation_enforces_root_owned_inodes(self) -> None:
+        good = types.SimpleNamespace(
+            st_mode=0o100600, st_uid=0, st_nlink=1, st_size=200,
+        )
+        cap._check_attempt_leaf(good)
+        for kwargs in (
+            {"st_uid": 1000}, {"st_mode": 0o100660},
+            {"st_mode": 0o120600}, {"st_nlink": 2},
+            {"st_size": 0}, {"st_size": cap.MAX_ATTEMPT_MARKER_BYTES+1},
+        ):
+            with self.subTest(kwargs=kwargs):
+                bad = types.SimpleNamespace(**{**vars(good), **kwargs})
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "not root-owned 0600"
+                ):
+                    cap._check_attempt_leaf(bad)
+
+    def test_reservation_symlink_or_malformed_identity_denied(self) -> None:
+        marker = self.dest / cap.ATTEMPT_MARKER
+        fd = os.open(self.dest, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            marker.symlink_to("/etc/hosts")
+            with patch.object(cap, "_check_staging_root_owned", return_value=None):
+                with self.assertRaises(cap.CaptureDenied):
+                    cap._reserve_prototype_capture(
+                        fd, host="heim-pc", policy_sha256="a"*64,
+                        initial_executable_sha256="b"*64,
+                    )
+            marker.unlink()
+            marker.write_text('{"schema_version":1}\n', encoding="utf-8")
+            marker.chmod(0o600)
+            with patch.object(cap, "_check_staging_root_owned", return_value=None), \
+                 patch.object(cap, "_check_attempt_leaf", return_value=None):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "invalid binding"
+                ):
+                    cap._reserve_prototype_capture(
+                        fd, host="heim-pc", policy_sha256="a"*64,
+                        initial_executable_sha256="b"*64,
+                    )
+        finally:
+            os.close(fd)
+
+    def test_post_rename_crash_does_not_issue_another_identity(self) -> None:
+        fd = os.open(self.dest, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with patch.object(cap, "_check_staging_root_owned", return_value=None), \
+                 patch.object(cap, "_check_attempt_leaf", return_value=None):
+                capture_id, nonce = cap._reserve_prototype_capture(
+                    fd, host="heim-pc", policy_sha256="a"*64,
+                    initial_executable_sha256="b"*64,
+                )
+                actual = cap.os.fsync
+                def fail_publish_sync(target: int) -> None:
+                    if target == fd:
+                        raise OSError("simulated crash after rename")
+                    return actual(target)
+                with patch.object(cap.os, "fsync", side_effect=fail_publish_sync):
+                    with self.assertRaisesRegex(
+                        cap.CaptureDenied, "publication durability uncertain"
+                    ):
+                        cap._publish_bundle(
+                            fd, task_id=capture_id, nonce=nonce,
+                            stdout=b"bytes", stderr=b"",
+                            receipt=b"not-admitted\n", signature=b"fixture",
+                        )
+                self.assertEqual(1, len(list(self.dest.glob("prototype-*"))))
+                with patch.object(cap.secrets, "token_hex",
+                                  side_effect=AssertionError("MUST NOT REISSUE")):
+                    with self.assertRaisesRegex(
+                        cap.CaptureDenied, "requires protected recovery"
+                    ):
+                        cap._reserve_prototype_capture(
+                            fd, host="heim-pc", policy_sha256="a"*64,
+                            initial_executable_sha256="b"*64,
+                        )
+        finally:
+            os.close(fd)
+
     def test_disposable_real_ssh_signature_over_exact_proof_bytes(self) -> None:
         receipt = cap._json_bytes({"kind":"disposable_fixture", "data_sha256":sha(OBSERVED_STDOUT)})
         self.policy_file = Path(self.temp.name) / "policy"
@@ -843,6 +1043,7 @@ int main(void) {
              patch.object(cap, "_separate_child_identity", return_value=(os.getuid(), os.getgid())), \
              patch.object(cap, "_drop_to_child", return_value=None), \
              patch.object(cap, "_assert_cgroup_drained", return_value=None), \
+             patch.object(cap, "_check_staging_root_owned", return_value=None), \
              patch.object(cap, "_sign_receipt", side_effect=cap.CaptureDenied("missing signer")):
             with self.assertRaisesRegex(cap.CaptureDenied, "missing signer"):
                 cap.run()
@@ -875,6 +1076,8 @@ int main(void) {
                                  return_value=(os.getuid(), os.getgid())),
                     patch.object(cap, "_drop_to_child", return_value=None),
                     patch.object(cap, "_assert_cgroup_drained", side_effect=gate),
+                    patch.object(cap, "_reserve_prototype_capture",
+                                 return_value=("a"*24, "b"*64)),
                     patch.object(cap, "_sign_receipt", side_effect=fake_sign),
                     patch.object(cap, "_publish_bundle",
                                  side_effect=AssertionError("MUST NOT PUBLISH")),
@@ -1012,6 +1215,7 @@ int main(void) {
              patch.object(cap, "_separate_child_identity", return_value=(os.getuid(), os.getgid())), \
              patch.object(cap, "_drop_to_child", return_value=None), \
              patch.object(cap, "_assert_cgroup_drained", return_value=None), \
+             patch.object(cap, "_check_staging_root_owned", return_value=None), \
              patch.object(cap, "_capture_from_pipes", side_effect=flip_source_after_execution), \
              patch.object(cap, "_sign_receipt", side_effect=AssertionError("MUST NOT SIGN")):
             with self.assertRaisesRegex(cap.CaptureDenied, "executable FD changed"):

@@ -566,6 +566,136 @@ def _check_staging_root_owned(fd: int) -> None:
         raise CaptureDenied("staged protected directory mode/owner mismatch")
 
 
+
+ATTEMPT_MARKER = ".capture-attempt-v1.json"
+MAX_ATTEMPT_MARKER_BYTES = 1024
+
+
+def _check_attempt_leaf(info: os.stat_result) -> None:
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0
+        or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+        or not 0 < info.st_size <= MAX_ATTEMPT_MARKER_BYTES):
+        raise CaptureDenied("protected capture reservation is not root-owned 0600")
+
+
+def _read_capture_reservation(root_fd: int) -> dict[str, Any] | None:
+    """Read the canonical root-owned reservation via an exact pinned inode."""
+    try:
+        before = os.stat(ATTEMPT_MARKER, dir_fd=root_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    try:
+        fd = os.open(
+            ATTEMPT_MARKER, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+    except OSError as exc:
+        raise CaptureDenied("protected capture reservation cannot be opened") from exc
+    try:
+        opened = os.fstat(fd)
+        _check_attempt_leaf(opened)
+        if _file_identity(before) != _file_identity(opened):
+            raise CaptureDenied("protected capture reservation was replaced")
+        remaining = opened.st_size
+        chunks: list[bytes] = []
+        while remaining:
+            data = os.read(fd, min(65536, remaining))
+            if not data:
+                break
+            chunks.append(data)
+            remaining -= len(data)
+        trailing = os.read(fd, 1)
+        after = os.fstat(fd)
+        linked = os.stat(ATTEMPT_MARKER, dir_fd=root_fd, follow_symlinks=False)
+        if (remaining or trailing or _file_identity(opened) != _file_identity(after)
+            or _file_identity(opened) != _file_identity(linked)):
+            raise CaptureDenied("protected capture reservation changed during read")
+        raw = b"".join(chunks)
+    except OSError as exc:
+        raise CaptureDenied("protected capture reservation read failed") from exc
+    finally:
+        os.close(fd)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise CaptureDenied("protected capture reservation is not canonical JSON") from exc
+    if (not isinstance(value, dict)
+        or set(value) != {
+            "schema_version", "kind", "state", "capture_id", "nonce",
+            "host", "policy_sha256", "initial_executable_sha256",
+        }
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+        or value.get("kind") != "grabowski.day1_capture_reservation_prototype"
+        or value.get("state") != "reserved_unreconciled"
+        or not isinstance(value.get("capture_id"), str)
+        or re.fullmatch(r"[0-9a-f]{24}", value["capture_id"]) is None
+        or not isinstance(value.get("nonce"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["nonce"]) is None
+        or not isinstance(value.get("host"), str)
+        or not value["host"] or len(value["host"]) > 255
+        or any(
+            not isinstance(value.get(key), str)
+            or SHA_RE.fullmatch(value[key]) is None
+            for key in ("policy_sha256", "initial_executable_sha256")
+        )
+        or _json_bytes(value) != raw):
+        raise CaptureDenied("protected capture reservation has invalid binding")
+    return value
+
+
+def _reserve_prototype_capture(
+    root_fd: int, *, host: str, policy_sha256: str,
+    initial_executable_sha256: str,
+) -> tuple[str, str]:
+    """Persist one capture identity BEFORE exec; never silently retry it.
+
+    Not a Grabowski task/attempt issuer. A restart after crash (or even a
+    successful prototype) is deliberately held for independent reconciliation.
+    This avoids reissuing unrelated random IDs on an uncertain retry.
+    """
+    _check_staging_root_owned(root_fd)
+    prior = _read_capture_reservation(root_fd)
+    if prior is not None:
+        if (prior["host"] != host
+            or prior["policy_sha256"] != policy_sha256
+            or prior["initial_executable_sha256"] != initial_executable_sha256):
+            raise CaptureDenied("previous capture reservation binding changed")
+        raise CaptureDenied(
+            "previous capture reservation requires protected recovery; retry denied"
+        )
+    try:
+        # With a missing reservation, unknown prior publications/stages make
+        # issuing a fresh identity unsafe. This is a one-shot evidence root,
+        # not a general retry queue or a cleanup/delete mechanism.
+        entries = os.listdir(root_fd)
+    except OSError as exc:
+        raise CaptureDenied("protected capture root is not enumerable") from exc
+    if entries:
+        raise CaptureDenied("unreconciled protected capture root blocks new attempt")
+    value = {
+        "schema_version": 1,
+        "kind": "grabowski.day1_capture_reservation_prototype",
+        "state": "reserved_unreconciled",
+        "capture_id": secrets.token_hex(12),
+        "nonce": secrets.token_hex(32),
+        "host": host,
+        "policy_sha256": policy_sha256,
+        "initial_executable_sha256": initial_executable_sha256,
+    }
+    try:
+        _write_new(root_fd, ATTEMPT_MARKER, _json_bytes(value))
+    except FileExistsError as exc:
+        raise CaptureDenied("protected capture reservation already exists") from exc
+    try:
+        os.fsync(root_fd)
+    except OSError as exc:
+        raise CaptureDenied(
+            "protected capture reservation durability uncertain; retry denied"
+        ) from exc
+    return value["capture_id"], value["nonce"]
+
+
 def _publish_bundle(
     root_fd: int, *, task_id: str, nonce: str, stdout: bytes, stderr: bytes,
     receipt: bytes, signature: bytes,
@@ -627,8 +757,11 @@ def run() -> dict[str, Any]:
         uid, gid = _separate_child_identity()
         root_fd = _open_root_directory(EVIDENCE_ROOT, private=True)
         try:
-            task_id, nonce = secrets.token_hex(12), secrets.token_hex(32)
             _assert_cgroup_drained()  # Kernel pids limit before child launch.
+            task_id, nonce = _reserve_prototype_capture(
+                root_fd, host=hostname, policy_sha256=_sha(config_bytes),
+                initial_executable_sha256=actual_sha,
+            )
             stdout, stderr, code, started, stopped, argv = _capture_from_pipes(
                 collector_fd, uid=uid, gid=gid,
                 seconds=policy["runtime_seconds"],
