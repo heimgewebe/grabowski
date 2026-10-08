@@ -114,14 +114,17 @@ class BenchmarkInputsTests(unittest.TestCase):
             probe.validate_sweep("1000", "verify,verify", 64)
 
     def test_modules_deny_unowned_parent_bytecode_cache_before_import(self):
-        with mock.patch.object(probe.sys, "pycache_prefix", None):
-            with self.assertRaisesRegex(RuntimeError, "private owned bytecode cache"):
-                probe.modules()
-        wrong = self.root / "unowned-cache"
-        wrong.mkdir(mode=0o700)
-        with mock.patch.object(probe.sys, "pycache_prefix", str(wrong)):
-            with self.assertRaisesRegex(RuntimeError, "private owned bytecode cache"):
-                probe.modules()
+        from types import SimpleNamespace
+        required_flags = SimpleNamespace(isolated=1, no_site=1, dont_write_bytecode=1)
+        with mock.patch.object(probe.sys, "flags", required_flags):
+            with mock.patch.object(probe.sys, "pycache_prefix", None):
+                with self.assertRaisesRegex(RuntimeError, "private owned bytecode cache"):
+                    probe.modules()
+            wrong = self.root / "unowned-cache"
+            wrong.mkdir(mode=0o700)
+            with mock.patch.object(probe.sys, "pycache_prefix", str(wrong)):
+                with self.assertRaisesRegex(RuntimeError, "private owned bytecode cache"):
+                    probe.modules()
 
     def test_parent_private_cache_never_loads_unchecked_hash_bytecode(self):
         import py_compile
@@ -143,6 +146,53 @@ class BenchmarkInputsTests(unittest.TestCase):
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
         self.assertEqual(module.VALUE, "safe")
+
+    def test_main_sets_private_cache_before_fixture_and_reuses_for_worker(self):
+        from types import SimpleNamespace
+
+        observed = []
+        output = StringIO()
+
+        def record_fixture(state, count, payload_bytes):
+            cache = Path(sys.pycache_prefix) if sys.pycache_prefix else None
+            self.assertIsNotNone(cache, "parent must set a private cache before fixture creation")
+            self.assertTrue(cache.is_dir())
+            self.assertEqual(cache.name, "worker-bytecode")
+            self.assertEqual(
+                json.loads((cache.parent / "synthetic-probe-owner.json").read_text()),
+                {"kind": "synthetic-audit-probe-v1"},
+            )
+            self.assertEqual(list(cache.iterdir()), [])
+            observed.append(cache)
+            return {"user_records": count, "payload_bytes": payload_bytes}
+
+        def record_worker(argv, **kwargs):
+            self.assertEqual(len(observed), 1)
+            self.assertEqual(argv[:5], [sys.executable, "-I", "-S", "-B", "-X"])
+            self.assertEqual(argv[5], f"pycache_prefix={observed[0]}")
+            self.assertIn("--expected-input-hashes", argv)
+            return SimpleNamespace(stdout=json.dumps({"case": "verify", "valid": True}))
+
+        with mock.patch.object(
+            sys, "argv", ["probe", "--records", "1", "--cases", "verify", "--payload-bytes", "16"]
+        ), mock.patch.object(
+            sys, "pycache_prefix", None
+        ), mock.patch.object(
+            probe, "make_fixture", side_effect=record_fixture
+        ) as fixture, mock.patch.object(
+            probe.subprocess, "check_output", return_value="0" * 40
+        ), mock.patch.object(
+            probe.subprocess, "run", side_effect=record_worker
+        ) as worker, redirect_stdout(output):
+            probe.main()
+
+        fixture.assert_called_once()
+        worker.assert_called_once()
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(
+            [json.loads(line).get("case") for line in output.getvalue().splitlines()],
+            [None, "verify"],
+        )
 
     def test_disk_budget_preflight(self):
         from types import SimpleNamespace
