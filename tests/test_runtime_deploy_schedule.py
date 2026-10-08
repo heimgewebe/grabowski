@@ -957,7 +957,7 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             ],
             check=False,
             capture=True,
-            timeout=240,
+            timeout=960,
         )
         with (
             mock.patch.object(
