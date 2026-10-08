@@ -268,6 +268,36 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("RandomizedDelaySec=30s", timer)
         self.assertIn("Persistent=true", timer)
 
+    def test_repoground_post_merge_reconcile_is_independent_and_operator_activated(self) -> None:
+        service = (
+            ROOT / "systemd" / "grabowski-repoground-post-merge-reconcile.service.example"
+        ).read_text(encoding="utf-8")
+        timer = (
+            ROOT / "systemd" / "grabowski-repoground-post-merge-reconcile.timer.example"
+        ).read_text(encoding="utf-8")
+        dropin = (
+            ROOT
+            / "systemd"
+            / "grabowski-operator.service.d"
+            / "95-repoground-post-merge-reconcile.conf.example"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("--reconcile-audit-followups", service)
+        self.assertIn("--reconcile-lookback-seconds 25200", service)
+        self.assertIn("TimeoutStartSec=1800s", service)
+        self.assertIn("ReadWritePaths=%h/.local/state/grabowski", service)
+        self.assertNotIn("PartOf=", service)
+        self.assertIn("OnActiveSec=15s", timer)
+        self.assertIn("OnUnitInactiveSec=1min", timer)
+        self.assertIn("Persistent=true", timer)
+        self.assertNotIn("PartOf=", timer)
+        self.assertIn(
+            "Wants=grabowski-repoground-post-merge-reconcile.timer",
+            dropin,
+        )
+
+
+
 
 if __name__ == "__main__":
     unittest.main()

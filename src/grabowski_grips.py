@@ -3831,6 +3831,7 @@ def _runtime_deploy_delay_seconds(parameters: dict[str, Any]) -> int:
     return value
 
 
+
 def _runtime_deploy_self_preflight(
     expected_head: str,
     source_repository: str | None = None,
@@ -3838,30 +3839,70 @@ def _runtime_deploy_self_preflight(
 ) -> dict[str, Any]:
     import grabowski_self_deploy
 
-    repository, runner, source_identity = grabowski_self_deploy._deployment_source_preflight(
+    plan = grabowski_self_deploy._deployment_schedule_preflight(
         expected_head,
         source_repository,
         source_lease_owner_id,
     )
+    source_identity = plan.get("source_identity")
+    lease_evidence = (
+        source_identity.get("lease_evidence")
+        if isinstance(source_identity, dict)
+        else None
+    )
+    lease = (
+        lease_evidence.get("lease")
+        if isinstance(lease_evidence, dict)
+        else None
+    )
     return {
         "adapter": RUNTIME_DEPLOY_ADAPTER_GRABOWSKI_SELF,
-        "repository": str(repository),
-        "runner": str(runner),
+        "repository": plan.get("repository"),
+        "runner": plan.get("runner"),
         "job_root": str(grabowski_self_deploy.DEPLOY_JOB_ROOT),
         "job_prefix": grabowski_self_deploy.DEPLOY_JOB_PREFIX,
         "expected_head": expected_head,
-        "source_kind": source_identity["source_kind"],
-        "source_identity_sha256": source_identity["identity_sha256"],
-        "source_lease_resource_key": source_identity["lease_evidence"].get("resource_key"),
+        "resolution_mode": plan["resolution_mode"],
+        "source_kind": (
+            source_identity.get("source_kind")
+            if isinstance(source_identity, dict)
+            else "scheduler-auto-source"
+        ),
+        "source_identity_sha256": plan.get("source_identity_sha256"),
+        "source_lease_resource_key": (
+            lease_evidence.get("resource_key")
+            if isinstance(lease_evidence, dict)
+            else None
+        ),
         "source_lease_metadata_sha256": (
-            source_identity["lease_evidence"].get("lease") or {}
-        ).get("metadata_sha256"),
+            lease.get("metadata_sha256") if isinstance(lease, dict) else None
+        ),
+        "origin_main_refresh_required": plan.get(
+            "origin_main_refresh_required", False
+        ),
+        "canonical_state": plan.get("canonical_state"),
         "target": {
             "service": RUNTIME_DEPLOY_GRABOWSKI_SERVICE,
             "runtime_target": RUNTIME_DEPLOY_GRABOWSKI_TARGET,
         },
-        "ready": True,
+        "ready": plan.get("ready") is True,
     }
+
+class RuntimeDeployPreEffectRefusal(RuntimeError):
+    """The scheduler proved that no deploy registration effect began."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        local_mutation_evidence: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.local_mutation_evidence = (
+            None
+            if local_mutation_evidence is None
+            else dict(local_mutation_evidence)
+        )
 
 
 def _runtime_deploy_self_schedule(
@@ -3872,12 +3913,108 @@ def _runtime_deploy_self_schedule(
 ) -> dict[str, Any]:
     import grabowski_self_deploy
 
-    return grabowski_self_deploy.grabowski_runtime_deploy_schedule(
-        expected_head,
-        delay_seconds,
-        source_repository,
-        source_lease_owner_id,
+    try:
+        return grabowski_self_deploy.grabowski_runtime_deploy_schedule(
+            expected_head,
+            delay_seconds,
+            source_repository,
+            source_lease_owner_id,
+        )
+    except grabowski_self_deploy.DeploySchedulePreEffectRefusal as exc:
+        raise RuntimeDeployPreEffectRefusal(
+            str(exc),
+            local_mutation_evidence=getattr(
+                exc, "local_mutation_evidence", None
+            ),
+        ) from exc
+
+
+
+def _runtime_deploy_self_schedule_source_preflight(
+    schedule: Any,
+    expected_head: str,
+) -> dict[str, Any]:
+    if not isinstance(schedule, dict):
+        raise GripPreflightError("runtime deploy scheduler returned non-object")
+
+    import grabowski_self_deploy
+
+    if schedule.get("reused_across_source_identity") is True:
+        raise GripPreflightError(
+            "runtime deploy schedule reused a different source identity; "
+            "Captain requires exact source readback"
+        )
+    source_identity = schedule.get("source_identity")
+    expected_identity_sha256 = schedule.get("source_identity_sha256")
+    if (
+        not isinstance(source_identity, dict)
+        or not isinstance(expected_identity_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_identity_sha256)
+        or source_identity.get("identity_sha256") != expected_identity_sha256
+    ):
+        raise GripPreflightError(
+            "runtime deploy schedule source identity is missing or malformed"
+        )
+    source_kind = source_identity.get("source_kind")
+    repository_text = source_identity.get("repository")
+    if source_kind == "canonical-main":
+        source_repository = None
+        source_owner = None
+    elif source_kind == "detached-worktree":
+        if not isinstance(repository_text, str) or not repository_text.startswith("/"):
+            raise GripPreflightError(
+                "runtime deploy detached source repository is invalid"
+            )
+        lease_evidence = source_identity.get("lease_evidence")
+        lease = (
+            lease_evidence.get("lease")
+            if isinstance(lease_evidence, dict)
+            else None
+        )
+        source_owner = lease.get("owner_id") if isinstance(lease, dict) else None
+        if not isinstance(source_owner, str) or not source_owner:
+            raise GripPreflightError(
+                "runtime deploy detached source lease owner is missing"
+            )
+        source_repository = repository_text
+    else:
+        raise GripPreflightError(
+            "runtime deploy schedule source kind is not recognized"
+        )
+
+    repository, runner, observed_identity = (
+        grabowski_self_deploy._deployment_source_preflight(
+            expected_head,
+            source_repository,
+            source_owner,
+        )
     )
+    if observed_identity["identity_sha256"] != expected_identity_sha256:
+        raise GripPreflightError(
+            "runtime deploy schedule source identity drifted after scheduling"
+        )
+    effective_identity = schedule.get("effective_source_identity_sha256")
+    if (
+        effective_identity is not None
+        and effective_identity != expected_identity_sha256
+    ):
+        raise GripPreflightError(
+            "runtime deploy scheduled job is bound to another source identity"
+        )
+    return {
+        "repository": str(repository),
+        "runner": str(runner),
+        "source_kind": observed_identity["source_kind"],
+        "source_identity_sha256": observed_identity["identity_sha256"],
+        "source_lease_resource_key": observed_identity["lease_evidence"].get(
+            "resource_key"
+        ),
+        "source_lease_metadata_sha256": (
+            (observed_identity["lease_evidence"].get("lease") or {}).get(
+                "metadata_sha256"
+            )
+        ),
+    }
 
 
 def _runtime_deploy_self_expected_argv_sha256(
@@ -15376,6 +15513,580 @@ def _captain_runtime_deploy_target_errors(
     return errors
 
 
+def _runtime_deploy_pending_unit_promotion_valid(
+    evidence: Any,
+    *,
+    expected_job_prefix: str,
+) -> bool:
+    fields = {
+        "schema_version",
+        "kind",
+        "unit",
+        "deploy_index_updated",
+        "index_updated_at_unix",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    material = {
+        key: value for key, value in evidence.items() if key != "evidence_sha256"
+    }
+    return bool(
+        type(evidence.get("schema_version")) is int
+        and evidence["schema_version"] == 1
+        and evidence.get("kind") == "grabowski_runtime_deploy_pending_unit_promotion"
+        and evidence.get("deploy_index_updated") is True
+        and type(evidence.get("index_updated_at_unix")) is int
+        and evidence["index_updated_at_unix"] >= 0
+        and isinstance(evidence.get("unit"), str)
+        and re.fullmatch(
+            rf"{re.escape(expected_job_prefix)}[0-9a-f]{{12}}", evidence["unit"]
+        ) is not None
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
+
+
+def _runtime_deploy_stale_pending_reconciliation_valid(
+    evidence: Any,
+    *,
+    expected_job_prefix: str,
+) -> bool:
+    evidence_fields = {
+        "schema_version",
+        "kind",
+        "unit",
+        "dispatch_outcome",
+        "deploy_index_updated",
+        "audit_recorded",
+        "index_updated_at_unix",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != evidence_fields:
+        return False
+    material = {
+        key: value
+        for key, value in evidence.items()
+        if key != "evidence_sha256"
+    }
+    return bool(
+        evidence.get("schema_version") == 1
+        and evidence.get("kind")
+        == "grabowski_runtime_deploy_stale_pending_reconciliation"
+        and evidence.get("dispatch_outcome") == "not_started"
+        and evidence.get("deploy_index_updated") is True
+        and isinstance(evidence.get("audit_recorded"), bool)
+        and not isinstance(evidence.get("index_updated_at_unix"), bool)
+        and isinstance(evidence.get("index_updated_at_unix"), int)
+        and evidence.get("index_updated_at_unix", -1) >= 0
+        and isinstance(evidence.get("unit"), str)
+        and re.fullmatch(
+            rf"{re.escape(expected_job_prefix)}[0-9a-f]{{12}}",
+            evidence.get("unit", ""),
+        )
+        is not None
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
+
+
+def _runtime_deploy_origin_main_refresh_evidence_valid(
+    evidence: Any,
+    *,
+    expected_head: str,
+) -> bool:
+    fields = {
+        "schema_version",
+        "kind",
+        "canonical_repository",
+        "expected_head",
+        "previous_head",
+        "previous_branch",
+        "previous_origin_main",
+        "observed_origin_main",
+        "owner_id",
+        "operation_resource_key",
+        "canonical_resource_key",
+        "common_dir_resource_key",
+        "objects_resource_key",
+        "origin_main_ref_resource_key",
+        "fetch",
+        "update_ref",
+        "public_github_main",
+        "receipt_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    material = {
+        key: value
+        for key, value in evidence.items()
+        if key != "receipt_sha256"
+    }
+    fetch = evidence.get("fetch")
+    update_ref = evidence.get("update_ref")
+    public = evidence.get("public_github_main")
+    resource_fields = (
+        "operation_resource_key",
+        "canonical_resource_key",
+        "common_dir_resource_key",
+        "objects_resource_key",
+        "origin_main_ref_resource_key",
+    )
+    return bool(
+        evidence.get("schema_version") == 1
+        and evidence.get("kind")
+        == "grabowski_runtime_deploy_origin_main_refresh"
+        and evidence.get("expected_head") == expected_head
+        and evidence.get("observed_origin_main") == expected_head
+        and isinstance(evidence.get("canonical_repository"), str)
+        and str(evidence.get("canonical_repository")).startswith("/")
+        and isinstance(evidence.get("previous_head"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", evidence.get("previous_head", "")) is not None
+        and isinstance(evidence.get("previous_origin_main"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", evidence.get("previous_origin_main", ""))
+        is not None
+        and (
+            evidence.get("previous_branch") is None
+            or isinstance(evidence.get("previous_branch"), str)
+        )
+        and isinstance(evidence.get("owner_id"), str)
+        and bool(evidence.get("owner_id"))
+        and all(
+            isinstance(evidence.get(key), str) and bool(evidence.get(key))
+            for key in resource_fields
+        )
+        and isinstance(fetch, dict)
+        and set(fetch) == {"returncode", "timed_out"}
+        and fetch.get("returncode") == 0
+        and fetch.get("timed_out") is False
+        and isinstance(update_ref, dict)
+        and set(update_ref) == {"returncode", "timed_out", "reported_success"}
+        and (
+            update_ref.get("returncode") is None
+            or (
+                isinstance(update_ref.get("returncode"), int)
+                and not isinstance(update_ref.get("returncode"), bool)
+            )
+        )
+        and isinstance(update_ref.get("timed_out"), bool)
+        and isinstance(update_ref.get("reported_success"), bool)
+        and update_ref.get("reported_success")
+        == (
+            update_ref.get("timed_out") is False
+            and update_ref.get("returncode") == 0
+        )
+        and isinstance(public, dict)
+        and set(public) == {"before_fetch", "after_fetch", "after_cas"}
+        and public.get("before_fetch") == expected_head
+        and public.get("after_fetch") == expected_head
+        and public.get("after_cas") == expected_head
+        and evidence.get("receipt_sha256") == sha256_json(material)
+    )
+
+
+def _runtime_deploy_origin_main_fetch_effect_evidence_valid(
+    evidence: Any,
+    *,
+    expected_head: str,
+) -> bool:
+    fields = {
+        "schema_version",
+        "kind",
+        "canonical_repository",
+        "expected_head",
+        "previous_head",
+        "previous_branch",
+        "previous_origin_main",
+        "owner_id",
+        "operation_resource_key",
+        "canonical_resource_key",
+        "common_dir_resource_key",
+        "objects_resource_key",
+        "origin_main_ref_resource_key",
+        "target_object",
+        "fetch",
+        "public_github_main",
+        "effect_observed",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    material = {k:v for k,v in evidence.items() if k != "evidence_sha256"}
+    fetch = evidence.get("fetch")
+    target_object = evidence.get("target_object")
+    public = evidence.get("public_github_main")
+    resource_fields = (
+        "operation_resource_key",
+        "canonical_resource_key",
+        "common_dir_resource_key",
+        "objects_resource_key",
+        "origin_main_ref_resource_key",
+    )
+    return bool(
+        evidence.get("schema_version") == 1
+        and evidence.get("kind") == "grabowski_runtime_deploy_origin_main_fetch_effect"
+        and evidence.get("expected_head") == expected_head
+        and evidence.get("effect_observed") is True
+        and isinstance(evidence.get("canonical_repository"), str)
+        and str(evidence.get("canonical_repository")).startswith("/")
+        and isinstance(evidence.get("previous_head"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", evidence.get("previous_head", "")) is not None
+        and isinstance(evidence.get("previous_origin_main"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", evidence.get("previous_origin_main", "")) is not None
+        and (
+            evidence.get("previous_branch") is None
+            or isinstance(evidence.get("previous_branch"), str)
+        )
+        and isinstance(evidence.get("owner_id"), str)
+        and bool(evidence.get("owner_id"))
+        and all(
+            isinstance(evidence.get(k), str) and bool(evidence.get(k))
+            for k in resource_fields
+        )
+        and isinstance(fetch, dict)
+        and set(fetch) == {"returncode", "timed_out"}
+        and fetch.get("returncode") == 0
+        and fetch.get("timed_out") is False
+        and isinstance(target_object, dict)
+        and set(target_object) == {"before_fetch_present", "after_fetch_commit"}
+        and target_object.get("before_fetch_present") is False
+        and target_object.get("after_fetch_commit") == expected_head
+        and isinstance(public, dict)
+        and set(public) == {"before_fetch"}
+        and public.get("before_fetch") == expected_head
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
+
+
+def _runtime_deploy_origin_main_refresh_effect_evidence_valid(
+    evidence: Any,
+    *,
+    expected_head: str,
+) -> bool:
+    fields = {
+        "schema_version",
+        "kind",
+        "canonical_repository",
+        "expected_head",
+        "previous_head",
+        "previous_branch",
+        "previous_origin_main",
+        "observed_origin_main",
+        "owner_id",
+        "operation_resource_key",
+        "canonical_resource_key",
+        "common_dir_resource_key",
+        "objects_resource_key",
+        "origin_main_ref_resource_key",
+        "fetch",
+        "update_ref",
+        "public_github_main",
+        "effect_observed",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    material = {
+        key: value
+        for key, value in evidence.items()
+        if key != "evidence_sha256"
+    }
+    fetch = evidence.get("fetch")
+    update_ref = evidence.get("update_ref")
+    public = evidence.get("public_github_main")
+    resource_fields = (
+        "operation_resource_key",
+        "canonical_resource_key",
+        "common_dir_resource_key",
+        "objects_resource_key",
+        "origin_main_ref_resource_key",
+    )
+    return bool(
+        evidence.get("schema_version") == 1
+        and evidence.get("kind")
+        == "grabowski_runtime_deploy_origin_main_refresh_effect"
+        and evidence.get("expected_head") == expected_head
+        and evidence.get("observed_origin_main") == expected_head
+        and evidence.get("effect_observed") is True
+        and isinstance(evidence.get("canonical_repository"), str)
+        and str(evidence.get("canonical_repository")).startswith("/")
+        and isinstance(evidence.get("previous_head"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", evidence.get("previous_head", "")) is not None
+        and isinstance(evidence.get("previous_origin_main"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", evidence.get("previous_origin_main", ""))
+        is not None
+        and (
+            evidence.get("previous_branch") is None
+            or isinstance(evidence.get("previous_branch"), str)
+        )
+        and isinstance(evidence.get("owner_id"), str)
+        and bool(evidence.get("owner_id"))
+        and all(
+            isinstance(evidence.get(key), str) and bool(evidence.get(key))
+            for key in resource_fields
+        )
+        and isinstance(fetch, dict)
+        and set(fetch) == {"returncode", "timed_out"}
+        and fetch.get("returncode") == 0
+        and fetch.get("timed_out") is False
+        and isinstance(update_ref, dict)
+        and set(update_ref) == {"returncode", "timed_out", "reported_success"}
+        and (
+            update_ref.get("returncode") is None
+            or (
+                isinstance(update_ref.get("returncode"), int)
+                and not isinstance(update_ref.get("returncode"), bool)
+            )
+        )
+        and isinstance(update_ref.get("timed_out"), bool)
+        and isinstance(update_ref.get("reported_success"), bool)
+        and update_ref.get("reported_success")
+        == (
+            update_ref.get("timed_out") is False
+            and update_ref.get("returncode") == 0
+        )
+        and isinstance(public, dict)
+        and set(public) == {"before_fetch", "after_fetch"}
+        and public.get("before_fetch") == expected_head
+        and public.get("after_fetch") == expected_head
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
+
+
+def _runtime_deploy_rootbroker_authority_evidence_valid(
+    evidence: Any,
+    *,
+    expected_head: str,
+) -> bool:
+    fields = {
+        "schema_version",
+        "kind",
+        "expected_head",
+        "outcome",
+        "attested_head",
+        "effect_started",
+        "request_id",
+        "reference_sha256",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    material = {
+        key: value
+        for key, value in evidence.items()
+        if key != "evidence_sha256"
+    }
+    attested_head = evidence.get("attested_head")
+    request_id = evidence.get("request_id")
+    reference_sha256 = evidence.get("reference_sha256")
+    return bool(
+        evidence.get("schema_version") == 1
+        and evidence.get("kind")
+        == "grabowski_runtime_deploy_rootbroker_authority_effect"
+        and evidence.get("expected_head") == expected_head
+        and isinstance(evidence.get("outcome"), str)
+        and bool(evidence.get("outcome"))
+        and evidence.get("effect_started") is True
+        and attested_head == expected_head
+        and (
+            request_id is None
+            or (isinstance(request_id, str) and 0 < len(request_id) <= 256)
+        )
+        and (
+            reference_sha256 is None
+            or (
+                isinstance(reference_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", reference_sha256) is not None
+            )
+        )
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
+
+
+def _runtime_deploy_auto_source_effect_evidence_valid(
+    evidence: Any,
+    *,
+    expected_head: str,
+) -> bool:
+    fields = {
+        "schema_version",
+        "kind",
+        "expected_head",
+        "repository",
+        "owner_id",
+        "generation",
+        "path_resource_key",
+        "source_identity_sha256",
+        "lifecycle_checkout_key",
+        "uncertainty_fence_id",
+        "uncertainty_evidence_sha256",
+        "effect_observed",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    repository = evidence.get("repository")
+    owner_id = evidence.get("owner_id")
+    generation = evidence.get("generation")
+    material = {
+        key: value
+        for key, value in evidence.items()
+        if key != "evidence_sha256"
+    }
+    return bool(
+        evidence.get("schema_version") == 1
+        and evidence.get("kind")
+        == "grabowski_runtime_deploy_auto_source_effect"
+        and evidence.get("expected_head") == expected_head
+        and isinstance(repository, str)
+        and repository.startswith("/")
+        and isinstance(owner_id, str)
+        and isinstance(generation, str)
+        and re.fullmatch(r"[0-9a-f]{12}", generation) is not None
+        and owner_id
+        == f"runtime-deploy-source:{expected_head[:12]}:{generation}"
+        and evidence.get("path_resource_key") == f"path:{repository}"
+        and isinstance(evidence.get("source_identity_sha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", evidence["source_identity_sha256"]
+        )
+        is not None
+        and isinstance(evidence.get("lifecycle_checkout_key"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", evidence["lifecycle_checkout_key"]
+        )
+        is not None
+        and isinstance(evidence.get("uncertainty_fence_id"), str)
+        and re.fullmatch(r"[0-9a-f]{32}", evidence["uncertainty_fence_id"])
+        is not None
+        and isinstance(evidence.get("uncertainty_evidence_sha256"), str)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", evidence["uncertainty_evidence_sha256"]
+        )
+        is not None
+        and evidence.get("effect_observed") is True
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
+
+
+def _runtime_deploy_local_mutation_evidence_valid(
+    evidence: Any,
+    *,
+    expected_job_prefix: str,
+    expected_head: str,
+) -> bool:
+    if _runtime_deploy_pending_unit_promotion_valid(
+        evidence,
+        expected_job_prefix=expected_job_prefix,
+    ):
+        return True
+    if _runtime_deploy_stale_pending_reconciliation_valid(
+        evidence,
+        expected_job_prefix=expected_job_prefix,
+    ):
+        return True
+    if _runtime_deploy_origin_main_refresh_evidence_valid(
+        evidence,
+        expected_head=expected_head,
+    ):
+        return True
+    if _runtime_deploy_origin_main_fetch_effect_evidence_valid(
+        evidence,
+        expected_head=expected_head,
+    ):
+        return True
+    if _runtime_deploy_origin_main_refresh_effect_evidence_valid(
+        evidence,
+        expected_head=expected_head,
+    ):
+        return True
+    if _runtime_deploy_rootbroker_authority_evidence_valid(
+        evidence,
+        expected_head=expected_head,
+    ):
+        return True
+    if _runtime_deploy_auto_source_effect_evidence_valid(
+        evidence,
+        expected_head=expected_head,
+    ):
+        return True
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "schema_version",
+        "kind",
+        "effects",
+        "evidence_sha256",
+    }:
+        return False
+    if (
+        evidence.get("schema_version") != 1
+        or evidence.get("kind")
+        != "grabowski_runtime_deploy_local_mutation_bundle"
+    ):
+        return False
+    effects = evidence.get("effects")
+    if not isinstance(effects, list) or not 2 <= len(effects) <= 5:
+        return False
+    expected_order = {
+        "grabowski_runtime_deploy_pending_unit_promotion": -1,
+        "grabowski_runtime_deploy_stale_pending_reconciliation": 0,
+        "grabowski_runtime_deploy_origin_main_refresh": 1,
+        "grabowski_runtime_deploy_origin_main_fetch_effect": 1,
+        "grabowski_runtime_deploy_origin_main_refresh_effect": 1,
+        "grabowski_runtime_deploy_rootbroker_authority_effect": 2,
+        "grabowski_runtime_deploy_auto_source_effect": 3,
+    }
+    observed_order: list[int] = []
+    for effect in effects:
+        kind = effect.get("kind") if isinstance(effect, dict) else None
+        order = expected_order.get(kind)
+        if order is None:
+            return False
+        observed_order.append(order)
+        if kind == "grabowski_runtime_deploy_pending_unit_promotion":
+            valid = _runtime_deploy_pending_unit_promotion_valid(
+                effect,
+                expected_job_prefix=expected_job_prefix,
+            )
+        elif kind == "grabowski_runtime_deploy_stale_pending_reconciliation":
+            valid = _runtime_deploy_stale_pending_reconciliation_valid(
+                effect,
+                expected_job_prefix=expected_job_prefix,
+            )
+        elif kind == "grabowski_runtime_deploy_origin_main_refresh":
+            valid = _runtime_deploy_origin_main_refresh_evidence_valid(
+                effect,
+                expected_head=expected_head,
+            )
+        elif kind == "grabowski_runtime_deploy_origin_main_fetch_effect":
+            valid = _runtime_deploy_origin_main_fetch_effect_evidence_valid(
+                effect,
+                expected_head=expected_head,
+            )
+        elif kind == "grabowski_runtime_deploy_origin_main_refresh_effect":
+            valid = _runtime_deploy_origin_main_refresh_effect_evidence_valid(
+                effect,
+                expected_head=expected_head,
+            )
+        elif kind == "grabowski_runtime_deploy_rootbroker_authority_effect":
+            valid = _runtime_deploy_rootbroker_authority_evidence_valid(
+                effect,
+                expected_head=expected_head,
+            )
+        else:
+            valid = _runtime_deploy_auto_source_effect_evidence_valid(
+                effect,
+                expected_head=expected_head,
+            )
+        if not valid:
+            return False
+    if observed_order != sorted(set(observed_order)):
+        return False
+    material = {
+        key: value
+        for key, value in evidence.items()
+        if key != "evidence_sha256"
+    }
+    return evidence.get("evidence_sha256") == sha256_json(material)
+
+
 def _runtime_deploy_schedule_errors(
     schedule: Any,
     *,
@@ -15416,6 +16127,14 @@ def _runtime_deploy_schedule_errors(
         errors.append("runtime_deploy_schedule_argv_hash_mismatch")
     if schedule.get("source_identity_sha256") != expected_source_identity_sha256:
         errors.append("runtime_deploy_schedule_source_identity_mismatch")
+    if schedule.get("reused_across_source_identity") is True:
+        errors.append("runtime_deploy_schedule_reused_across_source_identity")
+    effective_source_identity_sha256 = schedule.get("effective_source_identity_sha256")
+    if (
+        effective_source_identity_sha256 is not None
+        and effective_source_identity_sha256 != expected_source_identity_sha256
+    ):
+        errors.append("runtime_deploy_schedule_effective_source_identity_mismatch")
     source_identity = schedule.get("source_identity")
     if not isinstance(source_identity, dict) or source_identity.get("identity_sha256") != expected_source_identity_sha256:
         errors.append("runtime_deploy_schedule_source_identity_missing_or_unbound")
@@ -15425,6 +16144,16 @@ def _runtime_deploy_schedule_errors(
         errors.append("runtime_deploy_status_tool_missing")
     if schedule.get("logs_tool") != "grabowski_job_logs":
         errors.append("runtime_deploy_logs_tool_missing")
+    local_mutation_evidence = schedule.get("local_mutation_evidence")
+    if (
+        local_mutation_evidence is not None
+        and not _runtime_deploy_local_mutation_evidence_valid(
+            local_mutation_evidence,
+            expected_job_prefix=expected_job_prefix,
+            expected_head=expected_head,
+        )
+    ):
+        errors.append("runtime_deploy_schedule_local_mutation_evidence_invalid")
     path_values: dict[str, Path] = {}
     for key in ("metadata_path", "stdout_path", "stderr_path"):
         value = schedule.get(key)
@@ -15445,6 +16174,7 @@ def _runtime_deploy_schedule_errors(
             if path_values[key].name != expected_name:
                 errors.append(f"runtime_deploy_{key}_filename_invalid")
     return errors
+
 
 
 def _run_captain_runtime_deploy(
@@ -15470,7 +16200,9 @@ def _run_captain_runtime_deploy(
         "verification_scope": "schedule-registration",
         "deployment_completion_verified": False,
     }
-    source_repository, source_lease_owner_id = _runtime_deploy_source_parameters(parameters)
+    source_repository, source_lease_owner_id = _runtime_deploy_source_parameters(
+        parameters
+    )
     target_errors = _captain_runtime_deploy_target_errors(action, parameters)
     if target_errors:
         execution_result["preflight_errors"] = target_errors
@@ -15488,7 +16220,10 @@ def _run_captain_runtime_deploy(
         )
     except (GripPreflightError, OSError, RuntimeError, ValueError) as exc:
         execution_result["preflight_errors"] = [str(exc)]
-        execution_result["verification_error"] = f"runtime deploy preflight failed; deployment not scheduled: {exc}"
+        execution_result["verification_error"] = (
+            "runtime deploy preflight failed; deployment not scheduled: "
+            f"{exc}"
+        )
         return execution_result
     execution_result["preflight"] = preflight
     execution_result["preflight_passed"] = True
@@ -15506,20 +16241,83 @@ def _run_captain_runtime_deploy(
             )
         )
         execution_result["command_returned"] = True
-    except Exception as exc:  # pragma: no cover - defensive receipt boundary
+    except RuntimeDeployPreEffectRefusal as exc:
+        local_mutation_evidence = getattr(exc, "local_mutation_evidence", None)
+        if local_mutation_evidence is None:
+            execution_result["execution_invoked"] = False
+            execution_result["execution_attempted"] = False
+        else:
+            execution_result["local_mutation_observed"] = True
+            execution_result["local_mutation_evidence"] = local_mutation_evidence
+        execution_result["pre_effect_refusal"] = True
+        execution_result["definitely_not_scheduled"] = True
+        execution_result["verification_error"] = (
+            "runtime deploy scheduling refused before job registration: " + str(exc)
+        )
+        return execution_result
+    except Exception as exc:
         execution_result["runner_exception"] = (
             f"{type(exc).__name__}: {_bounded_command_output(str(exc), limit=512)}"
         )
+        local_mutation_evidence = getattr(exc, "local_mutation_evidence", None)
+        expected_job_prefix = str(preflight.get("job_prefix") or "")
+        if _runtime_deploy_local_mutation_evidence_valid(
+            local_mutation_evidence,
+            expected_job_prefix=expected_job_prefix,
+            expected_head=expected_head,
+        ):
+            execution_result["local_mutation_observed"] = True
+            execution_result["local_mutation_evidence"] = dict(
+                local_mutation_evidence
+            )
         execution_result["mutation_outcome_unknown"] = True
         execution_result["local_mutation_outcome_unknown"] = True
         execution_result["verification_error"] = (
-            "runtime deploy scheduling raised an exception; a job may already have been registered"
+            "runtime deploy scheduling raised an exception; a job may already "
+            "have been registered"
         )
         return execution_result
     execution_result["schedule"] = schedule
+    returned_local_mutation_evidence = (
+        schedule.get("local_mutation_evidence")
+        if isinstance(schedule, dict)
+        else None
+    )
+    if (
+        returned_local_mutation_evidence is not None
+        and _runtime_deploy_local_mutation_evidence_valid(
+            returned_local_mutation_evidence,
+            expected_job_prefix=str(preflight.get("job_prefix") or ""),
+            expected_head=expected_head,
+        )
+    ):
+        execution_result["local_mutation_observed"] = True
+        execution_result["local_mutation_evidence"] = dict(
+            returned_local_mutation_evidence
+        )
+    try:
+        source_readback = _runtime_deploy_self_schedule_source_preflight(
+            schedule,
+            expected_head,
+        )
+    except (GripPreflightError, OSError, RuntimeError, ValueError) as exc:
+        message = (
+            "runtime deploy schedule source readback failed after scheduling: "
+            f"{exc}"
+        )
+        execution_result["post_verify_errors"] = [message]
+        execution_result["mutation_outcome_unknown"] = True
+        execution_result["local_mutation_outcome_unknown"] = True
+        execution_result["verification_error"] = message
+        return execution_result
+    execution_result["source_readback"] = source_readback
     effective_delay = schedule.get("delay_seconds") if isinstance(schedule, dict) else None
     expected_schedule_hash = (
-        _runtime_deploy_self_expected_argv_sha256(preflight, expected_head, effective_delay)
+        _runtime_deploy_self_expected_argv_sha256(
+            {**preflight, **source_readback},
+            expected_head,
+            effective_delay,
+        )
         if isinstance(effective_delay, int) and not isinstance(effective_delay, bool)
         else ""
     )
@@ -15530,7 +16328,9 @@ def _run_captain_runtime_deploy(
         expected_argv_sha256=expected_schedule_hash,
         expected_job_root=str(preflight["job_root"]),
         expected_job_prefix=str(preflight["job_prefix"]),
-        expected_source_identity_sha256=str(preflight["source_identity_sha256"]),
+        expected_source_identity_sha256=str(
+            source_readback["source_identity_sha256"]
+        ),
     )
     if schedule_errors:
         execution_result["post_verify_errors"] = schedule_errors
@@ -15542,14 +16342,19 @@ def _run_captain_runtime_deploy(
     execution_result["scheduled_unit"] = schedule["unit"]
     execution_result["already_scheduled"] = schedule["already_scheduled"]
     execution_result["new_job_registered"] = not schedule["already_scheduled"]
-    execution_result["local_mutation_observed"] = not schedule["already_scheduled"]
+    local_mutation_evidence = schedule.get("local_mutation_evidence")
+    execution_result["local_mutation_observed"] = (
+        not schedule["already_scheduled"] or local_mutation_evidence is not None
+    )
+    if local_mutation_evidence is not None:
+        execution_result["local_mutation_evidence"] = dict(local_mutation_evidence)
     execution_result["verification_passed"] = True
     execution_result["next_verification"] = {
         "status_tool": schedule["status_tool"],
         "logs_tool": schedule["logs_tool"],
         "unit": schedule["unit"],
         "expected_head": expected_head,
-        "source_identity_sha256": schedule["source_identity_sha256"],
+        "source_identity_sha256": source_readback["source_identity_sha256"],
     }
     execution_result["non_claims"] = [
         "schedule verification does not claim that the delayed deployment has completed",
@@ -15557,8 +16362,6 @@ def _run_captain_runtime_deploy(
         "runtime identity must be checked after the connector reconnects",
     ]
     return execution_result
-
-
 
 def _run_runtime_refresh_lease_release(
     spec: GripSpec,

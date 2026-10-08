@@ -175,6 +175,15 @@ class DeploySourceSurfaceTests(unittest.TestCase):
         ) as check, patch.object(
             grips, "_runtime_deploy_self_schedule", return_value=schedule
         ) as scheduler, patch.object(
+            grips,
+            "_runtime_deploy_self_schedule_source_preflight",
+            return_value={
+                "repository": SOURCE_PATH,
+                "runner": f"{SOURCE_PATH}/tools/run_scheduled_deploy.py",
+                "source_kind": "detached-worktree",
+                "source_identity_sha256": SOURCE_SHA,
+            },
+        ) as source_readback, patch.object(
             grips, "_runtime_deploy_self_expected_argv_sha256", return_value="d" * 64
         ):
             result = grips.grip_run(
@@ -191,6 +200,7 @@ class DeploySourceSurfaceTests(unittest.TestCase):
         self.assertEqual(SOURCE_SHA, execution["next_verification"]["source_identity_sha256"])
         check.assert_called_once_with(CAPTAIN_HEAD, SOURCE_PATH, SOURCE_OWNER)
         scheduler.assert_called_once_with(CAPTAIN_HEAD, 8, SOURCE_PATH, SOURCE_OWNER)
+        source_readback.assert_called_once_with(schedule, CAPTAIN_HEAD)
 
     def test_captain_blocks_source_target_parameter_drift_before_schedule(self) -> None:
         action = captain_action(

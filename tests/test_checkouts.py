@@ -47,6 +47,7 @@ if "mcp" not in sys.modules:
 
 
 import grabowski_checkouts as checkouts
+import grabowski_operator_obligation as obligations
 import grabowski_work_admission as work_admission
 
 
@@ -74,6 +75,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
             patch.object(checkouts, "CHECKOUT_DB", self.checkout_db),
             patch.object(checkouts, "ARCHIVE_ROOT", self.archive_root),
             patch.object(checkouts, "CHECKOUT_LOCK", self.root / "state" / "checkouts.lock"),
+            patch.object(
+                checkouts,
+                "AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK",
+                self.root / "state" / "runtime-deploy-schedule.lock",
+            ),
             patch.object(checkouts.resources, "RESOURCE_DB", self.resource_db),
             patch.object(checkouts.tasks, "TASK_DB", self.task_db),
             patch.object(checkouts.operator, "_safe_environment", return_value=os.environ.copy()),
@@ -81,6 +87,15 @@ class CheckoutLifecycleTests(unittest.TestCase):
             patch.object(checkouts.operator, "_require_operator_capability"),
             patch.object(checkouts.base, "_append_audit"),
             patch.object(checkouts, "_processes_under", return_value=[]),
+            patch.dict(
+                os.environ,
+                {
+                    "GRABOWSKI_OPERATOR_OBLIGATION_ROOT": str(
+                        self.root / "state" / "operator-obligations"
+                    )
+                },
+            ),
+            patch.object(obligations.alert_outbox, "enqueue_and_schedule"),
         ]
         for item in self.patches:
             item.start()
@@ -2452,6 +2467,1107 @@ class CheckoutLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
                 checkouts._active_checkout_operation_uncertainties()
         self.assertTrue(connection.closed)
+
+    def _materialize_uncertainty_fixture(
+        self,
+        *,
+        create_worktree: bool,
+        expire_leases: bool = True,
+    ) -> tuple[Path, dict[str, object], dict[str, object], str]:
+        target = self.root / "worktrees" / "materialized"
+        common_dir = checkouts._git_common_dir(self.repo)
+        owner = "runtime-deploy-source:materialize-test"
+        checkout_key = checkouts._checkout_key(common_dir, target)
+        lifecycle = checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=target,
+            owner_id=owner,
+            purpose="materialize uncertainty test",
+            source_kind="operator_obligation",
+            source_id="goo-runtime-deploy-source-materialize-test",
+            artifact_class="deployment-source-worktree",
+            retention_until_unix=int(time.time()) + 3600,
+            expected_head=self.head,
+            expected_branch=None,
+        )
+        common_dir_key = f"path:{common_dir}"
+        path_key = f"path:{target}"
+        acquisition = checkouts.resources.acquire_resources(
+            owner,
+            [path_key, common_dir_key],
+            purpose="materialize uncertainty test",
+            ttl_seconds=120,
+        )
+        fence = checkouts._persist_checkout_operation_uncertainty(
+            lease={"owner_id": owner, "leases": acquisition["leases"]},
+            checkout_key=checkout_key,
+            owner_id=owner,
+            operation="materialize",
+            operation_id="materialize-test",
+            evidence={
+                "repo": str(self.repo.resolve()),
+                "git_common_dir": str(common_dir),
+                "checkout_path": str(target),
+                "checkout_key": checkout_key,
+                "owner_id": owner,
+                "expected_head": self.head,
+                "expected_branch": None,
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+            },
+        )
+        if create_worktree:
+            self._git("worktree", "add", "--detach", str(target), self.head)
+        obligations.open_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "objective": "Materialize the exact detached deployment source.",
+                "acceptance": [
+                    {
+                        "id": "source-materialized",
+                        "description": "The exact detached source exists.",
+                    }
+                ],
+                "origin": {
+                    "source": "grabowski_runtime_deploy_schedule",
+                    "repo": "heimgewebe/grabowski",
+                },
+            }
+        )
+        self.assertTrue(
+            obligations.status_obligation(
+                "goo-runtime-deploy-source-materialize-test"
+            )["continuation_required"]
+        )
+        with self.assertRaisesRegex(RuntimeError, "durably fenced"):
+            checkouts._require_no_checkout_operation_uncertainty([common_dir_key])
+        if expire_leases:
+            self._expire_uncertainty_lease(fence)
+        return target, fence, lifecycle, common_dir_key
+
+    def test_materialize_uncertainty_reconcile_removes_exact_created_worktree(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        self.assertTrue(target.exists())
+        self.assertEqual(
+            checkouts._materialize_uncertainty_readback(fence)["state"],
+            "recoverable_created",
+        )
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "reconciled_success")
+        self.assertFalse(target.exists())
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+        obligation_status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertFalse(obligation_status["continuation_required"])
+        self.assertEqual(obligation_status["resolution_disposition"], "resolved")
+
+    def test_materialize_uncertainty_reconcile_respects_git_mutation_freeze(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        mutation_gate = checkouts.operator._require_operator_mutation
+        mutation_gate.reset_mock()
+
+        def reject_git_mutation(capability: str, **_kwargs) -> None:
+            if capability == "git_cli":
+                raise PermissionError("git mutation frozen")
+
+        mutation_gate.side_effect = reject_git_mutation
+        try:
+            with self.assertRaisesRegex(PermissionError, "git mutation frozen"):
+                checkouts.grabowski_checkout_uncertainty_reconcile(
+                    fence["fence_id"],
+                    "reconcile-checkout-operation-outcome",
+                )
+        finally:
+            mutation_gate.side_effect = None
+
+        self.assertEqual(
+            [item.args[0] for item in mutation_gate.call_args_list],
+            ["resource_lease", "git_cli"],
+        )
+        git_gate = mutation_gate.call_args_list[1]
+        self.assertEqual(git_gate.kwargs["path"], str(target))
+        self.assertEqual(git_gate.kwargs["repo"], str(self.repo.resolve()))
+        self.assertTrue(target.exists())
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
+    def _materialize_uncertainty_retention(
+        self,
+        target: Path,
+        lifecycle: dict[str, object],
+    ) -> dict[str, object]:
+        return checkouts._upsert_retention(
+            checkout_key=str(lifecycle["checkout_key"]),
+            repo_common_dir=checkouts._git_common_dir(self.repo),
+            repo_path=self.repo,
+            checkout_path=target,
+            owner_id=str(lifecycle["owner_id"]),
+            purpose=f"detached runtime deploy source {self.head[:12]}",
+            retention_until_unix=int(lifecycle["retention_until_unix"]),
+            expected_head=self.head,
+            expected_branch=None,
+        )
+
+    def test_materialize_uncertainty_reconcile_preserves_completed_source(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "source-materialized",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": (
+                            f"runtime-deploy-source-materialized:{self.head}:"
+                            "materialize-test"
+                        ),
+                        "sha256": "8" * 64,
+                    }
+                ],
+                "closure_classification": {
+                    "convergence_required": False,
+                    "reason": "process_only",
+                },
+            }
+        )
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_success")
+        self.assertTrue(target.exists())
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+        obligation_status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(obligation_status["state"], "completed")
+        self.assertFalse(obligation_status["continuation_required"])
+
+
+    def test_materialize_uncertainty_reconcile_preserves_live_completed_source_path_lease(self) -> None:
+        target, fence, lifecycle, common_dir_key = (
+            self._materialize_uncertainty_fixture(
+                create_worktree=True,
+                expire_leases=False,
+            )
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        owner = "runtime-deploy-source:materialize-test"
+        path_key = f"path:{target}"
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "source-materialized",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": (
+                            f"runtime-deploy-source-materialized:{self.head}:"
+                            "materialize-test"
+                        ),
+                        "sha256": "8" * 64,
+                    }
+                ],
+                "closure_classification": {
+                    "convergence_required": False,
+                    "reason": "process_only",
+                },
+            }
+        )
+        common_lease = checkouts.resources.inspect_resource(common_dir_key)
+        self.assertIsNotNone(common_lease)
+        checkouts.resources.release_resources(
+            owner,
+            [common_dir_key],
+            expected_leases=[common_lease],
+        )
+        path_lease_before = checkouts.resources.inspect_resource(path_key)
+        self.assertIsNotNone(path_lease_before)
+
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_success")
+        self.assertTrue(target.exists())
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertIsNone(checkouts.resources.inspect_resource(common_dir_key))
+        self.assertEqual(checkouts.resources.inspect_resource(path_key), path_lease_before)
+    def test_materialize_uncertainty_reconcile_removes_expired_completed_source(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "source-materialized",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": (
+                            f"runtime-deploy-source-materialized:{self.head}:"
+                            "materialize-test"
+                        ),
+                        "sha256": "8" * 64,
+                    }
+                ],
+                "closure_classification": {
+                    "convergence_required": False,
+                    "reason": "process_only",
+                },
+            }
+        )
+        with patch.object(
+            checkouts,
+            "_now",
+            return_value=int(retention["retention_until_unix"]),
+        ):
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "reconciled_success")
+        self.assertTrue(result["readback"]["expired_completed_source_removed"])
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["state"], "completed")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_expired_completed_source_cleanup_retry_preserves_completed_obligation(
+        self,
+    ) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "source-materialized",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": (
+                            f"runtime-deploy-source-materialized:{self.head}:"
+                            "materialize-test"
+                        ),
+                        "sha256": "8" * 64,
+                    }
+                ],
+                "closure_classification": {
+                    "convergence_required": False,
+                    "reason": "process_only",
+                },
+            }
+        )
+        deadline = int(retention["retention_until_unix"])
+        with patch.object(
+            checkouts,
+            "_now",
+            return_value=deadline,
+        ), patch.object(
+            checkouts,
+            "_release_retention_exact",
+            return_value=False,
+        ) as release_retention:
+            first = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(first["state"], "still_fenced")
+        self.assertIn(
+            "materialize-recovery-retention-release-failed",
+            first["readback"]["reason"],
+        )
+        release_retention.assert_called_once_with(retention)
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            obligations.status_obligation(
+                "goo-runtime-deploy-source-materialize-test"
+            )["state"],
+            "completed",
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
+        with patch.object(checkouts, "_now", return_value=deadline):
+            retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(retry["state"], "reconciled")
+        self.assertEqual(retry["outcome"], "reconciled_success")
+        self.assertTrue(retry["readback"]["removed_recovery_worktree"])
+        self.assertTrue(retry["readback"]["expired_completed_source_removed"])
+        self.assertIsNotNone(retry["readback"]["recovery_removal_intent"])
+        self.assertEqual(
+            retry["readback"]["completed_obligation"]["state"],
+            "completed",
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["state"], "completed")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_materialize_uncertainty_reconcile_removes_bound_retention(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "reconciled_success")
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(retention["expected_head"], self.head)
+
+    def test_materialize_uncertainty_reconcile_retries_retention_release(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        with patch.object(
+            checkouts,
+            "_release_retention_exact",
+            return_value=False,
+            create=True,
+        ) as release_retention:
+            first = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        self.assertEqual(first["state"], "still_fenced")
+        self.assertIn("retention-release-failed", first["readback"]["reason"])
+        release_retention.assert_called_once_with(retention)
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
+        retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(retry["state"], "reconciled")
+        self.assertEqual(retry["outcome"], "reconciled_success")
+        self.assertTrue(retry["readback"]["removed_recovery_worktree"])
+        self.assertIsNotNone(retry["readback"]["recovery_removal_intent"])
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+
+    def _auto_source_cleanup_uncertainty_fixture(
+        self,
+        *,
+        remove_source: bool,
+    ) -> tuple[Path, dict[str, object], dict[str, object], dict[str, object], str]:
+        target, materialize_fence, lifecycle, common_dir_key = (
+            self._materialize_uncertainty_fixture(
+                create_worktree=True,
+                expire_leases=False,
+            )
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "source-materialized",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": (
+                            f"runtime-deploy-source-materialized:{self.head}:"
+                            "materialize-test"
+                        ),
+                        "sha256": "8" * 64,
+                    }
+                ],
+                "closure_classification": {
+                    "convergence_required": False,
+                    "reason": "process_only",
+                },
+            }
+        )
+        owner = "runtime-deploy-source:materialize-test"
+        path_key = f"path:{target}"
+        path_lease = checkouts.resources.inspect_resource(path_key)
+        common_lease = checkouts.resources.inspect_resource(common_dir_key)
+        self.assertIsNotNone(path_lease)
+        self.assertIsNotNone(common_lease)
+        checkouts._clear_checkout_operation_uncertainty(
+            materialize_fence["fence_id"],
+            outcome="confirmed_success",
+            evidence={"test": "materialization-finalized"},
+        )
+        checkouts.resources.release_resources(
+            owner,
+            [common_dir_key],
+            expected_leases=[common_lease],
+        )
+        cleanup_key = f"repo:{self.repo}:operation:worktree-remove:{target.name}"
+        acquisition = checkouts.resources.acquire_resources(
+            owner,
+            [cleanup_key, common_dir_key],
+            purpose="test auto source cleanup uncertainty",
+            ttl_seconds=7200,
+        )
+        checkouts.AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK.parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        checkouts.AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK.touch(exist_ok=True)
+        cleanup_fence = checkouts._persist_checkout_operation_uncertainty(
+            lease=acquisition,
+            checkout_key=str(lifecycle["checkout_key"]),
+            owner_id=owner,
+            operation="auto-source-cleanup",
+            operation_id="9" * 64,
+            evidence={
+                "kind": "grabowski_auto_runtime_deploy_source_cleanup_uncertainty",
+                "repo": str(self.repo.resolve()),
+                "git_common_dir": str(checkouts._git_common_dir(self.repo)),
+                "checkout_path": str(target),
+                "checkout_key": str(lifecycle["checkout_key"]),
+                "owner_id": owner,
+                "expected_head": self.head,
+                "expected_branch": None,
+                "path_resource_key": path_key,
+                "path_lease": path_lease,
+                "effect_leases": [dict(item) for item in acquisition["leases"]],
+                "source_identity_sha256": "9" * 64,
+            },
+        )
+        if remove_source:
+            self._git("worktree", "remove", str(target))
+        return target, cleanup_fence, lifecycle, retention, path_key
+
+    def test_auto_source_cleanup_uncertainty_reconciles_no_effect_under_live_leases(self) -> None:
+        target, fence, lifecycle, retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=False)
+        )
+        path_lease_before = checkouts.resources.inspect_resource(path_key)
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_no_effect")
+        self.assertTrue(target.exists())
+        self.assertEqual(
+            checkouts.resources.inspect_resource(path_key),
+            path_lease_before,
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_auto_source_cleanup_uncertainty_stays_fenced_while_owner_active(self) -> None:
+        target, fence, lifecycle, retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=False)
+        )
+        path_lease_before = checkouts.resources.inspect_resource(path_key)
+        descriptor = os.open(
+            checkouts.AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK,
+            os.O_RDWR | os.O_CLOEXEC,
+        )
+        try:
+            checkouts.fcntl.flock(descriptor, checkouts.fcntl.LOCK_EX)
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        finally:
+            checkouts.fcntl.flock(descriptor, checkouts.fcntl.LOCK_UN)
+            os.close(descriptor)
+        self.assertEqual(result["state"], "still_fenced")
+        self.assertEqual(
+            result["readback"]["reason"],
+            "auto-source-cleanup-owner-still-active",
+        )
+        self.assertTrue(target.exists())
+        self.assertEqual(
+            checkouts.resources.inspect_resource(path_key),
+            path_lease_before,
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
+    def test_auto_source_cleanup_uncertainty_stays_fenced_after_effect_leases_drop_while_owner_active(
+        self,
+    ) -> None:
+        target, fence, lifecycle, retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=True)
+        )
+        path_lease_before = checkouts.resources.inspect_resource(path_key)
+        effect_leases = [dict(item) for item in fence["evidence"]["effect_leases"]]
+        checkouts.resources.release_resources(
+            str(fence["lease_owner_id"]),
+            [str(item["resource_key"]) for item in effect_leases],
+            expected_leases=effect_leases,
+        )
+        descriptor = os.open(
+            checkouts.AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK,
+            os.O_RDWR | os.O_CLOEXEC,
+        )
+        try:
+            checkouts.fcntl.flock(descriptor, checkouts.fcntl.LOCK_EX)
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        finally:
+            checkouts.fcntl.flock(descriptor, checkouts.fcntl.LOCK_UN)
+            os.close(descriptor)
+
+        self.assertEqual(result["state"], "still_fenced")
+        self.assertEqual(
+            result["readback"]["reason"],
+            "auto-source-cleanup-owner-still-active",
+        )
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts.resources.inspect_resource(path_key),
+            path_lease_before,
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
+    def test_auto_source_cleanup_uncertainty_clears_dead_lease_fence_under_activity_guard(
+        self,
+    ) -> None:
+        target, fence, lifecycle, _retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=True)
+        )
+        effect_leases = [dict(item) for item in fence["evidence"]["effect_leases"]]
+        checkouts.resources.release_resources(
+            str(fence["lease_owner_id"]),
+            [str(item["resource_key"]) for item in effect_leases],
+            expected_leases=effect_leases,
+        )
+        activity = {"depth": 0}
+
+        @checkouts.contextmanager
+        def tracked_activity_guard(_fence):
+            activity["depth"] += 1
+            try:
+                yield True
+            finally:
+                activity["depth"] -= 1
+
+        real_clear = checkouts._clear_checkout_operation_uncertainty
+
+        def clear_while_guarded(*args, **kwargs):
+            self.assertGreater(activity["depth"], 0)
+            return real_clear(*args, **kwargs)
+
+        with (
+            patch.object(
+                checkouts,
+                "_auto_source_cleanup_activity_guard",
+                tracked_activity_guard,
+            ),
+            patch.object(
+                checkouts,
+                "_clear_checkout_operation_uncertainty",
+                side_effect=clear_while_guarded,
+            ),
+        ):
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_success")
+        self.assertEqual(activity["depth"], 0)
+        self.assertFalse(target.exists())
+        self.assertIsNone(checkouts.resources.inspect_resource(path_key))
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_auto_source_cleanup_uncertainty_reconciles_success_under_live_leases(self) -> None:
+        target, fence, lifecycle, _retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=True)
+        )
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_success")
+        self.assertFalse(target.exists())
+        self.assertIsNone(checkouts.resources.inspect_resource(path_key))
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+    def test_materialize_uncertainty_reconcile_clears_proven_no_effect(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts._materialize_uncertainty_readback(fence)["state"],
+            "confirmed_no_effect",
+        )
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_no_effect")
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+        obligation_status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertFalse(obligation_status["continuation_required"])
+        self.assertEqual(obligation_status["resolution_disposition"], "resolved")
+
+    def test_materialize_uncertainty_reconcile_resolves_existing_blocked_obligation(self) -> None:
+        _target, fence, _lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "materialization-failed",
+                        "detail": "Original scheduler already classified materialization as blocked.",
+                        "reference": "auto-deploy-source:test",
+                        "sha256": "7" * 64,
+                    }
+                ],
+                "next_action": "Reconcile the durable checkout uncertainty fence.",
+            }
+        )
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_no_effect")
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_materialize_uncertainty_reconcile_preserves_already_resolved_no_effect_obligation(
+        self,
+    ) -> None:
+        _target, fence, _lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        blocked = obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "materialization-failed",
+                        "detail": "Scheduler proved the materialization had no effect.",
+                        "reference": "auto-deploy-source:test",
+                        "sha256": "7" * 64,
+                    }
+                ],
+                "next_action": "No continuation is required after no-effect cleanup.",
+            }
+        )
+        resolved = obligations.resolve_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "disposition": "resolved",
+                "evidence": [
+                    {
+                        "source": "receipt",
+                        "reference": "auto-deploy-source-pre-effect:test",
+                        "sha256": blocked["close_file_sha256"],
+                    }
+                ],
+            }
+        )
+        resolution_sha256 = resolved["resolution_file_sha256"]
+
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_no_effect")
+        self.assertEqual(
+            result["readback"]["obligation_recovery"]["obligation_state"],
+            "blocked_terminal_preserved",
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(status["resolution_file_sha256"], resolution_sha256)
+        self.assertEqual(
+            status["resolution_evidence"],
+            [
+                {
+                    "source": "receipt",
+                    "reference": "auto-deploy-source-pre-effect:test",
+                    "sha256": blocked["close_file_sha256"],
+                }
+            ],
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_materialize_recovery_preserves_strategically_settled_obligation_states(
+        self,
+    ) -> None:
+        _target, fence, _lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        cases = [
+            ("open", "deferred"),
+            ("open", "superseded"),
+            ("blocked", "deferred"),
+        ]
+        for state, disposition in cases:
+            with self.subTest(state=state, disposition=disposition):
+                status = {
+                    "state": state,
+                    "resolution_disposition": disposition,
+                    "continuation_required": False,
+                    "close_file_sha256": "c" * 64 if state == "blocked" else None,
+                    "resolution_file_sha256": "d" * 64,
+                }
+                with (
+                    patch.object(
+                        obligations,
+                        "status_obligation",
+                        return_value=status,
+                    ),
+                    patch.object(obligations, "close_obligation") as close_obligation,
+                    patch.object(obligations, "resolve_obligation") as resolve_obligation,
+                ):
+                    result = checkouts._resolve_materialize_recovery_obligation(
+                        fence,
+                        recovery_state="confirmed_no_effect",
+                    )
+
+                self.assertEqual(
+                    result["obligation_state"],
+                    f"{state}_resolution_preserved",
+                )
+                self.assertEqual(
+                    result["resolution_file_sha256"],
+                    status["resolution_file_sha256"],
+                )
+                close_obligation.assert_not_called()
+                resolve_obligation.assert_not_called()
+
+    def test_materialize_no_effect_recovery_accepts_missing_preopen_obligation(self) -> None:
+        fence = {
+            "fence_id": "f" * 32,
+            "evidence": {
+                "obligation_id": "goo-runtime-deploy-source-missing-test",
+                "checkout_key": "a" * 64,
+                "expected_head": "b" * 40,
+            },
+        }
+        with patch.object(
+            obligations,
+            "status_obligation",
+            side_effect=FileNotFoundError("obligation was never opened"),
+        ), patch.object(
+            obligations, "close_obligation"
+        ) as close_obligation, patch.object(
+            obligations, "resolve_obligation"
+        ) as resolve_obligation:
+            result = checkouts._resolve_materialize_recovery_obligation(
+                fence,
+                recovery_state="confirmed_no_effect",
+            )
+        self.assertEqual(result["obligation_state"], "absent_before_open")
+        self.assertEqual(result["obligation_id"], fence["evidence"]["obligation_id"])
+        close_obligation.assert_not_called()
+        resolve_obligation.assert_not_called()
+
+    def test_materialize_recovery_evidence_is_stable_across_retry_states(self) -> None:
+        _target, fence, _lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        first = checkouts._resolve_materialize_recovery_obligation(
+            fence, recovery_state="reconciled_success"
+        )
+        second = checkouts._resolve_materialize_recovery_obligation(
+            fence, recovery_state="confirmed_no_effect"
+        )
+        self.assertEqual(first["recovery_sha256"], second["recovery_sha256"])
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+
+    def test_materialize_uncertainty_reconcile_keeps_fence_when_obligation_recovery_fails(self) -> None:
+        _target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        with patch.object(
+            checkouts,
+            "_resolve_materialize_recovery_obligation",
+            side_effect=RuntimeError("obligation close unavailable"),
+        ):
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        self.assertEqual(result["state"], "still_fenced")
+        self.assertIn(
+            "obligation-recovery-failed",
+            result["readback"]["reason"],
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertTrue(
+            obligations.status_obligation(
+                "goo-runtime-deploy-source-materialize-test"
+            )["continuation_required"]
+        )
+
+    def test_uncertainty_persist_has_no_post_commit_secondary_readback(self) -> None:
+        target = self.root / "worktrees" / "materialize-readback"
+        common_dir = checkouts._git_common_dir(self.repo)
+        owner = "runtime-deploy-source:materialize-readback"
+        checkout_key = checkouts._checkout_key(common_dir, target)
+        resource_keys = [f"path:{target}", f"path:{common_dir}"]
+        acquisition = checkouts.resources.acquire_resources(
+            owner,
+            resource_keys,
+            purpose="materialize uncertainty committed receipt",
+            ttl_seconds=120,
+        )
+        with patch.object(
+            checkouts,
+            "_load_checkout_operation_uncertainty",
+            side_effect=AssertionError("post-commit secondary readback must not run"),
+        ):
+            fence = checkouts._persist_checkout_operation_uncertainty(
+                lease={
+                    "owner_id": owner,
+                    "leases": acquisition["leases"],
+                },
+                checkout_key=checkout_key,
+                owner_id=owner,
+                operation="materialize",
+                operation_id="materialize-readback",
+                evidence={
+                    "repo": str(self.repo.resolve()),
+                    "git_common_dir": str(common_dir),
+                    "checkout_path": str(target),
+                    "checkout_key": checkout_key,
+                    "owner_id": owner,
+                    "expected_head": self.head,
+                    "expected_branch": None,
+                    "obligation_id": "goo-runtime-deploy-source-materialize-readback",
+                },
+            )
+        self.assertRegex(fence["fence_id"], r"^[0-9a-f]{32}$")
+        stored = checkouts._load_checkout_operation_uncertainty(fence["fence_id"])
+        self.assertEqual(stored, fence)
+        self.assertEqual(set(fence["resource_keys"]), set(resource_keys))
+        self.assertIsNone(fence["cleared_at_unix"])
+
+    def test_uncertainty_clear_has_no_post_commit_secondary_readback(self) -> None:
+        target = self.root / "worktrees" / "clear-readback"
+        common_dir = checkouts._git_common_dir(self.repo)
+        owner = "runtime-deploy-source:clear-readback"
+        checkout_key = checkouts._checkout_key(common_dir, target)
+        resource_keys = [f"path:{target}", f"path:{common_dir}"]
+        acquisition = checkouts.resources.acquire_resources(
+            owner,
+            resource_keys,
+            purpose="materialize uncertainty clearance receipt",
+            ttl_seconds=120,
+        )
+        fence = checkouts._persist_checkout_operation_uncertainty(
+            lease={"owner_id": owner, "leases": acquisition["leases"]},
+            checkout_key=checkout_key,
+            owner_id=owner,
+            operation="materialize",
+            operation_id="clear-readback",
+            evidence={
+                "repo": str(self.repo.resolve()),
+                "git_common_dir": str(common_dir),
+                "checkout_path": str(target),
+                "checkout_key": checkout_key,
+                "owner_id": owner,
+                "expected_head": self.head,
+                "expected_branch": None,
+                "obligation_id": "goo-runtime-deploy-source-clear-readback",
+            },
+        )
+        with patch.object(
+            checkouts,
+            "_load_checkout_operation_uncertainty",
+            side_effect=AssertionError("post-commit secondary readback must not run"),
+        ):
+            cleared = checkouts._clear_checkout_operation_uncertainty(
+                fence["fence_id"],
+                outcome="confirmed_no_effect",
+                evidence={"reason": "test"},
+            )
+        self.assertIsNotNone(cleared["cleared_at_unix"])
+        stored = checkouts._load_checkout_operation_uncertainty(fence["fence_id"])
+        self.assertEqual(stored, cleared)
+        self.assertEqual(stored["clearance"]["outcome"], "confirmed_no_effect")
 
     def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:
         self._publish_remote()

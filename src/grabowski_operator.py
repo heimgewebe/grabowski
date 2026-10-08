@@ -1586,6 +1586,7 @@ def _deployment_admission_midcutover_recovery_evidence(
         import grabowski_provenance_recovery as provenance_recovery
 
         gate = provenance_recovery.evaluate_resume_gate(expected_head)
+        gate_admits_locked_recheck = provenance_recovery._initial_gate_admits_locked_recheck(gate)
         lane = gate.get("recovery_lane")
         binding = (
             lane.get("resume_binding") if isinstance(lane, dict) else None
@@ -1614,7 +1615,7 @@ def _deployment_admission_midcutover_recovery_evidence(
 
     checks["resume_gate_available"] = True
     checks["resume_gate_allowed"] = (
-        gate.get("allowed") is True and not gate.get("reasons")
+        gate_admits_locked_recheck
     )
     checks["resume_gate_expected_head_bound"] = (
         gate.get("expected_head") == expected_head
