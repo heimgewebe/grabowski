@@ -9,6 +9,7 @@ registration, legacy receipt upgrade, or productive admission is provided.
 
 from __future__ import annotations
 
+import grp
 import hashlib
 import json
 import os
@@ -32,9 +33,9 @@ COLLECTOR_PATH = Path("/usr/local/libexec/grabowski/day1-collector-static")
 EVIDENCE_ROOT = Path("/var/lib/grabowski/day1-capture")
 SIGN_TOOL = Path("/usr/bin/ssh-keygen")
 CHILD_USER = "grabowski-day1-collector"
-PROOF_KIND = "grabowski.protected_day1_task_proof"
-PROOF_ISSUER = "grabowski-day1-capture@heimgewebe"
-PROOF_NAMESPACE = "grabowski-day1-task-proof-v1@heimgewebe"
+PROOF_KIND = "grabowski.day1_capture_prototype_not_admitted"
+PROOF_ISSUER = "grabowski-day1-prototype@heimgewebe"
+PROOF_NAMESPACE = "grabowski-day1-capture-prototype-v1@heimgewebe"
 CAPTURE_BOUNDARY = "protected-parent-pipe-v1"
 POLICY_KIND = "grabowski.day1_protected_capture_policy"
 MAX_EXECUTABLE = 8 * 1024 * 1024
@@ -46,8 +47,8 @@ SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
 REV_RE = re.compile(r"[0-9a-f]{40}\Z")
 POLICY_FIELDS = frozenset({
     "schema_version", "kind", "host", "source_revision",
-    "collector_sha256", "runtime_seconds", "max_stdout_bytes",
-    "max_stderr_bytes",
+    "collector_sha256", "signer_sha256", "runtime_seconds",
+    "max_stdout_bytes", "max_stderr_bytes",
 })
 
 
@@ -173,7 +174,11 @@ def _policy(payload: bytes, *, hostname: str) -> dict[str, Any]:
     if (type(value["schema_version"]) is not int or value["schema_version"] != 1
         or value["kind"] != POLICY_KIND or value["host"] != hostname):
         raise CaptureDenied("root policy identity or host mismatch")
-    for label, regex in (("source_revision", REV_RE), ("collector_sha256", SHA_RE)):
+    for label, regex in (
+        ("source_revision", REV_RE),
+        ("collector_sha256", SHA_RE),
+        ("signer_sha256", SHA_RE),
+    ):
         if not isinstance(value[label], str) or regex.fullmatch(value[label]) is None:
             raise CaptureDenied(f"{label} is not an exact digest")
     _integer(value["runtime_seconds"], "runtime_seconds", 1, MAX_RUNTIME)
@@ -221,10 +226,17 @@ def _separate_child_identity() -> tuple[int, int]:
     try:
         controller = pwd.getpwnam("alex")
         canonical = pwd.getpwuid(user.pw_uid)
-    except KeyError as exc:
-        raise CaptureDenied("dedicated collector/controller UID cannot be confirmed") from exc
+        collector_group = grp.getgrgid(user.pw_gid)
+        controller_gids = set(os.getgrouplist(controller.pw_name, controller.pw_gid))
+    except (KeyError, OSError) as exc:
+        raise CaptureDenied(
+            "dedicated collector/controller UID and GID cannot be confirmed"
+        ) from exc
     if (user.pw_name != CHILD_USER or user.pw_uid < 1 or user.pw_gid < 1
-        or user.pw_uid == controller.pw_uid or canonical.pw_name != CHILD_USER):
+        or user.pw_uid == controller.pw_uid or canonical.pw_name != CHILD_USER
+        or collector_group.gr_name != CHILD_USER
+        or user.pw_gid == controller.pw_gid
+        or user.pw_gid in controller_gids):
         raise CaptureDenied("dedicated capture UID/GID is not isolated")
     if not (user.pw_shell.endswith("/nologin") or user.pw_shell.endswith("/false")):
         raise CaptureDenied("dedicated collector must have a disabled login shell")
@@ -306,11 +318,13 @@ def _capture_from_pipes(
                 stream.close()
 
 
-def _recheck_executable_fd(fd: int, initial_bytes: bytes) -> None:
-    """Verify pinned executable FD bytes again after child exit, not old RAM."""
+def _recheck_executable_fd(
+    fd: int, initial_bytes: bytes, *, label: str = "collector executable"
+) -> None:
+    """Verify pinned protected file FD bytes again, not cached RAM."""
     before = os.fstat(fd)
     if before.st_size != len(initial_bytes) or not stat.S_ISREG(before.st_mode):
-        raise CaptureDenied("collector executable identity changed after run")
+        raise CaptureDenied(f"{label} identity changed after use")
     os.lseek(fd, 0, os.SEEK_SET)
     digest = hashlib.sha256()
     count = len(initial_bytes)
@@ -324,7 +338,7 @@ def _recheck_executable_fd(fd: int, initial_bytes: bytes) -> None:
     os.lseek(fd, 0, os.SEEK_SET)
     if (count or _file_identity(before) != _file_identity(after)
         or digest.hexdigest() != _sha(initial_bytes)):
-        raise CaptureDenied("collector executable FD changed during capture")
+        raise CaptureDenied(f"{label} FD changed during use")
 
 
 def _canonical_receipt(policy: dict[str, Any], *, hostname: str, code_hash: str,
@@ -332,24 +346,27 @@ def _canonical_receipt(policy: dict[str, Any], *, hostname: str, code_hash: str,
                        stderr: bytes, started_at: int, terminal_at: int) -> bytes:
     if not 0 <= terminal_at - started_at <= MAX_RUNTIME + 1:
         raise CaptureDenied("actual captured terminal time is invalid")
-    closure = _sha(_json_bytes({
-        "mode": "root-staged-static-elf64-x86_64-v1",
-        "executable_sha256": code_hash,
-        "source_revision": policy["source_revision"],
-        "collector_path": str(COLLECTOR_PATH),
-    }))
+    # This parent is NOT bound to an observed Grabowski task/attempt/unit or
+    # a transitive verified executable closure. A signature must not upgrade
+    # these synthetically generated IDs into a production-shaped task proof.
+    # The admission verifier in Draft #1389 rejects this deliberately separate
+    # prototype kind/namespace/field set, even with a valid SSH signature.
     value = {
         "schema_version": 1,
         "kind": PROOF_KIND,
         "issuer": PROOF_ISSUER,
         "capture_boundary": CAPTURE_BOUNDARY,
         "host": hostname,
-        "task_id": task_id,
-        "attempt": 1,
-        "unit": f"grabowski-task-{task_id}-a1.service",
-        "argv_sha256": _sha(_json_bytes({"argv": argv})),
-        "executed_source_sha256": code_hash,
-        "execution_closure_sha256": closure,
+        "capture_id": task_id,
+        "capture_attempt": 1,
+        "provider_unit_template": "grabowski-day1-protected-capture.service",
+        "initial_exec_command_sha256": _sha(_json_bytes({"argv": argv})),
+        "initial_executable_sha256": code_hash,
+        "source_revision_policy_claim": policy["source_revision"],
+        "execution_closure_verified": False,
+        "actual_task_binding_verified": False,
+        "collector_process_tree_verified": False,
+        "day1_admission_authorized": False,
         "nonce": nonce,
         "captured_stdout_sha256": _sha(stdout),
         "captured_stdout_bytes": len(stdout),
@@ -359,38 +376,67 @@ def _canonical_receipt(policy: dict[str, Any], *, hostname: str, code_hash: str,
         "captured_stderr_bytes": len(stderr),
         "captured_stderr_complete": True,
         "stderr_truncated": False,
-        "started_at_unix": started_at,
-        "terminalized_at_unix": terminal_at,
-        "state": "completed",
-        "exit_code": 0,
+        "parent_capture_started_at_unix": started_at,
+        "primary_exit_observed_at_unix": terminal_at,
+        "state": "primary_exited_zero_pipes_closed_tree_unverified",
+        "primary_exit_code": 0,
     }
     return _json_bytes(value)
 
 
-def _sign_receipt(payload: bytes) -> bytes:
-    key_fd, _key_bytes = _open_root_file(
+def _sign_receipt(
+    payload: bytes, *, expected_signer_sha256: str
+) -> bytes:
+    """Sign using verified pinned key/signer inodes, never reopened paths."""
+    if not isinstance(expected_signer_sha256, str) or not SHA_RE.fullmatch(
+        expected_signer_sha256
+    ):
+        raise CaptureDenied("pinned signer executable SHA-256 is invalid")
+    key_fd, key_bytes = _open_root_file(
         SIGNING_KEY_PATH, max_bytes=64 * 1024, private=True,
     )
-    os.close(key_fd)
-    signer_fd, _signer_bytes = _open_root_file(
-        SIGN_TOOL, max_bytes=4 * 1024 * 1024, executable=True,
-    )
-    os.close(signer_fd)
     try:
-        run = subprocess.run(
-            [str(SIGN_TOOL), "-Y", "sign", "-f", str(SIGNING_KEY_PATH),
-             "-n", PROOF_NAMESPACE],
-            input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            check=False, timeout=15,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+        signer_fd, signer_bytes = _open_root_file(
+            SIGN_TOOL, max_bytes=4 * 1024 * 1024, executable=True,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise CaptureDenied("root-only signing failed to start") from exc
-    if (run.returncode != 0 or not 0 < len(run.stdout) <= MAX_SIGNATURE_BYTES
-        or not run.stdout.startswith(b"-----BEGIN SSH SIGNATURE-----")
-        or not run.stdout.rstrip().endswith(b"-----END SSH SIGNATURE-----")):
-        raise CaptureDenied("protected evidence could not be signed")
-    return run.stdout
+        try:
+            if _sha(signer_bytes) != expected_signer_sha256:
+                raise CaptureDenied("actual signer executable differs from root policy")
+            # The trusted parent retains both descriptors through signing.
+            # /proc/self/fd/N names the exact checked inode inherited by the
+            # child, so root-managed key or package rotations cannot switch it.
+            try:
+                run = subprocess.run(
+                    [
+                        f"/proc/self/fd/{signer_fd}", "-Y", "sign",
+                        "-f", f"/proc/self/fd/{key_fd}",
+                        "-n", PROOF_NAMESPACE,
+                    ],
+                    pass_fds=(signer_fd, key_fd),
+                    input=payload, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False, timeout=15,
+                    env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise CaptureDenied("root-only signing failed to start") from exc
+            _recheck_executable_fd(
+                signer_fd, signer_bytes, label="signer executable"
+            )
+            _recheck_executable_fd(
+                key_fd, key_bytes, label="private signing key"
+            )
+            if (
+                run.returncode != 0 or not 0 < len(run.stdout) <= MAX_SIGNATURE_BYTES
+                or not run.stdout.startswith(b"-----BEGIN SSH SIGNATURE-----")
+                or not run.stdout.rstrip().endswith(b"-----END SSH SIGNATURE-----")
+            ):
+                raise CaptureDenied("protected evidence could not be signed")
+            return run.stdout
+        finally:
+            os.close(signer_fd)
+    finally:
+        os.close(key_fd)
 
 
 def _write_new(fd: int, name: str, blob: bytes) -> None:
@@ -439,14 +485,14 @@ def _publish_bundle(
     receipt: bytes, signature: bytes,
 ) -> str:
     """Create-only root-owned directory publication; no mutable current pointer."""
-    dirname = f"proof-{task_id}-{nonce}"
+    dirname = f"prototype-{task_id}-{nonce}"
     staging = f".incomplete-{task_id}-{nonce}"
     try:
         os.stat(dirname, dir_fd=root_fd, follow_symlinks=False)
     except FileNotFoundError:
         pass
     else:
-        raise CaptureDenied("protected proof identity has already been committed")
+        raise CaptureDenied("protected prototype identity has already been committed")
     os.mkdir(staging, 0o700, dir_fd=root_fd)
     sub_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY |
                      os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=root_fd)
@@ -461,7 +507,16 @@ def _publish_bundle(
         # A crash before this same-filesystem rename leaves only an ignored
         # .incomplete-* directory, never an authoritative proof-* bundle.
         os.rename(staging, dirname, src_dir_fd=root_fd, dst_dir_fd=root_fd)
-        os.fsync(root_fd)
+        try:
+            os.fsync(root_fd)
+        except OSError as exc:
+            # A prototype-* directory may now be visible but not durable.
+            # Never report publication success for this unknown outcome.
+            # A real task-proof producer must later reconcile a stable task
+            # attempt and nonce, rather than inventing a fresh identity.
+            raise CaptureDenied(
+                "prototype publication durability uncertain after rename"
+            ) from exc
         return dirname
     finally:
         os.close(sub_fd)
@@ -503,15 +558,17 @@ def run() -> dict[str, Any]:
                 task_id=task_id, nonce=nonce, argv=argv, stdout=stdout,
                 stderr=stderr, started_at=started, terminal_at=stopped,
             )
-            signed = _sign_receipt(receipt)
+            signed = _sign_receipt(
+                receipt, expected_signer_sha256=policy["signer_sha256"]
+            )
             name = _publish_bundle(
                 root_fd, task_id=task_id, nonce=nonce,
                 stdout=stdout, stderr=stderr, receipt=receipt, signature=signed,
             )
             return {
                 "kind": "grabowski.protected_day1_capture_result",
-                "status": "root_owned_proof_published_not_admitted",
-                "task_id": task_id,
+                "status": "root_owned_prototype_bundle_published_not_admitted",
+                "capture_id": task_id,
                 "bundle_name": name,
                 "receipt_sha256": _sha(receipt),
                 "source_executable_sha256": actual_sha,

@@ -36,6 +36,7 @@ def example_policy(binary: bytes, *, host: str | None = None) -> dict:
         "host": host or socket.gethostname(),
         "source_revision": "a" * 40,
         "collector_sha256": sha(binary),
+        "signer_sha256": sha(Path("/usr/bin/ssh-keygen").read_bytes()),
         "runtime_seconds": 5,
         "max_stdout_bytes": 65536,
         "max_stderr_bytes": 65536,
@@ -70,6 +71,7 @@ class StrictContractTests(unittest.TestCase):
             ("max_stderr_bytes", -1),
             ("max_stdout_bytes", cap.MAX_CAPTURE_BYTES + 1),
             ("collector_sha256", "not a digest"),
+            ("signer_sha256", "wrong signer digest"),
         ):
             with self.subTest(field=field, replacement=replacement):
                 copy = {**valid, field: replacement}
@@ -117,11 +119,14 @@ class StrictContractTests(unittest.TestCase):
             pw_name=cap.CHILD_USER, pw_uid=1000, pw_gid=998,
             pw_shell="/usr/sbin/nologin",
         )
-        controller = types.SimpleNamespace(pw_name="alex", pw_uid=1000)
+        controller = types.SimpleNamespace(pw_name="alex", pw_uid=1000, pw_gid=1000)
+        group = types.SimpleNamespace(gr_name=cap.CHILD_USER)
         def lookup(name):
             return dedicated if name == cap.CHILD_USER else controller
         with patch.object(cap.pwd, "getpwnam", side_effect=lookup), \
-             patch.object(cap.pwd, "getpwuid", return_value=dedicated):
+             patch.object(cap.pwd, "getpwuid", return_value=dedicated), \
+             patch.object(cap.grp, "getgrgid", return_value=group), \
+             patch.object(cap.os, "getgrouplist", return_value=[1000, 27]):
             with self.assertRaisesRegex(cap.CaptureDenied, "not isolated"):
                 cap._separate_child_identity()
 
@@ -130,12 +135,53 @@ class StrictContractTests(unittest.TestCase):
             pw_name=cap.CHILD_USER, pw_uid=963, pw_gid=963,
             pw_shell="/usr/sbin/nologin",
         )
-        controller = types.SimpleNamespace(pw_name="alex", pw_uid=1000)
+        controller = types.SimpleNamespace(pw_name="alex", pw_uid=1000, pw_gid=1000)
+        group = types.SimpleNamespace(gr_name=cap.CHILD_USER)
         def lookup(name):
             return dedicated if name == cap.CHILD_USER else controller
         with patch.object(cap.pwd, "getpwnam", side_effect=lookup), \
-             patch.object(cap.pwd, "getpwuid", return_value=dedicated):
+             patch.object(cap.pwd, "getpwuid", return_value=dedicated), \
+             patch.object(cap.grp, "getgrgid", return_value=group), \
+             patch.object(cap.os, "getgrouplist", return_value=[1000, 27]):
             self.assertEqual((963, 963), cap._separate_child_identity())
+
+    def test_rejects_shared_controller_primary_or_supplementary_gid(self) -> None:
+        dedicated = types.SimpleNamespace(
+            pw_name=cap.CHILD_USER, pw_uid=963, pw_gid=1000,
+            pw_shell="/usr/sbin/nologin",
+        )
+        controller = types.SimpleNamespace(
+            pw_name="alex", pw_uid=1000, pw_gid=1000,
+        )
+        def lookup(name):
+            return dedicated if name == cap.CHILD_USER else controller
+        for denied_gid in (1000, 27):
+            with self.subTest(denied_gid=denied_gid):
+                dedicated.pw_gid = denied_gid
+                group = types.SimpleNamespace(gr_name=cap.CHILD_USER)
+                with patch.object(cap.pwd, "getpwnam", side_effect=lookup), \
+                     patch.object(cap.pwd, "getpwuid", return_value=dedicated), \
+                     patch.object(cap.grp, "getgrgid", return_value=group), \
+                     patch.object(cap.os, "getgrouplist", return_value=[1000, 27]):
+                    with self.assertRaisesRegex(cap.CaptureDenied, "not isolated"):
+                        cap._separate_child_identity()
+
+    def test_rejects_canonical_group_mismatch(self) -> None:
+        dedicated = types.SimpleNamespace(
+            pw_name=cap.CHILD_USER, pw_uid=963, pw_gid=963,
+            pw_shell="/usr/sbin/nologin",
+        )
+        controller = types.SimpleNamespace(
+            pw_name="alex", pw_uid=1000, pw_gid=1000,
+        )
+        with patch.object(cap.pwd, "getpwnam", side_effect=lambda name: (
+            dedicated if name == cap.CHILD_USER else controller
+        )), patch.object(cap.pwd, "getpwuid", return_value=dedicated), \
+             patch.object(cap.grp, "getgrgid", return_value=types.SimpleNamespace(
+                 gr_name="shared-other-group"
+             )), patch.object(cap.os, "getgrouplist", return_value=[1000, 27]):
+            with self.assertRaisesRegex(cap.CaptureDenied, "not isolated"):
+                cap._separate_child_identity()
 
     def test_receipt_schema_explicitly_denies_admission(self) -> None:
         policy = example_policy(b"x", host="heim-pc")
@@ -146,19 +192,35 @@ class StrictContractTests(unittest.TestCase):
         ))
         fields = {
             "schema_version", "kind", "issuer", "capture_boundary",
-            "host", "task_id", "attempt", "unit", "argv_sha256",
-            "executed_source_sha256", "execution_closure_sha256", "nonce",
-            "captured_stdout_sha256", "captured_stdout_bytes",
+            "host", "capture_id", "capture_attempt",
+            "provider_unit_template", "initial_exec_command_sha256",
+            "initial_executable_sha256", "source_revision_policy_claim",
+            "execution_closure_verified", "actual_task_binding_verified",
+            "collector_process_tree_verified", "day1_admission_authorized",
+            "nonce", "captured_stdout_sha256", "captured_stdout_bytes",
             "captured_stdout_complete", "stdout_truncated",
             "captured_stderr_sha256", "captured_stderr_bytes",
             "captured_stderr_complete", "stderr_truncated",
-            "started_at_unix", "terminalized_at_unix", "state", "exit_code",
+            "parent_capture_started_at_unix", "primary_exit_observed_at_unix",
+            "state", "primary_exit_code",
         }
         self.assertEqual(fields, set(proof))
         self.assertEqual(sha(b""), proof["captured_stdout_sha256"])
         self.assertEqual(len(b"error"), proof["captured_stderr_bytes"])
-        self.assertNotIn("day1_admission_authorized", proof)
-        self.assertEqual("grabowski-task-"+("b"*24)+"-a1.service", proof["unit"])
+        self.assertEqual("b"*24, proof["capture_id"])
+        self.assertEqual(cap.PROOF_KIND, proof["kind"])
+        self.assertNotEqual("grabowski.protected_day1_task_proof", proof["kind"])
+        self.assertNotIn("task_id", proof)
+        self.assertNotIn("unit", proof)
+        self.assertNotIn("execution_closure_sha256", proof)
+        for field in (
+            "day1_admission_authorized", "execution_closure_verified",
+            "actual_task_binding_verified", "collector_process_tree_verified",
+        ):
+            self.assertIs(proof[field], False)
+        self.assertEqual(
+            "primary_exited_zero_pipes_closed_tree_unverified", proof["state"]
+        )
 
     def test_unit_example_is_inert_and_keeps_root_broker_unchanged(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -304,7 +366,7 @@ int main(void) {sleep(3);return 0;}
                 )
         finally:
             os.close(root_fd)
-        self.assertEqual([], list(self.dest.glob("proof-*")))
+        self.assertEqual([], list(self.dest.glob("prototype-*")))
 
     def test_simulated_root_bundle_atomic_write_readback_and_collision(self) -> None:
         # Only validates atomic publication and readback, not root ownership.
@@ -317,7 +379,7 @@ int main(void) {sleep(3);return 0;}
                     receipt=b"receipt\n", signature=b"signature\n",
                 )
                 name = cap._publish_bundle(root_fd, **params)
-                self.assertTrue(name.startswith("proof-"))
+                self.assertTrue(name.startswith("prototype-"))
                 for leaf, data in (("stdout.bin", OBSERVED_STDOUT),
                                    ("stderr.bin", OBSERVED_STDERR),
                                    ("proof.json", b"receipt\n"),
@@ -327,7 +389,7 @@ int main(void) {sleep(3);return 0;}
                     self.assertEqual(0o600, stored.stat().st_mode & 0o777)
                 with self.assertRaisesRegex(cap.CaptureDenied, "already"):
                     cap._publish_bundle(root_fd, **params)
-                self.assertEqual(1, len(list(self.dest.glob("proof-*"))))
+                self.assertEqual(1, len(list(self.dest.glob("prototype-*"))))
             finally:
                 os.close(root_fd)
 
@@ -352,8 +414,47 @@ int main(void) {sleep(3);return 0;}
                     )
         finally:
             os.close(root_fd)
-        self.assertEqual([], list(self.dest.glob("proof-*")))
+        self.assertEqual([], list(self.dest.glob("prototype-*")))
         self.assertEqual(1, len(list(self.dest.glob(".incomplete-*"))))
+
+    def test_post_rename_parent_fsync_failure_is_uncertain_not_success(self) -> None:
+        # Simulated power-loss boundary, not an authenticated restore protocol:
+        # the prototype directory may already be visible after rename.
+        params = dict(
+            task_id="a" * 24, nonce="d" * 64,
+            stdout=OBSERVED_STDOUT, stderr=OBSERVED_STDERR,
+            receipt=b"not-production-proof\n", signature=b"test-only\n",
+        )
+        expected_dir = self.dest / (
+            "prototype-" + params["task_id"] + "-" + params["nonce"]
+        )
+        fd = os.open(self.dest, os.O_RDONLY | os.O_DIRECTORY)
+        actual_fsync = cap.os.fsync
+        failed_after_rename = [False]
+
+        def fail_parent_fsync(target_fd):
+            if target_fd == fd:
+                self.assertTrue(expected_dir.is_dir())
+                failed_after_rename[0] = True
+                raise OSError("injected failure after atomic directory rename")
+            return actual_fsync(target_fd)
+
+        try:
+            with patch.object(cap, "_check_staging_root_owned", return_value=None), \
+                 patch.object(cap.os, "fsync", side_effect=fail_parent_fsync):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "publication durability uncertain"
+                ):
+                    cap._publish_bundle(fd, **params)
+            self.assertTrue(failed_after_rename[0])
+            # The residual folder is explicitly a non-admitting prototype.
+            self.assertEqual(
+                b"not-production-proof\n",
+                (expected_dir / "proof.json").read_bytes(),
+            )
+            self.assertFalse(any(self.dest.glob("proof-*")))
+        finally:
+            os.close(fd)
 
     def test_disposable_real_ssh_signature_over_exact_proof_bytes(self) -> None:
         receipt = cap._json_bytes({"kind":"disposable_fixture", "data_sha256":sha(OBSERVED_STDOUT)})
@@ -364,7 +465,11 @@ int main(void) {sleep(3);return 0;}
         self.active_binary = self.programs["success"]
         with patch.object(cap, "SIGNING_KEY_PATH", self.key), \
              patch.object(cap, "_open_root_file", side_effect=self.fake_root_file):
-            signed = cap._sign_receipt(receipt)
+            signed = cap._sign_receipt(
+                receipt, expected_signer_sha256=sha(
+                    Path("/usr/bin/ssh-keygen").read_bytes()
+                ),
+            )
         self.assertIn(b"-----BEGIN SSH SIGNATURE-----", signed)
         sig_path = Path(self.temp.name) / "sig"
         sig_path.write_bytes(signed)
@@ -374,6 +479,65 @@ int main(void) {sleep(3);return 0;}
             input=receipt, capture_output=True, timeout=15,
         )
         self.assertEqual(0, verified.returncode, verified.stderr.decode(errors="replace"))
+
+    def test_signer_executable_sha_is_exactly_root_policy_pinned(self) -> None:
+        self.active_binary = self.programs["success"]
+        self.policy_file = Path(self.temp.name) / "policy"
+        self.policy_file.write_bytes(cap._json_bytes(
+            example_policy(self.active_binary.read_bytes())
+        ))
+        with patch.object(cap, "SIGNING_KEY_PATH", self.key), \
+             patch.object(cap, "_open_root_file", side_effect=self.fake_root_file):
+            with self.assertRaisesRegex(
+                cap.CaptureDenied, "signer executable differs"
+            ):
+                cap._sign_receipt(
+                    b"synthetic fixture\n",
+                    expected_signer_sha256="f" * 64,
+                )
+
+    def test_key_path_rotation_does_not_swap_verified_signer_fd(self) -> None:
+        # This simulates a trusted root path rotation after descriptor-open,
+        # not a proof of deployed key custody or actual UID0 permissions.
+        self.active_binary = self.programs["success"]
+        self.policy_file = Path(self.temp.name) / "policy"
+        self.policy_file.write_bytes(cap._json_bytes(
+            example_policy(self.active_binary.read_bytes())
+        ))
+        receipt = b"pinned key fd during rotation\n"
+        rotated = [False]
+        original_key = Path(self.temp.name) / "original-key-inode"
+
+        def switch_path_after_open(path, **kwargs):
+            descriptor, data = self.fake_root_file(path, **kwargs)
+            if path == cap.SIGNING_KEY_PATH and not rotated[0]:
+                rotated[0] = True
+                self.key.rename(original_key)
+                self.key.write_bytes(b"attacker-supplied-incorrect-key")
+                self.key.chmod(0o600)
+            return descriptor, data
+
+        with patch.object(cap, "SIGNING_KEY_PATH", self.key), \
+             patch.object(cap, "_open_root_file", side_effect=switch_path_after_open):
+            signature = cap._sign_receipt(
+                receipt,
+                expected_signer_sha256=sha(
+                    Path("/usr/bin/ssh-keygen").read_bytes()
+                ),
+            )
+        self.assertTrue(rotated[0])
+        sig_path = Path(self.temp.name) / "rotated-fd.sshsig"
+        sig_path.write_bytes(signature)
+        checked = subprocess.run(
+            ["/usr/bin/ssh-keygen", "-Y", "verify", "-f", str(self.signers),
+             "-I", cap.PROOF_ISSUER, "-n", cap.PROOF_NAMESPACE,
+             "-s", str(sig_path)],
+            input=receipt, capture_output=True, timeout=15,
+        )
+        self.assertEqual(
+            0, checked.returncode,
+            checked.stderr.decode(errors="replace"),
+        )
 
     def test_wrong_pinned_binary_digest_fails_before_child_execution(self) -> None:
         self.active_binary = self.programs["success"]
@@ -386,7 +550,7 @@ int main(void) {sleep(3);return 0;}
              patch.object(cap, "_capture_from_pipes", side_effect=AssertionError("MUST NOT EXEC")):
             with self.assertRaisesRegex(cap.CaptureDenied, "differs"):
                 cap.run()
-        self.assertEqual([], list(self.dest.glob("proof-*")))
+        self.assertEqual([], list(self.dest.glob("prototype-*")))
 
     def test_signer_failure_leaves_no_authoritative_output(self) -> None:
         self.active_binary = self.programs["success"]
@@ -404,7 +568,7 @@ int main(void) {sleep(3);return 0;}
              patch.object(cap, "_sign_receipt", side_effect=cap.CaptureDenied("missing signer")):
             with self.assertRaisesRegex(cap.CaptureDenied, "missing signer"):
                 cap.run()
-        self.assertEqual([], list(self.dest.glob("proof-*")))
+        self.assertEqual([], list(self.dest.glob("prototype-*")))
 
     def test_end_to_end_simulated_static_capture_is_signed_but_not_admitted(self) -> None:
         # The root/uid/path checks are replaced in this user-UID fixture ONLY.
@@ -422,7 +586,7 @@ int main(void) {sleep(3);return 0;}
              patch.object(cap, "_separate_child_identity", return_value=(os.getuid(), os.getgid())), \
              patch.object(cap, "_drop_to_child", return_value=None):
             outcome = cap.run()
-        self.assertEqual("root_owned_proof_published_not_admitted", outcome["status"])
+        self.assertEqual("root_owned_prototype_bundle_published_not_admitted", outcome["status"])
         self.assertFalse(outcome["day1_admission_authorized"])
         self.assertFalse(outcome["ledger_binding_verified"])
         self.assertFalse(outcome["real_deployment_verified"])
@@ -437,15 +601,31 @@ int main(void) {sleep(3);return 0;}
         self.assertEqual(sha(stdout), proof["captured_stdout_sha256"])
         self.assertEqual(len(stdout), proof["captured_stdout_bytes"])
         self.assertEqual(sha(stderr), proof["captured_stderr_sha256"])
-        self.assertEqual(sha(self.active_binary.read_bytes()), proof["executed_source_sha256"])
+        self.assertEqual(sha(self.active_binary.read_bytes()), proof["initial_executable_sha256"])
         self.assertEqual(cap.PROOF_KIND, proof["kind"])
-        self.assertNotIn("day1_admission_authorized", proof)
+        self.assertIs(proof["day1_admission_authorized"], False)
         genuine = subprocess.run(
             ["/usr/bin/ssh-keygen", "-Y", "verify", "-f", str(self.signers),
              "-I", cap.PROOF_ISSUER, "-n", cap.PROOF_NAMESPACE, "-s", str(sig)],
             input=proofbytes, capture_output=True, timeout=15,
         )
         self.assertEqual(0, genuine.returncode, genuine.stderr.decode(errors="replace"))
+        # An authentic *prototype* signature cannot verify under the
+        # production task-proof principal/namespace from verifier PR #1389.
+        production_verification = subprocess.run(
+            [
+                "/usr/bin/ssh-keygen", "-Y", "verify",
+                "-f", str(self.signers),
+                "-I", "grabowski-day1-capture@heimgewebe",
+                "-n", "grabowski-day1-task-proof-v1@heimgewebe",
+                "-s", str(sig),
+            ],
+            input=proofbytes, capture_output=True, timeout=15,
+        )
+        self.assertNotEqual(0, production_verification.returncode)
+        self.assertNotEqual(
+            "grabowski.protected_day1_task_proof", proof["kind"]
+        )
         # A *canonical* reissued proof with forged stdout hash still has
         # valid JSON/schema; the original root-owned signature must reject it.
         forged_claim = {**proof, "captured_stdout_sha256": "f" * 64}
@@ -491,7 +671,7 @@ int main(void) {sleep(3);return 0;}
              patch.object(cap, "_sign_receipt", side_effect=AssertionError("MUST NOT SIGN")):
             with self.assertRaisesRegex(cap.CaptureDenied, "executable FD changed"):
                 cap.run()
-        self.assertEqual([], list(self.dest.glob("proof-*")))
+        self.assertEqual([], list(self.dest.glob("prototype-*")))
 
     def test_error_exits_without_authoritative_bundle_or_root_key(self) -> None:
         self.active_binary = self.programs["exit"]
@@ -510,4 +690,4 @@ int main(void) {sleep(3);return 0;}
              patch.object(cap, "_sign_receipt", side_effect=AssertionError("MUST NOT SIGN")):
             with self.assertRaises(cap.CaptureDenied):
                 cap.run()
-        self.assertEqual([], list(self.dest.glob("proof-*")))
+        self.assertEqual([], list(self.dest.glob("prototype-*")))
