@@ -11,8 +11,8 @@ ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%h/.local/state/grabowski
 UMask=0077
-# The reconciler keeps a 720s internal pass budget, reserves 540s before
-# entering a new 16-slot identity, and persists a round-robin cursor so a slow
-# read-only identity cannot starve later merge obligations across timer runs.
-# The outer limit leaves additional margin for audit verification and shutdown.
-TimeoutStartSec=900s
+# Allow up to 900s for verified audit discovery plus 720s for job processing.
+# The latter reserves 540s before entering a new 16-slot identity. An overlong
+# discovery fails explicitly rather than silently consuming the job reserve.
+# The outer timeout leaves 180s margin for finalization and shutdown.
+TimeoutStartSec=1800s

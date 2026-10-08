@@ -71,6 +71,7 @@ POST_MERGE_SINGLE_IDENTITY_BUDGET_SECONDS = (
     + POST_MERGE_START_TIMEOUT_SECONDS
 )
 DEFAULT_RECONCILE_PASS_BUDGET_SECONDS = 720
+DEFAULT_RECONCILE_DISCOVERY_BUDGET_SECONDS = 900
 RECONCILE_CURSOR_METADATA_KEY = "repoground_post_merge_reconcile_cursor_v1"
 RECONCILE_DISCOVERY_METADATA_KEY = "repoground_post_merge_reconcile_discovery_v1"
 RECONCILE_SCAN_NEXT_METADATA_KEY = "repoground_post_merge_reconcile_scan_next_v1"
@@ -2423,10 +2424,7 @@ def reconcile_recent_captain_audit_followups(
     if type(limit) is not int or not 1 <= limit <= 100:
         raise RepoGroundPostMergeError("reconcile limit is out of bounds")
 
-    pass_started_monotonic = time.monotonic()
-    pass_deadline_monotonic = (
-        pass_started_monotonic + DEFAULT_RECONCILE_PASS_BUDGET_SECONDS
-    )
+    discovery_started_monotonic = time.monotonic()
 
     import grabowski_audit_query
     import grabowski_operator
@@ -2592,6 +2590,21 @@ def reconcile_recent_captain_audit_followups(
             "Captain audit reconciliation discovery watermark was not reached"
         )
 
+    # Audit verification/ordinal discovery can be expensive after rotation.
+    # Do not spend the one-identity reserve before scheduling can begin.
+    # Fail explicitly if discovery itself overruns: it must not silently
+    # report a successful timer pass with zero processed obligations.
+    processing_started_monotonic = time.monotonic()
+    if (
+        processing_started_monotonic - discovery_started_monotonic
+        > DEFAULT_RECONCILE_DISCOVERY_BUDGET_SECONDS
+    ):
+        raise RepoGroundPostMergeError(
+            "Captain audit discovery budget exhausted before job processing"
+        )
+    pass_deadline_monotonic = (
+        processing_started_monotonic + DEFAULT_RECONCILE_PASS_BUDGET_SECONDS
+    )
     starter = resolve_job_starter({"grabowski_operator": grabowski_operator})
     if starter is None:
         raise RepoGroundPostMergeError("durable Grabowski job starter is unavailable")

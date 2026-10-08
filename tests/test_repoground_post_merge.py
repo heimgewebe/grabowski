@@ -1468,7 +1468,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 },
             ),
             patch.object(post_merge.time, "time", return_value=10_000),
-            patch.object(post_merge.time, "monotonic", side_effect=[0.0, 0.0, 1000.0]),
+            patch.object(post_merge.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 1000.0]),
             patch.object(
                 post_merge, "resolve_job_starter",
                 return_value=lambda *_args, **_kwargs: {},
@@ -1931,6 +1931,90 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
             "durable_freshness_job_slots_exhausted",
         )
 
+    def test_verified_audit_discovery_cannot_starve_first_completion(self) -> None:
+        items = [{
+            "record": {
+                "operation": "captain-run-audit-completion",
+                "action": "pr-merge",
+                "timestamp_unix": 9_950,
+            },
+            "evidence": {"record_sha256": "a" * 64},
+        }]
+        audit = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=10,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter(items),
+        )
+        scheduled: list[str] = []
+
+        def schedule(sha: str, **_kwargs: object) -> dict[str, object]:
+            scheduled.append(sha)
+            return {
+                "status": "already_satisfied",
+                "reason": "durable_freshness_already_converged",
+                "reused": True,
+            }
+
+        with (
+            patch.dict(sys.modules, {
+                "grabowski_audit_query": audit,
+                "grabowski_operator": types.SimpleNamespace(),
+            }),
+            patch.object(post_merge.time, "time", return_value=10_000),
+            # The audit phase itself consumes 181s: the former global 720s
+            # deadline leaves less than the conservative 540s identity reserve.
+            patch.object(post_merge.time, "monotonic", side_effect=[0.0, 181.0, 181.0]),
+            patch.object(
+                post_merge, "resolve_job_starter",
+                return_value=lambda *_args, **_kwargs: {},
+            ),
+            patch.object(
+                post_merge, "schedule_from_captain_audit_completion",
+                side_effect=schedule,
+            ),
+        ):
+            result = post_merge.reconcile_recent_captain_audit_followups(
+                lookback_seconds=100,
+            )
+        self.assertEqual(scheduled, ["a" * 64])
+        self.assertEqual(result["processed"], 1)
+        self.assertFalse(result["budget_exhausted"])
+        self.assertEqual(result["remaining"], 0)
+
+    def test_verified_audit_discovery_overrun_fails_closed_before_job(self) -> None:
+        audit = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=10,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter([
+                {
+                    "record": {
+                        "operation": "captain-run-audit-completion",
+                        "action": "pr-merge",
+                        "timestamp_unix": 9_950,
+                    },
+                    "evidence": {"record_sha256": "a" * 64},
+                }
+            ]),
+        )
+        with (
+            patch.dict(sys.modules, {
+                "grabowski_audit_query": audit,
+                "grabowski_operator": types.SimpleNamespace(),
+            }),
+            patch.object(post_merge.time, "time", return_value=10_000),
+            patch.object(post_merge.time, "monotonic", side_effect=[0.0, 901.0, 901.0]),
+            patch.object(
+                post_merge, "resolve_job_starter",
+                side_effect=AssertionError("overrun must fail before job processing"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                post_merge.RepoGroundPostMergeError, "discovery budget exhausted",
+            ):
+                post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100,
+                )
+
     def test_reconcile_pass_budget_stops_before_next_expensive_identity(self) -> None:
         items = [
             {
@@ -1979,7 +2063,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
             patch.object(
                 post_merge.time,
                 "monotonic",
-                side_effect=[0.0, 0.0, 181.0],
+                side_effect=[0.0, 0.0, 0.0, 181.0],
             ),
             patch.object(
                 post_merge,
@@ -2873,7 +2957,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 with patch.object(
                     post_merge.time,
                     "monotonic",
-                    side_effect=[0.0, 0.0, 3.0, 181.0],
+                    side_effect=[0.0, 0.0, 0.0, 3.0, 181.0],
                 ):
                     first = post_merge.reconcile_recent_captain_audit_followups(
                         lookback_seconds=100, limit=64
@@ -3372,7 +3456,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 "_save_reconcile_progress",
                 side_effect=save_progress,
             ),
-            patch.object(post_merge.time, "monotonic", side_effect=[0.0, 0.0, 181.0]),
+            patch.object(post_merge.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 181.0]),
         ):
             first = post_merge.reconcile_recent_captain_audit_followups()
 
@@ -3411,7 +3495,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 "_save_reconcile_progress",
                 side_effect=save_progress,
             ),
-            patch.object(post_merge.time, "monotonic", side_effect=[1_000.0, 1_000.0]),
+            patch.object(post_merge.time, "monotonic", side_effect=[1_000.0, 1_000.0, 1_000.0]),
         ):
             second = post_merge.reconcile_recent_captain_audit_followups()
 
