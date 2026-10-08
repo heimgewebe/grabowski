@@ -5523,6 +5523,15 @@ def deploy_url(
         else None
     )
     if topology.kind == "legacy-stdio":
+        # Legacy stdio has no installed post-merge reconciliation timer. Do not
+        # activate a release whose Captain promises durable RepoGround refreshes.
+        if "grabowski_repoground_post_merge" in getattr(
+            snapshot, "supporting_source_bytes", {}
+        ):
+            core.fail(
+                "legacy-stdio cannot provide durable RepoGround post-merge reconciliation",
+                phase="post-merge-reconciler-unsupported-topology",
+            )
         core.deploy(
             repo,
             runtime,

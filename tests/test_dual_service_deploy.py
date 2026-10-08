@@ -4583,6 +4583,24 @@ class DeploymentSequenceTests(unittest.TestCase):
         install_watchdogs.assert_not_called()
         install.assert_not_called()
 
+    def test_legacy_stdio_post_merge_reconciler_fails_before_deploy(self) -> None:
+        snapshot = self.snapshot()
+        snapshot.supporting_source_bytes = {
+            "grabowski_repoground_post_merge": b"verified module bytes",
+        }
+        topology = dual.ProfileTopology("legacy-stdio", legacy_entrypoint=CONTRACT)
+        with (
+            mock.patch.object(
+                dual, "preflight_url", return_value=(snapshot, RUNTIME, topology)
+            ),
+            mock.patch.object(core, "deploy") as deploy,
+            mock.patch.object(dual, "install_watchdog_host_assets") as install,
+        ):
+            with self.assertRaisesRegex(core.DeployError, "legacy-stdio"):
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+        deploy.assert_not_called()
+        install.assert_not_called()
+
     def test_operator_stop_failure_prevents_pointer_activation(self) -> None:
         events: list[str] = []
         stderr = io.StringIO()

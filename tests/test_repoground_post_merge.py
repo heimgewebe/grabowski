@@ -1116,7 +1116,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
         self.assertFalse(result["discovery_watermark_persisted"])
         self.assertEqual(saved, [(merge_sha256, None)])
 
-    def test_reconcile_terminal_ineligibility_advances_discovery_but_exhaustion_does_not(self) -> None:
+    def test_reconcile_exhaustion_records_debt_before_discovery_advances(self) -> None:
         sha = "a" * 64
         items = [
             {
@@ -1145,7 +1145,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
         cases = (
             ("merge_verification_not_passed", True),
             ("captain_merge_not_fast_path_eligible", True),
-            ("durable_freshness_job_slots_exhausted", False),
+            ("durable_freshness_job_slots_exhausted", True),
             ("unrecognized_not_scheduled_reason", False),
         )
         for reason, terminal in cases:
@@ -1176,8 +1176,9 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                     ),
                     patch.object(
                         post_merge, "_save_reconcile_progress",
-                        side_effect=lambda _tasks, *, cursor, discovery_ordinal: progress.append(
-                            (cursor, discovery_ordinal)
+                        side_effect=lambda _tasks, *, cursor, discovery_ordinal,
+                        exhausted_completion_record_sha256s=(): progress.append(
+                            (cursor, discovery_ordinal, tuple(exhausted_completion_record_sha256s))
                         ),
                     ),
                 ):
@@ -1189,7 +1190,116 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 self.assertEqual(result["matched"], 1)
                 self.assertEqual(result["discovery_ordinal_after"], 13 if terminal else 12)
                 self.assertEqual(result["discovery_watermark_persisted"], terminal)
-                self.assertEqual(progress, [(sha, 13 if terminal else None)])
+                self.assertEqual(
+                    progress,
+                    [(sha, 13 if terminal else None,
+                      (sha,) if reason == "durable_freshness_job_slots_exhausted" else ())],
+                )
+                self.assertEqual(
+                    result["exhausted_obligations_recorded"],
+                    [sha] if reason == "durable_freshness_job_slots_exhausted" else [],
+                )
+
+    def test_reconcile_after_exhausted_checkpoint_discovers_new_merge(self) -> None:
+        old_sha, new_sha = "a" * 64, "c" * 64
+        entries = [
+            {
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp_unix": 9_950,
+                },
+                "evidence": {"record_sha256": old_sha, "global_ordinal": 13},
+            },
+            {
+                "record": {"operation": "routine-event", "timestamp_unix": 9_940},
+                "evidence": {"record_sha256": "b" * 64, "global_ordinal": 12},
+            },
+        ]
+        query = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=3,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter(entries),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(database)
+            )
+            post_merge._save_reconcile_progress(
+                tasks, cursor=None, discovery_ordinal=12
+            )
+            outcomes = {
+                old_sha: {
+                    "status": "not_scheduled",
+                    "reason": "durable_freshness_job_slots_exhausted",
+                    "repository": REPO,
+                },
+                new_sha: {
+                    "status": "scheduled",
+                    "reason": "durable_freshness_job_started",
+                    "repository": REPO,
+                    "unit": "grabowski-job-new",
+                    "reused": False,
+                },
+            }
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "grabowski_audit_query": query,
+                        "grabowski_operator": types.SimpleNamespace(
+                            STATE_DIR=Path("/state")
+                        ),
+                        "grabowski_tasks": tasks,
+                    },
+                ),
+                patch.object(post_merge.time, "time", return_value=10_000),
+                patch.object(
+                    post_merge,
+                    "resolve_job_starter",
+                    return_value=lambda *_args, **_kwargs: {},
+                ),
+                patch.object(
+                    post_merge,
+                    "schedule_from_captain_audit_completion",
+                    side_effect=lambda sha, **_kwargs: outcomes[sha],
+                ),
+            ):
+                first = post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100
+                )
+                self.assertTrue(first["discovery_watermark_persisted"])
+                self.assertEqual(first["exhausted_obligations_recorded"], [old_sha])
+                self.assertEqual(
+                    post_merge._load_reconcile_discovery_ordinal(tasks), 13
+                )
+                entries.insert(
+                    0,
+                    {
+                        "record": {
+                            "operation": "captain-run-audit-completion",
+                            "action": "pr-merge",
+                            "timestamp_unix": 9_960,
+                        },
+                        "evidence": {
+                            "record_sha256": new_sha,
+                            "global_ordinal": 14,
+                        },
+                    },
+                )
+                second = post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100
+                )
+                self.assertEqual(second["matched"], 1)
+                self.assertEqual(second["processed"], 1)
+                self.assertEqual(second["outcomes"][0]["captain_audit_completion_sha256"], new_sha)
+                self.assertEqual(second["scanned_records"], 2)
+                self.assertFalse(second["progress_persisted"])
 
     def test_reconcile_partial_pass_does_not_skip_unprocessed_audits(self) -> None:
         items = [
@@ -1800,6 +1910,55 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 "cursor identity is invalid",
             ):
                 post_merge._load_reconcile_cursor(tasks_module)
+
+    def test_exhausted_debt_and_watermark_commit_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(database)
+            )
+            exhausted = "d" * 64
+            post_merge._save_reconcile_progress(
+                tasks,
+                cursor="a" * 64,
+                discovery_ordinal=13,
+                exhausted_completion_record_sha256s=(exhausted,),
+            )
+            with sqlite3.connect(database) as connection:
+                payload = connection.execute(
+                    "SELECT value FROM metadata WHERE key=?",
+                    (post_merge.RECONCILE_EXHAUSTED_METADATA_PREFIX + exhausted,),
+                ).fetchone()
+                self.assertIsNotNone(payload)
+                self.assertEqual(
+                    __import__("json").loads(payload[0])["status"],
+                    "manual_recovery_required",
+                )
+                connection.execute(
+                    "CREATE TRIGGER reject_debt BEFORE INSERT ON metadata "
+                    "WHEN NEW.key LIKE 'repoground_post_merge_exhausted_v1:%' "
+                    "BEGIN SELECT RAISE(ABORT, 'debt rejected'); END"
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                post_merge._save_reconcile_progress(
+                    tasks,
+                    cursor="b" * 64,
+                    discovery_ordinal=14,
+                    exhausted_completion_record_sha256s=("e" * 64,),
+                )
+            self.assertEqual(post_merge._load_reconcile_cursor(tasks), "a" * 64)
+            self.assertEqual(post_merge._load_reconcile_discovery_ordinal(tasks), 13)
+            with sqlite3.connect(database) as connection:
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT value FROM metadata WHERE key=?",
+                        (post_merge.RECONCILE_EXHAUSTED_METADATA_PREFIX + "e" * 64,),
+                    ).fetchone()
+                )
 
     def test_reconcile_skips_cursor_write_when_same_pass_starts_job(self) -> None:
         items = [

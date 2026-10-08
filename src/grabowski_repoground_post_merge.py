@@ -69,6 +69,7 @@ POST_MERGE_SINGLE_IDENTITY_BUDGET_SECONDS = (
 DEFAULT_RECONCILE_PASS_BUDGET_SECONDS = 720
 RECONCILE_CURSOR_METADATA_KEY = "repoground_post_merge_reconcile_cursor_v1"
 RECONCILE_DISCOVERY_METADATA_KEY = "repoground_post_merge_reconcile_discovery_v1"
+RECONCILE_EXHAUSTED_METADATA_PREFIX = "repoground_post_merge_exhausted_v1:"
 DEFAULT_PREDECESSOR_RECONCILER_SOURCE = (
     Path.home()
     / ".local/share/grabowski-mcp/inputs/src/grabowski_repoground_post_merge.py"
@@ -1718,6 +1719,7 @@ def _save_reconcile_progress(
     *,
     cursor: str | None,
     discovery_ordinal: int | None,
+    exhausted_completion_record_sha256s: tuple[str, ...] = (),
 ) -> None:
     payloads: list[tuple[str, str]] = []
     if cursor is not None:
@@ -1760,11 +1762,34 @@ def _save_reconcile_progress(
                 ),
             )
         )
+    if len(exhausted_completion_record_sha256s) > 100:
+        raise RepoGroundPostMergeError("Exhausted RepoGround obligations exceed pass bound")
+    for record_sha256 in exhausted_completion_record_sha256s:
+        if (
+            not isinstance(record_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", record_sha256) is None
+        ):
+            raise RepoGroundPostMergeError("Exhausted RepoGround audit SHA-256 is invalid")
+        payloads.append(
+            (
+                RECONCILE_EXHAUSTED_METADATA_PREFIX + record_sha256,
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "captain_audit_completion_sha256": record_sha256,
+                        "status": "manual_recovery_required",
+                        "reason": "durable_freshness_job_slots_exhausted",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        )
     if not payloads:
         return
 
-    # Cursor rotation and audit discovery progress are one metadata mutation:
-    # commit both keys in the same SQLite transaction.
+    # Cursor, discovery and any unsatisfied exhausted obligations must commit
+    # together. Discovery may never skip an obligation that was not persisted.
     with tasks_module._database_connection() as connection:
         for key, payload in payloads:
             connection.execute(
@@ -2039,7 +2064,14 @@ def reconcile_recent_captain_audit_followups(
     cursor_persisted = False
     discovery_watermark_persisted = False
     progress_persisted = False
+    exhausted_obligations_recorded: tuple[str, ...] = ()
     if not scheduling_mutation_attempted:
+        exhausted_pending = tuple(
+            outcome["captain_audit_completion_sha256"]
+            for outcome in outcomes
+            if outcome["status"] == "not_scheduled"
+            and outcome["reason"] == "durable_freshness_job_slots_exhausted"
+        )
         cursor_after = cursor_candidate
         # A watermark may skip older records on the next pass. Only advance
         # it once every newly discovered completion is terminally satisfied.
@@ -2052,10 +2084,16 @@ def reconcile_recent_captain_audit_followups(
                 outcome["status"] == "already_satisfied"
                 or (
                     outcome["status"] == "not_scheduled"
-                    and outcome["reason"] in {
-                        "merge_verification_not_passed",
-                        "captain_merge_not_fast_path_eligible",
-                    }
+                    and (
+                        outcome["reason"] in {
+                            "merge_verification_not_passed",
+                            "captain_merge_not_fast_path_eligible",
+                        }
+                        or (
+                            outcome["reason"] == "durable_freshness_job_slots_exhausted"
+                            and cursor_tasks is not None
+                        )
+                    )
                 )
                 for outcome in outcomes
             )
@@ -2073,16 +2111,21 @@ def reconcile_recent_captain_audit_followups(
             discovery_ordinal_candidate is not None
             and discovery_ordinal_candidate != discovery_ordinal_before
         )
-        if cursor_tasks is not None and (cursor_changed or discovery_changed):
-            _save_reconcile_progress(
-                cursor_tasks,
-                cursor=cursor_candidate if cursor_changed else None,
-                discovery_ordinal=(
+        if cursor_tasks is not None and (
+            cursor_changed or discovery_changed or exhausted_pending
+        ):
+            progress_args: dict[str, Any] = {
+                "cursor": cursor_candidate if cursor_changed else None,
+                "discovery_ordinal": (
                     discovery_ordinal_candidate if discovery_changed else None
                 ),
-            )
+            }
+            if exhausted_pending:
+                progress_args["exhausted_completion_record_sha256s"] = exhausted_pending
+            _save_reconcile_progress(cursor_tasks, **progress_args)
             cursor_persisted = cursor_changed
             discovery_watermark_persisted = discovery_changed
+            exhausted_obligations_recorded = exhausted_pending
             progress_persisted = True
 
     return {
@@ -2106,6 +2149,7 @@ def reconcile_recent_captain_audit_followups(
         "discovery_watermark_reached": discovery_watermark_reached,
         "discovery_watermark_persisted": discovery_watermark_persisted,
         "progress_persisted": progress_persisted,
+        "exhausted_obligations_recorded": list(exhausted_obligations_recorded),
         "pass_budget_seconds": DEFAULT_RECONCILE_PASS_BUDGET_SECONDS,
         "budget_exhausted": budget_exhausted,
         "remaining": len(completion_record_sha256s) - len(outcomes),
