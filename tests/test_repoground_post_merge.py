@@ -2185,6 +2185,236 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 ):
                     post_merge.acknowledge_exhausted_audit_followup(sha)
 
+    def test_acknowledged_debt_is_not_resurrected_when_cursor_and_watermark_do_not_change(self) -> None:
+        exhausted = "e" * 64
+        cursor = "a" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            post_merge._save_reconcile_progress(
+                tasks, cursor=cursor, discovery_ordinal=12,
+                exhausted_completion_record_sha256s=(exhausted,),
+            )
+            request = {
+                "status": "ready", "repository": REPO,
+                "merge_sha": MERGE, "target_branch": BASE,
+            }
+            with (
+                patch.dict(sys.modules, {"grabowski_tasks": tasks}),
+                patch.object(
+                    post_merge, "captain_followup_request_from_audit",
+                    return_value=request,
+                ),
+                patch.object(
+                    post_merge, "_read_freshness",
+                    return_value=freshness(
+                        state="fresh_exact", bundle=HEAD, live=HEAD, remote=HEAD
+                    ),
+                ),
+                patch.object(post_merge, "_check_ancestry", return_value=True),
+                patch.object(
+                    post_merge, "_read_remote_branch_head", return_value=HEAD,
+                ),
+            ):
+                acknowledged = post_merge.acknowledge_exhausted_audit_followup(
+                    exhausted
+                )
+            self.assertTrue(acknowledged["ledger_removed"])
+            self.assertEqual(
+                post_merge._load_reconcile_discovery_ordinal(tasks), 12
+            )
+            self.assertEqual(post_merge._load_reconcile_cursor(tasks), cursor)
+            # An old Reconcile attempt still sees exactly its expected CAS
+            # progress after the ACK. The ACK must be monotone per audit ID.
+            with self.assertRaisesRegex(
+                post_merge.RepoGroundPostMergeError, "already acknowledged"
+            ):
+                post_merge._save_reconcile_progress(
+                    tasks,
+                    cursor=None,
+                    discovery_ordinal=None,
+                    exhausted_completion_record_sha256s=(exhausted,),
+                    expected_discovery_ordinal=12,
+                    expected_cursor=cursor,
+                )
+            with sqlite3.connect(db) as connection:
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT value FROM metadata WHERE key=?",
+                        (post_merge._exhausted_record_key(exhausted),),
+                    ).fetchone()
+                )
+                tombstone = connection.execute(
+                    "SELECT value FROM metadata WHERE key=?",
+                    (post_merge._acknowledged_record_key(exhausted),),
+                ).fetchone()
+            self.assertIsNotNone(tombstone)
+            self.assertEqual(
+                post_merge._load_reconcile_discovery_ordinal(tasks), 12
+            )
+            self.assertEqual(post_merge._load_reconcile_cursor(tasks), cursor)
+
+            # Future passes must treat a verified immutable ACK as satisfied,
+            # not touch exhausted systemd slots or try to recreate the debt.
+            items = [
+                {
+                    "record": {
+                        "operation": "captain-run-audit-completion",
+                        "action": "pr-merge",
+                        "timestamp_unix": 9_950,
+                    },
+                    "evidence": {
+                        "record_sha256": exhausted, "global_ordinal": 13,
+                    },
+                },
+                {
+                    "record": {"operation": "routine-event", "timestamp_unix": 9_940},
+                    "evidence": {
+                        "record_sha256": "b" * 64, "global_ordinal": 12,
+                    },
+                },
+            ]
+            audit = types.SimpleNamespace(
+                MAX_SCAN_RECORDS=100,
+                capture_verified_audit_snapshot=lambda: object(),
+                _iter_snapshot_items=lambda _snapshot, *, order: iter(items),
+            )
+            with (
+                patch.dict(
+                    sys.modules, {
+                        "grabowski_audit_query": audit,
+                        "grabowski_operator": types.SimpleNamespace(
+                            STATE_DIR=Path(temporary),
+                        ),
+                        "grabowski_tasks": tasks,
+                    },
+                ),
+                patch.object(post_merge.time, "time", return_value=10_000),
+                patch.object(
+                    post_merge, "resolve_job_starter",
+                    return_value=lambda *_args, **_kwargs: {},
+                ),
+                patch.object(
+                    post_merge, "schedule_from_captain_audit_completion",
+                    side_effect=AssertionError(
+                        "an acknowledged audit must not be scheduled again"
+                    ),
+                ),
+            ):
+                observed = post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100,
+                )
+            self.assertEqual(observed["matched"], 1)
+            self.assertEqual(observed["processed"], 1)
+            self.assertEqual(
+                observed["outcomes"][0]["reason"],
+                "durable_exhausted_audit_previously_acknowledged",
+            )
+            self.assertEqual(observed["discovery_ordinal_after"], 13)
+            self.assertFalse(post_merge._read_exhausted_acknowledgement(tasks, "b" * 64))
+            self.assertTrue(post_merge._read_exhausted_acknowledgement(tasks, exhausted))
+            with sqlite3.connect(db) as connection:
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT value FROM metadata WHERE key=?",
+                        (post_merge._exhausted_record_key(exhausted),),
+                    ).fetchone()
+                )
+
+    def test_exhausted_ack_tombstone_failure_preserves_original_ledger(self) -> None:
+        exhausted = "f" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "CREATE TRIGGER deny_ack BEFORE INSERT ON metadata "
+                    "WHEN NEW.key LIKE 'repoground_post_merge_ack_v1:%' "
+                    "BEGIN SELECT RAISE(ABORT, 'ack marker denied'); END"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            post_merge._save_reconcile_progress(
+                tasks, cursor=None, discovery_ordinal=12,
+                exhausted_completion_record_sha256s=(exhausted,),
+            )
+            request = {
+                "status": "ready", "repository": REPO,
+                "merge_sha": MERGE, "target_branch": BASE,
+            }
+            with (
+                patch.dict(sys.modules, {"grabowski_tasks": tasks}),
+                patch.object(
+                    post_merge, "captain_followup_request_from_audit",
+                    return_value=request,
+                ),
+                patch.object(
+                    post_merge, "_read_freshness",
+                    return_value=freshness(
+                        state="fresh_exact", bundle=HEAD, live=HEAD, remote=HEAD
+                    ),
+                ),
+                patch.object(post_merge, "_check_ancestry", return_value=True),
+                patch.object(
+                    post_merge, "_read_remote_branch_head", return_value=HEAD,
+                ),
+            ):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    post_merge.acknowledge_exhausted_audit_followup(exhausted)
+            post_merge._require_exhausted_record(tasks, exhausted)
+            self.assertEqual(
+                post_merge._load_reconcile_discovery_ordinal(tasks), 12
+            )
+
+    def test_corrupt_ack_tombstone_fails_closed_before_debt_insert(self) -> None:
+        exhausted = "d" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                    (
+                        "repoground_post_merge_ack_v1:" + exhausted,
+                        '{"schema_version":999}',
+                    ),
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            with self.assertRaisesRegex(
+                post_merge.RepoGroundPostMergeError,
+                "acknowledgement record is invalid",
+            ):
+                post_merge._save_reconcile_progress(
+                    tasks, cursor=None, discovery_ordinal=14,
+                    exhausted_completion_record_sha256s=(exhausted,),
+                )
+            with sqlite3.connect(db) as connection:
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT value FROM metadata WHERE key=?",
+                        (post_merge._exhausted_record_key(exhausted),),
+                    ).fetchone()
+                )
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT value FROM metadata WHERE key=?",
+                        (post_merge.RECONCILE_DISCOVERY_METADATA_KEY,),
+                    ).fetchone()
+                )
+
     def test_queue_exhausted_recovery_checks_verified_identity_before_ack(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             db = Path(temporary) / "tasks.sqlite3"
@@ -2244,6 +2474,288 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 result = post_merge.acknowledge_exhausted_audit_followup(sha)
                 self.assertTrue(result["ledger_removed"])
                 self.assertEqual(read_pr.call_count, 2)
+
+    def test_bounded_audit_rotation_recovers_merge_beyond_scan_cap(self) -> None:
+        old_sha, new_sha = "a" * 64, "b" * 64
+        def item(ordinal: int, *, sha: str | None = None) -> dict:
+            completion = sha is not None
+            return {
+                "record": {
+                    "operation": (
+                        "captain-run-audit-completion" if completion else "routine-event"
+                    ),
+                    **({"action": "pr-merge"} if completion else {}),
+                    "timestamp_unix": 9_950 + ordinal,
+                },
+                "evidence": {
+                    "record_sha256": sha if completion else f"{ordinal:064x}",
+                    "global_ordinal": ordinal,
+                },
+            }
+        older = types.SimpleNamespace(
+            global_start_ordinal=11, global_end_ordinal=14,
+            records=4, items=[item(11, sha=old_sha), item(12),
+                              item(13), item(14)],
+        )
+        newer = types.SimpleNamespace(
+            global_start_ordinal=15, global_end_ordinal=18,
+            records=4, items=[item(15, sha=new_sha), item(16),
+                              item(17), item(18)],
+        )
+        snapshot = types.SimpleNamespace(
+            total_records=18, segments=(older, newer),
+        )
+        def verified_iterator(snap: object, *, order: str):
+            self.assertIn(order, {"asc", "desc"})
+            values = [value for seg in snap.segments for value in seg.items]
+            return iter(values if order == "asc" else list(reversed(values)))
+        audit = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=3,
+            capture_verified_audit_snapshot=lambda: snapshot,
+            _iter_snapshot_items=verified_iterator,
+        )
+        states = {"old": "retry_deferred", "new": "scheduled"}
+        newly_started: list[str] = []
+        def schedule(record_sha256: str, **_kw: object) -> dict:
+            if record_sha256 == old_sha:
+                return {
+                    "status": states["old"],
+                    "reason": "durable_freshness_job_retry_backoff",
+                    "repository": REPO, "reused": True,
+                }
+            self.assertEqual(record_sha256, new_sha)
+            current = states["new"]
+            if current == "scheduled":
+                newly_started.append(record_sha256)
+                states["new"] = "already_satisfied"
+            return {
+                "status": current,
+                "reason": "durable_freshness_job_started",
+                "repository": REPO,
+                "reused": current != "scheduled",
+                "unit": "grabowski-job-new",
+            }
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(database)
+            )
+            post_merge._save_reconcile_progress(
+                tasks, cursor=None, discovery_ordinal=10
+            )
+            modules = {
+                "grabowski_audit_query": audit,
+                "grabowski_operator": types.SimpleNamespace(STATE_DIR=Path("/state")),
+                "grabowski_tasks": tasks,
+            }
+            with (
+                patch.dict(sys.modules, modules),
+                patch.object(post_merge.time, "time", return_value=10_000),
+                patch.object(
+                    post_merge, "resolve_job_starter",
+                    return_value=lambda *_args, **_kwargs: {},
+                ),
+                patch.object(
+                    post_merge, "schedule_from_captain_audit_completion",
+                    side_effect=schedule,
+                ),
+            ):
+                def step() -> dict:
+                    return post_merge.reconcile_recent_captain_audit_followups(
+                        lookback_seconds=100
+                    )
+                first = step()
+                self.assertEqual(first["scanned_records"], 3)
+                self.assertEqual(first["scan_next_after"], 14)
+                self.assertEqual(first["discovery_ordinal_after"], 10)
+                second = step()
+                self.assertEqual(second["scanned_records"], 3)
+                self.assertEqual(second["matched"], 1)
+                self.assertEqual(newly_started, [new_sha])
+                self.assertFalse(second["progress_persisted"])
+                third = step()
+                self.assertEqual(third["scan_next_after"], 17)
+                fourth = step()
+                self.assertEqual(fourth["scan_next_after"], 11)
+                self.assertEqual(newly_started, [new_sha])
+                states["old"] = "already_satisfied"
+                resumed = step()
+                self.assertEqual(resumed["discovery_ordinal_after"], 13)
+                self.assertEqual(step()["discovery_ordinal_after"], 16)
+                self.assertEqual(step()["discovery_ordinal_after"], 18)
+                self.assertEqual(
+                    post_merge._load_reconcile_discovery_ordinal(tasks), 18
+                )
+
+    def test_stale_reconciliation_cannot_resurrect_acknowledged_debt(self) -> None:
+        exhausted = "e" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            post_merge._save_reconcile_progress(
+                tasks, cursor="a" * 64, discovery_ordinal=12
+            )
+            post_merge._save_reconcile_progress(
+                tasks, cursor="b" * 64, discovery_ordinal=14,
+                exhausted_completion_record_sha256s=(exhausted,),
+                expected_discovery_ordinal=12,
+                expected_cursor="a" * 64,
+            )
+            # Manual recovery was independently verified and acknowledged.
+            key = post_merge._exhausted_record_key(exhausted)
+            with sqlite3.connect(db) as connection:
+                connection.execute("DELETE FROM metadata WHERE key=?", (key,))
+            with self.assertRaisesRegex(
+                post_merge.RepoGroundPostMergeError, "changed"
+            ):
+                post_merge._save_reconcile_progress(
+                    tasks, cursor="c" * 64, discovery_ordinal=13,
+                    exhausted_completion_record_sha256s=(exhausted,),
+                    expected_discovery_ordinal=12,
+                    expected_cursor="a" * 64,
+                )
+            self.assertEqual(
+                post_merge._load_reconcile_discovery_ordinal(tasks), 14
+            )
+            self.assertEqual(
+                post_merge._load_reconcile_cursor(tasks), "b" * 64
+            )
+            with self.assertRaisesRegex(
+                post_merge.RepoGroundPostMergeError, "not durably registered"
+            ):
+                post_merge._require_exhausted_record(tasks, exhausted)
+
+    def test_reconcile_rejects_peer_watermark_change_before_debt_insert(self) -> None:
+        exhausted = "e" * 64
+        items = [
+            {
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp_unix": 9_950,
+                },
+                "evidence": {
+                    "record_sha256": exhausted,
+                    "global_ordinal": 13,
+                },
+            },
+            {
+                "record": {"operation": "routine-event", "timestamp_unix": 9_940},
+                "evidence": {"record_sha256": "f" * 64, "global_ordinal": 12},
+            },
+        ]
+        audit = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=100,
+            capture_verified_audit_snapshot=lambda: object(),
+            _iter_snapshot_items=lambda _snapshot, *, order: iter(items),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            post_merge._save_reconcile_progress(
+                tasks, cursor=None, discovery_ordinal=12
+            )
+
+            def simulate_peer_before_persist(sha: str, **kwargs: object) -> dict:
+                # Another pass checkpoints the same exhausted identity, then
+                # an operator ACKs the now recovered obligation.
+                self.assertEqual(sha, exhausted)
+                post_merge._save_reconcile_progress(
+                    tasks, cursor="a" * 64, discovery_ordinal=13,
+                    exhausted_completion_record_sha256s=(exhausted,),
+                )
+                with sqlite3.connect(db) as connection:
+                    connection.execute(
+                        "DELETE FROM metadata WHERE key=?",
+                        (post_merge._exhausted_record_key(exhausted),),
+                    )
+                return {
+                    "status": "not_scheduled",
+                    "reason": "durable_freshness_job_slots_exhausted",
+                    "repository": REPO,
+                }
+
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "grabowski_audit_query": audit,
+                        "grabowski_operator": types.SimpleNamespace(
+                            STATE_DIR=Path("/state")
+                        ),
+                        "grabowski_tasks": tasks,
+                    },
+                ),
+                patch.object(post_merge.time, "time", return_value=10_000),
+                patch.object(
+                    post_merge, "resolve_job_starter",
+                    return_value=lambda *_args, **_kwargs: {},
+                ),
+                patch.object(
+                    post_merge, "schedule_from_captain_audit_completion",
+                    side_effect=simulate_peer_before_persist,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    post_merge.RepoGroundPostMergeError, "changed"
+                ):
+                    post_merge.reconcile_recent_captain_audit_followups(
+                        lookback_seconds=100
+                    )
+            self.assertEqual(
+                post_merge._load_reconcile_discovery_ordinal(tasks), 13
+            )
+            self.assertEqual(
+                post_merge._load_reconcile_cursor(tasks), "a" * 64
+            )
+            with self.assertRaisesRegex(
+                post_merge.RepoGroundPostMergeError, "not durably registered"
+            ):
+                post_merge._require_exhausted_record(tasks, exhausted)
+
+    def test_reconcile_cursor_cas_rejects_parallel_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            post_merge._save_reconcile_progress(
+                tasks, cursor="a" * 64, discovery_ordinal=12
+            )
+            post_merge._save_reconcile_progress(
+                tasks, cursor="b" * 64, discovery_ordinal=None,
+                expected_discovery_ordinal=12, expected_cursor="a" * 64,
+            )
+            with self.assertRaisesRegex(
+                post_merge.RepoGroundPostMergeError, "changed"
+            ):
+                post_merge._save_reconcile_progress(
+                    tasks, cursor="c" * 64, discovery_ordinal=None,
+                    expected_discovery_ordinal=12, expected_cursor="a" * 64,
+                )
+            self.assertEqual(
+                post_merge._load_reconcile_cursor(tasks), "b" * 64
+            )
 
     def test_exhausted_debt_and_watermark_commit_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -5,6 +5,7 @@ from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import re
 import selectors
 import subprocess
@@ -69,7 +70,10 @@ POST_MERGE_SINGLE_IDENTITY_BUDGET_SECONDS = (
 DEFAULT_RECONCILE_PASS_BUDGET_SECONDS = 720
 RECONCILE_CURSOR_METADATA_KEY = "repoground_post_merge_reconcile_cursor_v1"
 RECONCILE_DISCOVERY_METADATA_KEY = "repoground_post_merge_reconcile_discovery_v1"
+RECONCILE_SCAN_NEXT_METADATA_KEY = "repoground_post_merge_reconcile_scan_next_v1"
 RECONCILE_EXHAUSTED_METADATA_PREFIX = "repoground_post_merge_exhausted_v1:"
+RECONCILE_ACKNOWLEDGED_METADATA_PREFIX = "repoground_post_merge_ack_v1:"
+_RECONCILE_CAS_UNSET = object()
 DEFAULT_PREDECESSOR_RECONCILER_SOURCE = (
     Path.home()
     / ".local/share/grabowski-mcp/inputs/src/grabowski_repoground_post_merge.py"
@@ -1715,6 +1719,29 @@ def _load_reconcile_discovery_ordinal(tasks_module: Any) -> int | None:
 
 
 
+def _load_reconcile_scan_next(tasks_module: Any) -> int | None:
+    with tasks_module._database_connection() as connection:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (RECONCILE_SCAN_NEXT_METADATA_KEY,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(row[0]))
+    except (TypeError, ValueError) as exc:
+        raise RepoGroundPostMergeError("RepoGround scan cursor is malformed") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema_version", "next_ordinal"}
+        or payload.get("schema_version") != 1
+        or type(payload.get("next_ordinal")) is not int
+        or payload["next_ordinal"] < 1
+    ):
+        raise RepoGroundPostMergeError("RepoGround scan cursor is invalid")
+    return payload["next_ordinal"]
+
+
 def _exhausted_record_key(record_sha256: str) -> str:
     if (
         not isinstance(record_sha256, str)
@@ -1736,6 +1763,79 @@ def _exhausted_record_payload(record_sha256: str) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _acknowledged_record_key(record_sha256: str) -> str:
+    _exhausted_record_key(record_sha256)
+    return RECONCILE_ACKNOWLEDGED_METADATA_PREFIX + record_sha256
+
+
+def _acknowledged_record_payload(
+    record_sha256: str, *, merge_sha: str, authoritative_head: str,
+) -> str:
+    _acknowledged_record_key(record_sha256)
+    for value in (merge_sha, authoritative_head):
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40}", value) is None:
+            raise RepoGroundPostMergeError(
+                "Exhausted acknowledgement SHA-1 identity is invalid"
+            )
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "captain_audit_completion_sha256": record_sha256,
+            "status": "fresh_exact_acknowledged",
+            "merge_sha": merge_sha,
+            "authoritative_head": authoritative_head,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _is_exhausted_acknowledged(
+    connection: Any, record_sha256: str,
+) -> bool:
+    key = _acknowledged_record_key(record_sha256)
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?", (key,),
+    ).fetchone()
+    if row is None:
+        return False
+    try:
+        payload = json.loads(str(row[0]))
+    except (TypeError, ValueError) as exc:
+        raise RepoGroundPostMergeError(
+            "Exhausted acknowledgement record is invalid"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {
+            "schema_version", "captain_audit_completion_sha256",
+            "status", "merge_sha", "authoritative_head",
+        }
+        or payload.get("schema_version") != 1
+        or payload.get("captain_audit_completion_sha256") != record_sha256
+        or payload.get("status") != "fresh_exact_acknowledged"
+    ):
+        raise RepoGroundPostMergeError(
+            "Exhausted acknowledgement record is invalid"
+        )
+    if str(row[0]) != _acknowledged_record_payload(
+        record_sha256,
+        merge_sha=payload["merge_sha"],
+        authoritative_head=payload["authoritative_head"],
+    ):
+        raise RepoGroundPostMergeError(
+            "Exhausted acknowledgement record is invalid"
+        )
+    return True
+
+
+def _read_exhausted_acknowledgement(
+    tasks_module: Any, record_sha256: str,
+) -> bool:
+    with tasks_module._database_connection() as connection:
+        return _is_exhausted_acknowledged(connection, record_sha256)
 
 
 def _require_exhausted_record(tasks_module: Any, record_sha256: str) -> None:
@@ -1898,6 +1998,25 @@ def acknowledge_exhausted_audit_followup(record_sha256: str) -> dict[str, Any]:
     key = _exhausted_record_key(record_sha256)
     payload = _exhausted_record_payload(record_sha256)
     with grabowski_tasks._database_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if _is_exhausted_acknowledged(connection, record_sha256):
+            raise RepoGroundPostMergeError(
+                "Exhausted audit is already acknowledged"
+            )
+        # One transaction owns both the deleted debt and the durable positive
+        # ACK. A stale scanner must be able to distinguish "never existed"
+        # from "verified fresh_exact and already acknowledged".
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?)",
+            (
+                _acknowledged_record_key(record_sha256),
+                _acknowledged_record_payload(
+                    record_sha256,
+                    merge_sha=merge_sha,
+                    authoritative_head=authoritative_head,
+                ),
+            ),
+        )
         deleted = connection.execute(
             "DELETE FROM metadata WHERE key=? AND value=?", (key, payload)
         ).rowcount
@@ -1914,6 +2033,7 @@ def acknowledge_exhausted_audit_followup(record_sha256: str) -> dict[str, Any]:
         "authoritative_head": authoritative_head,
         "freshness": projection,
         "ledger_removed": True,
+        "acknowledgement_persisted": True,
         "does_not_establish": ["future_branch_freshness"],
     }
 
@@ -1924,6 +2044,10 @@ def _save_reconcile_progress(
     cursor: str | None,
     discovery_ordinal: int | None,
     exhausted_completion_record_sha256s: tuple[str, ...] = (),
+    scan_next_ordinal: int | None = None,
+    expected_discovery_ordinal: Any = _RECONCILE_CAS_UNSET,
+    expected_cursor: Any = _RECONCILE_CAS_UNSET,
+    expected_scan_next_ordinal: Any = _RECONCILE_CAS_UNSET,
 ) -> None:
     payloads: list[tuple[str, str]] = []
     if cursor is not None:
@@ -1966,6 +2090,19 @@ def _save_reconcile_progress(
                 ),
             )
         )
+    if scan_next_ordinal is not None:
+        if type(scan_next_ordinal) is not int or scan_next_ordinal < 1:
+            raise RepoGroundPostMergeError("RepoGround scan cursor is invalid")
+        payloads.append(
+            (
+                RECONCILE_SCAN_NEXT_METADATA_KEY,
+                json.dumps(
+                    {"schema_version": 1, "next_ordinal": scan_next_ordinal},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        )
     if len(exhausted_completion_record_sha256s) > 100:
         raise RepoGroundPostMergeError("Exhausted RepoGround obligations exceed pass bound")
     for record_sha256 in exhausted_completion_record_sha256s:
@@ -1978,9 +2115,88 @@ def _save_reconcile_progress(
     if not payloads:
         return
 
-    # Cursor, discovery and any unsatisfied exhausted obligations must commit
-    # together. Discovery may never skip an obligation that was not persisted.
+    cas_discovery = expected_discovery_ordinal is not _RECONCILE_CAS_UNSET
+    cas_cursor = expected_cursor is not _RECONCILE_CAS_UNSET
+    cas_scan = expected_scan_next_ordinal is not _RECONCILE_CAS_UNSET
+    if cas_scan and expected_scan_next_ordinal is not None and (
+        type(expected_scan_next_ordinal) is not int
+        or expected_scan_next_ordinal < 1
+    ):
+        raise RepoGroundPostMergeError("Expected RepoGround scan cursor is invalid")
+    if cas_discovery and expected_discovery_ordinal is not None and (
+        type(expected_discovery_ordinal) is not int
+        or expected_discovery_ordinal < 0
+    ):
+        raise RepoGroundPostMergeError(
+            "Expected RepoGround discovery watermark is invalid"
+        )
+    if cas_cursor and expected_cursor is not None and (
+        not isinstance(expected_cursor, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_cursor) is None
+    ):
+        raise RepoGroundPostMergeError("Expected RepoGround cursor is invalid")
+    if (
+        cas_discovery
+        and discovery_ordinal is not None
+        and expected_discovery_ordinal is not None
+        and discovery_ordinal < expected_discovery_ordinal
+    ):
+        raise RepoGroundPostMergeError(
+            "RepoGround discovery watermark must never move backwards"
+        )
+
+    # Validate the exact old cursor/discovery under the SQLite writer lock.
+    # A stale reconciler must neither rewind progress nor recreate a ledger
+    # entry which a concurrent manual fresh_exact acknowledgement removed.
+    # Cursor, watermark and new debt remain one atomic mutation.
     with tasks_module._database_connection() as connection:
+        if cas_discovery or cas_cursor or cas_scan or exhausted_completion_record_sha256s:
+            connection.execute("BEGIN IMMEDIATE")
+        # Fail closed on a monotone per-audit ACK, even if an overlapping
+        # stale pass still has a valid old cursor/ordinal CAS preimage.
+        for record_sha256 in exhausted_completion_record_sha256s:
+            if _is_exhausted_acknowledged(connection, record_sha256):
+                raise RepoGroundPostMergeError(
+                    "Exhausted audit is already acknowledged"
+                )
+        if cas_discovery or cas_cursor or cas_scan:
+            for field, key, value in (
+                (
+                    "discovery watermark",
+                    RECONCILE_DISCOVERY_METADATA_KEY,
+                    expected_discovery_ordinal,
+                ),
+                ("cursor", RECONCILE_CURSOR_METADATA_KEY, expected_cursor),
+                ("scan cursor", RECONCILE_SCAN_NEXT_METADATA_KEY,
+                 expected_scan_next_ordinal),
+            ):
+                if value is _RECONCILE_CAS_UNSET:
+                    continue
+                row = connection.execute(
+                    "SELECT value FROM metadata WHERE key=?", (key,)
+                ).fetchone()
+                try:
+                    observed = json.loads(str(row[0])) if row is not None else None
+                except (TypeError, ValueError) as exc:
+                    raise RepoGroundPostMergeError(
+                        "RepoGround " + field + " changed before persistence"
+                    ) from exc
+                expected = (
+                    None
+                    if value is None
+                    else {
+                        "schema_version": 1,
+                        (
+                            "global_ordinal" if field == "discovery watermark"
+                            else "next_ordinal" if field == "scan cursor"
+                            else "cursor"
+                        ): value,
+                    }
+                )
+                if observed != expected:
+                    raise RepoGroundPostMergeError(
+                        "RepoGround " + field + " changed before persistence"
+                    )
         for key, payload in payloads:
             connection.execute(
                 "INSERT INTO metadata(key, value) VALUES(?, ?) "
@@ -2080,6 +2296,44 @@ def _cursor_ordered_completion_records(
     return ordered[start:] + ordered[:start]
 
 
+def _iter_reconcile_audit_window(
+    audit_query: Any,
+    snapshot: Any,
+    *,
+    first: int,
+    last: int,
+) -> Any:
+    """Seek in verified segment ordinals, decode at most a bounded page."""
+    segments = getattr(snapshot, "segments", None)
+    if not isinstance(segments, tuple) or not segments:
+        raise RepoGroundPostMergeError("Verified audit segments are unavailable")
+    selected = tuple(
+        segment
+        for segment in segments
+        if (
+            type(getattr(segment, "global_start_ordinal", None)) is int
+            and type(getattr(segment, "global_end_ordinal", None)) is int
+            and segment.global_start_ordinal <= last
+            and segment.global_end_ordinal >= first
+        )
+    )
+    if not selected:
+        raise RepoGroundPostMergeError("Verified audit scan window is not covered")
+    # The full audit snapshot was verified by its authoritative source. Only
+    # its unchanged segment objects are passed to the existing checked reader.
+    view = SimpleNamespace(segments=selected)
+    for item in audit_query._iter_snapshot_items(view, order="asc"):
+        evidence = item.get("evidence") if isinstance(item, dict) else None
+        ordinal = evidence.get("global_ordinal") if isinstance(evidence, dict) else None
+        if type(ordinal) is not int:
+            raise RepoGroundPostMergeError("Verified audit scan ordinal is unavailable")
+        if ordinal < first:
+            continue
+        if ordinal > last:
+            break
+        yield item
+
+
 def reconcile_recent_captain_audit_followups(
     *,
     lookback_seconds: int = DEFAULT_RECONCILE_LOOKBACK_SECONDS,
@@ -2101,12 +2355,15 @@ def reconcile_recent_captain_audit_followups(
     cursor_tasks: Any | None = None
     cursor_before: str | None = None
     discovery_ordinal_before: int | None = None
+    scan_next_before: int | None = None
     if isinstance(getattr(grabowski_operator, "STATE_DIR", None), Path):
         import grabowski_tasks
 
         cursor_tasks = grabowski_tasks
         cursor_before = _load_reconcile_cursor(cursor_tasks)
         discovery_ordinal_before = _load_reconcile_discovery_ordinal(cursor_tasks)
+        if callable(getattr(cursor_tasks, "_database_connection", None)):
+            scan_next_before = _load_reconcile_scan_next(cursor_tasks)
 
     since_unix = int(time.time()) - lookback_seconds
     snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
@@ -2123,9 +2380,36 @@ def reconcile_recent_captain_audit_followups(
     completion_record_sha256s: list[str] = []
     scanned_records = 0
     lookback_horizon_reached = False
-    newest_global_ordinal: int | None = None
-    discovery_watermark_reached = discovery_ordinal_before in (None, 0)
-    iterator = grabowski_audit_query._iter_snapshot_items(snapshot, order="desc")
+    window_mode = (
+        discovery_ordinal_before is not None
+        and type(getattr(snapshot, "total_records", None)) is int
+        and snapshot.total_records - discovery_ordinal_before > max_scan_records
+    )
+    scan_start: int | None = None
+    scan_end: int | None = None
+    if window_mode:
+        scan_start = (
+            scan_next_before
+            if (
+                scan_next_before is not None
+                and discovery_ordinal_before < scan_next_before <= snapshot.total_records
+            )
+            else discovery_ordinal_before + 1
+        )
+        scan_end = min(snapshot.total_records, scan_start + max_scan_records - 1)
+    newest_global_ordinal: int | None = scan_end if window_mode else None
+    discovery_watermark_reached = (
+        scan_start == discovery_ordinal_before + 1
+        if window_mode
+        else discovery_ordinal_before in (None, 0)
+    )
+    iterator = (
+        _iter_reconcile_audit_window(
+            grabowski_audit_query, snapshot, first=scan_start, last=scan_end
+        )
+        if window_mode
+        else grabowski_audit_query._iter_snapshot_items(snapshot, order="desc")
+    )
     for item in iterator:
         if scanned_records >= max_scan_records:
             raise RepoGroundPostMergeError(
@@ -2148,6 +2432,12 @@ def reconcile_recent_captain_audit_followups(
             raise RepoGroundPostMergeError(
                 "Captain audit reconciliation global ordinal is invalid"
             )
+        if window_mode:
+            assert scan_start is not None
+            if global_ordinal != scan_start + scanned_records - 1:
+                raise RepoGroundPostMergeError(
+                    "Verified audit scan window contains an ordinal gap"
+                )
         if newest_global_ordinal is None and isinstance(global_ordinal, int):
             newest_global_ordinal = global_ordinal
             if (
@@ -2193,7 +2483,13 @@ def reconcile_recent_captain_audit_followups(
             )
         completion_record_sha256s.append(record_sha256)
 
-    if discovery_ordinal_before is not None and not discovery_watermark_reached:
+    if window_mode:
+        assert scan_start is not None and scan_end is not None
+        if scanned_records != scan_end - scan_start + 1:
+            raise RepoGroundPostMergeError(
+                "Verified audit scan window was truncated before its last ordinal"
+            )
+    elif discovery_ordinal_before is not None and not discovery_watermark_reached:
         raise RepoGroundPostMergeError(
             "Captain audit reconciliation discovery watermark was not reached"
         )
@@ -2215,12 +2511,24 @@ def reconcile_recent_captain_audit_followups(
         if remaining_seconds < POST_MERGE_SINGLE_IDENTITY_BUDGET_SECONDS:
             budget_exhausted = True
             break
-        outcome = schedule_from_captain_audit_completion(
-            record_sha256,
-            job_starter=starter,
-            python_executable=__import__("sys").executable,
-            script_path=Path(__file__).resolve(),
-        )
+        # A fresh_exact ACK is a terminal fact for this immutable audit.
+        # On later retries it must not consume job slots or recreate debt.
+        # The save-side check below handles ACKs racing with this read.
+        if cursor_tasks is not None and callable(
+            getattr(cursor_tasks, "_database_connection", None)
+        ) and _read_exhausted_acknowledgement(cursor_tasks, record_sha256):
+            outcome = {
+                "status": "already_satisfied",
+                "reason": "durable_exhausted_audit_previously_acknowledged",
+                "reused": True,
+            }
+        else:
+            outcome = schedule_from_captain_audit_completion(
+                record_sha256,
+                job_starter=starter,
+                python_executable=__import__("sys").executable,
+                script_path=Path(__file__).resolve(),
+            )
         outcome_summary = {
             "captain_audit_completion_sha256": record_sha256,
             "status": outcome.get("status"),
@@ -2290,7 +2598,11 @@ def reconcile_recent_captain_audit_followups(
         )
         discovery_ordinal_candidate = (
             newest_global_ordinal
-            if discovery_complete and newest_global_ordinal is not None
+            if (
+                discovery_complete
+                and newest_global_ordinal is not None
+                and (not window_mode or discovery_watermark_reached)
+            )
             else discovery_ordinal_before
         )
         discovery_ordinal_after = discovery_ordinal_candidate
@@ -2305,8 +2617,21 @@ def reconcile_recent_captain_audit_followups(
         # discovery boundary can advance in this same SQLite transaction.
         # Otherwise the next pass could resurrect an already-acknowledged debt.
         exhausted_to_record = exhausted_pending if discovery_changed else ()
+        scan_next_after = scan_next_before
+        scan_next_changed = False
+        if window_mode:
+            assert scan_end is not None
+            assert discovery_ordinal_before is not None
+            assert type(snapshot.total_records) is int
+            scan_next_candidate = (
+                scan_end + 1
+                if scan_end < snapshot.total_records or discovery_changed
+                else discovery_ordinal_before + 1
+            )
+            scan_next_changed = scan_next_candidate != scan_next_before
         if cursor_tasks is not None and (
             cursor_changed or discovery_changed or exhausted_to_record
+            or scan_next_changed
         ):
             progress_args: dict[str, Any] = {
                 "cursor": cursor_candidate if cursor_changed else None,
@@ -2316,11 +2641,21 @@ def reconcile_recent_captain_audit_followups(
             }
             if exhausted_to_record:
                 progress_args["exhausted_completion_record_sha256s"] = exhausted_to_record
+            if scan_next_changed:
+                progress_args["scan_next_ordinal"] = scan_next_candidate
+            # Existing mocked legacy unit fixtures without a database retain
+            # their original signature; actual TaskStore persistence is CAS.
+            if callable(getattr(cursor_tasks, "_database_connection", None)):
+                progress_args["expected_discovery_ordinal"] = discovery_ordinal_before
+                progress_args["expected_cursor"] = cursor_before
+                progress_args["expected_scan_next_ordinal"] = scan_next_before
             _save_reconcile_progress(cursor_tasks, **progress_args)
             cursor_persisted = cursor_changed
             discovery_watermark_persisted = discovery_changed
             exhausted_obligations_recorded = exhausted_to_record
             progress_persisted = True
+            if scan_next_changed:
+                scan_next_after = scan_next_candidate
 
     return {
         "kind": "grabowski.repoground_post_merge_reconcile",
@@ -2333,7 +2668,18 @@ def reconcile_recent_captain_audit_followups(
         "audit_query_truncated": False,
         "scanned_records": scanned_records,
         "lookback_horizon_reached": lookback_horizon_reached,
-        "processing_order": "cursor_round_robin_newest_seed",
+        "processing_order": (
+            "cursor_round_robin_bounded_oldest_window"
+            if window_mode else "cursor_round_robin_newest_seed"
+        ),
+        "scan_mode": "bounded_rotation" if window_mode else "normal",
+        "scan_start_ordinal": scan_start,
+        "scan_end_ordinal": scan_end,
+        "scan_next_before": scan_next_before,
+        "scan_next_after": (
+            scan_next_after if not scheduling_mutation_attempted and window_mode
+            else scan_next_before
+        ),
         "cursor_before": cursor_before,
         "cursor_after": cursor_after,
         "cursor_persisted": cursor_persisted,
