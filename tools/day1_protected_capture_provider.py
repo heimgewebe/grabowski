@@ -9,6 +9,7 @@ registration, legacy receipt upgrade, or productive admission is provided.
 
 from __future__ import annotations
 
+import ctypes
 import grp
 import hashlib
 import json
@@ -251,6 +252,72 @@ def _drop_to_child(uid: int, gid: int) -> None:
     os.umask(0o077)
 
 
+# x86_64 Linux Landlock ABI (required by the pinned ELF64 x86-64 policy).
+# Restricts *filesystem-backed* execution. Anonymous memfd execution and
+# arbitrary in-process code loading remain outside this prototype's proof.
+_LANDLOCK_CREATE_RULESET = 444
+_LANDLOCK_ADD_RULE = 445
+_LANDLOCK_RESTRICT_SELF = 446
+_LANDLOCK_RULE_PATH_BENEATH = 1
+_LANDLOCK_ACCESS_FS_EXECUTE = 1
+_PR_SET_NO_NEW_PRIVS = 38
+
+
+class _LandlockRulesetAttr(ctypes.Structure):
+    _fields_ = [("handled_access_fs", ctypes.c_uint64)]
+
+
+class _LandlockPathBeneathAttr(ctypes.Structure):
+    _fields_ = [
+        ("allowed_access", ctypes.c_uint64),
+        ("parent_fd", ctypes.c_int32),
+    ]
+
+
+def _confine_child_filesystem_exec(program_fd: int) -> None:
+    """Allow filesystem exec only of the previously verified collector inode.
+
+    This runs after UID drop, before the *first* exec, only in the forked
+    child. No attempt to enable a product proof: memfd and in-memory
+    execution are not covered by a Landlock file rule.
+    """
+    try:
+        info = os.fstat(program_fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise CaptureDenied("collector execute allowlist is not a regular FD")
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.syscall.restype = ctypes.c_long
+        attr = _LandlockRulesetAttr(_LANDLOCK_ACCESS_FS_EXECUTE)
+        ruleset_fd = libc.syscall(
+            _LANDLOCK_CREATE_RULESET, ctypes.byref(attr),
+            ctypes.sizeof(attr), 0,
+        )
+        if ruleset_fd < 0:
+            raise CaptureDenied("Landlock execute ruleset is unavailable")
+        try:
+            rule = _LandlockPathBeneathAttr(
+                _LANDLOCK_ACCESS_FS_EXECUTE, program_fd,
+            )
+            if libc.syscall(
+                _LANDLOCK_ADD_RULE, ruleset_fd, _LANDLOCK_RULE_PATH_BENEATH,
+                ctypes.byref(rule), 0,
+            ) != 0:
+                raise CaptureDenied("Landlock cannot pin the collector executable")
+            if libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+                raise CaptureDenied("Landlock no_new_privs setup failed")
+            if libc.syscall(_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0) != 0:
+                raise CaptureDenied("Landlock execution restriction not installed")
+        finally:
+            os.close(ruleset_fd)
+    except OSError as exc:
+        raise CaptureDenied("Landlock execution restriction unavailable") from exc
+
+
+def _prepare_child_capture(uid: int, gid: int, program_fd: int) -> None:
+    _drop_to_child(uid, gid)
+    _confine_child_filesystem_exec(program_fd)
+
+
 def _kill_group(pid: int) -> None:
     try:
         os.killpg(pid, signal.SIGKILL)
@@ -342,7 +409,7 @@ def _capture_from_pipes(
             pass_fds=(program_fd,), close_fds=True,
             start_new_session=True, cwd="/",
             env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"},
-            preexec_fn=lambda: _drop_to_child(uid, gid),
+            preexec_fn=lambda: _prepare_child_capture(uid, gid, program_fd),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise CaptureDenied("protected collector child could not start") from exc

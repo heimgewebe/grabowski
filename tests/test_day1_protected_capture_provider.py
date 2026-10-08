@@ -479,9 +479,9 @@ int main(void) {
         self.assertRegex(argv[0], r"^/proc/self/fd/\d+$")
         self.assertGreaterEqual(end, begin)
 
-    def test_second_execve_yields_only_nonadmitting_signed_prototype(self) -> None:
-        # A reviewed initial static ELF may execve another ELF in the same
-        # PID. Root/UID/cgroup ownership gates are mocked in this fixture.
+    def test_second_execve_to_different_file_denied_before_publication(self) -> None:
+        # The kernel must block filesystem-backed secondary exec without
+        # trusting the primary PID, stdout digest, or prototype SSH signature.
         initial = self.programs["second_exec"]
         second = self.programs["second_stage"]
         self.assertNotEqual(sha(initial.read_bytes()), sha(second.read_bytes()))
@@ -504,33 +504,37 @@ int main(void) {
             patch.object(cap, "_drop_to_child", return_value=None),
             patch.object(cap, "_assert_cgroup_drained", return_value=None),
         ):
-            outcome = cap.run()
-        bundle = self.dest / outcome["bundle_name"]
-        stdout = (bundle / "stdout.bin").read_bytes()
-        proofbytes = (bundle / "proof.json").read_bytes()
-        proof = json.loads(proofbytes)
-        self.assertEqual(b"SECOND_EXEC_NOT_PINNED\n", stdout)
-        self.assertEqual(sha(stdout), proof["captured_stdout_sha256"])
-        self.assertEqual(sha(initial.read_bytes()), proof["initial_executable_sha256"])
-        self.assertNotEqual(sha(second.read_bytes()), proof["initial_executable_sha256"])
-        self.assertEqual("primary_exited_zero_pipes_closed_tree_unverified", proof["state"])
-        for field in (
-            "execution_closure_verified", "collector_process_tree_verified",
-            "actual_task_binding_verified", "day1_admission_authorized",
+            with self.assertRaisesRegex(
+                cap.CaptureDenied, "collector did not exit successfully"
+            ):
+                cap.run()
+        # An attempt reservation may persist, but no proof or output bundle
+        # may be signed or published for the executed second-stage code.
+        self.assertTrue((self.dest / cap.ATTEMPT_MARKER).exists())
+        self.assertEqual([], list(self.dest.glob("prototype-*")))
+        self.assertEqual([], list(self.dest.glob(".incomplete-*")))
+
+    def test_missing_landlock_fails_before_any_capture(self) -> None:
+        # The read-only fixture mocks UID drop, never Landlock success.
+        with patch.object(
+            cap, "_confine_child_filesystem_exec",
+            side_effect=cap.CaptureDenied("kernel restriction unavailable"),
         ):
-            self.assertIs(proof[field], False)
-        self.assertFalse(outcome["day1_admission_authorized"])
-        self.assertNotIn("execution_closure_sha256", proof)
-        signature = bundle / "proof.sshsig"
-        checked = subprocess.run(
-            ["/usr/bin/ssh-keygen", "-Y", "verify",
-             "-f", str(self.signers), "-I", cap.PROOF_ISSUER,
-             "-n", cap.PROOF_NAMESPACE, "-s", str(signature)],
-            input=proofbytes, capture_output=True, timeout=15,
-        )
-        self.assertEqual(
-            0, checked.returncode, checked.stderr.decode(errors="replace")
-        )
+            with self.assertRaisesRegex(
+                cap.CaptureDenied, "collector child could not start"
+            ):
+                self.capture("success")
+
+    def test_execute_allowlist_requires_a_regular_verified_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fd = os.open(tmp, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "not a regular FD"
+                ):
+                    cap._confine_child_filesystem_exec(fd)
+            finally:
+                os.close(fd)
 
     def test_genuinely_empty_stdout_can_be_captured(self) -> None:
         stdout, stderr, code, *_ = self.capture("empty")
