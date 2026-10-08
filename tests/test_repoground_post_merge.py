@@ -2876,8 +2876,9 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                     side_effect=[0.0, 0.0, 3.0, 181.0],
                 ):
                     first = post_merge.reconcile_recent_captain_audit_followups(
-                        lookback_seconds=100, limit=4
+                        lookback_seconds=100, limit=64
                     )
+                self.assertEqual(first["scan_mode"], "bounded_rotation")
                 self.assertTrue(first["budget_exhausted"])
                 self.assertEqual(first["processed"], 2)
                 self.assertEqual(first["discovery_ordinal_after"], 2)
@@ -2891,7 +2892,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                     post_merge._load_reconcile_discovery_ordinal(tasks), 2
                 )
                 second = post_merge.reconcile_recent_captain_audit_followups(
-                    lookback_seconds=100, limit=4
+                    lookback_seconds=100, limit=64
                 )
             self.assertEqual(second["discovery_ordinal_after"], 4)
             self.assertTrue(second["discovery_watermark_persisted"])

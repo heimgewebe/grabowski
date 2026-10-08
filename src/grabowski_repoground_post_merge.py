@@ -2467,7 +2467,7 @@ def reconcile_recent_captain_audit_followups(
             snapshot.total_records - discovery_ordinal_before >= max_scan_records
             or (
                 isinstance(getattr(snapshot, "segments", None), tuple)
-                and snapshot.total_records - discovery_ordinal_before >= limit
+                and snapshot.total_records > discovery_ordinal_before
             )
         )
     )
