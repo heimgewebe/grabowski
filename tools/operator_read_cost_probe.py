@@ -33,8 +33,27 @@ SOURCE_BINDING_FILES = ("grabowski_mcp.py", "grabowski_audit_query.py", "grabows
 TEST_LOADER_BINDING_FILES = ("test_operator_v2_runtime.py", "test_audit_segments.py", "test_read_surface.py")
 
 
+def python_tree_sha256(directory):
+    """Bind Python modules, including transitive imports and added files."""
+    root = ROOT / directory
+    if not root.is_dir():
+        raise RuntimeError("synthetic benchmark Python source tree is missing")
+    paths = sorted(root.rglob("*.py"))
+    if not paths:
+        raise RuntimeError("synthetic benchmark Python source tree is empty")
+    digest = hashlib.sha256()
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError("synthetic benchmark Python source path is unsafe")
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(4, "big"))
+        digest.update(relative)
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
 def benchmark_input_hashes():
-    """Pin every direct source/test loader imported by the synthetic benchmark."""
+    """Pin direct modules and both local Python trees before/after every worker."""
     return {
         "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "source_sha256": {
@@ -44,6 +63,10 @@ def benchmark_input_hashes():
         "test_loader_sha256": {
             name: hashlib.sha256((ROOT / "tests" / name).read_bytes()).hexdigest()
             for name in TEST_LOADER_BINDING_FILES
+        },
+        "python_tree_sha256": {
+            directory: python_tree_sha256(directory)
+            for directory in ("src", "tests")
         },
     }
 

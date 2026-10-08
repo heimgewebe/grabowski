@@ -31,6 +31,12 @@ class BenchmarkInputsTests(unittest.TestCase):
             for name in names:
                 (self.root / folder / name).write_text(name, encoding="utf-8")
         self.loader_path = self.root / "tests" / probe.TEST_LOADER_BINDING_FILES[0]
+        self.transitive_paths = [
+            self.root / "src" / "grabowski_audit_signal.py",
+            self.root / "src" / "grabowski_consumer_surface.py",
+        ]
+        for path in self.transitive_paths:
+            path.write_text(path.name, encoding="utf-8")
 
     def _worker_args(self, hashes):
         return [
@@ -48,6 +54,54 @@ class BenchmarkInputsTests(unittest.TestCase):
             self.loader_path.write_text("unexpected-new-loader", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "input hashes changed"):
                 probe.require_benchmark_inputs(pinned)
+
+    def test_transitive_projection_modules_are_bound(self):
+        with mock.patch.object(probe, "ROOT", self.root):
+            pinned = probe.benchmark_input_hashes()
+            direct_hashes = pinned["source_sha256"].copy()
+            self.assertEqual(
+                set(pinned["python_tree_sha256"]), {"src", "tests"}
+            )
+            for path in self.transitive_paths:
+                original = path.read_text(encoding="utf-8")
+                path.write_text("transitive-change", encoding="utf-8")
+                self.assertEqual(
+                    probe.benchmark_input_hashes()["source_sha256"], direct_hashes
+                )
+                with self.assertRaisesRegex(RuntimeError, "input hashes changed"):
+                    probe.require_benchmark_inputs(pinned)
+                path.write_text(original, encoding="utf-8")
+
+    def test_new_python_module_is_bound_before_worker_execution(self):
+        with mock.patch.object(probe, "ROOT", self.root):
+            pinned = probe.benchmark_input_hashes()
+            (self.root / "tests" / "new_dependency.py").write_text(
+                "dynamic-import", encoding="utf-8"
+            )
+            with mock.patch.object(sys, "argv", self._worker_args(pinned)), mock.patch.object(
+                probe, "run_case"
+            ) as measure:
+                with self.assertRaisesRegex(RuntimeError, "input hashes changed"):
+                    probe.main()
+                measure.assert_not_called()
+
+    def test_transitive_change_during_worker_blocks_result(self):
+        with mock.patch.object(probe, "ROOT", self.root):
+            pinned = probe.benchmark_input_hashes()
+
+            def changed_projection(*_args):
+                self.transitive_paths[0].write_text(
+                    "changed-during-measurement", encoding="utf-8"
+                )
+                return {"case": "projection", "valid": True}
+
+            output = StringIO()
+            with mock.patch.object(sys, "argv", self._worker_args(pinned)), mock.patch.object(
+                probe, "run_case", side_effect=changed_projection
+            ), redirect_stdout(output):
+                with self.assertRaisesRegex(RuntimeError, "input hashes changed"):
+                    probe.main()
+            self.assertEqual(output.getvalue(), "")
 
     def test_worker_denies_stale_input_before_measurement(self):
         with mock.patch.object(probe, "ROOT", self.root):
