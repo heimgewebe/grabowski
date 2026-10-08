@@ -41,7 +41,10 @@ IPAddressDeny=any
 SystemCallArchitectures=native
 MemoryDenyWriteExecute=yes
 LimitCORE=0
-TasksMax=32
+# Exactly one Python capture parent and one child process at a time.
+# Cgroup pids.max denies collector fork/clone while the parent is alive;
+# this does not constrain execve or prove a deployed cgroup.
+TasksMax=2
 MemoryMax=384M
 TimeoutStartSec=360s
 KillMode=control-group

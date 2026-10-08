@@ -235,6 +235,9 @@ class StrictContractTests(unittest.TestCase):
         self.assertNotIn("EnvironmentFile", unit)
         self.assertNotIn("ExecStartPre=", unit)
         self.assertIn("ProtectSystem=strict", unit)
+        # Kernel pids controller permits the root parent + one collector,
+        # not a detached forked process (source-only unit template).
+        self.assertRegex(unit, r"(?m)^TasksMax=2$")
 
 
 @unittest.skipUnless(shutil.which("gcc") and Path("/usr/lib/x86_64-linux-gnu/libc.a").exists(),
