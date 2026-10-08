@@ -25,6 +25,10 @@ from tools import day1_protected_capture_provider as cap
 OBSERVED_STDOUT = b"CAPTURED_FROM_FD\n"
 OBSERVED_STDERR = b"STDERR_FD\n"
 
+# Independent Linux x86-64 syscall UAPI reference: cannot inherit a wrong
+# number from the production module this integration test must check.
+_LANDLOCK_CREATE_RULESET_X86_64 = 444
+
 
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -39,7 +43,7 @@ def _probe_landlock_abi_version() -> tuple[int | None, int]:
     libc = cap.ctypes.CDLL(None, use_errno=True)
     libc.syscall.restype = cap.ctypes.c_long
     cap.ctypes.set_errno(0)
-    version = libc.syscall(cap._LANDLOCK_CREATE_RULESET, None, 0, 1)
+    version = libc.syscall(_LANDLOCK_CREATE_RULESET_X86_64, None, 0, 1)
     if version < 0:
         return None, cap.ctypes.get_errno()
     return version, 0
@@ -535,15 +539,18 @@ int main(void) {
                               (-1, errno.EOPNOTSUPP), (-1, errno.EPERM)):
             with self.subTest(result=result, errno=error):
                 syscall = FakeSyscall(result, error)
-                with patch.object(cap.ctypes, "CDLL",
-                                  return_value=types.SimpleNamespace(syscall=syscall)):
+                with (
+                    patch.object(cap, "_LANDLOCK_CREATE_RULESET", 9999),
+                    patch.object(cap.ctypes, "CDLL",
+                                 return_value=types.SimpleNamespace(syscall=syscall)),
+                ):
                     self.assertEqual(
                         (result if result >= 0 else None,
                          0 if result >= 0 else error),
                         _probe_landlock_abi_version(),
                     )
                 self.assertEqual(
-                    (cap._LANDLOCK_CREATE_RULESET, None, 0, 1), syscall.args
+                    (_LANDLOCK_CREATE_RULESET_X86_64, None, 0, 1), syscall.args
                 )
 
     def test_kernel_abi_skip_never_hides_child_launch_error(self) -> None:
