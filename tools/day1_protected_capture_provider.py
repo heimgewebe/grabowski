@@ -624,7 +624,8 @@ def _read_capture_reservation(root_fd: int) -> dict[str, Any] | None:
             "schema_version", "kind", "state", "capture_id", "nonce",
             "host", "policy_sha256", "initial_executable_sha256",
         }
-        or value.get("schema_version") != 1
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
         or value.get("kind") != "grabowski.day1_capture_reservation_prototype"
         or value.get("state") != "reserved_unreconciled"
         or not isinstance(value.get("capture_id"), str)
