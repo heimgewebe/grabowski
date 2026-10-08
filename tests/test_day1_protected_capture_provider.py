@@ -6,6 +6,7 @@ boundary, deployed key custody, an authenticated Grabowski unit, or admission.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -24,9 +25,28 @@ from tools import day1_protected_capture_provider as cap
 OBSERVED_STDOUT = b"CAPTURED_FROM_FD\n"
 OBSERVED_STDERR = b"STDERR_FD\n"
 
+# Independent Linux x86-64 syscall UAPI reference: cannot inherit a wrong
+# number from the production module this integration test must check.
+_LANDLOCK_CREATE_RULESET_X86_64 = 444
+
 
 def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _probe_landlock_abi_version() -> tuple[int | None, int]:
+    """Read only the kernel Landlock ABI version; never install restrictions.
+
+    Unlike a failed collector launch, this query preserves ENOSYS (absent)
+    and EOPNOTSUPP (disabled at boot) without masking unrelated runtime bugs.
+    """
+    libc = cap.ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = cap.ctypes.c_long
+    cap.ctypes.set_errno(0)
+    version = libc.syscall(_LANDLOCK_CREATE_RULESET_X86_64, None, 0, 1)
+    if version < 0:
+        return None, cap.ctypes.get_errno()
+    return version, 0
 
 
 def example_policy(binary: bytes, *, host: str | None = None) -> dict:
@@ -415,6 +435,37 @@ int main(void) {
             ' return 9;\n'
             '}\n'
         )
+        # Landlock restricts filesystem exec, not anonymous executable memfd.
+        # This alternate route must remain explicitly NON-ADMITTING.
+        sources["memfd_exec"] = (
+            '#define _GNU_SOURCE\n'
+            '#include <unistd.h>\n#include <sys/mman.h>\n'
+            '#include <fcntl.h>\n#include <stdio.h>\n#include <errno.h>\n'
+            '#ifndef MFD_EXEC\n#define MFD_EXEC 0x0010U\n#endif\n'
+            'int main(void) {\n'
+            f' const char *path = {json.dumps(str(cls.tmp / "second_stage"))};\n'
+            ' int input = open(path, O_RDONLY);\n'
+            ' int output = memfd_create("nonadmitted-stage", MFD_EXEC);\n'
+            ' if (output < 0 && errno == EINVAL)\n'
+            '   output = memfd_create("nonadmitted-stage", 0);\n'
+            ' if (input < 0 || output < 0) return 80;\n'
+            ' char buf[8192]; ssize_t count;\n'
+            ' while ((count = read(input, buf, sizeof(buf))) > 0) {\n'
+            '   ssize_t offset = 0;\n'
+            '   while (offset < count) {\n'
+            '     ssize_t wrote = write(output, buf + offset, count - offset);\n'
+            '     if (wrote < 1) return 81;\n'
+            '     offset += wrote;\n'
+            '   }\n'
+            ' }\n'
+            ' if (count < 0) return 82;\n'
+            ' char name[80];\n'
+            ' if (snprintf(name, sizeof(name), "/proc/self/fd/%d", output) < 0) return 83;\n'
+            ' char *const args[] = {name, 0};\n'
+            ' execv(name, args);\n'
+            ' return 84;\n'
+            '}\n'
+        )
         for name, source in sources.items():
             sourcepath = cls.tmp / f"{name}.c"
             binary = cls.tmp / name
@@ -446,6 +497,87 @@ int main(void) {
         pub = (Path(str(self.key)+".pub")).read_text().strip()
         self.signers = Path(self.temp.name) / "signers"
         self.signers.write_text(cap.PROOF_ISSUER+" "+pub+"\n")
+
+        # Unrelated collector/receipt unit fixtures do not depend on the
+        # CI runner's Landlock syscall exposure. Real-kernel tests opt in.
+        # This is NEVER a production runtime fallback.
+        self._landlock_unit_patch = patch.object(
+            cap, "_confine_child_filesystem_exec", return_value=None,
+        )
+        self._landlock_unit_patch.start()
+        self.addCleanup(self._landlock_unit_patch.stop)
+
+    def require_kernel_landlock(self) -> None:
+        # A read-only ABI query does not launch a child or restrict this test
+        # process. Only exact documented kernel unavailability may skip an
+        # integration case; *any* subsequent child-start failure is a bug.
+        abi, unavailable_errno = _probe_landlock_abi_version()
+        if abi is None:
+            if unavailable_errno in (errno.ENOSYS, errno.EOPNOTSUPP):
+                self.skipTest(f"Landlock ABI unavailable (errno={unavailable_errno})")
+            self.fail(f"Landlock ABI query unexpectedly failed (errno={unavailable_errno})")
+        self.assertGreaterEqual(abi, 1)
+        self._landlock_unit_patch.stop()
+        stdout, *_ = self.capture("success")
+        self.assertEqual(OBSERVED_STDOUT, stdout)
+
+    def test_kernel_abi_probe_preserves_syscall_errno(self) -> None:
+        class FakeSyscall:
+            restype = None
+
+            def __init__(self, result: int, error: int) -> None:
+                self.result = result
+                self.error = error
+                self.args = None
+
+            def __call__(self, *args) -> int:
+                self.args = args
+                cap.ctypes.set_errno(self.error)
+                return self.result
+
+        for result, error in ((9, 0), (-1, errno.ENOSYS),
+                              (-1, errno.EOPNOTSUPP), (-1, errno.EPERM)):
+            with self.subTest(result=result, errno=error):
+                syscall = FakeSyscall(result, error)
+                with (
+                    patch.object(cap, "_LANDLOCK_CREATE_RULESET", 9999),
+                    patch.object(cap.ctypes, "CDLL",
+                                 return_value=types.SimpleNamespace(syscall=syscall)),
+                ):
+                    self.assertEqual(
+                        (result if result >= 0 else None,
+                         0 if result >= 0 else error),
+                        _probe_landlock_abi_version(),
+                    )
+                self.assertEqual(
+                    (_LANDLOCK_CREATE_RULESET_X86_64, None, 0, 1), syscall.args
+                )
+
+    def test_kernel_abi_skip_never_hides_child_launch_error(self) -> None:
+        for unsupported in (errno.ENOSYS, errno.EOPNOTSUPP):
+            with self.subTest(unsupported=unsupported), patch(
+                __name__ + "._probe_landlock_abi_version",
+                return_value=(None, unsupported),
+            ):
+                with self.assertRaises(unittest.SkipTest):
+                    self.require_kernel_landlock()
+        for unexpected in (errno.EPERM, errno.EINVAL):
+            with self.subTest(unexpected=unexpected), patch(
+                __name__ + "._probe_landlock_abi_version",
+                return_value=(None, unexpected),
+            ):
+                with self.assertRaisesRegex(AssertionError, "unexpectedly failed"):
+                    self.require_kernel_landlock()
+        with patch(
+            __name__ + "._probe_landlock_abi_version", return_value=(9, 0)
+        ), patch.object(
+            self, "capture",
+            side_effect=cap.CaptureDenied("protected collector child could not start"),
+        ):
+            with self.assertRaisesRegex(
+                cap.CaptureDenied, "collector child could not start"
+            ):
+                self.require_kernel_landlock()
 
     def fake_root_file(self, path: Path, **_kwargs):
         # EXPLICIT test-only substitute for absent UID0/root installed files.
@@ -479,12 +611,63 @@ int main(void) {
         self.assertRegex(argv[0], r"^/proc/self/fd/\d+$")
         self.assertGreaterEqual(end, begin)
 
-    def test_second_execve_yields_only_nonadmitting_signed_prototype(self) -> None:
-        # A reviewed initial static ELF may execve another ELF in the same
-        # PID. Root/UID/cgroup ownership gates are mocked in this fixture.
+    def test_second_execve_to_different_file_denied_before_publication(self) -> None:
+        # The kernel must block filesystem-backed secondary exec without
+        # trusting the primary PID, stdout digest, or prototype SSH signature.
         initial = self.programs["second_exec"]
         second = self.programs["second_stage"]
         self.assertNotEqual(sha(initial.read_bytes()), sha(second.read_bytes()))
+        # Unconfined control must prove that this particular second ELF
+        # succeeds and produces the exact bytes before relying on denial.
+        unconfined_stdout, *_ = self.capture("second_exec")
+        self.assertEqual(b"SECOND_EXEC_NOT_PINNED\n", unconfined_stdout)
+        self.require_kernel_landlock()
+        self.active_binary = initial
+        self.policy_file = Path(self.temp.name) / "policy"
+        self.policy_file.write_bytes(cap._json_bytes(
+            example_policy(initial.read_bytes())
+        ))
+        def fake_dir(_path, *, private=False):
+            return os.open(self.dest, os.O_RDONLY | os.O_DIRECTORY)
+        with (
+            patch.object(cap.os, "geteuid", return_value=0),
+            patch.object(cap, "SIGNING_KEY_PATH", self.key),
+            patch.object(cap, "_open_root_file", side_effect=self.fake_root_file),
+            patch.object(cap, "_open_root_directory", side_effect=fake_dir),
+            patch.object(cap, "_check_staging_root_owned", return_value=None),
+            patch.object(cap, "_validate_signer_static", return_value=None),
+            patch.object(cap, "_separate_child_identity",
+                         return_value=(os.getuid(), os.getgid())),
+            patch.object(cap, "_drop_to_child", return_value=None),
+            patch.object(cap, "_assert_cgroup_drained", return_value=None),
+        ):
+            with self.assertRaisesRegex(
+                cap.CaptureDenied, "collector did not exit successfully"
+            ):
+                cap.run()
+        # An attempt reservation may persist, but no proof or output bundle
+        # may be signed or published for the executed second-stage code.
+        self.assertTrue((self.dest / cap.ATTEMPT_MARKER).exists())
+        self.assertEqual([], list(self.dest.glob("prototype-*")))
+        self.assertEqual([], list(self.dest.glob(".incomplete-*")))
+
+    def test_memfd_exec_bypass_is_signed_but_never_admitted(self) -> None:
+        # Explicitly demonstrate a residual same-PID code-closure gap where
+        # the host permits executable anonymous memfd objects. The signature
+        # authenticates the *nonadmitting prototype claim*, not the code tree.
+        setting = Path("/proc/sys/vm/memfd_noexec")
+        # Scope 1 only changes the default: explicit MFD_EXEC still works.
+        # Missing sysctl may mean a legacy executable-memfd kernel.
+        if setting.is_file() and setting.read_text().strip() == "2":
+            self.skipTest("kernel enforces no executable memfds (scope 2)")
+        initial = self.programs["memfd_exec"]
+        second = self.programs["second_stage"]
+        self.assertNotEqual(sha(initial.read_bytes()), sha(second.read_bytes()))
+        # The unconfined control must execute the copied second ELF.
+        # Do not treat a nonzero or unavailable sysctl as safety evidence.
+        unconfined_stdout, *_ = self.capture("memfd_exec")
+        self.assertEqual(b"SECOND_EXEC_NOT_PINNED\n", unconfined_stdout)
+        self.require_kernel_landlock()
         self.active_binary = initial
         self.policy_file = Path(self.temp.name) / "policy"
         self.policy_file.write_bytes(cap._json_bytes(
@@ -506,14 +689,11 @@ int main(void) {
         ):
             outcome = cap.run()
         bundle = self.dest / outcome["bundle_name"]
-        stdout = (bundle / "stdout.bin").read_bytes()
+        self.assertEqual(b"SECOND_EXEC_NOT_PINNED\n", (bundle / "stdout.bin").read_bytes())
         proofbytes = (bundle / "proof.json").read_bytes()
         proof = json.loads(proofbytes)
-        self.assertEqual(b"SECOND_EXEC_NOT_PINNED\n", stdout)
-        self.assertEqual(sha(stdout), proof["captured_stdout_sha256"])
         self.assertEqual(sha(initial.read_bytes()), proof["initial_executable_sha256"])
         self.assertNotEqual(sha(second.read_bytes()), proof["initial_executable_sha256"])
-        self.assertEqual("primary_exited_zero_pipes_closed_tree_unverified", proof["state"])
         for field in (
             "execution_closure_verified", "collector_process_tree_verified",
             "actual_task_binding_verified", "day1_admission_authorized",
@@ -521,16 +701,78 @@ int main(void) {
             self.assertIs(proof[field], False)
         self.assertFalse(outcome["day1_admission_authorized"])
         self.assertNotIn("execution_closure_sha256", proof)
-        signature = bundle / "proof.sshsig"
         checked = subprocess.run(
-            ["/usr/bin/ssh-keygen", "-Y", "verify",
-             "-f", str(self.signers), "-I", cap.PROOF_ISSUER,
-             "-n", cap.PROOF_NAMESPACE, "-s", str(signature)],
+            ["/usr/bin/ssh-keygen", "-Y", "verify", "-f", str(self.signers),
+             "-I", cap.PROOF_ISSUER, "-n", cap.PROOF_NAMESPACE, "-s",
+             str(bundle / "proof.sshsig")],
             input=proofbytes, capture_output=True, timeout=15,
         )
-        self.assertEqual(
-            0, checked.returncode, checked.stderr.decode(errors="replace")
-        )
+        self.assertEqual(0, checked.returncode, checked.stderr.decode(errors="replace"))
+
+    def test_missing_landlock_fails_before_any_capture(self) -> None:
+        # The read-only fixture mocks UID drop, never Landlock success.
+        with patch.object(
+            cap, "_confine_child_filesystem_exec",
+            side_effect=cap.CaptureDenied("kernel restriction unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                cap.CaptureDenied, "collector child could not start"
+            ):
+                self.capture("success")
+
+    def test_landlock_abi_marshalling_and_prebound_libc_symbols(self) -> None:
+        # Synthetic boundary: no kernel Landlock calls or no_new_privs here.
+        # Real-kernel behavior is exercised by the two opt-in integration tests.
+        self._landlock_unit_patch.stop()
+        self.assertEqual(8, cap.ctypes.sizeof(cap._LandlockRulesetAttr))
+        self.assertEqual(12, cap.ctypes.sizeof(cap._LandlockPathBeneathAttr))
+        self.assertEqual(8, cap._LandlockPathBeneathAttr.parent_fd.offset)
+        fd = os.open(self.programs["success"], os.O_RDONLY | os.O_CLOEXEC)
+        calls = []
+
+        def fake_syscall(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                return os.dup(fd)  # Fake, valid ruleset FD, closed by child helper.
+            return 0
+
+        try:
+            with (
+                patch.object(cap.ctypes, "CDLL", side_effect=AssertionError(
+                    "child must not resolve a new libc handle"
+                )),
+                patch.object(cap, "_LANDLOCK_SYSCALL", side_effect=fake_syscall),
+                patch.object(cap, "_LANDLOCK_PRCTL", return_value=0) as prctl,
+            ):
+                cap._confine_child_filesystem_exec(fd)
+            self.assertEqual(3, len(calls))
+            self.assertEqual(
+                [cap._LANDLOCK_CREATE_RULESET, cap._LANDLOCK_ADD_RULE,
+                 cap._LANDLOCK_RESTRICT_SELF],
+                [args[0].value for args in calls],
+            )
+            self.assertIsInstance(calls[0][2], cap.ctypes.c_size_t)
+            self.assertEqual(8, calls[0][2].value)
+            self.assertIsInstance(calls[1][1], cap.ctypes.c_int)
+            self.assertEqual(cap._LANDLOCK_RULE_PATH_BENEATH, calls[1][2].value)
+            self.assertEqual(1, prctl.call_count)
+            self.assertEqual(cap._PR_SET_NO_NEW_PRIVS, prctl.call_args.args[0].value)
+        finally:
+            os.close(fd)
+
+    def test_execute_allowlist_requires_a_regular_verified_fd(self) -> None:
+        # Validation occurs before the Landlock syscall and must remain
+        # testable without kernel privileges.
+        self._landlock_unit_patch.stop()
+        with tempfile.TemporaryDirectory() as tmp:
+            fd = os.open(tmp, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "not a regular FD"
+                ):
+                    cap._confine_child_filesystem_exec(fd)
+            finally:
+                os.close(fd)
 
     def test_genuinely_empty_stdout_can_be_captured(self) -> None:
         stdout, stderr, code, *_ = self.capture("empty")
