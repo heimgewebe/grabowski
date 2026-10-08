@@ -687,6 +687,7 @@ class OperatorContractTests(unittest.TestCase):
 
         fake = types.SimpleNamespace(
             evaluate_resume_gate=lambda _head: gate(),
+            _initial_gate_admits_locked_recheck=lambda value: value.get("allowed") is True and not value.get("reasons"),
             midcutover=types.SimpleNamespace(
                 LANE_MID_CUTOVER_RESUME="mid-cutover",
                 RESUME_PHASES=("resume-phase",),
@@ -705,6 +706,39 @@ class OperatorContractTests(unittest.TestCase):
         self.assertTrue(evidence["allowed"], evidence["reasons"])
         self.assertEqual([], evidence["reasons"])
         self.assertIn("retry_authority", evidence["does_not_establish"])
+
+        from tests.test_provenance_recovery import provenance_recovery
+
+        fake._initial_gate_admits_locked_recheck = provenance_recovery._initial_gate_admits_locked_recheck
+        for state in ("identical", "stale", "kill_switch", "blockade", "audit", "unreadable", "locked"):
+            with self.subTest(state=state):
+                assessment = {
+                    **gate(), "allowed": False, "reasons": ["no_competing_deployment"],
+                    "checks": {
+                        "kill_switch_clear": True, "no_blocking_operator_blockade": True,
+                        "audit_chain_valid": True, "no_competing_deployment": False,
+                    },
+                    "competing_deployment": {
+                        "deploy_lock_free": state != "locked",
+                        "inflight_deploy_jobs": ["grabowski-job-abcdef012345"],
+                        "error": "unreadable" if state == "unreadable" else None,
+                    },
+                }
+                failed = {
+                    "kill_switch": "kill_switch_clear", "blockade": "no_blocking_operator_blockade",
+                    "audit": "audit_chain_valid",
+                }.get(state)
+                if failed:
+                    assessment["checks"][failed] = False
+                    assessment["reasons"] = sorted([failed, "no_competing_deployment"])
+                fake.evaluate_resume_gate = lambda _head: assessment
+                with patch.dict(sys.modules, {"grabowski_provenance_recovery": fake}, clear=False):
+                    evidence = operator._deployment_admission_midcutover_recovery_evidence(
+                        "grabowski_recovery_provenance_repair", {"expected_head": head}, tool, marker,
+                    )
+                self.assertEqual(evidence["allowed"], state in {"identical", "stale"}, evidence)
+                self.assertIn("retry_authority", evidence["does_not_establish"])
+        fake.evaluate_resume_gate = lambda _head: gate()
 
         expired = {**marker, "state": "expired", "active": False}
         with patch.dict(
@@ -772,6 +806,7 @@ class OperatorContractTests(unittest.TestCase):
 
         def evidence_for(binding, *, allowed=True, lane="mid-cutover"):
             fake = types.SimpleNamespace(
+                _initial_gate_admits_locked_recheck=lambda value: value.get("allowed") is True and not value.get("reasons"),
                 evaluate_resume_gate=lambda _head: {
                     "allowed": allowed,
                     "reasons": [] if allowed else ["no_competing_deployment"],
