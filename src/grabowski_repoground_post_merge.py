@@ -300,28 +300,18 @@ def _post_merge_job_starter(
                 or statmod.S_IMODE(info.st_mode) & 0o077
             ):
                 return "uncertain"
-            # A present but unreadable, corrupt or symlinked metadata.json
-            # could belong to a job that actually started. Only a physically
-            # absent metadata file qualifies as a pre-metadata crash window.
+            # A corrupt metadata file never proves the job failed. Preserve
+            # it unchanged, but after a grace period allow an explicit manual
+            # recovery through the existing publisher. Never retry the slot.
+            latest_ns = info.st_mtime_ns
             try:
-                (directory / "metadata.json").lstat()
+                metadata_info = (directory / "metadata.json").lstat()
             except FileNotFoundError:
                 pass
             except OSError:
                 return "uncertain"
             else:
-                return "uncertain"
-            # An unreadable, corrupt or symlinked metadata.json is not a
-            # metadata-FREE slot. Keep the identity uncertain, never turn
-            # damaged evidence into an exhausted/manual-recovery record.
-            try:
-                (directory / "metadata.json").lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                return "uncertain"
-            latest_ns = info.st_mtime_ns
-            has_log = False
+                latest_ns = max(latest_ns, metadata_info.st_mtime_ns)
             for name in ("stdout.log", "stderr.log"):
                 try:
                     log = (directory / name).lstat()
@@ -334,10 +324,9 @@ def _post_merge_job_starter(
                     or statmod.S_IMODE(log.st_mode) & 0o077
                 ):
                     return "uncertain"
-                has_log = True
                 latest_ns = max(latest_ns, log.st_mtime_ns)
-            if not has_log:
-                return "uncertain"
+            # The directory can be left behind before *either* log was made.
+            # Its own mtime is the immutable minimum evidence for the grace.
             return (
                 "abandoned"
                 if time.time_ns() - latest_ns
@@ -2468,6 +2457,7 @@ def reconcile_recent_captain_audit_followups(
     # audit ordinal. Once the watermark exists, outages cannot age an unseen
     # Captain merge out of discovery.
     completion_record_sha256s: list[str] = []
+    completion_record_ordinals: dict[str, int] = {}
     scanned_records = 0
     lookback_horizon_reached = False
     window_mode = (
@@ -2578,6 +2568,12 @@ def reconcile_recent_captain_audit_followups(
                 "Captain audit reconciliation record identity is invalid"
             )
         completion_record_sha256s.append(record_sha256)
+        if window_mode:
+            if type(global_ordinal) is not int:
+                raise RepoGroundPostMergeError(
+                    "Verified Captain completion ordinal is unavailable"
+                )
+            completion_record_ordinals[record_sha256] = global_ordinal
         if window_mode and len(completion_record_sha256s) >= limit:
             # This is a contiguous, ordinal-verified prefix. Never collect
             # more exhausted obligations than one transaction can persist.
@@ -2673,14 +2669,12 @@ def reconcile_recent_captain_audit_followups(
             and outcome["reason"] == "durable_freshness_job_slots_exhausted"
         )
         cursor_after = cursor_candidate
-        # A watermark may skip older records on the next pass. Only advance
-        # it once every newly discovered completion is terminally satisfied.
-        # Deferred, reused-running and budget-limited completions remain
-        # discoverable, even when the timer is interrupted for hours.
-        discovery_complete = (
-            not budget_exhausted
-            and len(outcomes) == len(completion_record_sha256s)
-            and all(
+        # Only terminal, immutable outcomes can be checkpointed. In the
+        # oldest-first verified audit window a slow pass can commit the
+        # contiguous terminal prefix while keeping the remaining completions
+        # discoverable. Never advance across a deferred or unknown outcome.
+        def terminal_discovery_outcome(outcome: dict[str, Any]) -> bool:
+            return bool(
                 outcome["status"] == "already_satisfied"
                 or (
                     outcome["status"] == "not_scheduled"
@@ -2695,8 +2689,12 @@ def reconcile_recent_captain_audit_followups(
                         )
                     )
                 )
-                for outcome in outcomes
             )
+
+        discovery_complete = (
+            not budget_exhausted
+            and len(outcomes) == len(completion_record_sha256s)
+            and all(terminal_discovery_outcome(outcome) for outcome in outcomes)
         )
         discovery_ordinal_candidate = (
             newest_global_ordinal
@@ -2707,6 +2705,16 @@ def reconcile_recent_captain_audit_followups(
             )
             else discovery_ordinal_before
         )
+        if window_mode and discovery_watermark_reached and not discovery_complete:
+            settled_outcomes = {
+                outcome["captain_audit_completion_sha256"]: outcome
+                for outcome in outcomes
+            }
+            for completion_sha in completion_record_sha256s:
+                completion = settled_outcomes.get(completion_sha)
+                if completion is None or not terminal_discovery_outcome(completion):
+                    break
+                discovery_ordinal_candidate = completion_record_ordinals[completion_sha]
         discovery_ordinal_after = discovery_ordinal_candidate
         cursor_changed = (
             cursor_candidate is not None and cursor_candidate != cursor_before
@@ -2718,7 +2726,15 @@ def reconcile_recent_captain_audit_followups(
         # Only expose exhausted work for manual recovery once the verified
         # discovery boundary can advance in this same SQLite transaction.
         # Otherwise the next pass could resurrect an already-acknowledged debt.
-        exhausted_to_record = exhausted_pending if discovery_changed else ()
+        exhausted_to_record = (
+            tuple(
+                sha for sha in exhausted_pending
+                if completion_record_ordinals.get(sha, 0)
+                <= discovery_ordinal_candidate
+            )
+            if window_mode and discovery_changed
+            else exhausted_pending if discovery_changed else ()
+        )
         scan_next_after = scan_next_before
         scan_next_changed = False
         if window_mode:
@@ -2726,9 +2742,13 @@ def reconcile_recent_captain_audit_followups(
             assert discovery_ordinal_before is not None
             assert type(snapshot.total_records) is int
             scan_next_candidate = (
-                scan_end + 1
-                if scan_end < snapshot.total_records or discovery_changed
-                else discovery_ordinal_before + 1
+                discovery_ordinal_candidate + 1
+                if discovery_changed and not discovery_complete
+                else (
+                    scan_end + 1
+                    if scan_end < snapshot.total_records or discovery_changed
+                    else discovery_ordinal_before + 1
+                )
             )
             scan_next_changed = scan_next_candidate != scan_next_before
         if cursor_tasks is not None and (

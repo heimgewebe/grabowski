@@ -2793,6 +2793,121 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                     post_merge._load_reconcile_discovery_ordinal(tasks), 18
                 )
 
+    def test_slow_exhausted_window_checkpoints_terminal_prefix_before_budget(self) -> None:
+        items = [
+            {
+                "record": {
+                    "operation": "captain-run-audit-completion",
+                    "action": "pr-merge",
+                    "timestamp_unix": 9_950,
+                },
+                "evidence": {
+                    "record_sha256": f"{ordinal:064x}",
+                    "global_ordinal": ordinal,
+                },
+            }
+            for ordinal in range(1, 5)
+        ]
+        segment = types.SimpleNamespace(
+            global_start_ordinal=1,
+            global_end_ordinal=4,
+            records=4,
+            items=items,
+        )
+        snapshot = types.SimpleNamespace(total_records=4, segments=(segment,))
+
+        def iterator(view: object, *, order: str):
+            values = [item for seg in view.segments for item in seg.items]
+            return iter(values if order == "asc" else list(reversed(values)))
+
+        audit = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=10,
+            capture_verified_audit_snapshot=lambda: snapshot,
+            _iter_snapshot_items=iterator,
+        )
+        calls: list[str] = []
+
+        def schedule(sha: str, **_kwargs: object) -> dict:
+            calls.append(sha)
+            return {
+                "status": "not_scheduled",
+                "reason": "durable_freshness_job_slots_exhausted",
+                "repository": REPO,
+            }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            db = Path(temporary) / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            post_merge._save_reconcile_progress(
+                tasks, cursor=None, discovery_ordinal=0
+            )
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "grabowski_audit_query": audit,
+                        "grabowski_operator": types.SimpleNamespace(
+                            STATE_DIR=Path(temporary)
+                        ),
+                        "grabowski_tasks": tasks,
+                    },
+                ),
+                patch.object(post_merge.time, "time", return_value=10_000),
+                patch.object(
+                    post_merge,
+                    "resolve_job_starter",
+                    return_value=lambda *_args, **_kwargs: {},
+                ),
+                patch.object(
+                    post_merge,
+                    "schedule_from_captain_audit_completion",
+                    side_effect=schedule,
+                ),
+            ):
+                with patch.object(
+                    post_merge.time,
+                    "monotonic",
+                    side_effect=[0.0, 0.0, 3.0, 181.0],
+                ):
+                    first = post_merge.reconcile_recent_captain_audit_followups(
+                        lookback_seconds=100, limit=4
+                    )
+                self.assertTrue(first["budget_exhausted"])
+                self.assertEqual(first["processed"], 2)
+                self.assertEqual(first["discovery_ordinal_after"], 2)
+                self.assertTrue(first["discovery_watermark_persisted"])
+                self.assertEqual(
+                    first["exhausted_obligations_recorded"],
+                    ["1".zfill(64), "2".zfill(64)],
+                )
+                self.assertEqual(first["scan_next_after"], 3)
+                self.assertEqual(
+                    post_merge._load_reconcile_discovery_ordinal(tasks), 2
+                )
+                second = post_merge.reconcile_recent_captain_audit_followups(
+                    lookback_seconds=100, limit=4
+                )
+            self.assertEqual(second["discovery_ordinal_after"], 4)
+            self.assertTrue(second["discovery_watermark_persisted"])
+            self.assertEqual(
+                post_merge._load_reconcile_discovery_ordinal(tasks), 4
+            )
+            self.assertEqual(
+                set(calls), {f"{ordinal:064x}" for ordinal in range(1, 5)}
+            )
+            with sqlite3.connect(db) as connection:
+                rows = connection.execute(
+                    "SELECT key FROM metadata WHERE key LIKE ?",
+                    (post_merge.RECONCILE_EXHAUSTED_METADATA_PREFIX + "%",),
+                ).fetchall()
+            self.assertEqual(len(rows), 4)
+
     def test_stale_reconciliation_cannot_resurrect_acknowledged_debt(self) -> None:
         exhausted = "e" * 64
         with tempfile.TemporaryDirectory() as temporary:
@@ -4179,13 +4294,20 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
                 return_value=future_ns + 10_000_000_000,
             ):
                 malformed = schedule()
-            self.assertEqual(malformed["status"], "schedule_unknown")
+            # The old identity remains ambiguous, never a proven failed
+            # launch. After the grace window, however, it must become
+            # manually recoverable instead of starving all future merges.
+            self.assertEqual(malformed["status"], "not_scheduled")
+            self.assertEqual(
+                malformed["reason"], "durable_freshness_job_slots_exhausted"
+            )
             self.assertEqual(len(starts), 1)
             self.assertEqual(mutation_checks, ["durable_job"])
 
-    def test_old_logs_with_corrupt_metadata_never_enter_abandoned_recovery(self) -> None:
-        # Invalid metadata may be from an actually launched job. It is not
-        # equivalent to absence after a pre-metadata O_EXCL crash.
+    def test_corrupt_metadata_slot_becomes_manual_attention_after_grace(self) -> None:
+        # Invalid metadata may belong to an actually launched job. Neither
+        # delete it nor retry it automatically; after grace, require manual
+        # fresh_exact recovery rather than indefinite global starvation.
         starts: list[str] = []
         mutation_checks: list[str] = []
         with tempfile.TemporaryDirectory() as temporary:
@@ -4240,9 +4362,72 @@ class RepoGroundPostMergeSchedulingTests(unittest.TestCase):
             ) * 1_000_000_000
             with patch.object(post_merge.time, "time_ns", return_value=advanced_ns):
                 later = schedule()
-            self.assertEqual(later["status"], "schedule_unknown")
+            self.assertEqual(later["status"], "not_scheduled")
+            self.assertEqual(
+                later["reason"], "durable_freshness_job_slots_exhausted"
+            )
             self.assertEqual(len(starts), 1)
             self.assertEqual(mutation_checks, ["durable_job"])
+
+    def test_no_log_reserved_directory_ages_to_manual_recovery(self) -> None:
+        starts: list[str] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs_root = Path(temporary) / "jobs"
+            jobs_root.mkdir(mode=0o700)
+
+            def read_metadata(_unit: str) -> dict[str, object]:
+                raise ValueError("metadata never created")
+
+            def private_start(
+                _argv: list[str],
+                *,
+                cwd: str,
+                runtime_seconds: int,
+                reserved_unit: str,
+            ) -> dict[str, object]:
+                starts.append(reserved_unit)
+                (jobs_root / reserved_unit).mkdir(mode=0o700, exist_ok=True)
+                raise FileExistsError("job directory allocated without logs")
+
+            operator = types.SimpleNamespace(
+                JOBS_DIR=jobs_root,
+                grabowski_job_start=lambda *_args, **_kwargs: {},
+                grabowski_job_status=lambda *_args, **_kwargs: self.fail(
+                    "no metadata-based job identity available"
+                ),
+                _argv_hash=lambda _argv: "f" * 64,
+                _read_job_metadata=read_metadata,
+                _require_operator_mutation=lambda *_args, **_kwargs: None,
+                _start_job=private_start,
+            )
+            starter = post_merge.resolve_job_starter(
+                {"grabowski_operator": operator}
+            )
+            self.assertIsNotNone(starter)
+
+            def schedule() -> dict:
+                return post_merge.schedule_from_captain_result(
+                    captain_result(completed=False, queued=True),
+                    job_starter=starter,
+                    python_executable="/usr/bin/python3",
+                    script_path=Path(post_merge.__file__),
+                )
+
+            self.assertEqual(schedule()["status"], "schedule_unknown")
+            self.assertEqual(schedule()["status"], "schedule_unknown")
+            self.assertEqual(len(starts), 1)
+            future_ns = time.time_ns() + (
+                post_merge.POST_MERGE_METADATA_FREE_SLOT_GRACE_SECONDS + 10
+            ) * 1_000_000_000
+            with patch.object(
+                post_merge.time, "time_ns", return_value=future_ns
+            ):
+                abandoned = schedule()
+            self.assertEqual(abandoned["status"], "not_scheduled")
+            self.assertEqual(
+                abandoned["reason"], "durable_freshness_job_slots_exhausted"
+            )
+            self.assertEqual(len(starts), 1)
 
     def test_exhausted_retry_slots_are_read_only_not_scheduled(self) -> None:
         jobs: dict[str, dict[str, object]] = {}
