@@ -29,7 +29,11 @@ class TaskReconcileTimerContractTests(unittest.TestCase):
 
         self.assertIn("Type=oneshot", source)
         self.assertIn("--mode refresh --batch-size 100", source)
+        self.assertEqual(source.count("ExecStart="), 1)
+        self.assertNotIn("grabowski_repoground_post_merge", source)
+        self.assertIn("ReadWritePaths=%h/.local/state/grabowski", source)
         self.assertIn("TimeoutStartSec=120s", source)
+
 
 
 if __name__ == "__main__":

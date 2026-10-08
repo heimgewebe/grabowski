@@ -2262,7 +2262,7 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         return SimpleNamespace(repo_head="a" * 40)
 
     def test_default_projection_declares_complete_watchdog_asset_set(self) -> None:
-        self.assertEqual(15, len(dual.WATCHDOG_HOST_ASSETS))
+        self.assertEqual(18, len(dual.WATCHDOG_HOST_ASSETS))
         self.assertEqual(
             {
                 "tools/component_watchdog.py",
@@ -2274,6 +2274,9 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                 "systemd/grabowski-external-connector-maulwurf-x.service.example",
                 "systemd/tunnel-client-grabowski.service.d/70-operator-dependency.conf.example",
                 "systemd/grabowski-operator.service.d/90-recovery-target.conf.example",
+                "systemd/grabowski-repoground-post-merge-reconcile.service.example",
+                "systemd/grabowski-repoground-post-merge-reconcile.timer.example",
+                "systemd/grabowski-operator.service.d/95-repoground-post-merge-reconcile.conf.example",
                 "systemd/grabowski-operator-watchdog.service.example",
                 "systemd/grabowski-operator-watchdog.timer.example",
                 "systemd/grabowski-tunnel-watchdog.service.example",
@@ -2288,6 +2291,8 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                 "grabowski-transport-ingress.service",
                 "grabowski-transport-ingress-maulwurf-x.service",
                 "grabowski-external-connector-maulwurf-x.service",
+                "grabowski-repoground-post-merge-reconcile.service",
+                "grabowski-repoground-post-merge-reconcile.timer",
                 "grabowski-operator-watchdog.service",
                 "grabowski-operator-watchdog.timer",
                 "grabowski-tunnel-watchdog.service",
@@ -2297,6 +2302,39 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
             },
             {asset.unit for asset in dual.WATCHDOG_HOST_ASSETS if asset.unit},
         )
+
+    def test_repoground_reconcile_timer_service_and_activation_dropin_are_projected(self) -> None:
+        by_source = {
+            item.source.as_posix(): item for item in dual.WATCHDOG_HOST_ASSETS
+        }
+        service = by_source[
+            "systemd/grabowski-repoground-post-merge-reconcile.service.example"
+        ]
+        timer = by_source[
+            "systemd/grabowski-repoground-post-merge-reconcile.timer.example"
+        ]
+        dropin = by_source[
+            "systemd/grabowski-operator.service.d/95-repoground-post-merge-reconcile.conf.example"
+        ]
+        self.assertEqual(
+            dual.core.HOME
+            / ".config/systemd/user/grabowski-repoground-post-merge-reconcile.service",
+            service.target,
+        )
+        self.assertEqual(
+            "grabowski-repoground-post-merge-reconcile.service",
+            service.unit,
+        )
+        self.assertEqual(
+            "grabowski-repoground-post-merge-reconcile.timer",
+            timer.unit,
+        )
+        self.assertIsNone(dropin.unit)
+        self.assertTrue(dropin.reloads_systemd)
+        self.assertEqual(0o600, service.mode)
+        self.assertEqual(0o600, timer.mode)
+        self.assertEqual(0o600, dropin.mode)
+
 
     def test_watchdog_helper_is_installed_before_importing_script(self) -> None:
         sources = [asset.source.as_posix() for asset in dual.WATCHDOG_HOST_ASSETS]
@@ -4256,7 +4294,14 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "profile_topology",
                 return_value=dual.ProfileTopology("url", server_url_count=1),
             ),
-            mock.patch.object(dual, "require_topology_matches_contract"),
+            mock.patch.multiple(
+                dual,
+                require_topology_matches_contract=mock.Mock(),
+                _initialize_post_merge_discovery_before_activation=mock.Mock(
+                    side_effect=lambda *args, **kwargs: events.append("bootstrap:init")
+                    or {"initialized": True, "global_ordinal": 100},
+                ),
+            ),
             mock.patch.object(
                 core,
                 "activate_pointer",
@@ -4298,6 +4343,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                 f"stop:{dual.TUNNEL_SERVICE}",
                 f"stop:{dual.OPERATOR_SERVICE}",
                 "verify:snapshot",
+                "bootstrap:init",
                 "activate",
                 f"start:{dual.OPERATOR_SERVICE}",
                 "verify:operator",
@@ -4410,6 +4456,13 @@ class DeploymentSequenceTests(unittest.TestCase):
             )
             stack.enter_context(
                 mock.patch.object(
+                    dual, "_initialize_post_merge_discovery_before_activation",
+                    side_effect=lambda *args, **kwargs: events.append("bootstrap:init")
+                    or {"initialized": True, "global_ordinal": 100},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
                     core,
                     "activate_pointer",
                     side_effect=lambda activation: events.append("activate"),
@@ -4502,7 +4555,8 @@ class DeploymentSequenceTests(unittest.TestCase):
             events.index("quiesce:predecessor"),
             events.index("guard:inactive"),
         )
-        self.assertLess(events.index("guard:inactive"), events.index("activate"))
+        self.assertLess(events.index("guard:inactive"), events.index("bootstrap:init"))
+        self.assertLess(events.index("bootstrap:init"), events.index("activate"))
 
     def test_legacy_stdio_deploy_never_installs_observer_unit(self) -> None:
         snapshot = self.snapshot()
@@ -4527,6 +4581,41 @@ class DeploymentSequenceTests(unittest.TestCase):
         )
         build.assert_not_called()
         install_watchdogs.assert_not_called()
+        install.assert_not_called()
+
+    def test_post_merge_bootstrap_allows_verified_audit_discovery_budget(self) -> None:
+        result = SimpleNamespace(returncode=0, stdout=json.dumps({
+            "kind": "grabowski.repoground_post_merge_discovery_bootstrap",
+            "schema_version": 1,
+            "status": "ok",
+            "initialized": True,
+            "global_ordinal": 1_675_780,
+        }))
+        with mock.patch.object(core, "run", return_value=result) as runner:
+            summary = dual._initialize_post_merge_discovery_before_activation(
+                Path("/release/exact"), timeout_seconds=60,
+            )
+        self.assertEqual(summary["global_ordinal"], 1_675_780)
+        self.assertGreaterEqual(runner.call_args.kwargs["timeout"], 900)
+        self.assertIn("--initialize-reconcile-watermark",
+                      runner.call_args.args[0])
+
+    def test_legacy_stdio_post_merge_reconciler_fails_before_deploy(self) -> None:
+        snapshot = self.snapshot()
+        snapshot.supporting_source_bytes = {
+            "grabowski_repoground_post_merge": b"verified module bytes",
+        }
+        topology = dual.ProfileTopology("legacy-stdio", legacy_entrypoint=CONTRACT)
+        with (
+            mock.patch.object(
+                dual, "preflight_url", return_value=(snapshot, RUNTIME, topology)
+            ),
+            mock.patch.object(core, "deploy") as deploy,
+            mock.patch.object(dual, "install_watchdog_host_assets") as install,
+        ):
+            with self.assertRaisesRegex(core.DeployError, "legacy-stdio"):
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+        deploy.assert_not_called()
         install.assert_not_called()
 
     def test_operator_stop_failure_prevents_pointer_activation(self) -> None:

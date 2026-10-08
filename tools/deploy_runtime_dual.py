@@ -211,6 +211,24 @@ WATCHDOG_HOST_ASSETS = (
         reloads_systemd=True,
     ),
     WatchdogHostAsset(
+        source=Path("systemd/grabowski-repoground-post-merge-reconcile.service.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-repoground-post-merge-reconcile.service",
+        mode=0o600,
+        unit="grabowski-repoground-post-merge-reconcile.service",
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-repoground-post-merge-reconcile.timer.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-repoground-post-merge-reconcile.timer",
+        mode=0o600,
+        unit="grabowski-repoground-post-merge-reconcile.timer",
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-operator.service.d/95-repoground-post-merge-reconcile.conf.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-operator.service.d/95-repoground-post-merge-reconcile.conf",
+        mode=0o600,
+        reloads_systemd=True,
+    ),
+    WatchdogHostAsset(
         source=Path("systemd/grabowski-operator-watchdog.service.example"),
         target=core.HOME / ".config/systemd/user/grabowski-operator-watchdog.service",
         mode=0o600,
@@ -5505,6 +5523,15 @@ def deploy_url(
         else None
     )
     if topology.kind == "legacy-stdio":
+        # Legacy stdio has no installed post-merge reconciliation timer. Do not
+        # activate a release whose Captain promises durable RepoGround refreshes.
+        if "grabowski_repoground_post_merge" in getattr(
+            snapshot, "supporting_source_bytes", {}
+        ):
+            core.fail(
+                "legacy-stdio cannot provide durable RepoGround post-merge reconciliation",
+                phase="post-merge-reconciler-unsupported-topology",
+            )
         core.deploy(
             repo,
             runtime,
@@ -5604,6 +5631,11 @@ def deploy_url(
             bootstrap_predecessor = _require_bootstrap_recovery_predecessor_inactive(
                 topology
             )
+
+        phase = "initialize-post-merge-discovery"
+        _initialize_post_merge_discovery_before_activation(
+            build.release_path, timeout_seconds=timeout_seconds
+        )
 
         phase = "activate-pointer"
         activation_attempted = True
@@ -5879,6 +5911,63 @@ def _canonical_operator_green_environment() -> dict[str, str]:
             )
         observed[key] = value
     return observed
+
+
+def _initialize_post_merge_discovery_before_activation(
+    release_path: Path,
+    *,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Bind the first verified audit watermark before new Captain can serve.
+
+    A later deployment must keep the existing lower bound, including work
+    still waiting for a durable scheduler. Failure prevents promotion.
+    """
+    command = [
+        str(release_path / ".venv/bin/python"),
+        "-I",
+        "-m",
+        "grabowski_repoground_post_merge",
+        "--initialize-reconcile-watermark",
+    ]
+    result = core.run(
+        command,
+        check=False,
+        capture=True,
+        # Verified audit discovery can consume up to 900s on cold history.
+        # Keep startup fail-closed, but do not impose the former 240s cap.
+        timeout=max(timeout_seconds, 960),
+    )
+    if result.returncode != 0:
+        core.fail(
+            "RepoGround post-merge discovery initialization failed before activation",
+            phase="post-merge-discovery-bootstrap",
+            details={"returncode": result.returncode},
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        core.fail(
+            "RepoGround post-merge bootstrap did not return valid JSON",
+            phase="post-merge-discovery-bootstrap",
+        )
+    if (
+        not isinstance(payload, dict)
+        or payload.get("kind")
+        != "grabowski.repoground_post_merge_discovery_bootstrap"
+        or payload.get("status") != "ok"
+        or type(payload.get("initialized")) is not bool
+        or type(payload.get("global_ordinal")) is not int
+        or payload["global_ordinal"] < 0
+    ):
+        core.fail(
+            "RepoGround post-merge bootstrap receipt is invalid",
+            phase="post-merge-discovery-bootstrap",
+        )
+    return {
+        "initialized": payload["initialized"],
+        "global_ordinal": payload["global_ordinal"],
+    }
 
 
 def _start_green_operator(
@@ -6457,6 +6546,7 @@ class ProductionBlueGreenRuntime:
     watchdog_projection: WatchdogHostAssetProjection | None = None
     observer_repair: dict[str, Any] | None = None
     admission_marker: dict[str, Any] | None = None
+    discovery_bootstrap: dict[str, Any] | None = None
     green_started: bool = False
     connector_switched: bool = False
     current_selector: dict[str, Any] | None = None
@@ -6479,6 +6569,9 @@ class ProductionBlueGreenRuntime:
         )
         self.observer_repair = install_safety_observer_unit(
             self.repo, self.snapshot
+        )
+        self.discovery_bootstrap = _initialize_post_merge_discovery_before_activation(
+            self.build.release_path, timeout_seconds=self.timeout_seconds
         )
         # From this point forward the start call may already have created the
         # transient systemd unit even if a later service/argv/exe/listener
