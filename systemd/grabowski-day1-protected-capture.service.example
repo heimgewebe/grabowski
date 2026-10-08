@@ -9,6 +9,7 @@ RefuseManualStart=yes
 ConditionPathExists=/etc/grabowski/day1-capture-policy-v1.json
 ConditionPathExists=/etc/grabowski/day1-capture-signing-key
 ConditionPathExists=/usr/local/libexec/grabowski/day1-collector-static
+ConditionPathExists=/usr/local/libexec/grabowski/day1-ssh-keygen-static
 
 [Service]
 Type=oneshot

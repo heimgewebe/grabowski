@@ -31,7 +31,7 @@ POLICY_PATH = Path("/etc/grabowski/day1-capture-policy-v1.json")
 SIGNING_KEY_PATH = Path("/etc/grabowski/day1-capture-signing-key")
 COLLECTOR_PATH = Path("/usr/local/libexec/grabowski/day1-collector-static")
 EVIDENCE_ROOT = Path("/var/lib/grabowski/day1-capture")
-SIGN_TOOL = Path("/usr/bin/ssh-keygen")
+SIGN_TOOL = Path("/usr/local/libexec/grabowski/day1-ssh-keygen-static")
 CHILD_USER = "grabowski-day1-collector"
 PROOF_KIND = "grabowski.day1_capture_prototype_not_admitted"
 PROOF_ISSUER = "grabowski-day1-prototype@heimgewebe"
@@ -384,6 +384,21 @@ def _canonical_receipt(policy: dict[str, Any], *, hostname: str, code_hash: str,
     return _json_bytes(value)
 
 
+def _validate_signer_static(data: bytes) -> None:
+    """Reject unpinned runtime loader/libraries before exposing signing key.
+
+    Verifying only the main ssh-keygen executable FD does not bind PT_INTERP,
+    libcrypto, libc or other dynamically loaded signer code. No production
+    signing is possible until a separately reviewed static signer is staged.
+    """
+    try:
+        _validate_native_static_elf(data)
+    except CaptureDenied as exc:
+        raise CaptureDenied(
+            "signer requires pinned reviewed static ELF without dynamic loader"
+        ) from exc
+
+
 def _sign_receipt(
     payload: bytes, *, expected_signer_sha256: str
 ) -> bytes:
@@ -402,6 +417,9 @@ def _sign_receipt(
         try:
             if _sha(signer_bytes) != expected_signer_sha256:
                 raise CaptureDenied("actual signer executable differs from root policy")
+            # Enforce the root-owned reviewed static signer before handing its
+            # process the pinned private key FD. No dynamic OpenSSH fallback.
+            _validate_signer_static(signer_bytes)
             # The trusted parent retains both descriptors through signing.
             # /proc/self/fd/N names the exact checked inode inherited by the
             # child, so root-managed key or package rotations cannot switch it.

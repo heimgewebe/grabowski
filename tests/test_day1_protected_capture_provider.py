@@ -345,6 +345,61 @@ int main(void) {sleep(3);return 0;}
         with self.assertRaisesRegex(cap.CaptureDenied, "timed out"):
             self.capture("timeout", runtime=1)
 
+    def test_signer_refuses_any_elf_dynamic_loader(self) -> None:
+        # Even a pinned static collector SHA is not enough to justify
+        # exposing a private key to a dynamically loaded signer.
+        data = bytearray(self.programs["success"].read_bytes())
+        program_header_offset = int.from_bytes(data[32:40], "little")
+        data[program_header_offset:program_header_offset + 4] = (
+            3
+        ).to_bytes(4, "little")  # PT_INTERP
+        with self.assertRaisesRegex(
+            cap.CaptureDenied, "signer requires pinned reviewed static ELF"
+        ):
+            cap._validate_signer_static(bytes(data))
+        self.assertEqual(
+            "/usr/local/libexec/grabowski/day1-ssh-keygen-static",
+            str(cap.SIGN_TOOL),
+        )
+
+    def test_dynamic_signer_cannot_reach_signature_subprocess(self) -> None:
+        # A synthetically altered, sha-pinned ELF cannot consume the private
+        # signing key merely because its main file SHA matches root policy.
+        self.active_binary = self.programs["success"]
+        self.policy_file = Path(self.temp.name) / "policy"
+        self.policy_file.write_bytes(cap._json_bytes(
+            example_policy(self.active_binary.read_bytes())
+        ))
+        data = bytearray(self.active_binary.read_bytes())
+        phoff = int.from_bytes(data[32:40], "little")
+        data[phoff:phoff + 4] = (3).to_bytes(4, "little")
+        unsafe_signer = Path(self.temp.name) / "unsafe-dynamic-signer"
+        unsafe_signer.write_bytes(data)
+        unsafe_signer.chmod(0o755)
+
+        def fixture_open(path, **kwargs):
+            if path == cap.SIGN_TOOL:
+                return (
+                    os.open(unsafe_signer, os.O_RDONLY | os.O_CLOEXEC),
+                    bytes(data),
+                )
+            return self.fake_root_file(path, **kwargs)
+
+        with patch.object(cap, "SIGNING_KEY_PATH", self.key), \
+             patch.object(cap, "_open_root_file", side_effect=fixture_open), \
+             patch.object(
+                 cap.subprocess, "run",
+                 side_effect=AssertionError("MUST NOT LAUNCH SIGNER"),
+             ):
+            with self.assertRaisesRegex(
+                cap.CaptureDenied,
+                "signer requires pinned reviewed static ELF",
+            ):
+                cap._sign_receipt(
+                    b"synthetic reject unreviewed code\n",
+                    expected_signer_sha256=sha(bytes(data)),
+                )
+
     def test_elf_loader_or_arbitrary_script_is_rejected(self) -> None:
         with self.assertRaisesRegex(cap.CaptureDenied, "ELF"):
             cap._validate_native_static_elf(b"#!/bin/sh\necho forged\n")
@@ -359,11 +414,28 @@ int main(void) {sleep(3);return 0;}
     def test_create_only_bundle_requires_root_owned_directory(self) -> None:
         root_fd = os.open(self.dest, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            with self.assertRaisesRegex(cap.CaptureDenied, "directory mode/owner"):
-                cap._publish_bundle(
-                    root_fd, task_id="a"*24, nonce="b"*64, stdout=b"",
-                    stderr=b"", receipt=b"{}", signature=b"sig",
-                )
+            # Deterministic on root and non-root CI: real mode validation,
+            # plus a separate injected wrong-owner denial at publication.
+            os.fchmod(root_fd, 0o750)
+            with self.assertRaisesRegex(
+                cap.CaptureDenied, "directory mode/owner"
+            ):
+                cap._check_staging_root_owned(root_fd)
+            os.fchmod(root_fd, 0o700)
+            with patch.object(
+                cap, "_check_staging_root_owned",
+                side_effect=cap.CaptureDenied(
+                    "staged protected directory mode/owner mismatch"
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied, "directory mode/owner"
+                ):
+                    cap._publish_bundle(
+                        root_fd, task_id="a"*24, nonce="b"*64,
+                        stdout=b"", stderr=b"",
+                        receipt=b"{}", signature=b"sig",
+                    )
         finally:
             os.close(root_fd)
         self.assertEqual([], list(self.dest.glob("prototype-*")))
@@ -464,7 +536,10 @@ int main(void) {sleep(3);return 0;}
         )))
         self.active_binary = self.programs["success"]
         with patch.object(cap, "SIGNING_KEY_PATH", self.key), \
-             patch.object(cap, "_open_root_file", side_effect=self.fake_root_file):
+             patch.object(cap, "_open_root_file", side_effect=self.fake_root_file), \
+             patch.object(cap, "_validate_signer_static", return_value=None):
+            # This disposable fixture uses distro's dynamic ssh-keygen to
+            # exercise SSHSIG wire semantics ONLY; production must reject it.
             signed = cap._sign_receipt(
                 receipt, expected_signer_sha256=sha(
                     Path("/usr/bin/ssh-keygen").read_bytes()
@@ -518,7 +593,8 @@ int main(void) {sleep(3);return 0;}
             return descriptor, data
 
         with patch.object(cap, "SIGNING_KEY_PATH", self.key), \
-             patch.object(cap, "_open_root_file", side_effect=switch_path_after_open):
+             patch.object(cap, "_open_root_file", side_effect=switch_path_after_open), \
+             patch.object(cap, "_validate_signer_static", return_value=None):
             signature = cap._sign_receipt(
                 receipt,
                 expected_signer_sha256=sha(
@@ -583,6 +659,7 @@ int main(void) {sleep(3);return 0;}
              patch.object(cap, "_open_root_file", side_effect=self.fake_root_file), \
              patch.object(cap, "_open_root_directory", side_effect=fake_open_dir), \
              patch.object(cap, "_check_staging_root_owned", return_value=None), \
+             patch.object(cap, "_validate_signer_static", return_value=None), \
              patch.object(cap, "_separate_child_identity", return_value=(os.getuid(), os.getgid())), \
              patch.object(cap, "_drop_to_child", return_value=None):
             outcome = cap.run()
@@ -610,14 +687,40 @@ int main(void) {sleep(3);return 0;}
             input=proofbytes, capture_output=True, timeout=15,
         )
         self.assertEqual(0, genuine.returncode, genuine.stderr.decode(errors="replace"))
-        # An authentic *prototype* signature cannot verify under the
-        # production task-proof principal/namespace from verifier PR #1389.
+        # Control: the allowed-signers file authorizes BOTH principals
+        # for exactly the same key. Prove prototype SSHSIG namespace works
+        # with the production principal, then change ONLY the namespace.
+        # This detects regressions hidden by an unauthorized principal.
+        public = Path(str(self.key) + ".pub").read_text().strip()
+        both_principals = Path(self.temp.name) / "dual-principals"
+        production_principal = "grabowski-day1-capture@heimgewebe"
+        production_namespace = "grabowski-day1-task-proof-v1@heimgewebe"
+        both_principals.write_text(
+            cap.PROOF_ISSUER + " " + public + "\n"
+            + production_principal + " " + public + "\n",
+            encoding="utf-8",
+        )
+        self.assertNotEqual(cap.PROOF_NAMESPACE, production_namespace)
+        accepted_same_namespace = subprocess.run(
+            [
+                "/usr/bin/ssh-keygen", "-Y", "verify",
+                "-f", str(both_principals),
+                "-I", production_principal,
+                "-n", cap.PROOF_NAMESPACE,
+                "-s", str(sig),
+            ],
+            input=proofbytes, capture_output=True, timeout=15,
+        )
+        self.assertEqual(
+            0, accepted_same_namespace.returncode,
+            accepted_same_namespace.stderr.decode(errors="replace"),
+        )
         production_verification = subprocess.run(
             [
                 "/usr/bin/ssh-keygen", "-Y", "verify",
-                "-f", str(self.signers),
-                "-I", "grabowski-day1-capture@heimgewebe",
-                "-n", "grabowski-day1-task-proof-v1@heimgewebe",
+                "-f", str(both_principals),
+                "-I", production_principal,
+                "-n", production_namespace,
                 "-s", str(sig),
             ],
             input=proofbytes, capture_output=True, timeout=15,
