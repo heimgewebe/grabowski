@@ -220,6 +220,105 @@ class ProtectedAttemptReadbackTests(unittest.TestCase):
             self.assertTrue(renamed[0])
             self.assertFalse((self.root / dirname).exists())
 
+    def test_leaf_swapped_after_read_before_final_report_is_denied(self) -> None:
+        with self.fixture() as fd:
+            capture_id, nonce = self.reserve(fd)
+            path = self.publish(fd, capture_id, nonce)
+            original_read = rec._read_leaf
+            injected = [False]
+
+            def swap_after_later_leaf(directory_fd, name, maximum):
+                data = original_read(directory_fd, name, maximum)
+                if name == "proof.sshsig" and not injected[0]:
+                    # Replaces the already-read stdout after its first
+                    # identity/digest check but before readback completes.
+                    (path / "stdout.bin").unlink()
+                    (path / "stdout.bin").write_bytes(b"forged-after-first-read")
+                    injected[0] = True
+                return data
+
+            with patch.object(rec, "_read_leaf", side_effect=swap_after_later_leaf):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied,
+                    "prototype snapshot (changed|identity changed) during inspection",
+                ):
+                    rec.inspect_reserved_prototype(fd)
+            self.assertTrue(injected[0])
+
+    def test_same_bytes_leaf_replacement_during_read_is_denied(self) -> None:
+        with self.fixture() as fd:
+            capture_id, nonce = self.reserve(fd)
+            path = self.publish(fd, capture_id, nonce)
+            original_read = rec._read_leaf
+            injected = [False]
+            stdout = (path / "stdout.bin").read_bytes()
+
+            def same_bytes_different_inode(directory_fd, name, maximum):
+                data = original_read(directory_fd, name, maximum)
+                if name == "proof.sshsig" and not injected[0]:
+                    (path / "stdout.bin").unlink()
+                    (path / "stdout.bin").write_bytes(stdout)
+                    injected[0] = True
+                return data
+
+            with patch.object(rec, "_read_leaf", side_effect=same_bytes_different_inode):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied,
+                    "prototype snapshot (leaf )?identity changed during inspection",
+                ):
+                    rec.inspect_reserved_prototype(fd)
+            self.assertTrue(injected[0])
+
+    def test_inplace_change_after_stdout_read_is_denied(self) -> None:
+        with self.fixture() as fd:
+            capture_id, nonce = self.reserve(fd)
+            path = self.publish(fd, capture_id, nonce)
+            original_read = rec._read_leaf
+            injected = [False]
+
+            def mutate_after_read(directory_fd, name, maximum):
+                data = original_read(directory_fd, name, maximum)
+                if name == "proof.sshsig" and not injected[0]:
+                    with (path / "stdout.bin").open("r+b") as target:
+                        target.seek(0)
+                        target.write(b"x")
+                    injected[0] = True
+                return data
+
+            with patch.object(rec, "_read_leaf", side_effect=mutate_after_read):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied,
+                    "prototype snapshot changed during inspection",
+                ):
+                    rec.inspect_reserved_prototype(fd)
+            self.assertTrue(injected[0])
+
+    def test_reservation_swap_after_read_is_denied(self) -> None:
+        with self.fixture() as fd:
+            capture_id, nonce = self.reserve(fd)
+            self.publish(fd, capture_id, nonce)
+            original_read = rec._read_leaf
+            injected = [False]
+
+            def replace_reservation_late(directory_fd, name, maximum):
+                data = original_read(directory_fd, name, maximum)
+                if name == "proof.sshsig" and not injected[0]:
+                    marker = self.root / cap.ATTEMPT_MARKER
+                    raw = marker.read_bytes()
+                    marker.unlink()
+                    marker.write_bytes(raw)
+                    marker.chmod(0o600)
+                    injected[0] = True
+                return data
+
+            with patch.object(rec, "_read_leaf", side_effect=replace_reservation_late):
+                with self.assertRaisesRegex(
+                    cap.CaptureDenied,
+                    "prototype snapshot identity changed during inspection",
+                ):
+                    rec.inspect_reserved_prototype(fd)
+            self.assertTrue(injected[0])
+
     def test_published_absence_or_symlinked_directory_blocks(self) -> None:
         with self.fixture() as fd:
             capture_id, nonce = self.reserve(fd)

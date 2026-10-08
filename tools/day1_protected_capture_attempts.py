@@ -114,6 +114,62 @@ def _require_current_directory(parent_fd: int, name: str, fd: int) -> None:
         )
 
 
+def _assert_unchanged_snapshot(
+    root_fd: int, directory_fd: int, *,
+    reservation: dict[str, Any],
+    original_root_identity: tuple[int, ...],
+    original_directory_identity: tuple[int, ...],
+    original_entries: set[str],
+    original_leaves: dict[str, bytes],
+    original_leaf_identities: dict[str, tuple[int, ...]],
+) -> None:
+    """Detect replacement or in-place modification after earlier leaf reads.
+
+    This verifies one bounded read interval. Even a successful diagnostic
+    cannot promise these paths remain immutable after it returns; no signature
+    verification, attempt retry, or Day-1 admission is granted.
+    """
+    try:
+        current_leaves = set(os.listdir(directory_fd))
+        current_entries = set(os.listdir(root_fd))
+    except OSError as exc:
+        raise provider.CaptureDenied("prototype snapshot cannot be re-enumerated") from exc
+    if (current_leaves != set(original_leaves)
+        or current_entries != original_entries):
+        raise provider.CaptureDenied("prototype snapshot changed during inspection")
+
+    for name, before in original_leaves.items():
+        limit = (
+            4096 if name == "proof.json"
+            else provider.MAX_SIGNATURE_BYTES if name == "proof.sshsig"
+            else provider.MAX_CAPTURE_BYTES
+        )
+        if _read_leaf(directory_fd, name, limit) != before:
+            raise provider.CaptureDenied("prototype snapshot changed during inspection")
+        try:
+            linked = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise provider.CaptureDenied(
+                "prototype snapshot leaf identity is unobservable"
+            ) from exc
+        if provider._file_identity(linked) != original_leaf_identities[name]:
+            raise provider.CaptureDenied(
+                "prototype snapshot leaf identity changed during inspection"
+            )
+    if provider._read_capture_reservation(root_fd) != reservation:
+        raise provider.CaptureDenied("prototype reservation changed during inspection")
+    try:
+        current_directory = provider._file_identity(os.fstat(directory_fd))
+        current_root = provider._file_identity(os.fstat(root_fd))
+    except OSError as exc:
+        raise provider.CaptureDenied("prototype directory metadata unavailable") from exc
+    # Directory metadata captures same-byte replacement (rename/link) of any
+    # leaf. Comparing only the current directory FD and its path misses this.
+    if (current_directory != original_directory_identity
+        or current_root != original_root_identity):
+        raise provider.CaptureDenied("prototype snapshot identity changed during inspection")
+
+
 def _verify_nonadmitting_proof(
     raw: bytes, reservation: dict[str, Any], stdout: bytes, stderr: bytes
 ) -> None:
@@ -175,6 +231,7 @@ def inspect_reserved_prototype(root_fd: int) -> dict[str, Any]:
     Every result explicitly forbids admission and another capture attempt.
     """
     provider._check_staging_root_owned(root_fd)
+    original_root_identity = provider._file_identity(os.fstat(root_fd))
     reservation = provider._read_capture_reservation(root_fd)
     if reservation is None:
         raise provider.CaptureDenied("no authenticated protected reservation")
@@ -206,6 +263,7 @@ def inspect_reserved_prototype(root_fd: int) -> dict[str, Any]:
     name = published if published in entries else staging
     fd = _open_exact_directory(root_fd, name)
     try:
+        original_directory_identity = provider._file_identity(os.fstat(fd))
         try:
             children = os.listdir(fd)
         except OSError as exc:
@@ -217,6 +275,17 @@ def inspect_reserved_prototype(root_fd: int) -> dict[str, Any]:
             return {**result, "status": "incomplete_staging_unverified"}
         if set(children) != PROTOTYPE_LEAVES:
             raise provider.CaptureDenied("published prototype lacks required files")
+        try:
+            original_leaf_identities = {
+                leaf: provider._file_identity(
+                    os.stat(leaf, dir_fd=fd, follow_symlinks=False)
+                )
+                for leaf in PROTOTYPE_LEAVES
+            }
+        except OSError as exc:
+            raise provider.CaptureDenied(
+                "prototype snapshot leaf identity is unobservable"
+            ) from exc
         stdout = _read_leaf(fd, "stdout.bin", provider.MAX_CAPTURE_BYTES)
         stderr = _read_leaf(fd, "stderr.bin", provider.MAX_CAPTURE_BYTES)
         proof_raw = _read_leaf(fd, "proof.json", 4096)
@@ -225,6 +294,20 @@ def inspect_reserved_prototype(root_fd: int) -> dict[str, Any]:
         if (not signature.startswith(b"-----BEGIN SSH SIGNATURE-----")
             or not signature.rstrip().endswith(b"-----END SSH SIGNATURE-----")):
             raise provider.CaptureDenied("prototype signature envelope is malformed")
+        _require_current_directory(root_fd, name, fd)
+        _assert_unchanged_snapshot(
+            root_fd, fd, reservation=reservation,
+            original_root_identity=original_root_identity,
+            original_directory_identity=original_directory_identity,
+            original_entries=set(entries),
+            original_leaf_identities=original_leaf_identities,
+            original_leaves={
+                "stdout.bin": stdout,
+                "stderr.bin": stderr,
+                "proof.json": proof_raw,
+                "proof.sshsig": signature,
+            },
+        )
         _require_current_directory(root_fd, name, fd)
         return {
             **result,
