@@ -837,7 +837,11 @@ def _install_lowlevel_handler(
         if tracer is None or reason in skip_reasons_logged:
             return
         skip_reasons_logged.add(reason)
-        LOGGER.warning("Flowlines telemetry span skipped: %s", reason)
+        try:
+            LOGGER.warning("Flowlines telemetry span skipped: %s", reason)
+        except Exception:
+            # A broken diagnostic sink must not affect the actual MCP call.
+            pass
 
     async def flowlines_call_tool_handler(req: Any) -> Any:
         arguments = getattr(getattr(req, "params", None), "arguments", None) or {}

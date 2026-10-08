@@ -666,6 +666,24 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertNotIn(secret, records.output[0])
 
+    async def test_failing_diagnostic_logger_keeps_domain_call_fail_open(self) -> None:
+        mcp = self.server(verified_resolver=lambda _ctx: {"id": "verified-test-user"})
+        with mock.patch.object(
+            flowlines.LOGGER, "warning", side_effect=RuntimeError("logging transport unavailable")
+        ):
+            result = await self.call(
+                mcp,
+                arguments={
+                    "value": "hello",
+                    "reason": "Read the fixture value",
+                    "user_intent": "Verify diagnostics stay fail-open",
+                },
+                meta={},
+            )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(result.root.structuredContent, {"value": "hello"})
+        self.assertEqual(self.exporter.get_finished_spans(), ())
+
     async def test_verified_identity_failure_reports_bounded_reason_once(self) -> None:
         mcp = self.server(verified_resolver=lambda _ctx: (_ for _ in ()).throw(RuntimeError("private-transport-detail")))
         with self.assertLogs(flowlines.LOGGER, level="WARNING") as records:
