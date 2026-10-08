@@ -13961,6 +13961,10 @@ def _captain_audit_execution_result_material(
                 execution.get("preflight_passed") is True
                 and execution.get("duplicate_dispatch_prevented") is True
                 and isinstance(execution.get("merge_queue_entry"), dict)
+                and isinstance(execution["merge_queue_entry"].get("id"), str)
+                and 1 <= len(execution["merge_queue_entry"]["id"]) <= 256
+                and execution.get("execution_attempted") is False
+                and not remote_mutation_observed
                 and execution.get("merge_queue_reconciliation")
                 in {"already_queued_before_dispatch", "queued_during_dispatch_guard"}
             )
@@ -13987,6 +13991,16 @@ def _captain_audit_execution_result_material(
             "provenance_mode": provenance_mode,
         }
     )
+    if provenance_mode == "captain_queue_dispatch_pending" and not execution_invoked:
+        # Preserve the concrete verified duplicate-prevention evidence in
+        # the immutable digest-bound completion audit. The Saga validator
+        # must not infer it from a queue flag alone.
+        material["verified_duplicate_queue"] = {
+            "preflight_passed": True,
+            "duplicate_dispatch_prevented": True,
+            "queue_entry_id": execution["merge_queue_entry"]["id"],
+            "merge_queue_reconciliation": execution["merge_queue_reconciliation"],
+        }
     return material
 
 

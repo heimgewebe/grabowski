@@ -3899,6 +3899,7 @@ class CaptainAuditTrailTests(unittest.TestCase):
 
     def test_verified_preexisting_queue_entries_keep_durable_pending_followups(self) -> None:
         import grabowski_repoground_post_merge as post_merge
+        import grabowski_grip_orchestration as saga
 
         for reconciliation in (
             "already_queued_before_dispatch",
@@ -3937,6 +3938,34 @@ class CaptainAuditTrailTests(unittest.TestCase):
                 self.assertFalse(material["execution_invoked"])
                 self.assertTrue(material["verification_passed"])
                 self.assertTrue(material["merge_queued"])
+                verified = saga._captain_merge_provenance_from_execution_result(material)
+                self.assertEqual(verified["provenance_mode"], "captain_queue_dispatch_pending")
+                self.assertEqual(
+                    verified["verified_duplicate_queue"]["merge_queue_reconciliation"],
+                    reconciliation,
+                )
+                self.assertEqual(
+                    verified["verified_duplicate_queue"]["queue_entry_id"],
+                    "MQE_verified",
+                )
+                for corrupted in (
+                    None,
+                    {},
+                    {**material["verified_duplicate_queue"], "preflight_passed": False},
+                    {**material["verified_duplicate_queue"], "queue_entry_id": ""},
+                    {**material["verified_duplicate_queue"], "merge_queue_reconciliation": "unverified"},
+                    {**material["verified_duplicate_queue"], "unbound_extra": True},
+                ):
+                    with self.subTest(corrupted=corrupted), self.assertRaises(saga.SagaError):
+                        saga._captain_merge_provenance_from_execution_result(
+                            {**material, "verified_duplicate_queue": corrupted}
+                        )
+                without_proof = dict(material)
+                without_proof.pop("verified_duplicate_queue")
+                with self.assertRaisesRegex(saga.SagaError, "mode is internally inconsistent"):
+                    saga._captain_merge_provenance_from_execution_result(
+                        without_proof
+                    )
                 record = {
                     "operation": "captain-run-audit-completion",
                     "kind": "grabowski_captain_run_audit",
@@ -3967,6 +3996,9 @@ class CaptainAuditTrailTests(unittest.TestCase):
             for override in (
                 {"preflight_passed": False},
                 {"merge_queue_entry": None},
+                {"merge_queue_entry": {}},
+                {"execution_attempted": True},
+                {"remote_mutation_observed": True},
                 {"duplicate_dispatch_prevented": False},
                 {"verification_passed": False},
                 {"merge_queue_reconciliation": "unknown"},
@@ -3989,6 +4021,10 @@ class CaptainAuditTrailTests(unittest.TestCase):
                         hostile_result, action="pr-merge"
                     )
                     self.assertEqual(invalid["provenance_mode"], "unverified")
+                    normalized = saga._captain_merge_provenance_from_execution_result(
+                        invalid
+                    )
+                    self.assertEqual(normalized["provenance_mode"], "unverified")
 
     def test_completion_material_preserves_exact_base_reconciled_merge_sha(self) -> None:
         merge_sha = "d" * 40
