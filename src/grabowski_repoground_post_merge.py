@@ -69,6 +69,10 @@ POST_MERGE_SINGLE_IDENTITY_BUDGET_SECONDS = (
 DEFAULT_RECONCILE_PASS_BUDGET_SECONDS = 720
 RECONCILE_CURSOR_METADATA_KEY = "repoground_post_merge_reconcile_cursor_v1"
 RECONCILE_DISCOVERY_METADATA_KEY = "repoground_post_merge_reconcile_discovery_v1"
+DEFAULT_PREDECESSOR_RECONCILER_SOURCE = (
+    Path.home()
+    / ".local/share/grabowski-mcp/inputs/src/grabowski_repoground_post_merge.py"
+)
 
 
 class _ReusableJobSlotsExhausted(RuntimeError):
@@ -1701,7 +1705,7 @@ def _load_reconcile_discovery_ordinal(tasks_module: Any) -> int | None:
     if (
         isinstance(global_ordinal, bool)
         or not isinstance(global_ordinal, int)
-        or global_ordinal < 1
+        or global_ordinal < 0
     ):
         raise RepoGroundPostMergeError(
             "RepoGround post-merge discovery watermark ordinal is invalid"
@@ -1738,7 +1742,7 @@ def _save_reconcile_progress(
         if (
             isinstance(discovery_ordinal, bool)
             or not isinstance(discovery_ordinal, int)
-            or discovery_ordinal < 1
+            or discovery_ordinal < 0
         ):
             raise RepoGroundPostMergeError(
                 "RepoGround post-merge discovery watermark ordinal is invalid"
@@ -1776,6 +1780,78 @@ def _save_reconcile_cursor(tasks_module: Any, cursor: str) -> None:
         cursor=cursor,
         discovery_ordinal=None,
     )
+
+
+def initialize_reconcile_discovery_watermark(
+    *,
+    predecessor_module_path: Path | None = None,
+) -> dict[str, Any]:
+    """Seed the verified audit tip only before first activation of this feature.
+
+    Deployment must call this before the target operator can serve Captain merges.
+    Existing progress is immutable to the initializer: later deployments must
+    retain unfinished obligations instead of replacing their lower boundary.
+    """
+    import grabowski_audit_query
+    import grabowski_operator
+    import grabowski_tasks
+
+    if not isinstance(getattr(grabowski_operator, "STATE_DIR", None), Path):
+        raise RepoGroundPostMergeError(
+            "RepoGround discovery state store is unavailable"
+        )
+
+    existing = _load_reconcile_discovery_ordinal(grabowski_tasks)
+    if existing is not None:
+        return {
+            "kind": "grabowski.repoground_post_merge_discovery_bootstrap",
+            "schema_version": 1,
+            "status": "ok",
+            "initialized": False,
+            "global_ordinal": existing,
+        }
+
+    predecessor = (
+        DEFAULT_PREDECESSOR_RECONCILER_SOURCE
+        if predecessor_module_path is None
+        else predecessor_module_path
+    )
+    if not isinstance(predecessor, Path):
+        raise RepoGroundPostMergeError("Predecessor module path is invalid")
+    if predecessor.is_file():
+        raise RepoGroundPostMergeError(
+            "Prior runtime supports RepoGround reconciliation but its "
+            "discovery watermark is missing; refusing to discard pending work"
+        )
+
+    snapshot = grabowski_audit_query.capture_verified_audit_snapshot()
+    tip = snapshot.total_records
+    if type(tip) is not int or tip < 0:
+        raise RepoGroundPostMergeError("Verified audit tip ordinal is invalid")
+
+    payload = json.dumps(
+        {"schema_version": 1, "global_ordinal": tip},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with grabowski_tasks._database_connection() as connection:
+        inserted = connection.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO NOTHING",
+            (RECONCILE_DISCOVERY_METADATA_KEY, payload),
+        ).rowcount == 1
+    observed = _load_reconcile_discovery_ordinal(grabowski_tasks)
+    if observed is None:
+        raise RepoGroundPostMergeError(
+            "RepoGround discovery bootstrap did not persist a valid watermark"
+        )
+    return {
+        "kind": "grabowski.repoground_post_merge_discovery_bootstrap",
+        "schema_version": 1,
+        "status": "ok",
+        "initialized": inserted,
+        "global_ordinal": observed,
+    }
 
 
 def _cursor_ordered_completion_records(
@@ -1833,7 +1909,7 @@ def reconcile_recent_captain_audit_followups(
     scanned_records = 0
     lookback_horizon_reached = False
     newest_global_ordinal: int | None = None
-    discovery_watermark_reached = discovery_ordinal_before is None
+    discovery_watermark_reached = discovery_ordinal_before in (None, 0)
     iterator = grabowski_audit_query._iter_snapshot_items(snapshot, order="desc")
     for item in iterator:
         if scanned_records >= max_scan_records:
@@ -2047,6 +2123,7 @@ def _parser() -> argparse.ArgumentParser:
     mode.add_argument("--merge-sha")
     mode.add_argument("--pr", type=int)
     mode.add_argument("--reconcile-audit-followups", action="store_true")
+    mode.add_argument("--initialize-reconcile-watermark", action="store_true")
     parser.add_argument(
         "--reconcile-lookback-seconds",
         type=int,
@@ -2086,7 +2163,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        if args.reconcile_audit_followups:
+        if args.initialize_reconcile_watermark:
+            if args.repo is not None:
+                parser.error("--initialize-reconcile-watermark does not accept --repo")
+            result = initialize_reconcile_discovery_watermark()
+        elif args.reconcile_audit_followups:
             if args.repo is not None:
                 parser.error("--reconcile-audit-followups does not accept --repo")
             result = reconcile_recent_captain_audit_followups(

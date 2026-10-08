@@ -749,6 +749,122 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
         self.assertTrue(result["lookback_horizon_reached"])
         self.assertGreater(result["scanned_records"], 64)
 
+    def test_predecessor_discovery_uses_canonical_release_inputs_path(self) -> None:
+        self.assertEqual(
+            post_merge.DEFAULT_PREDECESSOR_RECONCILER_SOURCE.relative_to(
+                Path.home()
+            ),
+            Path(
+                ".local/share/grabowski-mcp/inputs/src/"
+                "grabowski_repoground_post_merge.py"
+            ),
+        )
+
+    def test_discovery_initialization_seeds_verified_tip_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            db = directory / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            snapshot = types.SimpleNamespace(total_records=1_675_780)
+            reads = []
+            audit = types.SimpleNamespace(
+                capture_verified_audit_snapshot=lambda: (
+                    reads.append(True) or snapshot
+                ),
+            )
+            modules = {
+                "grabowski_audit_query": audit,
+                "grabowski_operator": types.SimpleNamespace(STATE_DIR=directory),
+                "grabowski_tasks": tasks,
+            }
+            predecessor = directory / "not-installed.py"
+            with patch.dict(sys.modules, modules):
+                first = post_merge.initialize_reconcile_discovery_watermark(
+                    predecessor_module_path=predecessor
+                )
+                self.assertTrue(first["initialized"])
+                self.assertEqual(first["global_ordinal"], 1_675_780)
+                snapshot.total_records = 2_000_000
+                second = post_merge.initialize_reconcile_discovery_watermark(
+                    predecessor_module_path=predecessor
+                )
+                self.assertFalse(second["initialized"])
+                self.assertEqual(second["global_ordinal"], 1_675_780)
+                self.assertEqual(len(reads), 1)
+                self.assertEqual(
+                    post_merge._load_reconcile_discovery_ordinal(tasks),
+                    1_675_780,
+                )
+
+    def test_discovery_initialization_fails_closed_for_predecessor_without_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            db = directory / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            predecessor = directory / "grabowski_repoground_post_merge.py"
+            predecessor.write_text("existing release", encoding="utf-8")
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            modules = {
+                "grabowski_audit_query": types.SimpleNamespace(
+                    capture_verified_audit_snapshot=lambda: self.fail(
+                        "audit scan must not occur after ambiguous prior activation"
+                    ),
+                ),
+                "grabowski_operator": types.SimpleNamespace(STATE_DIR=directory),
+                "grabowski_tasks": tasks,
+            }
+            with patch.dict(sys.modules, modules):
+                with self.assertRaisesRegex(
+                    post_merge.RepoGroundPostMergeError,
+                    "discovery watermark is missing",
+                ):
+                    post_merge.initialize_reconcile_discovery_watermark(
+                        predecessor_module_path=predecessor
+                    )
+                self.assertIsNone(
+                    post_merge._load_reconcile_discovery_ordinal(tasks)
+                )
+
+    def test_discovery_initialization_handles_empty_verified_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            db = directory / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            modules = {
+                "grabowski_audit_query": types.SimpleNamespace(
+                    capture_verified_audit_snapshot=lambda: types.SimpleNamespace(
+                        total_records=0
+                    ),
+                ),
+                "grabowski_operator": types.SimpleNamespace(STATE_DIR=directory),
+                "grabowski_tasks": tasks,
+            }
+            with patch.dict(sys.modules, modules):
+                result = post_merge.initialize_reconcile_discovery_watermark(
+                    predecessor_module_path=directory / "not-installed.py"
+                )
+                self.assertEqual(result["global_ordinal"], 0)
+                self.assertEqual(
+                    post_merge._load_reconcile_discovery_ordinal(tasks), 0
+                )
+
     def test_reconcile_resumes_from_discovery_watermark_after_long_outage(self) -> None:
         old_merge_sha256 = "a" * 64
         items = [

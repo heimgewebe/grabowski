@@ -4294,7 +4294,14 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "profile_topology",
                 return_value=dual.ProfileTopology("url", server_url_count=1),
             ),
-            mock.patch.object(dual, "require_topology_matches_contract"),
+            mock.patch.multiple(
+                dual,
+                require_topology_matches_contract=mock.Mock(),
+                _initialize_post_merge_discovery_before_activation=mock.Mock(
+                    side_effect=lambda *args, **kwargs: events.append("bootstrap:init")
+                    or {"initialized": True, "global_ordinal": 100},
+                ),
+            ),
             mock.patch.object(
                 core,
                 "activate_pointer",
@@ -4336,6 +4343,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                 f"stop:{dual.TUNNEL_SERVICE}",
                 f"stop:{dual.OPERATOR_SERVICE}",
                 "verify:snapshot",
+                "bootstrap:init",
                 "activate",
                 f"start:{dual.OPERATOR_SERVICE}",
                 "verify:operator",
@@ -4448,6 +4456,13 @@ class DeploymentSequenceTests(unittest.TestCase):
             )
             stack.enter_context(
                 mock.patch.object(
+                    dual, "_initialize_post_merge_discovery_before_activation",
+                    side_effect=lambda *args, **kwargs: events.append("bootstrap:init")
+                    or {"initialized": True, "global_ordinal": 100},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
                     core,
                     "activate_pointer",
                     side_effect=lambda activation: events.append("activate"),
@@ -4540,7 +4555,8 @@ class DeploymentSequenceTests(unittest.TestCase):
             events.index("quiesce:predecessor"),
             events.index("guard:inactive"),
         )
-        self.assertLess(events.index("guard:inactive"), events.index("activate"))
+        self.assertLess(events.index("guard:inactive"), events.index("bootstrap:init"))
+        self.assertLess(events.index("bootstrap:init"), events.index("activate"))
 
     def test_legacy_stdio_deploy_never_installs_observer_unit(self) -> None:
         snapshot = self.snapshot()
