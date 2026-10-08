@@ -27,6 +27,7 @@ _SCALAR_RECORD_FIELDS = (
     "timestamp",
     "timestamp_unix",
     "operation",
+    "action",
     "task_id",
     "owner_id",
     "transaction_id",
