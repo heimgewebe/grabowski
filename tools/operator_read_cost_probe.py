@@ -102,6 +102,19 @@ def require_benchmark_inputs(expected):
 def modules():
     if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
         raise RuntimeError("run the synthetic benchmark with system Python -I -S -B")
+    cache = Path(sys.pycache_prefix) if isinstance(sys.pycache_prefix, str) else None
+    if (
+        cache is None or not cache.is_absolute() or cache.is_symlink()
+        or not cache.is_dir() or not cache.parent.is_relative_to(Path(tempfile.gettempdir()).resolve())
+        or stat.S_IMODE(cache.stat().st_mode) & 0o077
+    ):
+        raise RuntimeError("synthetic benchmark requires private owned bytecode cache")
+    try:
+        owned = json.loads((cache.parent / "synthetic-probe-owner.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("synthetic benchmark requires private owned bytecode cache") from exc
+    if owned != {"kind": "synthetic-audit-probe-v1"}:
+        raise RuntimeError("synthetic benchmark requires private owned bytecode cache")
     if sys.prefix != sys.base_prefix or Path(sys.executable).parent.parent.name == ".venv":
         raise RuntimeError("use system Python; runtime deployment imports are excluded")
     if (ROOT / "src" / "deployment-manifest.json").exists():
@@ -439,6 +452,8 @@ def main():
         (parent / "synthetic-probe-owner.json").write_text(json.dumps({"kind": "synthetic-audit-probe-v1"}))
         cache = parent / "worker-bytecode"
         cache.mkdir(mode=0o700)
+        # Parent fixture imports must not execute an existing __pycache__ pyc.
+        sys.pycache_prefix = str(cache)
         for count in sizes:
             require_benchmark_inputs(pinned)
             state = parent / str(count)

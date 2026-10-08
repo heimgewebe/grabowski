@@ -113,6 +113,37 @@ class BenchmarkInputsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             probe.validate_sweep("1000", "verify,verify", 64)
 
+    def test_modules_deny_unowned_parent_bytecode_cache_before_import(self):
+        with mock.patch.object(probe.sys, "pycache_prefix", None):
+            with self.assertRaisesRegex(RuntimeError, "private owned bytecode cache"):
+                probe.modules()
+        wrong = self.root / "unowned-cache"
+        wrong.mkdir(mode=0o700)
+        with mock.patch.object(probe.sys, "pycache_prefix", str(wrong)):
+            with self.assertRaisesRegex(RuntimeError, "private owned bytecode cache"):
+                probe.modules()
+
+    def test_parent_private_cache_never_loads_unchecked_hash_bytecode(self):
+        import py_compile
+        source = self.root / "src" / "parent_fixture_sentinel.py"
+        source.write_text("VALUE = 'poison'\n", encoding="utf-8")
+        cached = self.root / "src" / "__pycache__"
+        cached.mkdir()
+        compiled = cached / f"parent_fixture_sentinel.{sys.implementation.cache_tag}.pyc"
+        py_compile.compile(
+            str(source), cfile=str(compiled), doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH
+        )
+        source.write_text("VALUE = 'safe'\n", encoding="utf-8")
+        private = self.root / "private-bytecode"
+        private.mkdir(mode=0o700)
+        with mock.patch.object(sys, "pycache_prefix", str(private)):
+            spec = importlib.util.spec_from_file_location("parent_fixture_sentinel", source)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        self.assertEqual(module.VALUE, "safe")
+
     def test_disk_budget_preflight(self):
         from types import SimpleNamespace
         with mock.patch.object(probe.shutil, "disk_usage", return_value=SimpleNamespace(free=10)):
