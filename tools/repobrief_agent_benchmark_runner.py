@@ -1370,7 +1370,8 @@ def _provenance_match(item: Mapping[str, Any], requested: set[str]) -> str | Non
     Normalization mirrors grabowski_repobrief._snapshot_repository_matches:
     strip, drop ".git", match the repository segment, and accept canonical
     "<owner>__<segment>__<ref>[--<commit>]" identities.  The request carries
-    no ref, so the ref part is any non-empty token after an explicit segment.
+    no ref, so the ref is the single token after the last "__"; the segment
+    itself may contain "__" and must be the intact suffix of what precedes it.
     """
     segments = {name.rsplit("/", 1)[-1] for name in requested}
     segments.discard("")
@@ -1387,12 +1388,16 @@ def _provenance_match(item: Mapping[str, Any], requested: set[str]) -> str | Non
             if _SOURCE_RECOVERY_SUFFIX_RE.fullmatch(identity[separator + 2 :]):
                 canonical = identity[:separator]
                 break
-        parts = canonical.split("__")
+        prefix, separator_found, ref = canonical.rpartition("__")
         if (
-            len(parts) >= 3
-            and parts[-2] in segments
-            and parts[-1]
+            separator_found
+            and ref
             and "/" not in canonical
+            and any(
+                prefix == segment
+                or (prefix.endswith(f"__{segment}") and len(prefix) > len(segment) + 2)
+                for segment in segments
+            )
         ):
             hits.append("match")
         elif identity in segments:
@@ -1593,6 +1598,7 @@ def _validated_read_only_frontdoor_projection(value: Mapping[str, Any]) -> None:
     forbidden = boundary.get("forbidden_operations")
     if forbidden is not None and (
         not isinstance(forbidden, list)
+        or not all(isinstance(item, str) for item in forbidden)
         or not {"secret_read", "snapshot_create_side_effect"}.issubset(set(forbidden))
     ):
         raise RunnerError("RepoGround treatment tool read-only boundary is malformed")

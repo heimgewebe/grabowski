@@ -1624,6 +1624,72 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     _, _, commit, _ = runner._bound_repoground_manifest(value)
                     self.assertEqual(commit, COMMIT)
 
+    def test_provenance_match_preserves_double_underscore_repo_segments(self) -> None:
+        sha = "e" * 40
+        positive = (
+            ({"foo__bar"}, "owner__foo__bar__main"),
+            ({"foo__bar"}, f"owner__foo__bar__main--{sha}"),
+            ({"foo__bar"}, f"owner__foo__bar__main--{sha}--recovery-0123456789ab"),
+            ({"foo__bar"}, "foo__bar__main"),
+            ({"foo__bar"}, "foo__bar.git"),
+            ({"owner/foo__bar"}, "owner/foo__bar"),
+            ({"repo"}, "repo__main"),
+            ({"repo"}, "owner__repo__main"),
+        )
+        for requested, identity in positive:
+            with self.subTest(requested=requested, identity=identity):
+                self.assertEqual(
+                    runner._provenance_match({"repository": identity}, requested),
+                    "match",
+                )
+        unmatched = (
+            ({"foo"}, "owner__foo__bar__main"),
+            ({"foo__bar"}, "owner__foo__main"),
+            ({"foo__bar"}, "owner__xfoo__bar__main"),
+            ({"foo__bar"}, "owner__foo__bar__"),
+            ({"foo__bar"}, "owner__foo__bar"),
+            ({"foo__bar"}, "owner__foo__bar__main/x"),
+            ({"repo"}, "owner__repo"),
+            ({"repo"}, "repo__other__main"),
+        )
+        for requested, identity in unmatched:
+            with self.subTest(requested=requested, identity=identity):
+                self.assertIsNone(
+                    runner._provenance_match({"repository": identity}, requested)
+                )
+        self.assertEqual(
+            runner._provenance_match({"repository": "other/foo__bar"}, {"foo__bar"}),
+            "foreign",
+        )
+
+    def test_bound_manifest_double_underscore_repo_collision_and_ambiguity(self) -> None:
+        sha = "e" * 40
+        for requested_repo in ("foo__bar", "foo"):
+            for repositories, expected in (
+                ([{"repository": "owner__foo__bar__main", "git_commit": COMMIT}], "foo__bar"),
+                ([{"repository": f"owner__foo__bar__main--{sha}", "git_commit": COMMIT},
+                  {"repository": "owner__other__main", "git_commit": "b" * 40}], "foo__bar"),
+                (
+                    [
+                        {"repository": "owner__foo__bar__main", "git_commit": COMMIT},
+                        {"repository": "other__foo__bar__dev", "git_commit": "b" * 40},
+                    ],
+                    "ambiguous",
+                ),
+                ([{"repository": "other/foo__bar", "git_commit": COMMIT}], "foreign"),
+            ):
+                with self.subTest(
+                    requested=requested_repo, expected=expected
+                ), tempfile.TemporaryDirectory() as directory:
+                    value = self._bind_repositories(directory, repositories)
+                    value["repository"] = {**value.get("repository", {}), "id": requested_repo}
+                    if requested_repo == "foo" or expected in {"ambiguous", "foreign"}:
+                        with self.assertRaises(runner.RunnerError):
+                            runner._bound_repoground_manifest(value)
+                    else:
+                        _, _, commit, _ = runner._bound_repoground_manifest(value)
+                        self.assertEqual(commit, COMMIT)
+
     def test_bound_manifest_rejects_foreign_and_unknown_identities(self) -> None:
         cases = (
             [{"repository": "owner__other__main"}, {"repository": "x__y__main"}],
