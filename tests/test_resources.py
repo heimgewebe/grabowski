@@ -713,30 +713,74 @@ class ResourceTests(unittest.TestCase):
         )
         self.assertEqual([], self._resource_migration_backups())
 
+    def test_public_resource_inspect_never_initializes_missing_store(self) -> None:
+        with (
+            patch.object(resources, "_database") as initializing_store,
+            patch.object(
+                resources.operator, "_require_operator_mutation",
+                side_effect=PermissionError("mutation denied"),
+            ) as mutation_guard,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "explicit initialization"):
+                resources.grabowski_resource_inspect("port:9501")
+        initializing_store.assert_not_called()
+        mutation_guard.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_public_resource_inspect_reads_existing_store_without_mutation(self) -> None:
+        writer = resources._database()
+        writer.close()
+        before = self.database.read_bytes()
+        with (
+            patch.object(resources, "_database") as initializing_store,
+            patch.object(
+                resources.operator, "_require_operator_mutation",
+                side_effect=PermissionError("mutation denied"),
+            ) as mutation_guard,
+        ):
+            result = resources.grabowski_resource_inspect("port:9501")
+        self.assertEqual({"resource_key": "port:9501", "lease": None}, result)
+        self.assertEqual(before, self.database.read_bytes())
+        initializing_store.assert_not_called()
+        mutation_guard.assert_not_called()
+
     def test_unknown_resource_schema_still_fails_closed(self) -> None:
         # Store initialization is an explicitly mutating fixture step.
         initialized = resources._database()
         initialized.close()
-        with sqlite3.connect(self.database) as connection:
+        connection = sqlite3.connect(self.database)
+        try:
             connection.execute(
                 "UPDATE metadata SET value='4' WHERE key='schema_version'"
             )
             connection.commit()
+        finally:
+            connection.close()
         before = self.database.read_bytes()
         before_stat = self.database.stat()
         before_sidecars = {
             item.name for item in self.database.parent.glob(self.database.name + "-*")
         }
-        with self.assertRaisesRegex(RuntimeError, "requires an explicit schema migration"):
+        # Both observed future schemas and active WAL sidecars are explicit
+        # fail-closed read-only outcomes. Neither may initialize or migrate.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "requires an explicit schema migration|Strict read-only snapshot unavailable",
+        ):
             resources.count_resources(read_only=True)
-        with self.assertRaisesRegex(RuntimeError, "Unsupported resource database schema"):
-            resources._database()
+        # The READ_ONLY boundary must not touch the source or its sidecars.
+        # The subsequent explicitly mutating _database() preflight has a
+        # different contract and may create WAL/SHM on a quiescent WAL store.
         self.assertEqual(before, self.database.read_bytes())
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual(
             before_sidecars,
             {item.name for item in self.database.parent.glob(self.database.name + "-*")},
         )
+        with self.assertRaisesRegex(RuntimeError, "Unsupported resource database schema"):
+            resources._database()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual([], self._resource_migration_backups())
 
     def test_normalizes_typed_resource_keys(self) -> None:

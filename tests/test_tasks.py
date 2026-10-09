@@ -9066,6 +9066,47 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(before, self.database.read_bytes())
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
 
+    def test_root_broker_peek_is_persisted_only_without_privileged_probe(self) -> None:
+        created = self._start()["task"]
+        writer = tasks._database()
+        try:
+            writer.execute(
+                "UPDATE tasks SET execution_backend=?, systemd_scope=? WHERE task_id=?",
+                ("systemd-root-broker", "system", created["task_id"]),
+            )
+            writer.commit()
+        finally:
+            writer.close()
+        with (
+            patch.object(
+                tasks.privileged, "root_task_systemd_request",
+                side_effect=AssertionError("rootbroker effect forbidden for READ_ONLY"),
+            ) as broker,
+            patch.object(
+                tasks, "_observe",
+                side_effect=AssertionError("rootbroker probe forbidden for READ_ONLY"),
+            ) as probe,
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=PermissionError("mutation stopped"),
+            ) as gate,
+            patch.object(tasks, "_database") as database,
+        ):
+            result = tasks.grabowski_task_peek(created["task_id"])
+        broker.assert_not_called()
+        probe.assert_not_called()
+        gate.assert_not_called()
+        database.assert_not_called()
+        self.assertEqual("outcome_unknown", result["state"])
+        self.assertEqual("persisted_only_rootbroker_not_probed", result["observation_mode"])
+        self.assertEqual("unknown", result["systemd_unit_health"]["status"])
+        self.assertEqual(
+            "rootbroker_live_observation_requires_mutation_gate",
+            result["systemd_unit_health"]["reason"],
+        )
+        self.assertTrue(result["reconcile_required"])
+        self.assertIsNone(result["last_observation"])
+
     def test_task_list_denied_mutation_cannot_recover_or_open_store(self) -> None:
         with (
             patch.object(

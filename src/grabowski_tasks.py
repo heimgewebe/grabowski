@@ -1356,11 +1356,14 @@ class TaskSchemaInventoryChanged(RuntimeError):
 
 
 @contextmanager
-def _inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
+def _inventory_readonly_sqlite(
+    path: Path, *, allow_wal_copy: bool = True
+) -> Iterator[sqlite3.Connection]:
     with sqlite_store.inventory_readonly_sqlite(
         path,
         temporary_prefix="grabowski-task-schema-inventory-",
         error_type=TaskSchemaInventoryChanged,
+        allow_wal_copy=allow_wal_copy,
     ) as connection:
         yield connection
 
@@ -7365,10 +7368,10 @@ def _task_read_snapshot() -> Iterator[sqlite3.Connection]:
 
 @contextmanager
 def _task_readonly_snapshot() -> Iterator[sqlite3.Connection]:
-    """Read one verified WAL-consistent task-store snapshot, never opening for write."""
+    """Read without filesystem writes; refuse active WAL sidecars fail-closed."""
     if TASK_DB.is_symlink() or not TASK_DB.is_file() or TASK_DB.stat().st_size == 0:
         raise RuntimeError("Task store cannot be observed without explicit initialization")
-    with _inventory_readonly_sqlite(TASK_DB) as connection:
+    with _inventory_readonly_sqlite(TASK_DB, allow_wal_copy=False) as connection:
         if _task_schema_version(connection) != TASK_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Task store requires an explicit schema migration")
         _validate_task_schema_current(connection)
@@ -7392,9 +7395,24 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
     if row is None:
         raise ValueError(f"Unknown task: {identifier}")
     record = dict(row)
-    observation = _observe(record)
     result = _public(record)
     result["persisted_state"] = result["state"]
+    if _is_root_systemd_backend(record):
+        # The rootbroker's nominally observational show operation creates a
+        # reference file and invokes a privileged client.  READ_ONLY callers
+        # must not execute that effect or present persisted active as live truth.
+        terminal = _is_terminal_state(str(record["state"]))
+        result["state"] = record["state"] if terminal else "outcome_unknown"
+        result["last_observation"] = None
+        result["observation_mode"] = "persisted_only_rootbroker_not_probed"
+        result["observation_unavailable_reason"] = "privileged_broker_requires_mutation_gate"
+        result["systemd_unit_health"] = {
+            "status": "unknown",
+            "reason": "rootbroker_live_observation_requires_mutation_gate",
+        }
+        result["reconcile_required"] = not terminal
+        return result
+    observation = _observe(record)
     result["state"] = _effective_observed_state(record, observation["state"])
     result["last_observation"] = observation
     result["observation_mode"] = "unpersisted_readonly_probe"

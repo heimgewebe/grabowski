@@ -6496,7 +6496,12 @@ def _operator_system_overview(
     coding_agent_catalog_ready = coding_agent_catalog.get("ready") is True
     unknown_state_count = tasks.get("unknown_state_count")
     # Complete persisted state counts are not proof that live reconciliation ran.
-    truth_model_ready = tasks.get("available") is True and unknown_state_count == 0
+    truth_model_ready = (
+        tasks.get("available") is True
+        and tasks.get("snapshot_complete") is True
+        and tasks.get("reconciliation_performed") is True
+        and unknown_state_count == 0
+    )
     components_observable = (
         not errors
         and leases.get("available") is True
@@ -6543,6 +6548,10 @@ def _operator_system_overview(
         next_action = "narrow or extend bounded component projections before relying on the overview"
     elif unknown_state_count:
         next_action = "resolve unknown task states before relying on projections"
+    elif not tasks.get("snapshot_complete"):
+        next_action = "restore complete task state counts before relying on readiness"
+    elif tasks.get("reconciliation_performed") is not True:
+        next_action = "reconcile live task outcomes through an authorized mutation-capable path"
     elif obligations.get("integrity_error_count"):
         next_action = "inspect operator obligation integrity errors"
     elif obligations.get("attention_count"):

@@ -384,11 +384,14 @@ class ResourceLeaseExpired(RuntimeError):
 
 
 @contextmanager
-def _resource_inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
+def _resource_inventory_readonly_sqlite(
+    path: Path, *, allow_wal_copy: bool = True
+) -> Iterator[sqlite3.Connection]:
     with sqlite_store.inventory_readonly_sqlite(
         path,
         temporary_prefix="grabowski-resource-schema-inventory-",
         error_type=ResourceSchemaInventoryChanged,
+        allow_wal_copy=allow_wal_copy,
     ) as connection:
         yield connection
 
@@ -7996,10 +7999,15 @@ def release_resources(
     }
 
 
-def inspect_resource(resource_key: str) -> dict[str, Any] | None:
+def inspect_resource(
+    resource_key: str, *, read_only: bool = False
+) -> dict[str, Any] | None:
     key = normalize_resource_key(resource_key)
     now = _now()
-    with _database() as connection:
+    # The public READ_ONLY inspector may never initialize, migrate or copy
+    # a WAL store, including on a deny/kill-switch/audit failure.
+    source = _resource_readonly_snapshot() if read_only else _database()
+    with source as connection:
         row = connection.execute(
             "SELECT * FROM leases WHERE resource_key=?", (key,)
         ).fetchone()
@@ -8037,10 +8045,12 @@ def inspect_resources(resource_keys: Iterable[str]) -> dict[str, dict[str, Any]]
 
 @contextmanager
 def _resource_readonly_snapshot() -> Iterator[sqlite3.Connection]:
-    """Never initialize, migrate or mutate a resource store for an observer."""
+    """Observe a stable store without writes; active WAL sidecars fail closed."""
     if RESOURCE_DB.is_symlink() or not RESOURCE_DB.is_file() or RESOURCE_DB.stat().st_size == 0:
         raise RuntimeError("Resource store cannot be observed without explicit initialization")
-    with _resource_inventory_readonly_sqlite(RESOURCE_DB) as connection:
+    with _resource_inventory_readonly_sqlite(
+        RESOURCE_DB, allow_wal_copy=False
+    ) as connection:
         if _resource_schema_version(connection) != RESOURCE_CURRENT_SCHEMA_VERSION:
             raise RuntimeError("Resource store requires an explicit schema migration")
         _validate_resource_schema_current(connection)
@@ -8484,7 +8494,7 @@ def grabowski_resource_release(
 def grabowski_resource_inspect(resource_key: str) -> dict[str, Any]:
     """Inspect one typed resource lease without returning private metadata."""
     operator._require_operator_capability("resource_lease")
-    lease = inspect_resource(resource_key)
+    lease = inspect_resource(resource_key, read_only=True)
     return {"resource_key": normalize_resource_key(resource_key), "lease": lease}
 
 

@@ -137,9 +137,18 @@ def inventory_readonly_sqlite(
     temporary_prefix: str,
     error_type: type[ChangedError],
     message: str = INVENTORY_CHANGED_MESSAGE,
+    allow_wal_copy: bool = True,
 ) -> Iterator[sqlite3.Connection]:
     wal_path = Path(str(path) + "-wal")
     wal_present = wal_path.exists() or wal_path.is_symlink()
+    shm_path = Path(str(path) + "-shm")
+    if not allow_wal_copy and (
+        wal_present or shm_path.exists() or shm_path.is_symlink()
+    ):
+        raise _changed(
+            error_type,
+            "Strict read-only snapshot unavailable while SQLite WAL sidecars exist",
+        )
     if not wal_present:
         before_identity = file_identity(path)
         connection = sqlite3.connect(
@@ -160,6 +169,8 @@ def inventory_readonly_sqlite(
                 message=message,
             )
             if wal_path.exists() or wal_path.is_symlink():
+                raise _changed(error_type, message)
+            if not allow_wal_copy and (shm_path.exists() or shm_path.is_symlink()):
                 raise _changed(error_type, message)
         return
 
