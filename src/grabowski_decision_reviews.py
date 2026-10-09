@@ -572,62 +572,6 @@ def _validated_finalization(directory: Path, metadata: dict[str, Any]) -> dict[s
     return receipt
 
 
-def in_flight_review_units(
-    binding: dict[str, Any], *, jobs_root: Path | None = None
-) -> list[str]:
-    """Find unfinished jobs in one slot; call with decision_review_lock held.
-
-    The lock serializes the scan and each new job origin registration, not the
-    external reviewer runtime. A terminal review remains in the evidence chain
-    and never gets hidden or superseded by this admission-only check.
-    """
-    expected = normalize_binding(binding)
-    root = JOBS_ROOT if jobs_root is None else Path(jobs_root)
-    if root.is_symlink() or (root.exists() and not root.is_dir()):
-        raise ValueError("decision review jobs root is not a real directory")
-    if not root.exists():
-        return []
-    pending: list[str] = []
-    visited = 0
-    with os.scandir(root) as entries:
-        for entry in entries:
-            if _UNIT_RE.fullmatch(entry.name) is None:
-                continue
-            visited += 1
-            if visited > MAX_JOB_DIRECTORIES:
-                raise ValueError("decision review admission inventory exceeds bound")
-            if not entry.is_dir(follow_symlinks=False):
-                raise ValueError("decision review admission encountered an unsafe job directory")
-            directory = Path(entry.path)
-            try:
-                metadata = _read_private_json(directory / "metadata.json", MAX_METADATA_BYTES)
-            except FileNotFoundError:
-                # A directory with no persisted origin is not an admitted
-                # bound job. The start lock excludes an overlapping writer's
-                # metadata creation for this exact PR/head.
-                continue
-            scope = metadata.get("scope")
-            raw = scope.get("decision_bound_review") if isinstance(scope, dict) else None
-            if not _raw_binding_targets_pr_head(raw, expected):
-                continue
-            slot = raw.get("slot") if isinstance(raw, dict) else None
-            if not isinstance(slot, str) or slot.strip().lower() != expected["slot"]:
-                continue
-            if _proven_not_started(metadata):
-                continue
-            try:
-                finalization = _validated_finalization(directory, metadata)
-            except (OSError, ValueError) as exc:
-                # The job may have started; uncertainty must never authorize
-                # another concurrent attempt for the same PR/head/slot.
-                raise ValueError(
-                    f"decision review slot has unverified finalization: {directory.name}"
-                ) from exc
-            if finalization is None:
-                pending.append(directory.name)
-    return sorted(pending)
-
-
 def _parse_result_marker(stdout_text: str, binding: dict[str, Any]) -> dict[str, Any] | None:
     marker_lines = [
         line[len(RESULT_PREFIX) :]
