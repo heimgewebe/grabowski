@@ -573,6 +573,219 @@ class GrokReviewRoleTests(unittest.TestCase):
                             prepared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff"
                         )
 
+    def test_claude_review_sandbox_binds_frozen_diff_stdin_headlessly(self) -> None:
+        repo = Path("/tmp/claude-review-worktree")
+        declared = [
+            "claude", "--model", "claude-opus-5-5", "--effort", "high",
+            "--permission-mode", "plan", "Review exact committed change",
+        ]
+        prepared = PreparedSandboxCommand(
+            command=("/opt/grabowski-external/claude", *declared[1:]),
+        )
+        raw_diff = b"diff --git a/a.py b/a.py\n+interesting_but_untrusted\n"
+        with (
+            mock.patch.object(role, "prepare_external_agent_command",
+                              return_value=prepared) as prepare,
+            mock.patch.object(role, "sandbox_argv",
+                              return_value=["read-only-sandbox"]) as sandbox,
+        ):
+            argv, contract, stdin = role._review_sandbox_argv(
+                repo, declared, expected_head="a" * 40,
+                expected_base_head="b" * 40, review_diff=raw_diff,
+            )
+        self.assertEqual(["read-only-sandbox"], argv)
+        self.assertEqual(role.CLAUDE_REVIEW_JSON_CONTRACT, contract)
+        self.assertIsInstance(stdin, bytes)
+        self.assertIn(b"interesting_but_untrusted", stdin)
+        self.assertIn(b"a" * 40, stdin)
+        self.assertIn(b"b" * 40, stdin)
+        self.assertIn(hashlib.sha256(raw_diff).hexdigest().encode(), stdin)
+        self.assertIn(b"do not use any tool", stdin.lower())
+        prepare.assert_called_once_with(declared)
+        self.assertEqual(declared, sandbox.call_args.kwargs["declared_command"])
+        actual = sandbox.call_args.args[1]
+        self.assertEqual("/opt/grabowski-external/claude", actual[0])
+        self.assertIn("-p", actual)
+        self.assertEqual("json", actual[actual.index("--output-format") + 1])
+        self.assertEqual("plan", actual[actual.index("--permission-mode") + 1])
+        schema = json.loads(actual[actual.index("--json-schema") + 1])
+        self.assertEqual(["PASS", "NEEDS_CHANGE", "BLOCK"],
+                         schema["properties"]["verdict"]["enum"])
+        self.assertEqual(["verdict", "findings"], schema["required"])
+        for flag in ("--tools=", "--no-session-persistence", "--safe-mode"):
+            self.assertIn(flag, actual)
+        self.assertEqual("*", actual[actual.index("--disallowedTools") + 1])
+        self.assertNotIn("Review exact committed change", actual)
+        self.assertNotIn("interesting_but_untrusted", " ".join(actual))
+
+    def test_claude_review_bound_input_rejects_unsafe_or_oversized_diff(self) -> None:
+        command = (
+            "/opt/grabowski-external/claude", "--model", "claude-opus-5-5",
+            "--effort", "high", "--permission-mode", "plan",
+            "Review only the exact diff",
+        )
+        for content, reason in (
+            (b"\xff", "UTF-8"),
+            (b"x" * (role.MAX_CLAUDE_REVIEW_INPUT_BYTES + 1), "exceeds"),
+        ):
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    role._claude_json_review_command(
+                        command, expected_head="a" * 40,
+                        expected_base_head="b" * 40, review_diff=content,
+                    )
+
+    def test_claude_result_requires_successful_typed_envelope(self) -> None:
+        clean = {
+            "type": "result", "subtype": "success", "is_error": False,
+            "structured_output": {"verdict": "PASS", "findings": []},
+        }
+        review, error, metadata = role._extract_claude_review_document(
+            json.dumps(clean).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual({"verdict": "PASS", "findings": []}, json.loads(review))
+        self.assertEqual(role.CLAUDE_REVIEW_JSON_CONTRACT,
+                         metadata["review_provider_contract"])
+        for malformed in (
+            b"not-json",
+            b'{"verdict":"PASS","findings":[]}',
+            json.dumps({**clean, "is_error": True}).encode(),
+            json.dumps({**clean, "subtype": "error"}).encode(),
+            json.dumps({**clean, "structured_output": []}).encode(),
+            json.dumps({**clean, "structured_output": {
+                "verdict": "PASS", "findings": [], "extra": "forged",
+            }}).encode(),
+        ):
+            with self.subTest(malformed=malformed[:45]):
+                document, rejected, _meta = role._extract_claude_review_document(
+                    malformed
+                )
+                self.assertIsNone(document)
+                self.assertIsNotNone(rejected)
+
+    def test_claude_review_does_not_reuse_unbound_candidate_diff(self) -> None:
+        # Caller-provided review text must not substitute an exact Git three-dot
+        # diff; a dirty Claude candidate has no safely frozen input artifact.
+        source = [
+            "claude", "--model", "claude-opus-5-5", "--effort", "high",
+            "--permission-mode", "plan", "Please review the current draft",
+        ]
+        self.assertTrue(role._claude_review_requires_clean_source(source))
+        self.assertFalse(role._claude_review_requires_clean_source(["grok"]))
+
+    def test_claude_main_emits_job_bound_receipt_from_success_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            unit = "grabowski-job-a11111111111"
+            directory = Path(temporary) / unit
+            directory.mkdir(mode=0o700)
+            output = directory / role.REVIEW_ATTEMPT_RECEIPT_NAME
+            head, base, workspace = "a" * 40, "b" * 40, "c" * 64
+            frozen_diff = b"diff --git a/source b/source\\n+only reviewed bytes\\n"
+            prompt = b"exact immutable review input"
+            envelope = json.dumps({
+                "type": "result", "subtype": "success", "is_error": False,
+                "structured_output": {"verdict": "PASS", "findings": []},
+            }).encode()
+            completed = SimpleNamespace(
+                returncode=0,
+                stdout_sha256=hashlib.sha256(envelope).hexdigest(),
+                stderr_sha256=hashlib.sha256(b"").hexdigest(),
+                stdout_bytes=len(envelope), stderr_bytes=0,
+                stdout_tail="", stderr_tail="",
+                output_limit_exceeded=False, stdout_content_exceeded=False,
+                stdout_content=envelope,
+            )
+            environment = {
+                "GRABOWSKI_REVIEW_ATTEMPT_UNIT": unit,
+                "GRABOWSKI_JOB_UNIT": unit,
+                "GRABOWSKI_JOB_ID": "a11111111111",
+                "GRABOWSKI_JOB_ORIGIN_SHA256": "d" * 64,
+                "GRABOWSKI_JOB_DIRECTORY": str(directory),
+            }
+            with (
+                mock.patch.dict(os.environ, environment),
+                mock.patch.object(
+                    role, "current_binding",
+                    side_effect=[(head, workspace, False)] * 2,
+                ),
+                mock.patch.object(
+                    role, "committed_diff", return_value=frozen_diff
+                ) as committed,
+                mock.patch.object(
+                    role, "_review_sandbox_argv",
+                    return_value=(["sandbox"], role.CLAUDE_REVIEW_JSON_CONTRACT, prompt),
+                ),
+                mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                mock.patch.object(
+                    role, "run_bounded_capture", return_value=completed
+                ) as execute,
+            ):
+                self.assertEqual(role.main([
+                    "--role", "review", "--repository", str(ROOT),
+                    "--expected-head", head,
+                    "--expected-base-head", base,
+                    "--expected-diff-sha256", workspace,
+                    "--expected-dirty", "false",
+                    "--output", str(output), "--",
+                    "claude", "--model", "claude-opus-5-5",
+                    "--effort", "high", "--permission-mode", "plan",
+                    "Review only the exact frozen Git diff",
+                ]), 0)
+            committed.assert_called_once_with(ROOT, base, head)
+            self.assertEqual(prompt, execute.call_args.kwargs["stdin_content"])
+            receipt = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual("PASS", receipt["verdict"])
+            self.assertEqual([], receipt["findings"])
+            self.assertEqual("passed", receipt["failure_classification"])
+            self.assertEqual(unit, receipt["review_attempt_unit"])
+            self.assertEqual("d" * 64, receipt["review_attempt_origin_sha256"])
+            self.assertEqual("committed_diff", receipt["review_input_source"])
+            self.assertEqual(
+                hashlib.sha256(frozen_diff).hexdigest(),
+                receipt["review_input_sha256"],
+            )
+            self.assertEqual(
+                hashlib.sha256(prompt).hexdigest(),
+                receipt["review_prompt_sha256"],
+            )
+            self.assertEqual(role.CLAUDE_REVIEW_JSON_CONTRACT,
+                             receipt["review_provider_contract"])
+            self.assertEqual(receipt["receipt_sha256"], role.digest({
+                k: v for k, v in receipt.items() if k != "receipt_sha256"
+            }))
+
+    def test_claude_main_refuses_dirty_source_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "denied.json"
+            head, base, workspace = "a" * 40, "b" * 40, "c" * 64
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(
+                    role, "current_binding",
+                    return_value=(head, workspace, True),
+                ),
+                mock.patch.object(role, "committed_diff") as frozen,
+                mock.patch.object(role, "_review_sandbox_argv") as sandbox,
+                mock.patch.object(role, "run_bounded_capture") as execute,
+                self.assertRaisesRegex(RuntimeError, "clean committed diff"),
+            ):
+                role.main([
+                    "--role", "review", "--repository", str(ROOT),
+                    "--expected-head", head,
+                    "--expected-base-head", base,
+                    "--expected-diff-sha256", workspace,
+                    "--expected-dirty", "true",
+                    "--output", str(output), "--",
+                    "claude", "--model", "claude-opus-5-5",
+                    "--effort", "high", "--permission-mode", "plan",
+                    "Review only the exact frozen Git diff",
+                ])
+            frozen.assert_not_called()
+            sandbox.assert_not_called()
+            execute.assert_not_called()
+            self.assertFalse(output.exists())
+
     def test_codex_review_sandbox_inserts_exec_without_changing_declared_command(self) -> None:
         repo = Path("/tmp/repo")
         declared = [
