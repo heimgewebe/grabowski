@@ -1375,15 +1375,42 @@ def _bound_repoground_manifest(
     ):
         raise RunnerError("RepoGround manifest provenance is invalid")
 
+    repository = _mapping(request.get("repository"))
+    requested_names = {
+        value
+        for value in (repository.get("id"), repository.get("repository"))
+        if isinstance(value, str)
+    }
     if len(repositories) == 1:
         selected = repositories[0]
+        identities = [
+            value.strip().removesuffix(".git")
+            for value in (
+                selected.get("repo"),
+                selected.get("repository"),
+                selected.get("repo_id"),
+                selected.get("name"),
+            )
+            if isinstance(value, str) and value.strip()
+        ]
+        # A singleton without any identity field stays an anonymous legacy
+        # fallback; an explicit identity must match the requested repository
+        # (same rule as grabowski_repobrief._snapshot_repository_matches).
+        if identities:
+            segments = {
+                name.strip().removesuffix(".git").rsplit("/", 1)[-1]
+                for name in requested_names
+                if name.strip().removesuffix(".git")
+            }
+            if not any(
+                identity == segment or identity.endswith(f"/{segment}")
+                for identity in identities
+                for segment in segments
+            ):
+                raise RunnerError(
+                    "RepoGround manifest repository binding does not match request"
+                )
     else:
-        repository = _mapping(request.get("repository"))
-        requested_names = {
-            value
-            for value in (repository.get("id"), repository.get("repository"))
-            if isinstance(value, str)
-        }
         matches = []
         for item in repositories:
             names = {

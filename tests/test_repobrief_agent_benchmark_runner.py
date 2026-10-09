@@ -1315,6 +1315,95 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             with self.assertRaises(runner.RunnerError):
                 runner._bound_repoground_manifest(value)
 
+    def test_bound_manifest_singleton_identity_semantics(self) -> None:
+        foreign = "b" * 40
+        for field in ("repo", "repository", "repo_id", "name"):
+            for wrong in ("other", "other/repo-x", "heimgewebe/other.git"):
+                with self.subTest(field=field, wrong=wrong), tempfile.TemporaryDirectory() as directory:
+                    value = request(condition="treatment")
+                    bind_manifest(
+                        value,
+                        Path(directory),
+                        repositories=[{field: wrong, "git_commit": foreign}],
+                    )
+                    with self.assertRaises(runner.RunnerError):
+                        runner._bound_repoground_manifest(value)
+                    self.assertIsNone(
+                        runner._optional_repoground_manifest_binding(value)
+                    )
+        for field, good in (
+            ("repo", "repo"),
+            ("repository", "heimgewebe/repo"),
+            ("repo_id", "repo"),
+            ("name", "heimgewebe/repo.git"),
+            ("repository", "other-owner/repo"),
+        ):
+            with self.subTest(field=field, good=good), tempfile.TemporaryDirectory() as directory:
+                value = request(condition="treatment")
+                bind_manifest(
+                    value,
+                    Path(directory),
+                    repositories=[{field: good, "git_commit": COMMIT}],
+                )
+                _, _, commit, _ = runner._bound_repoground_manifest(value)
+                self.assertEqual(commit, COMMIT)
+        # Anonymous legacy singleton (no identity fields, blank ignored).
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            bind_manifest(
+                value,
+                Path(directory),
+                repositories=[{"name": "  ", "git_commit": COMMIT}],
+            )
+            _, _, commit, _ = runner._bound_repoground_manifest(value)
+            self.assertEqual(commit, COMMIT)
+
+    def test_mismatched_singleton_provenance_yields_no_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(
+                value,
+                Path(directory),
+                repositories=[{"repo": "other", "git_commit": "b" * 40}],
+            )
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="mcp__repobrief__ask_context")
+            )
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            payload = {
+                "kind": "repobrief.mcp.read_only_frontdoor",
+                "version": "v1",
+                "tool": "ask_context",
+                "status": "ok",
+                "context_pack": {
+                    "kind": "repobrief.ask_context_pack",
+                    "version": "1.0",
+                    "snapshot_ref": {
+                        "manifest_path": str(manifest),
+                        "manifest_sha256": value["repobrief"]["manifest_sha256"],
+                        "git_commit": None,
+                        "freshness_status": "not_comparable",
+                    },
+                    "freshness": {"status": "not_comparable"},
+                    "resolved_ranges": [],
+                    "budget": {"context_bytes_used": 1},
+                },
+            }
+            tool_result["content"] = json.dumps(
+                {"structuredContent": complete(payload)}, sort_keys=True
+            )
+            calls = runner.normalize_tool_calls(value, messages)
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(value, messages, calls)
+            )
+
     def test_treatment_projects_grounding_from_verdict_snapshot_ref(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
