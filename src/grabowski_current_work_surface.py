@@ -96,7 +96,7 @@ def _task_payload(
     tasks = _module("grabowski_tasks")
     projection = tasks._task_current_projection()
     required_task_ids = list(required_task_ids or [])
-    with tasks._task_read_snapshot() as connection:
+    with tasks._task_readonly_snapshot() as connection:
         if view == "current":
             placeholders = ",".join("?" for _ in CURRENT_TASK_STATES)
             current_rows = tasks._task_list_current_rows(
@@ -174,8 +174,9 @@ def _resources_payload() -> dict[str, Any]:
     leases = resources.list_resources(
         include_expired=False,
         limit=MAX_SOURCE_LEASES,
+        read_only=True,
     )
-    total = resources.count_resources(include_expired=False)
+    total = resources.count_resources(include_expired=False, read_only=True)
     return {
         "leases": leases,
         "count": total,

@@ -3306,7 +3306,8 @@ class AgentWorkspaceTests(unittest.TestCase):
             "review": {"status": "passed", "verdict": "PASS", "findings": []},
         })
 
-        def task_state(task_id):
+        def task_state(task_id, *, read_only=False):
+            self.assertTrue(read_only)
             state = "failed" if task_id == "writer-task" else "completed"
             return {"task_id": task_id, "state": state, "terminal": True}
 
@@ -5985,7 +5986,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 workspace._role_receipt_path(manifest, role_name),
                 signed_role_receipt(role_name, manifest, snapshot),
             )
-        def completed(task_id):
+        def completed(task_id, *, read_only=False):
             return {"task_id": task_id, "state": "completed", "terminal": True}
         with (
             mock.patch.object(workspace, "_task_public", side_effect=completed),
@@ -11415,7 +11416,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         with (
             mock.patch.object(workspace.operator, "_require_operator_capability"),
             mock.patch.object(
-                workspace.tasks, "grabowski_task_status", side_effect=task_status
+                workspace.tasks, "grabowski_task_peek", side_effect=task_status
             ),
             mock.patch.object(workspace, "_tmux_has_session", return_value=False),
             mock.patch.object(
@@ -12378,7 +12379,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         with (
             mock.patch.object(
                 workspace.tasks,
-                "grabowski_task_status",
+                "grabowski_task_peek",
                 return_value=self._handoff_writer_task(manifest),
             ),
             mock.patch.object(workspace.resources, "list_resources", return_value=leases),

@@ -714,7 +714,9 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual([], self._resource_migration_backups())
 
     def test_unknown_resource_schema_still_fails_closed(self) -> None:
-        resources.count_resources()
+        # Store initialization is an explicitly mutating fixture step.
+        initialized = resources._database()
+        initialized.close()
         with sqlite3.connect(self.database) as connection:
             connection.execute(
                 "UPDATE metadata SET value='4' WHERE key='schema_version'"
@@ -725,8 +727,10 @@ class ResourceTests(unittest.TestCase):
         before_sidecars = {
             item.name for item in self.database.parent.glob(self.database.name + "-*")
         }
+        with self.assertRaisesRegex(RuntimeError, "requires an explicit schema migration"):
+            resources.count_resources(read_only=True)
         with self.assertRaisesRegex(RuntimeError, "Unsupported resource database schema"):
-            resources.count_resources()
+            resources._database()
         self.assertEqual(before, self.database.read_bytes())
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual(
@@ -3727,6 +3731,37 @@ class ResourceTests(unittest.TestCase):
             sorted(item.name for item in self.database.parent.iterdir()),
         )
         self.assertEqual([], self._resource_migration_backups())
+
+    def test_shared_resource_readers_do_not_initialize_missing_store(self) -> None:
+        with patch.object(
+            resources.operator, "_require_operator_mutation",
+            side_effect=AssertionError("unexpected mutation gate"),
+        ) as gate:
+            with self.assertRaisesRegex(RuntimeError, "explicit initialization"):
+                resources.count_resources(read_only=True)
+            with self.assertRaisesRegex(RuntimeError, "explicit initialization"):
+                resources.list_resources(read_only=True)
+        gate.assert_not_called()
+        self.assertFalse(self.database.exists())
+        self.assertFalse(self.database.parent.exists())
+
+    def test_shared_resource_readers_preserve_legacy_store_bytes(self) -> None:
+        self._create_resource_schema_v1()
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        before_files = sorted(p.name for p in self.database.parent.iterdir())
+        with patch.object(
+            resources.operator, "_require_operator_mutation",
+            side_effect=AssertionError("unexpected mutation gate"),
+        ) as gate:
+            with self.assertRaisesRegex(RuntimeError, "explicit schema migration"):
+                resources.count_resources(read_only=True)
+            with self.assertRaisesRegex(RuntimeError, "explicit schema migration"):
+                resources.list_resources(read_only=True)
+        gate.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(before_files, sorted(p.name for p in self.database.parent.iterdir()))
 
     def test_resource_list_denied_mutation_cannot_open_or_migrate_store(self) -> None:
         with (

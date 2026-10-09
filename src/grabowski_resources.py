@@ -8035,10 +8035,24 @@ def inspect_resources(resource_keys: Iterable[str]) -> dict[str, dict[str, Any]]
     }
 
 
+@contextmanager
+def _resource_readonly_snapshot() -> Iterator[sqlite3.Connection]:
+    """Never initialize, migrate or mutate a resource store for an observer."""
+    if RESOURCE_DB.is_symlink() or not RESOURCE_DB.is_file() or RESOURCE_DB.stat().st_size == 0:
+        raise RuntimeError("Resource store cannot be observed without explicit initialization")
+    with _resource_inventory_readonly_sqlite(RESOURCE_DB) as connection:
+        if _resource_schema_version(connection) != RESOURCE_CURRENT_SCHEMA_VERSION:
+            raise RuntimeError("Resource store requires an explicit schema migration")
+        _validate_resource_schema_current(connection)
+        _resource_reconcile_revision_contract(connection)
+        yield connection
+
+
 def count_resources(
     *,
     owner_id: str | None = None,
     include_expired: bool = False,
+    read_only: bool = False,
 ) -> int:
     parameters: list[Any] = []
     clauses: list[str] = []
@@ -8050,7 +8064,12 @@ def count_resources(
         clauses.append("typeof(expires_at_unix)='integer' AND expires_at_unix>?")
         parameters.append(now)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    with _database() as connection:
+    if not isinstance(read_only, bool):
+        raise ValueError("read_only must be boolean")
+    if not read_only:
+        operator._require_operator_mutation("resource_lease")
+    source = _resource_readonly_snapshot() if read_only else _database()
+    with source as connection:
         row = connection.execute(
             f"SELECT COUNT(*) AS count FROM leases{where}",
             parameters,
@@ -8063,6 +8082,7 @@ def list_resources(
     owner_id: str | None = None,
     include_expired: bool = False,
     limit: int = 200,
+    read_only: bool = False,
 ) -> list[dict[str, Any]]:
     if not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError("limit must be between 1 and 1000")
@@ -8077,7 +8097,12 @@ def list_resources(
         parameters.append(now)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     parameters.append(limit)
-    with _database() as connection:
+    if not isinstance(read_only, bool):
+        raise ValueError("read_only must be boolean")
+    if not read_only:
+        operator._require_operator_mutation("resource_lease")
+    source = _resource_readonly_snapshot() if read_only else _database()
+    with source as connection:
         rows = connection.execute(
             f"SELECT * FROM leases{where} ORDER BY resource_key LIMIT ?",
             parameters,
@@ -8490,5 +8515,6 @@ def grabowski_resource_list(
         owner_id=owner_id,
         include_expired=include_expired,
         limit=limit,
+        read_only=False,
     )
     return {"database": str(RESOURCE_DB), "count": len(leases), "leases": leases}

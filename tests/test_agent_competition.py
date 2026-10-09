@@ -1222,7 +1222,7 @@ class AgentCompetitionTests(unittest.TestCase):
         cancel.assert_called_once_with("task-manifest")
         with mock.patch.object(
             competition.tasks,
-            "grabowski_task_status",
+            "grabowski_task_peek",
             return_value={"task_id": "task-manifest", "unit": "u", "state": "cancelled"},
         ):
             status = competition.grabowski_agent_competition_status(identifier)
@@ -1299,7 +1299,7 @@ class AgentCompetitionTests(unittest.TestCase):
         self._write_receipt(started["competition_id"], changed_paths=["src/sample.py"], risks=["race"], tests=["unit test"])
         with mock.patch.object(
             competition.tasks,
-            "grabowski_task_status",
+            "grabowski_task_peek",
             return_value={"task_id": started["task_id"], "unit": "u", "attempt": 1, "state": "completed", "updated_at_unix": 1},
         ):
             status = competition.grabowski_agent_competition_status(started["competition_id"])
@@ -2159,7 +2159,7 @@ class AgentCompetitionTests(unittest.TestCase):
         started = self._start()
         with mock.patch.object(
             competition.tasks,
-            "grabowski_task_status",
+            "grabowski_task_peek",
             return_value={"task_id": started["task_id"], "state": "running", "unit": "u"},
         ):
             status = competition.grabowski_agent_competition_status(started["competition_id"])
@@ -2349,7 +2349,7 @@ class AgentCompetitionTests(unittest.TestCase):
         os.utime(stale, (0, 0))
         with mock.patch.object(
             competition.tasks,
-            "grabowski_task_status",
+            "grabowski_task_peek",
             return_value={"task_id": started["task_id"], "state": "running", "unit": "u"},
         ):
             status = competition.grabowski_agent_competition_status(started["competition_id"])

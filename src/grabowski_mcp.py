@@ -6382,6 +6382,7 @@ def _operator_system_overview(
         task_payload = grabowski_tasks.grabowski_task_list(
             limit=1,
             view="minimal",
+            read_only=True,
         )
         tasks = {
             "available": True,
@@ -6390,6 +6391,7 @@ def _operator_system_overview(
             "projection_counts_overlap": task_payload.get("projection_counts_overlap"),
             "unknown_state_count": task_payload.get("unknown_state_count"),
             "snapshot_complete": task_payload.get("state_counts_complete"),
+            "reconciliation_performed": task_payload.get("reconciliation_performed"),
         }
     except Exception as exc:  # pragma: no cover - defensive status boundary
         errors.append({"component": "tasks", "error": type(exc).__name__})
@@ -6398,6 +6400,7 @@ def _operator_system_overview(
 
         active_count = grabowski_resources.count_resources(
             include_expired=False,
+            read_only=True,
         )
         leases = {
             "available": True,
@@ -6492,6 +6495,7 @@ def _operator_system_overview(
     )
     coding_agent_catalog_ready = coding_agent_catalog.get("ready") is True
     unknown_state_count = tasks.get("unknown_state_count")
+    # Complete persisted state counts are not proof that live reconciliation ran.
     truth_model_ready = tasks.get("available") is True and unknown_state_count == 0
     components_observable = (
         not errors
@@ -6565,7 +6569,7 @@ def _operator_system_overview(
             "observation_state": (
                 "observed" if tasks.get("available") else "unavailable"
             ),
-            "freshness": "single bounded read snapshot",
+            "freshness": "read-only persistent snapshot without terminalization recovery",
         },
         "resource_leases": {
             "authority": "Grabowski resource lease database",

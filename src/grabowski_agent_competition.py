@@ -2665,7 +2665,7 @@ def grabowski_agent_competition_status(competition_id: str) -> dict[str, Any]:
         if task_id is None and isinstance(reconciliation.get("task"), dict):
             task_id = reconciliation["task"].get("task_id")
         if isinstance(task_id, str):
-            task_status = tasks.grabowski_task_status(task_id)
+            task_status = tasks.grabowski_task_peek(task_id)
             bounded_task = {
                 key: task_status.get(key)
                 for key in ("task_id", "unit", "attempt", "state", "updated_at_unix", "resume_policy")
@@ -2708,7 +2708,7 @@ def grabowski_agent_competition_status(competition_id: str) -> dict[str, Any]:
             ],
         }
     manifest = _validated_manifest(competition_id)
-    task_status = tasks.grabowski_task_status(manifest["task_id"])
+    task_status = tasks.grabowski_task_peek(manifest["task_id"])
     receipt = _receipt(competition_id, manifest)
     task_state = task_status.get("state")
     if receipt is not None:

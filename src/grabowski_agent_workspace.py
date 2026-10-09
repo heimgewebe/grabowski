@@ -2205,11 +2205,17 @@ def _tmux_pane_ids(session: str) -> set[str]:
     return pane_ids
 
 
-def _task_public(task_id: str | None) -> dict[str, Any]:
+def _task_public(task_id: str | None, *, read_only: bool = False) -> dict[str, Any]:
     if task_id is None:
         return {"task_id": None, "state": "not_started", "terminal": False}
     try:
-        value = tasks.grabowski_task_status(task_id)
+        # Read-only workspace views never refresh persisted task or lease state;
+        # authorized writer/reconcile workflows retain their original semantics.
+        value = (
+            tasks.grabowski_task_peek(task_id)
+            if read_only
+            else tasks.grabowski_task_status(task_id)
+        )
     except Exception as exc:
         return {
             "task_id": task_id,
@@ -3172,7 +3178,7 @@ def _writer_handoff_eligibility(
         reasons.append("workspace_resources_invalid")
     else:
         try:
-            live = resources.list_resources(owner_id=owner, include_expired=False, limit=MAX_PATHS + 8)
+            live = resources.list_resources(owner_id=owner, include_expired=False, limit=MAX_PATHS + 8, read_only=True)
             observed = {str(item.get("resource_key")) for item in live}
             if not set(str(key) for key in keys).issubset(observed):
                 reasons.append("workspace_lease_missing")
@@ -4320,7 +4326,7 @@ def _persist_collection_round_archive(
 
 
 def _revision_collection_evidence(
-    manifest: dict[str, Any],
+    manifest: dict[str, Any], *, read_only: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     if not _lane_backed(manifest):
         raise AgentWorkspaceError("candidate revision requires a lane-backed workspace")
@@ -4432,7 +4438,7 @@ def _revision_collection_evidence(
     ):
         raise AgentWorkspaceError("live workspace no longer matches round-one Candidate")
     effective = _effective_writer_attempt(manifest)
-    writer = _task_public(str(effective["task_id"]))
+    writer = _task_public(str(effective["task_id"]), read_only=read_only)
     if (
         _writer_final_attempt(manifest) != 1
         or effective.get("actor") != "initial_writer"
@@ -4443,7 +4449,7 @@ def _revision_collection_evidence(
         raise AgentWorkspaceError("round-one writer is not a completed exact attempt")
     for role in READ_ONLY_ROLES:
         task_id = manifest.get("tasks", {}).get(role)
-        role_task = _task_public(task_id)
+        role_task = _task_public(task_id, read_only=read_only)
         if not role_task.get("terminal"):
             raise AgentWorkspaceError("candidate revision verifier task is not terminal")
     _require_live_lane_binding(manifest, _run)
@@ -5328,7 +5334,8 @@ def _cached_role_preflight_block(
 
 
 def _role_retry_classification(
-    manifest: dict[str, Any], role: str, frozen: dict[str, Any]
+    manifest: dict[str, Any], role: str, frozen: dict[str, Any],
+    *, read_only: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Classify whether one read-only role may be retried, and why."""
     start_intent = _role_start_intent_classification(manifest, role)
@@ -5348,7 +5355,7 @@ def _role_retry_classification(
                 }
             return "preflight_probe_error", {"prior_preflight": latest}
         return "not_attempted", {}
-    task_public = _task_public(task_id)
+    task_public = _task_public(task_id, read_only=read_only)
     if not task_public["terminal"]:
         return "role_running", {"task": task_public}
     if task_public["state"] in {"observation_error", "outcome_unknown", "interrupted"}:
@@ -5484,14 +5491,16 @@ def _role_retry_state(
     return {**raw, "count": count, "attempts": list(attempts)}, None
 
 
-def _status_role_retry(manifest: dict[str, Any]) -> dict[str, Any]:
+def _status_role_retry(manifest: dict[str, Any], *, read_only: bool = False) -> dict[str, Any]:
     frozen = manifest.get("frozen_writer")
     result: dict[str, Any] = {}
     for role_name in READ_ONLY_ROLES:
         if not isinstance(frozen, dict):
             result[role_name] = {"classification": "not_collected", "eligible": False}
             continue
-        classification, detail = _role_retry_classification(manifest, role_name, frozen)
+        classification, detail = _role_retry_classification(
+            manifest, role_name, frozen, read_only=read_only
+        )
         role_retry_state, retry_state_error = _role_retry_state(manifest, role_name)
         if retry_state_error is not None or role_retry_state is None:
             result[role_name] = {
@@ -5532,7 +5541,7 @@ def _prospective_closure_outcome(manifest: dict[str, Any], collection: Any) -> s
     return "would_abandon_failed_roles" if _collection_failed_roles(collection) else "would_be_successful"
 
 
-def _candidate_revision_status(manifest: dict[str, Any]) -> dict[str, Any]:
+def _candidate_revision_status(manifest: dict[str, Any], *, read_only: bool = False) -> dict[str, Any]:
     collection = manifest.get("collection")
     if not isinstance(collection, dict) or collection.get("state") != "complete":
         return {
@@ -5543,7 +5552,7 @@ def _candidate_revision_status(manifest: dict[str, Any]) -> dict[str, Any]:
         }
     try:
         observed, candidate, _receipts, summary, snapshot = (
-            _revision_collection_evidence(manifest)
+            _revision_collection_evidence(manifest, read_only=read_only)
         )
     except Exception as exc:
         return {
@@ -6464,9 +6473,9 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         writer_attempt_error = _error_summary(exc)
         writer_task_id = manifest.get("tasks", {}).get("writer")
     task_state = {
-        "writer": _task_public(writer_task_id),
-        "tests": _task_public(manifest.get("tasks", {}).get("tests")),
-        "review": _task_public(manifest.get("tasks", {}).get("review")),
+        "writer": _task_public(writer_task_id, read_only=True),
+        "tests": _task_public(manifest.get("tasks", {}).get("tests"), read_only=True),
+        "review": _task_public(manifest.get("tasks", {}).get("review"), read_only=True),
     }
     try:
         tmux_live = _tmux_has_session(str(manifest["session_name"]))
@@ -6547,10 +6556,10 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         writer_handoff = _writer_handoff_eligibility(manifest, task_state["writer"], snapshot)
     except Exception as exc:
         writer_handoff = {"eligible": False, "reasons": ["writer_attempt_history_invalid"], "error": _error_summary(exc), "max": MAX_WRITER_HANDOFFS, "used": None}
-    candidate_revision = _candidate_revision_status(manifest)
+    candidate_revision = _candidate_revision_status(manifest, read_only=True)
     if writer_terminal_failure and "writer" not in failed_roles:
         failed_roles = ["writer", *failed_roles]
-    role_retry = _status_role_retry(manifest)
+    role_retry = _status_role_retry(manifest, read_only=True)
     closure_outcome = _prospective_closure_outcome(manifest, collection)
     recommended_next_action = _recommended_next_action(
         creation_ready=creation_ready,
@@ -6586,7 +6595,7 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         "writer": snapshot,
         "roles": manifest["roles"],
         "tasks": task_state,
-        "original_writer_task": _task_public(manifest.get("tasks", {}).get("writer")),
+        "original_writer_task": _task_public(manifest.get("tasks", {}).get("writer"), read_only=True),
         "writer_attempts": _writer_attempt_refs(manifest) if writer_attempt_error is None else [],
         "writer_final_attempt": writer_final_attempt,
         "writer_attempt_error": writer_attempt_error,
@@ -7218,7 +7227,7 @@ def _existing_workspace_response(
     expected_writer_task_id = str(manifest["tasks"]["writer"])
     try:
         lane_status = _lane_binding_status(manifest, _run)
-        live_leases = resources.list_resources(owner_id=owner_id, include_expired=False, limit=MAX_PATHS + 8)
+        live_leases = resources.list_resources(owner_id=owner_id, include_expired=False, limit=MAX_PATHS + 8, read_only=True)
         observed_lease_keys = {str(item.get("resource_key")) for item in live_leases}
         tmux_live = _tmux_has_session(str(plan["session_name"]))
         observed_pane_ids = _tmux_pane_ids(str(plan["session_name"])) if tmux_live else set()

@@ -654,6 +654,45 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertEqual("bind snapshot", result["recommended_next_action"])
         self.assertNotIn("system_overview", result)
 
+    def test_overview_uses_only_readonly_task_and_resource_sources(self) -> None:
+        def tasks_snapshot(**kwargs):
+            self.assertIs(kwargs.get("read_only"), True)
+            raise RuntimeError("Task store requires an explicit schema migration")
+
+        def resource_snapshot(**kwargs):
+            self.assertIs(kwargs.get("read_only"), True)
+            raise RuntimeError("Resource store requires an explicit schema migration")
+
+        fake_tasks = SimpleNamespace(grabowski_task_list=tasks_snapshot)
+        fake_resources = SimpleNamespace(count_resources=resource_snapshot)
+        fake_obligations = SimpleNamespace(
+            list_obligations=lambda _params: {
+                "record_count": 0, "integrity_errors": [], "scan_truncated": False,
+            }
+        )
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "grabowski_tasks": fake_tasks,
+                "grabowski_resources": fake_resources,
+                "grabowski_operator_obligation": fake_obligations,
+            },
+        ):
+            overview = grabowski_mcp._operator_system_overview(
+                runtime_healthy=True,
+                normal_mutation_path_ready=True,
+                coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                client_snapshot={
+                    "observable": True, "fresh": True, "matched": True,
+                    "server_loopback_schema_contract_matches": True,
+                    "platform_publication_state": "platform_converged",
+                    "platform_publication_pending": False,
+                },
+            )
+        self.assertFalse(overview["tasks"]["available"])
+        self.assertFalse(overview["leases"]["available"])
+        self.assertFalse(overview["operator_ready"])
+
     def test_operator_system_overview_prioritizes_connector_and_compacts_components(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {

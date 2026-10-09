@@ -7363,6 +7363,45 @@ def _task_read_snapshot() -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+@contextmanager
+def _task_readonly_snapshot() -> Iterator[sqlite3.Connection]:
+    """Read one verified WAL-consistent task-store snapshot, never opening for write."""
+    if TASK_DB.is_symlink() or not TASK_DB.is_file() or TASK_DB.stat().st_size == 0:
+        raise RuntimeError("Task store cannot be observed without explicit initialization")
+    with _inventory_readonly_sqlite(TASK_DB) as connection:
+        if _task_schema_version(connection) != TASK_CURRENT_SCHEMA_VERSION:
+            raise RuntimeError("Task store requires an explicit schema migration")
+        _validate_task_schema_current(connection)
+        _task_reconcile_revision_contract(connection)
+        connection.execute("BEGIN DEFERRED")
+        try:
+            yield connection
+        finally:
+            if connection.in_transaction:
+                connection.rollback()
+
+
+def grabowski_task_peek(task_id: str) -> dict[str, Any]:
+    """Observe a task without persisting state, reconciling or touching any leases."""
+    operator._require_operator_capability("durable_job")
+    identifier = _validate_task_id(task_id)
+    with _task_readonly_snapshot() as connection:
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (identifier,)
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"Unknown task: {identifier}")
+    record = dict(row)
+    observation = _observe(record)
+    result = _public(record)
+    result["persisted_state"] = result["state"]
+    result["state"] = _effective_observed_state(record, observation["state"])
+    result["last_observation"] = observation
+    result["observation_mode"] = "unpersisted_readonly_probe"
+    result["reconcile_required"] = result["state"] != record["state"]
+    return result
+
+
 def _task_filter_states(state: str | None) -> tuple[str, ...] | None:
     if state is None:
         return None
@@ -9685,10 +9724,14 @@ def grabowski_task_start(
     }
 
 
-@_serialize_task_mutation
 def grabowski_task_status(task_id: str) -> dict[str, Any]:
-    """Observe one persistent task and refresh its recorded state."""
-    operator._require_operator_capability("durable_job")
+    """Refresh one task only after the real shared mutation gate succeeds."""
+    operator._require_operator_mutation("durable_job", task_id=task_id)
+    return _task_status_after_mutation_guard(task_id)
+
+
+@_serialize_task_mutation
+def _task_status_after_mutation_guard(task_id: str) -> dict[str, Any]:
     record = _row(task_id)
     observation = _observe(record)
     effective_state = _effective_observed_state(record, observation["state"])
@@ -12219,9 +12262,13 @@ def grabowski_task_list(
     cursor: str | None = None,
     fields: list[str] | None = None,
     schema_only: bool = False,
+    *,
+    read_only: bool = False,
 ) -> dict[str, Any]:
-    """List persistent tasks or inspect store-schema compatibility read-only."""
+    """List tasks; read_only=True never opens, migrates or reconciles a writable store."""
     operator._require_operator_capability("durable_job")
+    if not isinstance(read_only, bool):
+        raise ValueError("read_only must be boolean")
     if not isinstance(schema_only, bool):
         raise ValueError("schema_only must be boolean")
     if schema_only:
@@ -12236,10 +12283,12 @@ def grabowski_task_list(
                 "schema_only cannot be combined with task-list filters or projections"
             )
         return _task_schema_inventory()
-    # Task-list may recover pending terminalizations and migrate task storage.
-    # Authorize before any database open, cursor update or recovery effect.
-    operator._require_operator_mutation("durable_job")
+    # Ordinary task-list may recover terminalizations and migrate task storage.
+    if not read_only:
+        operator._require_operator_mutation("durable_job")
     if view == "managed_cargo_evidence":
+        if read_only:
+            raise ValueError("managed_cargo_evidence requires explicit mutation authority")
         if state is not None or cursor is not None or fields is not None:
             raise ValueError(
                 "managed_cargo_evidence view cannot be combined with state, cursor or fields"
@@ -12249,7 +12298,8 @@ def grabowski_task_list(
         _recover_pending_task_terminalizations()
         return _managed_cargo_evidence_from_task_store(limit)
     selected_view = consumer_surface.normalize_view(view)
-    _recover_pending_task_terminalizations()
+    if not read_only:
+        _recover_pending_task_terminalizations()
     current_projection = _task_current_projection()
     projection_sha256 = current_projection.get("projection_sha256")
     archived_task_bindings = current_projection.get("archived_task_bindings")
@@ -12273,7 +12323,8 @@ def grabowski_task_list(
         placeholders = ",".join("?" for _ in filter_states)
         where.append(f"state IN ({placeholders})")
         parameters.extend(filter_states)
-    with _task_read_snapshot() as connection:
+    snapshot = _task_readonly_snapshot() if read_only else _task_read_snapshot()
+    with snapshot as connection:
         # BEGIN DEFERRED does not pin a SQLite snapshot until the first read.
         # Pin it before helper calls so row pages, counts and attention decisions
         # are all derived against one task-store view even if a concurrent writer
@@ -12292,7 +12343,7 @@ def grabowski_task_list(
         )
         import grabowski_task_attention as task_attention
 
-        evaluate_attention_projection = state in {None, "attention"}
+        evaluate_attention_projection = not read_only and state in {None, "attention"}
         decision_guard = (
             task_attention.decision_snapshot_guard()
             if evaluate_attention_projection
@@ -12401,6 +12452,11 @@ def grabowski_task_list(
         "outcome_unknown",
     }
     warnings: list[dict[str, Any]] = []
+    if read_only:
+        warnings.append({
+            "code": "terminalization_recovery_not_run",
+            "detail": "Persistent state is a read-only snapshot, not reconciled execution truth",
+        })
     if unknown_state_count:
         warnings.append({
             "code": "unknown_task_states",
@@ -12441,6 +12497,8 @@ def grabowski_task_list(
         "count": len(tasks),
         "total_matching": total_matching,
         "state_filter": state,
+        "read_only_snapshot": read_only,
+        "reconciliation_performed": not read_only,
         "state_filter_kind": (
             "all" if state is None else "projection" if state in TASK_STATE_PROJECTIONS else "exact"
         ),

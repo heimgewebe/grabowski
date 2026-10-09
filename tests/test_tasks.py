@@ -9013,6 +9013,59 @@ class TaskTests(unittest.TestCase):
                     finally:
                         self.database = previous
 
+    def test_shared_task_status_denies_before_lock_or_any_store_access(self) -> None:
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=PermissionError("test mutation denied"),
+            ) as gate,
+            patch.object(tasks, "_task_mutation_lock") as lock,
+            patch.object(tasks, "_row") as row,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test mutation denied"):
+                tasks.grabowski_task_status("0" * 24)
+        gate.assert_called_once_with("durable_job", task_id="0" * 24)
+        lock.assert_not_called()
+        row.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_task_peek_cannot_initialize_missing_store(self) -> None:
+        with (
+            patch.object(tasks, "_database") as database,
+            patch.object(tasks, "_recover_pending_task_terminalizations") as recover,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "explicit initialization"):
+                tasks.grabowski_task_peek("0" * 24)
+        database.assert_not_called()
+        recover.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_task_peek_reads_current_store_without_state_or_lease_write(self) -> None:
+        created = self._start()["task"]
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        observation = {
+            "state": "completed", "properties": {}, "observed_at_unix": tasks._now()
+        }
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=AssertionError("task peek must not mutate"),
+            ) as gate,
+            patch.object(tasks, "_database") as database,
+            patch.object(tasks, "_maintain_record_resources") as maintenance,
+            patch.object(tasks, "_observe", return_value=observation) as observer,
+        ):
+            result = tasks.grabowski_task_peek(created["task_id"])
+        gate.assert_not_called()
+        database.assert_not_called()
+        maintenance.assert_not_called()
+        observer.assert_called_once()
+        self.assertEqual("unpersisted_readonly_probe", result["observation_mode"])
+        self.assertEqual("completed", result["state"])
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+
     def test_task_list_denied_mutation_cannot_recover_or_open_store(self) -> None:
         with (
             patch.object(
