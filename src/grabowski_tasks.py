@@ -1041,7 +1041,6 @@ TASK_EFFECT_PROFILES = frozenset({
 MUTATING_AGENT_EXECUTABLES = frozenset(
     {"agy", "claude", "cline", "codex", "grok", "grok-cli", "opencode", "openhands"}
 )
-READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
 TASK_EFFECT_CLASSIFICATION_POLICY_VERSION = 1
 TASK_EFFECT_CLASSIFICATION_SURFACE = "task_start"
 TASK_EXECUTION_BACKENDS = {"systemd-user", "systemd-root-broker"}
@@ -3815,12 +3814,8 @@ def _mutating_agent_workspace(
         return None
     executable = Path(argv[0]).name.lower()
     if executable == "codex":
-        if _agent_read_only(argv, executable):
-            return None
         return _local_workspace_path(_argument_value(argv, "-C", "--cd"), cwd=cwd)
     if executable in MUTATING_AGENT_EXECUTABLES - {"codex"}:
-        if _agent_read_only(argv, executable):
-            return None
         return _local_workspace_path(None, cwd=cwd)
     # Framework-managed writers already hold a workspace-level lease owned by
     # their workspace lifecycle. Inferring a second task-owned lease here would
@@ -3838,43 +3833,6 @@ def _validate_task_effect_profile(value: str | None) -> str | None:
     return value
 
 
-def _agent_read_only(argv: list[str], executable: str) -> bool:
-    """Exempt only effective read-only modes, never payload tokens or overrides."""
-    # Only Claude plan mode has the narrowly validated read-only contract.
-    # Codex's managed profiles can override its sandbox (openai/codex#47464);
-    # Grok plan mode still permits Bash writes and write-capable subagents.
-    # Other harnesses therefore retain workspace leases and opaque-quota gates.
-    if executable != "claude":
-        return False
-    controls = argv[1:]
-    if "--" in controls:
-        controls = controls[:controls.index("--")]
-    if any(
-        item in {
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--dangerously-skip-permissions",
-            "--yolo",
-            "--full-auto",
-        }
-        for item in controls
-    ):
-        return False
-    names = ("--sandbox", "-s") if executable == "codex" else ("--permission-mode",)
-    modes: list[str] = []
-    for index, item in enumerate(controls):
-        if item in names:
-            if index + 1 >= len(controls) or controls[index + 1].startswith("-"):
-                return False
-            modes.append(controls[index + 1])
-        else:
-            for name in names:
-                if item.startswith(f"{name}="):
-                    modes.append(item[len(name) + 1 :])
-                    break
-    # Duplicate/conflicting modes are never accepted as read-only.
-    return len(modes) == 1 and modes[0] == "plan"
-
-
 def _classify_task_effect(
     *,
     transport: str,
@@ -3885,7 +3843,6 @@ def _classify_task_effect(
     explicit = _validate_task_effect_profile(explicit_effect_profile)
     executable = Path(argv[0]).name.lower()
     declared_agent = executable in MUTATING_AGENT_EXECUTABLES
-    read_only_mode = declared_agent and _agent_read_only(argv, executable)
 
     if declared_agent and explicit == "unknown":
         raise ValueError(
@@ -3906,7 +3863,7 @@ def _classify_task_effect(
         }
 
     if transport != "local":
-        derived = "read_only" if read_only_mode else "remote_write"
+        derived = "remote_write"
         if explicit is not None and explicit != derived:
             raise ValueError(
                 f"effect_profile={explicit} conflicts with derived agent profile {derived}"
@@ -3916,22 +3873,6 @@ def _classify_task_effect(
             "policy_version": TASK_EFFECT_CLASSIFICATION_POLICY_VERSION,
             "surface": TASK_EFFECT_CLASSIFICATION_SURFACE,
             "effect_profile": derived,
-            "agent_executable": executable,
-            "classification_source": (
-                "explicit" if explicit is not None else "agent_command"
-            ),
-        }
-
-    if read_only_mode:
-        if explicit is not None and explicit != "read_only":
-            raise ValueError(
-                f"effect_profile={explicit} conflicts with read-only agent mode"
-            )
-        return {
-            "schema_version": 1,
-            "policy_version": TASK_EFFECT_CLASSIFICATION_POLICY_VERSION,
-            "surface": TASK_EFFECT_CLASSIFICATION_SURFACE,
-            "effect_profile": "read_only",
             "agent_executable": executable,
             "classification_source": (
                 "explicit" if explicit is not None else "agent_command"
@@ -9141,10 +9082,7 @@ def grabowski_task_start(
         import grabowski_coding_agent_router as coding_agent_router
 
         candidate_admission = coding_agent_router.coding_agent_pre_dispatch_admission(
-            command,
-            read_only_execution=(
-                task_effect_classification["effect_profile"] == "read_only"
-            ),
+            command
         )
         if candidate_admission.get("admitted") is not True:
             denial_audit = {
@@ -9993,32 +9931,33 @@ def grabowski_task_resume(
             recovery_launcher_bindings["retry_binding"] = retained_retry_binding
     coding_agent_pre_dispatch_admission: dict[str, Any] | None = None
     task_effect_classification = _record_task_effect_classification(record)
-    agent_executable = (
-        task_effect_classification.get("agent_executable")
-        if task_effect_classification is not None
-        else Path(command[0]).name.lower()
-    )
-    # Legacy persisted classification must not re-authorize a writable replay.
-    if (
-        task_effect_classification is not None
-        and task_effect_classification.get("effect_profile") == "read_only"
-        and agent_executable in MUTATING_AGENT_EXECUTABLES
-        and not _agent_read_only(command, agent_executable)
-    ):
-        raise RuntimeError("persisted read-only mode disagrees with current agent argv")
+    command_executable = Path(command[0]).name.lower()
+    # Derive the executing agent identity from actual argv, not editable
+    # persisted launcher metadata. Unknown legacy effects and previously
+    # read-only agent attempts lack a proven workspace lease for safe replay.
+    if command_executable in MUTATING_AGENT_EXECUTABLES:
+        if task_effect_classification is None:
+            raise RuntimeError("unverified agent effect in legacy resume")
+        if task_effect_classification.get("agent_executable") != command_executable:
+            raise RuntimeError("persisted agent identity mismatches current executable")
+        if task_effect_classification.get("effect_profile") == "read_only":
+            raise RuntimeError("persisted agent read-only mode cannot authorize resume")
+    agent_executable = command_executable
     if (
         agent_executable in MUTATING_AGENT_EXECUTABLES
         and fleet.fleet_host(str(record["host"]))["transport"] == "local"
     ):
+        workspace = _mutating_agent_workspace(
+            str(record["host"]), command, cwd=str(record["cwd"])
+        )
+        if workspace is None or not _workspace_lease_resource_keys(
+            workspace, _record_resource_keys(record)
+        ):
+            raise RuntimeError("persisted agent workspace lease is missing")
         import grabowski_coding_agent_router as coding_agent_router
 
         candidate_admission = coding_agent_router.coding_agent_pre_dispatch_admission(
-            command,
-            read_only_execution=(
-                task_effect_classification.get("effect_profile") == "read_only"
-                if task_effect_classification is not None
-                else _agent_read_only(command, agent_executable)
-            ),
+            command
         )
         if candidate_admission.get("admitted") is not True:
             denial_audit = {

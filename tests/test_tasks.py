@@ -2625,9 +2625,7 @@ class TaskTests(unittest.TestCase):
             ):
                 tasks.grabowski_task_resume(task_id)
 
-        admission.assert_called_once_with(
-            argv, read_only_execution=False
-        )
+        admission.assert_called_once_with(argv)
         renew.assert_not_called()
         acquire.assert_not_called()
         launch.assert_not_called()
@@ -2648,7 +2646,7 @@ class TaskTests(unittest.TestCase):
             denial_audits[0]["no_resource_lease_renewed_or_reacquired"]
         )
 
-    def test_legacy_read_only_agent_resume_uses_effective_argv_mode(self) -> None:
+    def test_legacy_agent_without_persisted_effect_fails_closed(self) -> None:
         argv = ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"]
         admitted = {
             "schema_version": 1,
@@ -2697,10 +2695,142 @@ class TaskTests(unittest.TestCase):
             coding_agent_router, "coding_agent_pre_dispatch_admission", return_value=admitted
         ) as admission, patch.object(
             tasks, "_launch", return_value=_launcher()
+        ) as launch, patch.object(tasks.base, "_append_audit"):
+            with self.assertRaisesRegex(RuntimeError, "unverified agent effect"):
+                tasks.grabowski_task_resume(task_id)
+        admission.assert_not_called()
+        launch.assert_not_called()
+        self.assertEqual(tasks._row_raw(task_id)["attempt"], 1)
+
+    def test_spoofed_persisted_read_only_agent_identity_denies_resume(self) -> None:
+        argv = ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"]
+        admitted = {
+            "schema_version": 1, "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True, "admitted": True, "reason_code": "admitted",
+            "argv_sha256": "1" * 64, "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission", return_value=admitted
         ), patch.object(tasks.base, "_append_audit"):
-            resumed = tasks.grabowski_task_resume(task_id)
-        admission.assert_called_once_with(argv, read_only_execution=True)
-        self.assertEqual(resumed["task"]["attempt"], 2)
+            started = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60,
+                resume_policy="verify-then-retry",
+            )
+        task_id = str(started["task"]["task_id"])
+        with tasks._database_connection() as connection:
+            row = connection.execute(
+                "SELECT launcher_json FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            assert row is not None
+            launcher = json.loads(str(row["launcher_json"]))
+            launcher["task_effect_classification"]["agent_executable"] = "spoofed"
+            launcher["task_effect_classification"]["effect_profile"] = "read_only"
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (tasks._canonical_json(launcher), task_id),
+            )
+        observation = {
+            "state": "failed", "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1), "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with patch.object(tasks, "_observe", return_value=observation), patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 148}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=admitted,
+        ) as admission, patch.object(tasks, "_launch") as launch, patch.object(
+            tasks.base, "_append_audit"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "persisted agent identity"):
+                tasks.grabowski_task_resume(task_id)
+        admission.assert_not_called()
+        launch.assert_not_called()
+        # Matching executable metadata still cannot reauthorize a legacy
+        # read-only attempt without its original workspace lease.
+        with tasks._database_connection() as connection:
+            row = connection.execute(
+                "SELECT launcher_json FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            assert row is not None
+            launcher = json.loads(str(row["launcher_json"]))
+            launcher["task_effect_classification"]["agent_executable"] = "claude"
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (tasks._canonical_json(launcher), task_id),
+            )
+        with patch.object(tasks, "_observe", return_value=observation), patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 148}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=admitted
+        ) as admission, patch.object(tasks, "_launch") as launch, patch.object(
+            tasks.base, "_append_audit"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "persisted agent read-only mode"):
+                tasks.grabowski_task_resume(task_id)
+        admission.assert_not_called()
+        launch.assert_not_called()
+
+    def test_resume_rejects_agent_without_persisted_workspace_lease(self) -> None:
+        # Spoofing a previously read-only launcher as workspace_write must
+        # not make a missing lease safe to replay.
+        argv = ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"]
+        admitted = {
+            "schema_version": 1, "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True, "admitted": True, "reason_code": "admitted",
+            "argv_sha256": "1" * 64, "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=admitted
+        ), patch.object(tasks.base, "_append_audit"):
+            started = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60,
+                resume_policy="verify-then-retry",
+            )
+        task_id = str(started["task"]["task_id"])
+        self.assertEqual(started["task"]["resource_keys"], [f"repo:{self.root}"])
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET resource_keys_json=? WHERE task_id=?",
+                ("[]", task_id),
+            )
+        observation = {
+            "state": "failed", "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1), "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with patch.object(tasks, "_observe", return_value=observation), patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 148}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=admitted
+        ) as admission, patch.object(tasks, "_launch") as launch, patch.object(
+            tasks.resources, "renew_resources"
+        ) as renew, patch.object(tasks.base, "_append_audit"):
+            with self.assertRaisesRegex(RuntimeError, "workspace lease"):
+                tasks.grabowski_task_resume(task_id)
+        admission.assert_not_called()
+        launch.assert_not_called()
+        renew.assert_not_called()
+        self.assertEqual(tasks._row_raw(task_id)["attempt"], 1)
 
     def test_legacy_local_resume_binds_managed_output_from_next_attempt(self) -> None:
         started = self._start()
@@ -3567,9 +3697,7 @@ class TaskTests(unittest.TestCase):
                 tasks.grabowski_task_start(
                     "local", argv, cwd=str(self.root), runtime_seconds=60
                 )
-        admission.assert_called_once_with(
-            argv, read_only_execution=False
-        )
+        admission.assert_called_once_with(argv)
         dispatch.assert_not_called()
         acquire.assert_not_called()
         denial_audits = [
@@ -3641,8 +3769,8 @@ class TaskTests(unittest.TestCase):
         self.assertEqual("task_start", local["surface"])
         repository = tasks._classify_task_effect(transport="local", argv=["/opt/codex", "exec", "--sandbox", "workspace-write"], mutating_workspace=str(self.root), explicit_effect_profile="repository_write")
         self.assertEqual("repository_write", repository["effect_profile"])
-        read_only = tasks._classify_task_effect(transport="local", argv=["/opt/claude", "--permission-mode", "plan"], mutating_workspace=None)
-        self.assertEqual("read_only", read_only["effect_profile"])
+        plan = tasks._classify_task_effect(transport="local", argv=["/opt/claude", "--permission-mode", "plan"], mutating_workspace=str(self.root))
+        self.assertEqual("workspace_write", plan["effect_profile"])
         remote = tasks._classify_task_effect(transport="ssh", argv=["/opt/codex", "exec", "--sandbox", "workspace-write"], mutating_workspace=None)
         self.assertEqual("remote_write", remote["effect_profile"])
 
@@ -3661,6 +3789,11 @@ class TaskTests(unittest.TestCase):
             ["/opt/grok-cli", "--permission-mode=plan", "--always-approve"],
             ["/opt/agy", "--permission-mode", "plan"],
             ["/opt/claude", "--permission-mode", "acceptEdits", "--", "--read-only"],
+            ["/opt/claude", "--permission-mode", "plan"],
+            ["/opt/claude", "--permission-mode=plan", "-p", "prompt"],
+            ["/opt/claude", "--bare", "--permission-mode", "plan", "-p", "prompt"],
+            ["/opt/claude", "--safe-mode", "--permission-mode", "plan"],
+            ["/opt/claude", "--settings", '{"disableAllHooks":true}', "--permission-mode", "plan"],
             ["/opt/claude", "--permission-mode", "plan", "--dangerously-skip-permissions"],
         ]
         for argv in write_commands:
@@ -3673,22 +3806,6 @@ class TaskTests(unittest.TestCase):
                     transport="local", argv=argv, mutating_workspace=workspace
                 )
                 self.assertEqual(classification["effect_profile"], "workspace_write")
-
-        for argv in (
-            ["/opt/claude", "--permission-mode", "plan", "--", "--read-only"],
-            ["/opt/claude", "--permission-mode=plan", "-p", "prompt"],
-            ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"],
-        ):
-            with self.subTest(argv=argv), patch.object(
-                tasks.fleet, "fleet_host", return_value=LOCAL_HOST
-            ):
-                self.assertIsNone(
-                    tasks._mutating_agent_workspace("local", argv, cwd=str(self.root))
-                )
-                classification = tasks._classify_task_effect(
-                    transport="local", argv=argv, mutating_workspace=None
-                )
-                self.assertEqual(classification["effect_profile"], "read_only")
 
     def test_unverified_grok_plan_mode_keeps_workspace_and_quota_guard(self) -> None:
         # Grok plan mode does not confine Bash or write-capable subagents.
@@ -3719,7 +3836,7 @@ class TaskTests(unittest.TestCase):
                 tasks.grabowski_task_start(
                     "local", argv, cwd=str(self.root), runtime_seconds=60
                 )
-        admission.assert_called_once_with(argv, read_only_execution=False)
+        admission.assert_called_once_with(argv)
         dispatch.assert_not_called()
         self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
@@ -3753,7 +3870,7 @@ class TaskTests(unittest.TestCase):
                 tasks.grabowski_task_start(
                     "local", argv, cwd=str(self.root), runtime_seconds=60
                 )
-        admission.assert_called_once_with(argv, read_only_execution=False)
+        admission.assert_called_once_with(argv)
         dispatch.assert_not_called()
         self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
@@ -3790,7 +3907,7 @@ class TaskTests(unittest.TestCase):
                 tasks.grabowski_task_start(
                     "local", argv, cwd=str(self.root), runtime_seconds=60
                 )
-        admission.assert_called_once_with(argv, read_only_execution=False)
+        admission.assert_called_once_with(argv)
         dispatch.assert_not_called()
         self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
@@ -4951,7 +5068,7 @@ class TaskTests(unittest.TestCase):
             result = tasks.grabowski_task_start(
                 "local", argv, cwd=str(self.root), runtime_seconds=60
             )
-        admission.assert_called_once_with(argv, read_only_execution=False)
+        admission.assert_called_once_with(argv)
         self.assertEqual(result["task"]["resource_keys"], [f"repo:{self.root}"])
         self.assertEqual(result["audit"]["implicit_workspace_resource_key"], f"repo:{self.root}")
         self.assertEqual(result["task_effect_classification"]["effect_profile"], "workspace_write")
