@@ -1210,6 +1210,11 @@ _REPOGROUND_FRESHNESS = {"fresh", "stale", "unknown", "not_comparable", "not_app
 _REPOGROUND_LIVE_FRESHNESS = {"fresh", "stale", "unknown", "not_comparable"}
 _REPOGROUND_GROUNDING = {"pass", "fail", "warn", "degraded", "not_applicable"}
 _REPOGROUND_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+# Mirrors repoground.core.bundle_identity; a legacy manifest may omit version.
+_REPOGROUND_MANIFEST_KIND = "repoground.bundle.manifest"
+_REPOGROUND_MANIFEST_VERSION = "2.0"
+_REPOGROUND_LEGACY_MANIFEST_KIND = "repolens.bundle.manifest"
+_REPOGROUND_LEGACY_MANIFEST_VERSION = "1.0"
 EXPECTED_REPOGROUND_READ_ONLY_KIND = "repobrief.mcp.read_only_frontdoor"
 EXPECTED_REPOGROUND_READ_ONLY_VERSION = "v1"
 EXPECTED_REPOGROUND_FRESHNESS_VALUES = ("fresh", "stale", "unknown", "not_comparable")
@@ -1399,6 +1404,24 @@ def _provenance_match(item: Mapping[str, Any], requested: set[str]) -> str | Non
     return "match" if hits else None
 
 
+def _require_repoground_manifest_envelope(document: Mapping[str, Any]) -> None:
+    kind = document.get("kind")
+    version = document.get("version")
+    if kind == _REPOGROUND_MANIFEST_KIND:
+        valid = version == _REPOGROUND_MANIFEST_VERSION
+    elif kind == _REPOGROUND_LEGACY_MANIFEST_KIND:
+        valid = version is None or version == _REPOGROUND_LEGACY_MANIFEST_VERSION
+    else:
+        raise RunnerError(
+            "RepoGround manifest kind is invalid: expected "
+            f"{_REPOGROUND_MANIFEST_KIND!r} or {_REPOGROUND_LEGACY_MANIFEST_KIND!r}"
+        )
+    if not valid:
+        raise RunnerError(
+            f"RepoGround manifest version is invalid for kind {kind!r}"
+        )
+
+
 def _bound_repoground_manifest(
     request: Mapping[str, Any],
 ) -> tuple[Path, str, str, str | None]:
@@ -1420,6 +1443,7 @@ def _bound_repoground_manifest(
     if _sha256_bytes(raw) != expected_sha:
         raise RunnerError("RepoGround manifest SHA mismatch")
     document = _load_object_bytes(raw, label="RepoGround manifest")
+    _require_repoground_manifest_envelope(document)
     provenance = document.get("snapshotProvenance")
     if not isinstance(provenance, Mapping):
         provenance = document.get("snapshot_provenance")

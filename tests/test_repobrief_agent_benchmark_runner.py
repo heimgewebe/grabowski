@@ -1454,6 +1454,51 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             self.assertEqual(commit, COMMIT)
             self.assertEqual(repo_root, "/tmp/repo")
 
+    def _bind_envelope(self, directory: str, **envelope) -> dict:
+        value = request(condition="treatment")
+        manifest = bind_manifest(value, Path(directory))
+        document = json.loads(manifest.read_bytes())
+        document.pop("kind")
+        document.pop("version")
+        document.update(envelope)
+        raw = json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+        manifest.write_bytes(raw)
+        value["repobrief"]["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+        return value
+
+    def test_bound_manifest_accepts_v2_and_legacy_envelopes(self) -> None:
+        cases = (
+            {"kind": "repoground.bundle.manifest", "version": "2.0"},
+            {"kind": "repolens.bundle.manifest", "version": "1.0"},
+            {"kind": "repolens.bundle.manifest"},
+        )
+        for envelope in cases:
+            with self.subTest(envelope=envelope), tempfile.TemporaryDirectory() as directory:
+                value = self._bind_envelope(directory, **envelope)
+                _, _, commit, _ = runner._bound_repoground_manifest(value)
+                self.assertEqual(commit, COMMIT)
+                self.assertIsNotNone(
+                    runner._optional_repoground_manifest_binding(value)
+                )
+
+    def test_bound_manifest_rejects_invalid_envelopes(self) -> None:
+        cases = (
+            ({}, "kind is invalid"),
+            ({"kind": "other.manifest", "version": "2.0"}, "kind is invalid"),
+            ({"kind": "repoground.bundle.manifest"}, "version is invalid"),
+            ({"kind": "repoground.bundle.manifest", "version": "1.0"}, "version is invalid"),
+            ({"kind": "repoground.bundle.manifest", "version": 2.0}, "version is invalid"),
+            ({"kind": "repolens.bundle.manifest", "version": "2.0"}, "version is invalid"),
+        )
+        for envelope, message in cases:
+            with self.subTest(envelope=envelope), tempfile.TemporaryDirectory() as directory:
+                value = self._bind_envelope(directory, **envelope)
+                with self.assertRaisesRegex(runner.RunnerError, message):
+                    runner._bound_repoground_manifest(value)
+                self.assertIsNone(
+                    runner._optional_repoground_manifest_binding(value)
+                )
+
     def test_bound_manifest_accepts_supported_commit_fields(self) -> None:
         for field in ("git_commit", "commit", "head"):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:

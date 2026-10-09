@@ -4706,6 +4706,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         evidence["calls"][0]["context_bytes_used"], expected
                     )
 
+    def test_codex_foreign_manifest_kind_omits_optional_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            raw = json.dumps(
+                {
+                    "kind": "something.else",
+                    "version": "2.0",
+                    "snapshotProvenance": {"repositories": [{"git_commit": COMMIT}]},
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            manifest.write_bytes(raw)
+            value["repobrief"]["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+            with self.assertRaisesRegex(runner.base.RunnerError, "kind is invalid"):
+                runner.base._bound_repoground_manifest(value)
+            self.assertIsNone(runner.base._optional_repoground_manifest_binding(value))
+
     def test_codex_manifest_bind_failure_omits_optional_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")

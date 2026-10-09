@@ -272,7 +272,10 @@ repoground_evidence ist bewusst keine Runner-Entscheidung über Nutzen:
 Der Runner projiziert nur validierte, revisionsgebundene Beobachtungen. Ob diese
 für Navigation, Struktur oder Grounding als tatsächliches Treatment-Exposure
 zählen, entscheidet der RepoGround-Evaluator. Die Projektion bleibt an das
-digestgebundene Manifest gekoppelt. Für `ask_context` müssen Pack-Commit und
+digestgebundene Manifest gekoppelt; dessen Hülle muss vor der Provenienz
+`kind: repoground.bundle.manifest` mit `version: "2.0"` (oder legacy
+`repolens.bundle.manifest` mit `version: "1.0"` bzw. fehlender Version) sein,
+sonst entsteht keine Evidenz. Für `ask_context` müssen Pack-Commit und
 same-call Live-Commit übereinstimmen; der projizierte Freshness-Status stammt aus
 dieser Live-Hülle, und nur Ranges mit `status=resolved` werden gezählt. Resolved Textranges brauchen nichtleeren `text_excerpt` plus Identität (`source_path`/`path` oder `range_ref.ref`/`range_ref.path`); resolved `language_structure_json`-Ranges tragen keinen Excerpt und brauchen stattdessen konsistente Strukturprovenienz (`range_ref.ref`, `range_ref.path` = `source_path`, ganzzahlige `start_line<=end_line` gleich in `range_ref.range` und `source_line_range`).
 Produktives `not_comparable` ohne Snapshot-Provenienz darf nur im
