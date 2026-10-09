@@ -11,7 +11,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import socket
 import subprocess
@@ -506,6 +505,13 @@ int main(void) {
         )
         self._landlock_unit_patch.start()
         self.addCleanup(self._landlock_unit_patch.stop)
+        # Synthetic algorithm fixtures must not assume kernel Seccomp support.
+        # Real-kernel Seccomp tests explicitly remove this unit-only patch.
+        self._anonymous_exec_patch = patch.object(
+            cap, "_confine_child_anonymous_exec", return_value=None, create=True,
+        )
+        self._anonymous_exec_patch.start()
+        self.addCleanup(self._anonymous_exec_patch.stop)
 
     def require_kernel_landlock(self) -> None:
         # A read-only ABI query does not launch a child or restrict this test
@@ -708,6 +714,158 @@ int main(void) {
             input=proofbytes, capture_output=True, timeout=15,
         )
         self.assertEqual(0, checked.returncode, checked.stderr.decode(errors="replace"))
+
+    def test_seccomp_filter_arch_x32_and_syscall_abi_are_pinned(self) -> None:
+        # Independent x86-64 seccomp UAPI/BPF contract, not copied from the
+        # implementation under test. No kernel filter is installed here.
+        self._anonymous_exec_patch.stop()
+        self.assertEqual(8, cap.ctypes.sizeof(cap._SeccompSockFilter))
+        self.assertEqual(16, cap.ctypes.sizeof(cap._SeccompSockFprog))
+        expected = [
+            (0x20, 0, 0, 4),  # seccomp_data.arch
+            (0x15, 1, 0, 0xC000003E),  # native x86-64 or KILL
+            (0x06, 0, 0, 0x80000000),
+            (0x20, 0, 0, 0),  # seccomp_data.nr
+            (0x35, 0, 1, 0x40000000),  # x32 ABI must fail closed
+            (0x06, 0, 0, 0x80000000),
+            (0x35, 0, 2, 512),  # legacy untagged x32 512..547
+            (0x35, 1, 0, 548),  # 548+ may be native, do not kill
+            (0x06, 0, 0, 0x80000000),
+            (0x15, 0, 1, 319),  # memfd_create
+            (0x06, 0, 0, 0x00050000 | errno.EPERM),
+            (0x15, 0, 1, 322),  # execveat
+            (0x06, 0, 0, 0x00050000 | errno.EPERM),
+            (0x06, 0, 0, 0x7FFF0000),  # remaining calls allowed
+        ]
+        filters = cap._seccomp_anonymous_exec_instructions()
+        self.assertEqual(expected, [
+            (x.code, x.jt, x.jf, x.k) for x in filters
+        ])
+        observed = []
+
+        def checked_prctl(*args):
+            observed.append(args)
+            self.assertEqual(22, args[0].value)  # PR_SET_SECCOMP
+            self.assertEqual(2, args[1].value)   # SECCOMP_MODE_FILTER
+            program = cap.ctypes.cast(
+                args[2], cap.ctypes.POINTER(cap._SeccompSockFprog),
+            ).contents
+            self.assertEqual(len(expected), program.len)
+            self.assertEqual(expected, [
+                (program.filter[k].code, program.filter[k].jt,
+                 program.filter[k].jf, program.filter[k].k)
+                for k in range(program.len)
+            ])
+            return 0
+
+        with (
+            patch.object(cap.ctypes, "CDLL", side_effect=AssertionError(
+                "preexec must not resolve libc symbols"
+            )),
+            patch.object(cap, "_LANDLOCK_PRCTL", side_effect=checked_prctl),
+        ):
+            cap._confine_child_anonymous_exec()
+        self.assertEqual(1, len(observed))
+
+    def test_seccomp_denies_legacy_x32_raw_545_without_blocking_native_548(self) -> None:
+        # Linux before 5.4 permitted untagged x32 syscall numbers 512..547.
+        # In particular 545 may dispatch x32 execveat without the x32 flag.
+        # Interpret this *actual* cBPF instruction list independently instead
+        # of inspecting individual instructions or invoking x32 in this process.
+        instructions = cap._seccomp_anonymous_exec_instructions()
+
+        def outcome(nr: int, arch: int = 0xC000003E) -> int:
+            accumulator = 0
+            pc = 0
+            for _ in range(32):
+                self.assertLess(pc, len(instructions), "BPF fell off program")
+                instruction = instructions[pc]
+                if instruction.code == 0x20:  # BPF_LD_W_ABS
+                    accumulator = arch if instruction.k == 4 else nr
+                    pc += 1
+                elif instruction.code == 0x15:  # BPF_JMP_JEQ_K
+                    pc += 1 + (instruction.jt if accumulator == instruction.k else instruction.jf)
+                elif instruction.code == 0x35:  # BPF_JMP_JGE_K
+                    pc += 1 + (instruction.jt if accumulator >= instruction.k else instruction.jf)
+                elif instruction.code == 0x06:  # BPF_RET_K
+                    return instruction.k
+                else:
+                    self.fail(f"unsupported seccomp BPF opcode: {instruction.code}")
+            self.fail("BPF has no terminal action")
+
+        for nr in (512, 520, 545, 547):
+            with self.subTest(raw_legacy_x32=nr):
+                self.assertEqual(0x80000000, outcome(nr))
+        for nr in (511, 548, 549):
+            with self.subTest(native_allowed=nr):
+                self.assertEqual(0x7FFF0000, outcome(nr))
+        for nr in (319, 322):
+            with self.subTest(native_denied=nr):
+                self.assertEqual(0x00050000 | errno.EPERM, outcome(nr))
+        self.assertEqual(0x80000000, outcome(0x40000000 | 545))
+        self.assertEqual(0x80000000, outcome(322, arch=0x40000003))
+
+    def test_seccomp_installation_failure_is_fail_closed(self) -> None:
+        self._anonymous_exec_patch.stop()
+        with patch.object(cap, "_LANDLOCK_PRCTL", return_value=-1):
+            with self.assertRaisesRegex(cap.CaptureDenied, "seccomp"):
+                cap._confine_child_anonymous_exec()
+
+    def test_kernel_seccomp_blocks_memfd_exec_before_publication(self) -> None:
+        # Regression for the separately demonstrated Landlock-only memfd
+        # bypass. The first stage can run unconfined, but MUST fail once
+        # Seccomp is installed after Landlock before its first exec.
+        setting = Path("/proc/sys/vm/memfd_noexec")
+        if setting.is_file() and setting.read_text().strip() == "2":
+            self.skipTest("kernel globally prohibits executable memfds")
+        initial = self.programs["memfd_exec"]
+        second = self.programs["second_stage"]
+        self.assertNotEqual(sha(initial.read_bytes()), sha(second.read_bytes()))
+        stdout, *_ = self.capture("memfd_exec")
+        self.assertEqual(b"SECOND_EXEC_NOT_PINNED\n", stdout)
+        self.require_kernel_landlock()
+        self._anonymous_exec_patch.stop()
+        # The verified first-stage binary still runs after both restrictions.
+        success, *_ = self.capture("success")
+        self.assertEqual(OBSERVED_STDOUT, success)
+        self.active_binary = initial
+        self.policy_file = Path(self.temp.name) / "policy"
+        self.policy_file.write_bytes(cap._json_bytes(
+            example_policy(initial.read_bytes())
+        ))
+
+        def fake_dir(_path, *, private=False):
+            return os.open(self.dest, os.O_RDONLY | os.O_DIRECTORY)
+
+        with (
+            patch.object(cap.os, "geteuid", return_value=0),
+            patch.object(cap, "SIGNING_KEY_PATH", self.key),
+            patch.object(cap, "_open_root_file", side_effect=self.fake_root_file),
+            patch.object(cap, "_open_root_directory", side_effect=fake_dir),
+            patch.object(cap, "_check_staging_root_owned", return_value=None),
+            patch.object(cap, "_validate_signer_static", return_value=None),
+            patch.object(cap, "_separate_child_identity",
+                         return_value=(os.getuid(), os.getgid())),
+            patch.object(cap, "_drop_to_child", return_value=None),
+            patch.object(cap, "_assert_cgroup_drained", return_value=None),
+        ):
+            with self.assertRaisesRegex(
+                cap.CaptureDenied, "collector did not exit successfully"
+            ):
+                cap.run()
+        self.assertTrue((self.dest / cap.ATTEMPT_MARKER).exists())
+        self.assertEqual([], list(self.dest.glob("prototype-*")))
+        self.assertEqual([], list(self.dest.glob(".incomplete-*")))
+
+    def test_missing_seccomp_fails_before_first_exec(self) -> None:
+        with patch.object(
+            cap, "_confine_child_anonymous_exec",
+            side_effect=cap.CaptureDenied("seccomp unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                cap.CaptureDenied, "collector child could not start"
+            ):
+                self.capture("success")
 
     def test_missing_landlock_fails_before_any_capture(self) -> None:
         # The read-only fixture mocks UID drop, never Landlock success.
