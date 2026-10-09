@@ -1643,6 +1643,23 @@ def _resolved_range_entries_valid(ranges: Any) -> bool:
     return True
 
 
+def _context_byte_budget_valid(budget: Mapping[str, Any]) -> bool:
+    """Hard byte accounting: used <= max_context_bytes <= token-derived ceiling.
+
+    The producer computes max_context_bytes as min(ceiling, requested), so the
+    relation is a production invariant. Unicode character fields are separate
+    and are not compared with byte limits.
+    """
+    values = []
+    for name in ("token_derived_byte_ceiling", "max_context_bytes", "context_bytes_used"):
+        item = budget.get(name)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            return False
+        values.append(item)
+    ceiling, limit, used = values
+    return used <= limit <= ceiling
+
+
 def _validated_ask_context_pack(value: Any) -> dict[str, Any]:
     base_keys = {
         "kind", "version", "request_id", "snapshot_ref", "freshness",
@@ -1710,6 +1727,7 @@ def _validated_ask_context_pack(value: Any) -> dict[str, Any]:
             or budget.get(name) < 0
             for name in integer_fields
         )
+        or not _context_byte_budget_valid(budget)
         or budget.get("byte_budget_is_hard") is not True
         or budget.get("unit") != "utf8_bytes"
         or not isinstance(budget.get("accounting"), str)
@@ -1998,13 +2016,9 @@ def _repoground_evidence_from_payload(
             budget, Mapping
         ):
             return None
-        context_bytes = budget.get("context_bytes_used")
-        if (
-            isinstance(context_bytes, bool)
-            or not isinstance(context_bytes, int)
-            or context_bytes < 0
-        ):
+        if not _context_byte_budget_valid(budget):
             return None
+        context_bytes = budget["context_bytes_used"]
         resolved_range_count = sum(
             1
             for item in ranges

@@ -4397,7 +4397,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                             "range_ref": {"ref": "example"},
                         }
                     ],
-                    "budget": {"context_bytes_used": 654},
+                    "budget": {"context_bytes_used": 654, "max_context_bytes": 654, "token_derived_byte_ceiling": 654},
                 },
                 "live_freshness": {
                     "kind": "repobrief.live_freshness",
@@ -4523,7 +4523,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         },
                         "freshness": {"status": "fresh"},
                         "resolved_ranges": ranges,
-                        "budget": {"context_bytes_used": 10},
+                        "budget": {"context_bytes_used": 10, "max_context_bytes": 10, "token_derived_byte_ceiling": 10},
                     },
                     "live_freshness": {
                         "kind": "repobrief.live_freshness",
@@ -4566,6 +4566,144 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 else:
                     self.assertEqual(
                         evidence["calls"][0]["resolved_range_count"], expected
+                    )
+
+    def test_codex_shared_validator_enforces_hard_context_byte_ceilings(self) -> None:
+        def pack(used: int, limit: int, ceiling: int) -> dict:
+            return {
+                "kind": runner.EXPECTED_ASK_CONTEXT_PACK_KIND,
+                "version": runner.EXPECTED_ASK_CONTEXT_PACK_VERSION,
+                "request_id": "0123456789abcdef",
+                "snapshot_ref": {},
+                "freshness": {"status": "fresh"},
+                "availability": {"status": "available"},
+                "required_reading": {"status": "available"},
+                "retrieval": {},
+                "retrieval_infrastructure": {"status": "available"},
+                "retrieval_hits": [],
+                "resolved_ranges": [],
+                "answer_scaffold": {
+                    "citation_obligations": [],
+                    "caveats_to_surface": [],
+                    "non_claims_to_surface": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+                },
+                "budget": {
+                    "max_context_tokens": 4,
+                    "token_derived_byte_ceiling": ceiling,
+                    "max_context_bytes": limit,
+                    "max_answer_tokens": 1,
+                    "context_bytes_used": used,
+                    "context_unicode_characters_used": 1000,
+                    "approx_context_chars_used": 1000,
+                    "byte_budget_is_hard": True,
+                    "unit": "utf8_bytes",
+                    "accounting": "pinned test contract",
+                    "omissions": [],
+                    "truncated": False,
+                    "does_not_establish_quality": True,
+                },
+                "forbidden_operations": list(runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS),
+                "does_not_establish": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+            }
+
+        cases = (
+            ("used_zero", 0, 8, 16, True),
+            ("used_equals_both_limits", 16, 16, 16, True),
+            ("used_equals_lower_requested_limit", 8, 8, 16, True),
+            ("used_over_requested_limit", 2, 1, 16, False),
+            ("used_over_token_ceiling", 2, 1, 1, False),
+            ("requested_limit_over_ceiling", 1, 32, 16, False),
+        )
+        for name, used, limit, ceiling, accepted in cases:
+            with self.subTest(case=name):
+                value = pack(used, limit, ceiling)
+                if accepted:
+                    self.assertEqual(
+                        runner._validated_ask_context_pack(value)["budget"][
+                            "context_bytes_used"
+                        ],
+                        used,
+                    )
+                else:
+                    with self.assertRaises(runner.RunnerError):
+                        runner._validated_ask_context_pack(value)
+
+    def test_codex_direct_projection_rejects_over_ceiling_context_bytes(self) -> None:
+        for name, used, limit, ceiling, expected in (
+            ("used_zero", 0, 4, 4, 0),
+            ("used_equals_limits", 4, 4, 4, 4),
+            ("over_requested_limit", 2, 1, 4, None),
+            ("over_token_ceiling", 2, 1, 1, None),
+        ):
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                value = request(condition="treatment")
+                manifest = bind_manifest(
+                    value, Path(directory), commit=COMMIT.upper(), repo_root="/tmp/repo"
+                )
+                snapshot_ref = {
+                    "manifest_path": str(manifest),
+                    "manifest_sha256": value["repobrief"]["manifest_sha256"],
+                    "git_commit": COMMIT.upper(),
+                    "freshness_status": "fresh",
+                }
+                payload = {
+                    "kind": "repobrief.mcp.read_only_frontdoor",
+                    "version": "v1",
+                    "tool": "ask_context",
+                    "status": "ok",
+                    "context_pack": {
+                        "kind": "repobrief.ask_context_pack",
+                        "version": "1.0",
+                        "snapshot_ref": snapshot_ref,
+                        "freshness": {"status": "fresh"},
+                        "resolved_ranges": [],
+                        "budget": {
+                            "context_bytes_used": used,
+                            "max_context_bytes": limit,
+                            "token_derived_byte_ceiling": ceiling,
+                        },
+                    },
+                    "live_freshness": {
+                        "kind": "repobrief.live_freshness",
+                        "version": "v1",
+                        "status": "fresh",
+                        "reason": "git_head_matches_snapshot",
+                        "bundle_manifest": str(manifest),
+                        "repo_root": "/tmp/repo",
+                        "read_only_git_probe": True,
+                        "implicit_refresh": False,
+                        "snapshot_provenance": {"git_commit": COMMIT.upper()},
+                    },
+                }
+                events = [{
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "ask_context",
+                        "arguments": {"query": "example"},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }]
+                calls = [{
+                    "sequence": 1, "name": "ask_context", "status": "success",
+                    "duration_ms": 0, "input_bytes": 1, "output_bytes": 1,
+                }]
+                with patch.object(
+                    runner,
+                    "_validated_treatment_structured_payload",
+                    return_value=payload,
+                ):
+                    evidence = runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                if expected is None:
+                    self.assertIsNone(evidence)
+                else:
+                    self.assertEqual(
+                        evidence["calls"][0]["context_bytes_used"], expected
                     )
 
     def test_codex_manifest_bind_failure_omits_optional_evidence(self) -> None:

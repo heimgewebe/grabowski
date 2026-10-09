@@ -2179,6 +2179,60 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 "pass",
             )
 
+    def test_claude_ask_context_enforces_hard_context_byte_ceilings(self) -> None:
+        def ask_context(budget: dict):
+            def build(manifest: str) -> dict:
+                return {
+                    "kind": "repobrief.mcp.read_only_frontdoor",
+                    "version": "v1",
+                    "tool": "ask_context",
+                    "status": "ok",
+                    "context_pack": {
+                        "kind": "repobrief.ask_context_pack",
+                        "version": "1.0",
+                        "snapshot_ref": {
+                            "manifest_path": manifest,
+                            "git_commit": COMMIT,
+                            "freshness_status": "fresh",
+                        },
+                        "freshness": {"status": "fresh"},
+                        "resolved_ranges": [],
+                        "budget": dict(budget),
+                    },
+                    "live_freshness": self._freshness(manifest),
+                }
+
+            return build
+
+        cases = (
+            ("used_zero", 0, 8, 16, True),
+            ("used_equals_both_limits", 16, 16, 16, True),
+            ("used_equals_lower_requested_limit", 8, 8, 16, True),
+            ("used_below_limits", 3, 8, 16, True),
+            ("used_over_requested_limit", 2, 1, 16, False),
+            ("used_over_token_ceiling", 2, 1, 1, False),
+            ("requested_limit_over_ceiling", 1, 32, 16, False),
+        )
+        for name, used, limit, ceiling, accepted in cases:
+            with self.subTest(case=name):
+                evidence = self._evidence_for_payload(
+                    "ask_context",
+                    ask_context({
+                        "context_bytes_used": used,
+                        "max_context_bytes": limit,
+                        "token_derived_byte_ceiling": ceiling,
+                        # Unicode counts are separate from byte limits.
+                        "context_unicode_characters_used": 1000,
+                        "approx_context_chars_used": 1000,
+                    }),
+                )
+                if accepted:
+                    self.assertEqual(
+                        evidence["calls"][0]["context_bytes_used"], used
+                    )
+                else:
+                    self.assertIsNone(evidence)
+
     def test_malformed_claude_payload_shapes_do_not_raise(self) -> None:
         for tool, payload in (
             ("live_freshness", lambda m: {"kind": "repobrief.live_freshness", "bundle_manifest": m}),

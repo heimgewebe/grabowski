@@ -228,6 +228,8 @@ Der Receipt enthält:
   dabei die same-call `live_freshness`-Hülle, revisionsgebundene
   Resource-Reads zählen ihre tatsächlich gelesenen Inhaltsbytes, reines
   Resource-Listing bleibt Nicht-Evidence;
+  `ask_context`-Kontextbytes müssen `context_bytes_used <= max_context_bytes <=
+  token_derived_byte_ceiling` erfüllen, sonst wird die Evidence verworfen;
   `fresh` und `stale` werden nur projiziert, wenn die `live_freshness`-Hülle
   `read_only_git_probe: true`, ein nichtleeres `repo_root` exakt gleich dem
   Manifest-`repo_root`, `implicit_refresh: false` und eine an den
