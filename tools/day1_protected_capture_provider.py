@@ -10,6 +10,7 @@ registration, legacy receipt upgrade, or productive admission is provided.
 from __future__ import annotations
 
 import ctypes
+import errno
 import grp
 import hashlib
 import json
@@ -253,8 +254,9 @@ def _drop_to_child(uid: int, gid: int) -> None:
 
 
 # x86_64 Linux Landlock ABI (required by the pinned ELF64 x86-64 policy).
-# Restricts *filesystem-backed* execution. Anonymous memfd execution and
-# arbitrary in-process code loading remain outside this prototype's proof.
+# Landlock alone restricts only filesystem-backed execution. A separate
+# Seccomp filter narrows known anonymous execution syscalls; neither filter
+# establishes a complete in-process or transitive executable-code closure.
 _LANDLOCK_CREATE_RULESET = 444
 _LANDLOCK_ADD_RULE = 445
 _LANDLOCK_RESTRICT_SELF = 446
@@ -329,9 +331,82 @@ def _confine_child_filesystem_exec(program_fd: int) -> None:
         raise CaptureDenied("Landlock execution restriction unavailable") from exc
 
 
+# Pinned Linux x86-64 Seccomp UAPI. This is a narrow denial of two known
+# anonymous-FD execution routes, NOT a complete executable-code sandbox.
+# seccomp_data.arch is at byte offset 4, nr at 0; x32 shares the arch token
+# but ORs 0x40000000 into its syscall numbers and must not evade the filter.
+_PR_SET_SECCOMP = 22
+_SECCOMP_MODE_FILTER = 2
+_AUDIT_ARCH_X86_64 = 0xC000003E
+_X32_SYSCALL_BIT = 0x40000000
+_SYS_MEMFD_CREATE = 319
+_SYS_EXECVEAT = 322
+_BPF_LD_W_ABS = 0x20
+_BPF_JMP_JEQ_K = 0x15
+_BPF_JMP_JGE_K = 0x35
+_BPF_RET_K = 0x06
+_SECCOMP_RET_KILL_PROCESS = 0x80000000
+_SECCOMP_RET_ERRNO_EPERM = 0x00050000 | errno.EPERM
+_SECCOMP_RET_ALLOW = 0x7FFF0000
+
+
+class _SeccompSockFilter(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_uint16), ("jt", ctypes.c_uint8),
+        ("jf", ctypes.c_uint8), ("k", ctypes.c_uint32),
+    ]
+
+
+class _SeccompSockFprog(ctypes.Structure):
+    _fields_ = [
+        ("len", ctypes.c_uint16),
+        ("filter", ctypes.POINTER(_SeccompSockFilter)),
+    ]
+
+
+def _seccomp_anonymous_exec_instructions() -> tuple[_SeccompSockFilter, ...]:
+    # Every branch lands on a kernel action without backward jumps. Always
+    # check ABI first (including x32) before comparing native syscall IDs.
+    return (
+        _SeccompSockFilter(_BPF_LD_W_ABS, 0, 0, 4),
+        _SeccompSockFilter(_BPF_JMP_JEQ_K, 1, 0, _AUDIT_ARCH_X86_64),
+        _SeccompSockFilter(_BPF_RET_K, 0, 0, _SECCOMP_RET_KILL_PROCESS),
+        _SeccompSockFilter(_BPF_LD_W_ABS, 0, 0, 0),
+        _SeccompSockFilter(_BPF_JMP_JGE_K, 0, 1, _X32_SYSCALL_BIT),
+        _SeccompSockFilter(_BPF_RET_K, 0, 0, _SECCOMP_RET_KILL_PROCESS),
+        _SeccompSockFilter(_BPF_JMP_JEQ_K, 0, 1, _SYS_MEMFD_CREATE),
+        _SeccompSockFilter(_BPF_RET_K, 0, 0, _SECCOMP_RET_ERRNO_EPERM),
+        _SeccompSockFilter(_BPF_JMP_JEQ_K, 0, 1, _SYS_EXECVEAT),
+        _SeccompSockFilter(_BPF_RET_K, 0, 0, _SECCOMP_RET_ERRNO_EPERM),
+        _SeccompSockFilter(_BPF_RET_K, 0, 0, _SECCOMP_RET_ALLOW),
+    )
+
+
+def _confine_child_anonymous_exec() -> None:
+    """Block native memfd_create and execveat before the pinned first exec.
+
+    Called ONLY in the already unprivileged, no_new_privs child following
+    Landlock. Uses the parent's prebound libc prctl pointer; missing kernel
+    support or denial fails closed before any collector bytes are captured.
+    This does not rule out arbitrary in-process code or prove full closure.
+    """
+    try:
+        instructions = _seccomp_anonymous_exec_instructions()
+        rule_array = (_SeccompSockFilter * len(instructions))(*instructions)
+        program = _SeccompSockFprog(len(rule_array), rule_array)
+        if _LANDLOCK_PRCTL(
+            ctypes.c_int(_PR_SET_SECCOMP), ctypes.c_ulong(_SECCOMP_MODE_FILTER),
+            ctypes.byref(program), ctypes.c_ulong(0), ctypes.c_ulong(0),
+        ) != 0:
+            raise CaptureDenied("seccomp anonymous exec restriction unavailable")
+    except OSError as exc:
+        raise CaptureDenied("seccomp anonymous exec restriction unavailable") from exc
+
+
 def _prepare_child_capture(uid: int, gid: int, program_fd: int) -> None:
     _drop_to_child(uid, gid)
     _confine_child_filesystem_exec(program_fd)
+    _confine_child_anonymous_exec()
 
 
 def _kill_group(pid: int) -> None:
