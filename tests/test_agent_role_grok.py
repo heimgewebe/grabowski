@@ -909,6 +909,8 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertIn(hashlib.sha256(diff).hexdigest().encode(), prompt)
         self.assertIn(b"frozen", prompt)
         self.assertNotIn("frozen", " ".join(actual))
+        self.assertIn("review input", actual[-1].lower())
+        self.assertNotIn("git diff", actual[-1].lower())
         with self.assertRaisesRegex(RuntimeError, "source"):
             role._claude_json_review_command(
                 declared, expected_head="a" * 40, expected_base_head="b" * 40,
