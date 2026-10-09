@@ -1910,9 +1910,9 @@ def _live_snapshot_commit(
         commit = snapshot.get("git_commit")
         if not (_is_commit(commit) and str(commit).lower() == manifest_commit):
             return None
-        if payload.get("status") in {"fresh", "stale"} and not (
-            # A fresh/stale verdict is only proven by a read-only probe of
-            # exactly the bound repository root without an implicit refresh.
+        if not (
+            # Snapshot-bound evidence of any status requires the permitted
+            # read-only probe of exactly the bound root without implicit refresh.
             payload.get("read_only_git_probe") is True
             and isinstance(payload.get("repo_root"), str)
             and bool(payload.get("repo_root"))

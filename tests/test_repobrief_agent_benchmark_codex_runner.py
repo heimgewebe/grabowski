@@ -4336,6 +4336,41 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     self._codex_live_freshness_evidence(root=root, **overrides)
                 )
 
+    def test_codex_snapshot_binds_every_status_to_proven_probe(self) -> None:
+        reasons = {
+            "fresh": "git_head_matches_snapshot",
+            "stale": "git_head_differs_from_snapshot",
+            "unknown": "snapshot_working_tree_cleanliness_unavailable",
+            "not_comparable": "current_git_provenance_unavailable",
+        }
+        for status, reason in reasons.items():
+            with self.subTest(status=status, case="valid"):
+                evidence = self._codex_live_freshness_evidence(
+                    root="/tmp/repo", status=status, reason=reason
+                )
+                self.assertEqual(evidence["calls"][0]["freshness_status"], status)
+            for case, overrides in (
+                ("probe_false", {"read_only_git_probe": False}),
+                ("root_none", {"repo_root": None}),
+                ("root_mismatch", {"repo_root": "/tmp/other"}),
+                ("implicit_refresh", {"implicit_refresh": True}),
+            ):
+                with self.subTest(status=status, case=case):
+                    self.assertIsNone(
+                        self._codex_live_freshness_evidence(
+                            root="/tmp/repo", status=status, reason=reason, **overrides
+                        )
+                    )
+        with self.subTest(case="malformed_not_comparable"):
+            self.assertIsNone(
+                self._codex_live_freshness_evidence(
+                    root="/tmp/repo",
+                    status="not_comparable",
+                    reason="random_reason",
+                    read_only_git_probe=False,
+                )
+            )
+
     def test_codex_preserves_unknown_and_not_comparable_fallbacks(self) -> None:
         unknown = self._codex_live_freshness_evidence(
             root="/tmp/repo",
