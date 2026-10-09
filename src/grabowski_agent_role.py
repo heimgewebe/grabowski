@@ -320,7 +320,16 @@ def write_receipt(path: Path, payload: dict[str, Any], *, create_only: bool = Fa
             dir_fd=directory_fd,
         )
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            try:
+                handle = os.fdopen(descriptor, "w", encoding="utf-8")
+            except BaseException:
+                # Ownership transfers only after fdopen returns successfully.
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                raise
+            with handle:
                 json.dump(payload, handle, ensure_ascii=True, sort_keys=True, indent=2)
                 handle.write("\n")
                 handle.flush()

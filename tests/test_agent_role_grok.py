@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -43,6 +44,50 @@ class GrokReviewRoleTests(unittest.TestCase):
             os.chmod(parent, 0o750)
             with self.assertRaises(PermissionError):
                 role.write_receipt(parent / "other.json", {}, create_only=True)
+
+    def test_fdopen_failure_closes_raw_descriptor_and_removes_temp(self) -> None:
+        # A failure to wrap an already opened fd must not exhaust a long-lived
+        # reviewer/operator process. Both legacy replace and create-only paths
+        # have the same pre-ownership constructor boundary.
+        for create_only in (False, True):
+            with self.subTest(create_only=create_only):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    target = root / "attempt.json"
+                    real_open = os.open
+                    opened_temporary: list[int] = []
+
+                    def capture_open(name, flags, *args, **kwargs):
+                        fd = real_open(name, flags, *args, **kwargs)
+                        if (
+                            isinstance(name, str)
+                            and name.startswith(".attempt.json.")
+                            and name.endswith(".tmp")
+                        ):
+                            opened_temporary.append(fd)
+                        return fd
+
+                    with (
+                        mock.patch.object(role.os, "open", side_effect=capture_open),
+                        mock.patch.object(
+                            role.os, "fdopen",
+                            side_effect=OSError(errno.EMFILE, "synthetic fdopen failure"),
+                        ),
+                        self.assertRaisesRegex(OSError, "synthetic fdopen failure"),
+                    ):
+                        role.write_receipt(
+                            target, {"verdict": "PASS"}, create_only=create_only
+                        )
+
+                    self.assertEqual(len(opened_temporary), 1)
+                    with self.assertRaises(OSError) as closed:
+                        os.fstat(opened_temporary[0])
+                    self.assertEqual(closed.exception.errno, errno.EBADF)
+                    self.assertFalse(target.exists())
+                    self.assertEqual(list(root.glob("*.tmp")), [])
+                    self.assertFalse(
+                        any(p.name.startswith(".attempt.json.") for p in root.iterdir())
+                    )
 
     def test_create_only_receipt_rejects_link_attacks(self) -> None:
         for kind in ("symlink", "hardlink", "parent-symlink"):
