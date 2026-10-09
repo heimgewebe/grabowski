@@ -19,7 +19,7 @@ ORIGIN_SCHEMA_VERSION = 1
 ORIGIN_KIND = "grabowski_job_origin"
 ORIGIN_INVOCATION_RE = re.compile(r"grabowski_[a-z0-9_]{1,80}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
-UNIT_RE = re.compile(r"grabowski-job-([0-9a-f]{12})")
+UNIT_RE = re.compile(r"grabowski-job-([0-9a-f]{12}|rgpm-[0-9a-f]{16}-[0-9]{2})")
 OWNER_RE = re.compile(r"uid:[0-9]+")
 STARTED_AT_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"
