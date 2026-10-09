@@ -3656,6 +3656,10 @@ class TaskTests(unittest.TestCase):
             ["/opt/codex", "exec", "--sandbox", "read-only", "--sandbox", "workspace-write"],
             ["/opt/codex", "exec", "--sandbox", "read-only", "--dangerously-bypass-approvals-and-sandbox"],
             ["/opt/codex", "exec", "--sandbox", "workspace-write", "--read-only"],
+            ["/opt/grok", "--model", "grok-4.6", "--permission-mode", "plan", "--always-approve"],
+            ["/opt/grok", "--permission-mode", "plan"],
+            ["/opt/grok-cli", "--permission-mode=plan", "--always-approve"],
+            ["/opt/agy", "--permission-mode", "plan"],
             ["/opt/claude", "--permission-mode", "acceptEdits", "--", "--read-only"],
             ["/opt/claude", "--permission-mode", "plan", "--dangerously-skip-permissions"],
         ]
@@ -3685,6 +3689,39 @@ class TaskTests(unittest.TestCase):
                     transport="local", argv=argv, mutating_workspace=None
                 )
                 self.assertEqual(classification["effect_profile"], "read_only")
+
+    def test_unverified_grok_plan_mode_keeps_workspace_and_quota_guard(self) -> None:
+        # Grok plan mode does not confine Bash or write-capable subagents.
+        argv = ["/opt/grok", "--permission-mode", "plan", "--always-approve"]
+        denial = {
+            "schema_version": 1,
+            "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True,
+            "admitted": False,
+            "reason_code": "quota_pool_blocked",
+            "argv_sha256": "1" * 64,
+            "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 149}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=denial,
+        ) as admission, patch.object(
+            tasks, "_dispatch"
+        ) as dispatch, patch.object(tasks.base, "_append_audit"):
+            with self.assertRaisesRegex(
+                RuntimeError, "coding-agent pre-dispatch admission denied"
+            ):
+                tasks.grabowski_task_start(
+                    "local", argv, cwd=str(self.root), runtime_seconds=60
+                )
+        admission.assert_called_once_with(argv, read_only_execution=False)
+        dispatch.assert_not_called()
+        self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
     def test_codex_unverified_read_only_flag_does_not_bypass_opaque_pool(self) -> None:
         # Managed Codex requirements may override -s read-only with write-capable

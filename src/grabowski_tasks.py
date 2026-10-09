@@ -3840,11 +3840,11 @@ def _validate_task_effect_profile(value: str | None) -> str | None:
 
 def _agent_read_only(argv: list[str], executable: str) -> bool:
     """Exempt only effective read-only modes, never payload tokens or overrides."""
-    # Codex managed permission profiles may override --sandbox read-only with
-    # write-capable defaults (openai/codex#47464). argv is not sandbox proof.
-    # Until the effective permissions are independently verified, retain the
-    # workspace lease and block advisory-only opaque quota.
-    if executable == "codex":
+    # Only Claude plan mode has the narrowly validated read-only contract.
+    # Codex's managed profiles can override its sandbox (openai/codex#47464);
+    # Grok plan mode still permits Bash writes and write-capable subagents.
+    # Other harnesses therefore retain workspace leases and opaque-quota gates.
+    if executable != "claude":
         return False
     controls = argv[1:]
     if "--" in controls:
@@ -3872,7 +3872,7 @@ def _agent_read_only(argv: list[str], executable: str) -> bool:
                     modes.append(item[len(name) + 1 :])
                     break
     # Duplicate/conflicting modes are never accepted as read-only.
-    return len(modes) == 1 and modes[0] in READ_ONLY_AGENT_MODES
+    return len(modes) == 1 and modes[0] == "plan"
 
 
 def _classify_task_effect(
