@@ -606,6 +606,11 @@ class GrokReviewRoleTests(unittest.TestCase):
         actual = sandbox.call_args.args[1]
         self.assertEqual("/opt/grabowski-external/claude", actual[0])
         self.assertIn("-p", actual)
+        self.assertEqual(1, actual.count("-p"))
+        self.assertEqual("1", actual[actual.index("--max-turns") + 1])
+        self.assertIn("exact", actual[-1].lower())
+        self.assertIn("stdin", actual[-1].lower())
+        self.assertNotEqual(declared[-1], actual[-1])
         self.assertEqual("json", actual[actual.index("--output-format") + 1])
         self.assertEqual("plan", actual[actual.index("--permission-mode") + 1])
         schema = json.loads(actual[actual.index("--json-schema") + 1])
@@ -617,6 +622,43 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertEqual("*", actual[actual.index("--disallowedTools") + 1])
         self.assertNotIn("Review exact committed change", actual)
         self.assertNotIn("interesting_but_untrusted", " ".join(actual))
+
+    def test_claude_fable_review_route_accepts_registered_cli_shape(self) -> None:
+        repo = Path("/tmp/claude-review-worktree")
+        declared = [
+            "claude", "-p", "--safe-mode", "--permission-mode", "plan",
+            "--model", "claude-fable-5", "--effort", "high",
+            "Review only the exact current revision",
+        ]
+        prepared = PreparedSandboxCommand(
+            command=("/opt/grabowski-external/claude", *declared[1:]),
+        )
+        frozen = b"diff --git a/a.py b/a.py\n+safe only\n"
+        with (
+            mock.patch.object(role, "prepare_external_agent_command",
+                              return_value=prepared) as prepare,
+            mock.patch.object(role, "sandbox_argv",
+                              return_value=["read-only-sandbox"]) as sandbox,
+        ):
+            argv, contract, stdin = role._review_sandbox_argv(
+                repo, declared, expected_head="a" * 40,
+                expected_base_head="b" * 40, review_diff=frozen,
+            )
+        self.assertEqual(["read-only-sandbox"], argv)
+        self.assertEqual(role.CLAUDE_REVIEW_JSON_CONTRACT, contract)
+        self.assertIn(frozen, stdin)
+        prepare.assert_called_once_with(declared)
+        actual = sandbox.call_args.args[1]
+        self.assertEqual(declared, sandbox.call_args.kwargs["declared_command"])
+        self.assertEqual(1, actual.count("-p"))
+        self.assertEqual(1, actual.count("--safe-mode"))
+        self.assertEqual("claude-fable-5", actual[actual.index("--model") + 1])
+        self.assertEqual("high", actual[actual.index("--effort") + 1])
+        self.assertEqual("plan", actual[actual.index("--permission-mode") + 1])
+        self.assertEqual("1", actual[actual.index("--max-turns") + 1])
+        self.assertIn("stdin", actual[-1].lower())
+        self.assertNotIn("safe only", " ".join(actual))
+        self.assertEqual("*", actual[actual.index("--disallowedTools") + 1])
 
     def test_claude_review_bound_input_rejects_unsafe_or_oversized_diff(self) -> None:
         command = (
@@ -663,6 +705,67 @@ class GrokReviewRoleTests(unittest.TestCase):
                 )
                 self.assertIsNone(document)
                 self.assertIsNotNone(rejected)
+
+    def test_claude_structured_findings_revalidated_locally(self) -> None:
+        valid_finding = {
+            "severity": "P2", "path": "src/role.py", "line": 12,
+            "evidence": "Concrete broken trust boundary",
+            "impact": "Incorrect irreversible reviewer receipt",
+            "minimal_fix": "Validate the exact finding fields before signing",
+        }
+        envelope = {
+            "type": "result", "subtype": "success", "is_error": False,
+            "structured_output": {
+                "verdict": "NEEDS_CHANGE", "findings": [valid_finding],
+            },
+        }
+        document, error, _meta = role._extract_claude_review_document(
+            json.dumps(envelope).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(envelope["structured_output"], json.loads(document))
+        mutations = (
+            {},
+            {**valid_finding, "extra": "forged"},
+            {**valid_finding, "severity": "P0"},
+            {**valid_finding, "severity": []},
+            {**valid_finding, "line": 0},
+            {**valid_finding, "line": True},
+            {**valid_finding, "line": "12"},
+            {**valid_finding, "path": " "},
+            {**valid_finding, "evidence": ""},
+            {**valid_finding, "impact": " "},
+            {**valid_finding, "minimal_fix": ""},
+        )
+        for invalid in mutations:
+            with self.subTest(invalid=invalid):
+                payload = {
+                    **envelope,
+                    "structured_output": {
+                        "verdict": "BLOCK", "findings": [invalid],
+                    },
+                }
+                result, failure, _meta = role._extract_claude_review_document(
+                    json.dumps(payload).encode()
+                )
+                self.assertIsNone(result)
+                self.assertIsNotNone(failure)
+        for payload in (
+            {"verdict": "PASS", "findings": [valid_finding]},
+            {"verdict": "BLOCK", "findings": []},
+            {"verdict": "PENDING", "findings": []},
+            {"verdict": [], "findings": []},
+            {"verdict": {}, "findings": []},
+            {"verdict": "PASS", "findings": {}},
+        ):
+            with self.subTest(payload=payload):
+                result, failure, _meta = role._extract_claude_review_document(
+                    json.dumps({
+                        **envelope, "structured_output": payload,
+                    }).encode()
+                )
+                self.assertIsNone(result)
+                self.assertIsNotNone(failure)
 
     def test_claude_review_does_not_reuse_unbound_candidate_diff(self) -> None:
         # Caller-provided review text must not substitute an exact Git three-dot
