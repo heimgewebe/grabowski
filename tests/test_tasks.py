@@ -2649,7 +2649,7 @@ class TaskTests(unittest.TestCase):
         )
 
     def test_legacy_read_only_agent_resume_uses_effective_argv_mode(self) -> None:
-        argv = ["/opt/codex", "exec", "--sandbox", "read-only"]
+        argv = ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"]
         admitted = {
             "schema_version": 1,
             "kind": "coding_agent_pre_dispatch_admission",
@@ -3641,13 +3641,16 @@ class TaskTests(unittest.TestCase):
         self.assertEqual("task_start", local["surface"])
         repository = tasks._classify_task_effect(transport="local", argv=["/opt/codex", "exec", "--sandbox", "workspace-write"], mutating_workspace=str(self.root), explicit_effect_profile="repository_write")
         self.assertEqual("repository_write", repository["effect_profile"])
-        read_only = tasks._classify_task_effect(transport="local", argv=["/opt/codex", "exec", "--sandbox", "read-only"], mutating_workspace=None)
+        read_only = tasks._classify_task_effect(transport="local", argv=["/opt/claude", "--permission-mode", "plan"], mutating_workspace=None)
         self.assertEqual("read_only", read_only["effect_profile"])
         remote = tasks._classify_task_effect(transport="ssh", argv=["/opt/codex", "exec", "--sandbox", "workspace-write"], mutating_workspace=None)
         self.assertEqual("remote_write", remote["effect_profile"])
 
     def test_read_only_classification_rejects_payload_flags_conflicts_and_overrides(self) -> None:
         write_commands = [
+            ["/opt/codex", "exec", "--sandbox", "read-only"],
+            ["/opt/codex", "exec", "-s", "read-only"],
+            ["/opt/codex", "exec", "--sandbox=read-only", "prompt"],
             ["/opt/codex", "exec", "--sandbox", "workspace-write", "--", "--read-only"],
             ["/opt/codex", "exec", "--", "--sandbox", "read-only"],
             ["/opt/codex", "exec", "--sandbox", "read-only", "--sandbox", "workspace-write"],
@@ -3668,8 +3671,8 @@ class TaskTests(unittest.TestCase):
                 self.assertEqual(classification["effect_profile"], "workspace_write")
 
         for argv in (
-            ["/opt/codex", "exec", "--sandbox", "read-only", "--", "--read-only"],
-            ["/opt/codex", "exec", "--sandbox=read-only", "prompt"],
+            ["/opt/claude", "--permission-mode", "plan", "--", "--read-only"],
+            ["/opt/claude", "--permission-mode=plan", "-p", "prompt"],
             ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"],
         ):
             with self.subTest(argv=argv), patch.object(
@@ -3682,6 +3685,40 @@ class TaskTests(unittest.TestCase):
                     transport="local", argv=argv, mutating_workspace=None
                 )
                 self.assertEqual(classification["effect_profile"], "read_only")
+
+    def test_codex_unverified_read_only_flag_does_not_bypass_opaque_pool(self) -> None:
+        # Managed Codex requirements may override -s read-only with write-capable
+        # default permissions (openai/codex#47464); argv is not proof.
+        argv = ["/opt/codex", "exec", "-s", "read-only", "prompt"]
+        denial = {
+            "schema_version": 1,
+            "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True,
+            "admitted": False,
+            "reason_code": "quota_pool_blocked",
+            "argv_sha256": "1" * 64,
+            "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 149}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=denial,
+        ) as admission, patch.object(
+            tasks, "_dispatch"
+        ) as dispatch, patch.object(tasks.base, "_append_audit"):
+            with self.assertRaisesRegex(
+                RuntimeError, "coding-agent pre-dispatch admission denied"
+            ):
+                tasks.grabowski_task_start(
+                    "local", argv, cwd=str(self.root), runtime_seconds=60
+                )
+        admission.assert_called_once_with(argv, read_only_execution=False)
+        dispatch.assert_not_called()
+        self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
     def test_payload_read_only_token_does_not_bypass_writer_admission(self) -> None:
         argv = [
@@ -4851,7 +4888,7 @@ class TaskTests(unittest.TestCase):
             ["port:4567", f"repo:{self.root}"],
         )
 
-    def test_read_only_codex_task_does_not_lease_workspace(self) -> None:
+    def test_unverified_codex_read_only_flag_keeps_workspace_lease(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "read-only"]
         admitted = {
             "schema_version": 1,
@@ -4877,10 +4914,10 @@ class TaskTests(unittest.TestCase):
             result = tasks.grabowski_task_start(
                 "local", argv, cwd=str(self.root), runtime_seconds=60
             )
-        admission.assert_called_once_with(argv, read_only_execution=True)
-        self.assertEqual(result["task"]["resource_keys"], [])
-        self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
-        self.assertEqual(result["task_effect_classification"]["effect_profile"], "read_only")
+        admission.assert_called_once_with(argv, read_only_execution=False)
+        self.assertEqual(result["task"]["resource_keys"], [f"repo:{self.root}"])
+        self.assertEqual(result["audit"]["implicit_workspace_resource_key"], f"repo:{self.root}")
+        self.assertEqual(result["task_effect_classification"]["effect_profile"], "workspace_write")
         self.assertNotIn("read_routing_advisory", result)
         self.assertNotIn("read_routing_advisory", result["audit"])
 

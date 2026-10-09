@@ -3839,7 +3839,13 @@ def _validate_task_effect_profile(value: str | None) -> str | None:
 
 
 def _agent_read_only(argv: list[str], executable: str) -> bool:
-    """Exempt only one unambiguous CLI mode, never payload tokens or overrides."""
+    """Exempt only effective read-only modes, never payload tokens or overrides."""
+    # Codex managed permission profiles may override --sandbox read-only with
+    # write-capable defaults (openai/codex#47464). argv is not sandbox proof.
+    # Until the effective permissions are independently verified, retain the
+    # workspace lease and block advisory-only opaque quota.
+    if executable == "codex":
+        return False
     controls = argv[1:]
     if "--" in controls:
         controls = controls[:controls.index("--")]
