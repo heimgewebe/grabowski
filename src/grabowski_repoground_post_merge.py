@@ -2474,7 +2474,7 @@ def reconcile_recent_captain_audit_followups(
     discovery_started_monotonic = time.monotonic()
 
     import grabowski_audit_query
-    import grabowski_operator
+    import grabowski_operator_core as grabowski_operator
 
     cursor_tasks: Any | None = None
     cursor_before: str | None = None
