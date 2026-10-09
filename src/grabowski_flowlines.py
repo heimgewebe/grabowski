@@ -248,14 +248,18 @@ def _identity_from_meta(
     verified: Mapping[str, Any] | None = None,
 ) -> dict[str, str] | None:
     verified = verified or {}
-    user_id = _nonempty_text(verified.get("id"), maximum=512)
-    if user_id is None:
-        user_id = _nonempty_text(meta.get("user.id"), maximum=512)
+    verified_user_id = _nonempty_text(verified.get("id"), maximum=512)
+    user_id = verified_user_id or _nonempty_text(meta.get("user.id"), maximum=512)
     session_id = _nonempty_text(meta.get("session.id"), maximum=512)
-    if user_id is None or session_id is None:
+    # Stateful clients may supply session context. In stateless HTTP, only a
+    # verified connector may emit a span without it; do not invent a session.
+    if user_id is None or (session_id is None and verified_user_id is None):
         return None
 
-    return {"user.id": user_id, "session.id": session_id}
+    identity = {"user.id": user_id}
+    if session_id is not None:
+        identity["session.id"] = session_id
+    return identity
 
 
 def _augment_tool_schema(tool: Any) -> None:

@@ -639,8 +639,8 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.root.isError)
         self.assertEqual(self.exporter.get_finished_spans(), ())
 
-    async def test_missing_client_session_reports_once_without_private_data(self) -> None:
-        mcp = self.server(verified_resolver=lambda _ctx: {"id": "verified-test-user"})
+    async def test_unverified_client_user_without_session_reports_once_without_private_data(self) -> None:
+        mcp = self.server()
         arguments = {
             "value": "private-value-do-not-log",
             "reason": "Reason contains private-reason-do-not-log",
@@ -666,8 +666,54 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertNotIn(secret, records.output[0])
 
+    async def test_verified_connector_without_session_emits_redacted_tool_span(self) -> None:
+        mcp = self.server(verified_resolver=lambda _ctx: {"id": "enrolled-connector"})
+        result = await self.call(
+            mcp,
+            arguments={
+                "value": "private-value-do-not-export",
+                "reason": "Read a harmless value",
+                "user_intent": "Verify stateless MCP tool telemetry",
+            },
+            meta={
+                "user.id": "spoofed-client-user",
+                "user.email": "private@example.invalid",
+            },
+        )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(
+            result.root.structuredContent, {"value": "private-value-do-not-export"}
+        )
+        spans = self.exporter.get_finished_spans()
+        self.assertEqual(len(spans), 1)
+        attrs = spans[0].attributes
+        self.assertEqual(attrs["user.id"], "enrolled-connector")
+        self.assertNotIn("session.id", attrs)
+        self.assertEqual(attrs["mcp.method.name"], "tools/call")
+        self.assertEqual(attrs["gen_ai.tool.name"], "echo")
+        for private_value in (
+            "private-value-do-not-export",
+            "spoofed-client-user",
+            "private@example.invalid",
+        ):
+            self.assertNotIn(private_value, str(attrs))
+
+    async def test_missing_verified_identity_never_admits_sessionless_span(self) -> None:
+        mcp = self.server(verified_resolver=lambda _ctx: {"id": " "})
+        result = await self.call(
+            mcp,
+            arguments={
+                "value": "hello",
+                "reason": "Read a harmless value",
+                "user_intent": "Reject unverified sessionless analytics",
+            },
+            meta={"user.id": "spoofed-client-user"},
+        )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(self.exporter.get_finished_spans(), ())
+
     async def test_failing_diagnostic_logger_keeps_domain_call_fail_open(self) -> None:
-        mcp = self.server(verified_resolver=lambda _ctx: {"id": "verified-test-user"})
+        mcp = self.server()
         with mock.patch.object(
             flowlines.LOGGER, "warning", side_effect=RuntimeError("logging transport unavailable")
         ):
