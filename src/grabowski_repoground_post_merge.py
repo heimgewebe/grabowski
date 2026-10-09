@@ -2351,10 +2351,10 @@ def initialize_reconcile_discovery_watermark(
     retain unfinished obligations instead of replacing their lower boundary.
     """
     import grabowski_audit_query
-    import grabowski_operator
+    import grabowski_operator_core
     import grabowski_tasks
 
-    if not isinstance(getattr(grabowski_operator, "STATE_DIR", None), Path):
+    if not isinstance(getattr(grabowski_operator_core, "STATE_DIR", None), Path):
         raise RepoGroundPostMergeError(
             "RepoGround discovery state store is unavailable"
         )
