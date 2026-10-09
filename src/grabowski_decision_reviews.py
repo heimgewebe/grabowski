@@ -385,15 +385,18 @@ def decision_review_lock(binding: dict[str, Any]) -> Iterator[None]:
             os.close(descriptor)
 
 
-def _read_private_bytes(path: Path, max_bytes: int) -> bytes:
+def _read_private_bytes(
+    path: Path, max_bytes: int, *, require_private_parent: bool = True
+) -> bytes:
     """Read a size-bounded, owner-private regular file through a stable fd."""
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     parent_fd = os.open(path.parent, flags | os.O_DIRECTORY)
     try:
         parent = os.fstat(parent_fd)
-        if (
-            not stat.S_ISDIR(parent.st_mode)
-            or parent.st_uid != os.getuid()
+        if not stat.S_ISDIR(parent.st_mode):
+            raise ValueError("review evidence parent is not a directory")
+        if require_private_parent and (
+            parent.st_uid != os.getuid()
             or stat.S_IMODE(parent.st_mode) & 0o077
         ):
             raise ValueError("review evidence parent is not owner-private")
@@ -432,9 +435,13 @@ def _read_private_bytes(path: Path, max_bytes: int) -> bytes:
         os.close(parent_fd)
 
 
-def _read_private_json(path: Path, max_bytes: int) -> dict[str, Any]:
+def _read_private_json(
+    path: Path, max_bytes: int, *, require_private_parent: bool = True
+) -> dict[str, Any]:
     """Read one stable owner-private JSON object without following its path."""
-    content = _read_private_bytes(path, max_bytes)
+    content = _read_private_bytes(
+        path, max_bytes, require_private_parent=require_private_parent
+    )
     try:
         value = json.loads(content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -984,7 +991,13 @@ def _validated_review_role_evidence(
 ) -> dict[str, Any] | None:
     if provenance is None:
         return None
-    receipt = _read_private_json(Path(provenance["role_receipt_path"]), MAX_ROLE_RECEIPT_BYTES)
+    # V1 allowed caller-selected private files in shared directories. Retain
+    # its fd/no-follow/owner/nlink/size checks; require a private parent for
+    # new V2 job-owned receipts only.
+    receipt = _read_private_json(
+        Path(provenance["role_receipt_path"]), MAX_ROLE_RECEIPT_BYTES,
+        require_private_parent=provenance["schema_version"] == 2,
+    )
     expected_receipt_sha256 = _agent_role_receipt_sha256(receipt)
     if receipt.get("receipt_sha256") != expected_receipt_sha256:
         raise ValueError("decision review role receipt digest mismatch")
