@@ -728,6 +728,9 @@ int main(void) {
             (0x20, 0, 0, 0),  # seccomp_data.nr
             (0x35, 0, 1, 0x40000000),  # x32 ABI must fail closed
             (0x06, 0, 0, 0x80000000),
+            (0x35, 0, 2, 512),  # legacy untagged x32 512..547
+            (0x35, 1, 0, 548),  # 548+ may be native, do not kill
+            (0x06, 0, 0, 0x80000000),
             (0x15, 0, 1, 319),  # memfd_create
             (0x06, 0, 0, 0x00050000 | errno.EPERM),
             (0x15, 0, 1, 322),  # execveat
@@ -763,6 +766,44 @@ int main(void) {
         ):
             cap._confine_child_anonymous_exec()
         self.assertEqual(1, len(observed))
+
+    def test_seccomp_denies_legacy_x32_raw_545_without_blocking_native_548(self) -> None:
+        # Linux before 5.4 permitted untagged x32 syscall numbers 512..547.
+        # In particular 545 may dispatch x32 execveat without the x32 flag.
+        # Interpret this *actual* cBPF instruction list independently instead
+        # of inspecting individual instructions or invoking x32 in this process.
+        instructions = cap._seccomp_anonymous_exec_instructions()
+
+        def outcome(nr: int, arch: int = 0xC000003E) -> int:
+            accumulator = 0
+            pc = 0
+            for _ in range(32):
+                self.assertLess(pc, len(instructions), "BPF fell off program")
+                instruction = instructions[pc]
+                if instruction.code == 0x20:  # BPF_LD_W_ABS
+                    accumulator = arch if instruction.k == 4 else nr
+                    pc += 1
+                elif instruction.code == 0x15:  # BPF_JMP_JEQ_K
+                    pc += 1 + (instruction.jt if accumulator == instruction.k else instruction.jf)
+                elif instruction.code == 0x35:  # BPF_JMP_JGE_K
+                    pc += 1 + (instruction.jt if accumulator >= instruction.k else instruction.jf)
+                elif instruction.code == 0x06:  # BPF_RET_K
+                    return instruction.k
+                else:
+                    self.fail(f"unsupported seccomp BPF opcode: {instruction.code}")
+            self.fail("BPF has no terminal action")
+
+        for nr in (512, 520, 545, 547):
+            with self.subTest(raw_legacy_x32=nr):
+                self.assertEqual(0x80000000, outcome(nr))
+        for nr in (511, 548, 549):
+            with self.subTest(native_allowed=nr):
+                self.assertEqual(0x7FFF0000, outcome(nr))
+        for nr in (319, 322):
+            with self.subTest(native_denied=nr):
+                self.assertEqual(0x00050000 | errno.EPERM, outcome(nr))
+        self.assertEqual(0x80000000, outcome(0x40000000 | 545))
+        self.assertEqual(0x80000000, outcome(322, arch=0x40000003))
 
     def test_seccomp_installation_failure_is_fail_closed(self) -> None:
         self._anonymous_exec_patch.stop()

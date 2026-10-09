@@ -333,8 +333,9 @@ def _confine_child_filesystem_exec(program_fd: int) -> None:
 
 # Pinned Linux x86-64 Seccomp UAPI. This is a narrow denial of two known
 # anonymous-FD execution routes, NOT a complete executable-code sandbox.
-# seccomp_data.arch is at byte offset 4, nr at 0; x32 shares the arch token
-# but ORs 0x40000000 into its syscall numbers and must not evade the filter.
+# seccomp_data.arch is at byte offset 4, nr at 0; x32 shares the arch token.
+# Reject both __X32_SYSCALL_BIT and the historically untagged 512..547 range,
+# which pre-5.4 kernels could still dispatch (notably execveat at nr 545).
 _PR_SET_SECCOMP = 22
 _SECCOMP_MODE_FILTER = 2
 _AUDIT_ARCH_X86_64 = 0xC000003E
@@ -373,6 +374,12 @@ def _seccomp_anonymous_exec_instructions() -> tuple[_SeccompSockFilter, ...]:
         _SeccompSockFilter(_BPF_RET_K, 0, 0, _SECCOMP_RET_KILL_PROCESS),
         _SeccompSockFilter(_BPF_LD_W_ABS, 0, 0, 0),
         _SeccompSockFilter(_BPF_JMP_JGE_K, 0, 1, _X32_SYSCALL_BIT),
+        _SeccompSockFilter(_BPF_RET_K, 0, 0, _SECCOMP_RET_KILL_PROCESS),
+        # x32 syscalls 512..547 could be dispatched without the x32 marker
+        # before Linux 5.4; reject that entire range rather than relying
+        # on today's kernel ENOSYS behavior. Native 548+ is unaffected.
+        _SeccompSockFilter(_BPF_JMP_JGE_K, 0, 2, 512),
+        _SeccompSockFilter(_BPF_JMP_JGE_K, 1, 0, 548),
         _SeccompSockFilter(_BPF_RET_K, 0, 0, _SECCOMP_RET_KILL_PROCESS),
         _SeccompSockFilter(_BPF_JMP_JEQ_K, 0, 1, _SYS_MEMFD_CREATE),
         _SeccompSockFilter(_BPF_RET_K, 0, 0, _SECCOMP_RET_ERRNO_EPERM),
