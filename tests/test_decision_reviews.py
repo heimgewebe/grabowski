@@ -1,6 +1,8 @@
 from pathlib import Path
+import hashlib
 import json
 import os
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -152,7 +154,10 @@ def make_job(
     review_result: dict | None,
     diff_sha256: str = DIFF,
     review_role: bool = False,
+    attempt_bound: bool = False,
+    legacy_role_receipt_parent: Path | None = None,
     origin_provenance: bool = True,
+    attempt_epoch: int | None = None,
     metadata_argv_override: list[str] | None = None,
     created_at_unix: int = 1_787_000_000,
     started_at_unix_ns: int | None = None,
@@ -174,7 +179,11 @@ def make_job(
         "plan",
         "Review the frozen revision",
     ]
-    role_receipt_path = directory / "review-role-receipt.json"
+    role_receipt_path = (
+        directory / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+        if attempt_bound else
+        (legacy_role_receipt_parent or directory) / "review-role-receipt.json"
+    )
     job_argv = (
         [
             reviews.REVIEW_ROLE_PYTHON,
@@ -210,9 +219,12 @@ def make_job(
     }
     if started_at_unix_ns is not None:
         scope["started_at_unix_ns"] = started_at_unix_ns
+    if attempt_epoch is not None:
+        scope["decision_review_attempt_epoch"] = attempt_epoch
     if review_role and origin_provenance:
         provenance = reviews.review_role_provenance(
-            job_argv, normalized_binding, cwd=Path("/tmp/review")
+            job_argv, normalized_binding, cwd=Path("/tmp/review"),
+            attempt_directory=directory if attempt_bound else None,
         )
         assert provenance is not None
         scope["decision_review_provenance"] = provenance
@@ -289,6 +301,9 @@ def make_job(
             "findings": [],
             "failure_classification": "passed",
         }
+        if attempt_bound:
+            role_receipt["review_attempt_unit"] = unit
+            role_receipt["review_attempt_origin_sha256"] = origin_sha
         role_receipt["receipt_sha256"] = reviews._agent_role_receipt_sha256(
             role_receipt
         )
@@ -429,6 +444,118 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertTrue(attempt["independence_verified"])
         self.assertEqual(attempt["review_route_id"], "claude-opus-5.5-high")
         self.assertEqual(attempt["review_provider_family"], "anthropic")
+
+
+    def test_v1_role_receipt_in_shared_audit_directory_remains_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            shared = root / "shared-audit"
+            shared.mkdir(mode=0o755)
+            make_job(
+                jobs, suffix="a00000000215", slot="independent-reviewer",
+                terminal_status="succeeded", review_result=None, review_role=True,
+                legacy_role_receipt_parent=shared,
+            )
+            receipt = shared / "review-role-receipt.json"
+            self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o600)
+            outcome = self.reconcile(jobs)
+        self.assertEqual(outcome["status"], "settled")
+        self.assertEqual(outcome["errors"], [])
+        self.assertTrue(outcome["attempts"][0]["independence_verified"])
+
+    def test_v1_shared_parent_still_rejects_symlinks_hardlinks_and_fifos(self) -> None:
+        for attack in ("symlink", "hardlink", "fifo"):
+            with self.subTest(attack=attack):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    jobs = root / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    shared = root / "shared-audit"
+                    shared.mkdir(mode=0o755)
+                    make_job(
+                        jobs, suffix="a00000000216", slot="independent-reviewer",
+                        terminal_status="succeeded", review_result=None, review_role=True,
+                        legacy_role_receipt_parent=shared,
+                    )
+                    receipt = shared / "review-role-receipt.json"
+                    if attack == "symlink":
+                        other = shared / "other-private.json"
+                        other.write_bytes(receipt.read_bytes())
+                        os.chmod(other, 0o600)
+                        receipt.unlink()
+                        receipt.symlink_to(other)
+                    elif attack == "hardlink":
+                        os.link(receipt, shared / "extra-link")
+                    else:
+                        receipt.unlink()
+                        os.mkfifo(receipt, 0o600)
+                    outcome = self.reconcile(jobs)
+                self.assertEqual(outcome["status"], "blocked")
+                self.assertEqual(outcome["attempts"][0]["classification"], "invalid_result")
+                self.assertTrue(any(error.startswith(
+                    "decision_review_result_invalid:grabowski-job-a00000000216:"
+                ) for error in outcome["errors"]))
+
+    def test_v2_role_receipt_still_requires_private_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            jobs.mkdir(mode=0o700)
+            directory = make_job(
+                jobs, suffix="a00000000217", slot="independent-reviewer",
+                terminal_status="succeeded", review_result=None, review_role=True,
+                attempt_bound=True,
+            )
+            metadata = json.loads((directory / "metadata.json").read_text())
+            os.chmod(directory, 0o755)
+            with self.assertRaisesRegex(ValueError, "parent is not owner-private"):
+                reviews._validated_review_role_evidence(
+                    metadata, reviews.normalize_binding(binding("independent-reviewer")),
+                    metadata["scope"]["decision_review_provenance"],
+                )
+
+    def test_historical_review_role_prior_module_digest_survives_upgrade_only_if_pinned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            jobs.mkdir()
+            directory = make_job(
+                jobs, suffix="a00000000052", slot="independent-reviewer",
+                terminal_status="succeeded", review_result=None, review_role=True,
+            )
+            metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+            provenance = dict(metadata["scope"]["decision_review_provenance"])
+            historical_bytes = b"immutable-previous-release-reviewer-module"
+            release_root = root / "releases"
+            historical = (
+                release_root
+                / "0123456789ab-srcset0123456789ab-lock0123456789ab-contract0123456789ab"
+                / ".venv" / "lib" / "python3.10" / "site-packages"
+                / f"{reviews.REVIEW_ROLE_MODULE}.py"
+            )
+            historical.parent.mkdir(parents=True)
+            historical.write_bytes(historical_bytes)
+            provenance["runner_module_path"] = str(historical)
+            provenance["runner_module_sha256"] = hashlib.sha256(historical_bytes).hexdigest()
+            provenance["provenance_sha256"] = reviews.sha256_json({
+                key: value for key, value in provenance.items() if key != "provenance_sha256"
+            })
+            with mock.patch.object(reviews, "REVIEW_ROLE_RELEASE_ROOT", release_root):
+                self.assertEqual(
+                    reviews._normalize_review_role_provenance(
+                        provenance, reviews.normalize_binding(binding("independent-reviewer")),
+                        cwd="/tmp/review",
+                    ),
+                    provenance,
+                )
+                historical.write_bytes(historical_bytes + b"tampered")
+                with self.assertRaisesRegex(ValueError, "binding mismatch"):
+                    reviews._normalize_review_role_provenance(
+                        provenance, reviews.normalize_binding(binding("independent-reviewer")),
+                        cwd="/tmp/review",
+                    )
 
     def test_historical_review_role_path_rotation_accepts_identical_immutable_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1582,6 +1709,389 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             reconciled = self.reconcile(jobs)
         self.assertEqual(reconciled["status"], "blocked")
         self.assertTrue(any(error.startswith("decision_review_origin_invalid:") for error in reconciled["errors"]))
+
+
+    def test_job_owned_attempt_receipts_are_distinct_across_parallel_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            first = make_job(jobs, suffix="a11111111111", slot="A",
+                             terminal_status="succeeded", review_result=None,
+                             review_role=True, attempt_bound=True)
+            second = make_job(jobs, suffix="b22222222222", slot="A",
+                              terminal_status="succeeded", review_result=None,
+                              review_role=True, attempt_bound=True)
+            provider = make_job(jobs, suffix="c33333333333", slot="B",
+                                terminal_status="succeeded", review_result=None,
+                                review_role=True, attempt_bound=True)
+            names = {str(p / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME) for p in (first, second, provider)}
+            self.assertEqual(len(names), 3)
+            output = self.reconcile(jobs)
+        self.assertEqual(output["status"], "settled")
+        self.assertEqual(output["attempt_count"], 3)
+        self.assertTrue(all(slot["pass_count"] > 0 for slot in output["slots"]))
+
+    def test_job_owned_attempt_receipt_swap_is_invalid_not_superseded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            first = make_job(jobs, suffix="a11111111111", slot="A",
+                             terminal_status="succeeded", review_result=None,
+                             review_role=True, attempt_bound=True)
+            second = make_job(jobs, suffix="b22222222222", slot="A",
+                              terminal_status="succeeded", review_result=None,
+                              review_role=True, attempt_bound=True)
+            name = reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+            write_private(second / name, (first / name).read_text(encoding="utf-8"))
+            output = self.reconcile(jobs)
+        self.assertEqual(output["status"], "blocked")
+        self.assertIn("decision_review_result_invalid:grabowski-job-b22222222222:ValueError", output["errors"])
+
+    def test_job_owned_attempt_path_tamper_is_not_an_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            first = make_job(jobs, suffix="a11111111111", slot="A",
+                             terminal_status="succeeded", review_result=None,
+                             review_role=True, attempt_bound=True)
+            second = make_job(jobs, suffix="b22222222222", slot="A",
+                              terminal_status="succeeded", review_result=None,
+                              review_role=True, attempt_bound=True)
+            metadata_path = second / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            provenance = metadata["scope"]["decision_review_provenance"]
+            provenance["role_receipt_path"] = str(first / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME)
+            provenance["provenance_sha256"] = reviews.sha256_json(
+                {key: value for key, value in provenance.items() if key != "provenance_sha256"}
+            )
+            metadata["origin"]["scope"]["decision_review_provenance"] = provenance
+            metadata["origin_sha256"] = reviews.sha256_json(metadata["origin"])
+            write_private(metadata_path, json.dumps(metadata))
+            output = self.reconcile(jobs)
+        self.assertEqual(output["status"], "blocked")
+        self.assertTrue(any(error.startswith("decision_review_origin_invalid:grabowski-job-b22222222222:")
+                            for error in output["errors"]))
+
+    def test_job_owned_attempt_symlink_and_hardlink_receipts_are_invalid(self) -> None:
+        for link_type in ("symlink", "hardlink"):
+            with self.subTest(link_type=link_type):
+                with tempfile.TemporaryDirectory() as temporary:
+                    jobs = Path(temporary) / "jobs"
+                    jobs.mkdir(mode=0o700)
+                    first = make_job(jobs, suffix="a11111111111", slot="A",
+                                     terminal_status="succeeded", review_result=None,
+                                     review_role=True, attempt_bound=True)
+                    second = make_job(jobs, suffix="b22222222222", slot="A",
+                                      terminal_status="succeeded", review_result=None,
+                                      review_role=True, attempt_bound=True)
+                    path = second / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+                    path.unlink()
+                    source = first / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+                    if link_type == "symlink":
+                        path.symlink_to(source)
+                    else:
+                        os.link(source, path)
+                    output = self.reconcile(jobs)
+                self.assertEqual(output["status"], "blocked")
+                self.assertTrue(any(error.startswith("decision_review_result_invalid:")
+                                    for error in output["errors"]))
+
+    def test_material_reject_in_job_owned_receipt_survives_later_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            first = make_job(jobs, suffix="a11111111111", slot="A",
+                             terminal_status="failed", review_result=None,
+                             review_role=True, attempt_bound=True)
+            make_job(jobs, suffix="b22222222222", slot="A",
+                     terminal_status="succeeded", review_result=None,
+                     review_role=True, attempt_bound=True,
+                     created_at_unix=1_787_000_200)
+            path = first / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+            receipt.update({
+                "verdict": "NEEDS_CHANGE",
+                "findings": [{"severity": "P1", "evidence": "material security issue"}],
+                "returncode": 1,
+                "failure_classification": "review_verdict",
+            })
+            receipt["receipt_sha256"] = reviews._agent_role_receipt_sha256(receipt)
+            write_private(path, json.dumps(receipt))
+            output = self.reconcile(jobs)
+        self.assertEqual(output["status"], "blocked")
+        self.assertIn("decision_review_material_reject:a:grabowski-job-a11111111111", output["errors"])
+
+    def test_v2_failed_missing_receipt_remains_blocked_after_later_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a44444444444", slot="A",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True,
+            )
+            (failed / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME).unlink()
+            make_job(
+                jobs, suffix="b55555555555", slot="A",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True,
+                created_at_unix=1_787_000_200,
+            )
+            outcome = self.reconcile(jobs)
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertIn(
+            "decision_review_result_invalid:grabowski-job-a44444444444:FileNotFoundError",
+            outcome["errors"],
+        )
+        attempts = {a["unit"]: a for a in outcome["attempts"]}
+        self.assertEqual(attempts["grabowski-job-a44444444444"]["classification"], "invalid_result")
+        self.assertEqual(attempts["grabowski-job-b55555555555"]["classification"], "pass")
+
+    def test_v2_invalid_reviewer_document_survives_later_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            invalid = make_job(
+                jobs, suffix="a66666666666", slot="A",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True,
+            )
+            receipt_path = invalid / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt.update({
+                "verdict": "INVALID",
+                "findings": [],
+                "returncode": 126,
+                "failure_classification": "invalid_review_output",
+            })
+            receipt["receipt_sha256"] = reviews._agent_role_receipt_sha256(receipt)
+            write_private(receipt_path, json.dumps(receipt))
+            make_job(
+                jobs, suffix="b77777777777", slot="A",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True,
+                created_at_unix=1_787_000_200,
+            )
+            outcome = self.reconcile(jobs)
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertIn(
+            "decision_review_result_invalid:grabowski-job-a66666666666:InvalidReviewDocument",
+            outcome["errors"],
+        )
+        attempts = {a["unit"]: a for a in outcome["attempts"]}
+        self.assertEqual(attempts["grabowski-job-a66666666666"]["classification"], "invalid_result")
+        self.assertEqual(attempts["grabowski-job-b77777777777"]["classification"], "pass")
+
+
+    def test_noncanonical_release_role_runner_is_rejected_before_start(self) -> None:
+        command = [
+            "/opt/grabowski-releases/release/.venv/bin/python", "-I",
+            "-m", reviews.REVIEW_ROLE_MODULE,
+            "--role", "review", "--output", "/tmp/shared-receipt.json",
+        ]
+        with self.assertRaisesRegex(ValueError, "noncanonical"):
+            reviews.bind_job_review_role_argv(
+                command, reviews.normalize_binding(binding("A")),
+                cwd=Path("/tmp/review"),
+                attempt_directory=Path("/tmp/grabowski-job-a11111111111"),
+            )
+        generic = ["python3", "-c", "print('safe generic decision marker')"]
+        self.assertEqual(
+            reviews.bind_job_review_role_argv(
+                generic, reviews.normalize_binding(binding("A")),
+                cwd=Path("/tmp/review"),
+                attempt_directory=Path("/tmp/grabowski-job-a11111111111"),
+            ),
+            generic,
+        )
+
+    def test_epoch_two_does_not_reconstruct_legacy_role_on_missing_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="b88888888888", slot="A",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, origin_provenance=False,
+                attempt_epoch=2,
+            )
+            outcome = self.reconcile(jobs)
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertEqual(outcome["attempts"][0]["review_role_verified"], False)
+        self.assertEqual(outcome["attempts"][0]["independence_verified"], False)
+
+    def test_epoch_two_rejects_historical_v1_role_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="c99999999999", slot="A",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, origin_provenance=True,
+                attempt_bound=False, attempt_epoch=2,
+            )
+            outcome = self.reconcile(jobs)
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertTrue(any(
+            error.startswith("decision_review_origin_invalid:grabowski-job-c99999999999:")
+            for error in outcome["errors"]
+        ))
+
+    def test_fifo_evidence_files_fail_without_blocking_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            fifo = directory / "metadata.json"
+            os.mkfifo(fifo, 0o600)
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                reviews._read_private_json(fifo, 1024)
+            fifo.unlink()
+            fifo = directory / "stdout.log"
+            os.mkfifo(fifo, 0o600)
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                reviews._read_stdout_tail(fifo)
+
+    def test_stdout_tail_does_not_follow_mid_read_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            trusted = directory / "stdout.log"
+            trusted.write_bytes(b"trusted review marker")
+            os.chmod(trusted, 0o600)
+            # Keep a link to the opened inode so fstat(nlink == 1) holds
+            # after the pathname is replaced with an unrelated symlink.
+            held = directory / "held"
+            os.link(trusted, held)
+            outside = directory / "synthetic-secret"
+            outside.write_bytes(b"SYNTHETIC_CROSS_FILE_READ")
+            os.chmod(outside, 0o600)
+            real_open = os.open
+            swapped = False
+
+            def swap_after_fd_open(name, flags, *args, **kwargs):
+                nonlocal swapped
+                descriptor = real_open(name, flags, *args, **kwargs)
+                if name == "stdout.log" and not swapped:
+                    trusted.unlink()
+                    trusted.symlink_to(outside)
+                    swapped = True
+                return descriptor
+
+            with mock.patch.object(reviews.os, "open", side_effect=swap_after_fd_open):
+                content, digest = reviews._read_stdout_tail(trusted)
+            self.assertTrue(swapped)
+            self.assertEqual(content, "trusted review marker")
+            self.assertEqual(digest, hashlib.sha256(b"trusted review marker").hexdigest())
+            self.assertNotIn("SYNTHETIC_CROSS_FILE_READ", content)
+
+
+    def test_named_provider_slot_family_identity_is_exact_not_substring(self) -> None:
+        self.assertEqual(reviews._named_slot_provider_family("independent-gemini-pro"), "google")
+        self.assertEqual(reviews._named_slot_provider_family("independent-grok-review"), "xai")
+        self.assertEqual(reviews._named_slot_provider_family("independent-claude-review"), "anthropic")
+        self.assertEqual(reviews._named_slot_provider_family("independent-codex-review"), "openai")
+        self.assertIsNone(reviews._named_slot_provider_family("independent-reviewer"))
+        self.assertIsNone(reviews._named_slot_provider_family("independent-geminix-review"))
+        with self.assertRaisesRegex(ValueError, "conflicting reviewer providers"):
+            reviews.normalize_binding(binding("independent-gemini-grok-review"))
+
+    def test_named_provider_slot_rejects_other_canonical_independent_route(self) -> None:
+        normalized = reviews.normalize_binding(binding("independent-gemini-pro"))
+        role_command = [
+            "claude", "--model", "claude-opus-5-5",
+            "--effort", "high", "--permission-mode", "plan",
+            "Review frozen code",
+        ]
+        argv = [
+            reviews.REVIEW_ROLE_PYTHON, "-I", "-m", reviews.REVIEW_ROLE_MODULE,
+            "--role", "review", "--repository", "/tmp/review",
+            "--expected-head", HEAD, "--expected-base-head", BASE,
+            "--expected-diff-sha256", "e" * 64,
+            "--expected-dirty", "false", "--output", "/tmp/review-attempt.json",
+            "--", *role_command,
+        ]
+        self.assertIsNone(reviews.review_role_provenance(
+            argv, normalized, cwd=Path("/tmp/review"),
+        ))
+        with self.assertRaisesRegex(ValueError, "valid read-only reviewer"):
+            reviews.bind_job_review_role_argv(
+                argv, normalized, cwd=Path("/tmp/review"),
+                attempt_directory=Path("/tmp/grabowski-job-a11111111111"),
+            )
+        self.assertIsNotNone(reviews.review_role_provenance(
+            argv, reviews.normalize_binding(binding("independent-claude-review")),
+            cwd=Path("/tmp/review"),
+        ))
+
+    def test_named_provider_slot_rejects_generic_pass_before_launch(self) -> None:
+        with self.assertRaisesRegex(ValueError, "canonical independent reviewer"):
+            reviews.bind_job_review_role_argv(
+                ["python3", "-c", "print('structured review marker')"],
+                reviews.normalize_binding(binding("independent-gemini-pro")),
+                cwd=Path("/tmp/review"),
+                attempt_directory=Path("/tmp/grabowski-job-a11111111111"),
+            )
+        generic = reviews.normalize_binding(binding("independent-reviewer"))
+        command = ["python3", "-c", "print('generic review marker')"]
+        self.assertEqual(reviews.bind_job_review_role_argv(
+            command, generic, cwd=Path("/tmp/review"),
+            attempt_directory=Path("/tmp/grabowski-job-a11111111111"),
+        ), command)
+
+    def test_historical_provider_mismatch_is_rejected_on_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            # Build a correctly origin-bound legacy-style witness under the
+            # old no-slot-family regime. The new reader must reject it.
+            with mock.patch.object(reviews, "_named_slot_provider_family", return_value=None):
+                make_job(
+                    jobs, suffix="a33333333333", slot="independent-gemini-pro",
+                    terminal_status="succeeded", review_result=None,
+                    review_role=True, attempt_bound=True,
+                )
+            result = self.reconcile(jobs)
+        self.assertEqual(result["status"], "blocked")
+        self.assertTrue(any(
+            x.startswith("decision_review_origin_invalid:grabowski-job-a33333333333:")
+            for x in result["errors"]
+        ))
+
+    def test_generic_named_provider_pass_cannot_borrow_other_independent_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="a44444444444", slot="independent-gemini-pro",
+                terminal_status="succeeded",
+                review_result=result("independent-gemini-pro", "PASS_THIS_REVISION", 0),
+            )
+            make_job(
+                jobs, suffix="b55555555555", slot="independent-reviewer",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "blocked")
+        self.assertIn(
+            "decision_review_named_provider_slot_without_independent_pass:independent-gemini-pro",
+            reconciled["errors"],
+        )
+        slots = {item["slot"]: item for item in reconciled["slots"]}
+        self.assertEqual(slots["independent-gemini-pro"]["pass_count"], 1)
+        self.assertEqual(slots["independent-gemini-pro"]["independent_pass_count"], 0)
+        self.assertEqual(slots["independent-reviewer"]["independent_pass_count"], 1)
+
+    def test_provider_matched_named_review_slot_settles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="a66666666666", slot="independent-claude-review",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "settled")
+        self.assertEqual(reconciled["slots"][0]["independent_pass_count"], 1)
 
 
 if __name__ == "__main__":

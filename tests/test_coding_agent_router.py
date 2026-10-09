@@ -1921,10 +1921,10 @@ class CodingAgentRouterTests(unittest.TestCase):
         direct = self._route("independent-review")
         self.assertEqual([], direct["reviewers"])
         self.assertEqual("no-independent-review-route", direct["review_status"])
-        self.assertIn("reviewer:codex-sol-review-high", direct["excluded"])
+        self.assertIn("reviewer:codex-astra-review-high", direct["excluded"])
         self.assertIn(
             "reviewer shares the primary provider family",
-            direct["excluded"]["reviewer:codex-sol-review-high"],
+            direct["excluded"]["reviewer:codex-astra-review-high"],
         )
 
         self.state = self._fresh_state()
@@ -1945,7 +1945,7 @@ class CodingAgentRouterTests(unittest.TestCase):
         )
         self.assertEqual("claude-opus-5.5-writer-high", delegated["writer_route"])
         self.assertEqual(
-            "codex-sol-review-high",
+            "codex-astra-review-high",
             delegated["reviewers"][0]["route"],
         )
         self.assertNotEqual(

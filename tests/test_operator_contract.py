@@ -687,6 +687,7 @@ class OperatorContractTests(unittest.TestCase):
 
         fake = types.SimpleNamespace(
             evaluate_resume_gate=lambda _head: gate(),
+            _initial_gate_admits_locked_recheck=lambda value: value.get("allowed") is True and not value.get("reasons"),
             midcutover=types.SimpleNamespace(
                 LANE_MID_CUTOVER_RESUME="mid-cutover",
                 RESUME_PHASES=("resume-phase",),
@@ -705,6 +706,39 @@ class OperatorContractTests(unittest.TestCase):
         self.assertTrue(evidence["allowed"], evidence["reasons"])
         self.assertEqual([], evidence["reasons"])
         self.assertIn("retry_authority", evidence["does_not_establish"])
+
+        from tests.test_provenance_recovery import provenance_recovery
+
+        fake._initial_gate_admits_locked_recheck = provenance_recovery._initial_gate_admits_locked_recheck
+        for state in ("identical", "stale", "kill_switch", "blockade", "audit", "unreadable", "locked"):
+            with self.subTest(state=state):
+                assessment = {
+                    **gate(), "allowed": False, "reasons": ["no_competing_deployment"],
+                    "checks": {
+                        "kill_switch_clear": True, "no_blocking_operator_blockade": True,
+                        "audit_chain_valid": True, "no_competing_deployment": False,
+                    },
+                    "competing_deployment": {
+                        "deploy_lock_free": state != "locked",
+                        "inflight_deploy_jobs": ["grabowski-job-abcdef012345"],
+                        "error": "unreadable" if state == "unreadable" else None,
+                    },
+                }
+                failed = {
+                    "kill_switch": "kill_switch_clear", "blockade": "no_blocking_operator_blockade",
+                    "audit": "audit_chain_valid",
+                }.get(state)
+                if failed:
+                    assessment["checks"][failed] = False
+                    assessment["reasons"] = sorted([failed, "no_competing_deployment"])
+                fake.evaluate_resume_gate = lambda _head: assessment
+                with patch.dict(sys.modules, {"grabowski_provenance_recovery": fake}, clear=False):
+                    evidence = operator._deployment_admission_midcutover_recovery_evidence(
+                        "grabowski_recovery_provenance_repair", {"expected_head": head}, tool, marker,
+                    )
+                self.assertEqual(evidence["allowed"], state in {"identical", "stale"}, evidence)
+                self.assertIn("retry_authority", evidence["does_not_establish"])
+        fake.evaluate_resume_gate = lambda _head: gate()
 
         expired = {**marker, "state": "expired", "active": False}
         with patch.dict(
@@ -772,6 +806,7 @@ class OperatorContractTests(unittest.TestCase):
 
         def evidence_for(binding, *, allowed=True, lane="mid-cutover"):
             fake = types.SimpleNamespace(
+                _initial_gate_admits_locked_recheck=lambda value: value.get("allowed") is True and not value.get("reasons"),
                 evaluate_resume_gate=lambda _head: {
                     "allowed": allowed,
                     "reasons": [] if allowed else ["no_competing_deployment"],
@@ -3089,7 +3124,7 @@ class OperatorContractTests(unittest.TestCase):
                 operator.decision_reviews, "LOCKS_ROOT", locks
             ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
                 operator, "_run", return_value=launcher
-            ):
+            ) as run_mock:
                 job = operator.grabowski_job_start(
                     argv,
                     cwd=str(cwd),
@@ -3098,6 +3133,17 @@ class OperatorContractTests(unittest.TestCase):
                 )
 
             provenance = job["scope"]["decision_review_provenance"]
+            expected_path = jobs / job["unit"] / operator.decision_reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+            self.assertEqual(provenance["schema_version"], 2)
+            self.assertEqual(job["scope"]["decision_review_attempt_epoch"], 2)
+            self.assertEqual(provenance["attempt_unit"], job["unit"])
+            self.assertEqual(provenance["role_receipt_path"], str(expected_path))
+            self.assertNotEqual(provenance["role_receipt_path"], str(output))
+            self.assertEqual(job["argv"][job["argv"].index("--output") + 1], str(expected_path))
+            self.assertIn(
+                f"--setenv=GRABOWSKI_REVIEW_ATTEMPT_UNIT={job['unit']}",
+                run_mock.call_args.args[0],
+            )
             self.assertEqual(provenance["kind"], "grabowski_decision_review_provenance")
             self.assertEqual(provenance["role"], "review")
             self.assertEqual(
@@ -3121,6 +3167,118 @@ class OperatorContractTests(unittest.TestCase):
                 provenance,
                 persisted["origin"]["scope"]["decision_review_provenance"],
             )
+
+
+    def test_two_review_jobs_with_one_supplied_output_get_distinct_receipts(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            jobs = state / "jobs"
+            locks = state / "decision-review-locks"
+            cwd = root / "cwd"
+            cwd.mkdir(mode=0o700)
+            binding = {
+                "schema_version": 1,
+                "kind": operator.decision_reviews.BINDING_KIND,
+                "repo": "heimgewebe/vibe-lab",
+                "pr": 350,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+                "diff_sha256": "c" * 64,
+                "slot": "independent-grok-review",
+            }
+            argv = [
+                operator.decision_reviews.REVIEW_ROLE_PYTHON,
+                "-I", "-m", operator.decision_reviews.REVIEW_ROLE_MODULE,
+                "--role", "review", "--repository", str(cwd),
+                "--expected-head", "a" * 40, "--expected-base-head", "b" * 40,
+                "--expected-diff-sha256", "e" * 64,
+                "--expected-dirty", "false",
+                "--output", str(root / "shared-legacy-output.json"),
+                "--", "grok", "--model", "grok-4.6", "Review frozen revision",
+            ]
+            launched = {
+                "returncode": 0,
+                "stdout": "started",
+                "stderr": "",
+                "argv": [],
+                "argv_sha256": "0" * 64,
+                "command": "systemd-run",
+                "cwd": str(root),
+                "timed_out": False,
+                "duration_seconds": 0.01,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+            counter = iter(range(1, 100))
+            def next_uuid():
+                return types.SimpleNamespace(hex=f"{next(counter):012x}" + ("f" * 20))
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator.decision_reviews, "LOCKS_ROOT", locks), patch.object(
+                operator.uuid, "uuid4", side_effect=next_uuid
+            ), patch.object(operator, "_run", return_value=launched):
+                first = operator.grabowski_job_start(
+                    argv, cwd=str(cwd), runtime_seconds=60, decision_review_binding=binding
+                )
+                second = operator.grabowski_job_start(
+                    argv, cwd=str(cwd), runtime_seconds=60, decision_review_binding=binding
+                )
+            self.assertNotEqual(first["unit"], second["unit"])
+            self.assertNotEqual(first["origin_sha256"], second["origin_sha256"])
+            self.assertNotEqual(
+                first["scope"]["decision_review_provenance"]["role_receipt_path"],
+                second["scope"]["decision_review_provenance"]["role_receipt_path"],
+            )
+            for job in (first, second):
+                path = jobs / job["unit"] / operator.decision_reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+                self.assertEqual(
+                    job["scope"]["decision_review_provenance"]["role_receipt_path"], str(path)
+                )
+                self.assertEqual(job["argv"][job["argv"].index("--output") + 1], str(path))
+                self.assertEqual(job["scope"]["decision_review_provenance"]["attempt_unit"], job["unit"])
+                persisted = json.loads(Path(job["metadata_path"]).read_text(encoding="utf-8"))
+                self.assertEqual(persisted["origin_sha256"], job["origin_sha256"])
+
+
+    def test_noncanonical_review_module_cannot_create_job_directory(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, cwd = root / "state", root / "state/jobs", root / "cwd"
+            cwd.mkdir(mode=0o700)
+            binding = {
+                "schema_version": 1,
+                "kind": operator.decision_reviews.BINDING_KIND,
+                "repo": "heimgewebe/vibe-lab",
+                "pr": 350,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+                "diff_sha256": "c" * 64,
+                "slot": "independent-reviewer",
+            }
+            alternate = [
+                "/opt/immutable-release/.venv/bin/python",
+                "-I", "-m", "grabowski_agent_role",
+                "--role", "review", "--output", str(root / "shared.json"),
+            ]
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(
+                operator, "_validate_argv", return_value=alternate
+            ), patch.object(
+                operator.uuid, "uuid4",
+                return_value=types.SimpleNamespace(hex="a11111111111" + "f" * 20),
+            ), patch.object(
+                operator, "_run", side_effect=AssertionError("must not launch")
+            ):
+                with self.assertRaisesRegex(ValueError, "noncanonical"):
+                    operator._start_job(
+                        alternate, cwd=str(cwd), runtime_seconds=60,
+                        decision_review_binding=binding,
+                    )
+            self.assertEqual(list(jobs.glob("grabowski-job-*")), [])
 
     def test_broad_github_wrapper_blocks_merge_bypass_paths(self) -> None:
         operator = _load_operator_module()

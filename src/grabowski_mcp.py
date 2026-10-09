@@ -603,6 +603,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "repoground_get_callers": ("bundle_registry",),
     "repoground_get_callees": ("bundle_registry",),
     "grabowski_runtime_health": (),
+    "grabowski_mcp_liveness": (),
     "grabowski_audit_projection": (),
     "grabowski_deployment_identity": (),
     "grabowski_contract_drift": (),
@@ -13908,6 +13909,22 @@ def _captain_audit_execution_result_material(
         if merge_completion_verified and isinstance(viewed, dict)
         else None
     )
+    post_merge_reconciliation = execution.get("post_merge_reconciliation")
+    if (
+        observed_merge_sha is None
+        and merge_completion_verified
+        and isinstance(post_merge_reconciliation, dict)
+        and post_merge_reconciliation.get("status")
+        == "verified_base_mutation_pr_metadata_unsettled"
+        and post_merge_reconciliation.get("errors") in (None, [])
+    ):
+        reconciled_merge_sha = post_merge_reconciliation.get("merge_sha")
+        if (
+            isinstance(reconciled_merge_sha, str)
+            and re.fullmatch(r"[0-9a-f]{40}", reconciled_merge_sha.lower())
+            is not None
+        ):
+            observed_merge_sha = reconciled_merge_sha.lower()
     external = execution.get("external_merge_reconciliation")
     external_merge_observed = (
         isinstance(external, dict)
@@ -13934,13 +13951,29 @@ def _captain_audit_execution_result_material(
     ):
         provenance_mode = "external_merge_reconciled"
     elif (
-        execution_invoked
-        and verification_passed
+        verification_passed
         and merge_queued
         and not merge_completion_verified
         and observed_merge_sha is None
         and not external_merge_observed
+        and (
+            execution_invoked
+            or (
+                execution.get("preflight_passed") is True
+                and execution.get("duplicate_dispatch_prevented") is True
+                and isinstance(execution.get("merge_queue_entry"), dict)
+                and isinstance(execution["merge_queue_entry"].get("id"), str)
+                and 1 <= len(execution["merge_queue_entry"]["id"]) <= 256
+                and execution.get("execution_attempted") is False
+                and not remote_mutation_observed
+                and execution.get("merge_queue_reconciliation")
+                in {"already_queued_before_dispatch", "queued_during_dispatch_guard"}
+            )
+        )
     ):
+        # A verified queue that Captain deliberately did not dispatch again
+        # still needs the same durable completion watcher. Do not permit an
+        # unverified queue, an external merge, or an ambiguous guard outcome.
         provenance_mode = "captain_queue_dispatch_pending"
     else:
         provenance_mode = "unverified"
@@ -13959,6 +13992,16 @@ def _captain_audit_execution_result_material(
             "provenance_mode": provenance_mode,
         }
     )
+    if provenance_mode == "captain_queue_dispatch_pending" and not execution_invoked:
+        # Preserve the concrete verified duplicate-prevention evidence in
+        # the immutable digest-bound completion audit. The Saga validator
+        # must not infer it from a queue flag alone.
+        material["verified_duplicate_queue"] = {
+            "preflight_passed": True,
+            "duplicate_dispatch_prevented": True,
+            "queue_entry_id": execution["merge_queue_entry"]["id"],
+            "merge_queue_reconciliation": execution["merge_queue_reconciliation"],
+        }
     return material
 
 
@@ -15139,6 +15182,54 @@ def _grip_run_core(
                 "error_code": _captain_audit_completion_error_code(exc),
                 "does_not_establish": ["audited_execution_completion"],
             }
+    if name == "captain-run" and allow_mutation:
+        actions = dispatch_parameters.get("actions")
+        captain_pr_merge = (
+            isinstance(actions, list)
+            and len(actions) == 1
+            and isinstance(actions[0], dict)
+            and actions[0].get("action") == "pr-merge"
+        )
+        if captain_pr_merge:
+            completion = (
+                result.get("captain_audit", {}).get("completion")
+                if isinstance(result.get("captain_audit"), dict)
+                else None
+            )
+            completion_sha256 = (
+                completion.get("audit_record_sha256")
+                if isinstance(completion, dict)
+                else None
+            )
+            if (
+                isinstance(completion_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", completion_sha256) is not None
+            ):
+                result["repoground_freshness_followup"] = {
+                    "kind": "grabowski.repoground_post_merge_followup",
+                    "schema_version": 1,
+                    "status": "durable_pending",
+                    "reason": "captain_audit_completion_persisted",
+                    "captain_audit_completion_sha256": completion_sha256,
+                    "reconciler": "grabowski-repoground-post-merge-reconcile.timer",
+                    "does_not_establish": [
+                        "job_started",
+                        "freshness_converged",
+                        "future_branch_freshness",
+                    ],
+                }
+            else:
+                result["repoground_freshness_followup"] = {
+                    "kind": "grabowski.repoground_post_merge_followup",
+                    "schema_version": 1,
+                    "status": "schedule_error",
+                    "reason": "captain_audit_completion_unavailable",
+                    "does_not_establish": [
+                        "job_started",
+                        "freshness_failed",
+                        "merge_failure",
+                    ],
+                }
     return result
 
 

@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "3d3685376352e7a8b8c36145aa88d614b16f0f9f865450a9a522b02a088921b1",
+  "capability_source_sha256": "2e158ca751ea852a8191e978d4689b4fc39fb351120f08423dbf126faf934a3c",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "37d292863168f2239c99ea41506d1626d58d0eeac4822c3bcc8c24854596d2c0",
+  "contract_sha256": "2681d2593edcdc23e200aa0fa3e6eec2cbda1b9c1794b1d9faf87fc81801c567",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -460,14 +460,25 @@
     },
     {
       "category": "context",
-      "description": "Return minimal Grabowski deployment, audit and kill-switch health.",
+      "description": "Return original deployment, audit and kill-switch integrity health.",
       "effects": [],
       "id": "grabowski_runtime_health",
-      "purpose": "Read minimal deployment, audit and kill-switch health without path inventories.",
+      "purpose": "Read deployment, audit and kill-switch integrity health with established healthy semantics.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_runtime_health"
+    },
+    {
+      "category": "context",
+      "description": "Report bounded MCP tool-dispatch liveness without integrity evaluation.",
+      "effects": [],
+      "id": "grabowski_mcp_liveness",
+      "purpose": "Read bounded MCP tool-dispatch liveness without establishing runtime or audit integrity.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_mcp_liveness"
     },
     {
       "category": "operations-observability",

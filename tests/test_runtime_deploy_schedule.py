@@ -886,6 +886,95 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             scheduler_source_identity, closed["source_identity_sha256"]
         )
 
+    def test_green_discovery_bootstrap_precedes_transient_operator_start(self) -> None:
+        snapshot = mock.Mock()
+        snapshot.contract = mock.Mock()
+        build = mock.Mock(release_path=Path("/release/green"))
+        runtime = dual.ProductionBlueGreenRuntime(
+            repo=ROOT,
+            runtime=Path("/runtime"),
+            snapshot=snapshot,
+            build=build,
+            activation=mock.Mock(steps=[]),
+            blue_manifest={},
+            blue_binding=runtime_binding("blue", HEAD_BLUE),
+            green_binding=runtime_binding("green", HEAD_GREEN),
+            selector_before={"selector_sha256": "7a" * 32},
+            cutover_id="bootstrap-before-green",
+            timeout_seconds=10,
+            green_unit="grabowski-green-operator-123456789abc.service",
+        )
+        with (
+            mock.patch.object(dual.core, "verify_apply_snapshot_unchanged"),
+            mock.patch.object(
+                dual, "install_watchdog_host_assets", return_value=mock.Mock()
+            ),
+            mock.patch.object(
+                dual, "install_safety_observer_unit", return_value={}
+            ),
+            mock.patch.object(
+                dual, "_initialize_post_merge_discovery_before_activation",
+                side_effect=RuntimeError("bootstrap refused ambiguous predecessor"),
+            ) as bootstrap,
+            mock.patch.object(dual, "_start_green_operator") as start_green,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "bootstrap refused ambiguous predecessor"
+            ):
+                runtime.start_green()
+            bootstrap.assert_called_once_with(
+                Path("/release/green"), timeout_seconds=10
+            )
+            start_green.assert_not_called()
+            self.assertFalse(runtime.green_started)
+
+    def test_discovery_bootstrap_requires_exact_receipt_before_green(self) -> None:
+        good = {
+            "kind": "grabowski.repoground_post_merge_discovery_bootstrap",
+            "schema_version": 1,
+            "status": "ok",
+            "initialized": True,
+            "global_ordinal": 1_675_780,
+        }
+        with mock.patch.object(
+            dual.core, "run",
+            return_value=mock.Mock(returncode=0, stdout=json.dumps(good)),
+        ) as run:
+            result = dual._initialize_post_merge_discovery_before_activation(
+                Path("/release/green"), timeout_seconds=10
+            )
+        self.assertEqual(result, {
+            "initialized": True,
+            "global_ordinal": 1_675_780,
+        })
+        run.assert_called_once_with(
+            [
+                "/release/green/.venv/bin/python",
+                "-I",
+                "-m",
+                "grabowski_repoground_post_merge",
+                "--initialize-reconcile-watermark",
+            ],
+            check=False,
+            capture=True,
+            timeout=960,
+        )
+        with (
+            mock.patch.object(
+                dual.core, "run",
+                return_value=mock.Mock(
+                    returncode=0, stdout='{"status":"ok","global_ordinal":3}'
+                ),
+            ),
+            mock.patch.object(
+                dual.core, "fail", side_effect=RuntimeError("invalid bootstrap")
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid bootstrap"):
+                dual._initialize_post_merge_discovery_before_activation(
+                    Path("/release/green"), timeout_seconds=10
+                )
+
     def test_start_green_marks_possible_unit_before_post_start_verification_failure(self) -> None:
         snapshot = mock.Mock()
         snapshot.contract = mock.Mock()
@@ -912,6 +1001,11 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             ),
             mock.patch.object(
                 dual, "install_safety_observer_unit", return_value={"installed": True}
+            ),
+            mock.patch.object(
+                dual,
+                "_initialize_post_merge_discovery_before_activation",
+                return_value={"initialized": True, "global_ordinal": 100},
             ),
             mock.patch.object(
                 dual,
