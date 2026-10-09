@@ -3186,7 +3186,7 @@ class OperatorContractTests(unittest.TestCase):
                 "head_sha": "a" * 40,
                 "base_sha": "b" * 40,
                 "diff_sha256": "c" * 64,
-                "slot": "independent-gemini-pro",
+                "slot": "independent-grok-review",
             }
             argv = [
                 operator.decision_reviews.REVIEW_ROLE_PYTHON,
@@ -3256,7 +3256,7 @@ class OperatorContractTests(unittest.TestCase):
                 "head_sha": "a" * 40,
                 "base_sha": "b" * 40,
                 "diff_sha256": "c" * 64,
-                "slot": "independent-claude-review",
+                "slot": "independent-reviewer",
             }
             alternate = [
                 "/opt/immutable-release/.venv/bin/python",

@@ -264,6 +264,30 @@ def _historical_review_role_python_matches(value: Any) -> bool:
     )
 
 
+
+_NAMED_SLOT_PROVIDER_FAMILIES = {
+    "gemini": "google",
+    "google": "google",
+    "grok": "xai",
+    "xai": "xai",
+    "claude": "anthropic",
+    "anthropic": "anthropic",
+    "codex": "openai",
+    "openai": "openai",
+}
+
+
+def _named_slot_provider_family(slot: str) -> str | None:
+    """Only explicit provider tokens bind slot identity; generic names stay generic."""
+    families = {
+        _NAMED_SLOT_PROVIDER_FAMILIES[token]
+        for token in re.split(r"[._:-]+", slot.lower())
+        if token in _NAMED_SLOT_PROVIDER_FAMILIES
+    }
+    if len(families) > 1:
+        raise ValueError("decision review slot names conflicting reviewer providers")
+    return next(iter(families), None)
+
 def normalize_binding(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != _BINDING_FIELDS:
         raise ValueError("decision review binding has an invalid shape")
@@ -291,6 +315,7 @@ def normalize_binding(value: Any) -> dict[str, Any]:
     slot = value.get("slot")
     if not isinstance(slot, str) or _SLOT_RE.fullmatch(slot.strip()) is None:
         raise ValueError("decision review slot must be a bounded identifier")
+    _named_slot_provider_family(slot.strip().lower())
     return {
         "schema_version": BINDING_SCHEMA_VERSION,
         "kind": BINDING_KIND,
@@ -715,6 +740,9 @@ def review_role_provenance(
     review_route = _review_route_evidence(reviewer_command)
     if review_route is None:
         return None
+    required_family = _named_slot_provider_family(normalized["slot"])
+    if required_family is not None and review_route["provider_family"] != required_family:
+        return None
     module_identity = _review_role_module_identity()
     if module_identity is None:
         return None
@@ -749,6 +777,8 @@ def bind_job_review_role_argv(
 ) -> list[str]:
     """Bind one canonical independent reviewer to a unique job-owned receipt."""
     if tuple(argv[:4]) != REVIEW_ROLE_LAUNCHER_PREFIX:
+        if _named_slot_provider_family(normalize_binding(binding)["slot"]) is not None:
+            raise ValueError("named provider slot requires a canonical independent reviewer")
         # Accept generic, origin-bound review jobs, but never admit a role
         # launcher under a release-python alias or other wrapper as V1.
         if any(
@@ -943,6 +973,9 @@ def _normalize_review_role_provenance(
     for key in ("route_id", "model", "provider_family", "independence_group", "argv_prefix_sha256"):
         if not isinstance(route.get(key), str) or not route[key]:
             raise ValueError("decision review route provenance is invalid")
+    required_family = _named_slot_provider_family(normalized["slot"])
+    if required_family is not None and route["provider_family"] != required_family:
+        raise ValueError("decision review role provider does not match named slot")
     return value
 
 
@@ -1339,6 +1372,16 @@ def reconcile(
                 unsuperseded_infrastructure.append(infrastructure_attempt)
         if not passes and not rejects:
             errors.append(f"decision_review_slot_without_pass:{slot}")
+        named_family = _named_slot_provider_family(slot)
+        if named_family is not None and not any(
+            attempt["classification"] == "pass"
+            and attempt.get("independence_verified") is True
+            and attempt.get("review_provider_family") == named_family
+            for attempt in slot_attempts
+        ):
+            errors.append(
+                f"decision_review_named_provider_slot_without_independent_pass:{slot}"
+            )
         for infrastructure_attempt in unsuperseded_infrastructure:
             errors.append(
                 "decision_review_infrastructure_not_superseded:"

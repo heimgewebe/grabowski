@@ -1910,5 +1910,116 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             self.assertNotIn("SYNTHETIC_CROSS_FILE_READ", content)
 
 
+    def test_named_provider_slot_family_identity_is_exact_not_substring(self) -> None:
+        self.assertEqual(reviews._named_slot_provider_family("independent-gemini-pro"), "google")
+        self.assertEqual(reviews._named_slot_provider_family("independent-grok-review"), "xai")
+        self.assertEqual(reviews._named_slot_provider_family("independent-claude-review"), "anthropic")
+        self.assertEqual(reviews._named_slot_provider_family("independent-codex-review"), "openai")
+        self.assertIsNone(reviews._named_slot_provider_family("independent-reviewer"))
+        self.assertIsNone(reviews._named_slot_provider_family("independent-geminix-review"))
+        with self.assertRaisesRegex(ValueError, "conflicting reviewer providers"):
+            reviews.normalize_binding(binding("independent-gemini-grok-review"))
+
+    def test_named_provider_slot_rejects_other_canonical_independent_route(self) -> None:
+        normalized = reviews.normalize_binding(binding("independent-gemini-pro"))
+        role_command = [
+            "claude", "--model", "claude-opus-5-5",
+            "--effort", "high", "--permission-mode", "plan",
+            "Review frozen code",
+        ]
+        argv = [
+            reviews.REVIEW_ROLE_PYTHON, "-I", "-m", reviews.REVIEW_ROLE_MODULE,
+            "--role", "review", "--repository", "/tmp/review",
+            "--expected-head", HEAD, "--expected-base-head", BASE,
+            "--expected-diff-sha256", "e" * 64,
+            "--expected-dirty", "false", "--output", "/tmp/review-attempt.json",
+            "--", *role_command,
+        ]
+        self.assertIsNone(reviews.review_role_provenance(
+            argv, normalized, cwd=Path("/tmp/review"),
+        ))
+        with self.assertRaisesRegex(ValueError, "valid read-only reviewer"):
+            reviews.bind_job_review_role_argv(
+                argv, normalized, cwd=Path("/tmp/review"),
+                attempt_directory=Path("/tmp/grabowski-job-a11111111111"),
+            )
+        self.assertIsNotNone(reviews.review_role_provenance(
+            argv, reviews.normalize_binding(binding("independent-claude-review")),
+            cwd=Path("/tmp/review"),
+        ))
+
+    def test_named_provider_slot_rejects_generic_pass_before_launch(self) -> None:
+        with self.assertRaisesRegex(ValueError, "canonical independent reviewer"):
+            reviews.bind_job_review_role_argv(
+                ["python3", "-c", "print('structured review marker')"],
+                reviews.normalize_binding(binding("independent-gemini-pro")),
+                cwd=Path("/tmp/review"),
+                attempt_directory=Path("/tmp/grabowski-job-a11111111111"),
+            )
+        generic = reviews.normalize_binding(binding("independent-reviewer"))
+        command = ["python3", "-c", "print('generic review marker')"]
+        self.assertEqual(reviews.bind_job_review_role_argv(
+            command, generic, cwd=Path("/tmp/review"),
+            attempt_directory=Path("/tmp/grabowski-job-a11111111111"),
+        ), command)
+
+    def test_historical_provider_mismatch_is_rejected_on_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            # Build a correctly origin-bound legacy-style witness under the
+            # old no-slot-family regime. The new reader must reject it.
+            with mock.patch.object(reviews, "_named_slot_provider_family", return_value=None):
+                make_job(
+                    jobs, suffix="a33333333333", slot="independent-gemini-pro",
+                    terminal_status="succeeded", review_result=None,
+                    review_role=True, attempt_bound=True,
+                )
+            result = self.reconcile(jobs)
+        self.assertEqual(result["status"], "blocked")
+        self.assertTrue(any(
+            x.startswith("decision_review_origin_invalid:grabowski-job-a33333333333:")
+            for x in result["errors"]
+        ))
+
+    def test_generic_named_provider_pass_cannot_borrow_other_independent_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="a44444444444", slot="independent-gemini-pro",
+                terminal_status="succeeded",
+                review_result=result("independent-gemini-pro", "PASS_THIS_REVISION", 0),
+            )
+            make_job(
+                jobs, suffix="b55555555555", slot="independent-reviewer",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "blocked")
+        self.assertIn(
+            "decision_review_named_provider_slot_without_independent_pass:independent-gemini-pro",
+            reconciled["errors"],
+        )
+        slots = {item["slot"]: item for item in reconciled["slots"]}
+        self.assertEqual(slots["independent-gemini-pro"]["pass_count"], 1)
+        self.assertEqual(slots["independent-gemini-pro"]["independent_pass_count"], 0)
+        self.assertEqual(slots["independent-reviewer"]["independent_pass_count"], 1)
+
+    def test_provider_matched_named_review_slot_settles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="a66666666666", slot="independent-claude-review",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True,
+            )
+            reconciled = self.reconcile(jobs)
+        self.assertEqual(reconciled["status"], "settled")
+        self.assertEqual(reconciled["slots"][0]["independent_pass_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
