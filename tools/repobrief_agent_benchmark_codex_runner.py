@@ -1074,8 +1074,16 @@ def create_checkout(request: Mapping[str, Any], source: Path, state_root: Path) 
     finally:
         os.close(parent_fd)
     workspace = parent_path / workspace_name
-    checkout = workspace / "repo"
+    scenario = base.validated_setup(request)
+    checkout = workspace / ("source" if scenario == "dirty" else "repo")
     commit = str(request["repository"]["commit"])
+    if (
+        base._run_checked(["git", "rev-parse", "HEAD"], cwd=source) != commit
+        or base._run_checked(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
+        )
+    ):
+        raise RunnerError("benchmark source checkout is not clean at requested commit")
     base._run_checked(
         [
             "git",
@@ -1095,8 +1103,18 @@ def create_checkout(request: Mapping[str, Any], source: Path, state_root: Path) 
     )
     if base._run_checked(["git", "rev-parse", "HEAD"], cwd=checkout) != commit:
         raise RunnerError("isolated Codex checkout HEAD mismatch")
-    if base._run_checked(["git", "status", "--porcelain"], cwd=checkout):
-        raise RunnerError("isolated Codex checkout is dirty before execution")
+    if base._run_checked(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=checkout
+    ):
+        raise RunnerError("isolated Codex checkout is dirty before fixture setup")
+    base.apply_checkout_setup(request, checkout)
+    if (
+        base._run_checked(["git", "rev-parse", "HEAD"], cwd=source) != commit
+        or base._run_checked(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
+        )
+    ):
+        raise RunnerError("benchmark source checkout changed during fixture setup")
     return checkout
 
 
@@ -1947,6 +1965,53 @@ def _preflight_report_evidence_projection(
     return projected
 
 
+def _require_g2_preflight_evidence(
+    report: Mapping[str, Any], binding: Mapping[str, Any]
+) -> None:
+    """Accept stale only with an immutable, real isolated G2 preflight proof."""
+
+    frozen = base.FROZEN_G2_IDENTITY
+    pair_id = binding.get("pair_id")
+    if (
+        binding.get("taskset_id") == frozen["taskset_id"]
+        and binding.get("taskset_sha256") == frozen["taskset_sha256"]
+        and isinstance(pair_id, str)
+        and re.fullmatch(
+            re.escape(frozen["taskset_id"] + ":" + frozen["case_id"] + ":r")
+            + r"[12]",
+            pair_id,
+        ) is not None
+    ):
+        scenario = report.get("scenario_probe")
+        expected = {
+            "working_tree": "dirty",
+            "fixture": "dirty-checkout",
+            "expected_status": "stale",
+            "observed_status": "stale",
+            "observed_reason": "current_working_tree_is_dirty",
+            "git_commit": frozen["repository"]["commit"],
+            "fixture_sha256": base._sha256_bytes(base.DIRTY_FIXTURE_BYTES),
+            "status_sha256": base._sha256_bytes(
+                f"?? {base.DIRTY_FIXTURE_NAME}".encode("utf-8")
+            ),
+            "source_unchanged_required": True,
+            "provider_started": False,
+        }
+        if (
+            not isinstance(scenario, dict)
+            or not all(scenario.get(key) == value for key, value in expected.items())
+            or not isinstance(scenario.get("mcp_result_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", scenario["mcp_result_sha256"]) is None
+            or not isinstance(scenario.get("probe_ms"), int)
+            or isinstance(scenario.get("probe_ms"), bool)
+            or scenario["probe_ms"] < 0
+            or report.get("source_before") != report.get("source_after")
+            or not isinstance(report.get("source_before"), dict)
+            or report["source_before"].get("clean") is not True
+        ):
+            raise RunnerError("preflight report lacks bound G2 stale scenario proof")
+
+
 def _assert_preflight_report_evidence(
     authorization: Mapping[str, Any],
     binding: Mapping[str, Any],
@@ -2034,6 +2099,7 @@ def _assert_preflight_report_evidence(
     ):
         raise RunnerError("preflight report does not prove this dispatch authorization")
 
+    _require_g2_preflight_evidence(report, binding)
     actual_evidence_sha256 = base._sha256_json(
         _preflight_report_evidence_projection(report)
     )
@@ -4610,6 +4676,7 @@ def build_command(
     proxy_path: Path | None = None,
     manifest_path: Path | None = None,
     mcp_runtime_root: Path | None = None,
+    source: Path | None = None,
 ) -> list[str]:
     filesystem = (
         '{":minimal"="read",":workspace_roots"={"."="read"},'
@@ -4648,6 +4715,18 @@ def build_command(
         if bundle_index + 1 >= len(upstream) or upstream.count("--bundle-root") != 1:
             raise RunnerError("treatment MCP command bundle root is invalid")
         upstream[bundle_index + 1] = str(manifest_path)
+        if base.validated_setup(request) == "dirty":
+            if upstream.count("--repo-root") != 1:
+                raise RunnerError("dirty treatment requires exactly one MCP --repo-root")
+            repo_index = upstream.index("--repo-root")
+            if (
+                repo_index + 1 >= len(upstream)
+                or source is None
+                or Path(upstream[repo_index + 1]).expanduser().resolve()
+                != source.resolve()
+            ):
+                raise RunnerError("dirty treatment MCP source is not the bound clean checkout")
+            upstream[repo_index + 1] = str(checkout)
         logical_manifest = Path(str(binding.get("manifest"))).expanduser()
         if not logical_manifest.is_absolute():
             raise RunnerError("treatment logical manifest path must be absolute")
@@ -5308,6 +5387,8 @@ def persist_provider_capture(
             "stdout":{"artifact":names["stdout"],"sha256":sha_bytes(stdout),"bytes":len(stdout),"overflow":bool(capture.get("stdout_overflow"))},
             "stderr":{"artifact":names["stderr"],"sha256":sha_bytes(stderr),"bytes":len(stderr),"overflow":bool(capture.get("stderr_overflow"))},
             "semantic_interpretation":"not_performed",
+            "scenario_before":capture.get("scenario_before"),
+            "scenario_after":capture.get("scenario_after"),
             "does_not_establish":["provider_success","stderr_policy_acceptance","benchmark_receipt_validity","answer_correctness","retry_authority"],
         }
         raw=(json.dumps(diagnostics,sort_keys=True,indent=2)+"\n").encode()
@@ -5893,6 +5974,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
     )
     try:
         checkout = create_checkout(request, source, args.state_root)
+        scenario_before = base.attest_checkout_setup(request, checkout)
         schema = checkout.parent / "answer-schema.json"
         write_schema(schema)
         started = utc_now()
@@ -5932,6 +6014,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     proxy_path=None if proxy_binding is None else Path(proxy_binding["path"]),
                     manifest_path=None if manifest_binding is None else Path(manifest_binding["path"]),
                     mcp_runtime_root=state_path,
+                    source=source,
                 )
                 if dispatch_authorization is None:
                     raise RunnerError("live dispatch authorization is unavailable before provider intent")
@@ -6022,6 +6105,23 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 cleanup_marker = f"codex_home_cleanup_failed:{cleanup_error}"
                 previous = capture.get("capture_error")
                 capture["capture_error"] = cleanup_marker if previous is None else f"{previous};{cleanup_marker}"
+        capture = dict(capture)
+        capture["scenario_before"] = scenario_before
+        try:
+            capture["scenario_after"] = base.attest_checkout_setup(request, checkout)
+            if (
+                base._run_checked(["git", "rev-parse", "HEAD"], cwd=source)
+                != request["repository"]["commit"]
+                or base._run_checked(
+                    ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                    cwd=source,
+                )
+            ):
+                raise RunnerError("historical benchmark source checkout changed")
+        except BaseException as exc:
+            marker = f"benchmark_scenario_readback_failed:{type(exc).__name__}"
+            previous = capture.get("capture_error")
+            capture["capture_error"] = marker if previous is None else f"{previous};{marker}"
         ended = utc_now()
         try:
             evidence = persist_provider_capture(
@@ -6072,8 +6172,15 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 args.codex_command_sha256,
                 require_read_only_mount=True,
             )
-        if base._run_checked(["git", "status", "--porcelain"], cwd=checkout):
-            raise RunnerError("Codex changed read-only checkout")
+        base.attest_checkout_setup(request, checkout)
+        if (
+            base._run_checked(["git", "rev-parse", "HEAD"], cwd=source)
+            != request["repository"]["commit"]
+            or base._run_checked(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
+            )
+        ):
+            raise RunnerError("Codex changed historical benchmark source checkout")
 
         normalized = receipt(
             request,

@@ -21,6 +21,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -1330,6 +1331,7 @@ def _validate_pair(baseline: Mapping[str, Any], treatment: Mapping[str, Any]) ->
         "taskset_id",
         "taskset_sha256",
         "prompt",
+        "setup",
         "budgets",
         "runner",
         "repository",
@@ -1407,6 +1409,8 @@ def _assert_source_matches_requested_commit(
         raise PreflightError(
             "source checkout HEAD does not match requested repository commit"
         )
+    if observed.get("clean") is not True:
+        raise PreflightError("historical benchmark source checkout must be clean")
 
 
 def prepare_snapshot(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
@@ -1488,7 +1492,11 @@ def _mcp_environment() -> dict[str, str]:
     return _unprivileged_environment()
 
 
-def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
+def probe_freshness(
+    treatment: Mapping[str, Any], *,
+    repo_root: Path | None = None,
+    clean_source: Path | None = None,
+) -> tuple[dict[str, Any], int]:
     binding = treatment.get("repobrief")
     if not isinstance(binding, Mapping):
         raise PreflightError("treatment request has no RepoBrief binding")
@@ -1497,6 +1505,18 @@ def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
         isinstance(item, str) and item for item in command
     ):
         raise PreflightError("treatment MCP command is invalid")
+    command = list(command)
+    if repo_root is not None:
+        if command.count("--repo-root") != 1 or clean_source is None:
+            raise PreflightError("dirty MCP probe lacks a unique bound source root")
+        index = command.index("--repo-root")
+        if (
+            index + 1 >= len(command)
+            or Path(command[index + 1]).expanduser().resolve()
+            != clean_source.resolve()
+        ):
+            raise PreflightError("dirty MCP probe clean source root mismatch")
+        command[index + 1] = str(repo_root.resolve())
     environment = _mcp_environment()
     started = time.monotonic()
     try:
@@ -1538,6 +1558,27 @@ def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
             },
             timeout_seconds=30,
         )
+        provider = treatment.get("runner")
+        if (
+            isinstance(provider, Mapping)
+            and provider.get("provider") == "openai-codex-cli"
+        ):
+            inventory = _rpc(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/list",
+                    "params": {},
+                },
+                timeout_seconds=20,
+            )
+            try:
+                _codex_runner_module()._filtered_treatment_tools(inventory)
+            except ValueError as exc:
+                raise PreflightError(
+                    "Codex treatment MCP tools/list violates the pinned tool contract"
+                ) from exc
     finally:
         if process.stdin is not None:
             process.stdin.close()
@@ -1561,6 +1602,31 @@ def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
     if result.get("isError") is not False or not isinstance(structured, dict):
         raise PreflightError("RepoBrief MCP freshness call failed")
     status = structured.get("status")
+    if repo_root is not None:
+        expected_root = str(repo_root.resolve())
+        current = structured.get("current_provenance")
+        snapshot = structured.get("snapshot_provenance")
+        expected_commit = (
+            treatment.get("repository", {}).get("commit")
+            if isinstance(treatment.get("repository"), Mapping)
+            else None
+        )
+        if (
+            structured.get("kind") != "repobrief.live_freshness"
+            or structured.get("version") != "v1"
+            or structured.get("repo_root") != expected_root
+            or structured.get("bundle_manifest") != str(binding.get("manifest"))
+            or structured.get("read_only_git_probe") is not True
+            or structured.get("implicit_refresh") is not False
+            or not isinstance(current, dict)
+            or current.get("repo_root") != expected_root
+            or current.get("git_commit") != expected_commit
+            or current.get("git_dirty") is not True
+            or current.get("provenance_status") != "present"
+            or not isinstance(snapshot, dict)
+            or snapshot.get("git_commit") != expected_commit
+        ):
+            raise PreflightError("dirty MCP provenance does not match isolated checkout")
     elapsed = max(int((time.monotonic() - started) * 1000), 0)
     return {
         "status": status,
@@ -1568,6 +1634,47 @@ def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
         "result_sha256": _sha256_json(structured),
         "stale_blocked": status != "fresh",
     }, elapsed
+
+
+def probe_bound_negative_scenario(
+    treatment: Mapping[str, Any], *, source: Path, state_root: Path
+) -> dict[str, Any] | None:
+    """Provider-free G2 stale proof using a new private clone of a clean source."""
+
+    if runner.validated_setup(treatment) != "dirty":
+        return None
+    with tempfile.TemporaryDirectory(
+        prefix="rab-g2-preflight-", dir=state_root
+    ) as temporary:
+        checkout = runner.create_isolated_checkout(
+            treatment, source, Path(temporary)
+        )
+        before = runner.attest_checkout_setup(treatment, checkout)
+        freshness, elapsed = probe_freshness(
+            treatment, repo_root=checkout, clean_source=source
+        )
+        after = runner.attest_checkout_setup(treatment, checkout)
+        if (
+            before != after
+            or freshness.get("status") != "stale"
+            or freshness.get("reason") != "current_working_tree_is_dirty"
+            or before.get("working_tree") != "dirty"
+        ):
+            raise PreflightError("bound G2 negative scenario did not prove stale")
+        return {
+            "working_tree": "dirty",
+            "fixture": "dirty-checkout",
+            "expected_status": "stale",
+            "observed_status": freshness["status"],
+            "observed_reason": freshness["reason"],
+            "git_commit": before["git_commit"],
+            "fixture_sha256": before["fixture_sha256"],
+            "status_sha256": before["status_sha256"],
+            "mcp_result_sha256": freshness["result_sha256"],
+            "probe_ms": elapsed,
+            "source_unchanged_required": True,
+            "provider_started": False,
+        }
 
 
 def _transcript_result(receipt: Mapping[str, Any], transcript_root: Path) -> Mapping[str, Any]:
@@ -1821,6 +1928,9 @@ def authorize_dispatch(
             raise PreflightError(
                 f"treatment snapshot is not fresh: {freshness['status']}"
             )
+        scenario_probe = probe_bound_negative_scenario(
+            treatment, source=source, state_root=state_root
+        )
         after = source_state(source)
         _assert_source_unchanged(before, after)
         _assert_dispatch_binding_unchanged(
@@ -1852,6 +1962,7 @@ def authorize_dispatch(
                 "treatment": _sha256_json(treatment),
             },
             "snapshot": {**snapshot, **freshness},
+            **({"scenario_probe": scenario_probe} if scenario_probe is not None else {}),
             "source_before": before,
             "source_after": after,
             "timings": {
@@ -1955,6 +2066,9 @@ def execute_preflight(
             raise PreflightError(
                 f"treatment snapshot is not fresh: {freshness['status']}"
             )
+        scenario_probe = probe_bound_negative_scenario(
+            treatment, source=source, state_root=state_root
+        )
         claude_identity = (
             {
                 "command": claude,
@@ -2148,6 +2262,7 @@ def execute_preflight(
                 "total_time_to_answer_ms": total_time_to_answer_ms,
             },
             "snapshot": {**snapshot, **freshness},
+            **({"scenario_probe": scenario_probe} if scenario_probe is not None else {}),
             "source_before": before,
             "source_after": after,
             "runs": {

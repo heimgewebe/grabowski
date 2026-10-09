@@ -86,6 +86,32 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
     }
 
 
+def frozen_g2_request(*, condition: str = "baseline", commit: str | None = None) -> dict:
+    """Use the frozen task identity, independently of local test Git fixtures."""
+
+    frozen = runner.base.FROZEN_G2_IDENTITY
+    value = request(condition=condition)
+    value["taskset_id"] = frozen["taskset_id"]
+    value["taskset_sha256"] = frozen["taskset_sha256"]
+    value["case_id"] = frozen["case_id"]
+    value["repository"] = dict(frozen["repository"])
+    if commit is not None:
+        value["repository"]["commit"] = commit
+    value["prompt"] = (
+        "Prüfe den Snapshot gegen einen Dirty Working Tree. "
+        "Ein gleicher Commit reicht nicht für fresh."
+    )
+    value["setup"] = dict(runner.base.FROZEN_G2_SETUP)
+    pair_id = f"{value['taskset_id']}:{value['case_id']}:r1"
+    value["pair_id"] = pair_id
+    value["request_id"] = f"{pair_id}:{condition}"
+    value["session_id"] = f"session:{value['request_id']}"
+    value["workspace_id"] = f"workspace:{value['request_id']}"
+    if condition == "treatment":
+        value["repobrief"]["manifest_sha256"] = frozen["manifest_sha256"]
+    return value
+
+
 def file_identity(path: Path) -> dict:
     resolved = path.resolve(strict=True)
     metadata = resolved.lstat()
@@ -421,6 +447,116 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         value["runner"]["sampling"] = {"reasoning_effort": "high"}
         with self.assertRaisesRegex(runner.RunnerError, "Codex runner contract mismatch"):
             runner.validate_request(value)
+
+    def test_frozen_g2_request_setup_requires_exact_revision_and_provider(self) -> None:
+        for condition in ("baseline", "treatment"):
+            candidate = frozen_g2_request(condition=condition)
+            runner.validate_request(candidate)
+            for change in ("missing", "clean", "hash", "commit", "prompt", "provider"):
+                forged = json.loads(json.dumps(candidate))
+                if change == "missing":
+                    forged.pop("setup")
+                elif change == "clean":
+                    forged["setup"] = {"working_tree": "clean"}
+                elif change == "hash":
+                    forged["taskset_sha256"] = "e" * 64
+                elif change == "commit":
+                    forged["repository"]["commit"] = "f" * 40
+                elif change == "prompt":
+                    forged["prompt"] += " unbound"
+                elif change == "provider":
+                    forged["runner"]["model"] = "gpt-unbound"
+                with self.subTest(condition=condition, mutation=change):
+                    with self.assertRaises(runner.RunnerError):
+                        runner.validate_request(forged)
+        value = request()
+        value["setup"] = {"working_tree": "clean", "fixture": "fresh-matching-snapshot"}
+        runner.validate_request(value)
+        value["setup"] = {"working_tree": "head_mismatch", "fixture": "stale-head"}
+        with self.assertRaisesRegex(runner.RunnerError, "unsupported"):
+            runner.validate_request(value)
+
+    def test_private_frozen_g2_checkout_is_reproducibly_dirty_and_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            (root / "state").mkdir(mode=0o700)
+            frozen = runner.base.FROZEN_G2_IDENTITY
+            bound_repo = {**frozen["repository"], "commit": commit}
+            with patch.dict(frozen, {"repository": bound_repo}):
+                value = frozen_g2_request(commit=commit)
+                checkout = runner.create_checkout(value, source, root / "state")
+                self.assertEqual(checkout.name, "source")
+                attestation = runner.base.attest_checkout_setup(value, checkout)
+                self.assertEqual(attestation["working_tree"], "dirty")
+                self.assertEqual(attestation["git_commit"], commit)
+                self.assertEqual(attestation["fixture_sha256"], runner.sha_bytes(
+                    runner.base.DIRTY_FIXTURE_BYTES
+                ))
+                self.assertEqual(git(["status", "--porcelain"], source), "")
+                self.assertEqual(
+                    git(["status", "--porcelain"], checkout),
+                    f"?? {runner.base.DIRTY_FIXTURE_NAME}",
+                )
+                with self.assertRaisesRegex(runner.RunnerError, "already used"):
+                    runner.create_checkout(value, source, root / "state")
+                (checkout / runner.base.DIRTY_FIXTURE_NAME).write_text(
+                    "tampered", encoding="utf-8"
+                )
+                with self.assertRaises(runner.RunnerError):
+                    runner.base.attest_checkout_setup(value, checkout)
+                self.assertEqual(git(["status", "--porcelain"], source), "")
+
+    def test_dirty_treatment_mcp_is_pinned_to_its_own_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            (root / "state").mkdir(mode=0o700)
+            frozen = runner.base.FROZEN_G2_IDENTITY
+            with patch.dict(frozen, {
+                "repository": {**frozen["repository"], "commit": commit}
+            }):
+                value = frozen_g2_request(condition="treatment", commit=commit)
+                value["repobrief"]["mcp_command"] = [
+                    sys.executable, "/fixture/mcp.py", "--bundle-root",
+                    "/snapshot", "--repo-root", str(source),
+                ]
+                checkout = runner.create_checkout(value, source, root / "state")
+                with patch.object(
+                    runner, "_validated_mcp_proxy_python",
+                    return_value=sys.executable,
+                ):
+                    command = runner.build_command(
+                        value, "/opt/codex", checkout,
+                        root / "answer.json", root / "codex-home",
+                        authorized_mcp_files=[],
+                        proxy_path=root / "proxy.py",
+                        manifest_path=root / "staged.bundle.manifest.json",
+                        mcp_runtime_root=root / "state",
+                        source=source,
+                    )
+                    config = next(
+                        item for item in command
+                        if item.startswith("mcp_servers.repobrief.args=")
+                    )
+                    proxy_args = json.loads(config.split("=", 1)[1])
+                    original = json.loads(
+                        proxy_args[proxy_args.index("--codex-mcp-proxy") + 1]
+                    )
+                    self.assertEqual(
+                        original[original.index("--repo-root") + 1], str(checkout)
+                    )
+                    value["repobrief"]["mcp_command"][-1] = str(root / "wrong")
+                    with self.assertRaisesRegex(runner.RunnerError, "source"):
+                        runner.build_command(
+                            value, "/opt/codex", checkout,
+                            root / "answer.json", root / "codex-home",
+                            authorized_mcp_files=[],
+                            proxy_path=root / "proxy.py",
+                            manifest_path=root / "staged.bundle.manifest.json",
+                            mcp_runtime_root=root / "state",
+                            source=source,
+                        )
 
     def test_codex_output_schema_strips_only_unsupported_unique_items(self) -> None:
         canonical = json.loads(json.dumps(runner.base.ANSWER_SCHEMA))
@@ -1590,6 +1726,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 )
                 failed = stack.enter_context(
                     patch.object(runner, "_record_preflight_dispatch_failed")
+                )
+                stack.enter_context(
+                    patch.object(
+                        runner.base, "attest_checkout_setup",
+                        return_value={"working_tree": "clean"},
+                    )
                 )
                 with self.assertRaises(KeyboardInterrupt):
                     runner.execute(value, args)

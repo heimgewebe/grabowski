@@ -139,6 +139,28 @@ REQUEST_FIELDS = {
     "isolation",
     "does_not_establish",
 }
+OPTIONAL_REQUEST_FIELDS = {"setup"}
+# Scenario permission is tied to a frozen, immutable experiment, not to an
+# arbitrary case ID or a mutable working tree.
+FROZEN_G2_IDENTITY = {
+    "taskset_id": "repobrief-agent-benchmark-v1-20260713",
+    "taskset_sha256": "834c4a730fe741b6015a69767db162c87c80311a6688dd8e83eb4a6c6e258184",
+    "case_id": "grounding-dirty-working-tree",
+    "repository": {
+        "id": "grabowski",
+        "repository": "heimgewebe/grabowski",
+        "commit": "f6eed48752fd2cf32f070dc69b2112e2498872cb",
+    },
+    "prompt_sha256": "c55114858d8b87432cf7bb0618a9d0d22d6acb09e77902f736c732d23f283602",
+    "manifest_sha256": "dff51514e0c7d722fa2aea64200c3a0f4e53052e441e330d26c30679fd0c74dd",
+}
+FROZEN_G2_SETUP = {"working_tree": "dirty", "fixture": "dirty-checkout"}
+DIRTY_FIXTURE_NAME = ".rab-g2-dirty-fixture"
+DIRTY_FIXTURE_BYTES = (
+    b"repobrief-agent-benchmark-v1-20260713\n"
+    b"grounding-dirty-working-tree\n"
+    b"dirty-checkout\n"
+)
 ANSWER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -389,10 +411,58 @@ def _validate_provider_executable(
     return str(path)
 
 
+def validated_setup(request: Mapping[str, Any]) -> str:
+    """Validate the optional scenario; only a frozen G2 pair may be dirty."""
+
+    setup = request.get("setup", {"working_tree": "clean"})
+    if not isinstance(setup, dict) or (
+        set(setup) not in ({"working_tree"}, {"working_tree", "fixture"})
+    ):
+        raise RunnerError("benchmark setup shape is invalid")
+    fixture = setup.get("fixture")
+    if fixture is not None and (
+        not isinstance(fixture, str) or len(fixture) > 256
+    ):
+        raise RunnerError("benchmark setup fixture is invalid")
+    dirty_target = (
+        request.get("taskset_id") == FROZEN_G2_IDENTITY["taskset_id"]
+        and request.get("taskset_sha256") == FROZEN_G2_IDENTITY["taskset_sha256"]
+        and request.get("case_id") == FROZEN_G2_IDENTITY["case_id"]
+    )
+    if dirty_target or setup.get("working_tree") == "dirty":
+        repobrief = request.get("repobrief")
+        if (
+            not dirty_target
+            or setup != FROZEN_G2_SETUP
+            or request.get("repository") != FROZEN_G2_IDENTITY["repository"]
+            or request.get("runner") != {
+                "execution_contract": "grabowski-codex-cli-live-v1",
+                "provider": "openai-codex-cli",
+                "model": "gpt-6-astra",
+                "sampling": {"reasoning_effort": "medium"},
+            }
+            or _sha256_bytes(str(request.get("prompt", "")).encode("utf-8"))
+            != FROZEN_G2_IDENTITY["prompt_sha256"]
+            or (
+                request.get("condition") == "treatment"
+                and (
+                    not isinstance(repobrief, Mapping)
+                    or repobrief.get("manifest_sha256")
+                    != FROZEN_G2_IDENTITY["manifest_sha256"]
+                )
+            )
+        ):
+            raise RunnerError("dirty setup is not bound to the frozen G2 task")
+        return "dirty"
+    if setup.get("working_tree") != "clean":
+        raise RunnerError("unsupported benchmark scenario must fail closed")
+    return "clean"
+
+
 def _validate_request_common(request: Mapping[str, Any]) -> None:
     """Validate provider-neutral request invariants without a provider contract."""
 
-    unknown = set(request).difference(REQUEST_FIELDS)
+    unknown = set(request).difference(REQUEST_FIELDS | OPTIONAL_REQUEST_FIELDS)
     missing = REQUEST_FIELDS.difference(request)
     if unknown:
         raise RunnerError(f"request contains unknown fields: {sorted(unknown)!r}")
@@ -434,6 +504,7 @@ def _validate_request_common(request: Mapping[str, Any]) -> None:
     _validate_isolation(request)
     _validate_tool_policy(request)
     _validate_repobrief(request)
+    validated_setup(request)
 
 
 def validate_request(request: Mapping[str, Any]) -> None:
@@ -604,6 +675,81 @@ def _run_checked(command: Sequence[str], *, cwd: Path | None = None) -> str:
     return completed.stdout.strip()
 
 
+def attest_checkout_setup(
+    request: Mapping[str, Any], checkout: Path
+) -> dict[str, Any]:
+    """Attest the exact checkout state, including the intentionally dirty case."""
+
+    scenario = validated_setup(request)
+    expected_commit = str(_mapping(request.get("repository")).get("commit"))
+    observed_commit = _run_checked(["git", "rev-parse", "HEAD"], cwd=checkout)
+    if observed_commit != expected_commit:
+        raise RunnerError("benchmark checkout commit differs from frozen request")
+    status = _run_checked(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=checkout
+    )
+    if scenario == "clean":
+        if status:
+            raise RunnerError("benchmark clean checkout was modified")
+        return {
+            "working_tree": "clean",
+            "git_commit": observed_commit,
+            "status_sha256": _sha256_bytes(status.encode("utf-8")),
+            "fixture_sha256": None,
+        }
+    expected_status = f"?? {DIRTY_FIXTURE_NAME}"
+    if status != expected_status:
+        raise RunnerError("dirty benchmark checkout has unexpected changes")
+    path = checkout / DIRTY_FIXTURE_NAME
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            metadata = os.fstat(descriptor)
+            data = os.read(descriptor, len(DIRTY_FIXTURE_BYTES) + 1)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise RunnerError("bound dirty benchmark fixture is unavailable") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or data != DIRTY_FIXTURE_BYTES
+    ):
+        raise RunnerError("bound dirty benchmark fixture changed")
+    return {
+        "working_tree": "dirty",
+        "git_commit": observed_commit,
+        "status_sha256": _sha256_bytes(status.encode("utf-8")),
+        "fixture_sha256": _sha256_bytes(data),
+    }
+
+
+def apply_checkout_setup(
+    request: Mapping[str, Any], checkout: Path
+) -> dict[str, Any]:
+    """Prepare one frozen scenario only inside the freshly cloned workspace."""
+
+    scenario = validated_setup(request)
+    if scenario == "dirty":
+        if _run_checked(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=checkout
+        ):
+            raise RunnerError("dirty benchmark checkout was not initially clean")
+        path = checkout / DIRTY_FIXTURE_NAME
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(DIRTY_FIXTURE_BYTES)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            raise RunnerError("bound dirty benchmark fixture could not be created") from exc
+    return attest_checkout_setup(request, checkout)
+
+
 def create_isolated_checkout(
     request: Mapping[str, Any], source: Path, state_root: Path
 ) -> Path:
@@ -614,8 +760,17 @@ def create_isolated_checkout(
         workspace.mkdir(mode=0o700)
     except FileExistsError as exc:
         raise RunnerError("workspace identity was already used") from exc
-    checkout = workspace / "repo"
+    checkout = workspace / (
+        "source" if validated_setup(request) == "dirty" else "repo"
+    )
     commit = str(_mapping(request.get("repository")).get("commit"))
+    if (
+        _run_checked(["git", "rev-parse", "HEAD"], cwd=source) != commit
+        or _run_checked(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
+        )
+    ):
+        raise RunnerError("historical source is not clean at frozen commit")
     _run_checked(
         [
             "git",
@@ -636,8 +791,18 @@ def create_isolated_checkout(
     head = _run_checked(["git", "rev-parse", "HEAD"], cwd=checkout)
     if head != commit:
         raise RunnerError("isolated checkout HEAD mismatch")
-    if _run_checked(["git", "status", "--porcelain"], cwd=checkout):
-        raise RunnerError("isolated checkout is not clean")
+    if _run_checked(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=checkout
+    ):
+        raise RunnerError("isolated checkout is not initially clean")
+    apply_checkout_setup(request, checkout)
+    if (
+        _run_checked(["git", "rev-parse", "HEAD"], cwd=source) != commit
+        or _run_checked(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
+        )
+    ):
+        raise RunnerError("historical source changed during benchmark setup")
     return checkout
 
 
