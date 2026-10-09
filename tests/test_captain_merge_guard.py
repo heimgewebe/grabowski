@@ -710,6 +710,120 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
                 resources.RESOURCE_DB = original_db
 
 
+
+class MboxDiffIdentityTests(unittest.TestCase):
+    @staticmethod
+    def _evidence():
+        head = "b" * 40
+        first = (
+            "diff --git a/one.txt b/one.txt\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/one.txt\n"
+            "+++ b/one.txt\n"
+            "@@ -1 +1 @@\n"
+            "-before\n"
+            "+after\n"
+        )
+        second = (
+            "diff --git a/two.txt b/two.txt\n"
+            "index 3333333..4444444 100644\n"
+            "--- a/two.txt\n"
+            "+++ b/two.txt\n"
+            "@@ -1 +1 @@\n"
+            "-before\n"
+            "+after\n"
+        )
+        prefix = (
+            "From {sha} Mon Sep 17 00:00:00 2001\n"
+            "From: Test Author <test@example.com>\n"
+            "Date: Fri, 9 Oct 2026 00:00:00 +0000\n"
+            "Subject: [PATCH] test\n"
+            "\n"
+            "---\n"
+            " 1 file changed\n"
+            "\n"
+        )
+        patch = (
+            prefix.format(sha="a" * 40) + first + "\n"
+            + prefix.format(sha=head) + second
+        )
+        return head, (first + second).encode(), patch.encode()
+
+    def test_accepts_only_proven_equivalent_mbox_patch(self):
+        head, plain, mbox = self._evidence()
+        self.assertNotEqual(
+            merge_guard.github_pr_diff_identity_sha256(plain),
+            merge_guard.github_pr_diff_identity_sha256(mbox),
+        )
+        self.assertTrue(
+            merge_guard._merge_guard_mbox_patch_matches_diff(mbox, plain, head)
+        )
+
+    def test_rejects_drifted_patch_or_unbound_head(self):
+        head, plain, mbox = self._evidence()
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                mbox.replace(b"+after\n", b"+unreviewed\n", 1), plain, head
+            )
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(mbox, plain, "c" * 40)
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                b"not a GitHub patch", plain, head
+            )
+        )
+
+    def test_live_bindings_accepts_exact_proven_patch_hash_only(self):
+        gh = _RenamePrGh()
+        gh.diff_text = (
+            "diff --git a/new-name.txt b/new-name.txt\n"
+            "index 1234567..abcdef0 100644\n"
+            "--- a/new-name.txt\n"
+            "+++ b/new-name.txt\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        mbox = (
+            f"From {gh.head_sha} Mon Sep 17 00:00:00 2001\n"
+            "From: Test <test@example.com>\n"
+            "Subject: [PATCH] rename\n\n"
+            "---\n 1 file changed\n\n" + gh.diff_text
+        )
+        standard_runner = gh.__call__
+
+        def github(repo: Path, argv: list[str]) -> dict[str, object]:
+            if argv[:2] == ["pr", "diff"] and "--patch" in argv:
+                return {"returncode": 0, "stdout": mbox, "stderr": ""}
+            return standard_runner(repo, argv)
+
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.action = {"target": {"repo": "heimgewebe/commonworld", "pr": 212, "base": "main"}}
+        runner.parameters = {
+            "expected_head": gh.head_sha,
+            "expected_base_sha": gh.base_sha,
+            "diff_sha256": merge_guard.github_pr_diff_identity_sha256(mbox.encode()),
+        }
+        runner.static_errors = []
+        runner.repo_path = Path.cwd()
+        runner.github_runner = github
+        runner.receipt = {}
+        runner.execution_intent_sha256 = "1" * 64
+        runner._revalidate_codex_review = lambda _bindings, phase: []
+
+        bindings, errors = runner._live_bindings()
+
+        self.assertEqual([], errors)
+        self.assertIsNotNone(bindings)
+        assert bindings is not None
+        self.assertEqual("mbox-patch-proven-equivalent", bindings["diff_identity_mode"])
+        self.assertEqual(
+            runner.parameters["diff_sha256"], bindings["patch_diff_sha256"]
+        )
+
+
 _PLAN_LIMIT_403 = (
     "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. "
     "(HTTP 403)"

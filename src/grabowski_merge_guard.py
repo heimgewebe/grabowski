@@ -81,6 +81,50 @@ _MERGE_GUARD_MAX_DIFF_BYTES = 32 * 1024 * 1024
 _MERGE_GUARD_BINARY_DIFF_RE = re.compile(
     rb"(?m)^(?:GIT binary patch|Binary files [^\r\n]+ and [^\r\n]+ differ)\r?$"
 )
+
+def _merge_guard_mbox_patch_matches_diff(
+    patch_bytes: bytes, diff_bytes: bytes, expected_head: str
+) -> bool:
+    """Prove that a GitHub per-commit mbox contains the exact cumulative diff.
+
+    Only blank email separators between commits are removed. No changed line,
+    hunk header or blob identity can differ from the live plain PR diff.
+    """
+    if (
+        not patch_bytes
+        or not diff_bytes
+        or len(patch_bytes) > _MERGE_GUARD_MAX_DIFF_BYTES
+        or len(diff_bytes) > _MERGE_GUARD_MAX_DIFF_BYTES
+        or _SHA40_RE.fullmatch(expected_head) is None
+    ):
+        return False
+    boundaries = list(re.finditer(
+        rb"(?m)^From (?P<sha>[0-9a-f]{40}) Mon Sep 17 00:00:00 2001\r?$",
+        patch_bytes,
+    ))
+    if (
+        not boundaries
+        or boundaries[0].start() != 0
+        or len(boundaries) > 250
+        or boundaries[-1].group("sha") != expected_head.encode("ascii")
+    ):
+        return False
+    sections: list[bytes] = []
+    for index, boundary in enumerate(boundaries):
+        end = boundaries[index + 1].start() if index + 1 < len(boundaries) else len(patch_bytes)
+        block = patch_bytes[boundary.end() + 1:end]
+        separator = re.search(rb"(?m)^---\r?$", block)
+        if separator is None:
+            return False
+        after_metadata = block[separator.end() + 1:]
+        diff_start = re.search(rb"(?m)^diff --git ", after_metadata)
+        if diff_start is None:
+            return False
+        section = after_metadata[diff_start.start():]
+        sections.append(section.rstrip(b"\n") + b"\n")
+    return b"".join(sections) == diff_bytes.rstrip(b"\n") + b"\n"
+
+
 _MERGE_GUARD_REPLAY_PARAMETERS = frozenset({"merge_lease_snapshot", "merge_guard_receipt"})
 _CODEX_REVIEW_ACTORS = frozenset({
     "chatgpt-codex-connector",
@@ -5068,6 +5112,51 @@ class CaptainMergeGuardRunner:
         else:
             binding_diff_sha256 = canonical_live_diff_sha256
             diff_identity_mode = "unmatched"
+        # A completed independent review may bind GitHub's per-commit
+        # "--patch" mbox instead of the default cumulative PR diff. Admit
+        # its digest only after proving byte-for-byte equivalent file hunks
+        # against the live default diff at this exact head/base.
+        patch_diff_sha256 = None
+        if diff_identity_mode == "unmatched" and provider_raw_identity_available:
+            patch_args = [*diff_args, "--patch"]
+            try:
+                patch_raw = self.github_runner(self.repo_path, patch_args)
+                patch_info = _merge_guard_result_info(patch_raw)
+                patch_stdout = (
+                    patch_info["stdout_bytes"]
+                    if isinstance(patch_info.get("stdout_bytes"), bytes)
+                    else patch_info["stdout"].encode("utf-8")
+                )
+                patch_proven_equivalent = (
+                    patch_info["returncode"] == 0
+                    and _merge_guard_mbox_patch_matches_diff(
+                        patch_stdout, raw_live_diff_bytes, expected_head
+                    )
+                )
+                patch_digest = (
+                    github_pr_diff_identity_sha256(patch_stdout)
+                    if patch_info["returncode"] == 0
+                    and len(patch_stdout) <= _MERGE_GUARD_MAX_DIFF_BYTES
+                    else None
+                )
+                self.receipt["live_patch_diff"] = {
+                    "command": ["gh", *patch_args],
+                    "returncode": patch_info["returncode"],
+                    "stdout_sha256": hashlib.sha256(patch_stdout).hexdigest(),
+                    "canonical_sha256": patch_digest,
+                    "proven_equivalent": patch_proven_equivalent,
+                }
+                if patch_proven_equivalent:
+                    patch_diff_sha256 = patch_digest
+                    if expected_diff == patch_digest:
+                        binding_diff_sha256 = patch_digest
+                        diff_identity_mode = "mbox-patch-proven-equivalent"
+            except Exception as exc:
+                self.receipt["live_patch_diff"] = {
+                    "command": ["gh", *patch_args],
+                    "error": f"{type(exc).__name__}",
+                    "proven_equivalent": False,
+                }
         diff_canonicalization = diff_source
         if live_diff_bytes != raw_live_diff_bytes:
             diff_canonicalization += "+" + GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION
@@ -5106,6 +5195,7 @@ class CaptainMergeGuardRunner:
             "canonical_diff_sha256": canonical_live_diff_sha256,
             "previous_canonical_diff_sha256": previous_canonical_live_diff_sha256,
             "raw_diff_sha256": raw_live_diff_sha256,
+            "patch_diff_sha256": patch_diff_sha256,
             "diff_identity_mode": diff_identity_mode,
             "execution_intent_sha256": self.execution_intent_sha256,
             "changed_paths": changed_paths,
