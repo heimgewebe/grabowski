@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import errno
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import json
 import os
 from pathlib import Path
@@ -24,6 +27,198 @@ def stream_bytes(events: list[dict]) -> bytes:
 
 
 class GrokReviewRoleTests(unittest.TestCase):
+
+    def test_create_only_receipt_is_private_and_cannot_be_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "receipts"
+            parent.mkdir(mode=0o700)
+            path = parent / "attempt.json"
+            role.write_receipt(path, {"verdict": "PASS"}, create_only=True)
+            original = path.read_bytes()
+            self.assertEqual(json.loads(original), {"verdict": "PASS"})
+            self.assertEqual(os.stat(path).st_nlink, 1)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                role.write_receipt(path, {"verdict": "NEEDS_CHANGE"}, create_only=True)
+            self.assertEqual(path.read_bytes(), original)
+            os.chmod(parent, 0o750)
+            with self.assertRaises(PermissionError):
+                role.write_receipt(parent / "other.json", {}, create_only=True)
+
+    def test_fdopen_failure_closes_raw_descriptor_and_removes_temp(self) -> None:
+        # A failure to wrap an already opened fd must not exhaust a long-lived
+        # reviewer/operator process. Both legacy replace and create-only paths
+        # have the same pre-ownership constructor boundary.
+        for create_only in (False, True):
+            with self.subTest(create_only=create_only):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    target = root / "attempt.json"
+                    real_open = os.open
+                    opened_temporary: list[int] = []
+
+                    def capture_open(name, flags, *args, **kwargs):
+                        fd = real_open(name, flags, *args, **kwargs)
+                        if (
+                            isinstance(name, str)
+                            and name.startswith(".attempt.json.")
+                            and name.endswith(".tmp")
+                        ):
+                            opened_temporary.append(fd)
+                        return fd
+
+                    with (
+                        mock.patch.object(role.os, "open", side_effect=capture_open),
+                        mock.patch.object(
+                            role.os, "fdopen",
+                            side_effect=OSError(errno.EMFILE, "synthetic fdopen failure"),
+                        ),
+                        self.assertRaisesRegex(OSError, "synthetic fdopen failure"),
+                    ):
+                        role.write_receipt(
+                            target, {"verdict": "PASS"}, create_only=create_only
+                        )
+
+                    self.assertEqual(len(opened_temporary), 1)
+                    with self.assertRaises(OSError) as closed:
+                        os.fstat(opened_temporary[0])
+                    self.assertEqual(closed.exception.errno, errno.EBADF)
+                    self.assertFalse(target.exists())
+                    self.assertEqual(list(root.glob("*.tmp")), [])
+                    self.assertFalse(
+                        any(p.name.startswith(".attempt.json.") for p in root.iterdir())
+                    )
+
+    def test_create_only_receipt_rejects_link_attacks(self) -> None:
+        for kind in ("symlink", "hardlink", "parent-symlink"):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    parent = root / "receipts"
+                    parent.mkdir(mode=0o700)
+                    target = root / "real.json"
+                    target.write_text('{"untouched": true}', encoding="utf-8")
+                    os.chmod(target, 0o600)
+                    path = parent / "attempt.json"
+                    if kind == "parent-symlink":
+                        alias = root / "link"
+                        alias.symlink_to(parent, target_is_directory=True)
+                        path = alias / "attempt.json"
+                        with self.assertRaises(OSError):
+                            role.write_receipt(path, {}, create_only=True)
+                    else:
+                        if kind == "symlink":
+                            path.symlink_to(target)
+                        else:
+                            os.link(target, path)
+                        with self.assertRaises(PermissionError):
+                            role.write_receipt(path, {}, create_only=True)
+                    self.assertEqual(json.loads(target.read_text()), {"untouched": True})
+
+    def test_create_only_receipt_race_has_exactly_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "review.json"
+            barrier = threading.Barrier(2)
+            def write(value: int) -> str:
+                barrier.wait()
+                try:
+                    role.write_receipt(path, {"attempt": value}, create_only=True)
+                    return "created"
+                except FileExistsError:
+                    return "exists"
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                a = pool.submit(write, 1)
+                b = pool.submit(write, 2)
+                self.assertEqual(sorted([a.result(), b.result()]), ["created", "exists"])
+            self.assertIn(json.loads(path.read_text())["attempt"], (1, 2))
+            self.assertFalse(any(p.name.endswith(".tmp") for p in path.parent.iterdir()))
+
+
+    def test_role_main_binds_review_receipt_to_job_unit_and_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            unit = "grabowski-job-a11111111111"
+            directory = Path(temporary) / unit
+            directory.mkdir(mode=0o700)
+            output = directory / role.REVIEW_ATTEMPT_RECEIPT_NAME
+            head, base, diff = "a" * 40, "b" * 40, "c" * 64
+            document = b'{"verdict":"PASS","findings":[]}'
+            completed = SimpleNamespace(
+                returncode=0, stdout_sha256=hashlib.sha256(document).hexdigest(),
+                stderr_sha256="e" * 64, stdout_bytes=len(document), stderr_bytes=0,
+                stdout_tail="", stderr_tail="", output_limit_exceeded=False,
+                stdout_content_exceeded=False, stdout_content=document,
+            )
+            environment = {
+                "GRABOWSKI_REVIEW_ATTEMPT_UNIT": unit,
+                "GRABOWSKI_JOB_UNIT": unit,
+                "GRABOWSKI_JOB_ID": "a11111111111",
+                "GRABOWSKI_JOB_ORIGIN_SHA256": "d" * 64,
+                "GRABOWSKI_JOB_DIRECTORY": str(directory),
+            }
+            with (
+                mock.patch.dict(os.environ, environment),
+                mock.patch.object(role, "current_binding", side_effect=[(head, diff, False)] * 2),
+                mock.patch.object(role, "committed_diff", return_value=b"frozen diff"),
+                mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], None, None)),
+                mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                mock.patch.object(role, "run_bounded_capture", return_value=completed),
+                mock.patch.object(role, "classify_result", return_value="passed"),
+            ):
+                self.assertEqual(role.main([
+                    "--role", "review", "--repository", str(ROOT),
+                    "--expected-head", head, "--expected-base-head", base,
+                    "--expected-diff-sha256", diff, "--expected-dirty", "false",
+                    "--output", str(output), "--", "grok", "--model", "grok-4.6",
+                    "Review the frozen diff",
+                ]), 0)
+            receipt = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["review_attempt_unit"], unit)
+            self.assertEqual(receipt["review_attempt_origin_sha256"], "d" * 64)
+            self.assertEqual(receipt["receipt_sha256"], role.digest({
+                k: v for k, v in receipt.items() if k != "receipt_sha256"
+            }))
+
+    def test_role_main_rejects_cross_attempt_environment_before_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            unit = "grabowski-job-a11111111111"
+            directory = Path(temporary) / unit
+            directory.mkdir(mode=0o700)
+            output = directory / role.REVIEW_ATTEMPT_RECEIPT_NAME
+            head, base, diff = "a" * 40, "b" * 40, "c" * 64
+            completed = SimpleNamespace(
+                returncode=0, stdout_sha256="d" * 64, stderr_sha256="e" * 64,
+                stdout_bytes=0, stderr_bytes=0, stdout_tail="", stderr_tail="",
+                output_limit_exceeded=False, stdout_content_exceeded=False,
+                stdout_content=b'{"verdict":"PASS","findings":[]}',
+            )
+            environment = {
+                "GRABOWSKI_REVIEW_ATTEMPT_UNIT": unit,
+                "GRABOWSKI_JOB_UNIT": "grabowski-job-b22222222222",
+                "GRABOWSKI_JOB_ID": "a11111111111",
+                "GRABOWSKI_JOB_ORIGIN_SHA256": "d" * 64,
+                "GRABOWSKI_JOB_DIRECTORY": str(directory),
+            }
+            with (
+                mock.patch.dict(os.environ, environment),
+                mock.patch.object(role, "current_binding", side_effect=AssertionError("snapshot must not execute")) as current_binding,
+                mock.patch.object(role, "committed_diff", return_value=b"frozen diff"),
+                mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], None, None)),
+                mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                mock.patch.object(role, "run_bounded_capture", side_effect=AssertionError("reviewer must not execute")) as execute,
+                mock.patch.object(role, "classify_result", return_value="passed"),
+                self.assertRaisesRegex(RuntimeError, "attempt binding is invalid"),
+            ):
+                role.main([
+                    "--role", "review", "--repository", str(ROOT),
+                    "--expected-head", head, "--expected-base-head", base,
+                    "--expected-diff-sha256", diff, "--expected-dirty", "false",
+                    "--output", str(output), "--", "grok", "--model", "grok-4.6",
+                    "Review the frozen diff",
+                ])
+            current_binding.assert_not_called()
+            execute.assert_not_called()
+            self.assertFalse(output.exists())
+
     def test_streaming_review_command_embeds_bound_diff_without_repository_tools(self) -> None:
         prepared = ("/opt/grabowski-external/grok", "--model", "grok-4.6", "-p", "review this")
         head = "a" * 40

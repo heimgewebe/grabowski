@@ -31,6 +31,7 @@ MAX_STDOUT_TAIL_BYTES = 256 * 1024
 MAX_ROLE_RECEIPT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_ROLE_MODULE_BYTES = 1024 * 1024
 REVIEW_ROLE_MODULE = "grabowski_agent_role"
+REVIEW_ROLE_ATTEMPT_RECEIPT_NAME = "review-role-attempt.json"
 REVIEW_ROLE_SANDBOX = "bubblewrap-minimal-root-read-only-worktree-v1"
 REVIEW_ROLE_PYTHON = os.path.abspath(sys.executable)
 REVIEW_ROLE_STABLE_PYTHON = Path.home() / ".local/share/grabowski-mcp/.venv/bin/python"
@@ -263,6 +264,30 @@ def _historical_review_role_python_matches(value: Any) -> bool:
     )
 
 
+
+_NAMED_SLOT_PROVIDER_FAMILIES = {
+    "gemini": "google",
+    "google": "google",
+    "grok": "xai",
+    "xai": "xai",
+    "claude": "anthropic",
+    "anthropic": "anthropic",
+    "codex": "openai",
+    "openai": "openai",
+}
+
+
+def _named_slot_provider_family(slot: str) -> str | None:
+    """Only explicit provider tokens bind slot identity; generic names stay generic."""
+    families = {
+        _NAMED_SLOT_PROVIDER_FAMILIES[token]
+        for token in re.split(r"[._:-]+", slot.lower())
+        if token in _NAMED_SLOT_PROVIDER_FAMILIES
+    }
+    if len(families) > 1:
+        raise ValueError("decision review slot names conflicting reviewer providers")
+    return next(iter(families), None)
+
 def normalize_binding(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != _BINDING_FIELDS:
         raise ValueError("decision review binding has an invalid shape")
@@ -290,6 +315,7 @@ def normalize_binding(value: Any) -> dict[str, Any]:
     slot = value.get("slot")
     if not isinstance(slot, str) or _SLOT_RE.fullmatch(slot.strip()) is None:
         raise ValueError("decision review slot must be a bounded identifier")
+    _named_slot_provider_family(slot.strip().lower())
     return {
         "schema_version": BINDING_SCHEMA_VERSION,
         "kind": BINDING_KIND,
@@ -359,16 +385,65 @@ def decision_review_lock(binding: dict[str, Any]) -> Iterator[None]:
             os.close(descriptor)
 
 
-def _read_private_json(path: Path, max_bytes: int) -> dict[str, Any]:
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise ValueError(f"{path.name} is not one regular file")
-    if stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise ValueError(f"{path.name} must be private")
-    if metadata.st_size > max_bytes:
-        raise ValueError(f"{path.name} is too large")
+def _read_private_bytes(
+    path: Path, max_bytes: int, *, require_private_parent: bool = True
+) -> bytes:
+    """Read a size-bounded, owner-private regular file through a stable fd."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    parent_fd = os.open(path.parent, flags | os.O_DIRECTORY)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        parent = os.fstat(parent_fd)
+        if not stat.S_ISDIR(parent.st_mode):
+            raise ValueError("review evidence parent is not a directory")
+        if require_private_parent and (
+            parent.st_uid != os.getuid()
+            or stat.S_IMODE(parent.st_mode) & 0o077
+        ):
+            raise ValueError("review evidence parent is not owner-private")
+        descriptor = os.open(path.name, flags, dir_fd=parent_fd)
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) & 0o077
+            ):
+                raise ValueError(f"{path.name} is not one owner-private regular file")
+            if before.st_size > max_bytes:
+                raise ValueError(f"{path.name} is too large")
+            content = bytearray()
+            while len(content) <= max_bytes:
+                chunk = os.read(descriptor, min(65536, max_bytes + 1 - len(content)))
+                if not chunk:
+                    break
+                content.extend(chunk)
+            after = os.fstat(descriptor)
+            if (
+                len(content) > max_bytes
+                or len(content) != before.st_size
+                or (before.st_dev, before.st_ino, before.st_nlink,
+                    before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_nlink,
+                    after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            ):
+                raise ValueError(f"{path.name} changed during read")
+            return bytes(content)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+
+
+def _read_private_json(
+    path: Path, max_bytes: int, *, require_private_parent: bool = True
+) -> dict[str, Any]:
+    """Read one stable owner-private JSON object without following its path."""
+    content = _read_private_bytes(
+        path, max_bytes, require_private_parent=require_private_parent
+    )
+    try:
+        value = json.loads(content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"{path.name} is invalid JSON") from exc
     if not isinstance(value, dict):
@@ -377,16 +452,7 @@ def _read_private_json(path: Path, max_bytes: int) -> dict[str, Any]:
 
 
 def _read_stdout_tail(path: Path) -> tuple[str, str]:
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise ValueError("stdout.log is not one regular file")
-    if stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise ValueError("stdout.log must be private")
-    if metadata.st_size > MAX_STDOUT_TAIL_BYTES:
-        raise ValueError("stdout.log exceeds the decision review output limit")
-    payload = path.read_bytes()
-    if len(payload) > MAX_STDOUT_TAIL_BYTES:
-        raise ValueError("stdout.log exceeds the decision review output limit")
+    payload = _read_private_bytes(path, MAX_STDOUT_TAIL_BYTES)
     return payload.decode("utf-8", errors="replace"), hashlib.sha256(payload).hexdigest()
 
 
@@ -451,10 +517,20 @@ def _validated_origin_binding(directory: Path) -> tuple[dict[str, Any], dict[str
     origin_cwd = scope.get("cwd")
     if not isinstance(origin_cwd, str) or not origin_cwd:
         raise ValueError("job origin cwd is invalid")
+    attempt_epoch = scope.get("decision_review_attempt_epoch")
+    if attempt_epoch is not None and attempt_epoch != 2:
+        raise ValueError("decision review attempt epoch is invalid")
     provenance = _normalize_review_role_provenance(
-        scope.get("decision_review_provenance"), binding, cwd=origin_cwd
+        scope.get("decision_review_provenance"), binding, cwd=origin_cwd,
+        attempt_directory=directory,
     )
-    if provenance is None:
+    if (
+        attempt_epoch == 2
+        and provenance is not None
+        and provenance.get("schema_version") != 2
+    ):
+        raise ValueError("new decision review attempt cannot use historical role provenance")
+    if provenance is None and attempt_epoch is None:
         exact_argv = metadata.get("argv")
         if (
             isinstance(exact_argv, list)
@@ -613,7 +689,8 @@ def _review_route_evidence(command: list[str]) -> dict[str, Any] | None:
 
 
 def review_role_provenance(
-    argv: list[str], binding: dict[str, Any], *, cwd: Path
+    argv: list[str], binding: dict[str, Any], *, cwd: Path,
+    attempt_directory: Path | None = None,
 ) -> dict[str, Any] | None:
     """Derive server-owned reviewer provenance from the pre-redaction launch argv."""
     normalized = normalize_binding(binding)
@@ -659,15 +736,26 @@ def review_role_provenance(
     reviewer_command = argv[separator + 1 :]
     if not reviewer_command:
         return None
+    if attempt_directory is not None:
+        # Do not resolve the output through a caller-controlled symlink.
+        expected_path = attempt_directory / REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+        if (
+            _UNIT_RE.fullmatch(attempt_directory.name) is None
+            or output != expected_path
+        ):
+            return None
     review_route = _review_route_evidence(reviewer_command)
     if review_route is None:
+        return None
+    required_family = _named_slot_provider_family(normalized["slot"])
+    if required_family is not None and review_route["provider_family"] != required_family:
         return None
     module_identity = _review_role_module_identity()
     if module_identity is None:
         return None
     runner_module_path, runner_module_sha256 = module_identity
     material = {
-        "schema_version": 1,
+        "schema_version": 2 if attempt_directory is not None else 1,
         "kind": "grabowski_decision_review_provenance",
         "role": "review",
         "runner_python": REVIEW_ROLE_PYTHON,
@@ -681,12 +769,43 @@ def review_role_provenance(
         "base_sha": normalized["base_sha"],
         "workspace_diff_sha256": workspace_diff,
         "expected_dirty": False,
-        "role_receipt_path": str(output.resolve(strict=False)),
+        "role_receipt_path": str(output if attempt_directory is not None else output.resolve(strict=False)),
+        **({"attempt_unit": attempt_directory.name} if attempt_directory is not None else {}),
         "reviewer_command_sha256": _agent_role_command_sha256(reviewer_command),
         "review_route": review_route,
         "binding_sha256": sha256_json(normalized),
     }
     return {**material, "provenance_sha256": sha256_json(material)}
+
+
+def bind_job_review_role_argv(
+    argv: list[str], binding: dict[str, Any], *,
+    cwd: Path, attempt_directory: Path,
+) -> list[str]:
+    """Bind one canonical independent reviewer to a unique job-owned receipt."""
+    if tuple(argv[:4]) != REVIEW_ROLE_LAUNCHER_PREFIX:
+        if _named_slot_provider_family(normalize_binding(binding)["slot"]) is not None:
+            raise ValueError("named provider slot requires a canonical independent reviewer")
+        # Accept generic, origin-bound review jobs, but never admit a role
+        # launcher under a release-python alias or other wrapper as V1.
+        if any(
+            item == REVIEW_ROLE_MODULE
+            or Path(item).name == f"{REVIEW_ROLE_MODULE}.py"
+            for item in argv
+        ):
+            raise ValueError("noncanonical decision-bound role launcher is not admitted")
+        return argv
+    if review_role_provenance(argv, binding, cwd=cwd) is None:
+        raise ValueError("decision-bound role launcher is not a valid read-only reviewer")
+    separator = argv.index("--")
+    output_index = argv.index("--output", 4, separator) + 1
+    result = list(argv)
+    result[output_index] = str(attempt_directory / REVIEW_ROLE_ATTEMPT_RECEIPT_NAME)
+    if review_role_provenance(
+        result, binding, cwd=cwd, attempt_directory=attempt_directory
+    ) is None:
+        raise ValueError("job-owned review role receipt binding is invalid")
+    return result
 
 
 def _historical_review_role_module_path_for_python(
@@ -763,7 +882,8 @@ def _historical_review_role_provenance(
 
 
 def _normalize_review_role_provenance(
-    value: Any, binding: dict[str, Any], *, cwd: str
+    value: Any, binding: dict[str, Any], *, cwd: str,
+    attempt_directory: Path | None = None,
 ) -> dict[str, Any] | None:
     if value is None:
         return None
@@ -776,6 +896,11 @@ def _normalize_review_role_provenance(
         "expected_dirty", "role_receipt_path", "reviewer_command_sha256",
         "review_route", "binding_sha256", "provenance_sha256",
     }
+    schema = value.get("schema_version")
+    if schema == 2:
+        required.add("attempt_unit")
+    elif schema != 1:
+        raise ValueError("decision review provenance schema is invalid")
     if set(value) != required:
         raise ValueError("decision review provenance has an invalid shape")
     material = {key: item for key, item in value.items() if key != "provenance_sha256"}
@@ -794,18 +919,22 @@ def _normalize_review_role_provenance(
     ) or _historical_review_role_python_matches(recorded_runner_python)
     recorded_module_path = value.get("runner_module_path")
     recorded_module_sha256 = value.get("runner_module_sha256")
+    # Historical attempts bind the module bytes installed when the review ran.
+    # A later source upgrade must not erase that evidence. Never trust an
+    # arbitrary caller-selected digest: require the exact byte-matching module
+    # in an owner-controlled, immutable release-layout path.
     module_identity_matches = (
-        recorded_module_sha256 == runner_module_sha256
-        and (
-            recorded_module_path == runner_module_path
-            or _historical_review_role_module_matches(
-                recorded_module_path,
-                expected_sha256=runner_module_sha256,
-            )
+        (
+            recorded_module_sha256 == runner_module_sha256
+            and recorded_module_path == runner_module_path
+        )
+        or _historical_review_role_module_matches(
+            recorded_module_path,
+            expected_sha256=recorded_module_sha256,
         )
     )
     if (
-        value.get("schema_version") != 1
+        schema not in {1, 2}
         or value.get("kind") != "grabowski_decision_review_provenance"
         or value.get("role") != "review"
         or not runner_python_matches
@@ -836,9 +965,24 @@ def _normalize_review_role_provenance(
         or not isinstance(route, dict)
     ):
         raise ValueError("decision review provenance fields are invalid")
+    if schema == 2:
+        expected = (
+            attempt_directory / REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+            if attempt_directory is not None else None
+        )
+        if (
+            expected is None
+            or _UNIT_RE.fullmatch(attempt_directory.name) is None
+            or value.get("attempt_unit") != attempt_directory.name
+            or Path(receipt_path) != expected
+        ):
+            raise ValueError("decision review attempt receipt belongs to another job")
     for key in ("route_id", "model", "provider_family", "independence_group", "argv_prefix_sha256"):
         if not isinstance(route.get(key), str) or not route[key]:
             raise ValueError("decision review route provenance is invalid")
+    required_family = _named_slot_provider_family(normalized["slot"])
+    if required_family is not None and route["provider_family"] != required_family:
+        raise ValueError("decision review role provider does not match named slot")
     return value
 
 
@@ -847,7 +991,13 @@ def _validated_review_role_evidence(
 ) -> dict[str, Any] | None:
     if provenance is None:
         return None
-    receipt = _read_private_json(Path(provenance["role_receipt_path"]), MAX_ROLE_RECEIPT_BYTES)
+    # V1 allowed caller-selected private files in shared directories. Retain
+    # its fd/no-follow/owner/nlink/size checks; require a private parent for
+    # new V2 job-owned receipts only.
+    receipt = _read_private_json(
+        Path(provenance["role_receipt_path"]), MAX_ROLE_RECEIPT_BYTES,
+        require_private_parent=provenance["schema_version"] == 2,
+    )
     expected_receipt_sha256 = _agent_role_receipt_sha256(receipt)
     if receipt.get("receipt_sha256") != expected_receipt_sha256:
         raise ValueError("decision review role receipt digest mismatch")
@@ -867,6 +1017,11 @@ def _validated_review_role_evidence(
         "review_receipt_generated_by": REVIEW_ROLE_MODULE,
         "argv_sha256": provenance["reviewer_command_sha256"],
     }
+    if provenance["schema_version"] == 2:
+        expected_fields.update({
+            "review_attempt_unit": metadata["unit"],
+            "review_attempt_origin_sha256": metadata["origin_sha256"],
+        })
     for key, expected_value in expected_fields.items():
         if receipt.get(key) != expected_value:
             raise ValueError(f"decision review role receipt {key} mismatch")
@@ -1117,7 +1272,14 @@ def reconcile(
             # supersede them. A succeeded reviewer missing its create-only
             # receipt is contradictory and remains fail-closed, as do malformed,
             # unreadable or binding-invalid receipts below.
-            if attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES:
+            # The V2 reviewer can have finished a material REJECT before a
+            # failed receipt write. A missing receipt is not proof of a
+            # pre-review failure, even when systemd reports a failed unit.
+            # Only a server-proven non-start above can be retried safely.
+            if (
+                (provenance is None or provenance.get("schema_version") != 2)
+                and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
+            ):
                 attempt["classification"] = "infrastructure_error"
                 attempts.append(attempt)
                 continue
@@ -1162,6 +1324,7 @@ def reconcile(
             if (
                 result is None
                 and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
+                and (provenance is None or provenance.get("schema_version") != 2)
             ):
                 attempt["classification"] = "infrastructure_error"
                 attempts.append(attempt)
@@ -1171,12 +1334,15 @@ def reconcile(
             attempts.append(attempt)
             continue
         if result is None:
-            # A terminal reviewer that produced no decision marker did not
-            # establish a semantic review outcome. Treat that attempt as
-            # retryable infrastructure evidence rather than permanently
-            # poisoning the slot. The slot still blocks below until a later
-            # PASS exists, while any material REJECT remains globally blocking.
-            attempt["classification"] = "infrastructure_error"
+            # A V2 role receipt containing malformed or non-semantic output
+            # cannot prove whether the provider emitted a material finding.
+            # Preserve legacy handling for old immutable attempts, but never
+            # supersede the new ambiguous evidence on a later PASS.
+            if provenance is not None and provenance.get("schema_version") == 2:
+                attempt["classification"] = "invalid_result"
+                errors.append(f"decision_review_result_invalid:{directory.name}:InvalidReviewDocument")
+            else:
+                attempt["classification"] = "infrastructure_error"
             attempts.append(attempt)
             continue
         if result["verdict"] == "REJECT_THIS_REVISION":
@@ -1219,6 +1385,16 @@ def reconcile(
                 unsuperseded_infrastructure.append(infrastructure_attempt)
         if not passes and not rejects:
             errors.append(f"decision_review_slot_without_pass:{slot}")
+        named_family = _named_slot_provider_family(slot)
+        if named_family is not None and not any(
+            attempt["classification"] == "pass"
+            and attempt.get("independence_verified") is True
+            and attempt.get("review_provider_family") == named_family
+            for attempt in slot_attempts
+        ):
+            errors.append(
+                f"decision_review_named_provider_slot_without_independent_pass:{slot}"
+            )
         for infrastructure_attempt in unsuperseded_infrastructure:
             errors.append(
                 "decision_review_infrastructure_not_superseded:"
