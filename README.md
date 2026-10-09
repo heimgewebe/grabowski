@@ -77,9 +77,13 @@ make context-refresh
 make context-check
 ```
 
-Für die erste Orientierung genügen `grabowski_runtime_health()` und
-`grabowski_contract_drift()`. Wenn die Aufgabe den kombinierten Runtime-,
-Policy- und Checkout-Zustand benötigt, liefert `grabowski_context` ihn live:
+`grabowski_mcp_liveness()` prüft kostengünstig nur den MCP-Tool-Dispatch
+(`dispatch_healthy`), ohne daraus Integritätsgesundheit abzuleiten.
+`grabowski_runtime_health()` behält den bisherigen `healthy`-Vertrag
+für Deployment-, Audit- und Kill-Switch-Integrität; die explizite Diagnose bietet
+auch `grabowski_status(view="minimal")`. Vertragsdrift prüft `grabowski_contract_drift()`.
+Wenn die Aufgabe den kombinierten Runtime-, Policy- und Checkout-Zustand
+benötigt, liefert `grabowski_context` ihn live:
 
 ```text
 grabowski_context(profile="repository-work")
