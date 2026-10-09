@@ -775,6 +775,31 @@ class MboxDiffIdentityTests(unittest.TestCase):
             )
         )
 
+    def test_format_patch_footer_must_match_hunks(self):
+        head, plain, mbox = self._evidence()
+        separator = b"\nFrom " + head.encode("ascii")
+        self.assertIn(separator, mbox)
+        with_footer = mbox.replace(
+            separator,
+            b"-- \n2.43.0\n\nFrom " + head.encode("ascii"),
+            1,
+        ) + b"\n-- \n2.43.0\n"
+        self.assertTrue(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                with_footer, plain, head
+            )
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                with_footer.replace(b"+after\n", b"+changed\n", 1), plain, head
+            )
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                with_footer + b"unexpected content", plain, head
+            )
+        )
+
     def test_live_bindings_accepts_exact_proven_patch_hash_only(self):
         gh = _RenamePrGh()
         gh.diff_text = (

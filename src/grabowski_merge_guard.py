@@ -121,6 +121,15 @@ def _merge_guard_mbox_patch_matches_diff(
         if diff_start is None:
             return False
         section = after_metadata[diff_start.start():]
+        # Git format-patch may append a version trailer after the final hunk.
+        # Only the exact terminal signature is ignored; all patch bytes
+        # otherwise remain significant in the cumulative diff comparison.
+        footer = re.search(
+            rb"(?m)^-- \r?\n[0-9][A-Za-z0-9.+-]{0,127}\r?\n(?:\r?\n)*\Z",
+            section,
+        )
+        if footer is not None:
+            section = section[:footer.start()]
         sections.append(section.rstrip(b"\n") + b"\n")
     return b"".join(sections) == diff_bytes.rstrip(b"\n") + b"\n"
 
