@@ -1591,7 +1591,7 @@ def _tailscale_status_projection(payload: Any) -> dict[str, Any]:
 
 @mcp.tool(name="grabowski_runtime_health", annotations=LOCAL_READ)
 def grabowski_runtime_health() -> dict[str, Any]:
-    """Return minimal Grabowski deployment, audit and kill-switch health."""
+    """Return original deployment, audit and kill-switch integrity health."""
     deployment = base._deployment_metadata()
     audit = base._verify_audit_log(base.AUDIT_LOG)
     integrity = {
@@ -1599,6 +1599,7 @@ def grabowski_runtime_health() -> dict[str, Any]:
         for key in DEPLOYMENT_INTEGRITY_FIELDS
     }
     audit_writable = bool(audit.get("audit_writable"))
+    kill_switch_engaged = bool(base._kill_switch_state().get("engaged"))
     return {
         "service": runtime_extensions.LOGICAL_RUNTIME_SERVICE,
         "service_model": runtime_extensions.runtime_service_model(deployment),
@@ -1607,7 +1608,7 @@ def grabowski_runtime_health() -> dict[str, Any]:
             and all(integrity.values())
             and bool(audit.get("valid"))
             and audit_writable
-            and not bool(base._kill_switch_state().get("engaged"))
+            and not kill_switch_engaged
         ),
         "deployment_complete": deployment.get("completion_status") == "complete",
         "deployment_integrity_valid": all(integrity.values()),
@@ -1621,11 +1622,29 @@ def grabowski_runtime_health() -> dict[str, Any]:
         "audit_rotation_required": audit.get("rotation_required"),
         "audit_archived_segment_count": audit.get("archived_segment_count"),
         "audit_total_records": audit.get("total_records"),
-        "kill_switch_engaged": bool(base._kill_switch_state().get("engaged")),
+        "kill_switch_engaged": kill_switch_engaged,
         "release_id": deployment.get("release_id"),
         "repo_head": deployment.get("repo_head"),
     }
 
+
+@mcp.tool(name="grabowski_mcp_liveness", annotations=LOCAL_READ)
+def grabowski_mcp_liveness() -> dict[str, Any]:
+    """Report bounded MCP tool-dispatch liveness without integrity evaluation."""
+    return {
+        "schema_version": 1,
+        "service": runtime_extensions.LOGICAL_RUNTIME_SERVICE,
+        "health_scope": "mcp_tool_dispatch",
+        "dispatch_healthy": True,
+        "integrity_evaluated": False,
+        "does_not_establish": [
+            "deployment_integrity",
+            "audit_integrity",
+            "audit_writability",
+            "mutation_readiness",
+            "systemd_manager_scope",
+        ],
+    }
 
 @mcp.tool(name="grabowski_audit_projection", annotations=LOCAL_READ)
 def grabowski_audit_projection(

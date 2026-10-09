@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "043c579e8d0717ea00226965d77d1a0555aed91fe587402d6c7472d60914678e"
+    "sha256": "2681d2593edcdc23e200aa0fa3e6eec2cbda1b9c1794b1d9faf87fc81801c567"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "0d6686a041d35c5b4bcf3a85b896d54fb40ad6baf5797a3e08a0854d6bdd9f71"
+    "sha256": "5a7396575d6f76ad96b63e01dcbbf72cf57c938a1af4d45a9f408cc9917de2ac"
   },
   "counts": {
-    "core": 24,
-    "full": 202,
-    "operator": 186
+    "core": 25,
+    "full": 203,
+    "operator": 187
   },
   "profiles": {
     "core": [
@@ -22,6 +22,7 @@
       "repoground_context_pack",
       "repoground_context_compose",
       "grabowski_runtime_health",
+      "grabowski_mcp_liveness",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
       "grabowski_checkout_summary",
@@ -78,6 +79,7 @@
       "repoground_get_callers",
       "repoground_get_callees",
       "grabowski_runtime_health",
+      "grabowski_mcp_liveness",
       "grabowski_audit_projection",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -281,6 +283,7 @@
       "repoground_get_callers",
       "repoground_get_callees",
       "grabowski_runtime_health",
+      "grabowski_mcp_liveness",
       "grabowski_audit_projection",
       "grabowski_contract_drift",
       "grabowski_current_work",
@@ -452,6 +455,7 @@
         "grabowski_git_status",
         "grabowski_github_checks",
         "grabowski_github_pr_view",
+        "grabowski_mcp_liveness",
         "grabowski_ports",
         "grabowski_privileged_broker_status",
         "grabowski_recovery_status",
@@ -480,6 +484,7 @@
       "orientation_tools": [
         "grabowski_audit_projection",
         "grabowski_contract_drift",
+        "grabowski_mcp_liveness",
         "grabowski_runtime_health",
         "repoground_bundle_discover",
         "repoground_bundle_status",

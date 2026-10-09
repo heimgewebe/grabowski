@@ -12285,8 +12285,10 @@ class TaskTests(unittest.TestCase):
     ) -> None:
         record, identity = self._completed_execution_reuse_validation_fixture()
         future = dict(record)
-        future["terminalized_at_unix"] = tasks._now() + 1
+        frozen_now = tasks._now()
+        future["terminalized_at_unix"] = frozen_now + 1
         with (
+            patch.object(tasks, "_now", return_value=frozen_now),
             patch.object(
                 tasks,
                 "_latest_matching_unbound_execution_record",

@@ -1427,6 +1427,9 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             },
         }
         with (
+            # The fixture imports the tested MCP module under an alias. The
+            # grip runner resolves its canonical module through sys.modules.
+            patch.dict(sys.modules, {"grabowski_grips": grabowski_mcp.grabowski_grips}),
             patch.object(grabowski_mcp, "_require_capability"),
             patch.object(grabowski_mcp, "_require_mutations_enabled"),
             patch.object(
@@ -2018,8 +2021,8 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 202)
-        self.assertEqual(summary["known_tool_requirements"], 203)
+        self.assertEqual(summary["registered_tool_requirements"], 203)
+        self.assertEqual(summary["known_tool_requirements"], 204)
         self.assertEqual(
             summary["staged_unpublished_tools"],
             ["grabowski_agent_workspace_adopt"],

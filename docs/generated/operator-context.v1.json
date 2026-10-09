@@ -520,14 +520,25 @@
     },
     {
       "category": "context",
-      "description": "Return minimal Grabowski deployment, audit and kill-switch health.",
+      "description": "Return original deployment, audit and kill-switch integrity health.",
       "effects": [],
       "id": "grabowski_runtime_health",
-      "purpose": "Read minimal deployment, audit and kill-switch health without path inventories.",
+      "purpose": "Read deployment, audit and kill-switch integrity health with established healthy semantics.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_runtime_health"
+    },
+    {
+      "category": "context",
+      "description": "Report bounded MCP tool-dispatch liveness without integrity evaluation.",
+      "effects": [],
+      "id": "grabowski_mcp_liveness",
+      "purpose": "Read bounded MCP tool-dispatch liveness without establishing runtime or audit integrity.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_mcp_liveness"
     },
     {
       "category": "operations-observability",
@@ -2925,6 +2936,7 @@
       "repoground_get_callers",
       "repoground_get_callees",
       "grabowski_runtime_health",
+      "grabowski_mcp_liveness",
       "grabowski_audit_projection",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -3658,7 +3670,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "3d3685376352e7a8b8c36145aa88d614b16f0f9f865450a9a522b02a088921b1"
+      "sha256": "2e158ca751ea852a8191e978d4689b4fc39fb351120f08423dbf126faf934a3c"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3666,7 +3678,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "043c579e8d0717ea00226965d77d1a0555aed91fe587402d6c7472d60914678e"
+      "sha256": "2681d2593edcdc23e200aa0fa3e6eec2cbda1b9c1794b1d9faf87fc81801c567"
     },
     "runtime_source_digest_contract": "mcp-tool-surface-v1",
     "runtime_sources": {
@@ -3770,7 +3782,7 @@
       "src/grabowski_privileged.py": "dbe6fc34230ac20f9ed611049ce1332785a26874bd5ccb45a1133599b4cf5a55",
       "src/grabowski_privileged_broker.py": "d43c37ffa9fa154ae7ce53b6c3620b72cff62ecf0eabbf14f60639097f526829",
       "src/grabowski_provenance_recovery.py": "b507add38c5fdaf9ad4248f0e2cc5bf7570f1a62415a06e1bf171d44f26e0730",
-      "src/grabowski_read_surface.py": "1df8cb96e2c84f52817bbb0f64832de0f66f376de37a683849d41f50e7b08e1f",
+      "src/grabowski_read_surface.py": "6ab24e3ff6d04ddef35c8fc1b7a176804208313bf9c3cd7234c5dde4755783bf",
       "src/grabowski_recall.py": "386afec03e078b6a7934b0744eb17edb1ae97b0addde982c34c544d0c1b74413",
       "src/grabowski_recovery.py": "0ed22cef9bc1f41b18e4f40b4cedf0492a78469b9d02ffd2747481c337b43013",
       "src/grabowski_redaction.py": "d1f394aa11e3feb6c8b37e39dfad3b445a2b6fee343f1ff60dd6ac48ca854e84",

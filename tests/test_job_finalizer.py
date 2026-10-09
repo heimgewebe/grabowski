@@ -106,6 +106,23 @@ class JobFinalizerTests(unittest.TestCase):
         self._write_metadata(self.metadata)
         return contract
 
+    def test_reserved_repoground_job_finalizes_with_original_origin(self) -> None:
+        self.job_id = "rgpm-" + "a" * 16 + "-01"
+        self.unit = "grabowski-job-" + self.job_id
+        self.directory = self.root / self.unit
+        self.directory.mkdir(mode=0o700)
+        self.metadata["job_id"] = self.job_id
+        self.metadata["unit"] = self.unit
+        self._write_metadata(self.metadata)
+        _origin, environment = self._bind_origin()
+        self._install_generic_contract()
+
+        self.assertEqual(finalizer._validate_job_directory(self.directory), self.directory)
+        result = finalizer.finalize(self.directory, environment)
+        self.assertTrue(result["created"])
+        again = finalizer.finalize(self.directory, environment)
+        self.assertFalse(again["created"])
+
     def test_finalize_creates_private_hash_bound_receipt_and_is_idempotent(self) -> None:
         first = finalizer.finalize(self.directory, self._environment())
         second = finalizer.finalize(self.directory, self._environment())

@@ -660,6 +660,77 @@ class RepoGroundCaptainAuditFollowupTests(unittest.TestCase):
 
 
 class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
+
+    def test_reconciler_uses_core_after_facade_split(self) -> None:
+        def row(ordinal: int) -> dict:
+            return {
+                "record": {
+                    "operation": "runtime-observation",
+                    "timestamp_unix": 9_950,
+                },
+                "evidence": {
+                    "record_sha256": f"{ordinal:064x}",
+                    "global_ordinal": ordinal,
+                },
+            }
+
+        rows = [row(11), row(12)]
+        snapshot = types.SimpleNamespace(
+            total_records=12,
+            segments=(
+                types.SimpleNamespace(
+                    global_start_ordinal=11, global_end_ordinal=12
+                ),
+            ),
+        )
+        scanned_orders: list[str] = []
+
+        def iter_items(_snapshot: object, *, order: str) -> object:
+            scanned_orders.append(order)
+            return iter(rows if order == "asc" else rows + [row(10)])
+
+        audit = types.SimpleNamespace(
+            MAX_SCAN_RECORDS=2,
+            capture_verified_audit_snapshot=lambda: snapshot,
+            _iter_snapshot_items=iter_items,
+        )
+        core = types.SimpleNamespace(
+            STATE_DIR=Path("/state"),
+            grabowski_job_start=lambda *_args, **_kwargs: {
+                "unit": "unused-test-starter"
+            },
+        )
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "grabowski_audit_query": audit,
+                    "grabowski_operator": types.SimpleNamespace(),
+                    "grabowski_operator_core": core,
+                    "grabowski_tasks": types.SimpleNamespace(),
+                },
+            ),
+            patch.object(post_merge.time, "time", return_value=10_000),
+            patch.object(post_merge, "_load_reconcile_cursor", return_value=None),
+            patch.object(
+                post_merge, "_load_reconcile_discovery_ordinal", return_value=10
+            ) as read_watermark,
+            patch.object(post_merge, "_save_reconcile_progress") as save_progress,
+        ):
+            result = post_merge.reconcile_recent_captain_audit_followups(
+                lookback_seconds=100
+            )
+
+        self.assertTrue(read_watermark.called)
+        self.assertEqual(scanned_orders, ["asc"])
+        self.assertEqual(result["scan_mode"], "bounded_rotation")
+        self.assertEqual(result["discovery_ordinal_before"], 10)
+        self.assertEqual(result["discovery_ordinal_after"], 12)
+        self.assertTrue(result["discovery_watermark_persisted"])
+        self.assertEqual(
+            save_progress.call_args.kwargs["discovery_ordinal"], 12
+        )
+
     def test_reconcile_reuses_original_verified_snapshot_for_audit_completion(self) -> None:
         sha = "a" * 64
         snapshot = types.SimpleNamespace(total_records=1, segments=())
@@ -714,7 +785,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 "grabowski_grip_orchestration": types.SimpleNamespace(
                     _verified_captain_audit_record=verify,
                 ),
-                "grabowski_operator": types.SimpleNamespace(),
+                "grabowski_operator_core": types.SimpleNamespace(),
             }),
             patch.object(post_merge.time, "time", return_value=10_000),
             patch.object(post_merge, "resolve_job_starter", return_value=starter),
@@ -807,7 +878,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {
                 "grabowski_audit_query": audit,
-                "grabowski_operator": types.SimpleNamespace(STATE_DIR=Path("/state")),
+                "grabowski_operator_core": types.SimpleNamespace(STATE_DIR=Path("/state")),
                 "grabowski_tasks": types.SimpleNamespace(),
             }),
             patch.object(post_merge.time, "time", return_value=10_000),
@@ -890,7 +961,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 sys.modules,
                 {
                     "grabowski_audit_query": audit_query,
-                    "grabowski_operator": types.SimpleNamespace(),
+                    "grabowski_operator_core": types.SimpleNamespace(),
                 },
             ),
             patch.object(post_merge.time, "time", return_value=now),
@@ -927,6 +998,61 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
             ),
         )
 
+    def test_discovery_initialization_uses_core_state_dir_in_split_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            db = directory / "tasks.sqlite3"
+            with sqlite3.connect(db) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+            tasks = types.SimpleNamespace(
+                _database_connection=lambda: sqlite3.connect(db)
+            )
+            modules = {
+                "grabowski_operator_core": types.SimpleNamespace(STATE_DIR=directory),
+                "grabowski_operator": types.SimpleNamespace(),
+                "grabowski_tasks": tasks,
+                "grabowski_audit_query": types.SimpleNamespace(
+                    capture_verified_audit_snapshot=lambda: types.SimpleNamespace(
+                        total_records=37
+                    ),
+                ),
+            }
+            with patch.dict(sys.modules, modules):
+                result = post_merge.initialize_reconcile_discovery_watermark(
+                    predecessor_module_path=directory / "not-installed.py"
+                )
+            self.assertTrue(result["initialized"])
+            self.assertEqual(result["global_ordinal"], 37)
+            self.assertEqual(
+                post_merge._load_reconcile_discovery_ordinal(tasks), 37
+            )
+
+    def test_discovery_initialization_rejects_missing_core_state_dir(self) -> None:
+        modules = {
+            "grabowski_operator_core": types.SimpleNamespace(),
+            "grabowski_operator": types.SimpleNamespace(STATE_DIR=Path("/state")),
+            "grabowski_tasks": types.SimpleNamespace(
+                _database_connection=lambda: self.fail(
+                    "must not read task DB without core state directory"
+                )
+            ),
+            "grabowski_audit_query": types.SimpleNamespace(
+                capture_verified_audit_snapshot=lambda: self.fail(
+                    "must not scan audit without core state directory"
+                )
+            ),
+        }
+        with patch.dict(sys.modules, modules):
+            with self.assertRaisesRegex(
+                post_merge.RepoGroundPostMergeError,
+                "discovery state store is unavailable",
+            ):
+                post_merge.initialize_reconcile_discovery_watermark(
+                    predecessor_module_path=Path("/not-installed.py")
+                )
+
     def test_discovery_initialization_seeds_verified_tip_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -947,7 +1073,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
             )
             modules = {
                 "grabowski_audit_query": audit,
-                "grabowski_operator": types.SimpleNamespace(STATE_DIR=directory),
+                "grabowski_operator_core": types.SimpleNamespace(STATE_DIR=directory),
                 "grabowski_tasks": tasks,
             }
             predecessor = directory / "not-installed.py"
@@ -988,7 +1114,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                         "audit scan must not occur after ambiguous prior activation"
                     ),
                 ),
-                "grabowski_operator": types.SimpleNamespace(STATE_DIR=directory),
+                "grabowski_operator_core": types.SimpleNamespace(STATE_DIR=directory),
                 "grabowski_tasks": tasks,
             }
             with patch.dict(sys.modules, modules):
@@ -1020,7 +1146,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                         total_records=0
                     ),
                 ),
-                "grabowski_operator": types.SimpleNamespace(STATE_DIR=directory),
+                "grabowski_operator_core": types.SimpleNamespace(STATE_DIR=directory),
                 "grabowski_tasks": tasks,
             }
             with patch.dict(sys.modules, modules):
@@ -1092,7 +1218,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
 
         modules = {
             "grabowski_audit_query": audit_query,
-            "grabowski_operator": operator,
+            "grabowski_operator_core": operator,
             "grabowski_tasks": tasks_module,
         }
         with (
@@ -1179,7 +1305,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 sys.modules,
                 {
                     "grabowski_audit_query": audit_query,
-                    "grabowski_operator": operator,
+                    "grabowski_operator_core": operator,
                     "grabowski_tasks": tasks_module,
                 },
             ),
@@ -1243,7 +1369,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 sys.modules,
                 {
                     "grabowski_audit_query": audit_query,
-                    "grabowski_operator": operator,
+                    "grabowski_operator_core": operator,
                     "grabowski_tasks": tasks_module,
                 },
             ),
@@ -1306,7 +1432,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
         )
         modules = {
             "grabowski_audit_query": audit_query,
-            "grabowski_operator": types.SimpleNamespace(STATE_DIR=Path("/state")),
+            "grabowski_operator_core": types.SimpleNamespace(STATE_DIR=Path("/state")),
             "grabowski_tasks": types.SimpleNamespace(),
         }
         cases = (
@@ -1419,7 +1545,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                     sys.modules,
                     {
                         "grabowski_audit_query": query,
-                        "grabowski_operator": types.SimpleNamespace(
+                        "grabowski_operator_core": types.SimpleNamespace(
                             STATE_DIR=Path("/state")
                         ),
                         "grabowski_tasks": tasks,
@@ -1524,7 +1650,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
             }
             modules = {
                 "grabowski_audit_query": query,
-                "grabowski_operator": types.SimpleNamespace(STATE_DIR=Path("/state")),
+                "grabowski_operator_core": types.SimpleNamespace(STATE_DIR=Path("/state")),
                 "grabowski_tasks": tasks,
             }
             with (
@@ -1630,7 +1756,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 sys.modules,
                 {
                     "grabowski_audit_query": audit_query,
-                    "grabowski_operator": operator,
+                    "grabowski_operator_core": operator,
                     "grabowski_tasks": tasks_module,
                 },
             ),
@@ -1709,7 +1835,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
 
         modules = {
             "grabowski_audit_query": audit_query,
-            "grabowski_operator": operator,
+            "grabowski_operator_core": operator,
             "grabowski_tasks": tasks_module,
         }
         with (
@@ -1800,7 +1926,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 sys.modules,
                 {
                     "grabowski_audit_query": audit_query,
-                    "grabowski_operator": types.SimpleNamespace(),
+                    "grabowski_operator_core": types.SimpleNamespace(),
                 },
             ),
             patch.object(post_merge.time, "time", return_value=10_000),
@@ -1867,7 +1993,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 sys.modules,
                 {
                     "grabowski_audit_query": audit_query,
-                    "grabowski_operator": types.SimpleNamespace(),
+                    "grabowski_operator_core": types.SimpleNamespace(),
                 },
             ),
             patch.object(post_merge.time, "time", return_value=10_000),
@@ -1925,7 +2051,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 sys.modules,
                 {
                     "grabowski_audit_query": audit_query,
-                    "grabowski_operator": types.SimpleNamespace(),
+                    "grabowski_operator_core": types.SimpleNamespace(),
                 },
             ),
             patch.object(post_merge.time, "time", return_value=10_000),
@@ -1996,7 +2122,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 sys.modules,
                 {
                     "grabowski_audit_query": audit_query,
-                    "grabowski_operator": types.SimpleNamespace(),
+                    "grabowski_operator_core": types.SimpleNamespace(),
                 },
             ),
             patch.object(post_merge.time, "time", return_value=10_000),
@@ -2070,7 +2196,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 sys.modules,
                 {
                     "grabowski_audit_query": audit_query,
-                    "grabowski_operator": types.SimpleNamespace(),
+                    "grabowski_operator_core": types.SimpleNamespace(),
                 },
             ),
             patch.object(post_merge.time, "time", return_value=10_000),
@@ -2125,7 +2251,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {
                 "grabowski_audit_query": audit,
-                "grabowski_operator": types.SimpleNamespace(),
+                "grabowski_operator_core": types.SimpleNamespace(),
             }),
             patch.object(post_merge.time, "time", return_value=10_000),
             # The audit phase itself consumes 181s: the former global 720s
@@ -2166,7 +2292,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, {
                 "grabowski_audit_query": audit,
-                "grabowski_operator": types.SimpleNamespace(),
+                "grabowski_operator_core": types.SimpleNamespace(),
             }),
             patch.object(post_merge.time, "time", return_value=10_000),
             patch.object(post_merge.time, "monotonic", side_effect=[0.0, 901.0, 901.0]),
@@ -2223,7 +2349,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 sys.modules,
                 {
                     "grabowski_audit_query": audit_query,
-                    "grabowski_operator": types.SimpleNamespace(),
+                    "grabowski_operator_core": types.SimpleNamespace(),
                 },
             ),
             patch.object(post_merge.time, "time", return_value=10_000),
@@ -2540,7 +2666,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 patch.dict(
                     sys.modules, {
                         "grabowski_audit_query": audit,
-                        "grabowski_operator": types.SimpleNamespace(
+                        "grabowski_operator_core": types.SimpleNamespace(
                             STATE_DIR=Path(temporary),
                         ),
                         "grabowski_tasks": tasks,
@@ -2785,7 +2911,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                     sys.modules,
                     {
                         "grabowski_audit_query": query,
-                        "grabowski_operator": types.SimpleNamespace(
+                        "grabowski_operator_core": types.SimpleNamespace(
                             STATE_DIR=Path(temporary)
                         ),
                         "grabowski_tasks": tasks,
@@ -2903,7 +3029,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                     sys.modules,
                     {
                         "grabowski_audit_query": audit,
-                        "grabowski_operator": types.SimpleNamespace(
+                        "grabowski_operator_core": types.SimpleNamespace(
                             STATE_DIR=Path(temporary)
                         ),
                         "grabowski_tasks": tasks,
@@ -3002,7 +3128,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
             )
             modules = {
                 "grabowski_audit_query": audit,
-                "grabowski_operator": types.SimpleNamespace(STATE_DIR=Path("/state")),
+                "grabowski_operator_core": types.SimpleNamespace(STATE_DIR=Path("/state")),
                 "grabowski_tasks": tasks,
             }
             with (
@@ -3103,7 +3229,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                     sys.modules,
                     {
                         "grabowski_audit_query": audit,
-                        "grabowski_operator": types.SimpleNamespace(
+                        "grabowski_operator_core": types.SimpleNamespace(
                             STATE_DIR=Path(temporary)
                         ),
                         "grabowski_tasks": tasks,
@@ -3265,7 +3391,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                     sys.modules,
                     {
                         "grabowski_audit_query": audit,
-                        "grabowski_operator": types.SimpleNamespace(
+                        "grabowski_operator_core": types.SimpleNamespace(
                             STATE_DIR=Path("/state")
                         ),
                         "grabowski_tasks": tasks,
@@ -3426,7 +3552,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
 
         modules = {
             "grabowski_audit_query": audit_query,
-            "grabowski_operator": operator,
+            "grabowski_operator_core": operator,
             "grabowski_tasks": tasks_module,
         }
         with (
@@ -3496,7 +3622,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
 
         modules = {
             "grabowski_audit_query": audit_query,
-            "grabowski_operator": operator,
+            "grabowski_operator_core": operator,
             "grabowski_tasks": tasks_module,
         }
         with (
@@ -3592,7 +3718,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
 
         modules = {
             "grabowski_audit_query": audit_query,
-            "grabowski_operator": operator,
+            "grabowski_operator_core": operator,
             "grabowski_tasks": tasks_module,
         }
         with (
@@ -3695,7 +3821,7 @@ class RepoGroundPostMergeAuditBindingTests(unittest.TestCase):
                 sys.modules,
                 {
                     "grabowski_audit_query": audit_query,
-                    "grabowski_operator": types.SimpleNamespace(),
+                    "grabowski_operator_core": types.SimpleNamespace(),
                 },
             ),
             patch.object(post_merge.time, "time", return_value=10_000),
