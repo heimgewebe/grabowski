@@ -4389,7 +4389,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     },
                     "freshness": {"status": "fresh"},
                     "resolved_ranges": [
-                        {"path": "src/example.py", "status": "resolved"}
+                        {
+                            "path": "src/example.py",
+                            "status": "resolved",
+                            "text_excerpt": "def example(): ...",
+                            "range_ref": {"ref": "example"},
+                        }
                     ],
                     "budget": {"context_bytes_used": 654},
                 },

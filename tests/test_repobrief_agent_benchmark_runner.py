@@ -967,7 +967,12 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     },
                     "freshness": {"status": "not_comparable"},
                     "resolved_ranges": [
-                        {"status": "resolved", "source_path": "src/resolved.py"},
+                        {
+                            "status": "resolved",
+                            "source_path": "src/resolved.py",
+                            "text_excerpt": "def resolved(): ...",
+                            "range_ref": {"ref": "resolved"},
+                        },
                         {"source_path": "src/no-status.py"},
                         {"status": "candidate", "source_path": "src/candidate.py"},
                     ],
@@ -1028,6 +1033,120 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                             runner.normalize_tool_calls(value, messages),
                         )
                     )
+
+    def test_resolved_range_entries_require_identity_and_text(self) -> None:
+        good = {
+            "status": "resolved",
+            "source_path": "src/a.py",
+            "text_excerpt": "x = 1",
+            "range_ref": {"ref": "a"},
+        }
+        self.assertTrue(runner._resolved_range_entries_valid([]))
+        self.assertTrue(runner._resolved_range_entries_valid([good]))
+        self.assertTrue(runner._resolved_range_entries_valid(
+            [{"status": "candidate"}, {"source_path": "src/b.py"}, good]
+        ))
+        self.assertTrue(runner._resolved_range_entries_valid(
+            [{"status": "resolved", "path": "src/a.py", "text_excerpt": "x"}]
+        ))
+        self.assertTrue(runner._resolved_range_entries_valid(
+            [{"status": "resolved", "range_ref": {"ref": "r"}, "text_excerpt": "x"}]
+        ))
+        malformed = [
+            {"status": "resolved"},
+            {"status": "resolved", "source_path": "src/a.py"},
+            {"status": "resolved", "text_excerpt": "x"},
+            {"status": "resolved", "text_excerpt": "  ", "source_path": "a.py"},
+            {"status": "resolved", "text_excerpt": 5, "source_path": "a.py"},
+            {"status": "resolved", "text_excerpt": "x", "source_path": ""},
+            {"status": "resolved", "text_excerpt": "x", "source_path": 7},
+            {"status": "resolved", "text_excerpt": "x", "range_ref": {}},
+            {"status": "resolved", "text_excerpt": "x", "range_ref": "r"},
+            "resolved",
+            None,
+        ]
+        for entry in malformed:
+            with self.subTest(entry=entry):
+                self.assertFalse(runner._resolved_range_entries_valid([entry]))
+                self.assertFalse(runner._resolved_range_entries_valid([good, entry]))
+        self.assertFalse(runner._resolved_range_entries_valid(None))
+        self.assertFalse(runner._resolved_range_entries_valid({"status": "resolved"}))
+
+    def test_treatment_rejects_identityless_resolved_ranges_without_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="mcp__repobrief__ask_context")
+            )
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+
+            def payload(ranges: object) -> dict:
+                return {
+                    "kind": "repobrief.mcp.read_only_frontdoor",
+                    "version": "v1",
+                    "tool": "ask_context",
+                    "status": "ok",
+                    "context_pack": {
+                        "kind": "repobrief.ask_context_pack",
+                        "version": "1.0",
+                        "snapshot_ref": {
+                            "manifest_path": str(manifest),
+                            "manifest_sha256": value["repobrief"]["manifest_sha256"],
+                            "git_commit": COMMIT,
+                            "freshness_status": "not_comparable",
+                        },
+                        "freshness": {"status": "not_comparable"},
+                        "resolved_ranges": ranges,
+                        "budget": {"context_bytes_used": 3},
+                    },
+                    "live_freshness": {
+                        "kind": "repobrief.live_freshness",
+                        "version": "v1",
+                        "status": "fresh",
+                        "reason": "git_head_matches_snapshot",
+                        "bundle_manifest": str(manifest),
+                        "repo_root": "/tmp/repo",
+                        "read_only_git_probe": True,
+                        "implicit_refresh": False,
+                        "snapshot_provenance": {"git_commit": COMMIT},
+                    },
+                }
+
+            def evidence_for(ranges: object):
+                tool_result["content"] = json.dumps(
+                    {"structuredContent": complete(payload(ranges))}, sort_keys=True
+                )
+                calls = runner.normalize_tool_calls(value, messages)
+                return runner.normalize_repoground_evidence(value, messages, calls)
+
+            for ranges in (
+                [{"status": "resolved"}],
+                [{"status": "resolved", "source_path": "src/a.py"}],
+                [{"status": "resolved", "text_excerpt": "x"}],
+                [{"status": "resolved", "text_excerpt": "x", "range_ref": {}}],
+                ["resolved"],
+                [None],
+            ):
+                with self.subTest(ranges=ranges):
+                    self.assertIsNone(evidence_for(ranges))
+
+            good = evidence_for([{
+                "status": "resolved",
+                "source_path": "src/a.py",
+                "text_excerpt": "x = 1",
+                "range_ref": {"ref": "a"},
+            }])
+            self.assertEqual(good["calls"][0]["resolved_range_count"], 1)
+            empty = evidence_for([])
+            self.assertEqual(empty["calls"][0]["resolved_range_count"], 0)
 
     def test_treatment_binds_manifest_once_for_multiple_evidence_calls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

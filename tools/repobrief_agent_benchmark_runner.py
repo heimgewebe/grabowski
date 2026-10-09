@@ -1588,6 +1588,26 @@ def _validated_read_only_frontdoor_projection(value: Mapping[str, Any]) -> None:
         raise RunnerError("RepoGround treatment tool non-claim projection is malformed")
 
 
+def _resolved_range_entries_valid(ranges: Any) -> bool:
+    """Frontdoor shape: a resolved range carries identity and excerpt text."""
+    if not isinstance(ranges, list):
+        return False
+    for item in ranges:
+        if not isinstance(item, Mapping):
+            return False
+        if item.get("status") != "resolved":
+            continue
+        excerpt = item.get("text_excerpt")
+        range_ref = item.get("range_ref")
+        source_path = item.get("source_path") or item.get("path")
+        has_identity = (
+            isinstance(range_ref, Mapping) and bool(range_ref)
+        ) or (isinstance(source_path, str) and bool(source_path.strip()))
+        if not isinstance(excerpt, str) or not excerpt.strip() or not has_identity:
+            return False
+    return True
+
+
 def _validated_ask_context_pack(value: Any) -> dict[str, Any]:
     base_keys = {
         "kind", "version", "request_id", "snapshot_ref", "freshness",
@@ -1611,7 +1631,7 @@ def _validated_ask_context_pack(value: Any) -> dict[str, Any]:
             "retrieval", "retrieval_infrastructure", "answer_scaffold", "budget"
         ))
         or not isinstance(value.get("retrieval_hits"), list)
-        or not isinstance(value.get("resolved_ranges"), list)
+        or not _resolved_range_entries_valid(value.get("resolved_ranges"))
         or value.get("forbidden_operations") != list(EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS)
         or value.get("does_not_establish") != list(EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH)
         or ("structured_evidence" in value and not isinstance(value.get("structured_evidence"), dict))
@@ -1939,7 +1959,9 @@ def _repoground_evidence_from_payload(
             return None
         ranges = pack.get("resolved_ranges")
         budget = pack.get("budget")
-        if not isinstance(ranges, list) or not isinstance(budget, Mapping):
+        if not _resolved_range_entries_valid(ranges) or not isinstance(
+            budget, Mapping
+        ):
             return None
         context_bytes = budget.get("context_bytes_used")
         if (
