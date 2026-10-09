@@ -85,10 +85,10 @@ _MERGE_GUARD_BINARY_DIFF_RE = re.compile(
 def _merge_guard_mbox_patch_matches_diff(
     patch_bytes: bytes, diff_bytes: bytes, expected_head: str
 ) -> bool:
-    """Prove that a GitHub per-commit mbox contains the exact cumulative diff.
+    """Require mail-wrapped per-commit diffs to equal the live cumulative diff.
 
-    Only blank email separators between commits are removed. No changed line,
-    hunk header or blob identity can differ from the live plain PR diff.
+    Mail headers and exact terminal format-patch footers may be removed;
+    file hunks, blob identities, and binary payload bytes remain significant.
     """
     if (
         not patch_bytes
@@ -113,14 +113,31 @@ def _merge_guard_mbox_patch_matches_diff(
     for index, boundary in enumerate(boundaries):
         end = boundaries[index + 1].start() if index + 1 < len(boundaries) else len(patch_bytes)
         block = patch_bytes[boundary.end() + 1:end]
-        separator = re.search(rb"(?m)^---\r?$", block)
-        if separator is None:
+        # Parse the mail header up to its first blank line. A standalone
+        # "---" or "diff --git" in the commit message is not a trusted
+        # format-patch delimiter; it must not hide a forged diff.
+        header_end = re.search(rb"\r?\n\r?\n", block)
+        if header_end is None or header_end.start() > 64 * 1024:
             return False
-        after_metadata = block[separator.end() + 1:]
-        diff_start = re.search(rb"(?m)^diff --git ", after_metadata)
+        headers = block[:header_end.start()].splitlines()
+        if (
+            not headers
+            or not headers[0].startswith(b"From: ")
+            or not any(line.startswith(b"Subject: ") for line in headers)
+            or any(
+                re.fullmatch(
+                    rb"(?:[A-Za-z0-9-]{1,64}:[^\r\n]*|[ \t][^\r\n]*)",
+                    line,
+                ) is None
+                for line in headers
+            )
+        ):
+            return False
+        body = block[header_end.end():]
+        diff_start = re.search(rb"(?m)^diff --git ", body)
         if diff_start is None:
             return False
-        section = after_metadata[diff_start.start():]
+        section = body[diff_start.start():]
         # Git format-patch may append a version trailer after the final hunk.
         # Only the exact terminal signature is ignored; all patch bytes
         # otherwise remain significant in the cumulative diff comparison.

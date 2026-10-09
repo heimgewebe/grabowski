@@ -800,6 +800,113 @@ class MboxDiffIdentityTests(unittest.TestCase):
             )
         )
 
+    def test_accepts_header_terminated_patch_without_stats_separator(self):
+        head, plain, _mbox = self._evidence()
+        first = plain.split(b"diff --git a/two.txt", 1)[0]
+        patch = (
+            f"From {head} Mon Sep 17 00:00:00 2001\n"
+            "From: Author <author@example.com>\n"
+            "Subject: [PATCH] A markdown section\n\n"
+            "A commit message can contain a separator:\n"
+            "---\n"
+            "It is not the patch boundary.\n\n"
+        ).encode() + first
+        self.assertTrue(
+            merge_guard._merge_guard_mbox_patch_matches_diff(patch, first, head)
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                patch.replace(b"Subject: [PATCH] A markdown section\n\n",
+                              b"Subject: [PATCH] A markdown section\n", 1),
+                first, head,
+            )
+        )
+
+    def test_rejects_forged_diff_in_commit_message(self):
+        head, plain, mbox = self._evidence()
+        forged = mbox.replace(
+            b"Subject: [PATCH] test\n\n---\n",
+            (b"Subject: [PATCH] test\n\n"
+             b"diff --git a/forged.txt b/forged.txt\n"
+             b"---\n"),
+            1,
+        )
+        self.assertNotEqual(forged, mbox)
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                forged, plain, head
+            )
+        )
+
+    def test_rejects_forged_mbox_boundary_in_message(self):
+        head, plain, mbox = self._evidence()
+        injected = mbox.replace(
+            b"Subject: [PATCH] test\n\n",
+            (b"Subject: [PATCH] test\n\n"
+             b"From " + b"c" * 40 +
+             b" Mon Sep 17 00:00:00 2001\n"),
+            1,
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                injected, plain, head
+            )
+        )
+
+    def test_rejects_overlapping_commits_against_net_diff(self):
+        head, plain, mbox = self._evidence()
+        same_path = mbox.replace(
+            b"diff --git a/two.txt b/two.txt",
+            b"diff --git a/one.txt b/one.txt",
+            1,
+        )
+        net_diff = plain.split(b"diff --git a/two.txt", 1)[0]
+        self.assertNotEqual(same_path, mbox)
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                same_path, net_diff, head
+            )
+        )
+
+    def test_rejects_binary_patch_against_binary_summary(self):
+        head, plain, mbox = self._evidence()
+        binary = mbox.replace(
+            b"-before\n+after\n",
+            b"GIT binary patch\nliteral 3\nAAAA\n",
+            1,
+        )
+        summary = plain.replace(
+            b"-before\n+after\n",
+            b"Binary files a/one.txt and b/one.txt differ\n",
+            1,
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                binary, summary, head
+            )
+        )
+
+    def test_crlf_mail_headers_and_footer_do_not_change_hunks(self):
+        head, plain, _mbox = self._evidence()
+        first = plain.split(b"diff --git a/two.txt", 1)[0]
+        patch = (
+            (f"From {head} Mon Sep 17 00:00:00 2001\r\n"
+             "From: Author <author@example.com>\r\n"
+             "Subject: [PATCH] test\r\n\r\n"
+             "---\r\n"
+             " 1 file changed\r\n\r\n").encode()
+            + first
+            + b"\n-- \r\n2.43.0\r\n"
+        )
+        self.assertTrue(
+            merge_guard._merge_guard_mbox_patch_matches_diff(patch, first, head)
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                patch, first.replace(b"+after\n", b"+changed\n"), head
+            )
+        )
+
     def test_live_bindings_accepts_exact_proven_patch_hash_only(self):
         gh = _RenamePrGh()
         gh.diff_text = (
