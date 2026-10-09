@@ -43,6 +43,51 @@ ARTIFACT_ROOT = Path(
     )
 ).expanduser()
 BUREAU_ROOT = bureau_runtime.BUREAU_CONTROL_ROOT
+
+def _configured_bureau_state_roots() -> tuple[Path, Path]:
+    legacy_root = Path(
+        os.environ.get("BUREAU_STATE_DIR", "~/.local/state/bureau")
+    ).expanduser()
+    state_root = Path(
+        os.environ.get(
+            "GRABOWSKI_BUREAU_COORDINATION_ROOT",
+            str(legacy_root),
+        )
+    ).expanduser()
+    return legacy_root, state_root
+
+
+BUREAU_LEGACY_STATE_ROOT, BUREAU_STATE_ROOT = _configured_bureau_state_roots()
+
+
+def _absolute_bureau_state_root(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+
+
+def _assert_bureau_state_root_has_no_symlink_components(path: Path) -> None:
+    normalized = _absolute_bureau_state_root(path)
+    current = Path(normalized.anchor)
+    for component_index, component in enumerate(normalized.parts[1:], start=1):
+        current = current / component
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise bureau_runtime.BureauLeaseContractError(
+                "bureau-state-root-path-unavailable",
+                details={
+                    "component_index": component_index,
+                    "error_type": type(exc).__name__,
+                },
+            ) from None
+        if stat.S_ISLNK(metadata.st_mode):
+            raise bureau_runtime.BureauLeaseContractError(
+                "bureau-state-root-symlink-component",
+                details={"component_index": component_index},
+            )
+
+
 MAX_INPUT_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 30
@@ -76,6 +121,7 @@ BUREAU_FAILURE_IDENTITY_SCHEMA_VERSION = 1
 BUREAU_ADAPTER_SURFACE = "grabowski_bureau_intake"
 BUREAU_ADAPTER_COMMANDS = frozenset(
     {
+        "acceptance-authenticate",
         "operator-candidate-assess",
         "operator-candidate-record",
         "operator-task-propose",
@@ -1448,6 +1494,66 @@ def grabowski_bureau_candidate_assess(
     return _invoke_bureau(arguments)
 
 
+@mcp.tool(name="grabowski_bureau_acceptance_authenticate", annotations=MUTATING)
+def grabowski_bureau_acceptance_authenticate(
+    run_id: str,
+    criterion_id: str,
+    expected_evidence_sha256: str,
+    reviewer: str,
+) -> dict[str, Any]:
+    """Authenticate one exact manual Bureau acceptance item through Bureau's canonical contract."""
+    state_root = _absolute_bureau_state_root(BUREAU_STATE_ROOT)
+    _assert_bureau_state_root_has_no_symlink_components(state_root)
+    operator._require_operator_mutation("bureau_mutation", path=str(state_root))
+    normalized: dict[str, str] = {}
+    for label, value, maximum in (
+        ("run_id", run_id, 128),
+        ("criterion_id", criterion_id, 256),
+        ("reviewer", reviewer, 200),
+    ):
+        if not isinstance(value, str):
+            raise ValueError(f"{label} must be text")
+        current = value.strip()
+        if not current or "\x00" in current or len(current) > maximum:
+            raise ValueError(
+                f"{label} must contain 1-{maximum} non-NUL characters"
+            )
+        normalized[label] = current
+    if (
+        not isinstance(expected_evidence_sha256, str)
+        or SHA256_RE.fullmatch(expected_evidence_sha256) is None
+    ):
+        raise ValueError(
+            "expected_evidence_sha256 must be a lowercase SHA-256 digest"
+        )
+    payload = _invoke_bureau(
+        [
+            "--json",
+            "--json-envelope",
+            "--state-root",
+            str(state_root),
+            "acceptance-authenticate",
+            normalized["run_id"],
+            normalized["criterion_id"],
+            "--expected-evidence-sha256",
+            expected_evidence_sha256,
+            "--reviewer",
+            normalized["reviewer"],
+        ],
+        mutation=True,
+        required_readback=[f"bureau_run:{normalized['run_id']}"],
+    )
+    _audit(
+        "bureau-acceptance-authenticate",
+        payload,
+        run_id=normalized["run_id"],
+        criterion_id=normalized["criterion_id"],
+        expected_evidence_sha256=expected_evidence_sha256,
+        reviewer=normalized["reviewer"],
+    )
+    return payload
+
+
 @mcp.tool(name="grabowski_bureau_task_propose", annotations=MUTATING)
 def grabowski_bureau_task_propose(
     task_json: dict[str, Any],
@@ -1662,6 +1768,11 @@ def _task_publication_lease_metadata(
     standard_keys = set(metadata)
     if required_keys == standard_keys:
         if required != metadata:
+            raise ValueError("publication-lease-metadata-contract-invalid")
+        return metadata
+    legacy_revision_keys = {"operation", "proposal_sha256", "task_id"}
+    if required_keys == legacy_revision_keys:
+        if any(required.get(key) != metadata[key] for key in legacy_revision_keys):
             raise ValueError("publication-lease-metadata-contract-invalid")
         return metadata
     expected_keys = {

@@ -553,7 +553,13 @@ def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
         command_class = "other"
         if workspace_id:
             command_class = "agent-workspace-pane"
-        elif executable.lower() in CODING_AGENT_EXECUTABLES:
+        # Zombies remain observable, but cannot execute provider work. Excluding
+        # them from coding-agent classification prevents unreadable zombie argv
+        # from making otherwise complete physical occupancy globally unavailable.
+        elif (
+            not state.startswith("Z")
+            and executable.lower() in CODING_AGENT_EXECUTABLES
+        ):
             command_class = "coding-agent"
         elif "grabowski_operator" in arguments:
             command_class = "operator-runtime"
@@ -931,6 +937,50 @@ def _reconciliation_has_more(payload: dict[str, Any] | None) -> bool:
         pagination,
         "checkout_binding_reconciliation.pagination",
     )
+
+
+def _task_checkout_presence(
+    payload: dict[str, Any] | None,
+) -> tuple[dict[str, list[str]], bool]:
+    if payload is None:
+        return {}, False
+    complete = payload.get("task_checkout_presence_complete", False)
+    if not isinstance(complete, bool):
+        raise CurrentWorkProjectionError(
+            "checkout_binding_reconciliation.task_checkout_presence_complete must be boolean"
+        )
+    raw = payload.get("task_checkout_presence", {})
+    if not isinstance(raw, dict) or len(raw) > MAX_TASKS:
+        raise CurrentWorkProjectionError(
+            "checkout_binding_reconciliation.task_checkout_presence must be a bounded object"
+        )
+    result: dict[str, list[str]] = {}
+    for raw_task_id, raw_checkout_keys in raw.items():
+        task_id = _identifier(
+            raw_task_id,
+            "checkout_binding_reconciliation.task_checkout_presence.task_id",
+        )
+        if (
+            not isinstance(raw_checkout_keys, list)
+            or len(raw_checkout_keys) > MAX_EVIDENCE
+            or not raw_checkout_keys
+        ):
+            raise CurrentWorkProjectionError(
+                "checkout_binding_reconciliation.task_checkout_presence checkout keys are invalid"
+            )
+        checkout_keys = [
+            _identifier(
+                item,
+                "checkout_binding_reconciliation.task_checkout_presence.checkout_key",
+            )
+            for item in raw_checkout_keys
+        ]
+        if len(checkout_keys) != len(set(checkout_keys)):
+            raise CurrentWorkProjectionError(
+                "checkout_binding_reconciliation.task_checkout_presence checkout keys are duplicated"
+            )
+        result[task_id] = sorted(checkout_keys)
+    return result, complete
 
 
 def _task_has_more(payload: dict[str, Any] | None) -> bool:
@@ -1407,9 +1457,9 @@ def _add_checkouts(
                 if "closed-not-cleaned" not in group["action_reasons"]:
                     group["action_reasons"].append("closed-not-cleaned")
         elif item["binding_phase"] == "active" and item["binding_consistent"]:
-            # An active lifecycle binding remains operational authority until
-            # exact terminal evidence changes the binding phase. Lease/process
-            # absence alone never proves terminality.
+            # Active lifecycle bindings keep identity authority. Finalization may
+            # demote only the attention projection when expiry is proven and no
+            # independent live operational evidence exists.
             _set_projection_state(group, "active")
         elif item["coordination_blocking"]:
             _set_projection_state(group, "active")
@@ -1772,10 +1822,28 @@ def _finalize_groups(
     tasks: dict[str, dict[str, Any]],
     *,
     view: str,
+    source_truncation: dict[str, bool],
+    source_errors: list[dict[str, Any]],
+    task_checkout_presence: dict[str, list[str]],
+    task_checkout_presence_complete: bool,
+    attention_current_work_filter_applied: bool,
 ) -> list[dict[str, Any]]:
     projected: list[dict[str, Any]] = []
+    source_error_sources = {
+        str(item.get("source", "unknown")) for item in source_errors
+    }
     for group in groups.values():
-        task_item = tasks.get(group["binding"]["id"]) if group["binding"]["kind"] == "task" else None
+        task_id = (
+            group["binding"]["id"]
+            if group["binding"]["kind"] == "task"
+            else None
+        )
+        task_item = tasks.get(task_id) if task_id is not None else None
+        task_checkout_keys = (
+            task_checkout_presence.get(task_id, [])
+            if task_id is not None
+            else []
+        )
         has_live_surface = bool(
             group["lease_summary"]["count"]
             or group["checkout_refs"]
@@ -1791,12 +1859,133 @@ def _finalize_groups(
             and task_item is None
         ):
             _blocking(group, "task-lifecycle-unresolved-for-live-lease")
+        if task_item is None and task_checkout_keys:
+            for checkout_key in task_checkout_keys:
+                _append(
+                    group["authority_refs"],
+                    {
+                        "source": "checkout-lifecycle-presence",
+                        "task_id": task_id,
+                        "checkout_key": checkout_key,
+                        "authority": True,
+                    },
+                )
+            _blocking(group, "task-lifecycle-unresolved-for-live-checkout")
         archived_attention = bool(
             {"attention:decision_closed", "attention:decision_superseded"}
             & set(group["source_states"])
         )
         if archived_attention and has_live_surface:
             _blocking(group, "archived-attention-with-live-surfaces")
+
+        active_lifecycle_checkouts = [
+            item
+            for item in group["checkout_refs"]
+            if item["binding_present"]
+            and item["binding_consistent"]
+            and item["binding_phase"] == "active"
+        ]
+        expired_coordination_free_active_only = bool(active_lifecycle_checkouts) and all(
+            item["retention_expiration_proven"]
+            and not item["retention_active"]
+            and not item["dirty"]
+            and not item["coordination_blocking"]
+            and not item["resource_leases"]
+            and not item["processes"]
+            for item in active_lifecycle_checkouts
+        )
+        live_worker_authority = any(
+            item["state"] in ACTIVE_WORKER_STATES
+            for item in group["worker_refs"]
+        )
+        resumable_worker_authority = any(
+            item["state"] == "interrupted"
+            for item in group["worker_refs"]
+        )
+        independent_live_authority = bool(
+            (task_item and task_item["state"] in ACTIVE_TASK_STATES)
+            or group["lease_summary"]["count"]
+            or live_worker_authority
+            or group["physical_refs"]["tmux_sessions"]
+            or group["physical_refs"]["processes"]
+            or any(
+                ref.get("source") not in {"checkout-lifecycle-binding", "worker-registry"}
+                for ref in group["authority_refs"]
+            )
+        )
+        negative_authority_sources = {
+            "checkouts",
+            "resources",
+            "tmux",
+            "processes",
+            "checkout_binding_reconciliation",
+        }
+        if group["binding"]["kind"] == "task":
+            negative_authority_sources.update({"tasks", "attention"})
+        elif group["binding"]["kind"] == "worker":
+            negative_authority_sources.update({"browser_workers", "gui_workers"})
+        live_authority_absence_proven = (
+            not source_truncation.get("source_errors", False)
+            and not any(
+                source_truncation.get(source, False)
+                for source in negative_authority_sources
+            )
+            and not (negative_authority_sources & source_error_sources)
+        )
+        if (
+            group["projection_state"] == "active"
+            and expired_coordination_free_active_only
+            and not independent_live_authority
+            and live_authority_absence_proven
+        ):
+            if resumable_worker_authority:
+                group["projection_state"] = "resumable"
+                group["work_class"] = "operational"
+            else:
+                group["projection_state"] = "hygiene"
+                group["work_class"] = "hygiene"
+                group["action_required"] = True
+                if "managed-active-retention-expired" not in group["action_reasons"]:
+                    group["action_reasons"].append("managed-active-retention-expired")
+
+        current_binding_absence_sources = {
+            "tasks",
+            "resources",
+            "checkout_binding_reconciliation",
+        }
+        current_binding_absence_proven = (
+            task_checkout_presence_complete
+            and not task_checkout_keys
+            and not source_truncation.get("source_errors", False)
+            and not source_truncation.get("tasks", False)
+            and not source_truncation.get("resources", False)
+            and not (current_binding_absence_sources & source_error_sources)
+        )
+        attention_page_safe_to_suppress = bool(
+            not attention_current_work_filter_applied
+            and not source_truncation.get("attention", False)
+        )
+        attention_only_hygiene = (
+            group["binding"]["kind"] == "task"
+            and task_item is None
+            and group["projection_state"] == "hygiene"
+            and "attention-actionable" in group["action_reasons"]
+            and bool(group["authority_refs"])
+            and all(
+                ref.get("source") == "task-attention-decision-evidence"
+                for ref in group["authority_refs"]
+            )
+            and not group["heuristic_refs"]
+        )
+        if (
+            view == "current"
+            and attention_only_hygiene
+            and not has_live_surface
+            and current_binding_absence_proven
+            and attention_page_safe_to_suppress
+        ):
+            continue
+
         if view == "current" and group["projection_state"] == "terminal_archived" and not has_live_surface and not group["action_required"]:
             continue
 
@@ -2118,6 +2307,15 @@ def build_current_work_projection(
 
     task_rows = _records(tasks_payload, "tasks", MAX_TASKS, "tasks")
     attention_rows = _attention_records(attention_payload)
+    attention_current_work_filter_applied = bool(
+        attention_payload
+        and "current_work_orphan_filter_safe" in attention_payload
+    )
+    if attention_current_work_filter_applied:
+        _boolean(
+            attention_payload.get("current_work_orphan_filter_safe"),
+            "attention.current_work_orphan_filter_safe",
+        )
     lease_rows = _records(resources_payload, "leases", MAX_LEASES, "resources")
     browser_rows = _records(browser_payload, "workers", MAX_WORKERS, "browser")
     gui_rows = _records(gui_payload, "workers", MAX_WORKERS, "gui")
@@ -2126,6 +2324,9 @@ def build_current_work_projection(
         "bindings",
         MAX_WORKTREES,
         "checkout_binding_reconciliation",
+    )
+    task_checkout_presence, task_checkout_presence_complete = _task_checkout_presence(
+        reconciliation_payload
     )
     if checkout_payloads is None:
         checkout_payloads = []
@@ -2165,18 +2366,6 @@ def build_current_work_projection(
     if processes["errors"]:
         errors.append({"source": "processes", "parse_errors": processes["errors"]})
 
-    groups: dict[str, dict[str, Any]] = {}
-    tasks, task_paths = _add_tasks(groups, task_rows)
-    _apply_attention(groups, tasks, attention_rows)
-    _add_leases(groups, lease_rows, set(tasks) | {item["task_id"] for item in attention_rows})
-    _add_workers(groups, browser_rows, gui_rows)
-    _add_checkouts(groups, checkouts, tasks, task_paths, view=view)
-    _add_binding_reconciliation(groups, reconciliation_rows)
-    unbound_tmux, unbound_tmux_total, unbound_processes, unbound_process_total = _add_physical_surfaces(
-        groups, tmux, processes
-    )
-    projected = _finalize_groups(groups, tasks, view=view)
-
     resource_count = _integer(
         resources_payload.get("count", len(lease_rows)) if resources_payload else 0,
         "resources.count",
@@ -2199,6 +2388,28 @@ def build_current_work_projection(
         ),
         "source_errors": source_errors_truncated,
     }
+
+    groups: dict[str, dict[str, Any]] = {}
+    tasks, task_paths = _add_tasks(groups, task_rows)
+    _apply_attention(groups, tasks, attention_rows)
+    _add_leases(groups, lease_rows, set(tasks) | {item["task_id"] for item in attention_rows})
+    _add_workers(groups, browser_rows, gui_rows)
+    _add_checkouts(groups, checkouts, tasks, task_paths, view=view)
+    _add_binding_reconciliation(groups, reconciliation_rows)
+    unbound_tmux, unbound_tmux_total, unbound_processes, unbound_process_total = _add_physical_surfaces(
+        groups, tmux, processes
+    )
+    projected = _finalize_groups(
+        groups,
+        tasks,
+        view=view,
+        source_truncation=source_truncation,
+        source_errors=errors,
+        task_checkout_presence=task_checkout_presence,
+        task_checkout_presence_complete=task_checkout_presence_complete,
+        attention_current_work_filter_applied=attention_current_work_filter_applied,
+    )
+
     _annotate_groups(
         projected,
         generated_at_unix=generated_at_unix,
@@ -2425,4 +2636,3 @@ def build_current_work_projection(
             "repository-filter-invariant aggregate values from globally sourced work groups",
         ],
     }
-

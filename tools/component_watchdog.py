@@ -33,6 +33,7 @@ DEFAULT_MODULE = "grabowski_operator"
 DEFAULT_OPERATOR_SERVICE = "grabowski-operator.service"
 DEFAULT_TUNNEL_SERVICE = "tunnel-client-grabowski.service"
 DEFAULT_MCP_URL = "http://127.0.0.1:18181/_grabowski/mcp-liveness"
+DEFAULT_TRANSPORT_INGRESS_HEALTH_URL = "http://127.0.0.1:18180/_grabowski/transport-ingress"
 DEFAULT_HEALTH_URL = "http://127.0.0.1:18080/healthz"
 DEFAULT_READY_URL = "http://127.0.0.1:18080/readyz"
 DEFAULT_METRICS_URL = "http://127.0.0.1:18080/metrics"
@@ -41,7 +42,7 @@ TUNNEL_METRICS_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 CONTROL_PLANE_POLL_METRIC = "commands_poll_last_successful_timestamp_seconds"
 TUNNEL_RECOVERY_PHASES = frozenset({"idle", "degraded", "restarting", "connector-convergence"})
 PROTOCOL_VERSION = "2025-06-18"
-MCP_HEALTH_TOOL = "grabowski_runtime_health"
+MCP_HEALTH_TOOL = "grabowski_mcp_liveness"
 MCP_MAX_RESPONSE_BYTES = 65536
 MCP_STDIO_SHUTDOWN_TIMEOUT = 2.0
 CONNECTOR_SNAPSHOT_REFRESH_MAX_OUTPUT_BYTES = 64 * 1024
@@ -959,6 +960,51 @@ def _mcp_http_request(
         connection.close()
 
 
+def transport_ingress_selected_operator_url(
+    url: str, timeout: float
+) -> tuple[str | None, str | None]:
+    if timeout <= 0:
+        raise WatchdogError("invalid-mcp-timeout")
+    host, port, path = loopback_http_url(url)
+    try:
+        status, headers, body = _mcp_http_request(
+            host=host,
+            port=port,
+            path=path,
+            timeout=timeout,
+        )
+    except McpProbeFailure:
+        return None, "transport-ingress-unavailable"
+    if status != 200:
+        return None, "transport-ingress-health-status"
+    if len(body) > MCP_MAX_RESPONSE_BYTES:
+        return None, "transport-ingress-health-response-too-large"
+    content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        return None, "transport-ingress-health-content-type-invalid"
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "transport-ingress-health-json-invalid"
+    if not isinstance(payload, dict):
+        return None, "transport-ingress-health-shape-invalid"
+    slot = payload.get("selected_slot")
+    upstream_port = payload.get("upstream_port")
+    expected_port = {"canonical": 18181, "green": 18182}.get(slot)
+    if (
+        payload.get("healthy") is not True
+        or payload.get("selector_authoritative") is not True
+        or payload.get("upstream") != "loopback-operator"
+        or expected_port is None
+        or upstream_port != expected_port
+    ):
+        return None, "transport-ingress-route-invalid"
+    return (
+        f"http://127.0.0.1:{upstream_port}/_grabowski/mcp-liveness",
+        None,
+    )
+
+
 def mcp_http_probe(url: str, timeout: float) -> str | None:
     # Probe the live event loop and session-creation lock without creating a session.
     if timeout <= 0:
@@ -1087,9 +1133,21 @@ def mcp_stdio_probe(
         if is_error:
             raise McpProbeFailure("mcp-tool-error")
         payload = tool_health_payload(result)
-        if payload is None or not isinstance(payload.get("healthy"), bool):
+        if (
+            payload is None
+            or type(payload.get("schema_version")) is not int
+            or payload["schema_version"] != 1
+            or payload.get("service") != "grabowski-mcp"
+            or payload.get("health_scope") != "mcp_tool_dispatch"
+            or payload.get("integrity_evaluated") is not False
+            or type(payload.get("dispatch_healthy")) is not bool
+            or any(field in payload for field in (
+                "healthy", "deployment_complete", "deployment_integrity_valid",
+                "audit_valid", "audit_writable", "kill_switch_engaged",
+            ))
+        ):
             raise McpProbeFailure("mcp-tool-shape-invalid")
-        if payload["healthy"] is not True:
+        if payload["dispatch_healthy"] is not True:
             raise McpProbeFailure("mcp-runtime-unhealthy")
     except McpProbeFailure as failure:
         primary_failure = failure.reason
@@ -2221,6 +2279,7 @@ def classify_tunnel_readiness_dependency(
     startup_grace: float,
     mcp_url: str,
     timeout: float,
+    ingress_health_url: str | None = None,
     proc_root: Path = Path("/proc"),
 ) -> tuple[ProbeResult, WatchdogState]:
     """Separate a missing readiness dependency from stale tunnel state."""
@@ -2245,9 +2304,33 @@ def classify_tunnel_readiness_dependency(
             readiness_dependency_unavailable_start_ticks=None,
         )
         evidence_matches_process = False
-    if probe.status != "indeterminate" or probe.reasons != ("readiness-failed",):
+    healthy_tunnel = probe.status == "healthy"
+    readiness_failed = (
+        probe.status == "indeterminate"
+        and probe.reasons == ("readiness-failed",)
+    )
+    if not (healthy_tunnel or readiness_failed):
         return probe, state
-    dependency_failure = mcp_http_probe(mcp_url, timeout)
+
+    dependency_url = mcp_url
+    if ingress_health_url is not None:
+        dependency_url, route_failure = transport_ingress_selected_operator_url(
+            ingress_health_url, timeout
+        )
+        if route_failure is not None or dependency_url is None:
+            return (
+                ProbeResult(
+                    "indeterminate",
+                    (route_failure or "transport-ingress-route-invalid",),
+                    probe.pid,
+                    probe.age_seconds,
+                    probe.start_ticks,
+                    probe.boot_id,
+                ),
+                state,
+            )
+
+    dependency_failure = mcp_http_probe(dependency_url, timeout)
     identity, identity_failure = tunnel_service_process_identity(
         service,
         profile,
@@ -2282,16 +2365,35 @@ def classify_tunnel_readiness_dependency(
             state,
         )
     if dependency_failure == "mcp-http-request-failed":
-        state = replace(
-            state,
-            readiness_dependency_unavailable_boot_id=identity.boot_id,
-            readiness_dependency_unavailable_pid=identity.pid,
-            readiness_dependency_unavailable_start_ticks=identity.start_ticks,
-        )
+        if readiness_failed:
+            state = replace(
+                state,
+                readiness_dependency_unavailable_boot_id=identity.boot_id,
+                readiness_dependency_unavailable_pid=identity.pid,
+                readiness_dependency_unavailable_start_ticks=identity.start_ticks,
+            )
         return (
             ProbeResult(
                 "dependency-unavailable",
-                ("readiness-dependency-unavailable",),
+                (
+                    "selected-operator-unavailable"
+                    if healthy_tunnel
+                    else "readiness-dependency-unavailable",
+                ),
+                probe.pid,
+                probe.age_seconds,
+                probe.start_ticks,
+                probe.boot_id,
+            ),
+            state,
+        )
+    if healthy_tunnel:
+        if dependency_failure is None:
+            return probe, state
+        return (
+            ProbeResult(
+                "indeterminate",
+                (f"selected-operator-{dependency_failure}",),
                 probe.pid,
                 probe.age_seconds,
                 probe.start_ticks,
@@ -2404,6 +2506,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     startup_grace=args.startup_grace,
                     mcp_url=args.mcp_url,
                     timeout=args.http_timeout,
+                    ingress_health_url=DEFAULT_TRANSPORT_INGRESS_HEALTH_URL,
                 )
                 save_state(state_path, state)
             common = {

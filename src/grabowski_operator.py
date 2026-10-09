@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import ctypes
 import errno
 import faulthandler
 import fcntl
@@ -21,6 +22,7 @@ import shlex
 import signal
 import stat
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -36,6 +38,7 @@ except ImportError:
 from mcp.types import ToolAnnotations
 
 import grabowski_mcp as base
+import grabowski_flowlines
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
 import grabowski_bureau_runtime_refresh_executor as bureau_runtime_refresh_executor
@@ -50,6 +53,7 @@ import grabowski_git_preimage
 import grabowski_transport_assertion
 import grabowski_transport_roundtrip
 import grabowski_serving_process
+import grabowski_physical_checkout
 
 
 HOME = Path.home().resolve()
@@ -79,6 +83,7 @@ DEPLOYMENT_ADMISSION_HEAD_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _DEPLOYMENT_ADMISSION_LOCK = threading.Lock()
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY: dict[str, dict[str, Any]] = {}
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX = 4096
+_DEPLOYMENT_ADMISSION_DRAIN_NEUTRAL_RESERVE = 16
 _DEPLOYMENT_ADMISSION_IDENTITY_ATTEMPTS_MAX = 8
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX = 16
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_NAME_GROUP_MAX = 32
@@ -94,6 +99,47 @@ _SYNC_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=SYNC_TOOL_EXECUTOR_MAX_WORKERS,
     thread_name_prefix="grabowski-sync-tool",
 )
+_SYNC_TOOL_STATUS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="grabowski-status-tool",
+)
+_SYNC_TOOL_DRAIN_NEUTRAL_STATUS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="grabowski-drain-neutral-status-tool",
+)
+_SYNC_TOOL_DRAIN_NEUTRAL_OBSERVER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="grabowski-drain-neutral-observer-tool",
+)
+SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES = 128 * 1024 * 1024
+SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS = 30.0
+_SYNC_TOOL_ALLOCATOR_TRIM_LOCK = threading.Lock()
+_SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK = threading.Lock()
+_SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC = float("-inf")
+_SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
+_SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER: threading.Timer | None = None
+_SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION = 0
+_SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT = False
+_SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS: float | None = None
+_SYNC_TOOL_ALLOCATOR_LIBC: Any | None = None
+_SYNC_TOOL_ALLOCATOR_LIBC_UNAVAILABLE = False
+
+
+class _Mallinfo2(ctypes.Structure):
+    _fields_ = [
+        ("arena", ctypes.c_size_t),
+        ("ordblks", ctypes.c_size_t),
+        ("smblks", ctypes.c_size_t),
+        ("hblks", ctypes.c_size_t),
+        ("hblkhd", ctypes.c_size_t),
+        ("usmblks", ctypes.c_size_t),
+        ("fsmblks", ctypes.c_size_t),
+        ("uordblks", ctypes.c_size_t),
+        ("fordblks", ctypes.c_size_t),
+        ("keepcost", ctypes.c_size_t),
+    ]
+
+
 JOB_PREFIX = "grabowski-job-"
 
 #: Tools that may appear as the authorizing invoker in a durable job origin.
@@ -207,6 +253,36 @@ HTTP_TRANSPORT_VERBOSE_LOGGERS = (
 )
 MCP_SESSION_LOCK_PROBE_TIMEOUT_SECONDS = 1.0
 MCP_LIVENESS_PATH = "/_grabowski/mcp-liveness"
+POSTHOG_MCP_ANALYTICS_SWITCH_ENV = "GRABOWSKI_POSTHOG_MCP_ANALYTICS"
+POSTHOG_PROJECT_TOKEN_ENV = "GRABOWSKI_POSTHOG_PROJECT_TOKEN"
+POSTHOG_HOST_ENV = "GRABOWSKI_POSTHOG_HOST"
+POSTHOG_DEFAULT_HOST = "https://eu.i.posthog.com"
+POSTHOG_ALLOWED_HOSTS = frozenset(
+    {"https://eu.i.posthog.com", "https://us.i.posthog.com"}
+)
+POSTHOG_PROJECT_TOKEN_FILE = (
+    HOME / ".config" / "grabowski" / "posthog-project-token"
+)
+POSTHOG_PROJECT_TOKEN_MAX_BYTES = 512
+POSTHOG_DISTINCT_ID = "grabowski-mcp-anonymous"
+POSTHOG_METADATA_PROPERTIES = frozenset(
+    {
+        "$lib",
+        "$lib_version",
+        "$mcp_duration_ms",
+        "$mcp_is_error",
+        "$mcp_protocol_version",
+        "$mcp_server_name",
+        "$mcp_server_version",
+        "$mcp_source",
+        "$mcp_tool_name",
+        "$session_id",
+    }
+)
+_POSTHOG_MCP_CLIENT: Any | None = None
+_POSTHOG_MCP_ANALYTICS: Any | None = None
+
+
 STACK_DUMP_MEMFD_NAME = "grabowski-operator-stackdump"
 STACK_DUMP_MAX_BYTES = 1_048_576
 _STACK_DUMP_FILE: Any | None = None
@@ -241,6 +317,34 @@ SENSITIVE_ENV_PARTS = (
     "AUTHORIZATION",
     "API_KEY",
     "APIKEY",
+)
+SENSITIVE_ENV_KEYS = frozenset(
+    {
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_TRACES_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_METRICS_CREDENTIAL_PROVIDER",
+        "OTEL_PYTHON_EXPORTER_OTLP_HTTP_LOGS_CREDENTIAL_PROVIDER",
+        "OTEL_EXPORTER_OTLP_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_CERTIFICATE",
+        "OTEL_EXPORTER_OTLP_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_METRICS_CLIENT_KEY",
+        "OTEL_EXPORTER_OTLP_LOGS_CLIENT_KEY",
+    }
 )
 PRIVILEGE_ESCALATORS = {"sudo", "su", "pkexec", "doas"}
 PROTECTED_BRANCHES = {"main", "master"}
@@ -381,6 +485,17 @@ REDACTIONS = (
     (_OPENAI_SECRET_PATTERN, "<REDACTED_OPENAI_KEY>"),
     (_ANTHROPIC_SECRET_PATTERN, "<REDACTED_ANTHROPIC_KEY>"),
     (
+        re.compile(
+            r"(?im)^(\s*(?:"
+            r"OTEL_EXPORTER_OTLP(?:_(?:TRACES|METRICS|LOGS))?_"
+            r"(?:HEADERS|ENDPOINT|CERTIFICATE|CLIENT_CERTIFICATE|CLIENT_KEY)"
+            r"|OTEL_PYTHON_EXPORTER_OTLP_HTTP"
+            r"(?:_(?:TRACES|METRICS|LOGS))?_CREDENTIAL_PROVIDER"
+            r")\s*[:=]\s*).+$"
+        ),
+        r"\1<REDACTED>",
+    ),
+    (
         re.compile(r"Bearer\s+[A-Za-z0-9._~+/-]{12,}=*", re.I),
         "Bearer <REDACTED>",
     ),
@@ -462,10 +577,14 @@ def _maulwurf_recovery_control_call(tool_name: Any, arguments: Any) -> bool:
     return _maulwurf_recovery_operation_name(tool_name, arguments) is not None
 
 
+def _maulwurf_recovery_restricted() -> bool:
+    return _maulwurf_runtime_active() and not _trusted_owner_mode()
+
+
 def _enforce_maulwurf_recovery_mode(
     tool_name: Any, arguments: Any, tool: Any
 ) -> None:
-    if not _maulwurf_runtime_active():
+    if not _maulwurf_recovery_restricted():
         return
     if _maulwurf_recovery_control_call(tool_name, arguments):
         return
@@ -639,7 +758,7 @@ def _tool_read_only_hint(tool: Any) -> bool | None:
 
 
 GIT_SERVER_READ_ONLY_SUBCOMMANDS = frozenset(
-    {"diff", "log", "rev-parse", "show"}
+    {"diff", "log", "rev-parse", "show", "status"}
 )
 GIT_SERVER_READ_ONLY_OPTIONS = {
     "diff": frozenset(
@@ -712,6 +831,13 @@ GIT_SERVER_READ_ONLY_OPTIONS = {
             "-s",
         }
     ),
+    "status": frozenset(
+        {
+            "--branch",
+            "--short",
+            "--untracked-files=normal",
+        }
+    ),
 }
 
 
@@ -758,12 +884,31 @@ def _server_verified_git_read_invocation(
     if subcommand not in GIT_SERVER_READ_ONLY_SUBCOMMANDS:
         return None
     # A worktree diff can run repository-configured clean filters while merely
-    # inspecting files.  Only index-vs-tree diff forms are effect-free enough
-    # for this transport exemption; worktree diff and status stay gated.
+    # inspecting files. Only index-vs-tree diff forms are effect-free enough
+    # for this transport exemption. Status is admitted only through the narrow
+    # option allowlist above and executes with GIT_OPTIONAL_LOCKS=0.
     if subcommand == "diff" and not any(
         item in {"--cached", "--staged"} for item in command_arguments
     ):
         return None
+    if subcommand == "status":
+        # Never execute porcelain status itself on the replay-exempt path:
+        # worktree refresh may invoke repository-configured clean/process filters.
+        # Admit only the fixed short status projection reconstructed below from
+        # a config-isolated shadow Git directory.
+        if (
+            "--short" not in command_arguments
+            or len(command_arguments) != len(set(command_arguments))
+            or any(
+                item not in GIT_SERVER_READ_ONLY_OPTIONS["status"]
+                for item in command_arguments
+            )
+        ):
+            return None
+        return {
+            "subcommand": subcommand,
+            "command_arguments": list(command_arguments),
+        }
     after_separator = False
     for item in command_arguments:
         if after_separator:
@@ -812,6 +957,21 @@ def _operator_gate_read_only(tool_name: Any, arguments: Any, tool: Any) -> bool:
     if _tool_read_only_hint(tool) is True:
         return True
     return tool_name == "grabowski_git" and _grabowski_git_server_verified_read(arguments)
+
+
+def _operator_policy_arguments(
+    tool_name: Any,
+    arguments: Any,
+    tool: Any,
+) -> Any:
+    """Remove only Flowlines-injected analytics fields before policy checks."""
+    if not isinstance(tool_name, str):
+        return arguments
+    return grabowski_flowlines._strip_analytics_arguments(
+        tool,
+        tool_name,
+        arguments,
+    )
 
 
 def _git_server_read_environment() -> dict[str, str]:
@@ -888,6 +1048,271 @@ def _git_server_read_command(
         ],
         cwd=repo,
     )
+
+
+def _git_server_plumbing_command(repo: Path, *arguments: str) -> list[str]:
+    return _validate_argv(
+        [
+            _trusted_git_cli_path(),
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "pager.status=false",
+            "-c",
+            "diff.external=",
+            "-c",
+            "diff.trustExitCode=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "protocol.file.allow=never",
+            "-C",
+            str(repo),
+            *arguments,
+        ],
+        cwd=repo,
+    )
+
+
+def _git_server_safe_status(
+    repo: Path,
+    read_shape: dict[str, Any],
+    *,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Run short status against a config-free shadow Git directory."""
+
+    requested = list(read_shape["command_arguments"])
+    include_branch = "--branch" in requested
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    probes: list[dict[str, Any]] = []
+    metadata_environment = _git_server_read_environment()
+    explicit_remove = {
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+    }
+    for key in tuple(metadata_environment):
+        if key in explicit_remove or key.startswith("GIT_CONFIG_"):
+            metadata_environment.pop(key, None)
+    metadata_environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "PATH": "/usr/bin:/bin",
+        }
+    )
+
+    def run_probe(
+        arguments: list[str],
+        *,
+        environment: dict[str, str],
+        allowed: tuple[int, ...] = (0,),
+    ) -> dict[str, Any]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("safe Git status projection exceeded its total timeout")
+        result = _run(
+            _git_server_plumbing_command(repo, *arguments),
+            cwd=repo,
+            timeout_seconds=max(1, int(remaining) + 1),
+            max_output_bytes=MAX_OUTPUT_BYTES,
+            environment=environment,
+        )
+        probes.append(result)
+        if (
+            result.get("timed_out") is True
+            or result.get("stdout_truncated") is True
+            or result.get("stderr_truncated") is True
+            or result.get("returncode") not in allowed
+        ):
+            detail = str(result.get("stderr") or "").strip()
+            raise RuntimeError(
+                "safe Git status probe failed"
+                + (f": {detail}" if detail else "")
+            )
+        return result
+
+    head_probe = run_probe(
+        ["rev-parse", "--verify", "--quiet", "HEAD"],
+        environment=metadata_environment,
+        allowed=(0, 1),
+    )
+    head_oid = head_probe["stdout"].strip() if head_probe["returncode"] == 0 else None
+    if head_oid is not None and re.fullmatch(
+        r"[0-9a-f]{40}|[0-9a-f]{64}", head_oid
+    ) is None:
+        raise RuntimeError("safe Git status probe returned malformed HEAD")
+
+    format_probe = run_probe(
+        ["rev-parse", "--show-object-format"],
+        environment=metadata_environment,
+    )
+    object_format = format_probe["stdout"].strip()
+    if object_format not in {"sha1", "sha256"}:
+        raise RuntimeError("safe Git status probe returned unsupported object format")
+    if head_oid is not None and len(head_oid) != (
+        40 if object_format == "sha1" else 64
+    ):
+        raise RuntimeError("safe Git status HEAD/object-format mismatch")
+
+    try:
+        physical = grabowski_physical_checkout.capture_physical_checkout_identity(repo)
+        git_dir = Path(physical["git_dir"]["path"])
+        common_dir = Path(physical["common_dir"]["path"])
+    except Exception as exc:
+        raise RuntimeError("safe Git status could not bind the physical checkout") from exc
+    index_path = git_dir / "index"
+    objects_path = common_dir / "objects"
+    if not objects_path.is_dir() or objects_path.is_symlink():
+        raise RuntimeError("safe Git status object directory is unavailable")
+
+    branch_header: str | None = None
+    if include_branch:
+        branch_probe = run_probe(
+            ["symbolic-ref", "--quiet", "--short", "HEAD"],
+            environment=metadata_environment,
+            allowed=(0, 1),
+        )
+        if branch_probe["returncode"] == 0:
+            branch = branch_probe["stdout"].strip()
+            if (
+                not branch
+                or "\n" in branch
+                or "\r" in branch
+                or branch.startswith("-")
+                or len(branch.encode("utf-8")) > 512
+            ):
+                raise RuntimeError("safe Git status probe returned malformed branch")
+            branch_header = f"## {branch}"
+            upstream_probe = run_probe(
+                [
+                    "for-each-ref",
+                    "--format=%(upstream:short)",
+                    f"refs/heads/{branch}",
+                ],
+                environment=metadata_environment,
+            )
+            upstream = upstream_probe["stdout"].strip()
+            if upstream:
+                if (
+                    "\n" in upstream
+                    or "\r" in upstream
+                    or upstream.startswith("-")
+                    or len(upstream.encode("utf-8")) > 512
+                ):
+                    raise RuntimeError("safe Git status probe returned malformed upstream")
+                branch_header += f"...{upstream}"
+                upstream_commit = run_probe(
+                    ["rev-parse", "--verify", "--quiet", f"{upstream}^{{commit}}"],
+                    environment=metadata_environment,
+                    allowed=(0, 1),
+                )
+                if upstream_commit["returncode"] == 1:
+                    branch_header += " [gone]"
+                else:
+                    counts = run_probe(
+                        ["rev-list", "--left-right", "--count", f"HEAD...{upstream}"],
+                        environment=metadata_environment,
+                    )
+                    fields = counts["stdout"].split()
+                    if len(fields) != 2 or not all(
+                        item.isdigit() for item in fields
+                    ):
+                        raise RuntimeError(
+                            "safe Git status probe returned malformed divergence counts"
+                        )
+                    ahead, behind = (int(fields[0]), int(fields[1]))
+                    divergence = []
+                    if ahead:
+                        divergence.append(f"ahead {ahead}")
+                    if behind:
+                        divergence.append(f"behind {behind}")
+                    if divergence:
+                        branch_header += " [" + ", ".join(divergence) + "]"
+        else:
+            branch_header = "## HEAD (no branch)"
+
+    with tempfile.TemporaryDirectory(prefix="grabowski-status-shadow-") as temporary:
+        shadow = Path(temporary)
+        (shadow / "objects").mkdir(mode=0o700)
+        (shadow / "refs").mkdir(mode=0o700)
+        head_value = (
+            head_oid
+            if head_oid is not None
+            else "ref: refs/heads/grabowski-unborn"
+        )
+        (shadow / "HEAD").write_text(head_value + "\n", encoding="ascii")
+        config_lines = [
+            "[core]",
+            "\trepositoryformatversion = "
+            + ("0" if object_format == "sha1" else "1"),
+            "\tbare = false",
+        ]
+        if object_format == "sha256":
+            config_lines.extend(["[extensions]", "\tobjectFormat = sha256"])
+        (shadow / "config").write_text(
+            "\n".join(config_lines) + "\n",
+            encoding="ascii",
+        )
+        shadow_environment = dict(metadata_environment)
+        shadow_environment.update(
+            {
+                "GIT_DIR": str(shadow),
+                "GIT_WORK_TREE": str(repo),
+                "GIT_INDEX_FILE": str(index_path),
+                "GIT_OBJECT_DIRECTORY": str(objects_path),
+            }
+        )
+        status_result = run_probe(
+            [
+                "status",
+                "--short",
+                "--untracked-files=normal",
+                "--ignore-submodules=all",
+                "--no-renames",
+            ],
+            environment=shadow_environment,
+        )
+
+    stdout = status_result["stdout"]
+    if branch_header is not None:
+        stdout = branch_header + "\n" + stdout
+    stdout, late_truncated = _limit(stdout, MAX_OUTPUT_BYTES)
+    virtual_argv = _git_server_read_command(repo, read_shape)
+    return {
+        "argv": _redact_argv(virtual_argv),
+        "argv_sha256": _argv_hash(virtual_argv),
+        "command": _redacted_command(virtual_argv),
+        "cwd": str(repo),
+        "returncode": 0,
+        "timed_out": False,
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "stdout": stdout,
+        "stderr": status_result["stderr"],
+        "stdout_truncated": status_result["stdout_truncated"] or late_truncated,
+        "stderr_truncated": status_result["stderr_truncated"],
+        "read_strategy": "config-isolated-shadow-status-v1",
+        "probe_argv_sha256s": [item["argv_sha256"] for item in probes],
+        "does_not_establish": [
+            "exact_git_status_porcelain_equivalence",
+            "submodule_worktree_status",
+            "repository_config_dependent_status_semantics",
+        ],
+    }
 
 
 def _github_pr_view_transport_read_only(arguments: Any) -> bool:
@@ -1161,6 +1586,7 @@ def _deployment_admission_midcutover_recovery_evidence(
         import grabowski_provenance_recovery as provenance_recovery
 
         gate = provenance_recovery.evaluate_resume_gate(expected_head)
+        gate_admits_locked_recheck = provenance_recovery._initial_gate_admits_locked_recheck(gate)
         lane = gate.get("recovery_lane")
         binding = (
             lane.get("resume_binding") if isinstance(lane, dict) else None
@@ -1189,7 +1615,7 @@ def _deployment_admission_midcutover_recovery_evidence(
 
     checks["resume_gate_available"] = True
     checks["resume_gate_allowed"] = (
-        gate.get("allowed") is True and not gate.get("reasons")
+        gate_admits_locked_recheck
     )
     checks["resume_gate_expected_head_bound"] = (
         gate.get("expected_head") == expected_head
@@ -1315,10 +1741,170 @@ def _require_current_serving_process() -> None:
     )
 
 
+def _post_merge_sync_apply_replay_preflight(
+    *, tool_name: str, arguments: Any
+) -> dict[str, Any] | None:
+    """Bind signed replay reentry to the exact intrinsically idempotent grip."""
+
+    if tool_name != "grip_run" or not isinstance(arguments, dict):
+        return None
+    allowed_outer = {"name", "parameters", "profile", "allow_mutation"}
+    if set(arguments) - allowed_outer:
+        return None
+    if arguments.get("name") != "post-merge-sync-apply":
+        return None
+    if arguments.get("profile", "operator") != "operator":
+        return None
+    if arguments.get("allow_mutation") is not True:
+        return None
+
+    parameters = arguments.get("parameters")
+    if not isinstance(parameters, dict):
+        return None
+    required_parameters = {
+        "repo",
+        "target_branch",
+        "expected_local_head",
+        "expected_remote_head",
+        "expected_physical_identity_sha256",
+        "confirmation",
+    }
+    allowed_parameters = required_parameters | {"remote"}
+    if set(parameters) - allowed_parameters or not required_parameters.issubset(
+        parameters
+    ):
+        return None
+
+    spec = grabowski_grips.GRIP_SPECS.get("post-merge-sync-apply")
+    required_acceptance = frozenset(
+        {
+            "physical-checkout-bound",
+            "protected-canonical-checkout",
+            "clean-exact-preimage",
+            "remote-head-bound",
+            "fast-forward-only",
+            "worktree-common-dir-branch-serialized",
+            "branch-ref-cas",
+            "post-state-verified",
+            "outcome-unknown-fail-closed",
+        }
+    )
+    if (
+        spec is None
+        or spec.version != "1.1"
+        or tuple(spec.required_parameters)
+        != (
+            "repo",
+            "target_branch",
+            "expected_local_head",
+            "expected_remote_head",
+            "expected_physical_identity_sha256",
+            "confirmation",
+        )
+        or spec.effect != grabowski_grips.MUTATING
+        or spec.runner != "post_merge_sync_apply"
+        or spec.operation_effect_class != "worktree_admin"
+        or spec.operation_class != "worktree-admin"
+        or frozenset(spec.acceptance_ids) != required_acceptance
+    ):
+        return None
+
+    repo = parameters.get("repo")
+    target_branch = parameters.get("target_branch")
+    expected_local_head = parameters.get("expected_local_head")
+    expected_remote_head = parameters.get("expected_remote_head")
+    expected_physical_identity_sha256 = parameters.get(
+        "expected_physical_identity_sha256"
+    )
+    confirmation = parameters.get("confirmation")
+    remote = parameters.get("remote", "origin")
+    if (
+        not isinstance(repo, str)
+        or not repo.strip()
+        or repo != repo.strip()
+        or "\x00" in repo
+        or target_branch not in {"main", "master"}
+        or not isinstance(expected_local_head, str)
+        or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", expected_local_head)
+        is None
+        or not isinstance(expected_remote_head, str)
+        or re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", expected_remote_head)
+        is None
+        or len(expected_local_head) != len(expected_remote_head)
+        or not isinstance(expected_physical_identity_sha256, str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}", expected_physical_identity_sha256
+        )
+        is None
+        or confirmation != "apply-protected-post-merge-sync"
+        or not isinstance(remote, str)
+        or remote in {"", ".", ".."}
+        or re.fullmatch(r"[A-Za-z0-9._-]{1,128}", remote) is None
+        or remote.startswith("-")
+    ):
+        return None
+
+    try:
+        physical_identity = (
+            grabowski_physical_checkout.capture_physical_checkout_identity(
+                Path(repo).expanduser()
+            )
+        )
+    except (
+        OSError,
+        ValueError,
+        grabowski_physical_checkout.PhysicalCheckoutIdentityError,
+    ):
+        return None
+    if (
+        physical_identity.get("physical_identity_sha256")
+        != expected_physical_identity_sha256
+    ):
+        return None
+
+    grip_contract = {
+        "name": spec.name,
+        "version": spec.version,
+        "required_parameters": list(spec.required_parameters),
+        "effect": spec.effect,
+        "runner": spec.runner,
+        "operation_effect_class": spec.operation_effect_class,
+        "operation_class": spec.operation_class,
+        "acceptance_ids": list(spec.acceptance_ids),
+    }
+    return {
+        "kind": "grabowski_signed_replay_recovery_preflight",
+        "schema_version": 1,
+        "tool_name": tool_name,
+        "grip_name": "post-merge-sync-apply",
+        "reentry_mode": "intrinsic_idempotent_domain",
+        "physical_identity_sha256": expected_physical_identity_sha256,
+        "parameters_sha256": grabowski_transport_roundtrip.canonical_arguments_sha256(
+            parameters
+        ),
+        "grip_contract_sha256": hashlib.sha256(
+            _canonical_json_bytes(grip_contract)
+        ).hexdigest(),
+        "does_not_establish": [
+            "generic replay retry authority",
+            "permission for another grip or argument digest",
+            "current target state",
+            "retry authorization after an outcome_unknown result",
+        ],
+    }
+
+
 def _signed_replay_recovery_preflight(
     *, tool_name: str, arguments: Any
 ) -> dict[str, Any] | None:
     """Prove one domain-safe replay recovery without granting generic retry."""
+
+    intrinsic = _post_merge_sync_apply_replay_preflight(
+        tool_name=tool_name,
+        arguments=arguments,
+    )
+    if intrinsic is not None:
+        return intrinsic
 
     if tool_name != "grabowski_bureau_task_publish" or not isinstance(arguments, dict):
         return None
@@ -1398,13 +1984,115 @@ def _signed_replay_recovery_preflight(
     }
 
 
+def _effect_admission_transport_inputs(
+    transport_evidence: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Project intrinsic signed-replay reentry into runtime-bound admission."""
+
+    if (
+        not isinstance(transport_evidence, dict)
+        or transport_evidence.get("effect_admission_transport_exempt") is not True
+    ):
+        return transport_evidence, None
+    runtime_sha256 = transport_evidence.get("runtime_binding_sha256")
+    if (
+        transport_evidence.get("signed_one_call_replay_recovery") is not True
+        or transport_evidence.get("recovery_basis")
+        != "authenticated_signed_replay_intrinsic_domain_idempotency"
+        or not isinstance(runtime_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", runtime_sha256) is None
+    ):
+        raise RuntimeError("signed replay recovery evidence is malformed")
+    return None, runtime_sha256
+
+
+_TERMINAL_SED_RANGE_READ_RE = re.compile(r"([1-9][0-9]*)(?:,([1-9][0-9]*))?p\Z")
+
+
+def _terminal_typed_read_redirect(
+    tool_name: Any, arguments: Any
+) -> dict[str, Any] | None:
+    """Route one exact effect-free terminal range-read to the existing typed surface."""
+
+    if tool_name != "grabowski_terminal_run" or not isinstance(arguments, dict):
+        return None
+    if set(arguments) - {"argv", "cwd"}:
+        return None
+    argv = arguments.get("argv")
+    if not isinstance(argv, list) or len(argv) != 4:
+        return None
+    executable, flag, expression, path = argv
+    if (
+        executable not in {"sed", "/bin/sed", "/usr/bin/sed"}
+        or flag != "-n"
+        or not isinstance(expression, str)
+        or not isinstance(path, str)
+        or not path
+        or "\x00" in path
+    ):
+        return None
+    match = _TERMINAL_SED_RANGE_READ_RE.fullmatch(expression)
+    if match is None:
+        return None
+    try:
+        start_line = int(match.group(1))
+        end_line = int(match.group(2) or match.group(1))
+    except ValueError:
+        return None
+    if end_line < start_line:
+        return None
+    max_lines = end_line - start_line + 1
+    if max_lines > 2000 or path.startswith("-"):
+        return None
+
+    typed_path = Path(path)
+    if not typed_path.is_absolute():
+        cwd = arguments.get("cwd")
+        try:
+            typed_cwd = _resolve_cwd(cwd)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        typed_path = typed_cwd / typed_path
+
+    return {
+        "schema_version": 1,
+        "code": "typed_read_route_required",
+        "source_tool": "grabowski_terminal_run",
+        "typed_tool": "grabowski_read_text",
+        "typed_arguments": {
+            "path": str(typed_path),
+            "start_line": start_line,
+            "max_lines": max_lines,
+        },
+        "reason": "exact simple sed range read has an existing typed read surface",
+        "transport_consumed": False,
+        "does_not_establish": [
+            "typed read success",
+            "path authorization",
+            "permission to retry the terminal command",
+        ],
+    }
+
+
 def _require_transport_roundtrip_for_tool(
     *,
     tool_name: Any,
     arguments: Any,
     context: Context | None,
     tool: Any,
+    transport_arguments: Any | None = None,
 ) -> dict[str, Any] | None:
+    typed_read_redirect = _terminal_typed_read_redirect(tool_name, arguments)
+    if typed_read_redirect is not None:
+        raise RuntimeError(
+            "typed read route required before mutation transport: "
+            + json.dumps(
+                typed_read_redirect,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        )
     if _transport_roundtrip_exempt_call(tool_name, arguments):
         return
     read_only_hint = _tool_read_only_hint(tool)
@@ -1420,9 +2108,18 @@ def _require_transport_roundtrip_for_tool(
         return None
     runtime_binding = base._transport_roundtrip_runtime_binding()
     try:
+        domain_arguments = arguments if arguments is not None else {}
+        public_arguments = (
+            domain_arguments if transport_arguments is None else transport_arguments
+        )
         arguments_sha256 = (
             grabowski_transport_roundtrip.canonical_arguments_sha256(
-                arguments if arguments is not None else {}
+                domain_arguments
+            )
+        )
+        transport_arguments_sha256 = (
+            grabowski_transport_assertion.canonical_arguments_sha256(
+                public_arguments if public_arguments is not None else {}
             )
         )
         tool_name_text = str(tool_name)
@@ -1432,7 +2129,7 @@ def _require_transport_roundtrip_for_tool(
                 signed_evidence = signed_transport(
                     context,
                     tool_name=tool_name_text,
-                    arguments_sha256=arguments_sha256,
+                    arguments_sha256=transport_arguments_sha256,
                     runtime_binding=runtime_binding,
                 )
             except grabowski_transport_assertion.TransportAssertionReplay as replay_exc:
@@ -1445,6 +2142,40 @@ def _require_transport_roundtrip_for_tool(
                 )
                 if recovery_preflight is None:
                     raise RuntimeError(str(replay_exc)) from replay_exc
+                if (
+                    recovery_preflight.get("reentry_mode")
+                    == "intrinsic_idempotent_domain"
+                ):
+                    # TransportAssertionReplay is raised only after the current
+                    # signed request has passed capability, MAC, freshness and
+                    # runtime-binding validation. For this exact grip, the
+                    # domain itself is the replay reconciler: it re-reads the
+                    # canonical checkout and remote before any effect, returns
+                    # already_synced after a completed prior effect, and keeps
+                    # ambiguous partial states fail-closed.
+                    return {
+                        "schema_version": 1,
+                        "state": "replay_domain_reentry",
+                        "transport_mode": "signed-one-call-replay-domain-reentry-v1",
+                        "runtime_binding_sha256": (
+                            grabowski_transport_assertion.runtime_binding_sha256(
+                                runtime_binding
+                            )
+                        ),
+                        "tool_name": tool_name_text,
+                        "arguments_sha256": arguments_sha256,
+                        "signed_one_call_replay_recovery": True,
+                        "effect_admission_transport_exempt": True,
+                        "recovery_basis": (
+                            "authenticated_signed_replay_intrinsic_domain_idempotency"
+                        ),
+                        "recovery_preflight": recovery_preflight,
+                        "does_not_establish": [
+                            "generic replay retry authority",
+                            "fresh transport consumption",
+                            "permission for another tool or argument digest",
+                        ],
+                    }
                 client_scope = base._transport_roundtrip_client_scope(context)
                 try:
                     recovery_evidence = grabowski_transport_roundtrip.consume_verified(
@@ -1629,6 +2360,14 @@ def _deployment_admission_active_tool_calls() -> int:
         return len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY)
 
 
+def _deployment_admission_has_drain_blocking_tool_calls_locked() -> bool:
+    """Return whether any active tool call still blocks global allocator trim."""
+    return any(
+        entry.get("drain_blocking") is not False
+        for entry in _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.values()
+    )
+
+
 def _repoground_consultation_tool_name(tool_name: Any) -> str | None:
     """Return one bounded public RepoGround tool name suitable for telemetry."""
     if (
@@ -1663,6 +2402,7 @@ def _deployment_admission_register_tool_call(
     kind: str,
     *,
     drain_blocking: bool = True,
+    drain_neutral: bool = False,
 ) -> str:
     if kind not in {
         _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
@@ -1671,13 +2411,19 @@ def _deployment_admission_register_tool_call(
         raise ValueError(f"unknown deployment admission execution kind: {kind!r}")
     if not isinstance(drain_blocking, bool):
         raise ValueError("deployment admission drain_blocking must be boolean")
+    if not isinstance(drain_neutral, bool):
+        raise ValueError("deployment admission drain_neutral must be boolean")
+    if drain_neutral and drain_blocking:
+        raise ValueError(
+            "deployment admission drain_neutral calls must be drain_blocking=false"
+        )
     name = tool_name if isinstance(tool_name, str) and tool_name else "unnamed"
     name = name[:_DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS]
     with _DEPLOYMENT_ADMISSION_LOCK:
-        if (
-            len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY)
-            >= _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
-        ):
+        capacity_limit = _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
+        if drain_neutral:
+            capacity_limit += _DEPLOYMENT_ADMISSION_DRAIN_NEUTRAL_RESERVE
+        if len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY) >= capacity_limit:
             raise RuntimeError(
                 "Grabowski deployment admission active-call registry is full"
             )
@@ -1703,13 +2449,88 @@ def _deployment_admission_register_tool_call(
     return identity
 
 
+def _deployment_admission_register_drain_blocking_tool_call(
+    tool_name: Any,
+    kind: str,
+) -> str:
+    """Register blocking work while holding the allocator trim barrier."""
+    with _SYNC_TOOL_ALLOCATOR_TRIM_LOCK:
+        return _deployment_admission_register_tool_call(
+            tool_name,
+            kind,
+            drain_blocking=True,
+        )
+
+
+async def _deployment_admission_register_gated_tool_call(
+    tool_name: Any,
+    kind: str,
+    *,
+    drain_blocking: bool,
+) -> str:
+    """Register one gated call without stalling the event loop on allocator trim."""
+    if not isinstance(drain_blocking, bool):
+        raise ValueError("deployment admission drain_blocking must be boolean")
+    if not drain_blocking:
+        return _deployment_admission_register_tool_call(
+            tool_name,
+            kind,
+            drain_blocking=False,
+        )
+    if _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.acquire(blocking=False):
+        try:
+            return _deployment_admission_register_tool_call(
+                tool_name,
+                kind,
+                drain_blocking=True,
+            )
+        finally:
+            _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release()
+    cancelled = False
+    pending_registration = asyncio.create_task(
+        asyncio.to_thread(
+            _deployment_admission_register_drain_blocking_tool_call,
+            tool_name,
+            kind,
+        )
+    )
+
+    def _release_cancelled_registration(completed: asyncio.Task[str]) -> None:
+        if not cancelled or completed.cancelled():
+            return
+        try:
+            identity = completed.result()
+        except Exception:
+            return
+        _deployment_admission_release_tool_call(identity)
+
+    pending_registration.add_done_callback(_release_cancelled_registration)
+    try:
+        return await asyncio.shield(pending_registration)
+    except asyncio.CancelledError:
+        cancelled = True
+        if pending_registration.done():
+            _release_cancelled_registration(pending_registration)
+        raise
+
+
 def _deployment_admission_release_tool_call(identity: Any) -> bool:
     if not isinstance(identity, str) or not identity:
         return False
     with _DEPLOYMENT_ADMISSION_LOCK:
-        return (
-            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.pop(identity, None) is not None
+        entry = _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.pop(identity, None)
+        released = entry is not None
+        retry_deferred_idle = (
+            released
+            and not _deployment_admission_has_drain_blocking_tool_calls_locked()
+            and _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED
         )
+    if retry_deferred_idle:
+        # The final release can run on the event loop or on a sync path that
+        # never reached a completion callback. Preserve the deferred trim
+        # obligation by handing the blocking allocator gate to a daemon timer.
+        _schedule_sync_tool_allocator_trim_retry(0.0)
+    return released
 
 
 def _deployment_admission_active_registry_snapshot() -> dict[str, dict[str, Any]]:
@@ -1779,6 +2600,13 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
         "active_tool_call_registry_max": (
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
         ),
+        "drain_neutral_tool_call_reserve": (
+            _DEPLOYMENT_ADMISSION_DRAIN_NEUTRAL_RESERVE
+        ),
+        "active_tool_call_registry_hard_max": (
+            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
+            + _DEPLOYMENT_ADMISSION_DRAIN_NEUTRAL_RESERVE
+        ),
         "admission_gate_installed": _DEPLOYMENT_ADMISSION_GATE_INSTALLED,
         "oldest_active_tool_call_age_seconds": oldest_age_seconds,
         "active_tool_calls_by_kind": by_kind,
@@ -1831,6 +2659,331 @@ def _append_effect_audit(record: dict[str, Any]) -> str:
         raise RuntimeError("Grabowski audit append boundary is unavailable")
     legacy(record)
     return hashlib.sha256(_canonical_json_bytes(record)).hexdigest()
+
+
+def _sync_tool_allocator_libc() -> Any | None:
+    global _SYNC_TOOL_ALLOCATOR_LIBC, _SYNC_TOOL_ALLOCATOR_LIBC_UNAVAILABLE
+    if _SYNC_TOOL_ALLOCATOR_LIBC_UNAVAILABLE:
+        return None
+    if _SYNC_TOOL_ALLOCATOR_LIBC is not None:
+        return _SYNC_TOOL_ALLOCATOR_LIBC
+    try:
+        libc = ctypes.CDLL(None)
+        mallinfo2 = libc.mallinfo2
+        malloc_trim = libc.malloc_trim
+        mallinfo2.argtypes = []
+        mallinfo2.restype = _Mallinfo2
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+    except (AttributeError, OSError, TypeError, ValueError):
+        _SYNC_TOOL_ALLOCATOR_LIBC_UNAVAILABLE = True
+        return None
+    _SYNC_TOOL_ALLOCATOR_LIBC = libc
+    return libc
+
+
+def _cancel_sync_tool_allocator_trim_retry() -> None:
+    """Cancel one pending allocator retry without holding the trim gate."""
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
+    with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
+        timer = _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
+        _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = None
+        _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
+        # A running allocator attempt cannot be cancelled. Preserve any retry
+        # request that arrived after it started; the runner will schedule that
+        # one coalesced follow-up after the attempt leaves the trim gate.
+        if not _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT:
+            _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS = None
+    if timer is not None:
+        timer.cancel()
+
+
+def _start_sync_tool_allocator_trim_retry_timer(timer: threading.Timer) -> bool:
+    """Start one already-published retry timer and fail soft on thread refusal."""
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
+    try:
+        timer.start()
+    except RuntimeError:
+        with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
+            if _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is timer:
+                _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = None
+                _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
+        return False
+    return True
+
+
+def _prepare_sync_tool_allocator_trim_retry_locked(
+    delay_seconds: float,
+) -> threading.Timer:
+    """Publish one pending retry while the retry-state lock is held."""
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
+    _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION += 1
+    generation = _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
+    timer = threading.Timer(
+        max(0.0, delay_seconds),
+        _run_sync_tool_allocator_trim_retry,
+        args=(generation,),
+    )
+    timer.daemon = True
+    _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = timer
+    return timer
+
+
+def _run_sync_tool_allocator_trim_retry(generation: int) -> None:
+    """Re-enter the normal trim gate for one still-current allocator retry."""
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER
+    with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
+        if (
+            generation != _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_GENERATION
+            or _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is None
+            or _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT
+        ):
+            return
+        _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER = None
+        _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT = True
+
+    follow_up_timer: threading.Timer | None = None
+    try:
+        _maybe_trim_sync_tool_allocator()
+    finally:
+        with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
+            _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT = False
+            follow_up_delay = (
+                _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+            )
+            _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS = None
+            if (
+                follow_up_delay is not None
+                and _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is None
+            ):
+                follow_up_timer = _prepare_sync_tool_allocator_trim_retry_locked(
+                    follow_up_delay
+                )
+        if follow_up_timer is not None:
+            _start_sync_tool_allocator_trim_retry_timer(follow_up_timer)
+
+
+def _schedule_sync_tool_allocator_trim_retry(delay_seconds: float) -> bool:
+    """Schedule at most one allocator retry without blocking the trim gate."""
+    global _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+    delay_seconds = max(0.0, delay_seconds)
+    with _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_LOCK:
+        if _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_IN_FLIGHT:
+            current = _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS
+            if current is None or delay_seconds < current:
+                _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_COALESCED_DELAY_SECONDS = (
+                    delay_seconds
+                )
+            return False
+        if _SYNC_TOOL_ALLOCATOR_TRIM_RETRY_TIMER is not None:
+            return False
+        timer = _prepare_sync_tool_allocator_trim_retry_locked(delay_seconds)
+    return _start_sync_tool_allocator_trim_retry_timer(timer)
+
+
+def _maybe_trim_sync_tool_allocator() -> bool:
+    """Return free glibc pages when no drain-blocking MCP tool is active."""
+    global _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED
+    global _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC
+    _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.acquire()
+    try:
+        # The trim lock is also the admission barrier for new drain-blocking
+        # calls. Keep the deployment-admission lock short: ordinary nonblocking
+        # reads may register and release while process-wide malloc_trim runs,
+        # while a new blocking call waits off the event loop on the trim lock.
+        with _DEPLOYMENT_ADMISSION_LOCK:
+            if _deployment_admission_has_drain_blocking_tool_calls_locked():
+                _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
+                return False
+        now = time.monotonic()
+        libc = _sync_tool_allocator_libc()
+        if libc is None:
+            _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
+            _cancel_sync_tool_allocator_trim_retry()
+            return False
+        try:
+            free_bytes = int(libc.mallinfo2().fordblks)
+        except (AttributeError, OSError, TypeError, ValueError):
+            _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
+            _cancel_sync_tool_allocator_trim_retry()
+            return False
+        if free_bytes < SYNC_TOOL_ALLOCATOR_TRIM_FREE_BYTES:
+            _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
+            _cancel_sync_tool_allocator_trim_retry()
+            return False
+        elapsed = now - _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC
+        if elapsed < SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS:
+            # The free arena is already material, so a final request must
+            # not leave retention stranded merely because no later tool
+            # release occurs after the cooldown expires.
+            _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = True
+            _schedule_sync_tool_allocator_trim_retry(
+                SYNC_TOOL_ALLOCATOR_TRIM_MIN_INTERVAL_SECONDS - elapsed
+            )
+            return False
+        # Record the attempt, not only a successful madvise, so an already
+        # trimmed arena cannot cause a malloc_trim storm on every small read.
+        _cancel_sync_tool_allocator_trim_retry()
+        _SYNC_TOOL_ALLOCATOR_TRIM_LAST_MONOTONIC = now
+        _SYNC_TOOL_ALLOCATOR_TRIM_DEFERRED = False
+        try:
+            return bool(libc.malloc_trim(0))
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
+    finally:
+        _SYNC_TOOL_ALLOCATOR_TRIM_LOCK.release()
+
+
+def _sync_tool_executor(
+    tool_name: Any,
+    *,
+    drain_neutral: bool = False,
+) -> concurrent.futures.ThreadPoolExecutor:
+    if drain_neutral:
+        if tool_name == "grabowski_status":
+            # Minimal readiness must bypass the ordinary status backlog while
+            # readiness probes remain serialized with each other.
+            return _SYNC_TOOL_DRAIN_NEUTRAL_STATUS_EXECUTOR
+        if tool_name == deployment_observer.OPERATION:
+            # Capability-bound job observers need an independent reserved lane:
+            # they must bypass shared work without blocking readiness probes.
+            return _SYNC_TOOL_DRAIN_NEUTRAL_OBSERVER_EXECUTOR
+        raise RuntimeError(
+            f"unsupported drain-neutral sync tool: {tool_name!r}"
+        )
+    if tool_name == "grabowski_status":
+        # Keep cold audit-chain serialization out of the shared sync-tool pool:
+        # queued status waiters must not occupy workers needed by unrelated tools.
+        return _SYNC_TOOL_STATUS_EXECUTOR
+    return _SYNC_TOOL_EXECUTOR
+
+
+def _submit_sync_tool_call(
+    call_runner: Any,
+    original: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *extra_args: Any,
+    tool_name: Any,
+    drain_neutral: bool = False,
+) -> concurrent.futures.Future[Any]:
+    return _sync_tool_executor(
+        tool_name,
+        drain_neutral=drain_neutral,
+    ).submit(
+        call_runner,
+        original,
+        args,
+        kwargs,
+        *extra_args,
+    )
+
+
+async def _run_drain_neutral_tool_call(
+    original: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    tool_name: Any,
+    tool: Any,
+) -> Any:
+    kind = (
+        _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC
+        if tool is not None and getattr(tool, "is_async", True) is False
+        else _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
+    )
+    identity = _deployment_admission_register_tool_call(
+        tool_name,
+        kind,
+        drain_blocking=False,
+        drain_neutral=True,
+    )
+    if kind != _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC:
+        try:
+            return await original(*args, **kwargs)
+        finally:
+            _deployment_admission_release_tool_call(identity)
+
+    try:
+        worker_future = _submit_sync_tool_call(
+            _run_sync_tool_call,
+            original,
+            args,
+            kwargs,
+            tool_name=tool_name,
+            drain_neutral=True,
+        )
+    except BaseException:
+        _deployment_admission_release_tool_call(identity)
+        raise
+
+    release_lock = threading.Lock()
+    release_done = False
+
+    def _release_when_worker_finishes(_completed: Any) -> None:
+        nonlocal release_done
+        with release_lock:
+            if release_done:
+                return
+            release_done = True
+        try:
+            _deployment_admission_release_tool_call(identity)
+        finally:
+            # Future callbacks may run synchronously in add_done_callback() when
+            # the worker is already done/cancelled. Never let that caller
+            # (including the asyncio event loop) enter the blocking allocator
+            # gate or malloc_trim directly.
+            _schedule_sync_tool_allocator_trim_retry(0.0)
+
+    callback_registered = False
+    try:
+        worker_future.add_done_callback(_release_when_worker_finishes)
+        callback_registered = True
+        wrapped = asyncio.wrap_future(
+            worker_future,
+            loop=asyncio.get_running_loop(),
+        )
+    except BaseException:
+        if not callback_registered:
+            try:
+                worker_future.add_done_callback(_release_when_worker_finishes)
+                callback_registered = True
+            except BaseException:
+                def _fallback_wait_and_release() -> None:
+                    try:
+                        try:
+                            worker_future.result()
+                        except BaseException:
+                            pass
+                    finally:
+                        _release_when_worker_finishes(worker_future)
+
+                try:
+                    threading.Thread(
+                        target=_fallback_wait_and_release,
+                        name="grabowski-drain-neutral-sync-release-fallback",
+                        daemon=True,
+                    ).start()
+                    callback_registered = True
+                except BaseException as fallback_error:
+                    logging.getLogger(__name__).error(
+                        "drain-neutral sync release handoff failed after submit; "
+                        "admission remains held until process lifecycle: %s",
+                        type(fallback_error).__name__,
+                        exc_info=fallback_error,
+                    )
+        raise
+    try:
+        return await wrapped
+    except asyncio.CancelledError:
+        worker_future.cancel()
+        raise
 
 
 def _run_sync_tool_call(
@@ -1961,25 +3114,33 @@ def _install_deployment_admission_gate() -> None:
         tool_name, arguments, context = _deployment_observer_tool_call_parts(
             args, kwargs
         )
-        # Connector least-privilege is an authority gate, not a presentation
-        # hint. Enforce it before observer/readiness bypasses and before any
-        # transport assertion can be consumed. Headerless local reads retain
-        # legacy behavior; an enrolled connector capability is policy-bound.
-        base._transport_authorize_connector_tool(context, tool_name, arguments)
-        observer_evidence: dict[str, Any] | None = None
-        try:
-            observer_evidence = _deployment_observer_request_evidence(
-                tool_name, arguments, context, observer_marker
-            )
-        except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
-            observer_evidence = None
         get_tool = getattr(manager, "get_tool", None)
         tool = (
             get_tool(tool_name)
             if callable(get_tool) and isinstance(tool_name, str)
             else None
         )
-        _enforce_maulwurf_recovery_mode(tool_name, arguments, tool)
+        policy_arguments = _operator_policy_arguments(
+            tool_name,
+            arguments,
+            tool,
+        )
+        # Connector least-privilege and every exact admission classifier operate
+        # on domain arguments only. Flowlines-injected reason/user_intent stay
+        # available to the inner telemetry wrapper but cannot change authority.
+        base._transport_authorize_connector_tool(
+            context,
+            tool_name,
+            policy_arguments,
+        )
+        observer_evidence: dict[str, Any] | None = None
+        try:
+            observer_evidence = _deployment_observer_request_evidence(
+                tool_name, policy_arguments, context, observer_marker
+            )
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
+            observer_evidence = None
+        _enforce_maulwurf_recovery_mode(tool_name, policy_arguments, tool)
         if (
             observer_evidence is not None
             and observer_evidence.get("marker_bound") is True
@@ -1988,7 +3149,7 @@ def _install_deployment_admission_gate() -> None:
             current_observer_marker = _read_deployment_admission_marker()
             try:
                 current_observer_evidence = _deployment_observer_request_evidence(
-                    tool_name, arguments, context, current_observer_marker
+                    tool_name, policy_arguments, context, current_observer_marker
                 )
             except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
                 current_observer_evidence = None
@@ -1996,55 +3157,51 @@ def _install_deployment_admission_gate() -> None:
                 current_observer_evidence is not None
                 and current_observer_evidence.get("marker_bound") is True
             ):
-                if tool is not None and getattr(tool, "is_async", True) is False:
-                    loop = asyncio.get_running_loop()
-                    worker_future = _SYNC_TOOL_EXECUTOR.submit(
-                        _run_sync_tool_call,
-                        original,
-                        args,
-                        kwargs,
-                    )
-                    return await asyncio.wrap_future(worker_future, loop=loop)
-                return await original(*args, **kwargs)
+                return await _run_drain_neutral_tool_call(
+                    original,
+                    args,
+                    kwargs,
+                    tool_name=tool_name,
+                    tool=tool,
+                )
 
         if (
             observer_marker.get("active") is True
             and observer_marker.get("valid") is True
-            and _deployment_readiness_status_call(tool_name, arguments, tool)
+            and _deployment_readiness_status_call(tool_name, policy_arguments, tool)
         ):
             current_marker = _read_deployment_admission_marker()
             if (
                 current_marker.get("active") is True
                 and current_marker.get("valid") is True
-                and _deployment_readiness_status_call(tool_name, arguments, tool)
+                and _deployment_readiness_status_call(tool_name, policy_arguments, tool)
             ):
-                if tool is not None and getattr(tool, "is_async", True) is False:
-                    loop = asyncio.get_running_loop()
-                    worker_future = _SYNC_TOOL_EXECUTOR.submit(
-                        _run_sync_tool_call,
-                        original,
-                        args,
-                        kwargs,
-                    )
-                    return await asyncio.wrap_future(worker_future, loop=loop)
-                return await original(*args, **kwargs)
+                return await _run_drain_neutral_tool_call(
+                    original,
+                    args,
+                    kwargs,
+                    tool_name=tool_name,
+                    tool=tool,
+                )
 
         read_only_hint = _tool_read_only_hint(tool)
-        effective_read_only = _operator_gate_read_only(tool_name, arguments, tool)
+        effective_read_only = _operator_gate_read_only(tool_name, policy_arguments, tool)
         maulwurf_recovery_operation = _maulwurf_recovery_operation_name(
-            tool_name, arguments
+            tool_name, policy_arguments
         )
+        maulwurf_recovery_restricted = _maulwurf_recovery_restricted()
         kind = (
             _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC
             if tool is not None and getattr(tool, "is_async", True) is False
             else _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
         )
-        identity = _deployment_admission_register_tool_call(
+        drain_blocking = _deployment_admission_drain_blocking(
+            tool_name, policy_arguments, tool
+        )
+        identity = await _deployment_admission_register_gated_tool_call(
             tool_name,
             kind,
-            drain_blocking=_deployment_admission_drain_blocking(
-                tool_name, arguments, tool
-            ),
+            drain_blocking=drain_blocking,
         )
         maulwurf_guard: int | None = None
         release_in_finally = True
@@ -2055,7 +3212,7 @@ def _install_deployment_admission_gate() -> None:
                 midcutover_recovery_evidence = await asyncio.to_thread(
                     _deployment_admission_midcutover_recovery_evidence,
                     tool_name,
-                    arguments,
+                    policy_arguments,
                     tool,
                     marker,
                 )
@@ -2095,7 +3252,7 @@ def _install_deployment_admission_gate() -> None:
                     f"while marker state is {marker.get('state')}"
                 )
             if (
-                _maulwurf_runtime_active()
+                maulwurf_recovery_restricted
                 and not effective_read_only
                 and maulwurf_recovery_operation is None
             ):
@@ -2104,13 +3261,18 @@ def _install_deployment_admission_gate() -> None:
                 )
             transport_evidence = _require_transport_roundtrip_for_tool(
                 tool_name=tool_name,
-                arguments=arguments,
+                arguments=policy_arguments,
                 context=context,
                 tool=tool,
+                transport_arguments=arguments,
             )
+            (
+                admission_transport_evidence,
+                replay_reentry_runtime_sha256,
+            ) = _effect_admission_transport_inputs(transport_evidence)
             enforcement_configured = (
                 grabowski_effect_interceptor.fence_enforcement_required()
-                if not effective_read_only and not _maulwurf_runtime_active()
+                if not effective_read_only and not maulwurf_recovery_restricted
                 else False
             )
             if not effective_read_only:
@@ -2118,7 +3280,7 @@ def _install_deployment_admission_gate() -> None:
                 if (
                     active_profile == "failover-mutate"
                     and not enforcement_configured
-                    and not _maulwurf_runtime_active()
+                    and not maulwurf_recovery_restricted
                 ):
                     raise grabowski_effect_interceptor.OperatorFenceEnforcementDenied(
                         "failover_mutation_requires_fence_config"
@@ -2133,7 +3295,7 @@ def _install_deployment_admission_gate() -> None:
                 transport_evidence is None
                 and not effective_read_only
                 and fence_required
-                and not _transport_roundtrip_exempt_call(tool_name, arguments)
+                and not _transport_roundtrip_exempt_call(tool_name, policy_arguments)
                 and not recovery_transport_exempt
             ):
                 raise grabowski_effect_interceptor.OperatorFenceEnforcementDenied(
@@ -2152,10 +3314,12 @@ def _install_deployment_admission_gate() -> None:
                 try:
                     effect_admission = grabowski_effect_interceptor.admit_mutation(
                         tool_name=str(tool_name),
-                        arguments=arguments,
-                        transport_evidence=transport_evidence,
+                        arguments=policy_arguments,
+                        transport_evidence=admission_transport_evidence,
                         runtime_sha256=(
-                            _provenance_recovery_fence_runtime_sha256()
+                            replay_reentry_runtime_sha256
+                            if replay_reentry_runtime_sha256 is not None
+                            else _provenance_recovery_fence_runtime_sha256()
                             if transport_evidence is None
                             else None
                         ),
@@ -2199,12 +3363,13 @@ def _install_deployment_admission_gate() -> None:
                     else:
                         call_runner = _run_sync_tool_call
                         call_extra_args = ()
-                    worker_future = _SYNC_TOOL_EXECUTOR.submit(
+                    worker_future = _submit_sync_tool_call(
                         call_runner,
                         original,
                         args,
                         kwargs,
                         *call_extra_args,
+                        tool_name=tool_name,
                     )
                 except BaseException as error:
                     # Submit never accepted work: no domain effect started. A
@@ -2251,7 +3416,14 @@ def _install_deployment_admission_gate() -> None:
                                 guard_for_callback
                             )
                     finally:
-                        _deployment_admission_release_tool_call(identity)
+                        try:
+                            _deployment_admission_release_tool_call(identity)
+                        finally:
+                            # Future callbacks may run synchronously in
+                            # add_done_callback() when the worker is already
+                            # done/cancelled. Keep process-wide allocator work
+                            # off that caller, including the asyncio event loop.
+                            _schedule_sync_tool_allocator_trim_retry(0.0)
 
                 callback_registered = False
                 try:
@@ -2513,7 +3685,7 @@ async def deployment_admission_status(_request: Any) -> Any:
     )
 
 
-def _configure_http_runtime() -> None:
+def _configure_http_runtime(*, admission_gate_preinstalled: bool = False) -> None:
     if not callable(getattr(mcp, "custom_route", None)):
         raise RuntimeError("FastMCP custom_route support is required")
     mcp.settings.stateless_http = HTTP_STATELESS_MODE
@@ -2531,13 +3703,231 @@ def _configure_http_runtime() -> None:
         raise RuntimeError("FastMCP session creation lock is unavailable")
     if getattr(manager, "stateless", None) is not HTTP_STATELESS_MODE:
         raise RuntimeError("FastMCP stateless HTTP mode is unavailable")
-    _install_deployment_admission_gate()
+    if admission_gate_preinstalled:
+        if not _DEPLOYMENT_ADMISSION_GATE_INSTALLED:
+            raise RuntimeError(
+                "Grabowski deployment admission gate was not preinstalled"
+            )
+    else:
+        _install_deployment_admission_gate()
     if manager.session_idle_timeout is not None:
         raise RuntimeError("FastMCP stateless HTTP mode retained an idle timeout")
     if manager.max_sessions is not None:
         raise RuntimeError("FastMCP stateless HTTP mode retained a session limit")
 
 
+
+
+def _posthog_mcp_analytics_switch() -> bool | None:
+    raw = os.environ.get(POSTHOG_MCP_ANALYTICS_SWITCH_ENV)
+    if raw is None:
+        return None
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    logging.getLogger(__name__).warning(
+        "%s has an invalid boolean value; PostHog MCP analytics stays disabled",
+        POSTHOG_MCP_ANALYTICS_SWITCH_ENV,
+    )
+    return False
+
+
+def _read_posthog_project_token_file(path: Path = POSTHOG_PROJECT_TOKEN_FILE) -> str | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError("PostHog project token path is not a regular file")
+        if before.st_uid != os.getuid():
+            raise RuntimeError("PostHog project token file is not owned by the operator user")
+        if before.st_nlink != 1:
+            raise RuntimeError("PostHog project token file must have exactly one hard link")
+        if stat.S_IMODE(before.st_mode) & 0o077:
+            raise RuntimeError("PostHog project token file permissions must be 0600 or stricter")
+        if before.st_size > POSTHOG_PROJECT_TOKEN_MAX_BYTES:
+            raise RuntimeError("PostHog project token file is too large")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, POSTHOG_PROJECT_TOKEN_MAX_BYTES))
+            if not chunk:
+                raise RuntimeError("PostHog project token file ended early")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise RuntimeError("PostHog project token file grew while being read")
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_nlink,
+        before.st_uid,
+        before.st_gid,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_nlink,
+        after.st_uid,
+        after.st_gid,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if identity_before != identity_after:
+        raise RuntimeError("PostHog project token file changed while being read")
+    payload = b"".join(chunks)
+    try:
+        token = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("PostHog project token file is not UTF-8") from exc
+    if any(character.isspace() for character in token):
+        raise RuntimeError("PostHog project token file must not contain whitespace")
+    return token or None
+
+
+def _posthog_project_token() -> str | None:
+    token = os.environ.get(POSTHOG_PROJECT_TOKEN_ENV, "")
+    if not token:
+        token = _read_posthog_project_token_file()
+    if token is not None and (
+        not token.startswith("phc_")
+        or len(token.encode("utf-8")) > POSTHOG_PROJECT_TOKEN_MAX_BYTES
+        or any(character.isspace() for character in token)
+    ):
+        raise RuntimeError("PostHog project token has an unexpected format")
+    return token
+
+
+def _posthog_ingestion_host() -> str:
+    raw = os.environ.get(POSTHOG_HOST_ENV, POSTHOG_DEFAULT_HOST).strip()
+    parsed = urlsplit(raw)
+    normalized = f"{parsed.scheme}://{parsed.netloc}"
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or normalized not in POSTHOG_ALLOWED_HOSTS
+    ):
+        raise RuntimeError("PostHog host must be an allowlisted HTTPS ingestion origin")
+    return normalized
+
+
+def _posthog_metadata_only_before_send(event: Any) -> dict[str, Any] | None:
+    if not isinstance(event, dict) or event.get("event") != "$mcp_tool_call":
+        return None
+    properties = event.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    tool_name = properties.get("$mcp_tool_name")
+    is_error = properties.get("$mcp_is_error")
+    if not isinstance(tool_name, str) or not tool_name or not isinstance(is_error, bool):
+        return None
+    projected = {
+        key: properties[key]
+        for key in POSTHOG_METADATA_PROPERTIES
+        if key in properties
+    }
+    projected["$geoip_disable"] = True
+    projected["$process_person_profile"] = False
+    sanitized: dict[str, Any] = {
+        "event": "$mcp_tool_call",
+        "distinct_id": POSTHOG_DISTINCT_ID,
+        "properties": projected,
+    }
+    if "timestamp" in event:
+        sanitized["timestamp"] = event["timestamp"]
+    return sanitized
+
+
+def _configure_posthog_mcp_analytics() -> bool:
+    global _POSTHOG_MCP_ANALYTICS, _POSTHOG_MCP_CLIENT
+    if _POSTHOG_MCP_CLIENT is not None:
+        return True
+    switch = _posthog_mcp_analytics_switch()
+    if switch is False:
+        return False
+    try:
+        token = _posthog_project_token()
+        if token is None:
+            if switch is True:
+                logging.getLogger(__name__).warning(
+                    "PostHog MCP analytics requested but no project token is configured"
+                )
+            return False
+        host = _posthog_ingestion_host()
+        from posthog import Posthog
+        from posthog.mcp import instrument
+        from posthog.mcp.types import MCPAnalyticsOptions
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        logging.getLogger(__name__).warning(
+            "PostHog MCP analytics remains disabled: %s", type(exc).__name__
+        )
+        return False
+
+    client: Any | None = None
+    try:
+        client = Posthog(token, host=host)
+        analytics = instrument(
+            mcp,
+            client,
+            MCPAnalyticsOptions(
+                report_missing=False,
+                enable_conversation_id=False,
+                enable_exception_autocapture=False,
+                context=False,
+                capture_model=False,
+                collect_feedback=False,
+                before_send=_posthog_metadata_only_before_send,
+            ),
+        )
+    except Exception as exc:
+        if client is not None:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+        logging.getLogger(__name__).warning(
+            "PostHog MCP analytics initialization failed open: %s",
+            type(exc).__name__,
+        )
+        return False
+    _POSTHOG_MCP_CLIENT = client
+    _POSTHOG_MCP_ANALYTICS = analytics
+    return True
+
+
+def _shutdown_posthog_mcp_analytics() -> None:
+    global _POSTHOG_MCP_ANALYTICS, _POSTHOG_MCP_CLIENT
+    client = _POSTHOG_MCP_CLIENT
+    _POSTHOG_MCP_CLIENT = None
+    _POSTHOG_MCP_ANALYTICS = None
+    if client is None:
+        return
+    try:
+        client.shutdown()
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "PostHog MCP analytics shutdown failed open: %s", type(exc).__name__
+        )
 
 
 def _open_stack_dump_memfd(max_bytes: int = STACK_DUMP_MAX_BYTES) -> Any:
@@ -2641,7 +4031,7 @@ def _argv_hash(argv: list[str]) -> str:
 
 def _sensitive_argv_name(name: str) -> bool:
     key = name.lstrip("-").replace("-", "_").upper()
-    return any(part in key for part in SENSITIVE_ENV_PARTS)
+    return key in SENSITIVE_ENV_KEYS or any(part in key for part in SENSITIVE_ENV_PARTS)
 
 
 def _argv_inline_secret_spans(item: str) -> list[tuple[int, int, str]]:
@@ -2882,9 +4272,11 @@ def _safe_environment() -> dict[str, str]:
         environment = {}
         for key, value in os.environ.items():
             upper = key.upper()
-            if any(part in upper for part in SENSITIVE_ENV_PARTS):
+            if upper in SENSITIVE_ENV_KEYS or any(part in upper for part in SENSITIVE_ENV_PARTS):
                 continue
             environment[key] = value
+    for key in SENSITIVE_ENV_KEYS:
+        environment.pop(key, None)
     environment.update(_managed_runtime_environment(environment))
     environment["GRABOWSKI_EVIDENCE_ROOT"] = str(EVIDENCE_ROOT)
     environment["GRABOWSKI_TRUSTED_OWNER"] = "1" if _trusted_owner_mode() else "0"
@@ -6721,6 +8113,12 @@ def _start_job(
         else JOB_PREFIX + uuid.uuid4().hex[:12]
     )
     metadata_temp_cleanup = _cleanup_stale_job_metadata_temps(_jobs_root())
+    if decision_review_binding is not None:
+        # No orphan job directory for a role-launcher preflight rejection.
+        command = decision_reviews.bind_job_review_role_argv(
+            command, decision_review_binding,
+            cwd=working_directory, attempt_directory=_jobs_root() / unit,
+        )
     directory = _job_directory(unit, create=True)
     stdout_path = directory / "stdout.log"
     stderr_path = directory / "stderr.log"
@@ -6746,9 +8144,13 @@ def _start_job(
             decision_review_binding
         )
         scope["decision_bound_review"] = normalized_review_binding
+        # A new attempt may never recover historical V1 role provenance from
+        # an alternate executable form after its launch.
+        scope["decision_review_attempt_epoch"] = 2
         scope["started_at_unix_ns"] = started_at_unix_ns
         review_provenance = decision_reviews.review_role_provenance(
-            command, normalized_review_binding, cwd=working_directory
+            command, normalized_review_binding, cwd=working_directory,
+            attempt_directory=directory,
         )
         if review_provenance is not None:
             scope["decision_review_provenance"] = review_provenance
@@ -6901,6 +8303,11 @@ def _start_job(
         "GRABOWSKI_JOB_STDERR_PATH": finalization_contract["receipt_paths"]["stderr"],
         "GRABOWSKI_JOB_FINALIZATION_PATH": finalization_contract["receipt_paths"]["finalization"],
     }
+    if (
+        decision_review_binding is not None
+        and scope.get("decision_review_provenance", {}).get("schema_version") == 2
+    ):
+        environment["GRABOWSKI_REVIEW_ATTEMPT_UNIT"] = unit
     if "expected_head" in finalization_contract:
         environment["GRABOWSKI_JOB_EXPECTED_HEAD"] = finalization_contract["expected_head"]
     systemd_argv.extend(f"--setenv={key}={value}" for key, value in environment.items())
@@ -7337,10 +8744,11 @@ def grabowski_job_cancel(unit: str) -> dict[str, Any]:
     """Stop one Grabowski background job."""
     name = _validate_unit(unit, job_only=True)
     _require_operator_mutation("durable_job", task_id=name)
-    return _run(
-        ["systemctl", "--user", "stop", name],
-        cwd=HOME,
-        timeout_seconds=60,
+    systemd_unit = name if "." in name else f"{name}.service"
+    return _run_mutating_user_systemd_unit(
+        systemd_unit,
+        "stop",
+        mutation_timeout_seconds=60,
         max_output_bytes=DEFAULT_OUTPUT_BYTES,
     )
 
@@ -7372,6 +8780,12 @@ def grabowski_git(
     subcommand, _command_arguments, _configurations = _split_git_invocation(arguments)
     execution_timeout_seconds = _timeout(timeout_seconds)
 
+    if read_shape is not None and subcommand == "status":
+        return _git_server_safe_status(
+            path,
+            read_shape,
+            timeout_seconds=execution_timeout_seconds,
+        )
     if read_shape is not None:
         command = _git_server_read_command(path, read_shape)
         environment = _git_server_read_environment()
@@ -7701,6 +9115,1062 @@ def grabowski_github(
     )
 
 
+_USER_SYSTEMD_FRAGMENT_LOOKUP_TIMEOUT_SECONDS = 30
+_USER_SYSTEMD_MUTATION_TIMEOUT_SECONDS = 120
+_USER_SYSTEMD_RECONCILIATION_TIMEOUT_SECONDS = 30
+_USER_SYSTEMD_LEASE_SAFETY_SECONDS = 60
+_USER_SYSTEMD_RECONCILIATION_POLL_SECONDS = 5.0
+_USER_SYSTEMD_RECONCILIATION_MAX_ATTEMPTS = 2
+_USER_SYSTEMD_RECONCILIATION_PROPERTIES = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "UnitFileState",
+    "Job",
+    "FragmentPath",
+)
+
+
+def _user_systemd_lease_ttl_seconds(mutation_timeout_seconds: int) -> int:
+    return (
+        _USER_SYSTEMD_FRAGMENT_LOOKUP_TIMEOUT_SECONDS
+        + mutation_timeout_seconds
+        + int(PROCESS_TERMINATION_GRACE_SECONDS * 3)
+        + _USER_SYSTEMD_LEASE_SAFETY_SECONDS
+    )
+
+
+_USER_SYSTEMD_LEASE_TTL_SECONDS = _user_systemd_lease_ttl_seconds(
+    _USER_SYSTEMD_MUTATION_TIMEOUT_SECONDS
+)
+_USER_SYSTEMD_RECONCILIATION_LEASE_TTL_SECONDS = (
+    _USER_SYSTEMD_RECONCILIATION_TIMEOUT_SECONDS
+    * _USER_SYSTEMD_RECONCILIATION_MAX_ATTEMPTS
+    + int(
+        _USER_SYSTEMD_RECONCILIATION_POLL_SECONDS
+        * max(0, _USER_SYSTEMD_RECONCILIATION_MAX_ATTEMPTS - 1)
+    )
+    + _USER_SYSTEMD_LEASE_SAFETY_SECONDS
+)
+
+
+_USER_SYSTEMD_UNIT_FILE_ACTIONS = frozenset({"enable", "disable"})
+
+
+def _user_systemd_unit_config_root() -> Path:
+    raw = os.environ.get("XDG_CONFIG_HOME")
+    if raw:
+        config_home = Path(raw).expanduser()
+        if not config_home.is_absolute():
+            raise RuntimeError("XDG_CONFIG_HOME for user systemd must be absolute")
+    else:
+        config_home = HOME / ".config"
+    try:
+        return (config_home / "systemd" / "user").resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError("Unable to resolve user systemd config root") from exc
+
+
+def _normalize_user_systemd_fragment_path(name: str, value: str) -> Path | None:
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    if not lines:
+        return None
+    if len(lines) != 1:
+        raise RuntimeError(f"Ambiguous FragmentPath observation for user unit {name}")
+    fragment = Path(lines[0]).expanduser()
+    if not fragment.is_absolute():
+        raise RuntimeError(f"FragmentPath for user unit {name} is not absolute")
+    return Path(os.path.normpath(str(fragment)))
+
+
+def _user_systemd_fragment_path(name: str) -> Path | None:
+    result = _run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            name,
+            "--no-pager",
+            "--property=FragmentPath",
+            "--value",
+        ],
+        cwd=HOME,
+        timeout_seconds=_USER_SYSTEMD_FRAGMENT_LOOKUP_TIMEOUT_SECONDS,
+        max_output_bytes=DEFAULT_OUTPUT_BYTES,
+    )
+    if result.get("returncode") != 0 or result.get("timed_out") is True:
+        raise RuntimeError(f"Unable to resolve FragmentPath for user unit {name}")
+    stdout = result.get("stdout")
+    if not isinstance(stdout, str):
+        raise RuntimeError(f"Invalid FragmentPath observation for user unit {name}")
+    return _normalize_user_systemd_fragment_path(name, stdout)
+
+
+def _user_systemd_reconciliation_state(name: str) -> dict[str, str]:
+    result = _run(
+        [
+            "systemctl",
+            "--user",
+            "show",
+            name,
+            "--no-pager",
+            "--all",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=UnitFileState",
+            "--property=Job",
+            "--property=FragmentPath",
+        ],
+        cwd=HOME,
+        timeout_seconds=_USER_SYSTEMD_RECONCILIATION_TIMEOUT_SECONDS,
+        max_output_bytes=DEFAULT_OUTPUT_BYTES,
+    )
+    if result.get("returncode") != 0 or result.get("timed_out") is True:
+        raise RuntimeError(f"Unable to reconcile user unit state for {name}")
+    stdout = result.get("stdout")
+    if not isinstance(stdout, str):
+        raise RuntimeError(f"Invalid user unit reconciliation state for {name}")
+    properties = _parse_show(stdout)
+    missing = [
+        property_name
+        for property_name in _USER_SYSTEMD_RECONCILIATION_PROPERTIES
+        if property_name not in properties
+    ]
+    if missing:
+        raise RuntimeError(
+            f"Incomplete user unit reconciliation state for {name}: "
+            + ", ".join(missing)
+        )
+    return {
+        property_name: properties[property_name]
+        for property_name in _USER_SYSTEMD_RECONCILIATION_PROPERTIES
+    }
+
+
+def _user_systemd_manager_job_readback(name: str) -> dict[str, Any]:
+    result = _run(
+        [
+            "systemctl",
+            "--user",
+            "list-jobs",
+            "--no-legend",
+            "--plain",
+            "--no-pager",
+        ],
+        cwd=HOME,
+        timeout_seconds=_USER_SYSTEMD_RECONCILIATION_TIMEOUT_SECONDS,
+        max_output_bytes=DEFAULT_OUTPUT_BYTES,
+    )
+    if (
+        result.get("returncode") != 0
+        or result.get("timed_out") is True
+        or result.get("stdout_truncated") is True
+    ):
+        raise RuntimeError(
+            f"Unable to read user systemd manager jobs while reconciling {name}"
+        )
+    stdout = result.get("stdout")
+    if not isinstance(stdout, str):
+        raise RuntimeError(
+            f"Invalid user systemd manager job readback while reconciling {name}"
+        )
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    matching_jobs: list[dict[str, str]] = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 4:
+            raise RuntimeError(
+                f"Malformed user systemd manager job readback while reconciling {name}"
+            )
+        job_id, unit, job_type, state = fields
+        if unit == name:
+            matching_jobs.append(
+                {
+                    "job_id": job_id,
+                    "unit": unit,
+                    "type": job_type,
+                    "state": state,
+                }
+            )
+    return {
+        "schema_version": 1,
+        "kind": "user_systemd_manager_job_readback",
+        "unit": name,
+        "job_present": bool(matching_jobs),
+        "matching_jobs": matching_jobs,
+        "observed_job_line_count": len(lines),
+    }
+
+
+def _user_systemd_lease_expiry(
+    lease_snapshots: list[dict[str, Any]],
+) -> int | None:
+    expiries = [
+        item.get("expires_at_unix")
+        for item in lease_snapshots
+        if isinstance(item, dict)
+        and isinstance(item.get("expires_at_unix"), int)
+        and not isinstance(item.get("expires_at_unix"), bool)
+    ]
+    return min(expiries) if expiries else None
+
+
+def _user_systemd_release_recovery(
+    owner_id: str,
+    resource_keys: list[str],
+) -> dict[str, Any]:
+    return {
+        "kind": "resource_readback_then_exact_release",
+        "inspect_tool": "grabowski_resource_inspect",
+        "release_tool": "grabowski_resource_release",
+        "lease_owner_id": owner_id,
+        "resource_keys": list(resource_keys),
+        "rule": "inspect every exact key before release; do not retry the systemd mutation",
+    }
+
+
+def _user_systemd_release_after_observed_action(
+    resources: Any,
+    *,
+    owner_id: str,
+    resource_keys: list[str],
+    lease_snapshots: list[dict[str, Any]],
+    result: dict[str, Any],
+    coordination: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        resources.release_resources(
+            owner_id,
+            resource_keys,
+            expected_leases=lease_snapshots,
+        )
+    except Exception as exc:
+        finalized = dict(result)
+        release_coordination = {} if coordination is None else dict(coordination)
+        if "status" in release_coordination:
+            release_coordination["mutation_status"] = release_coordination["status"]
+        release_coordination.update(
+            {
+                "status": "lease_release_unknown_after_observed_action",
+                "action_result_observed": True,
+                "retry_allowed": False,
+                "requires_readback_before_next_attempt": True,
+                "lease_release_state": "unknown",
+                "lease_retained": None,
+                "release_required_after_terminal_readback": True,
+                "lease_owner_id": owner_id,
+                "resource_keys": list(resource_keys),
+                "last_known_lease_expires_at_unix": _user_systemd_lease_expiry(
+                    lease_snapshots
+                ),
+                "release_error_class": type(exc).__name__,
+                "recovery": _user_systemd_release_recovery(owner_id, resource_keys),
+            }
+        )
+        finalized["user_service_coordination"] = release_coordination
+        return finalized
+
+    if coordination is None:
+        return result
+    finalized = dict(result)
+    finalized["user_service_coordination"] = coordination
+    return finalized
+
+
+def _user_systemd_unknown_result(
+    action_result: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if action_result is None:
+        result: dict[str, Any] = {
+            "stdout": "",
+            "stderr": "",
+            "returncode": None,
+            "timed_out": False,
+        }
+    else:
+        result = dict(action_result)
+    result["outcome_unknown"] = True
+    return result
+
+
+def _user_systemd_release_after_unknown_outcome(
+    resources: Any,
+    *,
+    owner_id: str,
+    resource_keys: list[str],
+    lease_snapshots: list[dict[str, Any]],
+    result: dict[str, Any],
+    coordination: dict[str, Any],
+    release_failure_status: str = "lease_release_unknown_after_outcome_unknown",
+) -> dict[str, Any]:
+    finalized = dict(result)
+    release_coordination = dict(coordination)
+    try:
+        resources.release_resources(
+            owner_id,
+            resource_keys,
+            expected_leases=lease_snapshots,
+        )
+    except Exception as exc:
+        release_coordination.update(
+            {
+                "status": release_failure_status,
+                "lease_release_state": "unknown",
+                "lease_retained": None,
+                "release_required_after_terminal_readback": True,
+                "release_error_class": type(exc).__name__,
+                "recovery": _user_systemd_release_recovery(owner_id, resource_keys),
+            }
+        )
+    else:
+        release_coordination.update(
+            {
+                "lease_release_state": "released",
+                "lease_retained": False,
+                "release_required_after_terminal_readback": False,
+            }
+        )
+    finalized["user_service_coordination"] = release_coordination
+    return finalized
+
+
+def _raise_pre_effect_release_failure(
+    primary_error: Exception,
+    release_error: Exception,
+    *,
+    owner_id: str,
+    resource_keys: list[str],
+    lease_snapshots: list[dict[str, Any]],
+) -> None:
+    raise RuntimeError(
+        f"{primary_error}; coordination release is uncertain after pre-effect failure "
+        f"(primary_error_class={type(primary_error).__name__}, "
+        f"release_error_class={type(release_error).__name__}, "
+        f"lease_owner_id={owner_id}, resource_keys={resource_keys!r}, "
+        f"last_known_lease_expires_at_unix="
+        f"{_user_systemd_lease_expiry(lease_snapshots)})"
+    ) from primary_error
+
+
+def _user_systemd_evidence_sha256(value: Any) -> str:
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _user_systemd_job_pending(value: str) -> bool:
+    normalized = value.strip()
+    if not normalized:
+        return False
+    return normalized.split(maxsplit=1)[0] != "0"
+
+
+def _raise_user_systemd_pre_effect_recovery_failure(
+    primary_error: Exception,
+    *,
+    fence_id: str,
+    owner_id: str,
+    resource_keys: list[str],
+    lease_snapshots: list[dict[str, Any]],
+    fence_clearance_error: Exception | None,
+    release_error: Exception | None,
+) -> None:
+    raise RuntimeError(
+        f"{primary_error}; pre-effect coordination recovery is uncertain "
+        f"(primary_error_class={type(primary_error).__name__}, "
+        f"fence_clearance_error_class="
+        f"{type(fence_clearance_error).__name__ if fence_clearance_error is not None else None}, "
+        f"release_error_class="
+        f"{type(release_error).__name__ if release_error is not None else None}, "
+        f"uncertainty_fence_id={fence_id}, lease_owner_id={owner_id}, "
+        f"resource_keys={resource_keys!r}, last_known_lease_expires_at_unix="
+        f"{_user_systemd_lease_expiry(lease_snapshots)}, "
+        f"recovery={_user_systemd_release_recovery(owner_id, resource_keys)!r})"
+    ) from primary_error
+
+
+def _abort_user_systemd_pre_effect(
+    resources: Any,
+    primary_error: Exception,
+    *,
+    fence_id: str,
+    owner_id: str,
+    resource_keys: list[str],
+    lease_snapshots: list[dict[str, Any]],
+    evidence: dict[str, Any],
+) -> None:
+    fence_clearance_error: Exception | None = None
+    try:
+        active = resources.user_systemd_uncertainty_status(resource_keys)
+    except Exception as exc:
+        fence_clearance_error = exc
+    else:
+        if active is not None:
+            try:
+                resources.clear_user_systemd_uncertainty_fence(
+                    fence_id,
+                    outcome="pre_effect_abort",
+                    evidence_sha256=_user_systemd_evidence_sha256(evidence),
+                )
+            except Exception as exc:
+                fence_clearance_error = exc
+
+    release_error: Exception | None = None
+    try:
+        resources.release_resources(
+            owner_id,
+            resource_keys,
+            expected_leases=lease_snapshots,
+        )
+    except Exception as exc:
+        release_error = exc
+
+    if fence_clearance_error is not None or release_error is not None:
+        _raise_user_systemd_pre_effect_recovery_failure(
+            primary_error,
+            fence_id=fence_id,
+            owner_id=owner_id,
+            resource_keys=resource_keys,
+            lease_snapshots=lease_snapshots,
+            fence_clearance_error=fence_clearance_error,
+            release_error=release_error,
+        )
+    raise primary_error
+
+
+def _user_systemd_reconcile_durable_uncertainty(
+    resources: Any,
+    resource_keys: list[str],
+) -> dict[str, Any] | None:
+    fence = resources.user_systemd_uncertainty_status(resource_keys)
+    if fence is None:
+        return None
+
+    try:
+        live_leases = resources.inspect_resources(fence["resource_keys"])
+    except Exception as exc:
+        return {
+            "blocked": True,
+            "fence": fence,
+            "reconciliation": None,
+            "reconciliation_error_class": None,
+            "manager_job_readback": None,
+            "manager_job_readback_error_class": None,
+            "live_lease_resource_keys": [],
+            "lease_readback_error_class": type(exc).__name__,
+            "clearance_error_class": None,
+        }
+    live_lease_resource_keys = sorted(live_leases)
+    if live_lease_resource_keys:
+        return {
+            "blocked": True,
+            "fence": fence,
+            "reconciliation": None,
+            "reconciliation_error_class": None,
+            "manager_job_readback": None,
+            "manager_job_readback_error_class": None,
+            "live_lease_resource_keys": live_lease_resource_keys,
+            "lease_readback_error_class": None,
+            "clearance_error_class": None,
+        }
+
+    reconciliation: dict[str, str] | None = None
+    reconciliation_error_class: str | None = None
+    manager_job_readback: dict[str, Any] | None = None
+    manager_job_readback_error_class: str | None = None
+    try:
+        reconciliation = _user_systemd_reconciliation_state(fence["unit"])
+    except Exception as exc:
+        reconciliation_error_class = type(exc).__name__
+        try:
+            manager_job_readback = _user_systemd_manager_job_readback(
+                fence["unit"]
+            )
+        except Exception as manager_exc:
+            manager_job_readback_error_class = type(manager_exc).__name__
+        return {
+            "blocked": True,
+            "fence": fence,
+            "reconciliation": None,
+            "reconciliation_error_class": reconciliation_error_class,
+            "manager_job_readback": manager_job_readback,
+            "manager_job_readback_error_class": manager_job_readback_error_class,
+            "live_lease_resource_keys": [],
+            "lease_readback_error_class": None,
+            "clearance_error_class": None,
+        }
+
+    effective_action = (
+        "stop" if fence["phase"] == "stop_recovery" else fence["action"]
+    )
+    if not _user_systemd_reconciliation_terminal(
+        reconciliation, action=effective_action
+    ):
+        return {
+            "blocked": True,
+            "fence": fence,
+            "reconciliation": reconciliation,
+            "reconciliation_error_class": None,
+            "manager_job_readback": None,
+            "manager_job_readback_error_class": None,
+            "live_lease_resource_keys": [],
+            "lease_readback_error_class": None,
+            "clearance_error_class": None,
+        }
+
+    try:
+        cleared = resources.clear_user_systemd_uncertainty_fence(
+            fence["fence_id"],
+            outcome="terminal_readback",
+            evidence_sha256=_user_systemd_evidence_sha256(reconciliation),
+        )
+    except Exception as exc:
+        return {
+            "blocked": True,
+            "fence": fence,
+            "reconciliation": reconciliation,
+            "reconciliation_error_class": None,
+            "manager_job_readback": None,
+            "manager_job_readback_error_class": None,
+            "live_lease_resource_keys": [],
+            "lease_readback_error_class": None,
+            "clearance_error_class": type(exc).__name__,
+        }
+    return {
+        "blocked": False,
+        "fence": cleared,
+        "reconciliation": reconciliation,
+        "reconciliation_error_class": None,
+        "manager_job_readback": None,
+        "manager_job_readback_error_class": None,
+        "live_lease_resource_keys": [],
+        "lease_readback_error_class": None,
+        "clearance_error_class": None,
+    }
+
+def _user_systemd_durable_fence_block_result(
+    prior: dict[str, Any],
+) -> dict[str, Any]:
+    fence = prior["fence"]
+    live_lease_resource_keys = prior.get("live_lease_resource_keys") or []
+    lease_readback_error_class = prior.get("lease_readback_error_class")
+    result = _user_systemd_unknown_result(None)
+    result["user_service_coordination"] = {
+        "status": "blocked_by_durable_uncertainty_fence",
+        "retry_allowed": False,
+        "requires_readback_before_next_attempt": True,
+        "lease_retained": (
+            None if lease_readback_error_class is not None else bool(live_lease_resource_keys)
+        ),
+        "lease_release_state": (
+            "unknown"
+            if lease_readback_error_class is not None
+            else "active"
+            if live_lease_resource_keys
+            else "released_or_expired"
+        ),
+        "durable_fence_active": True,
+        "uncertainty_fence_id": fence["fence_id"],
+        "fenced_unit": fence["unit"],
+        "fenced_action": fence["action"],
+        "fence_phase": fence["phase"],
+        "resource_keys": list(fence["resource_keys"]),
+        "reconciliation": prior["reconciliation"],
+        "reconciliation_error_class": prior["reconciliation_error_class"],
+        "manager_job_readback": prior.get("manager_job_readback"),
+        "manager_job_readback_error_class": prior.get(
+            "manager_job_readback_error_class"
+        ),
+        "live_lease_resource_keys": list(live_lease_resource_keys),
+        "lease_readback_error_class": lease_readback_error_class,
+        "fence_clearance_error_class": prior["clearance_error_class"],
+        "handoff": "durable_fence_requires_terminal_systemd_readback",
+    }
+    return result
+
+
+def _require_fully_qualified_user_systemd_unit(name: str) -> str:
+    name = _validate_unit(name)
+    stem, separator, unit_type = name.rpartition(".")
+    if not separator or not stem or not unit_type:
+        raise ValueError(
+            "mutating user systemd actions require a fully qualified unit name "
+            "with an explicit unit-type suffix"
+        )
+    return name
+
+
+def _user_systemd_reconciliation_terminal(
+    reconciliation: dict[str, str],
+    *,
+    action: str,
+) -> bool:
+    if _user_systemd_job_pending(reconciliation["Job"]):
+        return False
+    if action == "stop":
+        return reconciliation["ActiveState"] in {"inactive", "failed"}
+    return True
+
+
+def _user_systemd_stop_recovery_eligible(prior: dict[str, Any]) -> bool:
+    reconciliation = prior.get("reconciliation")
+    fence = prior.get("fence")
+    if not isinstance(reconciliation, dict) or not isinstance(fence, dict):
+        return False
+    if (
+        prior.get("reconciliation_error_class") is not None
+        or prior.get("lease_readback_error_class") is not None
+        or prior.get("clearance_error_class") is not None
+        or bool(prior.get("live_lease_resource_keys") or [])
+    ):
+        return False
+    return (
+        not _user_systemd_reconciliation_terminal(reconciliation, action="stop")
+        and (
+            _user_systemd_job_pending(reconciliation["Job"])
+            or fence.get("action") == "stop"
+            or fence.get("phase") == "stop_recovery"
+        )
+    )
+
+
+def _abort_user_systemd_stop_recovery_pre_effect(
+    resources: Any,
+    primary_error: Exception,
+    *,
+    owner_id: str,
+    resource_keys: list[str],
+    lease_snapshots: list[dict[str, Any]],
+) -> None:
+    try:
+        resources.release_resources(
+            owner_id,
+            resource_keys,
+            expected_leases=lease_snapshots,
+        )
+    except Exception as release_error:
+        _raise_pre_effect_release_failure(
+            primary_error,
+            release_error,
+            owner_id=owner_id,
+            resource_keys=resource_keys,
+            lease_snapshots=lease_snapshots,
+        )
+    raise primary_error
+
+
+def _run_mutating_user_systemd_unit(
+    name: str,
+    action: str,
+    *,
+    mutation_timeout_seconds: int = _USER_SYSTEMD_MUTATION_TIMEOUT_SECONDS,
+    max_output_bytes: int = MAX_OUTPUT_BYTES,
+) -> dict[str, Any]:
+    import grabowski_resources as resources
+
+    name = _require_fully_qualified_user_systemd_unit(name)
+    unit_resource_key = f"service:user-systemd:{name}"
+    prior = _user_systemd_reconcile_durable_uncertainty(
+        resources, [unit_resource_key]
+    )
+    recovering_prior_fence = bool(
+        prior is not None
+        and prior["blocked"]
+        and action == "stop"
+        and _user_systemd_stop_recovery_eligible(prior)
+    )
+    if prior is not None and prior["blocked"] and not recovering_prior_fence:
+        return _user_systemd_durable_fence_block_result(prior)
+
+    recovery_fence = prior["fence"] if recovering_prior_fence else None
+    fragment_before = _user_systemd_fragment_path(name)
+    unit_file_config_root = (
+        _user_systemd_unit_config_root()
+        if action in _USER_SYSTEMD_UNIT_FILE_ACTIONS
+        else None
+    )
+    if recovering_prior_fence:
+        assert recovery_fence is not None
+        resource_keys = list(recovery_fence["resource_keys"])
+        if fragment_before is not None:
+            resource_keys.append(f"path:{fragment_before}")
+        resource_keys = sorted(set(resource_keys))
+    else:
+        resource_keys = [unit_resource_key]
+        if fragment_before is not None:
+            resource_keys.append(f"path:{fragment_before}")
+        if unit_file_config_root is not None:
+            resource_keys.append(f"path:{unit_file_config_root}")
+
+    lease_metadata = {"unit": name, "action": action}
+    if unit_file_config_root is not None:
+        lease_metadata["unit_file_config_root"] = str(unit_file_config_root)
+    owner_id = f"operator:user-systemd-{uuid.uuid4().hex}"
+    acquire_kwargs: dict[str, Any] = {}
+    if recovering_prior_fence:
+        acquire_kwargs["_user_systemd_stop_recovery_fence_id"] = recovery_fence[
+            "fence_id"
+        ]
+    lease = resources.acquire_resources(
+        owner_id,
+        resource_keys,
+        purpose=f"user systemd {action} {name}",
+        ttl_seconds=_user_systemd_lease_ttl_seconds(mutation_timeout_seconds),
+        metadata=lease_metadata,
+        **acquire_kwargs,
+    )
+    lease_snapshots = list(lease["leases"])
+
+    if recovering_prior_fence:
+        assert recovery_fence is not None
+        try:
+            fence = resources.rebind_user_systemd_stop_recovery_fence(
+                recovery_fence["fence_id"],
+                owner_id,
+                resource_keys,
+                expected_leases=lease_snapshots,
+            )
+        except Exception as primary_error:
+            _abort_user_systemd_stop_recovery_pre_effect(
+                resources,
+                primary_error,
+                owner_id=owner_id,
+                resource_keys=resource_keys,
+                lease_snapshots=lease_snapshots,
+            )
+    else:
+        try:
+            fence = resources.prepare_user_systemd_uncertainty_fence(
+                owner_id,
+                resource_keys,
+                expected_leases=lease_snapshots,
+                unit=name,
+                action=action,
+            )
+        except Exception as primary_error:
+            try:
+                resources.release_resources(
+                    owner_id,
+                    resource_keys,
+                    expected_leases=lease_snapshots,
+                )
+            except Exception as release_error:
+                _raise_pre_effect_release_failure(
+                    primary_error,
+                    release_error,
+                    owner_id=owner_id,
+                    resource_keys=resource_keys,
+                    lease_snapshots=lease_snapshots,
+                )
+            raise
+
+    pre_action_state: dict[str, str] | None = None
+    preexisting_job_pending = False
+    try:
+        pre_action_state = _user_systemd_reconciliation_state(name)
+        fragment_after = _normalize_user_systemd_fragment_path(
+            name, pre_action_state["FragmentPath"]
+        )
+        if fragment_after != fragment_before:
+            if not recovering_prior_fence:
+                resources.clear_user_systemd_uncertainty_fence(
+                    fence["fence_id"],
+                    outcome="pre_effect_abort",
+                    evidence_sha256=_user_systemd_evidence_sha256(pre_action_state),
+                )
+            raise RuntimeError(
+                f"FragmentPath changed after coordination lease acquisition for user unit {name}"
+            )
+        preexisting_job_pending = _user_systemd_job_pending(pre_action_state["Job"])
+        if preexisting_job_pending and action != "stop":
+            resources.update_user_systemd_uncertainty_fence(
+                fence["fence_id"],
+                phase="preexisting_job",
+            )
+            blocked = _user_systemd_unknown_result(None)
+            blocked["user_service_coordination"] = {
+                "status": "preexisting_job_fenced",
+                "retry_allowed": False,
+                "requires_readback_before_next_attempt": True,
+                "lease_retained": False,
+                "durable_fence_active": True,
+                "uncertainty_fence_id": fence["fence_id"],
+                "lease_owner_id": owner_id,
+                "resource_keys": list(resource_keys),
+                "reconciliation": pre_action_state,
+                "handoff": "durable_fence_requires_terminal_systemd_readback",
+            }
+            return _user_systemd_release_after_unknown_outcome(
+                resources,
+                owner_id=owner_id,
+                resource_keys=resource_keys,
+                lease_snapshots=lease_snapshots,
+                result=blocked,
+                coordination=blocked["user_service_coordination"],
+            )
+    except Exception as primary_error:
+        if recovering_prior_fence:
+            _abort_user_systemd_stop_recovery_pre_effect(
+                resources,
+                primary_error,
+                owner_id=owner_id,
+                resource_keys=resource_keys,
+                lease_snapshots=lease_snapshots,
+            )
+        _abort_user_systemd_pre_effect(
+            resources,
+            primary_error,
+            fence_id=fence["fence_id"],
+            owner_id=owner_id,
+            resource_keys=resource_keys,
+            lease_snapshots=lease_snapshots,
+            evidence={
+                "phase": "pre_action_abort",
+                "unit": name,
+                "action": action,
+                "pre_action_state": pre_action_state,
+                "error_class": type(primary_error).__name__,
+            },
+        )
+
+    replace_pending_job = action == "stop" and (
+        recovering_prior_fence or preexisting_job_pending
+    )
+    try:
+        resources.update_user_systemd_uncertainty_fence(
+            fence["fence_id"],
+            phase="stop_recovery" if recovering_prior_fence else "dispatching",
+        )
+    except Exception as primary_error:
+        if recovering_prior_fence:
+            _abort_user_systemd_stop_recovery_pre_effect(
+                resources,
+                primary_error,
+                owner_id=owner_id,
+                resource_keys=resource_keys,
+                lease_snapshots=lease_snapshots,
+            )
+        _abort_user_systemd_pre_effect(
+            resources,
+            primary_error,
+            fence_id=fence["fence_id"],
+            owner_id=owner_id,
+            resource_keys=resource_keys,
+            lease_snapshots=lease_snapshots,
+            evidence={
+                "phase": "dispatching_pre_effect_abort",
+                "unit": name,
+                "action": action,
+                "pre_action_state": pre_action_state,
+                "error_class": type(primary_error).__name__,
+            },
+        )
+
+    action_argv = ["systemctl", "--user", action]
+    if replace_pending_job:
+        action_argv.append("--job-mode=replace")
+    action_argv.append(name)
+
+    action_result: dict[str, Any] | None = None
+    action_error: Exception | None = None
+    try:
+        action_result = _run(
+            action_argv,
+            cwd=HOME,
+            timeout_seconds=mutation_timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
+    except Exception as exc:
+        action_error = exc
+
+    uncertain_transport = (
+        action_error is not None
+        or action_result is None
+        or action_result.get("timed_out") is True
+        or action_result.get("returncode") != 0
+    )
+    requires_terminal_reconciliation = uncertain_transport or replace_pending_job
+    if not requires_terminal_reconciliation:
+        assert action_result is not None
+        coordination: dict[str, Any] | None = None
+        try:
+            resources.clear_user_systemd_uncertainty_fence(
+                fence["fence_id"],
+                outcome="definite_action_result",
+                evidence_sha256=_user_systemd_evidence_sha256(action_result),
+            )
+        except Exception as exc:
+            coordination = {
+                "status": "durable_fence_clear_unknown_after_observed_action",
+                "action_result_observed": True,
+                "retry_allowed": False,
+                "requires_readback_before_next_attempt": True,
+                "durable_fence_active": True,
+                "uncertainty_fence_id": fence["fence_id"],
+                "fence_clearance_error_class": type(exc).__name__,
+                "lease_owner_id": owner_id,
+                "resource_keys": list(resource_keys),
+            }
+        return _user_systemd_release_after_observed_action(
+            resources,
+            owner_id=owner_id,
+            resource_keys=resource_keys,
+            lease_snapshots=lease_snapshots,
+            result=action_result,
+            coordination=coordination,
+        )
+
+    if uncertain_transport and not recovering_prior_fence:
+        try:
+            resources.update_user_systemd_uncertainty_fence(
+                fence["fence_id"],
+                phase="outcome_unknown",
+            )
+        except Exception:
+            # The already-persisted prepared/dispatching fence still blocks overlap.
+            pass
+
+    renewal_error_class: str | None = None
+    try:
+        renewal = resources.renew_resources(
+            owner_id,
+            resource_keys,
+            ttl_seconds=_USER_SYSTEMD_RECONCILIATION_LEASE_TTL_SECONDS,
+            expected_leases=lease_snapshots,
+        )
+    except Exception as exc:
+        renewal_error_class = type(exc).__name__
+    else:
+        lease_snapshots = list(renewal["leases"])
+
+    reconciliation: dict[str, str] | None = None
+    reconciliation_error_class: str | None = None
+    reconciliation_attempts = 0
+    for attempt in range(_USER_SYSTEMD_RECONCILIATION_MAX_ATTEMPTS):
+        reconciliation_attempts = attempt + 1
+        try:
+            reconciliation = _user_systemd_reconciliation_state(name)
+            reconciliation_error_class = None
+        except Exception as exc:
+            reconciliation = None
+            reconciliation_error_class = type(exc).__name__
+        else:
+            if _user_systemd_reconciliation_terminal(
+                reconciliation, action=action
+            ):
+                break
+
+        if attempt + 1 < _USER_SYSTEMD_RECONCILIATION_MAX_ATTEMPTS:
+            time.sleep(_USER_SYSTEMD_RECONCILIATION_POLL_SECONDS)
+
+    common_coordination: dict[str, Any] = {
+        "retry_allowed": False,
+        "requires_readback_before_next_attempt": True,
+        "action_result_observed": action_result is not None,
+        "lease_owner_id": owner_id,
+        "resource_keys": list(resource_keys),
+        "last_known_lease_expires_at_unix": _user_systemd_lease_expiry(
+            lease_snapshots
+        ),
+        "reconciliation_attempts": reconciliation_attempts,
+        "reconciliation": reconciliation,
+        "reconciliation_error_class": reconciliation_error_class,
+        "renewal_error_class": renewal_error_class,
+        "action_error_class": (
+            type(action_error).__name__ if action_error is not None else None
+        ),
+        "durable_fence_active": True,
+        "uncertainty_fence_id": fence["fence_id"],
+        "stop_replaced_pending_job": replace_pending_job,
+        "recovered_prior_uncertainty_fence": recovering_prior_fence,
+    }
+
+    terminal_readback = (
+        reconciliation is not None
+        and _user_systemd_reconciliation_terminal(reconciliation, action=action)
+    )
+    if not terminal_readback:
+        handoff = {
+            **common_coordination,
+            "status": "outcome_unknown",
+            "handoff": "durable_fence_requires_terminal_systemd_readback",
+        }
+        return _user_systemd_release_after_unknown_outcome(
+            resources,
+            owner_id=owner_id,
+            resource_keys=resource_keys,
+            lease_snapshots=lease_snapshots,
+            result=_user_systemd_unknown_result(action_result),
+            coordination=handoff,
+        )
+
+    fence_clearance_error_class: str | None = None
+    try:
+        resources.clear_user_systemd_uncertainty_fence(
+            fence["fence_id"],
+            outcome="terminal_readback",
+            evidence_sha256=_user_systemd_evidence_sha256(reconciliation),
+        )
+    except Exception as exc:
+        fence_clearance_error_class = type(exc).__name__
+
+    if action_error is not None:
+        reconciled_failure = {
+            **common_coordination,
+            "status": "reconciled_transport_failure",
+            "reconciliation": reconciliation,
+            "durable_fence_active": fence_clearance_error_class is not None,
+            "fence_clearance_error_class": fence_clearance_error_class,
+        }
+        release_result = _user_systemd_release_after_unknown_outcome(
+            resources,
+            owner_id=owner_id,
+            resource_keys=resource_keys,
+            lease_snapshots=lease_snapshots,
+            result=_user_systemd_unknown_result(None),
+            coordination=reconciled_failure,
+            release_failure_status=(
+                "lease_release_unknown_after_reconciled_transport_failure"
+            ),
+        )
+        coordination = release_result["user_service_coordination"]
+        if (
+            coordination["lease_release_state"] == "unknown"
+            or fence_clearance_error_class is not None
+        ):
+            return release_result
+        raise RuntimeError(
+            "user systemd mutation transport failed after effect may have begun; "
+            "unit state was reconciled before coordination release"
+        ) from action_error
+
+    assert action_result is not None
+    coordination = {
+        **common_coordination,
+        "status": (
+            "durable_fence_clear_unknown_after_terminal_readback"
+            if fence_clearance_error_class is not None
+            else "reconciled_stop_replacement"
+            if replace_pending_job
+            else "reconciled_after_transport_uncertainty"
+        ),
+        "requires_readback_before_next_attempt": fence_clearance_error_class is not None,
+        "lease_retained": False,
+        "lease_release_state": "released",
+        "release_required_after_terminal_readback": False,
+        "durable_fence_active": fence_clearance_error_class is not None,
+        "fence_clearance_error_class": fence_clearance_error_class,
+        "reconciliation": reconciliation,
+    }
+    return _user_systemd_release_after_observed_action(
+        resources,
+        owner_id=owner_id,
+        resource_keys=resource_keys,
+        lease_snapshots=lease_snapshots,
+        result=action_result,
+        coordination=coordination,
+    )
+
+
 @mcp.tool(name="grabowski_user_service", annotations=MUTATING)
 def grabowski_user_service(
     unit: str,
@@ -7723,6 +10193,7 @@ def grabowski_user_service(
         raise ValueError(f"action must be one of {sorted(allowed)}")
     if action not in {"status", "logs"}:
         _require_operator_mutation("user_service_control", service=name)
+        return _run_mutating_user_systemd_unit(name, action)
 
     if action == "logs":
         if max_lines < 1 or max_lines > 2000:
@@ -7736,7 +10207,7 @@ def grabowski_user_service(
             "--lines",
             str(max_lines),
         ]
-    elif action == "status":
+    else:
         argv = [
             "systemctl",
             "--user",
@@ -7745,8 +10216,6 @@ def grabowski_user_service(
             "--no-pager",
             "--full",
         ]
-    else:
-        argv = ["systemctl", "--user", action, name]
 
     return _run(
         argv,
@@ -8067,6 +10536,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     _configure_faulthandler()
+    grabowski_flowlines.configure_flowlines_observability(
+        mcp,
+        READ_ONLY,
+        verified_identity_resolver=base._flowlines_verified_identity,
+    )
     if args.transport == "streamable-http":
         if args.host != "127.0.0.1":
             raise SystemExit(
@@ -8076,8 +10550,22 @@ def main() -> None:
             raise SystemExit("port must be between 1024 and 65535")
         mcp.settings.host = args.host
         mcp.settings.port = args.port
-        _configure_http_runtime()
-    mcp.run(transport=args.transport)
+        # Install the authority/execution gate before PostHog wraps call_tool.
+        # Sync tools then offload only FastMCP's base call into their short-lived
+        # asyncio.run() worker loops; PostHog's server-wide asyncio state remains
+        # on the stable HTTP event loop instead of crossing worker loops.
+        _install_deployment_admission_gate()
+    _configure_posthog_mcp_analytics()
+    try:
+        if args.transport == "streamable-http":
+            # Instrument before building the Streamable HTTP app. PostHog's
+            # FastMCP adapter installs middleware while the app is built. The
+            # admission gate is already inside that wrapper so its sync worker
+            # never executes PostHog's server-wide asyncio locks.
+            _configure_http_runtime(admission_gate_preinstalled=True)
+        mcp.run(transport=args.transport)
+    finally:
+        _shutdown_posthog_mcp_analytics()
 
 
 if __name__ == "__main__":

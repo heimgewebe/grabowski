@@ -1,89 +1,115 @@
 # Konvergenz-Abdeckung der Operator-Abschlussflächen
 
-Stand: 2026-07-26
+Stand: 2026-09-23
 
-Geprüfter Grabowski-Commit: `d2097c909bd60be7f947b5c50cc9fa6d56ba907c`
+Geprüfter Grabowski-`main`: `2dec93336884852660e5b7d0ca1ca9ce756752d2`
 
-Geprüfter Protokoll-Commit: `fae4c26faa22d62d148d39e1995fe5492211cb43`
+Geprüfte Produktionsruntime: `d1e1d3dd8df3504b2e8913c49f00b9a020429840`
+
+Geprüfter Protokoll-Commit: `c2f75946aa0f3f37646f3c93f1c176c683f341cc`
+
+Die für diesen Vertrag relevanten Implementierungs- und Testdateien `grabowski_convergence.py`, `grabowski_operator_obligation.py`, `grabowski_grips.py`, `test_convergence.py` und `test_grips.py` sind zwischen der geprüften Produktionsruntime und dem genannten `main` unverändert.
 
 ## Fragestellung
 
-Dieser Audit prüft, welche mutierenden Grabowski-Oberflächen einen semantischen Abschluss herstellen oder dafür verwendet werden können und ob sie ein unverändertes Consumer-Receipt technisch erzwingen, das eine hash- und revisionsgebundene Transition-Assessment-Ausgabe mit `status=terminally_closed` bindet.
+Dieser Audit trennt vier unterschiedliche Dinge:
 
-Der Audit unterscheidet bewusst:
-
-- **semantischen Abschluss**: Eine Änderung gilt als systemisch abgeschlossen;
-- **Prozessabschluss**: Ein Prozess oder Task ist terminal;
+- **systemischen Abschluss**: Eine Wirkung darf als systemisch abgeschlossen gelten;
+- **Prozessabschluss**: Ein Prozess, Task oder Workspace ist terminal;
 - **Effekt**: Merge, Deployment oder Veröffentlichung hat stattgefunden;
 - **Hygiene**: Leases, Worktrees oder Archive werden bereinigt.
 
-Nur der semantische Abschluss benötigt zwingend die Wirkungsevidenz des Konvergenzregelkreises. Ein mechanischer Effekt oder Cleanup darf diese Evidenz weder ersetzen noch selbst erfinden.
+Nur ein systemischer Abschluss benötigt zwingend terminale Konvergenzevidenz. Prozessende, Effekt und Cleanup dürfen diese Evidenz weder ersetzen noch selbst erfinden.
 
-## Bestehender Consumer
+## Consumer
 
-`convergence-assess` ist ein read-only Grip. Er bindet Requestbytes, Protokollcommit, sauberen Checkout, Evaluatoridentität sowie Status und Exit-Code. Nur `status=terminally_closed` ergibt `allow_closure`.
+`convergence-assess` ist ein read-only Grip. Er bindet die Requestbytes an `expected_request_sha256` und das Protokoll an `expected_protocol_head`.
 
-Der Consumer funktioniert, ist aber derzeit kein zentraler technischer Vorgänger aller mutierenden Abschlussflächen. Die Operator-Instruktion fordert seinen Aufruf für Deployment-, Runtime-, Security-, Daten- und irreversible Arbeit; die nachfolgenden Mutationen validieren weder das Consumer-Receipt noch die darin gebundene Transition-Assessment-Ausgabe durchgängig selbst.
+Für den erwarteten Protokollcommit verwendet Grabowski bevorzugt ein verifiziertes immutable Runtime-Bundle. Ist für diesen Commit kein Bundle vorhanden, wird ausschließlich ein sauberer Checkout mit exakt passendem HEAD und gebundenem Evaluator akzeptiert. Identitätsdrift während der Auswertung scheitert fail-closed.
+
+Nur `assessment.status=terminally_closed` ergibt:
+
+```text
+closure_allowed = true
+decision = allow_closure
+```
+
+Fachlich nichtterminale Zustände wie `evidence_missing`, `conflicting_evidence`, `source_stale` oder `blocked` ergeben einen gültigen, aber blockierenden Consumer-Receipt.
+
+## Systemischer Operator-Abschluss
+
+Die im Audit vom 26.07.2026 dokumentierte semantische Lücke von `operator-obligation-close` besteht im aktuellen Vertrag nicht mehr.
+
+Für `outcome=completed` ist heute eine explizite `closure_classification` Pflicht.
+
+### Systemischer Abschluss
+
+```text
+convergence_required = true
+reason = systemic
+```
+
+verlangt einen exakt gebundenen, bestandenen `convergence-assess`-Receipt mit einer v2-Ausgabe `status=terminally_closed`. Gebunden und geprüft werden unter anderem Request-Hash, Protokoll-Head, Assessment-ID, Profilidentität, Output-Hash und die konkrete `closure_id=operator-obligation:<obligation_id>`.
+
+Unmittelbar vor dem create-only Close führt Grabowski das gebundene Assessment erneut live aus. Die frische Ausgabe muss weiterhin Closure erlauben und exakt zur gebundenen Consumer-Ausgabe passen. Nichtterminaler Zustand oder Drift blockieren den systemischen Close.
+
+### Prozessabschluss
+
+```text
+convergence_required = false
+reason = process_only
+```
+
+ist weiterhin zulässig, enthält aber keinen Konvergenz-Receipt und behauptet ausdrücklich keine systemische Konvergenz.
 
 ## Abdeckungsmatrix
 
-| Oberfläche | Wirkung | Aktueller Konvergenzstatus | Urteil |
-|---|---|---|---|
-| `convergence-assess` | bewertet ein gebundenes Belegpaket | vollständiger Consumer, keine Mutation | **belegt** |
-| `operator-obligation-close` mit `outcome=completed` | erklärt eine Operatorverpflichtung für abgeschlossen | kein verpflichtender Parameter für ein Consumer-Receipt mit terminaler Transition-Assessment-Ausgabe | **semantische Lücke** |
-| `task-closeout-archive` | archiviert und projiziert einen terminalen Task | bindet Task- und Lifecycle-Receipts, aber keine terminale Transition-Assessment-Ausgabe | **bedingte semantische Lücke** |
-| `grabowski_agent_workspace_close` | schließt einen Workspace und gibt Ressourcen frei | bindet Writer-, Test- und Review-Ergebnis, aber keine terminale Transition-Assessment-Ausgabe | **bedingte semantische Lücke** |
-| `grabowski_agent_workspace_cleanup` | archiviert und entfernt einen bereits geschlossenen Writer-Checkout | besitzt Recovery- und Workspace-Evidenz, bewertet aber nicht selbst die Systemwirkung | **Upstream-Bindung nötig** |
-| `grabowski_checkout_cleanup` | entfernt einen archivierten Linked Checkout | Hygieneoperation mit Dry-Run und Recovery-Refs | **kein eigener Assessment-Fall** |
-| `bureau-pickup-release` | gibt unveränderte Leases eines terminalen Bureau-Laufs frei | rein mechanischer Release nach Bureau-Readback | **außerhalb des Scopes** |
-| `runtime-refresh-lease-release`, `grabowski_runtime_refresh_lease_release` | geben exakt fünf unveränderte Runtime-Refresh-Pfadleasing-Zeilen frei | prüfen private Observation-, Intent-, Start- und Result-Receipts; behaupten keinen Systemabschluss | **außerhalb des Scopes** |
-| `task-attention-decision` | klassifiziert einen terminalen Taskausgang | darf keinen systemischen Abschluss behaupten | **außerhalb des Scopes** |
-| `grabowski_runtime_deploy_schedule` | startet einen Deployment-Effekt | erzeugt erst Evidenz für eine spätere Verifikation | **vor dem Abschluss** |
-| `grabowski_git` mit Push, `branch-publish`, `pr-base-converge`, `pr-create-or-update`, `grabowski_bureau_task_publish` | erzeugen Branch- oder PR-Veröffentlichungseffekte | Wirkung noch nicht verifiziert | **vor dem Abschluss** |
-| `post-merge-sync-apply` | führt einen exakt gebundenen Fast-Forward eines geschützten kanonischen Checkouts unter exklusivem Repository-Guard aus | lokaler und Remote-Postzustand werden geprüft; der Synchronisationseffekt ist dennoch kein Systemabschluss | **vor dem Abschluss** |
-| `grabowski_text_artifact_publish` | publiziert unveränderliche Textevidenz | liefert Belegmaterial, keinen Systemabschluss | **Evidenzfläche** |
-| `pr-check-readiness`, `grabowski_bureau_task_publish_preview`, `grabowski_github_pr_view` | beobachten PR- oder Publikationszustand | read-only, keine Abschlussmutation | **außerhalb des Scopes** |
-| Task-Reconcile und Prozess-Terminalisierung | aktualisieren Prozesszustand | Prozessende ist kein Systemabschluss | **außerhalb des Scopes** |
+| Oberfläche | Wirkung | Aktueller Konvergenzstatus |
+|---|---|---|
+| `convergence-assess` | bewertet ein hash- und revisionsgebundenes Belegpaket | **Consumer belegt** |
+| `operator-obligation-close` / `completed` / `systemic` | persistiert einen systemischen Operator-Abschluss | **terminales v2-Assessment technisch erzwungen und live revalidiert** |
+| `operator-obligation-close` / `completed` / `process_only` | persistiert nur acceptance-gebundenen Prozessabschluss | **explizit nichtsystemisch** |
+| `task-closeout-archive` | archiviert und projiziert einen terminalen Task | **Prozess/Hygiene; kein eigener Systemabschluss** |
+| `grabowski_agent_workspace_close` | schließt einen Workspace | **Workspace-/Prozessabschluss; kein eigener Systemabschluss** |
+| `grabowski_agent_workspace_cleanup`, Checkout-Cleanup | räumt bereits klassifizierten Zustand auf | **Hygiene; kein eigener Assessment-Fall** |
+| Lease-Release-Flächen | geben gebundene Ressourcen frei | **Hygiene; kein eigener Assessment-Fall** |
+| `grabowski_git`, `branch-publish`, `pr-base-converge`, `pr-create-or-update`, `grabowski_bureau_task_publish` | erzeugen Branch-, PR- oder Publikationseffekte | **Effekt, nicht selbst Systemabschluss** |
+| `grabowski_text_artifact_publish` | publiziert unveränderliche Textevidenz | **Evidenzfläche, nicht selbst Systemabschluss** |
+| `pr-check-readiness`, `grabowski_bureau_task_publish_preview`, `grabowski_github_pr_view` | beobachten Readiness oder Publikationszustand | **read-only, kein Systemabschluss** |
+| Deploy-Flächen | erzeugen Deployment-Effekte | **Evidenz für spätere Verifikation, nicht selbst Systemabschluss** |
 
-## Konkrete Umgehungspfade
+Eine Prozess- oder Hygieneoberfläche soll nicht allein deshalb ein eigenes Konvergenzgate erhalten. Entscheidend ist, ob sie selbst systemische Konvergenz behauptet.
 
-### 1. Operatorverpflichtung
+## Historischer Proof
 
-`operator-obligation-close` kann eine Verpflichtung mit `completed` schließen, ohne selbst ein Consumer-Receipt zu validieren, das eine Transition-Assessment-Ausgabe mit `status=terminally_closed` bindet. Bei R2-/R3-, Deployment-, Runtime-, Security-, Daten- oder irreversibler Arbeit ist damit ein Abschluss trotz fehlender oder blockierender Wirkungsevidenz technisch möglich.
+`docs/proofs/convergence-closure-surface-coverage-v1.json` bleibt als revisionsgebundener Beleg des Audits vom 26.07.2026 erhalten. Seine Klassifikation `operator-obligation-close = semantic_gap` beschreibt den dort gebundenen alten Grabowski-Commit und ist **keine aktuelle Klassifikation** des heutigen Codes.
 
-### 2. Task-Archivierung
+## Produktionsbeleg vom 23.09.2026
 
-`task-closeout-archive` prüft den terminalen Task und dessen Lifecycle-Evidenz. Ein erfolgreich beendeter Prozess beweist jedoch nicht, dass Deployment, Laufzeit und Produktwirkung korrekt sind. Wird die Archivierung als fachlicher Abschluss interpretiert, fehlt die Konvergenzbindung.
+Gegen die tatsächlich deployte Grabowski-Runtime und den echten Protokollcheckout `c2f75946...` wurden beide Richtungen ausgeführt:
 
-### 3. Workspace-Abschluss
+1. Ein vollständiger v2-R2-Request ergab `terminally_closed / allow_closure`. Ein daran exakt gebundener `operator-obligation-close` wurde als `completion_scope=systemic` create-only persistiert.
+2. Derselbe reale Protokollpfad mit gezielt fehlender Closure-Evidenz ergab `evidence_missing / block_closure`. Der anschließende systemische `operator-obligation-close` blockierte und erzeugte kein Close-Record.
 
-`grabowski_agent_workspace_close` bindet Writer-Head, Diff, Tests und Review. Für reine Codeerzeugung ist das ausreichend als Workspace-Abschluss. Wird derselbe Receipt jedoch als systemischer Abschluss einer R2-/R3-Änderung verwendet, fehlen Deployment-, Live-, Recovery- und Cleanup-Belege.
+Damit ist für diese Abschlussfläche sowohl der positive als auch der fail-closed negative Runtimepfad belegt.
 
-## Erforderliche Härtung
+## Regressionssicherung
 
-Ein zentrales, fail-closed Closeout-Gate sollte für jede semantische Abschlussmutation eine explizite Klassifikation verlangen:
+Die Unit-/Integrationstests prüfen zusätzlich unter anderem:
 
-1. `convergence_required=true` mit einem gültigen, unveränderten Consumer-Receipt, das eine Transition-Assessment-Ausgabe mit `status=terminally_closed` an Ziel, Assessment-Request und konkrete Abschlussmutation bindet; oder
-2. `convergence_required=false` mit einer kanonischen, testbaren Begründung wie `process_only`, `effect_only`, `lease_release_only` oder `cleanup_after_bound_closure`.
+- fehlende oder ungültige Completion-Klassifikation;
+- nichtterminales Assessment;
+- Request-, Protokoll- und Output-Drift;
+- Live-Revalidierung direkt vor dem Close;
+- explizite Trennung von `systemic` und `process_only`.
 
-Für high-risk Abschlussklassen darf eine fehlende Klassifikation nicht implizit als `false` gelten.
-
-## Negative Abnahmekriterien
-
-Die Härtung ist erst vollständig, wenn Tests beweisen:
-
-- `operator-obligation-close(completed)` blockiert ohne erforderliches Consumer-Receipt mit gebundener terminaler Transition-Assessment-Ausgabe;
-- ein nichtterminales Assessment blockiert dieselbe Mutation;
-- Consumer-Receipt-, Transition-Assessment-, Request-, Protokoll- oder Ziel-Drift blockiert;
-- `task-closeout-archive` und Workspace-Closeout können einen Prozessabschluss nicht als Systemabschluss hochstufen;
-- rein mechanische Releases und Cleanup-Operationen bleiben ohne unnötige Doppelbewertung möglich, verlangen aber bei high-risk Artefakten einen gebundenen Upstream-Closeout;
-- v1-Verbraucher und nachweislich niedrig riskante, rein dokumentarische Pfade bleiben kompatibel.
+Der vorhandene Cross-Repo-Test `test_real_regelkreis_conformance_and_evaluation` bleibt der kanonische Vertragstest gegen den echten Regelkreis. Die Validate-CI stellt dafür den Protokollcommit `c2f75946...` als gepinnten Geschwister-Checkout samt Evaluator bereit, statt einen zweiten Testpfad einzuführen.
 
 ## Nichtbehauptungen
 
-Dieser Audit ist eine revisionsgebundene Code- und Vertragsprüfung. Er beweist nicht:
+Dieser Nachweis bedeutet nicht:
 
-- dass jeder externe Client die Operator-Instruktionen ignoriert;
-- dass jeder abgeschlossene historische Vorgang fehlerhaft war;
-- dass Cleanup- oder Lease-Release-Oberflächen selbst Konvergenzevidenz erzeugen sollten;
-- dass der Konvergenzregelkreis Task-, Merge-, Deployment- oder Runtime-Autorität erhält.
+- dass jede Prozess-, Effekt- oder Cleanup-Fläche ein eigenes Konvergenzgate benötigt;
+- dass `convergence-assess` Task-, Merge-, Deployment-, Bureau- oder Runtime-Autorität erhält;
+- dass ein Prozessabschluss automatisch ein Systemabschluss ist;
+- dass ein erfolgreicher Effekt ohne nachfolgende Verifikation systemisch abgeschlossen ist.

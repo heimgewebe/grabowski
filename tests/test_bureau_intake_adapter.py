@@ -14,6 +14,9 @@ from unittest import mock
 import grabowski_bureau_intake as intake
 
 
+REAL_REQUIRE_OPERATOR_MUTATION = intake.operator._require_operator_mutation
+
+
 class BureauIntakeAdapterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -1397,6 +1400,216 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             invoke.call_args.args[0],
         )
 
+    def test_acceptance_authenticate_delegates_exact_digest_bound_call(self) -> None:
+        expected_sha256 = "a" * 64
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={
+                "schema_version": 1,
+                "kind": "bureau.manual_acceptance_authentication_receipt",
+                "status": "authenticated",
+            },
+        ) as invoke:
+            result = intake.grabowski_bureau_acceptance_authenticate(
+                "BUR-RUN-20260926T165340Z-1addeb3bd4",
+                "offline-recovery-key",
+                expected_sha256,
+                "manual-gate-d-reviewer-20260926-r6",
+            )
+        self.assertEqual("authenticated", result["status"])
+        self.assertEqual(
+            [
+                "--json",
+                "--json-envelope",
+                "--state-root",
+                str(intake.BUREAU_STATE_ROOT),
+                "acceptance-authenticate",
+                "BUR-RUN-20260926T165340Z-1addeb3bd4",
+                "offline-recovery-key",
+                "--expected-evidence-sha256",
+                expected_sha256,
+                "--reviewer",
+                "manual-gate-d-reviewer-20260926-r6",
+            ],
+            invoke.call_args.args[0],
+        )
+        self.assertTrue(invoke.call_args.kwargs["mutation"])
+        self.assertEqual(
+            ["bureau_run:BUR-RUN-20260926T165340Z-1addeb3bd4"],
+            invoke.call_args.kwargs["required_readback"],
+        )
+
+    def test_configured_bureau_state_roots_match_pickup_environment_contract(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"BUREAU_STATE_DIR": "/tmp/legacy-bureau-state"},
+            clear=True,
+        ):
+            legacy, current = intake._configured_bureau_state_roots()
+        self.assertEqual(Path("/tmp/legacy-bureau-state"), legacy)
+        self.assertEqual(legacy, current)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BUREAU_STATE_DIR": "/tmp/legacy-bureau-state",
+                "GRABOWSKI_BUREAU_COORDINATION_ROOT": "/tmp/current-bureau-state",
+            },
+            clear=True,
+        ):
+            legacy, current = intake._configured_bureau_state_roots()
+        self.assertEqual(Path("/tmp/legacy-bureau-state"), legacy)
+        self.assertEqual(Path("/tmp/current-bureau-state"), current)
+
+    def test_acceptance_authenticate_binds_canonical_state_root_gate_and_audit(self) -> None:
+        expected_sha256 = "b" * 64
+        state_root = self.root / "configured-bureau-state"
+        result_payload = {
+            "schema_version": 1,
+            "kind": "bureau.manual_acceptance_authentication_receipt",
+            "status": "authenticated",
+        }
+        with (
+            mock.patch.object(intake, "BUREAU_STATE_ROOT", state_root),
+            mock.patch.object(
+                intake, "_invoke_bureau", return_value=result_payload
+            ) as invoke,
+        ):
+            result = intake.grabowski_bureau_acceptance_authenticate(
+                "BUR-RUN-20260927T000000Z-0123456789",
+                "production-boundary",
+                expected_sha256,
+                "reviewer-a",
+            )
+        normalized_root = Path(
+            os.path.abspath(os.fspath(state_root.expanduser()))
+        )
+        self.assertEqual(result_payload, result)
+        intake.operator._require_operator_mutation.assert_called_once_with(
+            "bureau_mutation", path=str(normalized_root)
+        )
+        arguments = invoke.call_args.args[0]
+        self.assertEqual(
+            arguments[arguments.index("--state-root") + 1],
+            str(normalized_root),
+        )
+        intake._audit.assert_called_once()
+        self.assertEqual(intake._audit.call_args.kwargs["reviewer"], "reviewer-a")
+
+    def test_acceptance_authenticate_rejects_symlinked_state_root_before_gate(self) -> None:
+        target = self.root / "real-bureau-state"
+        target.mkdir()
+        state_root = self.root / "bureau-state-link"
+        state_root.symlink_to(target, target_is_directory=True)
+        with (
+            mock.patch.object(intake, "BUREAU_STATE_ROOT", state_root),
+            mock.patch.object(intake, "_invoke_bureau") as invoke,
+        ):
+            with self.assertRaisesRegex(
+                intake.bureau_runtime.BureauLeaseContractError,
+                "bureau-state-root-symlink-component",
+            ):
+                intake.grabowski_bureau_acceptance_authenticate(
+                    "BUR-RUN-20260927T000000Z-0123456789",
+                    "production-boundary",
+                    "c" * 64,
+                    "reviewer-a",
+                )
+        intake.operator._require_operator_mutation.assert_not_called()
+        invoke.assert_not_called()
+
+    def test_acceptance_authenticate_honors_matching_path_blockade(self) -> None:
+        state_root = self.root / "configured-bureau-state"
+        state_root.mkdir()
+        other_root = self.root / "other-state"
+        other_root.mkdir()
+        record = intake.base.blockade_policy.BlockadeRecord(
+            blockade_id="acceptance-state-root-freeze",
+            posture="mutation_freeze",
+            scope=intake.base.blockade_policy.Scope("path", str(state_root)),
+            reason="Test Acceptance StateStore blockade.",
+            trigger_class="manual_path_freeze",
+            engaged_at=intake.base.datetime.now(intake.base.timezone.utc),
+            evidence_refs=("test:acceptance-state-root",),
+            provenance=intake.base.blockade_policy.Provenance(
+                tool="test",
+                request_id="request-1",
+                session_id="session-1",
+                task_id="task-1",
+                owner_id="owner-1",
+            ),
+        )
+
+        def real_gate(capability: str, **kwargs: object) -> None:
+            REAL_REQUIRE_OPERATOR_MUTATION(capability, **kwargs)
+
+        intake.operator._require_operator_mutation.side_effect = real_gate
+        with (
+            mock.patch.object(intake, "BUREAU_STATE_ROOT", state_root),
+            mock.patch.object(intake.operator, "_require_operator_capability"),
+            mock.patch.object(
+                intake.base,
+                "_operator_blockade_records",
+                return_value=((record,), {"marker_source": "test"}),
+            ),
+            mock.patch.object(intake.base, "_require_valid_audit_chain"),
+            mock.patch.object(intake, "_invoke_bureau") as invoke,
+        ):
+            with self.assertRaisesRegex(
+                PermissionError,
+                "mutation_blocked_by_mutation_freeze",
+            ):
+                intake.grabowski_bureau_acceptance_authenticate(
+                    "BUR-RUN-20260927T000000Z-0123456789",
+                    "production-boundary",
+                    "d" * 64,
+                    "reviewer-a",
+                )
+            REAL_REQUIRE_OPERATOR_MUTATION(
+                "bureau_mutation",
+                path=str(other_root),
+            )
+        invoke.assert_not_called()
+
+    def test_acceptance_authenticate_rejects_invalid_bindings_before_dispatch(self) -> None:
+        invalid = (
+            ("", "criterion", "a" * 64, "reviewer"),
+            ("run\x00id", "criterion", "a" * 64, "reviewer"),
+            ("run", "", "a" * 64, "reviewer"),
+            ("run", "criterion", "A" * 64, "reviewer"),
+            ("run", "criterion", "a" * 63, "reviewer"),
+            ("run", "criterion", "a" * 64, ""),
+            ("run", "criterion", "a" * 64, "reviewer\x00x"),
+        )
+        for values in invalid:
+            with self.subTest(values=values), mock.patch.object(
+                intake, "_invoke_bureau"
+            ) as invoke:
+                with self.assertRaises(ValueError):
+                    intake.grabowski_bureau_acceptance_authenticate(*values)
+                invoke.assert_not_called()
+
+    def test_acceptance_authenticate_registered_schema_is_exact(self) -> None:
+        if not hasattr(intake.mcp, "list_tools"):
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+        tool = next(
+            item
+            for item in asyncio.run(intake.mcp.list_tools())
+            if item.name == "grabowski_bureau_acceptance_authenticate"
+        )
+        schema = tool.inputSchema
+        self.assertEqual(
+            {
+                "run_id",
+                "criterion_id",
+                "expected_evidence_sha256",
+                "reviewer",
+            },
+            set(schema["properties"]),
+        )
+        self.assertEqual(set(schema["properties"]), set(schema["required"]))
+
     def test_registry_defaults_use_isolated_control_checkout(self) -> None:
         expected = str(intake.bureau_runtime.BUREAU_CONTROL_ROOT)
         functions = (
@@ -1706,6 +1919,52 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         )
         self.assertTrue(result["leases_released"])
         self.assertTrue((directory / "publication-receipt.json").exists())
+
+    def test_publish_state_store_accepts_legacy_revision_lease_metadata(
+        self,
+    ) -> None:
+        required_metadata = {
+            "task_id": "INIT-T001",
+            "operation": "state-task-publication",
+            "proposal_sha256": "c" * 64,
+        }
+        metadata = intake._task_publication_lease_metadata(
+            {"required_lease_metadata": required_metadata},
+            publication_mode="state_store",
+            publishing_task_id="INIT-T001",
+            proposal_sha256="c" * 64,
+        )
+        self.assertEqual(metadata["task_id"], "INIT-T001")
+        self.assertEqual(metadata["operation"], "state-task-publication")
+        self.assertEqual(metadata["proposal_sha256"], "c" * 64)
+        self.assertEqual(
+            metadata["kind"],
+            intake.resources.BUREAU_TASK_PUBLICATION_AUTHORITY_KIND,
+        )
+        self.assertEqual(
+            metadata["authority_action_class"],
+            "task_creation_from_external_evidence",
+        )
+        self.assertEqual(metadata["authority_capability"], "bureau_mutation")
+        self.assertEqual(metadata["bureau_phase"], "work")
+
+    def test_publish_state_store_rejects_mismatched_legacy_revision_lease_metadata(
+        self,
+    ) -> None:
+        required_metadata = {
+            "task_id": "INIT-T001",
+            "operation": "state-task-publication",
+            "proposal_sha256": "d" * 64,
+        }
+        with self.assertRaisesRegex(
+            ValueError, "publication-lease-metadata-contract-invalid"
+        ):
+            intake._task_publication_lease_metadata(
+                {"required_lease_metadata": required_metadata},
+                publication_mode="state_store",
+                publishing_task_id="INIT-T001",
+                proposal_sha256="c" * 64,
+            )
 
     def test_publish_state_store_rejects_mismatched_standard_lease_metadata(
         self,

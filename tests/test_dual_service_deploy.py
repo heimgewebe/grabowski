@@ -52,6 +52,34 @@ def observation(active: bool) -> core.ServiceObservation:
 class OperatorAuthorityAttestationTests(unittest.TestCase):
     HEAD = "a" * 40
 
+    def test_critical_user_data_inventory_target_pattern_matches_canonical_action(self) -> None:
+        config = json.loads(
+            (ROOT / "config" / "privileged-actions.example.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        action = config["actions"][dual.CRITICAL_USER_DATA_INVENTORY_ACTION]
+        self.assertEqual(
+            dual.CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN,
+            action["target_pattern"],
+        )
+        self.assertEqual(
+            rootbroker_cutover_module.CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN,
+            action["target_pattern"],
+        )
+
+        read_action = config["actions"][dual.CRITICAL_USER_DATA_INVENTORY_READ_ACTION]
+        self.assertEqual(
+            dual.CRITICAL_USER_DATA_INVENTORY_READ_TARGET_PATTERN,
+            read_action["target_pattern"],
+        )
+        self.assertEqual(
+            rootbroker_cutover_module.CRITICAL_USER_DATA_INVENTORY_READ_TARGET_PATTERN,
+            read_action["target_pattern"],
+        )
+        self.assertNotIn("kill_switch_path", read_action)
+        self.assertNotIn("legacy_kill_switch_path", read_action)
+
     def _fixture(self) -> tuple[dict[str, object], dict[Path, bytes]]:
         lifecycle = {
             "enabled": True,
@@ -108,6 +136,32 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             "allowed_peer_uid": 1000,
             "allowed_peer_unit": dual.OPERATOR_SERVICE,
         }
+        critical_user_data_inventory = {
+            "enabled": True,
+            "mode": "template",
+            "target_pattern": dual.CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN,
+            "argv": [
+                "/usr/local/libexec/grabowski-critical-user-data-inventory",
+                "{target}",
+            ],
+            "timeout_seconds": 90,
+            "kill_switch_path": "/var/lib/grabowski/operator-blockade/" + "operator-kill-switch",
+            "legacy_kill_switch_path": "/home/alex/.local/state/grabowski/" + "operator-kill-switch",
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": dual.OPERATOR_SERVICE,
+        }
+        critical_user_data_inventory_read = {
+            "enabled": True,
+            "mode": "template",
+            "target_pattern": dual.CRITICAL_USER_DATA_INVENTORY_READ_TARGET_PATTERN,
+            "argv": [
+                "/usr/local/libexec/grabowski-critical-user-data-inventory",
+                "{target}",
+            ],
+            "timeout_seconds": 90,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": dual.OPERATOR_SERVICE,
+        }
         config = {
             "schema_version": 2,
             "actions": {
@@ -116,6 +170,8 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 dual.ROOTBROKER_CUTOVER_ACTION: rootbroker_cutover,
                 dual.SECRET_PTY_ACTION: secret_pty,
                 dual.PLATFORM_CONNECTOR_CAPTURE_ACTION: platform_connector_capture,
+                dual.CRITICAL_USER_DATA_INVENTORY_ACTION: critical_user_data_inventory,
+                dual.CRITICAL_USER_DATA_INVENTORY_READ_ACTION: critical_user_data_inventory_read,
             },
         }
         artifact_sources = tuple(
@@ -151,11 +207,21 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
             "platform_connector_capture": __import__("hashlib").sha256(
                 blobs[Path("tools/grabowski_platform_connector_capture.py")]
             ).hexdigest(),
+            "critical_user_data_inventory": __import__("hashlib").sha256(
+                blobs[Path("tools/grabowski_critical_user_data_inventory.py")]
+            ).hexdigest(),
             "cutover_helper": __import__("hashlib").sha256(
                 blobs[Path("tools/grabowski_rootbroker_cutover.py")]
             ).hexdigest(),
             "operator_service": __import__("hashlib").sha256(
                 blobs[Path("systemd/grabowski-operator.service.example")]
+            ).hexdigest(),
+            "operator_flowlines_dropin": __import__("hashlib").sha256(
+                blobs[
+                    Path(
+                        "systemd/grabowski-operator.service.d/80-flowlines.conf.example"
+                    )
+                ]
             ).hexdigest(),
         }
         attestation: dict[str, object] = {
@@ -179,6 +245,12 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
                 dual.SECRET_PTY_ACTION: dual._canonical_line_sha256(secret_pty),
                 dual.PLATFORM_CONNECTOR_CAPTURE_ACTION: dual._canonical_line_sha256(
                     platform_connector_capture
+                ),
+                dual.CRITICAL_USER_DATA_INVENTORY_ACTION: dual._canonical_line_sha256(
+                    critical_user_data_inventory
+                ),
+                dual.CRITICAL_USER_DATA_INVENTORY_READ_ACTION: dual._canonical_line_sha256(
+                    critical_user_data_inventory_read
                 ),
             },
             "power_peer_binding": {
@@ -397,6 +469,10 @@ class OperatorAuthorityAttestationTests(unittest.TestCase):
         self.assertEqual(dual._rootbroker_artifact_source_paths(helper), expected)
         self.assertIn(Path("src/grabowski_blockade_authority.py"), expected)
         self.assertIn(Path("src/grabowski_command_identity.py"), expected)
+        self.assertIn(
+            Path("systemd/grabowski-operator.service.d/80-flowlines.conf.example"),
+            expected,
+        )
 
     def test_bootstrap_compatible_predecessor_attestation_is_accepted(self) -> None:
         attestation, blobs = self._fixture()
@@ -1498,7 +1574,6 @@ class SafetyObserverUnitTests(unittest.TestCase):
             )
             with self.subTest(name=name), self.assertRaises(core.DeployError):
                 dual._validate_observer_unit_bytes(candidate)
-
     def test_vertical_tab_before_after_directive_is_rejected(self) -> None:
         candidate = self.expected.replace(b"\nAfter=", b"\n\x0bAfter=")
         with self.assertRaises(core.DeployError):
@@ -2187,7 +2262,7 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         return SimpleNamespace(repo_head="a" * 40)
 
     def test_default_projection_declares_complete_watchdog_asset_set(self) -> None:
-        self.assertEqual(15, len(dual.WATCHDOG_HOST_ASSETS))
+        self.assertEqual(18, len(dual.WATCHDOG_HOST_ASSETS))
         self.assertEqual(
             {
                 "tools/component_watchdog.py",
@@ -2199,6 +2274,9 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                 "systemd/grabowski-external-connector-maulwurf-x.service.example",
                 "systemd/tunnel-client-grabowski.service.d/70-operator-dependency.conf.example",
                 "systemd/grabowski-operator.service.d/90-recovery-target.conf.example",
+                "systemd/grabowski-repoground-post-merge-reconcile.service.example",
+                "systemd/grabowski-repoground-post-merge-reconcile.timer.example",
+                "systemd/grabowski-operator.service.d/95-repoground-post-merge-reconcile.conf.example",
                 "systemd/grabowski-operator-watchdog.service.example",
                 "systemd/grabowski-operator-watchdog.timer.example",
                 "systemd/grabowski-tunnel-watchdog.service.example",
@@ -2213,6 +2291,8 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                 "grabowski-transport-ingress.service",
                 "grabowski-transport-ingress-maulwurf-x.service",
                 "grabowski-external-connector-maulwurf-x.service",
+                "grabowski-repoground-post-merge-reconcile.service",
+                "grabowski-repoground-post-merge-reconcile.timer",
                 "grabowski-operator-watchdog.service",
                 "grabowski-operator-watchdog.timer",
                 "grabowski-tunnel-watchdog.service",
@@ -2222,6 +2302,39 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
             },
             {asset.unit for asset in dual.WATCHDOG_HOST_ASSETS if asset.unit},
         )
+
+    def test_repoground_reconcile_timer_service_and_activation_dropin_are_projected(self) -> None:
+        by_source = {
+            item.source.as_posix(): item for item in dual.WATCHDOG_HOST_ASSETS
+        }
+        service = by_source[
+            "systemd/grabowski-repoground-post-merge-reconcile.service.example"
+        ]
+        timer = by_source[
+            "systemd/grabowski-repoground-post-merge-reconcile.timer.example"
+        ]
+        dropin = by_source[
+            "systemd/grabowski-operator.service.d/95-repoground-post-merge-reconcile.conf.example"
+        ]
+        self.assertEqual(
+            dual.core.HOME
+            / ".config/systemd/user/grabowski-repoground-post-merge-reconcile.service",
+            service.target,
+        )
+        self.assertEqual(
+            "grabowski-repoground-post-merge-reconcile.service",
+            service.unit,
+        )
+        self.assertEqual(
+            "grabowski-repoground-post-merge-reconcile.timer",
+            timer.unit,
+        )
+        self.assertIsNone(dropin.unit)
+        self.assertTrue(dropin.reloads_systemd)
+        self.assertEqual(0o600, service.mode)
+        self.assertEqual(0o600, timer.mode)
+        self.assertEqual(0o600, dropin.mode)
+
 
     def test_watchdog_helper_is_installed_before_importing_script(self) -> None:
         sources = [asset.source.as_posix() for asset in dual.WATCHDOG_HOST_ASSETS]
@@ -3156,6 +3269,147 @@ class DeploymentAdmissionTests(unittest.TestCase):
         )
         self.assertEqual(0, proof["observation"]["drain_blocking_tool_calls"])
 
+    def test_operator_admission_s3_wait_tolerates_only_recovery_parent(
+        self,
+    ) -> None:
+        marker = self.marker()
+        observed = {
+            "valid": True,
+            "active": True,
+            "state": "active",
+            "admission_gate_installed": True,
+            "token": marker["token"],
+            "expected_head": marker["expected_head"],
+            "source_identity_sha256": marker["source_identity_sha256"],
+            "active_tool_calls": 1,
+            "drain_blocking_tool_calls": 1,
+            "read_only_active_tool_calls": 0,
+            "effect_classification": dual.OPERATOR_ADMISSION_EFFECT_CLASSIFICATION,
+            "active_tool_calls_by_tool_name": {
+                dual.MIDCUTOVER_RECOVERY_TOOL_NAME: 1
+            },
+            "active_tool_calls_by_tool_name_truncated": False,
+            "active_tool_calls_by_tool_name_omitted_call_count": 0,
+            "active_tool_calls_sample": [
+                {
+                    "tool_name": dual.MIDCUTOVER_RECOVERY_TOOL_NAME,
+                    "drain_blocking": True,
+                }
+            ],
+            "active_tool_calls_sample_truncated": False,
+        }
+        with (
+            mock.patch.object(
+                dual,
+                "_operator_admission_observation",
+                side_effect=[observed, observed],
+            ),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            proof = dual.wait_for_operator_deployment_admission(
+                marker,
+                timeout_seconds=5,
+                allow_single_recovery_parent=True,
+            )
+        self.assertTrue(proof["supported"])
+        self.assertEqual(2, proof["attempts"])
+        self.assertEqual(1, proof["blocking_tool_calls"])
+        self.assertTrue(proof["recovery_parent_allowed"])
+
+    def test_operator_admission_s3_parent_can_coexist_with_read_only_call(
+        self,
+    ) -> None:
+        observed = {
+            "active_tool_calls": 2,
+            "drain_blocking_tool_calls": 1,
+            "read_only_active_tool_calls": 1,
+            "effect_classification": dual.OPERATOR_ADMISSION_EFFECT_CLASSIFICATION,
+            "active_tool_calls_by_tool_name": {
+                dual.MIDCUTOVER_RECOVERY_TOOL_NAME: 1,
+                "grabowski_git": 1,
+            },
+            "active_tool_calls_by_tool_name_truncated": False,
+            "active_tool_calls_by_tool_name_omitted_call_count": 0,
+            "active_tool_calls_sample": [
+                {
+                    "tool_name": dual.MIDCUTOVER_RECOVERY_TOOL_NAME,
+                    "drain_blocking": True,
+                },
+                {"tool_name": "grabowski_git", "drain_blocking": False},
+            ],
+            "active_tool_calls_sample_truncated": False,
+        }
+        call_counts = dual._operator_admission_call_counts(
+            observed, phase="operator-admission-drain"
+        )
+        self.assertTrue(
+            dual._operator_admission_recovery_parent_allowed(
+                observed,
+                call_counts,
+                allow_single_recovery_parent=True,
+            )
+        )
+
+    def test_operator_admission_s3_parent_rejects_second_blocker_and_truncation(
+        self,
+    ) -> None:
+        second_blocker = {
+            "active_tool_calls": 2,
+            "drain_blocking_tool_calls": 2,
+            "read_only_active_tool_calls": 0,
+            "effect_classification": dual.OPERATOR_ADMISSION_EFFECT_CLASSIFICATION,
+            "active_tool_calls_by_tool_name": {
+                dual.MIDCUTOVER_RECOVERY_TOOL_NAME: 1,
+                "grabowski_create_text": 1,
+            },
+            "active_tool_calls_by_tool_name_truncated": False,
+            "active_tool_calls_by_tool_name_omitted_call_count": 0,
+            "active_tool_calls_sample": [
+                {
+                    "tool_name": dual.MIDCUTOVER_RECOVERY_TOOL_NAME,
+                    "drain_blocking": True,
+                },
+                {"tool_name": "grabowski_create_text", "drain_blocking": True},
+            ],
+            "active_tool_calls_sample_truncated": False,
+        }
+        counts = dual._operator_admission_call_counts(
+            second_blocker, phase="operator-admission-drain"
+        )
+        self.assertFalse(
+            dual._operator_admission_recovery_parent_allowed(
+                second_blocker,
+                counts,
+                allow_single_recovery_parent=True,
+            )
+        )
+        truncated = {
+            **second_blocker,
+            "active_tool_calls": 1,
+            "drain_blocking_tool_calls": 1,
+            "read_only_active_tool_calls": 0,
+            "active_tool_calls_by_tool_name": {
+                dual.MIDCUTOVER_RECOVERY_TOOL_NAME: 1
+            },
+            "active_tool_calls_sample": [
+                {
+                    "tool_name": dual.MIDCUTOVER_RECOVERY_TOOL_NAME,
+                    "drain_blocking": True,
+                }
+            ],
+            "active_tool_calls_sample_truncated": True,
+        }
+        counts = dual._operator_admission_call_counts(
+            truncated, phase="operator-admission-drain"
+        )
+        self.assertFalse(
+            dual._operator_admission_recovery_parent_allowed(
+                truncated,
+                counts,
+                allow_single_recovery_parent=True,
+            )
+        )
+
     def test_operator_admission_extended_timeout_preserves_failure_evidence(self) -> None:
         marker = self.marker()
         observed = {
@@ -4040,7 +4294,14 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "profile_topology",
                 return_value=dual.ProfileTopology("url", server_url_count=1),
             ),
-            mock.patch.object(dual, "require_topology_matches_contract"),
+            mock.patch.multiple(
+                dual,
+                require_topology_matches_contract=mock.Mock(),
+                _initialize_post_merge_discovery_before_activation=mock.Mock(
+                    side_effect=lambda *args, **kwargs: events.append("bootstrap:init")
+                    or {"initialized": True, "global_ordinal": 100},
+                ),
+            ),
             mock.patch.object(
                 core,
                 "activate_pointer",
@@ -4082,6 +4343,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                 f"stop:{dual.TUNNEL_SERVICE}",
                 f"stop:{dual.OPERATOR_SERVICE}",
                 "verify:snapshot",
+                "bootstrap:init",
                 "activate",
                 f"start:{dual.OPERATOR_SERVICE}",
                 "verify:operator",
@@ -4194,6 +4456,13 @@ class DeploymentSequenceTests(unittest.TestCase):
             )
             stack.enter_context(
                 mock.patch.object(
+                    dual, "_initialize_post_merge_discovery_before_activation",
+                    side_effect=lambda *args, **kwargs: events.append("bootstrap:init")
+                    or {"initialized": True, "global_ordinal": 100},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
                     core,
                     "activate_pointer",
                     side_effect=lambda activation: events.append("activate"),
@@ -4286,7 +4555,8 @@ class DeploymentSequenceTests(unittest.TestCase):
             events.index("quiesce:predecessor"),
             events.index("guard:inactive"),
         )
-        self.assertLess(events.index("guard:inactive"), events.index("activate"))
+        self.assertLess(events.index("guard:inactive"), events.index("bootstrap:init"))
+        self.assertLess(events.index("bootstrap:init"), events.index("activate"))
 
     def test_legacy_stdio_deploy_never_installs_observer_unit(self) -> None:
         snapshot = self.snapshot()
@@ -4311,6 +4581,41 @@ class DeploymentSequenceTests(unittest.TestCase):
         )
         build.assert_not_called()
         install_watchdogs.assert_not_called()
+        install.assert_not_called()
+
+    def test_post_merge_bootstrap_allows_verified_audit_discovery_budget(self) -> None:
+        result = SimpleNamespace(returncode=0, stdout=json.dumps({
+            "kind": "grabowski.repoground_post_merge_discovery_bootstrap",
+            "schema_version": 1,
+            "status": "ok",
+            "initialized": True,
+            "global_ordinal": 1_675_780,
+        }))
+        with mock.patch.object(core, "run", return_value=result) as runner:
+            summary = dual._initialize_post_merge_discovery_before_activation(
+                Path("/release/exact"), timeout_seconds=60,
+            )
+        self.assertEqual(summary["global_ordinal"], 1_675_780)
+        self.assertGreaterEqual(runner.call_args.kwargs["timeout"], 900)
+        self.assertIn("--initialize-reconcile-watermark",
+                      runner.call_args.args[0])
+
+    def test_legacy_stdio_post_merge_reconciler_fails_before_deploy(self) -> None:
+        snapshot = self.snapshot()
+        snapshot.supporting_source_bytes = {
+            "grabowski_repoground_post_merge": b"verified module bytes",
+        }
+        topology = dual.ProfileTopology("legacy-stdio", legacy_entrypoint=CONTRACT)
+        with (
+            mock.patch.object(
+                dual, "preflight_url", return_value=(snapshot, RUNTIME, topology)
+            ),
+            mock.patch.object(core, "deploy") as deploy,
+            mock.patch.object(dual, "install_watchdog_host_assets") as install,
+        ):
+            with self.assertRaisesRegex(core.DeployError, "legacy-stdio"):
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+        deploy.assert_not_called()
         install.assert_not_called()
 
     def test_operator_stop_failure_prevents_pointer_activation(self) -> None:

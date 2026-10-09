@@ -188,6 +188,59 @@ class CodingAgentRouterCliTests(unittest.TestCase):
                 "subscription_type": "pro",
             },
         )
+        long_lived = cli._claude_auth_summary(
+            {
+                "loggedIn": True,
+                "authMethod": "oauth_token",
+            }
+        )
+        self.assertEqual(
+            long_lived,
+            {
+                "logged_in": True,
+                "auth_method": "oauth_token",
+                "subscription_type": None,
+            },
+        )
+
+        unknown_oauth = cli._claude_auth_summary(
+            {
+                "loggedIn": True,
+                "authMethod": "oauth_token",
+                "subscriptionType": "future-or-unrecognized-plan",
+            }
+        )
+        self.assertEqual(
+            unknown_oauth,
+            {
+                "logged_in": True,
+                "auth_method": "oauth_token",
+                "subscription_type": "unknown",
+            },
+        )
+        catalog = json.loads(
+            (ROOT / "config" / "coding-agent-catalog.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        route = next(
+            route
+            for route in catalog["routes"]
+            if route["id"] == "claude-sonnet-5-high"
+        )
+        available, reason = router._route_available(
+            route,
+            catalog,
+            {
+                "catalog": {
+                    "harnesses": {"claude": {"available": True}},
+                    "providers": {"claude": {"auth": unknown_oauth}},
+                }
+            },
+        )
+        self.assertFalse(available)
+        self.assertEqual(reason, "Claude plan authentication is unavailable")
+
         encoded = json.dumps(summary, sort_keys=True)
         self.assertNotIn("secret-provider-value", encoded)
         self.assertNotIn("must-not-propagate", encoded)
@@ -204,7 +257,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             {
                 "logged_in": True,
                 "auth_method": None,
-                "subscription_type": None,
+                "subscription_type": "unknown",
             },
         )
 

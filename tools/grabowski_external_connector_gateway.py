@@ -66,6 +66,7 @@ PROPOSAL_REQUIRED_FIELDS = frozenset(
         "does_not_establish",
     }
 )
+PROPOSAL_ANALYTICS_FIELDS = frozenset({"reason", "user_intent"})
 ALLOWED_JSON_RPC_METHODS = frozenset(
     {
         "initialize",
@@ -478,8 +479,10 @@ def _proposal_tool_descriptor() -> dict[str, Any]:
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
-            "required": sorted(PROPOSAL_REQUIRED_FIELDS),
+            "required": sorted(PROPOSAL_REQUIRED_FIELDS | PROPOSAL_ANALYTICS_FIELDS),
             "properties": {
+                "reason": {"type": "string", "minLength": 1, "maxLength": 128},
+                "user_intent": {"type": "string", "minLength": 1, "maxLength": 256},
                 "title": {"type": "string", "minLength": 1, "maxLength": 200},
                 "category": {"type": "string", "enum": sorted(PROPOSAL_CATEGORIES)},
                 "severity": {"type": "string", "enum": sorted(PROPOSAL_SEVERITIES)},
@@ -552,6 +555,23 @@ def _normalize_proposal_list(
     if len(normalized) != len(set(normalized)):
         raise ValueError(f"{label} contains duplicates")
     return normalized
+
+
+def _proposal_domain_arguments(arguments: Any) -> dict[str, Any]:
+    expected_fields = PROPOSAL_REQUIRED_FIELDS | PROPOSAL_ANALYTICS_FIELDS
+    if not isinstance(arguments, dict) or set(arguments) != expected_fields:
+        raise ValueError("finding proposal shape is invalid")
+    _normalize_proposal_text(
+        arguments.get("reason"),
+        label="reason",
+        maximum_bytes=128,
+    )
+    _normalize_proposal_text(
+        arguments.get("user_intent"),
+        label="user_intent",
+        maximum_bytes=256,
+    )
+    return {field: arguments[field] for field in PROPOSAL_REQUIRED_FIELDS}
 
 
 def _normalize_finding_arguments(arguments: Any) -> dict[str, Any]:
@@ -1557,10 +1577,11 @@ class ExternalConnectorGateway:
                     status_code=200,
                 )
             try:
+                domain_arguments = _proposal_domain_arguments(arguments)
                 async with self._proposal_lock:
                     receipt = _record_finding_proposal(
                         connector_id=self._connector_id,
-                        arguments=arguments,
+                        arguments=domain_arguments,
                         finding_root=self._finding_root,
                         deployment_manifest=self._deployment_manifest,
                     )

@@ -68,6 +68,9 @@ CONVERGENCE_STATES = frozenset(
     }
 )
 TERMINAL_NONBLOCKING_STATES = frozenset({"externally_terminal_missing"})
+FOREIGN_LIFECYCLE_OWNER_CONVERGENCE_STATES = frozenset(
+    {"completed_retained", "archived_retained"}
+)
 HARD_BLOCK_CODES = frozenset(
     {
         "dirty-worktree",
@@ -667,25 +670,37 @@ def _exact_checkout_scope(
         return None
 
     scope_contract = requested_scope
+    worktree_admin_scope = False
     if operation == "broad_repository_lease":
         try:
             scope_contract = nonconflict.normalize_scope_manifest(requested_scope)
         except ValueError:
             return None
         effects = set(scope_contract["effects"])
+        worktree_admin_scope = effects == {"worktree-admin"}
         nonlocal_axes = (
             "components",
             "runtime_resources",
             "processes",
             "deployments",
             "migrations",
-            "shared_gates",
         )
         if (
             scope_contract["repository"] != repository
             or not effects
-            or not effects <= {"read", "write", "generate"}
+            or (
+                not effects <= {"read", "write", "generate"}
+                and not worktree_admin_scope
+            )
             or any(scope_contract[axis] for axis in nonlocal_axes)
+            or (
+                scope_contract["shared_gates"]
+                != (
+                    ["repository-worktree-admin"]
+                    if worktree_admin_scope
+                    else []
+                )
+            )
             or (
                 bool(effects - {"read"})
                 and not (
@@ -727,10 +742,20 @@ def _exact_checkout_scope(
     ):
         return None
     canonical_target = _canonical_checkout_path(scope_target)
+    canonical_repository_target = (
+        operation == "broad_repository_lease"
+        and worktree_admin_scope
+        and canonical_target is not None
+        and _same_checkout_path(repository, canonical_target)
+    )
     if (
         canonical_target is None
         or (target_path is not None and not _same_checkout_path(target_path, canonical_target))
-        or _checkout_paths_overlap(repository, canonical_target)
+        or (
+            _checkout_paths_overlap(repository, canonical_target)
+            and not canonical_repository_target
+        )
+        or (worktree_admin_scope and not canonical_repository_target)
     ):
         return None
 
@@ -1297,7 +1322,19 @@ def assess_repository_admission(
             )
 
     blocker_codes = sorted({str(item["code"]) for item in blockers})
-    hard_blocked = any(code in HARD_BLOCK_CODES or code.startswith("foreign-") for code in blocker_codes)
+    foreign_lifecycle_owner_hard = any(
+        item.get("code") == "foreign-lifecycle-owner"
+        and item.get("state") not in FOREIGN_LIFECYCLE_OWNER_CONVERGENCE_STATES
+        for item in blockers
+    )
+    hard_blocked = foreign_lifecycle_owner_hard or any(
+        code in HARD_BLOCK_CODES
+        or (
+            code.startswith("foreign-")
+            and code != "foreign-lifecycle-owner"
+        )
+        for code in blocker_codes
+    )
     isolation_required = bool(
         not blockers
         and exact_checkout_scope is not None

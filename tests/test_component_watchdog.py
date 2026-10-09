@@ -21,7 +21,13 @@ watchdog = importlib.util.module_from_spec(spec)
 sys.modules["component_watchdog_test"] = watchdog
 spec.loader.exec_module(watchdog)
 
-HEALTH_PAYLOAD = {"healthy": True, "audit_valid": True}
+HEALTH_PAYLOAD = {
+    "schema_version": 1,
+    "service": "grabowski-mcp",
+    "health_scope": "mcp_tool_dispatch",
+    "dispatch_healthy": True,
+    "integrity_evaluated": False,
+}
 BOOT_ID = "11111111-2222-3333-8444-555555555555"
 
 
@@ -112,6 +118,25 @@ class McpLifecycleProbeTests(unittest.TestCase):
                 log_path.read_text(encoding="utf-8").splitlines(),
             )
 
+    def test_versioned_dispatch_liveness_needs_no_integrity_verdict(self) -> None:
+        self.assertEqual(watchdog.MCP_HEALTH_TOOL, "grabowski_mcp_liveness")
+        self.assertIsNone(self.probe(tool_payload=HEALTH_PAYLOAD))
+        for invalid in (
+            {"healthy": True},
+            {**HEALTH_PAYLOAD, "healthy": True},
+            {**HEALTH_PAYLOAD, "schema_version": 2},
+            {**HEALTH_PAYLOAD, "schema_version": True},
+            {**HEALTH_PAYLOAD, "service": "unrelated-service"},
+            {key: value for key, value in HEALTH_PAYLOAD.items() if key != "service"},
+            {**HEALTH_PAYLOAD, "health_scope": "runtime_integrity"},
+            {**HEALTH_PAYLOAD, "dispatch_healthy": "true"},
+            {**HEALTH_PAYLOAD, "integrity_evaluated": True},
+            {**HEALTH_PAYLOAD, "audit_valid": True},
+            {key: value for key, value in HEALTH_PAYLOAD.items() if key != "dispatch_healthy"},
+        ):
+            with self.subTest(payload=invalid):
+                self.assertEqual("mcp-tool-shape-invalid", self.probe(tool_payload=invalid))
+
     def test_unrelated_jsonrpc_message_is_ignored(self) -> None:
         self.assertIsNone(self.probe(unrelated_before_initialize=True))
 
@@ -139,7 +164,7 @@ class McpLifecycleProbeTests(unittest.TestCase):
     def test_runtime_unhealthy_is_not_a_green_probe(self) -> None:
         self.assertEqual(
             "mcp-runtime-unhealthy",
-            self.probe(tool_payload={"healthy": False}),
+            self.probe(tool_payload={**HEALTH_PAYLOAD, "dispatch_healthy": False}),
         )
 
     def test_text_content_fallback_without_structured_content(self) -> None:
@@ -514,6 +539,150 @@ class ControlPlanePollProbeTests(unittest.TestCase):
             )
         self.assertEqual("indeterminate", result.status)
         self.assertEqual(("readiness-failed",), result.reasons)
+
+    def test_healthy_tunnel_checks_selector_bound_operator_dependency(self) -> None:
+        probe = watchdog.ProbeResult(
+            "healthy",
+            pid=321,
+            age_seconds=120.0,
+            start_ticks=77,
+            boot_id=BOOT_ID,
+        )
+        seen_urls = []
+
+        def selected_operator_probe(url: str, _timeout: float) -> str:
+            seen_urls.append(url)
+            return "mcp-http-request-failed"
+
+        with (
+            patch.object(
+                watchdog,
+                "transport_ingress_selected_operator_url",
+                return_value=(
+                    "http://127.0.0.1:18182/_grabowski/mcp-liveness",
+                    None,
+                ),
+            ),
+            patch.object(
+                watchdog,
+                "mcp_http_probe",
+                side_effect=selected_operator_probe,
+            ),
+            patch.object(
+                watchdog,
+                "tunnel_service_process_identity",
+                return_value=(self.tunnel_identity(), None),
+            ),
+        ):
+            result, state = watchdog.classify_tunnel_readiness_dependency(
+                probe,
+                watchdog.WatchdogState(),
+                service=watchdog.DEFAULT_TUNNEL_SERVICE,
+                profile=watchdog.DEFAULT_PROFILE,
+                startup_grace=20,
+                mcp_url=watchdog.DEFAULT_MCP_URL,
+                timeout=2,
+                ingress_health_url="http://127.0.0.1:18180/_grabowski/transport-ingress",
+            )
+
+        self.assertEqual("dependency-unavailable", result.status)
+        self.assertEqual(("selected-operator-unavailable",), result.reasons)
+        self.assertEqual(
+            ["http://127.0.0.1:18182/_grabowski/mcp-liveness"],
+            seen_urls,
+        )
+        self.assertIsNone(state.readiness_dependency_unavailable_boot_id)
+        self.assertIsNone(state.readiness_dependency_unavailable_pid)
+        self.assertIsNone(state.readiness_dependency_unavailable_start_ticks)
+
+    def test_selected_operator_outage_does_not_arm_readiness_recovery(self) -> None:
+        healthy_probe = watchdog.ProbeResult(
+            "healthy",
+            pid=321,
+            age_seconds=120.0,
+            start_ticks=77,
+            boot_id=BOOT_ID,
+        )
+        readiness_probe = watchdog.ProbeResult(
+            "indeterminate",
+            ("readiness-failed",),
+            pid=321,
+            age_seconds=120.0,
+            start_ticks=77,
+            boot_id=BOOT_ID,
+        )
+        with (
+            patch.object(
+                watchdog,
+                "transport_ingress_selected_operator_url",
+                return_value=(watchdog.DEFAULT_MCP_URL, None),
+            ),
+            patch.object(
+                watchdog,
+                "mcp_http_probe",
+                side_effect=["mcp-http-request-failed", None],
+            ),
+            patch.object(
+                watchdog,
+                "tunnel_service_process_identity",
+                return_value=(self.tunnel_identity(), None),
+            ),
+        ):
+            outage, state = watchdog.classify_tunnel_readiness_dependency(
+                healthy_probe,
+                watchdog.WatchdogState(),
+                service=watchdog.DEFAULT_TUNNEL_SERVICE,
+                profile=watchdog.DEFAULT_PROFILE,
+                startup_grace=20,
+                mcp_url=watchdog.DEFAULT_MCP_URL,
+                timeout=2,
+                ingress_health_url=watchdog.DEFAULT_TRANSPORT_INGRESS_HEALTH_URL,
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "state.json"
+                watchdog.save_state(path, state)
+                loaded_state = watchdog.load_state(path)
+            recovered, _ = watchdog.classify_tunnel_readiness_dependency(
+                readiness_probe,
+                loaded_state,
+                service=watchdog.DEFAULT_TUNNEL_SERVICE,
+                profile=watchdog.DEFAULT_PROFILE,
+                startup_grace=20,
+                mcp_url=watchdog.DEFAULT_MCP_URL,
+                timeout=2,
+                ingress_health_url=watchdog.DEFAULT_TRANSPORT_INGRESS_HEALTH_URL,
+            )
+
+        self.assertEqual("dependency-unavailable", outage.status)
+        self.assertEqual(("selected-operator-unavailable",), outage.reasons)
+        self.assertEqual("indeterminate", recovered.status)
+        self.assertEqual(("readiness-failed",), recovered.reasons)
+
+    def test_invalid_selector_prevents_false_green_tunnel(self) -> None:
+        probe = watchdog.ProbeResult(
+            "healthy",
+            pid=321,
+            age_seconds=120.0,
+            start_ticks=77,
+            boot_id=BOOT_ID,
+        )
+        with patch.object(
+            watchdog,
+            "transport_ingress_selected_operator_url",
+            return_value=(None, "transport-ingress-route-invalid"),
+        ):
+            result, _state = watchdog.classify_tunnel_readiness_dependency(
+                probe,
+                watchdog.WatchdogState(),
+                service=watchdog.DEFAULT_TUNNEL_SERVICE,
+                profile=watchdog.DEFAULT_PROFILE,
+                startup_grace=20,
+                mcp_url=watchdog.DEFAULT_MCP_URL,
+                timeout=2,
+                ingress_health_url="http://127.0.0.1:18180/_grabowski/transport-ingress",
+            )
+        self.assertEqual("indeterminate", result.status)
+        self.assertEqual(("transport-ingress-route-invalid",), result.reasons)
 
     def test_missing_readiness_dependency_is_distinct_and_non_restartable(self) -> None:
         result, state = self.classify(
@@ -1528,9 +1697,25 @@ class ConnectorSnapshotRefreshTests(unittest.TestCase):
                     ["--component", "tunnel", "--state-dir", tmp]
                 )
             )
-            probe = watchdog.ProbeResult("healthy", pid=123, age_seconds=30.0, start_ticks=456)
+            probe = watchdog.ProbeResult("healthy", pid=123, age_seconds=30.0, start_ticks=456, boot_id=BOOT_ID)
             with (
                 patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(
+                    watchdog,
+                    "transport_ingress_selected_operator_url",
+                    return_value=(watchdog.DEFAULT_MCP_URL, None),
+                ),
+                patch.object(watchdog, "mcp_http_probe", return_value=None),
+                patch.object(
+                    watchdog,
+                    "tunnel_service_process_identity",
+                    return_value=(
+                        watchdog.TunnelProcessIdentity(
+                            BOOT_ID, 123, 456, 30.0
+                        ),
+                        None,
+                    ),
+                ),
                 patch.object(watchdog, "refresh_connector_snapshot_from_runtime", return_value={"state": "not_due"}) as refresh,
                 patch.object(watchdog, "emit"),
             ):
@@ -1544,6 +1729,22 @@ class ConnectorSnapshotRefreshTests(unittest.TestCase):
             )
             with (
                 patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(
+                    watchdog,
+                    "transport_ingress_selected_operator_url",
+                    return_value=(watchdog.DEFAULT_MCP_URL, None),
+                ),
+                patch.object(watchdog, "mcp_http_probe", return_value=None),
+                patch.object(
+                    watchdog,
+                    "tunnel_service_process_identity",
+                    return_value=(
+                        watchdog.TunnelProcessIdentity(
+                            BOOT_ID, 123, 456, 30.0
+                        ),
+                        None,
+                    ),
+                ),
                 patch.object(watchdog, "refresh_connector_snapshot_from_runtime") as refresh,
                 patch.object(watchdog, "emit"),
             ):
@@ -1558,10 +1759,26 @@ class ConnectorSnapshotRefreshTests(unittest.TestCase):
                 )
             )
             probe = watchdog.ProbeResult(
-                "healthy", pid=123, age_seconds=30.0, start_ticks=456
+                "healthy", pid=123, age_seconds=30.0, start_ticks=456, boot_id=BOOT_ID
             )
             with (
                 patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(
+                    watchdog,
+                    "transport_ingress_selected_operator_url",
+                    return_value=(watchdog.DEFAULT_MCP_URL, None),
+                ),
+                patch.object(watchdog, "mcp_http_probe", return_value=None),
+                patch.object(
+                    watchdog,
+                    "tunnel_service_process_identity",
+                    return_value=(
+                        watchdog.TunnelProcessIdentity(
+                            BOOT_ID, 123, 456, 30.0
+                        ),
+                        None,
+                    ),
+                ),
                 patch.object(
                     watchdog,
                     "refresh_connector_snapshot_from_runtime",
@@ -2509,6 +2726,11 @@ class WatchdogPolicyTests(unittest.TestCase):
                 patch.object(watchdog, "probe_component", return_value=probe),
                 patch.object(
                     watchdog,
+                    "transport_ingress_selected_operator_url",
+                    return_value=(watchdog.DEFAULT_MCP_URL, None),
+                ),
+                patch.object(
+                    watchdog,
                     "mcp_http_probe",
                     return_value="mcp-http-request-failed",
                 ),
@@ -2587,6 +2809,11 @@ class WatchdogPolicyTests(unittest.TestCase):
                     watchdog,
                     "probe_component",
                     side_effect=[initial, recovered],
+                ),
+                patch.object(
+                    watchdog,
+                    "transport_ingress_selected_operator_url",
+                    return_value=(watchdog.DEFAULT_MCP_URL, None),
                 ),
                 patch.object(watchdog, "mcp_http_probe", return_value=None),
                 patch.object(
@@ -2674,6 +2901,11 @@ class WatchdogPolicyTests(unittest.TestCase):
             )
             with (
                 patch.object(watchdog, "probe_component", return_value=initial),
+                patch.object(
+                    watchdog,
+                    "transport_ingress_selected_operator_url",
+                    return_value=(watchdog.DEFAULT_MCP_URL, None),
+                ),
                 patch.object(watchdog, "mcp_http_probe", return_value=None),
                 patch.object(
                     watchdog,

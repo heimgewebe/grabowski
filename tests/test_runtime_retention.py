@@ -941,6 +941,35 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertFalse(plan["archive_inventory_complete"])
             self.assertEqual(plan["reset_failed_units"], [task_unit])
 
+    def test_reserved_repoground_jobs_enter_typed_retention_and_failed_reset(self) -> None:
+        job_name = "grabowski-job-rgpm-" + "a" * 16 + "-01"
+        unit = job_name + ".service"
+        self.assertIsNotNone(RETENTION.JOB_NAME.fullmatch(job_name))
+        self.assertIsNotNone(RETENTION.JOB_UNIT.fullmatch(unit))
+        self.assertIsNone(RETENTION.JOB_NAME.fullmatch(job_name + "-extra"))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            self._job(jobs, job_name, 100)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50,
+                now=1_000,
+                jobs_root=jobs,
+                archive_root=root / "archive",
+                receipt_root=root / "receipts",
+                task_db=root / "missing.sqlite3",
+                failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            self.assertIn(unit, [item["unit"] for item in plan["archive_jobs"]])
+            self.assertIn(unit, plan["reset_failed_units"])
+            self.assertFalse(
+                any(
+                    item["unit"] == job_name and "legacy" in item["reason"]
+                    for item in plan["blocked"]
+                )
+            )
+
     def test_failed_job_outside_primary_scan_is_still_classified(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

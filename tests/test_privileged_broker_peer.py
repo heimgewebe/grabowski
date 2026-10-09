@@ -1006,6 +1006,85 @@ class PrivilegedBrokerPeerTests(unittest.TestCase):
                     )
             popen.assert_not_called()
 
+    def test_execute_broker_command_reuses_scoped_rootbroker_kill_switch_policy_before_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            kill_switch = Path(raw) / "operator.kill"
+            kill_switch.write_text("typed-placeholder\n", encoding="utf-8")
+            reference = {
+                "request_id": "a" * 32,
+                "reference_sha256": "b" * 64,
+                "action": broker_tool.ROOTBROKER_CUTOVER_ACTION,
+                "target": "c" * 40,
+            }
+            execution = {
+                "mode": "template",
+                "argv": ["/usr/bin/true"],
+                "cwd": None,
+                "timeout_seconds": 5,
+                "kill_switch_path": str(kill_switch),
+                "legacy_kill_switch_path": None,
+            }
+            process = mock.Mock(pid=4242, returncode=0)
+            process.communicate.return_value = (b"", b"")
+
+            with (
+                mock.patch.object(
+                    broker_tool,
+                    "_scoped_template_marker_allows_dispatch",
+                    return_value=True,
+                ) as scoped,
+                mock.patch.object(broker_tool, "append_audit"),
+                mock.patch.object(
+                    broker_tool.subprocess, "Popen", return_value=process
+                ) as popen,
+            ):
+                result = broker_tool._execute_broker_command(
+                    reference=reference,
+                    execution=execution,
+                    operator_peer=self.peer(),
+                )
+
+            scoped.assert_called_once_with(
+                kill_switch, action=broker_tool.ROOTBROKER_CUTOVER_ACTION
+            )
+            popen.assert_called_once()
+            self.assertEqual(result["returncode"], 0)
+
+    def test_execute_broker_command_blocks_rootbroker_when_scoped_marker_recheck_denies(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            kill_switch = Path(raw) / "operator.kill"
+            kill_switch.write_text("typed-placeholder\n", encoding="utf-8")
+            reference = {
+                "request_id": "c" * 32,
+                "reference_sha256": "d" * 64,
+                "action": broker_tool.ROOTBROKER_CUTOVER_ACTION,
+                "target": "e" * 40,
+            }
+            execution = {
+                "mode": "template",
+                "argv": ["/usr/bin/true"],
+                "cwd": None,
+                "timeout_seconds": 5,
+                "kill_switch_path": str(kill_switch),
+                "legacy_kill_switch_path": None,
+            }
+
+            with (
+                mock.patch.object(
+                    broker_tool,
+                    "_scoped_template_marker_allows_dispatch",
+                    return_value=False,
+                ),
+                mock.patch.object(broker_tool.subprocess, "Popen") as popen,
+            ):
+                with self.assertRaisesRegex(PermissionError, "kill-switch"):
+                    broker_tool._execute_broker_command(
+                        reference=reference,
+                        execution=execution,
+                        operator_peer=self.peer(),
+                    )
+            popen.assert_not_called()
+
     def test_safe_package_readback_publishes_output_evidence(self) -> None:
         reference = {
             "request_id": "6" * 32,

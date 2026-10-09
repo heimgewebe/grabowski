@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import grabowski_git_preimage as git_preimage
 import grabowski_physical_checkout as physical_checkout
@@ -101,6 +102,134 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
             with self.assertRaises(physical_checkout.PhysicalCheckoutIdentityError):
                 physical_checkout.verify_physical_checkout_identity(identity_before)
 
+
+    def test_bound_checkout_effect_root_survives_lexical_path_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            retired = root / "retired"
+            self._init_committed_repo(repo)
+            original_head = self._run(
+                "git", "rev-parse", "HEAD", cwd=repo
+            ).stdout.decode("utf-8").strip()
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+
+            with physical_checkout.bind_physical_checkout(repo) as bound:
+                self.assertEqual(expected, bound.identity)
+                repo.rename(retired)
+                self._init_committed_repo(repo)
+                (repo / "README.md").write_text(
+                    "replacement\n", encoding="utf-8"
+                )
+                self._run("git", "add", "README.md", cwd=repo)
+                self._run(
+                    "git", "commit", "-q", "-m", "replacement", cwd=repo
+                )
+                replacement_head = self._run(
+                    "git", "rev-parse", "HEAD", cwd=repo
+                ).stdout.decode("utf-8").strip()
+                bound_head = self._run(
+                    "git", "-C", str(bound.effect_root), "rev-parse", "HEAD"
+                ).stdout.decode("utf-8").strip()
+
+                self.assertNotEqual(original_head, replacement_head)
+                self.assertEqual(original_head, bound_head)
+                self.assertEqual(
+                    expected["root"]["inode"],
+                    os.stat(bound.effect_root).st_ino,
+                )
+
+
+    def test_failed_bind_cleanup_attempts_root_close_after_git_close_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            self._init_committed_repo(repo)
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            real_open_absolute = physical_checkout._open_absolute_directory
+            real_open_relative = physical_checkout._open_relative_directory
+            real_close = physical_checkout.os.close
+            opened: dict[str, int] = {}
+            close_attempts: list[int] = []
+
+            def recording_open_absolute(path: Path, *, label: str):
+                descriptor, metadata = real_open_absolute(path, label=label)
+                if label == "checkout root":
+                    opened["root"] = descriptor
+                return descriptor, metadata
+
+            def recording_open_relative(
+                parent_descriptor: int,
+                name: str,
+                *,
+                label: str,
+            ):
+                descriptor, metadata = real_open_relative(
+                    parent_descriptor,
+                    name,
+                    label=label,
+                )
+                if name == ".git":
+                    opened["git"] = descriptor
+                return descriptor, metadata
+
+            def fail_validation(*_args: object, **_kwargs: object) -> None:
+                close_attempts.clear()
+                raise physical_checkout.PhysicalCheckoutIdentityError(
+                    "injected bind validation failure"
+                )
+
+            def close_with_git_failure(descriptor: int) -> None:
+                close_attempts.append(descriptor)
+                if descriptor == opened.get("git"):
+                    raise OSError("injected git descriptor close failure")
+                real_close(descriptor)
+
+            try:
+                with (
+                    patch.object(
+                        physical_checkout,
+                        "capture_physical_checkout_identity",
+                        return_value=expected,
+                    ),
+                    patch.object(
+                        physical_checkout,
+                        "_open_absolute_directory",
+                        side_effect=recording_open_absolute,
+                    ),
+                    patch.object(
+                        physical_checkout,
+                        "_open_relative_directory",
+                        side_effect=recording_open_relative,
+                    ),
+                    patch.object(
+                        physical_checkout,
+                        "_assert_absolute_directory_node",
+                        side_effect=fail_validation,
+                    ),
+                    patch.object(
+                        physical_checkout.os,
+                        "close",
+                        side_effect=close_with_git_failure,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        physical_checkout.PhysicalCheckoutIdentityError,
+                        "injected bind validation failure",
+                    ):
+                        physical_checkout.bind_physical_checkout(repo)
+
+                self.assertIn(opened["git"], close_attempts)
+                self.assertIn(opened["root"], close_attempts)
+            finally:
+                for descriptor in opened.values():
+                    try:
+                        os.fstat(descriptor)
+                    except OSError:
+                        continue
+                    real_close(descriptor)
+
     def test_stable_gitdir_pointer_detects_metadata_directory_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -192,6 +321,423 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                 identity["git_dir"]["path"], identity["common_dir"]["path"]
             )
             physical_checkout.verify_physical_checkout_identity(identity)
+
+    def test_registered_linked_worktree_git_dir_is_exact_and_ambiguity_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            self._init_committed_repo(repo, branch="main")
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                str(worktree),
+                "HEAD",
+                cwd=repo,
+            )
+
+            identity = physical_checkout.capture_physical_checkout_identity(worktree)
+            registered = physical_checkout.capture_registered_linked_worktree_git_dir(
+                identity["common_dir"]["path"], worktree
+            )
+            self.assertEqual(identity["git_dir"], registered)
+
+            fake = Path(identity["common_dir"]["path"]) / "worktrees" / "fake"
+            fake.mkdir()
+            (fake / "gitdir").write_text(
+                str(worktree / ".git") + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                physical_checkout.PhysicalCheckoutIdentityError,
+                "entry bound",
+            ):
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    identity["common_dir"]["path"], worktree, max_entries=1
+                )
+            with self.assertRaisesRegex(
+                physical_checkout.PhysicalCheckoutIdentityError,
+                "missing or ambiguous",
+            ):
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    identity["common_dir"]["path"], worktree
+                )
+
+    def test_registered_gitdir_backlink_drift_is_detected_before_return(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            self._init_committed_repo(repo, branch="main")
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                str(worktree),
+                "HEAD",
+                cwd=repo,
+            )
+            identity = physical_checkout.capture_physical_checkout_identity(worktree)
+            backlink = Path(identity["git_dir"]["path"]) / "gitdir"
+            original_open = physical_checkout._open_absolute_directory
+
+            def drift_before_final_open(path: Path, *, label: str):
+                if label == "registered worktree git directory":
+                    backlink.write_text(
+                        str(root / "replacement" / ".git") + "\n",
+                        encoding="utf-8",
+                    )
+                return original_open(path, label=label)
+
+            with (
+                patch.object(
+                    physical_checkout,
+                    "_open_absolute_directory",
+                    side_effect=drift_before_final_open,
+                ),
+                self.assertRaisesRegex(
+                    physical_checkout.PhysicalCheckoutIdentityError,
+                    "git worktree backlink changed during capture",
+                ),
+            ):
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    identity["common_dir"]["path"], worktree
+                )
+
+    def test_nonmatching_backlink_drift_is_detected_before_return(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            other = root / "other"
+            self._init_committed_repo(repo, branch="main")
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-target",
+                str(worktree),
+                "HEAD",
+                cwd=repo,
+            )
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-other",
+                str(other),
+                "HEAD",
+                cwd=repo,
+            )
+
+            identity = physical_checkout.capture_physical_checkout_identity(worktree)
+            other_identity = physical_checkout.capture_physical_checkout_identity(other)
+            other_backlink = Path(other_identity["git_dir"]["path"]) / "gitdir"
+            original_scandir = physical_checkout.os.scandir
+
+            class DriftAfterScan:
+                def __init__(self, iterator):
+                    self.iterator = iterator
+                    self.drifted = False
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    self.iterator.close()
+                    return False
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    try:
+                        return next(self.iterator)
+                    except StopIteration:
+                        if not self.drifted:
+                            other_backlink.write_text(
+                                str(worktree / ".git") + "\n",
+                                encoding="utf-8",
+                            )
+                            self.drifted = True
+                        raise
+
+            with (
+                patch.object(
+                    physical_checkout.os,
+                    "scandir",
+                    side_effect=lambda fd: DriftAfterScan(original_scandir(fd)),
+                ),
+                self.assertRaisesRegex(
+                    physical_checkout.PhysicalCheckoutIdentityError,
+                    "git worktree backlink changed during capture",
+                ),
+            ):
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    identity["common_dir"]["path"], worktree
+                )
+
+    def test_nonmatching_backlink_becoming_second_match_after_validation_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            other = root / "other"
+            self._init_committed_repo(repo, branch="main")
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-target",
+                str(worktree),
+                "HEAD",
+                cwd=repo,
+            )
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-other",
+                str(other),
+                "HEAD",
+                cwd=repo,
+            )
+
+            identity = physical_checkout.capture_physical_checkout_identity(worktree)
+            other_identity = physical_checkout.capture_physical_checkout_identity(other)
+            other_backlink = Path(other_identity["git_dir"]["path"]) / "gitdir"
+            original_open = physical_checkout._open_absolute_directory
+            drifted = False
+
+            def drift_after_selected_match_verification(path: Path, *, label: str):
+                nonlocal drifted
+                opened = original_open(path, label=label)
+                if label == "registered worktree git directory" and not drifted:
+                    other_backlink.write_text(
+                        str(worktree / ".git") + "\n",
+                        encoding="utf-8",
+                    )
+                    drifted = True
+                return opened
+
+            with (
+                patch.object(
+                    physical_checkout,
+                    "_open_absolute_directory",
+                    side_effect=drift_after_selected_match_verification,
+                ),
+                self.assertRaisesRegex(
+                    physical_checkout.PhysicalCheckoutIdentityError,
+                    "git worktree backlink changed during registered identity capture",
+                ),
+            ):
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    identity["common_dir"]["path"], worktree
+                )
+            self.assertTrue(drifted)
+
+    def test_new_registration_during_backlink_revalidation_is_detected_before_return(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            self._init_committed_repo(repo, branch="main")
+            self._run(
+                "git",
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                str(worktree),
+                "HEAD",
+                cwd=repo,
+            )
+
+            identity = physical_checkout.capture_physical_checkout_identity(worktree)
+            registered_name = Path(identity["git_dir"]["path"]).name
+            worktrees = Path(identity["common_dir"]["path"]) / "worktrees"
+            duplicate = worktrees / "late-duplicate"
+            original_open = physical_checkout._open_relative_directory
+            target_admin_open_count = 0
+
+            def create_duplicate_during_revalidation(
+                parent_descriptor: int,
+                name: str,
+                *,
+                label: str,
+            ):
+                nonlocal target_admin_open_count
+                if (
+                    label == "git worktree admin directory"
+                    and name == registered_name
+                ):
+                    target_admin_open_count += 1
+                    if target_admin_open_count == 2:
+                        duplicate.mkdir()
+                        (duplicate / "gitdir").write_text(
+                            str(worktree / ".git") + "\n",
+                            encoding="utf-8",
+                        )
+                return original_open(parent_descriptor, name, label=label)
+
+            with (
+                patch.object(
+                    physical_checkout,
+                    "_open_relative_directory",
+                    side_effect=create_duplicate_during_revalidation,
+                ),
+                self.assertRaisesRegex(
+                    physical_checkout.PhysicalCheckoutIdentityError,
+                    "git worktrees directory changed during registered identity capture",
+                ),
+            ):
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    identity["common_dir"]["path"], worktree
+                )
+
+            self.assertEqual(3, target_admin_open_count)
+
+    def test_untracked_hash_rejects_atomic_leaf_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "file.txt"
+            replacement = root / "replacement.tmp"
+            target.write_bytes(b"old-bytes")
+            replacement.write_bytes(b"new-bytes")
+            original_read = git_preimage.os.read
+            replaced = False
+
+            def replace_after_first_read(fd: int, size: int) -> bytes:
+                nonlocal replaced
+                chunk = original_read(fd, size)
+                if chunk and not replaced:
+                    os.replace(replacement, target)
+                    replaced = True
+                return chunk
+
+            with (
+                patch.object(
+                    git_preimage.os,
+                    "read",
+                    side_effect=replace_after_first_read,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "(?:Worktree file changed|Untracked worktree file path changed) during preimage capture",
+                ),
+            ):
+                git_preimage._safe_worktree_paths_sha256(
+                    root,
+                    [b"file.txt"],
+                    max_paths=10,
+                )
+
+    def test_tracked_hash_rejects_parent_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = root / "sub"
+            replacement_parent = root / "replacement-sub"
+            retired_parent = root / "retired-sub"
+            parent.mkdir()
+            replacement_parent.mkdir()
+            (parent / "file.txt").write_bytes(b"old-bytes")
+            (replacement_parent / "file.txt").write_bytes(b"new-bytes")
+            index = b"100644 " + (b"a" * 40) + b" 0\tsub/file.txt\0"
+            original_read = git_preimage.os.read
+            replaced = False
+
+            def replace_parent_after_first_read(fd: int, size: int) -> bytes:
+                nonlocal replaced
+                chunk = original_read(fd, size)
+                if chunk and not replaced:
+                    parent.rename(retired_parent)
+                    replacement_parent.rename(parent)
+                    replaced = True
+                return chunk
+
+            with (
+                patch.object(
+                    git_preimage.os,
+                    "read",
+                    side_effect=replace_parent_after_first_read,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "Tracked worktree file parent changed during preimage capture",
+                ),
+            ):
+                git_preimage._tracked_worktree_sha256(
+                    root,
+                    index,
+                    max_paths=10,
+                )
+
+    def test_tracked_hash_revalidates_missing_parent_before_accepting_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            index = b"100644 " + (b"a" * 40) + b" 0\tdir/file.txt\0"
+            original_stat = git_preimage.os.stat
+            created = False
+
+            def create_after_missing_parent(path, *args, **kwargs):
+                nonlocal created
+                try:
+                    return original_stat(path, *args, **kwargs)
+                except FileNotFoundError:
+                    if path == b"dir" and not created:
+                        (root / "dir").mkdir()
+                        (root / "dir" / "file.txt").write_bytes(b"late-bytes")
+                        created = True
+                    raise
+
+            with (
+                patch.object(
+                    git_preimage.os,
+                    "stat",
+                    side_effect=create_after_missing_parent,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "Tracked worktree blocked parent path changed during preimage capture",
+                ),
+            ):
+                git_preimage._tracked_worktree_sha256(
+                    root,
+                    index,
+                    max_paths=10,
+                )
+
+    def test_branch_preimage_detects_rebase_apply_operation_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            self._init_committed_repo(repo, branch="main")
+            (repo / ".git" / "rebase-apply").mkdir()
+
+            preimage = git_preimage.capture_branch_preimage(
+                repo,
+                self._probe(repo),
+            )
+
+            self.assertEqual(
+                "present",
+                preimage["operation_refs"]["STATE:rebase-apply"],
+            )
 
     def test_gitdir_pointer_preserves_whitespace_as_path_material(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

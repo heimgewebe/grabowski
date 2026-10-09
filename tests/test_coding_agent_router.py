@@ -1142,7 +1142,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             for model in router.grabowski_coding_agent_catalog(include_disabled=True)["models"]
             for route in model["routes"]
         }
-        opus = public["claude-opus-5-high"]
+        opus = public["claude-opus-5.5-high"]
         self.assertEqual(opus["permission_mode"], "plan")
         self.assertTrue(opus["review_only"])
         self.assertTrue(opus["review_capable"])
@@ -1152,7 +1152,7 @@ class CodingAgentRouterTests(unittest.TestCase):
     def test_learning_applies_to_review_routes_not_authoritative_writing(
         self,
     ) -> None:
-        route_id = "claude-opus-5-high"
+        route_id = "claude-opus-5.5-high"
         self.state["routes"] = {
             route_id: {
                 "by_task_class": {
@@ -1765,6 +1765,42 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertFalse(available)
         self.assertIn("authentication", reason)
 
+    def test_claude_long_lived_oauth_token_route_is_available_without_plan_label(
+        self,
+    ) -> None:
+        route = next(
+            route
+            for route in self.catalog["routes"]
+            if route["id"] == "claude-sonnet-5-high"
+        )
+        state = self._fresh_state()
+        auth = state["catalog"]["providers"]["claude"]["auth"]
+
+        auth.update(
+            {
+                "logged_in": True,
+                "auth_method": "oauth_token",
+                "subscription_type": None,
+            }
+        )
+        available, reason = router._route_available(route, self.catalog, state)
+        self.assertTrue(available, reason)
+
+        auth["subscription_type"] = "unknown-plan"
+        available, reason = router._route_available(route, self.catalog, state)
+        self.assertFalse(available)
+        self.assertEqual(reason, "Claude plan authentication is unavailable")
+
+        auth.update(
+            {
+                "auth_method": "unknown",
+                "subscription_type": None,
+            }
+        )
+        available, reason = router._route_available(route, self.catalog, state)
+        self.assertFalse(available)
+        self.assertEqual(reason, "Claude plan authentication is unavailable")
+
     def test_stale_opencode_deepseek_free_route_remains_fail_closed(self) -> None:
         route = next(
             route
@@ -1863,17 +1899,17 @@ class CodingAgentRouterTests(unittest.TestCase):
             verification_policy="independent_review",
         )
 
-        self.assertEqual("claude-opus-5-writer-high", result["writer_route"])
+        self.assertEqual("claude-opus-5.5-writer-high", result["writer_route"])
         writer = result["scoped_writer"]
         self.assertIsNotNone(writer)
         reviewer = result["reviewers"][0]
         self.assertEqual("antigravity-gemini-pro-review-high", reviewer["route"])
         self.assertNotEqual(writer["independence_group"], reviewer["independence_group"])
         self.assertNotEqual(writer["provider_family"], reviewer["provider_family"])
-        self.assertIn("reviewer:claude-opus-5-high", result["excluded"])
+        self.assertIn("reviewer:claude-opus-5.5-high", result["excluded"])
         self.assertIn(
             "reviewer shares the primary model lineage",
-            result["excluded"]["reviewer:claude-opus-5-high"],
+            result["excluded"]["reviewer:claude-opus-5.5-high"],
         )
 
     def test_codex_reviewer_preserves_provider_independence(self) -> None:
@@ -1885,10 +1921,10 @@ class CodingAgentRouterTests(unittest.TestCase):
         direct = self._route("independent-review")
         self.assertEqual([], direct["reviewers"])
         self.assertEqual("no-independent-review-route", direct["review_status"])
-        self.assertIn("reviewer:codex-sol-review-high", direct["excluded"])
+        self.assertIn("reviewer:codex-astra-review-high", direct["excluded"])
         self.assertIn(
             "reviewer shares the primary provider family",
-            direct["excluded"]["reviewer:codex-sol-review-high"],
+            direct["excluded"]["reviewer:codex-astra-review-high"],
         )
 
         self.state = self._fresh_state()
@@ -1907,9 +1943,9 @@ class CodingAgentRouterTests(unittest.TestCase):
             need_review=True,
             verification_policy="independent_review",
         )
-        self.assertEqual("claude-opus-5-writer-high", delegated["writer_route"])
+        self.assertEqual("claude-opus-5.5-writer-high", delegated["writer_route"])
         self.assertEqual(
-            "codex-sol-review-high",
+            "codex-astra-review-high",
             delegated["reviewers"][0]["route"],
         )
         self.assertNotEqual(
@@ -1935,12 +1971,12 @@ class CodingAgentRouterTests(unittest.TestCase):
             verification_policy="independent_review",
         )
 
-        self.assertEqual("claude-opus-5-writer-high", result["writer_route"])
+        self.assertEqual("claude-opus-5.5-writer-high", result["writer_route"])
         self.assertEqual([], result["reviewers"])
         self.assertEqual("no-independent-review-route", result["review_status"])
         self.assertIn(
             "reviewer shares the primary model lineage",
-            result["excluded"]["reviewer:claude-opus-5-high"],
+            result["excluded"]["reviewer:claude-opus-5.5-high"],
         )
 
     def test_fable_contrast_and_review_routes_never_become_primary_writer(self) -> None:

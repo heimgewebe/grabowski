@@ -24,6 +24,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "report_outcome": {
+        "category": "operations-observability",
+        "purpose": "Accept the required final agent outcome self-report for Flowlines telemetry when export is enabled, without product mutation.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grip_list": {
         "category": "grip-surface",
         "purpose": "List allowlisted receipt-bound Grabowski grips with profile visibility and expected receipt shape.",
@@ -469,6 +476,31 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "privileged-reference",
         "purpose": "Create a non-executable reference contract for a future external privileged action.",
         "risk_class": "medium",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_critical_user_data_inventory": {
+        "category": "privileged-execution",
+        "purpose": (
+            "Start one fixed SHA-pinned authoritative critical-user-data inventory "
+            "through the root-owned broker without arbitrary argv or paths; sealed "
+            "result evidence is root-owned but transient and must be captured before reboot."
+        ),
+        "risk_class": "high",
+        "effects": [
+            "root-read-only-home-traversal",
+            "root-systemd-task-start",
+            "root-owned-inventory-evidence-write",
+        ],
+        "reversibility": "no-user-data-mutation-root-owned-evidence-transient",
+    },
+    "grabowski_critical_user_data_inventory_read": {
+        "category": "privileged-reference",
+        "purpose": (
+            "Read status or a sealed result for the fixed SHA-pinned critical-user-data "
+            "inventory without dispatching a new scan."
+        ),
+        "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",
     },
@@ -1117,7 +1149,14 @@ TOOL_PROFILES.update(
     {
         "grabowski_runtime_health": {
             "category": "context",
-            "purpose": "Read minimal deployment, audit and kill-switch health without path inventories.",
+            "purpose": "Read deployment, audit and kill-switch integrity health with established healthy semantics.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_mcp_liveness": {
+            "category": "context",
+            "purpose": "Read bounded MCP tool-dispatch liveness without establishing runtime or audit integrity.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",
@@ -1422,6 +1461,16 @@ TOOL_PROFILES.update(
 
 TOOL_PROFILES.update(
     {
+        "grabowski_bureau_acceptance_authenticate": {
+            "category": "bureau",
+            "purpose": (
+                "Authenticate one exact digest- and revision-bound manual Bureau "
+                "acceptance item through Bureau's canonical StateStore journal contract."
+            ),
+            "risk_class": "medium",
+            "effects": ["bureau_acceptance_authentication_event"],
+            "reversibility": "append-only-idempotent-attestation",
+        },
         "grabowski_bureau_candidate_record": {
             "category": "bureau",
             "purpose": "Record one source-bound candidate through Bureau's canonical append-only operator intake contract.",

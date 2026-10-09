@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import importlib
 from pathlib import Path
 import time
@@ -15,6 +16,7 @@ CURRENT_TASK_STATES = ("launching", "running", "interrupted", "outcome_unknown")
 CURRENT_WORK_GIT_TIMEOUT_SECONDS = 1.0
 CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS = 4.0
 CURRENT_WORK_CHECKOUT_MAX_WORKTREES: int | None = None
+CURRENT_WORK_MAX_PARALLEL_SOURCES = 2
 
 
 def _module(name: str) -> Any:
@@ -150,11 +152,21 @@ def _task_payload(
     }
 
 
-def _attention_payload(view: str) -> dict[str, Any]:
+def _attention_payload(
+    view: str,
+    *,
+    current_work_task_ids: set[str] | None = None,
+) -> dict[str, Any]:
     task_attention = _module("grabowski_task_attention")
-    return task_attention.reconcile_attention(
-        {"limit": task_attention.MAX_PAGE_LIMIT, "view": view}
-    )
+    parameters = {"limit": task_attention.MAX_PAGE_LIMIT, "view": view}
+    if view == "current":
+        kwargs: dict[str, Any] = {"_bounded_current_projection": True}
+        if current_work_task_ids is not None:
+            kwargs["_current_work_task_ids"] = current_work_task_ids
+        return task_attention.reconcile_attention(parameters, **kwargs)
+    if current_work_task_ids is not None:
+        raise ValueError("current_work task ids are only valid for current view")
+    return task_attention.reconcile_attention(parameters)
 
 
 def _resources_payload() -> dict[str, Any]:
@@ -219,13 +231,199 @@ def _checkout_payloads(
     return payloads
 
 
+def _task_checkout_presence(
+    repositories: list[str],
+    *,
+    reconciler: Any,
+    reconciliation_payload: dict[str, Any],
+    database_snapshot: dict[str, Any] | None = None,
+) -> tuple[dict[str, list[str]], bool]:
+    source_snapshot = reconciliation_payload.get("source_snapshot")
+    expected_database_sha256 = (
+        source_snapshot.get("database_snapshot_sha256")
+        if isinstance(source_snapshot, dict)
+        else None
+    )
+    if not isinstance(expected_database_sha256, str):
+        raise RuntimeError("checkout reconciliation database snapshot is missing")
+
+    database_before = (
+        reconciler.collect_lifecycle_bindings_from_db()
+        if database_snapshot is None
+        else reconciler._validated_database_snapshot(database_snapshot)
+    )
+    if database_before.get("snapshot_sha256") != expected_database_sha256:
+        raise RuntimeError(
+            "checkout lifecycle database changed during current_work observation"
+        )
+    bindings = database_before.get("bindings")
+    retentions = database_before.get("retentions")
+    if not isinstance(bindings, list) or not isinstance(retentions, list):
+        raise RuntimeError("checkout lifecycle database snapshot is incomplete")
+
+    task_owned_repository_paths: set[str] = set()
+
+    def task_owner_repository(item: object) -> None:
+        if not isinstance(item, dict):
+            raise RuntimeError("checkout lifecycle database row is invalid")
+        owner_id = item.get("owner_id")
+        if (
+            not isinstance(owner_id, str)
+            or not owner_id.startswith("task:")
+            or owner_id == "task:"
+        ):
+            return
+        repo_path = item.get("repo_path")
+        if not isinstance(repo_path, str) or not repo_path:
+            raise RuntimeError("task-owned checkout repository is invalid")
+        task_owned_repository_paths.add(
+            str(Path(repo_path).expanduser().resolve(strict=False))
+        )
+
+    for binding in bindings:
+        task_owner_repository(binding)
+    for retention in retentions:
+        task_owner_repository(retention)
+
+    # The ordinary current_work checkout projection stays caller-scoped.  This
+    # extra observer exists only to prove the absence of task-owned checkouts
+    # before global attention may be pruned.
+    if len(task_owned_repository_paths) > current_work.MAX_REPOSITORIES:
+        return {}, False
+    observation_targets = sorted(
+        set(repositories) | task_owned_repository_paths
+    )
+    if len(observation_targets) > current_work.MAX_REPOSITORIES:
+        return {}, False
+    git = reconciler.collect_git_worktrees_for_repos(
+        observation_targets,
+        git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
+    )
+    if git.get("errors") or git.get("errors_truncated"):
+        return {}, False
+    observable = {
+        str(Path(item).expanduser().resolve(strict=False))
+        for item in git.get("observable_repo_paths", [])
+        if isinstance(item, str)
+    }
+    required_observable = set(repositories) | task_owned_repository_paths
+    if not required_observable.issubset(observable):
+        return {}, False
+    present_keys = {
+        str(item.get("checkout_key"))
+        for item in git.get("worktrees", [])
+        if isinstance(item, dict) and isinstance(item.get("checkout_key"), str)
+    }
+
+    checkout_keys_by_task: dict[str, set[str]] = {}
+
+    def add(item: object) -> None:
+        if not isinstance(item, dict):
+            raise RuntimeError("checkout lifecycle database row is invalid")
+        owner_id = item.get("owner_id")
+        checkout_key = item.get("checkout_key")
+        if (
+            not isinstance(owner_id, str)
+            or not owner_id.startswith("task:")
+            or owner_id == "task:"
+            or not isinstance(checkout_key, str)
+            or checkout_key not in present_keys
+        ):
+            return
+        task_id = owner_id.removeprefix("task:")
+        checkout_keys_by_task.setdefault(task_id, set()).add(checkout_key)
+
+    for binding in bindings:
+        add(binding)
+    for retention in retentions:
+        add(retention)
+
+    database_after = reconciler.collect_lifecycle_bindings_from_db()
+    if database_after.get("snapshot_sha256") != expected_database_sha256:
+        raise RuntimeError(
+            "checkout lifecycle database changed during current_work observation"
+        )
+
+    if len(checkout_keys_by_task) > MAX_SOURCE_TASKS:
+        raise RuntimeError("task checkout presence exceeds bounded task maximum")
+    result: dict[str, list[str]] = {}
+    for task_id, checkout_keys in sorted(checkout_keys_by_task.items()):
+        if len(checkout_keys) > current_work.MAX_EVIDENCE:
+            raise RuntimeError("task checkout presence exceeds bounded evidence maximum")
+        result[task_id] = sorted(checkout_keys)
+    return result, True
+
+
 def _reconciliation_payload(repositories: list[str]) -> dict[str, Any]:
     reconciler = _module("grabowski_checkout_binding_reconciler")
-    return reconciler.reconcile_checkout_bindings(
+    database_snapshot = reconciler.collect_lifecycle_bindings_from_db()
+    payload = reconciler.reconcile_checkout_bindings(
         repository_filters=repositories,
         limit=reconciler.MAX_PAGE_LIMIT,
         git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
+        _database_snapshot=database_snapshot,
     )
+    (
+        task_checkout_presence,
+        task_checkout_presence_complete,
+    ) = _task_checkout_presence(
+        repositories,
+        reconciler=reconciler,
+        reconciliation_payload=payload,
+        database_snapshot=database_snapshot,
+    )
+    return {
+        **payload,
+        "task_checkout_presence": task_checkout_presence,
+        "task_checkout_presence_complete": task_checkout_presence_complete,
+    }
+
+
+def _current_work_attention_task_ids(
+    tasks_payload: dict[str, Any],
+    resources_payload: dict[str, Any],
+    reconciliation_payload: dict[str, Any],
+    *,
+    lease_task_ids: list[str],
+    lease_task_ids_truncated: bool,
+) -> set[str] | None:
+    task_pagination = tasks_payload.get("pagination")
+    task_rows = tasks_payload.get("tasks")
+    leases = resources_payload.get("leases")
+    resource_count = resources_payload.get("count")
+    if (
+        not isinstance(task_pagination, dict)
+        or task_pagination.get("has_more") is not False
+        or not isinstance(task_rows, list)
+        or lease_task_ids_truncated
+        or resources_payload.get("truncated") is not False
+        or not isinstance(leases, list)
+        or isinstance(resource_count, bool)
+        or not isinstance(resource_count, int)
+        or resource_count != len(leases)
+        or reconciliation_payload.get("task_checkout_presence_complete") is not True
+    ):
+        return None
+
+    task_checkout_presence = reconciliation_payload.get(
+        "task_checkout_presence", {}
+    )
+    if not isinstance(task_checkout_presence, dict):
+        return None
+
+    task_ids = set(lease_task_ids)
+    for item in task_rows:
+        if not isinstance(item, dict):
+            return None
+        task_id = item.get("task_id")
+        if not isinstance(task_id, str):
+            return None
+        task_ids.add(task_id)
+    for task_id in task_checkout_presence:
+        if not isinstance(task_id, str):
+            return None
+        task_ids.add(task_id)
+    return task_ids
 
 
 def _tmux_payload() -> dict[str, Any]:
@@ -241,6 +439,23 @@ def _worker_payload(kind: str, view: str) -> dict[str, Any]:
     return workers.worker_list(kind, MAX_SOURCE_WORKERS, view=view)
 
 
+def _collect_independent_source(
+    source: str,
+    capability: str,
+    loader: Callable[[list[dict[str, Any]]], Any],
+    default: Any,
+) -> tuple[Any, list[dict[str, Any]]]:
+    errors: list[dict[str, Any]] = []
+    value = _attempt_source(
+        source,
+        capability,
+        lambda: loader(errors),
+        errors,
+        default,
+    )
+    return value, errors
+
+
 def grabowski_current_work(
     repositories: list[str],
     view: str = "current",
@@ -253,81 +468,159 @@ def grabowski_current_work(
         raise ValueError("view must be current or history")
 
     source_errors: list[dict[str, Any]] = []
-    resources_payload = _attempt_source(
-        "resources",
-        "resource_lease",
-        _resources_payload,
-        source_errors,
-        {"leases": [], "count": 0, "truncated": True},
-    )
-    lease_task_ids, lease_task_ids_truncated = _task_lease_ids(resources_payload)
-    tasks_payload = _attempt_source(
-        "tasks",
-        "durable_job",
-        lambda: _task_payload(
-            view,
-            lease_task_ids,
-            required_ids_truncated=lease_task_ids_truncated,
+    independent_sources = [
+        (
+            "checkouts",
+            "git_cli",
+            lambda errors: _checkout_payloads(repository_filters, errors),
+            [
+                {"repository": repository, "worktrees": [], "truncated": True}
+                for repository in repository_filters
+            ],
         ),
-        source_errors,
-        {"tasks": [], "pagination": {"has_more": True}},
-    )
-    attention_payload = _attempt_source(
+        (
+            "tmux",
+            "tmux_interaction",
+            lambda _errors: _tmux_payload(),
+            {"returncode": 1, "stdout": ""},
+        ),
+        (
+            "processes",
+            "process_inspect",
+            lambda _errors: _process_payload(),
+            {"returncode": 1, "lines": []},
+        ),
+        (
+            "browser_workers",
+            "browser_worker",
+            lambda _errors: _worker_payload("browser", view),
+            {"workers": [], "has_more": True},
+        ),
+        (
+            "gui_workers",
+            "gui_worker",
+            lambda _errors: _worker_payload("gui", view),
+            {"workers": [], "has_more": True},
+        ),
+    ]
+    source_order = [
         "attention",
-        "durable_job",
-        lambda: _attention_payload(view),
-        source_errors,
-        {"records": [], "pagination": {"has_more": True}},
-    )
-    checkout_payloads = _attempt_source(
         "checkouts",
-        "git_cli",
-        lambda: _checkout_payloads(repository_filters, source_errors),
-        source_errors,
-        [
-            {"repository": repository, "worktrees": [], "truncated": True}
-            for repository in repository_filters
-        ],
-    )
-    reconciliation_payload = _attempt_source(
         "checkout_binding_reconciliation",
-        "git_cli",
-        lambda: _reconciliation_payload(repository_filters),
-        source_errors,
-        {
-            "bindings": [],
-            "pagination": {"has_more": True},
-            "total_count": 0,
-        },
-    )
-    tmux_payload = _attempt_source(
         "tmux",
-        "tmux_interaction",
-        _tmux_payload,
-        source_errors,
-        {"returncode": 1, "stdout": ""},
-    )
-    process_payload = _attempt_source(
         "processes",
-        "process_inspect",
-        _process_payload,
-        source_errors,
-        {"returncode": 1, "lines": []},
-    )
-    browser_payload = _attempt_source(
         "browser_workers",
-        "browser_worker",
-        lambda: _worker_payload("browser", view),
-        source_errors,
-        {"workers": [], "has_more": True},
-    )
-    gui_payload = _attempt_source(
         "gui_workers",
-        "gui_worker",
-        lambda: _worker_payload("gui", view),
-        source_errors,
-        {"workers": [], "has_more": True},
-    )
+    ]
+
+    with ThreadPoolExecutor(
+        max_workers=min(CURRENT_WORK_MAX_PARALLEL_SOURCES, len(independent_sources)),
+        thread_name_prefix="grabowski-current-work",
+    ) as executor:
+        futures = {
+            source: executor.submit(
+                _collect_independent_source,
+                source,
+                capability,
+                loader,
+                default,
+            )
+            for source, capability, loader, default in independent_sources
+        }
+
+        # Resource leases determine which exact task lifecycles must be retained,
+        # so this dependency stays ordered while independent sources overlap it.
+        resources_payload = _attempt_source(
+            "resources",
+            "resource_lease",
+            _resources_payload,
+            source_errors,
+            {"leases": [], "count": 0, "truncated": True},
+        )
+        lease_task_ids, lease_task_ids_truncated = _task_lease_ids(resources_payload)
+        tasks_payload = _attempt_source(
+            "tasks",
+            "durable_job",
+            lambda: _task_payload(
+                view,
+                lease_task_ids,
+                required_ids_truncated=lease_task_ids_truncated,
+            ),
+            source_errors,
+            {"tasks": [], "pagination": {"has_more": True}},
+        )
+
+        # Checkout inventory and binding reconciliation share checkout-binding
+        # storage. Keep that pair ordered while still overlapping it with the
+        # other independent read surfaces.
+        independent_results = {
+            "checkouts": futures["checkouts"].result(),
+        }
+        reconciliation_future = executor.submit(
+            _collect_independent_source,
+            "checkout_binding_reconciliation",
+            "git_cli",
+            lambda _errors: _reconciliation_payload(repository_filters),
+            {
+                "bindings": [],
+                "pagination": {"has_more": True},
+                "total_count": 0,
+            },
+        )
+        for source, future in futures.items():
+            if source == "checkouts":
+                continue
+            independent_results[source] = future.result()
+        independent_results["checkout_binding_reconciliation"] = (
+            reconciliation_future.result()
+        )
+
+        reconciliation_payload_for_attention = independent_results[
+            "checkout_binding_reconciliation"
+        ][0]
+        current_work_task_ids = (
+            _current_work_attention_task_ids(
+                tasks_payload,
+                resources_payload,
+                reconciliation_payload_for_attention,
+                lease_task_ids=lease_task_ids,
+                lease_task_ids_truncated=lease_task_ids_truncated,
+            )
+            if view == "current"
+            else None
+        )
+        # Attention is collected last so orphan suppression is bound to the same
+        # complete task/lease/exact-checkout presence evidence used by current_work.
+        attention_loader = (
+            (lambda _errors: _attention_payload(view))
+            if current_work_task_ids is None
+            else (
+                lambda _errors: _attention_payload(
+                    view,
+                    current_work_task_ids=current_work_task_ids,
+                )
+            )
+        )
+        independent_results["attention"] = _collect_independent_source(
+            "attention",
+            "durable_job",
+            attention_loader,
+            {"records": [], "pagination": {"has_more": True}},
+        )
+
+    independent_payloads: dict[str, Any] = {}
+    for source in source_order:
+        payload, errors = independent_results[source]
+        independent_payloads[source] = payload
+        source_errors.extend(errors)
+
+    attention_payload = independent_payloads["attention"]
+    checkout_payloads = independent_payloads["checkouts"]
+    reconciliation_payload = independent_payloads["checkout_binding_reconciliation"]
+    tmux_payload = independent_payloads["tmux"]
+    process_payload = independent_payloads["processes"]
+    browser_payload = independent_payloads["browser_workers"]
+    gui_payload = independent_payloads["gui_workers"]
 
     return current_work.build_current_work_projection(
         tasks_payload=tasks_payload,

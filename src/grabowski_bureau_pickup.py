@@ -38,15 +38,8 @@ STATE_ROOT = Path(
         str(operator.STATE_DIR / "bureau-pickup"),
     )
 ).expanduser()
-LEGACY_COORDINATION_ROOT = Path(
-    os.environ.get("BUREAU_STATE_DIR", "~/.local/state/bureau")
-).expanduser()
-COORDINATION_ROOT = Path(
-    os.environ.get(
-        "GRABOWSKI_BUREAU_COORDINATION_ROOT",
-        str(LEGACY_COORDINATION_ROOT),
-    )
-).expanduser()
+LEGACY_COORDINATION_ROOT = bureau.BUREAU_LEGACY_STATE_ROOT
+COORDINATION_ROOT = bureau.BUREAU_STATE_ROOT
 RUN_ID_RE = re.compile(r"^BUR-RUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
@@ -466,11 +459,11 @@ def _private_root() -> Path:
 
 
 def _default_coordination_root() -> Path:
-    return _absolute_path(COORDINATION_ROOT)
+    return bureau._absolute_bureau_state_root(COORDINATION_ROOT)
 
 
 def _legacy_coordination_root() -> Path:
-    return _absolute_path(LEGACY_COORDINATION_ROOT)
+    return bureau._absolute_bureau_state_root(LEGACY_COORDINATION_ROOT)
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:

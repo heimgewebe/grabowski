@@ -337,7 +337,10 @@ def _target_contract_evidence(repository: Path, expected_head: str) -> dict[str,
 
 
 def _competing_deployment_evidence(
-    command: list[str] | None = None, *, prune: bool = False
+    command: list[str] | None = None,
+    *,
+    prune: bool = False,
+    reconcile_stale_pending: bool = False,
 ) -> dict[str, Any]:
     """Detect an in-flight deployment that this lane must not race.
 
@@ -355,6 +358,9 @@ def _competing_deployment_evidence(
         "inflight_deploy_jobs": [],
         "idempotent_match": None,
         "pruned_units": [],
+        "stale_pending_reconciliation": None,
+        "deploy_index_mutation": None,
+        "local_mutation_evidence": None,
         "error": None,
     }
     lock_path = Path.home() / ".local/state/grabowski/deploy.lock"
@@ -373,14 +379,35 @@ def _competing_deployment_evidence(
             evidence["error"] = f"deploy lock is unreadable: {exc}"
             return evidence
 
-    indexed = self_deploy.inflight_runtime_job_evidence(command, prune=prune)
+    indexed = self_deploy.inflight_runtime_job_evidence(
+        command,
+        prune=prune,
+        reconcile_stale_pending=reconcile_stale_pending,
+    )
     evidence["inflight_deploy_jobs"] = list(indexed["blocking_units"])
     evidence["inflight_units"] = list(indexed["inflight_units"])
     evidence["idempotent_match"] = indexed["idempotent_match"]
     evidence["pruned_units"] = list(indexed["pruned_units"])
+    evidence["stale_pending_reconciliation"] = indexed.get(
+        "stale_pending_reconciliation"
+    )
+    evidence["deploy_index_mutation"] = indexed.get("deploy_index_mutation")
+    evidence["local_mutation_evidence"] = _recovery_local_mutation_evidence(evidence)
     if indexed["error"] is not None:
         evidence["error"] = indexed["error"]
     return evidence
+
+
+def _recovery_local_mutation_evidence(
+    competing: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Use the scheduler's ordered evidence bundle for both recovery lanes."""
+    return self_deploy._tracked_runtime_deploy_local_mutation_evidence(
+        {
+            "deploy_index_mutation": competing.get("deploy_index_mutation"),
+            "stale_pending_reconciliation": competing.get("stale_pending_reconciliation"),
+        }
+    )
 
 
 def _blockade_evidence(repository: Path | None) -> dict[str, Any]:
@@ -412,23 +439,49 @@ def _volatile_gate_recheck(
     """Re-read the gates that can change between assessment and dispatch."""
     kill_switch = base._kill_switch_state()
     blockade = _blockade_evidence(repository)
-    # Carries the exact argv: the recheck runs under the schedule lock, which is
-    # where an identical intent that started meanwhile must be recognised as
-    # ours rather than dispatched a second time.
-    competing = _competing_deployment_evidence(command, prune=True)
+    kill_switch_clear = not bool(kill_switch.get("engaged"))
+    blockade_allows_mutation = bool(blockade["allows_mutation"])
+    mutation_allowed = kill_switch_clear and blockade_allows_mutation
+    # Stop-gate classification must not touch deploy-index readers at all:
+    # _deploy_index() may normalize a pending started unit by writing the index.
+    # Once either stop gate denies mutation, competing-deploy classification is
+    # explicitly not evaluated; the failed stop gate already closes dispatch.
+    if mutation_allowed:
+        competing = _competing_deployment_evidence(
+            command,
+            prune=True,
+            reconcile_stale_pending=True,
+        )
+    else:
+        competing = {
+            "state": "not_evaluated_due_to_stop_gate",
+            "deploy_lock_free": None,
+            "inflight_deploy_jobs": [],
+            "inflight_units": [],
+            "idempotent_match": None,
+            "pruned_units": [],
+            "stale_pending_reconciliation": None,
+            "error": None,
+        }
     checks = {
-        "kill_switch_clear": not bool(kill_switch.get("engaged")),
-        "no_blocking_operator_blockade": bool(blockade["allows_mutation"]),
+        "kill_switch_clear": kill_switch_clear,
+        "no_blocking_operator_blockade": blockade_allows_mutation,
         "no_competing_deployment": (
-            bool(competing.get("deploy_lock_free"))
-            and not competing.get("inflight_deploy_jobs")
-            and competing.get("error") is None
+            None
+            if not mutation_allowed
+            else (
+                bool(competing.get("deploy_lock_free"))
+                and not competing.get("inflight_deploy_jobs")
+                and competing.get("error") is None
+            )
         ),
     }
     return {
         "checked_at_unix": int(time.time()),
         "checks": checks,
-        "reasons": sorted(name for name, passed in checks.items() if not passed),
+        "reasons": sorted(
+            name for name, passed in checks.items() if passed is False
+        ),
         "operator_blockade": blockade,
         "competing_deployment": competing,
     }
@@ -928,6 +981,30 @@ def grabowski_recovery_provenance_repair(
         )
 
 
+def _initial_gate_admits_locked_recheck(gate: dict[str, Any]) -> bool:
+    """Defer only clean competition to the command-bound locked recheck.
+
+    An assessment cannot identify our command or clear stale reservations. Every
+    independent authority check must already pass before that recheck may run.
+    """
+    if gate.get("allowed") is True:
+        return not gate.get("reasons")
+    checks = gate.get("checks", {})
+    competing = gate.get("competing_deployment", {})
+    return bool(
+        gate.get("reasons") == ["no_competing_deployment"]
+        and len(checks) > 1
+        and checks.get("no_competing_deployment") is False
+        and all(
+            passed is True
+            for name, passed in checks.items()
+            if name != "no_competing_deployment"
+        )
+        and competing.get("deploy_lock_free") is True
+        and competing.get("error") is None
+    )
+
+
 def _resume_under_schedule_lock(
     expected_head: str,
     source_repository: str | None = None,
@@ -935,7 +1012,7 @@ def _resume_under_schedule_lock(
 ) -> dict[str, Any]:
     """Gate, source-bind and dispatch the mid-cutover resume under the deploy lock."""
     gate = evaluate_resume_gate(expected_head)
-    if not gate["allowed"]:
+    if not _initial_gate_admits_locked_recheck(gate):
         base._append_audit(
             {
                 "timestamp_unix": int(time.time()),
@@ -999,20 +1076,33 @@ def _resume_under_schedule_lock(
     # Absent evidence is not a match: a recheck that carries no competing-job
     # projection means nothing was recognised as ours, which must dispatch
     # normally rather than silently coalesce onto nothing.
-    already_running = (volatile.get("competing_deployment") or {}).get(
-        "idempotent_match"
+    competing_deployment = volatile.get("competing_deployment") or {}
+    already_running = competing_deployment.get("idempotent_match")
+    stale_pending_reconciliation = competing_deployment.get(
+        "stale_pending_reconciliation"
     )
+    local_mutation_evidence = _recovery_local_mutation_evidence(competing_deployment)
     if already_running is not None and not volatile["reasons"]:
-        base._append_audit(
-            {
-                "timestamp_unix": int(time.time()),
-                "operation": "midcutover-resume-coalesced",
-                "expected_head": expected_head,
-                "cutover_id": resume_binding["cutover_id"],
-                "unit": already_running["unit"],
-                "intent_sha256": intent_sha256,
-            }
-        )
+        try:
+            base._append_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "midcutover-resume-coalesced",
+                    "expected_head": expected_head,
+                    "cutover_id": resume_binding["cutover_id"],
+                    "unit": already_running["unit"],
+                    "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "local_mutation_evidence": local_mutation_evidence,
+                    "intent_sha256": intent_sha256,
+                }
+            )
+        except Exception as exc:
+            if local_mutation_evidence is not None:
+                raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                    f"{type(exc).__name__}: {exc}",
+                    local_mutation_evidence=local_mutation_evidence,
+                ) from exc
+            raise
         return {
             "schema_version": SCHEMA_VERSION,
             "kind": "grabowski_midcutover_resume_receipt",
@@ -1020,8 +1110,11 @@ def _resume_under_schedule_lock(
             "expected_head": expected_head,
             "cutover_id": resume_binding["cutover_id"],
             "gate": gate,
+            "recheck": volatile,
             "job": already_running,
             "already_dispatched": True,
+            "stale_pending_reconciliation": stale_pending_reconciliation,
+            "local_mutation_evidence": local_mutation_evidence,
             "intent_sha256": intent_sha256,
             "source_identity_sha256": source_identity["identity_sha256"],
             "post_state_readback_required": True,
@@ -1035,26 +1128,50 @@ def _resume_under_schedule_lock(
             ],
         }
     if volatile["reasons"]:
-        base._append_audit(
-            {
-                "timestamp_unix": int(time.time()),
-                "operation": "midcutover-resume-aborted-before-dispatch",
-                "expected_head": expected_head,
-                "reasons": volatile["reasons"],
-                "intent_sha256": intent_sha256,
-            }
-        )
+        try:
+            base._append_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "midcutover-resume-aborted-before-dispatch",
+                    "expected_head": expected_head,
+                    "reasons": volatile["reasons"],
+                    "intent_sha256": intent_sha256,
+                    "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "local_mutation_evidence": local_mutation_evidence,
+                }
+            )
+        except Exception as exc:
+            if local_mutation_evidence is not None:
+                raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                    f"{type(exc).__name__}: {exc}",
+                    local_mutation_evidence=local_mutation_evidence,
+                ) from exc
+            raise
+        if local_mutation_evidence is not None:
+            raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                "provenance recovery denied after local mutation: "
+                + ",".join(volatile["reasons"]),
+                local_mutation_evidence=local_mutation_evidence,
+            )
         raise ProvenanceRecoveryDenied(
             volatile["reasons"], {**gate, "recheck": volatile}
         )
 
-    jobs_root = operator._jobs_root()
-    reserved_unit = self_deploy.DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
-    self_deploy._write_deploy_index(
-        jobs_root,
-        units=self_deploy._deploy_index(jobs_root)["units"],
-        pending_unit=reserved_unit,
-    )
+    try:
+        jobs_root = operator._jobs_root()
+        reserved_unit = self_deploy.DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
+        self_deploy._write_deploy_index(
+            jobs_root,
+            units=self_deploy._deploy_index(jobs_root)["units"],
+            pending_unit=reserved_unit,
+        )
+    except Exception as exc:
+        if local_mutation_evidence is not None:
+            raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                f"{type(exc).__name__}: {exc}",
+                local_mutation_evidence=local_mutation_evidence,
+            ) from exc
+        raise
     try:
         job = operator._start_job(
             command,
@@ -1065,19 +1182,35 @@ def _resume_under_schedule_lock(
             invoker_tool="grabowski_recovery_provenance_repair",
         )
     except operator.JobDispatchUnknown as exc:
-        base._append_audit(
-            {
-                "timestamp_unix": int(time.time()),
-                "operation": "midcutover-resume-dispatch-outcome-unknown",
-                "expected_head": expected_head,
-                "cutover_id": resume_binding["cutover_id"],
-                "unit": exc.unit,
-                "evidence": exc.evidence,
-                "intent_sha256": intent_sha256,
-            }
-        )
+        dispatch_evidence = dict(exc.evidence)
+        if local_mutation_evidence is not None:
+            dispatch_evidence["local_mutation_evidence"] = local_mutation_evidence
+            if stale_pending_reconciliation is not None:
+                dispatch_evidence["stale_pending_reconciliation"] = stale_pending_reconciliation
+        try:
+            base._append_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "midcutover-resume-dispatch-outcome-unknown",
+                    "expected_head": expected_head,
+                    "cutover_id": resume_binding["cutover_id"],
+                    "unit": exc.unit,
+                    "evidence": dispatch_evidence,
+                    "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "local_mutation_evidence": local_mutation_evidence,
+                    "intent_sha256": intent_sha256,
+                }
+            )
+        except Exception as audit_exc:
+            dispatch_evidence["audit_append_error"] = (
+                f"{type(audit_exc).__name__}: {audit_exc}"
+            )
+            exc.evidence = dispatch_evidence
+            raise exc from audit_exc
+        if local_mutation_evidence is not None:
+            exc.evidence = dispatch_evidence
         raise
-    except Exception:
+    except Exception as exc:
         try:
             self_deploy._write_deploy_index(
                 jobs_root,
@@ -1086,6 +1219,11 @@ def _resume_under_schedule_lock(
             )
         except Exception:  # noqa: BLE001 - the start failure is the real error
             pass
+        if local_mutation_evidence is not None:
+            raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                f"{type(exc).__name__}: {exc}",
+                local_mutation_evidence=local_mutation_evidence,
+            ) from exc
         raise
 
     post_dispatch_warnings: list[str] = list(job.get("post_dispatch_warnings") or [])
@@ -1099,6 +1237,8 @@ def _resume_under_schedule_lock(
                 "unit": job["unit"],
                 "argv_sha256": job["argv_sha256"],
                 "source_identity_sha256": source_identity["identity_sha256"],
+                "stale_pending_reconciliation": stale_pending_reconciliation,
+                "local_mutation_evidence": local_mutation_evidence,
             }
         )
     except Exception as exc:  # noqa: BLE001 - effect already dispatched
@@ -1125,9 +1265,12 @@ def _resume_under_schedule_lock(
         "resume_binding_sha256": resume_binding["binding_sha256"],
         "source_identity_sha256": source_identity["identity_sha256"],
         "gate": gate,
+        "recheck": volatile,
         "job": job,
         "intent_sha256": intent_sha256,
         "scheduled_sha256": scheduled_sha256,
+        "stale_pending_reconciliation": stale_pending_reconciliation,
+        "local_mutation_evidence": local_mutation_evidence,
         "post_dispatch_warnings": post_dispatch_warnings,
         "post_state_readback_required": True,
         "next_action": (
@@ -1151,7 +1294,7 @@ def _repair_under_schedule_lock(
 ) -> dict[str, Any]:
     """Gate, reserve and dispatch, all under the deploy schedule lock."""
     gate = evaluate_gate(expected_head, source_repository, source_lease_owner_id)
-    if not gate["allowed"]:
+    if not _initial_gate_admits_locked_recheck(gate):
         base._append_audit(
             {
                 "timestamp_unix": int(time.time()),
@@ -1215,29 +1358,45 @@ def _repair_under_schedule_lock(
     # Absent evidence is not a match: a recheck that carries no competing-job
     # projection means nothing was recognised as ours, which must dispatch
     # normally rather than silently coalesce onto nothing.
-    already_running = (volatile.get("competing_deployment") or {}).get(
-        "idempotent_match"
+    competing_deployment = volatile.get("competing_deployment") or {}
+    already_running = competing_deployment.get("idempotent_match")
+    stale_pending_reconciliation = competing_deployment.get(
+        "stale_pending_reconciliation"
     )
+    local_mutation_evidence = _recovery_local_mutation_evidence(competing_deployment)
     if already_running is not None and not volatile["reasons"]:
         # This exact intent is already in flight.  Starting a second job would
         # be the historically observed double dispatch, so the existing one is
         # returned instead: same argv, same target, same receipt lineage.
-        base._append_audit(
-            {
-                "timestamp_unix": int(time.time()),
-                "operation": "provenance-recovery-coalesced",
-                "expected_head": expected_head,
-                "unit": already_running["unit"],
-                "intent_sha256": intent_sha256,
-            }
-        )
+        try:
+            base._append_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "provenance-recovery-coalesced",
+                    "expected_head": expected_head,
+                    "unit": already_running["unit"],
+                    "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "local_mutation_evidence": local_mutation_evidence,
+                    "intent_sha256": intent_sha256,
+                }
+            )
+        except Exception as exc:
+            if local_mutation_evidence is not None:
+                raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                    f"{type(exc).__name__}: {exc}",
+                    local_mutation_evidence=local_mutation_evidence,
+                ) from exc
+            raise
         return {
             "schema_version": SCHEMA_VERSION,
             "kind": "grabowski_provenance_recovery_receipt",
             "expected_head": expected_head,
             "gate": gate,
+            "recheck": volatile,
             "job": already_running,
             "already_dispatched": True,
+            "stale_pending_reconciliation": stale_pending_reconciliation,
+            "local_mutation_evidence": local_mutation_evidence,
             "intent_sha256": intent_sha256,
             "repair_intent_id": repair_intent_id,
             "post_state_readback_required": True,
@@ -1251,24 +1410,48 @@ def _repair_under_schedule_lock(
             ],
         }
     if volatile["reasons"]:
-        base._append_audit(
-            {
-                "timestamp_unix": int(time.time()),
-                "operation": "provenance-recovery-aborted-before-dispatch",
-                "expected_head": expected_head,
-                "reasons": volatile["reasons"],
-                "intent_sha256": intent_sha256,
-            }
-        )
+        try:
+            base._append_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "provenance-recovery-aborted-before-dispatch",
+                    "expected_head": expected_head,
+                    "reasons": volatile["reasons"],
+                    "intent_sha256": intent_sha256,
+                    "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "local_mutation_evidence": local_mutation_evidence,
+                }
+            )
+        except Exception as exc:
+            if local_mutation_evidence is not None:
+                raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                    f"{type(exc).__name__}: {exc}",
+                    local_mutation_evidence=local_mutation_evidence,
+                ) from exc
+            raise
+        if local_mutation_evidence is not None:
+            raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                "provenance recovery denied after local mutation: "
+                + ",".join(volatile["reasons"]),
+                local_mutation_evidence=local_mutation_evidence,
+            )
         raise ProvenanceRecoveryDenied(volatile["reasons"], {**gate, "recheck": volatile})
 
-    jobs_root = operator._jobs_root()
-    reserved_unit = self_deploy.DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
-    self_deploy._write_deploy_index(
-        jobs_root,
-        units=self_deploy._deploy_index(jobs_root)["units"],
-        pending_unit=reserved_unit,
-    )
+    try:
+        jobs_root = operator._jobs_root()
+        reserved_unit = self_deploy.DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
+        self_deploy._write_deploy_index(
+            jobs_root,
+            units=self_deploy._deploy_index(jobs_root)["units"],
+            pending_unit=reserved_unit,
+        )
+    except Exception as exc:
+        if local_mutation_evidence is not None:
+            raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                f"{type(exc).__name__}: {exc}",
+                local_mutation_evidence=local_mutation_evidence,
+            ) from exc
+        raise
     try:
         job = operator._start_job(
             command,
@@ -1284,19 +1467,35 @@ def _repair_under_schedule_lock(
         # second repair start alongside it, and reporting a clean failure would
         # be a lie about an effect that may already exist.  Keep the
         # reservation, record the ambiguity, and make the operator read back.
-        base._append_audit(
-            {
-                "timestamp_unix": int(time.time()),
-                "operation": "provenance-recovery-dispatch-outcome-unknown",
-                "expected_head": expected_head,
-                "repair_intent_id": repair_intent_id,
-                "unit": exc.unit,
-                "evidence": exc.evidence,
-                "intent_sha256": intent_sha256,
-            }
-        )
+        dispatch_evidence = dict(exc.evidence)
+        if local_mutation_evidence is not None:
+            dispatch_evidence["local_mutation_evidence"] = local_mutation_evidence
+            if stale_pending_reconciliation is not None:
+                dispatch_evidence["stale_pending_reconciliation"] = stale_pending_reconciliation
+        try:
+            base._append_audit(
+                {
+                    "timestamp_unix": int(time.time()),
+                    "operation": "provenance-recovery-dispatch-outcome-unknown",
+                    "expected_head": expected_head,
+                    "repair_intent_id": repair_intent_id,
+                    "unit": exc.unit,
+                    "evidence": dispatch_evidence,
+                    "stale_pending_reconciliation": stale_pending_reconciliation,
+                    "local_mutation_evidence": local_mutation_evidence,
+                    "intent_sha256": intent_sha256,
+                }
+            )
+        except Exception as audit_exc:
+            dispatch_evidence["audit_append_error"] = (
+                f"{type(audit_exc).__name__}: {audit_exc}"
+            )
+            exc.evidence = dispatch_evidence
+            raise exc from audit_exc
+        if local_mutation_evidence is not None:
+            exc.evidence = dispatch_evidence
         raise
-    except Exception:
+    except Exception as exc:
         # Definitive non-start, so the reservation must go.  Re-read rather than
         # restoring the snapshot taken before the attempt: another deploy may
         # have finished and removed itself meanwhile, and writing back the stale
@@ -1309,6 +1508,11 @@ def _repair_under_schedule_lock(
             )
         except Exception:  # noqa: BLE001 - the start failure is the real error
             pass
+        if local_mutation_evidence is not None:
+            raise self_deploy.DeployScheduleFailureAfterLocalMutation(
+                f"{type(exc).__name__}: {exc}",
+                local_mutation_evidence=local_mutation_evidence,
+            ) from exc
         raise
 
     # The effect now exists.  From here on nothing may raise: an exception after
@@ -1324,6 +1528,8 @@ def _repair_under_schedule_lock(
         "unit": job["unit"],
         "argv_sha256": job["argv_sha256"],
         "source_identity_sha256": source_identity["identity_sha256"],
+        "stale_pending_reconciliation": stale_pending_reconciliation,
+        "local_mutation_evidence": local_mutation_evidence,
     }
     post_dispatch_warnings: list[str] = list(job.get("post_dispatch_warnings") or [])
     try:
@@ -1347,10 +1553,13 @@ def _repair_under_schedule_lock(
         "kind": "grabowski_provenance_recovery_receipt",
         "expected_head": expected_head,
         "gate": gate,
+        "recheck": volatile,
         "job": job,
         "intent_sha256": intent_sha256,
         "scheduled_sha256": scheduled_sha256,
         "repair_intent_id": repair_intent_id,
+        "stale_pending_reconciliation": stale_pending_reconciliation,
+        "local_mutation_evidence": local_mutation_evidence,
         "post_dispatch_warnings": post_dispatch_warnings,
         "post_state_readback_required": True,
         "next_action": (

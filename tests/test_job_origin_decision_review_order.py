@@ -62,6 +62,48 @@ def build(suffix: str, observed_ns: int | None) -> tuple[dict, str]:
     )
 
 
+class RepoGroundReservedJobOriginTests(unittest.TestCase):
+    def test_reserved_unit_origin_round_trip_remains_exact(self) -> None:
+        unit = "grabowski-job-rgpm-" + "a" * 16 + "-01"
+        origin, digest = job_origin.build_origin(
+            unit=unit,
+            owner=f"uid:{os.getuid()}",
+            argv_sha256="e" * 64,
+            scope={
+                "cwd": "/tmp",
+                "argv_sha256": "e" * 64,
+                "runtime_seconds": 60,
+            },
+            notify_on_done={"requested": False, "channels": []},
+            created_at_unix=100,
+            started_at="1970-01-01T00:01:40Z",
+            invoker_tool="grabowski_job_start",
+        )
+        self.assertEqual(origin["unit"], unit)
+        self.assertEqual(origin["job_id"], "rgpm-" + "a" * 16 + "-01")
+        self.assertEqual(
+            job_origin.validate_origin(origin, digest, expected_unit=unit),
+            origin,
+        )
+
+    def test_reserved_unit_name_admits_no_other_shapes(self) -> None:
+        names = (
+            "grabowski-job-rgpm-" + "a" * 15 + "-01",
+            "grabowski-job-rgpm-" + "a" * 17 + "-01",
+            "grabowski-job-rgpm-" + "a" * 16 + "-1",
+            "grabowski-job-rgpm-" + "a" * 16 + "-001",
+            "grabowski-job-rgpm-" + "z" * 16 + "-01",
+            "grabowski-job-rgpm-" + "a" * 16 + "-0x",
+            "grabowski-job-rgpm-" + "a" * 16 + "-01-extra",
+        )
+        for name in names:
+            with self.subTest(unit=name):
+                self.assertIsNone(job_origin.UNIT_RE.fullmatch(name))
+        self.assertIsNotNone(
+            job_origin.UNIT_RE.fullmatch("grabowski-job-" + "f" * 12)
+        )
+
+
 class DecisionReviewLogicalClockTests(unittest.TestCase):
     def roots(self, temporary: str):
         root = Path(temporary)

@@ -29,6 +29,7 @@ CANONICAL_ORIGIN_URL = "git@github.com:heimgewebe/grabowski.git"
 RECOVERY_WORKTREE_ROOT = Path("/home/alex/repos/.grabowski-deploy-worktrees/runtime-bootstrap")
 RUNTIME_MANIFEST = Path("/home/alex/.local/share/grabowski-mcp/deployment-manifest.json")
 SCHEDULE_LOCK = Path("/home/alex/.local/state/grabowski/runtime-deploy-schedule.lock")
+CHECKOUT_OPERATION_LOCK = Path("/home/alex/.local/state/grabowski/checkouts.lock")
 ROOT_HELPER = Path("/usr/local/libexec/grabowski-runtime-bootstrap-recover")
 ROOT_KILL_SWITCH = Path("/var/lib/grabowski/operator-blockade/operator-kill-switch")
 LEGACY_KILL_SWITCH = Path("/home/alex/.local/state/grabowski/operator-kill-switch")
@@ -301,6 +302,46 @@ def _runtime_manifest_readback(expected_head: str) -> dict[str, Any]:
 
 
 @contextmanager
+def _checkout_operation_lock() -> Iterator[None]:
+    """Serialize standalone recovery worktree mutations with Grabowski runtime."""
+
+    parent = _safe_user_directory(
+        CHECKOUT_OPERATION_LOCK.parent,
+        require_private=True,
+    )
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(parent / CHECKOUT_OPERATION_LOCK.name, flags, 0o600)
+    locked = False
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != DEPLOY_UID
+            or metadata.st_nlink != 1
+        ):
+            raise BootstrapRecoveryError("checkout operation lock identity is unsafe")
+        os.fchmod(descriptor, 0o600)
+        deadline = time.monotonic() + SCHEDULE_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+                break
+            except BlockingIOError as exc:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BootstrapRecoveryError(
+                        "checkout operation lock is held by another worktree mutation"
+                    ) from exc
+                time.sleep(min(SCHEDULE_LOCK_POLL_SECONDS, remaining))
+        yield
+    finally:
+        if locked:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+@contextmanager
 def _schedule_lock() -> Iterator[None]:
     parent = _safe_user_directory(SCHEDULE_LOCK.parent, require_private=True)
     flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
@@ -344,7 +385,8 @@ def _create_recovery_worktree(expected_head: str, execution_id: str) -> tuple[Pa
     path = root / f"runtime-bootstrap-{expected_head[:12]}-{execution_id}"
     if os.path.lexists(path):
         raise BootstrapRecoveryError("recovery worktree path already exists")
-    _git(CANONICAL_REPOSITORY, "worktree", "add", "--detach", str(path), expected_head)
+    with _checkout_operation_lock():
+        _git(CANONICAL_REPOSITORY, "worktree", "add", "--detach", str(path), expected_head)
     os.chmod(path, 0o700)
     try:
         _validate_recovery_worktree(
@@ -358,6 +400,17 @@ def _create_recovery_worktree(expected_head: str, execution_id: str) -> tuple[Pa
         # not yet trusted.
         raise
     return path, expected_common
+
+
+def _remove_recovery_worktree(worktree: Path) -> subprocess.CompletedProcess[bytes]:
+    with _checkout_operation_lock():
+        return _git(
+            CANONICAL_REPOSITORY,
+            "worktree",
+            "remove",
+            str(worktree),
+            accepted_returncodes=(0, 1),
+        )
 
 
 def _deploy_exact(worktree: Path, expected_head: str) -> dict[str, Any]:
@@ -420,13 +473,7 @@ def user_execute(expected_head: str, execution_id: str) -> dict[str, Any]:
                 expected_common=common,
             )
             manifest = _runtime_manifest_readback(expected)
-            remove = _git(
-                CANONICAL_REPOSITORY,
-                "worktree",
-                "remove",
-                str(worktree),
-                accepted_returncodes=(0, 1),
-            )
+            remove = _remove_recovery_worktree(worktree)
             if remove.returncode == 0 and not os.path.lexists(worktree):
                 cleanup = "removed"
             else:

@@ -74,6 +74,21 @@ OPERATOR_SERVICE_CONTROL_ACTION = "operator_system_service_control"
 ROOTBROKER_CUTOVER_ACTION = "operator_rootbroker_cutover"
 SECRET_PTY_ACTION = "operator_secret_pty_getpass_probe"
 PLATFORM_CONNECTOR_CAPTURE_ACTION = "platform_connector_capture"
+CRITICAL_USER_DATA_INVENTORY_ACTION = "critical_user_data_inventory"
+CRITICAL_USER_DATA_INVENTORY_READ_ACTION = "critical_user_data_inventory_read"
+CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN = (
+    r'\{"contract_sha256":"[0-9a-f]{64}",'
+    r'"operation":"start",'
+    r'"scanner_sha256":"[0-9a-f]{64}","schema_version":1\}'
+)
+CRITICAL_USER_DATA_INVENTORY_READ_TARGET_PATTERN = (
+    r'\{"contract_sha256":"[0-9a-f]{64}",'
+    r'"operation":"(?:status|result)",'
+    r'"scanner_sha256":"[0-9a-f]{64}","schema_version":1\}'
+)
+CRITICAL_USER_DATA_INVENTORY_TARGET = (
+    "/usr/local/libexec/grabowski-critical-user-data-inventory"
+)
 LOCAL_BACKUP_NTFS_CHECK_ACTION = "local_backup_ntfs_check"
 LOCAL_BACKUP_NTFS_CLEAR_DIRTY_ACTION = "local_backup_ntfs_clear_dirty"
 LOCAL_BACKUP_SMART_READ_ACTION = "local_backup_smart_read"
@@ -192,6 +207,24 @@ WATCHDOG_HOST_ASSETS = (
     WatchdogHostAsset(
         source=OPERATOR_RECOVERY_TARGET_RELATIVE,
         target=OPERATOR_RECOVERY_TARGET_PATH,
+        mode=0o600,
+        reloads_systemd=True,
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-repoground-post-merge-reconcile.service.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-repoground-post-merge-reconcile.service",
+        mode=0o600,
+        unit="grabowski-repoground-post-merge-reconcile.service",
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-repoground-post-merge-reconcile.timer.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-repoground-post-merge-reconcile.timer",
+        mode=0o600,
+        unit="grabowski-repoground-post-merge-reconcile.timer",
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-operator.service.d/95-repoground-post-merge-reconcile.conf.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-operator.service.d/95-repoground-post-merge-reconcile.conf",
         mode=0o600,
         reloads_systemd=True,
     ),
@@ -397,6 +430,8 @@ MIDCUTOVER_ADMISSION_REUSE_STOP_OPERATIONS = 2
 MIDCUTOVER_ADMISSION_REUSE_START_OPERATIONS = 2
 OPERATOR_ADMISSION_REQUIRED_IDLE_SAMPLES = 2
 OPERATOR_ADMISSION_PROBE_SECONDS = 30
+CANONICAL_ADMISSION_TOPOLOGY_TRANSPORT_ATTEMPTS = 5
+CANONICAL_ADMISSION_TOPOLOGY_RETRY_SECONDS = 0.2
 TUNNEL_DRAIN_DIRECT_METRIC_NAMES = (
     TUNNEL_DRAIN_QUEUE_GAUGE_NAME,
     TUNNEL_DRAIN_WORKER_GAUGE_NAME,
@@ -4010,11 +4045,63 @@ def _operator_admission_call_counts(
     }
 
 
+def _operator_admission_recovery_parent_allowed(
+    observed: dict[str, Any],
+    call_counts: dict[str, Any],
+    *,
+    allow_single_recovery_parent: bool,
+) -> bool:
+    """Whether one exact S3 parent recovery call may remain in flight.
+
+    The aggregate blocking count is necessary but not sufficient evidence: the
+    tool-name projection includes both blocking and read-only calls.  Bind the
+    exception to the complete active-call sample as well, and prove that its one
+    and only drain-blocking entry is the recovery parent itself.  Read-only
+    calls may coexist because retirement intentionally does not wait on them.
+    """
+    if not (
+        allow_single_recovery_parent
+        and call_counts.get("effect_aware") is True
+        and call_counts.get("blocking_tool_calls") == 1
+        and observed.get("active_tool_calls_by_tool_name_truncated") is False
+        and observed.get("active_tool_calls_by_tool_name_omitted_call_count") == 0
+        and observed.get("active_tool_calls_sample_truncated") is False
+    ):
+        return False
+    by_tool_name = observed.get("active_tool_calls_by_tool_name")
+    sample = observed.get("active_tool_calls_sample")
+    active_tool_calls = call_counts.get("active_tool_calls")
+    if (
+        not isinstance(by_tool_name, dict)
+        or by_tool_name.get(MIDCUTOVER_RECOVERY_TOOL_NAME) != 1
+        or not isinstance(sample, list)
+        or isinstance(active_tool_calls, bool)
+        or not isinstance(active_tool_calls, int)
+        or len(sample) != active_tool_calls
+    ):
+        return False
+    blocking_entries: list[dict[str, Any]] = []
+    for entry in sample:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("tool_name"), str)
+            or not isinstance(entry.get("drain_blocking"), bool)
+        ):
+            return False
+        if entry["drain_blocking"]:
+            blocking_entries.append(entry)
+    return bool(
+        len(blocking_entries) == 1
+        and blocking_entries[0]["tool_name"] == MIDCUTOVER_RECOVERY_TOOL_NAME
+    )
+
+
 def wait_for_operator_deployment_admission(
     marker: dict[str, Any],
     *,
     timeout_seconds: int,
     port: int = OPERATOR_LISTENER_PORT,
+    allow_single_recovery_parent: bool = False,
 ) -> dict[str, Any]:
     probe_seconds = min(timeout_seconds, OPERATOR_ADMISSION_PROBE_SECONDS)
     probe_deadline = time.monotonic() + probe_seconds
@@ -4108,9 +4195,15 @@ def wait_for_operator_deployment_admission(
                     phase="operator-admission-drain",
                     details={"observation": observed},
                 )
-            consecutive_idle = (
-                consecutive_idle + 1 if drain_blocking_calls == 0 else 0
+            recovery_parent_allowed = _operator_admission_recovery_parent_allowed(
+                observed,
+                call_counts,
+                allow_single_recovery_parent=allow_single_recovery_parent,
             )
+            drain_settled = (
+                drain_blocking_calls == 0 or recovery_parent_allowed
+            )
+            consecutive_idle = consecutive_idle + 1 if drain_settled else 0
             if consecutive_idle >= OPERATOR_ADMISSION_REQUIRED_IDLE_SAMPLES:
                 return {
                     "supported": True,
@@ -4121,6 +4214,7 @@ def wait_for_operator_deployment_admission(
                     "drain_timeout_seconds": drain_timeout_seconds,
                     "initial_blocking_tool_calls": initial_blocking_tool_calls,
                     "extended_existing_call_drain": extended_existing_call_drain,
+                    "recovery_parent_allowed": recovery_parent_allowed,
                     "probe_attempts": probe_attempts,
                     "transport_retries": transport_retries,
                     "attempts": attempts,
@@ -4159,21 +4253,15 @@ def _verify_operator_deployment_admission_final_guard(
         if isinstance(observed, dict)
         else None
     )
-    recovery_parent_allowed = False
-    if (
-        allow_single_recovery_parent
-        and isinstance(observed, dict)
+    recovery_parent_allowed = bool(
+        isinstance(observed, dict)
         and call_counts is not None
-        and call_counts.get("effect_aware") is True
-        and call_counts.get("blocking_tool_calls") == 1
-        and observed.get("active_tool_calls_by_tool_name_truncated") is False
-        and observed.get("active_tool_calls_by_tool_name_omitted_call_count") == 0
-    ):
-        by_tool_name = observed.get("active_tool_calls_by_tool_name")
-        recovery_parent_allowed = (
-            isinstance(by_tool_name, dict)
-            and by_tool_name.get(MIDCUTOVER_RECOVERY_TOOL_NAME) == 1
+        and _operator_admission_recovery_parent_allowed(
+            observed,
+            call_counts,
+            allow_single_recovery_parent=allow_single_recovery_parent,
         )
+    )
     blocking_calls_valid = bool(
         call_counts is not None
         and (
@@ -5006,9 +5094,15 @@ def require_operator_authority_anchored(
         "broker_module": Path("src/grabowski_privileged_broker.py"),
         "secret_pty_module": Path("src/grabowski_secret_pty.py"),
         "broker_wrapper": Path("tools/grabowski_privileged_broker.py"),
+        "critical_user_data_inventory": Path(
+            "tools/grabowski_critical_user_data_inventory.py"
+        ),
         "platform_connector_capture": Path("tools/grabowski_platform_connector_capture.py"),
         "cutover_helper": Path("tools/grabowski_rootbroker_cutover.py"),
         "operator_service": Path("systemd/grabowski-operator.service.example"),
+        "operator_flowlines_dropin": Path(
+            "systemd/grabowski-operator.service.d/80-flowlines.conf.example"
+        ),
     }
     observed_artifacts = attestation.get("artifact_sha256")
     if not isinstance(observed_artifacts, dict) or set(observed_artifacts) != set(relative_artifacts):
@@ -5049,6 +5143,10 @@ def require_operator_authority_anchored(
     rootbroker_cutover = actions.get(ROOTBROKER_CUTOVER_ACTION)
     secret_pty = actions.get(SECRET_PTY_ACTION)
     platform_connector_capture = actions.get(PLATFORM_CONNECTOR_CAPTURE_ACTION)
+    critical_user_data_inventory = actions.get(CRITICAL_USER_DATA_INVENTORY_ACTION)
+    critical_user_data_inventory_read = actions.get(
+        CRITICAL_USER_DATA_INVENTORY_READ_ACTION
+    )
     backup_storage = {
         name: actions.get(name) for name in LOCAL_BACKUP_STORAGE_ACTIONS
     }
@@ -5060,6 +5158,8 @@ def require_operator_authority_anchored(
             rootbroker_cutover,
             secret_pty,
             platform_connector_capture,
+            critical_user_data_inventory,
+            critical_user_data_inventory_read,
         )
     ):
         core.fail(
@@ -5084,6 +5184,68 @@ def require_operator_authority_anchored(
     assert isinstance(rootbroker_cutover, dict)
     assert isinstance(secret_pty, dict)
     assert isinstance(platform_connector_capture, dict)
+    assert isinstance(critical_user_data_inventory, dict)
+    assert isinstance(critical_user_data_inventory_read, dict)
+    required_critical_user_data_inventory = {
+        "enabled",
+        "mode",
+        "target_pattern",
+        "argv",
+        "timeout_seconds",
+        "kill_switch_path",
+        "legacy_kill_switch_path",
+        "allowed_peer_unit",
+        "allowed_peer_uid",
+    }
+    if (
+        set(critical_user_data_inventory) != required_critical_user_data_inventory
+        or critical_user_data_inventory.get("enabled") is not True
+        or critical_user_data_inventory.get("mode") != "template"
+        or critical_user_data_inventory.get("target_pattern")
+        != CRITICAL_USER_DATA_INVENTORY_TARGET_PATTERN
+        or critical_user_data_inventory.get("argv")
+        != [CRITICAL_USER_DATA_INVENTORY_TARGET, "{target}"]
+        or critical_user_data_inventory.get("timeout_seconds") != 90
+        or critical_user_data_inventory.get("kill_switch_path")
+        != "/var/lib/grabowski/operator-blockade/operator-kill-switch"
+        or critical_user_data_inventory.get("legacy_kill_switch_path")
+        != "/home/alex/.local/state/grabowski/operator-kill-switch"
+        or critical_user_data_inventory.get("allowed_peer_uid") != 1000
+        or critical_user_data_inventory.get("allowed_peer_unit") != OPERATOR_SERVICE
+    ):
+        core.fail(
+            "Critical-User-Data-Inventory-Authority-Vertrag driftet",
+            phase="operator-authority-attestation",
+        )
+    required_critical_user_data_inventory_read = {
+        "enabled",
+        "mode",
+        "target_pattern",
+        "argv",
+        "timeout_seconds",
+        "allowed_peer_unit",
+        "allowed_peer_uid",
+    }
+    if (
+        set(critical_user_data_inventory_read)
+        != required_critical_user_data_inventory_read
+        or critical_user_data_inventory_read.get("enabled") is not True
+        or critical_user_data_inventory_read.get("mode") != "template"
+        or critical_user_data_inventory_read.get("target_pattern")
+        != CRITICAL_USER_DATA_INVENTORY_READ_TARGET_PATTERN
+        or critical_user_data_inventory_read.get("argv")
+        != [CRITICAL_USER_DATA_INVENTORY_TARGET, "{target}"]
+        or critical_user_data_inventory_read.get("timeout_seconds") != 90
+        or critical_user_data_inventory_read.get("allowed_peer_uid") != 1000
+        or critical_user_data_inventory_read.get("allowed_peer_unit")
+        != OPERATOR_SERVICE
+        or "kill_switch_path" in critical_user_data_inventory_read
+        or "legacy_kill_switch_path" in critical_user_data_inventory_read
+    ):
+        core.fail(
+            "Critical-User-Data-Inventory-Read-Authority-Vertrag driftet",
+            phase="operator-authority-attestation",
+        )
     expected_peer = {
         "allowed_peer_uid": lifecycle.get("allowed_peer_uid"),
         "allowed_peer_unit": lifecycle.get("allowed_peer_unit"),
@@ -5099,6 +5261,8 @@ def require_operator_authority_anchored(
         ROOTBROKER_CUTOVER_ACTION: rootbroker_cutover,
         SECRET_PTY_ACTION: secret_pty,
         PLATFORM_CONNECTOR_CAPTURE_ACTION: platform_connector_capture,
+        CRITICAL_USER_DATA_INVENTORY_ACTION: critical_user_data_inventory,
+        CRITICAL_USER_DATA_INVENTORY_READ_ACTION: critical_user_data_inventory_read,
     }
     expected_action_contracts.update(
         {
@@ -5359,6 +5523,15 @@ def deploy_url(
         else None
     )
     if topology.kind == "legacy-stdio":
+        # Legacy stdio has no installed post-merge reconciliation timer. Do not
+        # activate a release whose Captain promises durable RepoGround refreshes.
+        if "grabowski_repoground_post_merge" in getattr(
+            snapshot, "supporting_source_bytes", {}
+        ):
+            core.fail(
+                "legacy-stdio cannot provide durable RepoGround post-merge reconciliation",
+                phase="post-merge-reconciler-unsupported-topology",
+            )
         core.deploy(
             repo,
             runtime,
@@ -5458,6 +5631,11 @@ def deploy_url(
             bootstrap_predecessor = _require_bootstrap_recovery_predecessor_inactive(
                 topology
             )
+
+        phase = "initialize-post-merge-discovery"
+        _initialize_post_merge_discovery_before_activation(
+            build.release_path, timeout_seconds=timeout_seconds
+        )
 
         phase = "activate-pointer"
         activation_attempted = True
@@ -5735,6 +5913,63 @@ def _canonical_operator_green_environment() -> dict[str, str]:
     return observed
 
 
+def _initialize_post_merge_discovery_before_activation(
+    release_path: Path,
+    *,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Bind the first verified audit watermark before new Captain can serve.
+
+    A later deployment must keep the existing lower bound, including work
+    still waiting for a durable scheduler. Failure prevents promotion.
+    """
+    command = [
+        str(release_path / ".venv/bin/python"),
+        "-I",
+        "-m",
+        "grabowski_repoground_post_merge",
+        "--initialize-reconcile-watermark",
+    ]
+    result = core.run(
+        command,
+        check=False,
+        capture=True,
+        # Verified audit discovery can consume up to 900s on cold history.
+        # Keep startup fail-closed, but do not impose the former 240s cap.
+        timeout=max(timeout_seconds, 960),
+    )
+    if result.returncode != 0:
+        core.fail(
+            "RepoGround post-merge discovery initialization failed before activation",
+            phase="post-merge-discovery-bootstrap",
+            details={"returncode": result.returncode},
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        core.fail(
+            "RepoGround post-merge bootstrap did not return valid JSON",
+            phase="post-merge-discovery-bootstrap",
+        )
+    if (
+        not isinstance(payload, dict)
+        or payload.get("kind")
+        != "grabowski.repoground_post_merge_discovery_bootstrap"
+        or payload.get("status") != "ok"
+        or type(payload.get("initialized")) is not bool
+        or type(payload.get("global_ordinal")) is not int
+        or payload["global_ordinal"] < 0
+    ):
+        core.fail(
+            "RepoGround post-merge bootstrap receipt is invalid",
+            phase="post-merge-discovery-bootstrap",
+        )
+    return {
+        "initialized": payload["initialized"],
+        "global_ordinal": payload["global_ordinal"],
+    }
+
+
 def _start_green_operator(
     *,
     unit: str,
@@ -5986,7 +6221,11 @@ def _release_complete_schema_identity(
     """Derive the complete tool-schema identity from the immutable target release."""
     python = release_path / ".venv/bin/python"
     code = (
-        "import json, grabowski_operator, grabowski_mcp; "
+        "import json, grabowski_flowlines, grabowski_operator, grabowski_mcp; "
+        "grabowski_flowlines.configure_flowlines_observability("
+        "grabowski_operator.mcp, grabowski_operator.READ_ONLY, "
+        "verified_identity_resolver=grabowski_mcp._flowlines_verified_identity, "
+        "load_environment_exporter=False); "
         "print(json.dumps(grabowski_mcp._runtime_connector_observed_tools(), sort_keys=True))"
     )
     result = core.run(
@@ -6307,6 +6546,7 @@ class ProductionBlueGreenRuntime:
     watchdog_projection: WatchdogHostAssetProjection | None = None
     observer_repair: dict[str, Any] | None = None
     admission_marker: dict[str, Any] | None = None
+    discovery_bootstrap: dict[str, Any] | None = None
     green_started: bool = False
     connector_switched: bool = False
     current_selector: dict[str, Any] | None = None
@@ -6329,6 +6569,9 @@ class ProductionBlueGreenRuntime:
         )
         self.observer_repair = install_safety_observer_unit(
             self.repo, self.snapshot
+        )
+        self.discovery_bootstrap = _initialize_post_merge_discovery_before_activation(
+            self.build.release_path, timeout_seconds=self.timeout_seconds
         )
         # From this point forward the start call may already have created the
         # transient systemd unit even if a later service/argv/exe/listener
@@ -7943,18 +8186,47 @@ def classify_canonical_admission_topology() -> dict[str, Any]:
         Anything else -- active but unreachable, inactive with a live listener,
         an unusable service query.  Fail closed: an unknown admission state is
         not an empty one.
+
+    A confirmed-active process with a listening socket gets a short bounded
+    retry only for transport-class readback failures.  The admission endpoint
+    may be briefly unavailable while the predecessor event loop settles after
+    validation, but semantic, HTTP and malformed-response failures remain
+    immediately ambiguous.
     """
     observation = observe_service(OPERATOR_SERVICE)
     listener = _listener_present(OPERATOR_LISTENER_PORT)
     status_reachable: bool | None = None
     status_error: str | None = None
+    status_probe_attempts = 0
+    transport_retries = 0
     if observation.confirmed_active:
-        try:
-            _operator_admission_observation(OPERATOR_LISTENER_PORT)
-            status_reachable = True
-        except core.DeployError as exc:
-            status_reachable = False
-            status_error = str(exc.details.get("failure_class") or exc.phase or "")
+        while True:
+            status_probe_attempts += 1
+            try:
+                _operator_admission_observation(OPERATOR_LISTENER_PORT)
+                status_reachable = True
+                status_error = None
+                break
+            except core.DeployError as exc:
+                status_reachable = False
+                failure_class = str(
+                    exc.details.get("failure_class") or exc.phase or ""
+                )
+                status_error = failure_class
+                is_transport = (
+                    exc.phase == "operator-admission-drain"
+                    and exc.details.get("failure_class") == "transport"
+                )
+                if is_transport:
+                    transport_retries += 1
+                if not (
+                    listener
+                    and is_transport
+                    and status_probe_attempts
+                    < CANONICAL_ADMISSION_TOPOLOGY_TRANSPORT_ATTEMPTS
+                ):
+                    break
+                time.sleep(CANONICAL_ADMISSION_TOPOLOGY_RETRY_SECONDS)
     if observation.confirmed_active and status_reachable:
         topology = CANONICAL_OPERATOR_LIVE
     elif observation.confirmed_inactive and not listener:
@@ -7967,6 +8239,8 @@ def classify_canonical_admission_topology() -> dict[str, Any]:
         "listener_present": listener,
         "admission_status_reachable": status_reachable,
         "admission_status_error": status_error,
+        "admission_status_probe_attempts": status_probe_attempts,
+        "admission_status_transport_retries": transport_retries,
         "does_not_establish": [
             "that no effect is in flight on green",
             "that the canonical operator will stay in this state",
@@ -8121,7 +8395,12 @@ class MidCutoverResumeRuntime:
             source_repo_head=self.blue_repo_head,
             target_release_id=self.green_binding["release_id"],
             target_repo_head=self.green_binding["repo_head"],
-            source_evidence_time=int(self.resume_binding["source_evidence_time"]),
+            source_evidence_time=int(
+                self.resume_binding.get(
+                    "snapshot_source_evidence_time",
+                    self.resume_binding["source_evidence_time"],
+                )
+            ),
             publication_request_id=str(
                 self.resume_binding["publication_request_id"]
             ),
@@ -8255,12 +8534,27 @@ class MidCutoverResumeRuntime:
         )
         canonical_guard = None
         if (self.admission_topology or {}).get("topology") == CANONICAL_OPERATOR_LIVE:
+            allow_recovery_parent = (
+                self.resume_phase == midcutover.PHASE_RETIRE_GREEN
+            )
+            canonical_drained = wait_for_operator_deployment_admission(
+                self.admission_marker,
+                timeout_seconds=self.timeout_seconds,
+                port=OPERATOR_LISTENER_PORT,
+                allow_single_recovery_parent=allow_recovery_parent,
+            )
+            if canonical_drained.get("supported") is not True:
+                core.fail(
+                    "Canonical operator does not support the deployment admission contract",
+                    phase="midcutover-canonical-admission-drain",
+                    details={"drain": canonical_drained},
+                )
             # Guard canonical whenever it remains live. Before S3 it is the old
             # directly reachable process; in S3 it is already the selected public
             # process and may contain the still-running parent recovery call.
             canonical_guard_reader = (
                 verify_operator_deployment_admission_for_s3_retirement
-                if self.resume_phase == midcutover.PHASE_RETIRE_GREEN
+                if allow_recovery_parent
                 else verify_operator_deployment_admission
             )
             canonical_guard = _json_sha256(
@@ -8417,7 +8711,10 @@ class MidCutoverResumeRuntime:
             green_release_id=self.green_binding["release_id"],
             target_head=self.green_binding["repo_head"],
             source_evidence_time=int(
-                self.resume_binding["source_evidence_time"]
+                self.resume_binding.get(
+                    "snapshot_source_evidence_time",
+                    self.resume_binding["source_evidence_time"],
+                )
             ),
             publication_request_id=str(
                 self.resume_binding["publication_request_id"]
@@ -8507,7 +8804,12 @@ class MidCutoverResumeRuntime:
             blue_repo_head=self.blue_repo_head,
             green_release_id=self.green_binding["release_id"],
             target_head=self.green_binding["repo_head"],
-            source_evidence_time=int(self.resume_binding["source_evidence_time"]),
+            source_evidence_time=int(
+                self.resume_binding.get(
+                    "snapshot_source_evidence_time",
+                    self.resume_binding["source_evidence_time"],
+                )
+            ),
             publication_request_id=str(
                 self.resume_binding["publication_request_id"]
             ),

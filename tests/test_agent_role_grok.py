@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import errno
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import json
 import os
 from pathlib import Path
@@ -24,6 +27,198 @@ def stream_bytes(events: list[dict]) -> bytes:
 
 
 class GrokReviewRoleTests(unittest.TestCase):
+
+    def test_create_only_receipt_is_private_and_cannot_be_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "receipts"
+            parent.mkdir(mode=0o700)
+            path = parent / "attempt.json"
+            role.write_receipt(path, {"verdict": "PASS"}, create_only=True)
+            original = path.read_bytes()
+            self.assertEqual(json.loads(original), {"verdict": "PASS"})
+            self.assertEqual(os.stat(path).st_nlink, 1)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                role.write_receipt(path, {"verdict": "NEEDS_CHANGE"}, create_only=True)
+            self.assertEqual(path.read_bytes(), original)
+            os.chmod(parent, 0o750)
+            with self.assertRaises(PermissionError):
+                role.write_receipt(parent / "other.json", {}, create_only=True)
+
+    def test_fdopen_failure_closes_raw_descriptor_and_removes_temp(self) -> None:
+        # A failure to wrap an already opened fd must not exhaust a long-lived
+        # reviewer/operator process. Both legacy replace and create-only paths
+        # have the same pre-ownership constructor boundary.
+        for create_only in (False, True):
+            with self.subTest(create_only=create_only):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    target = root / "attempt.json"
+                    real_open = os.open
+                    opened_temporary: list[int] = []
+
+                    def capture_open(name, flags, *args, **kwargs):
+                        fd = real_open(name, flags, *args, **kwargs)
+                        if (
+                            isinstance(name, str)
+                            and name.startswith(".attempt.json.")
+                            and name.endswith(".tmp")
+                        ):
+                            opened_temporary.append(fd)
+                        return fd
+
+                    with (
+                        mock.patch.object(role.os, "open", side_effect=capture_open),
+                        mock.patch.object(
+                            role.os, "fdopen",
+                            side_effect=OSError(errno.EMFILE, "synthetic fdopen failure"),
+                        ),
+                        self.assertRaisesRegex(OSError, "synthetic fdopen failure"),
+                    ):
+                        role.write_receipt(
+                            target, {"verdict": "PASS"}, create_only=create_only
+                        )
+
+                    self.assertEqual(len(opened_temporary), 1)
+                    with self.assertRaises(OSError) as closed:
+                        os.fstat(opened_temporary[0])
+                    self.assertEqual(closed.exception.errno, errno.EBADF)
+                    self.assertFalse(target.exists())
+                    self.assertEqual(list(root.glob("*.tmp")), [])
+                    self.assertFalse(
+                        any(p.name.startswith(".attempt.json.") for p in root.iterdir())
+                    )
+
+    def test_create_only_receipt_rejects_link_attacks(self) -> None:
+        for kind in ("symlink", "hardlink", "parent-symlink"):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    parent = root / "receipts"
+                    parent.mkdir(mode=0o700)
+                    target = root / "real.json"
+                    target.write_text('{"untouched": true}', encoding="utf-8")
+                    os.chmod(target, 0o600)
+                    path = parent / "attempt.json"
+                    if kind == "parent-symlink":
+                        alias = root / "link"
+                        alias.symlink_to(parent, target_is_directory=True)
+                        path = alias / "attempt.json"
+                        with self.assertRaises(OSError):
+                            role.write_receipt(path, {}, create_only=True)
+                    else:
+                        if kind == "symlink":
+                            path.symlink_to(target)
+                        else:
+                            os.link(target, path)
+                        with self.assertRaises(PermissionError):
+                            role.write_receipt(path, {}, create_only=True)
+                    self.assertEqual(json.loads(target.read_text()), {"untouched": True})
+
+    def test_create_only_receipt_race_has_exactly_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "review.json"
+            barrier = threading.Barrier(2)
+            def write(value: int) -> str:
+                barrier.wait()
+                try:
+                    role.write_receipt(path, {"attempt": value}, create_only=True)
+                    return "created"
+                except FileExistsError:
+                    return "exists"
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                a = pool.submit(write, 1)
+                b = pool.submit(write, 2)
+                self.assertEqual(sorted([a.result(), b.result()]), ["created", "exists"])
+            self.assertIn(json.loads(path.read_text())["attempt"], (1, 2))
+            self.assertFalse(any(p.name.endswith(".tmp") for p in path.parent.iterdir()))
+
+
+    def test_role_main_binds_review_receipt_to_job_unit_and_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            unit = "grabowski-job-a11111111111"
+            directory = Path(temporary) / unit
+            directory.mkdir(mode=0o700)
+            output = directory / role.REVIEW_ATTEMPT_RECEIPT_NAME
+            head, base, diff = "a" * 40, "b" * 40, "c" * 64
+            document = b'{"verdict":"PASS","findings":[]}'
+            completed = SimpleNamespace(
+                returncode=0, stdout_sha256=hashlib.sha256(document).hexdigest(),
+                stderr_sha256="e" * 64, stdout_bytes=len(document), stderr_bytes=0,
+                stdout_tail="", stderr_tail="", output_limit_exceeded=False,
+                stdout_content_exceeded=False, stdout_content=document,
+            )
+            environment = {
+                "GRABOWSKI_REVIEW_ATTEMPT_UNIT": unit,
+                "GRABOWSKI_JOB_UNIT": unit,
+                "GRABOWSKI_JOB_ID": "a11111111111",
+                "GRABOWSKI_JOB_ORIGIN_SHA256": "d" * 64,
+                "GRABOWSKI_JOB_DIRECTORY": str(directory),
+            }
+            with (
+                mock.patch.dict(os.environ, environment),
+                mock.patch.object(role, "current_binding", side_effect=[(head, diff, False)] * 2),
+                mock.patch.object(role, "committed_diff", return_value=b"frozen diff"),
+                mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], None, None)),
+                mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                mock.patch.object(role, "run_bounded_capture", return_value=completed),
+                mock.patch.object(role, "classify_result", return_value="passed"),
+            ):
+                self.assertEqual(role.main([
+                    "--role", "review", "--repository", str(ROOT),
+                    "--expected-head", head, "--expected-base-head", base,
+                    "--expected-diff-sha256", diff, "--expected-dirty", "false",
+                    "--output", str(output), "--", "grok", "--model", "grok-4.6",
+                    "Review the frozen diff",
+                ]), 0)
+            receipt = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["review_attempt_unit"], unit)
+            self.assertEqual(receipt["review_attempt_origin_sha256"], "d" * 64)
+            self.assertEqual(receipt["receipt_sha256"], role.digest({
+                k: v for k, v in receipt.items() if k != "receipt_sha256"
+            }))
+
+    def test_role_main_rejects_cross_attempt_environment_before_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            unit = "grabowski-job-a11111111111"
+            directory = Path(temporary) / unit
+            directory.mkdir(mode=0o700)
+            output = directory / role.REVIEW_ATTEMPT_RECEIPT_NAME
+            head, base, diff = "a" * 40, "b" * 40, "c" * 64
+            completed = SimpleNamespace(
+                returncode=0, stdout_sha256="d" * 64, stderr_sha256="e" * 64,
+                stdout_bytes=0, stderr_bytes=0, stdout_tail="", stderr_tail="",
+                output_limit_exceeded=False, stdout_content_exceeded=False,
+                stdout_content=b'{"verdict":"PASS","findings":[]}',
+            )
+            environment = {
+                "GRABOWSKI_REVIEW_ATTEMPT_UNIT": unit,
+                "GRABOWSKI_JOB_UNIT": "grabowski-job-b22222222222",
+                "GRABOWSKI_JOB_ID": "a11111111111",
+                "GRABOWSKI_JOB_ORIGIN_SHA256": "d" * 64,
+                "GRABOWSKI_JOB_DIRECTORY": str(directory),
+            }
+            with (
+                mock.patch.dict(os.environ, environment),
+                mock.patch.object(role, "current_binding", side_effect=AssertionError("snapshot must not execute")) as current_binding,
+                mock.patch.object(role, "committed_diff", return_value=b"frozen diff"),
+                mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], None, None)),
+                mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                mock.patch.object(role, "run_bounded_capture", side_effect=AssertionError("reviewer must not execute")) as execute,
+                mock.patch.object(role, "classify_result", return_value="passed"),
+                self.assertRaisesRegex(RuntimeError, "attempt binding is invalid"),
+            ):
+                role.main([
+                    "--role", "review", "--repository", str(ROOT),
+                    "--expected-head", head, "--expected-base-head", base,
+                    "--expected-diff-sha256", diff, "--expected-dirty", "false",
+                    "--output", str(output), "--", "grok", "--model", "grok-4.6",
+                    "Review the frozen diff",
+                ])
+            current_binding.assert_not_called()
+            execute.assert_not_called()
+            self.assertFalse(output.exists())
+
     def test_streaming_review_command_embeds_bound_diff_without_repository_tools(self) -> None:
         prepared = ("/opt/grabowski-external/grok", "--model", "grok-4.6", "-p", "review this")
         head = "a" * 40
@@ -377,6 +572,240 @@ class GrokReviewRoleTests(unittest.TestCase):
                         role._grok_streaming_review_command(
                             prepared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff"
                         )
+
+    def test_codex_review_sandbox_inserts_exec_without_changing_declared_command(self) -> None:
+        repo = Path("/tmp/repo")
+        declared = [
+            "codex",
+            "--model",
+            "gpt-5.6-sol",
+            "--sandbox",
+            "read-only",
+            "--ask-for-approval",
+            "never",
+            "review this",
+        ]
+        prepared = PreparedSandboxCommand(
+            command=("/usr/bin/python3", "-I", "codex-launcher", "exec", "review this")
+        )
+        with (
+            mock.patch.object(
+                role, "prepare_external_agent_command", return_value=prepared
+            ) as prepare,
+            mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]) as sandbox_argv,
+        ):
+            argv, contract, prompt_bytes = role._review_sandbox_argv(
+                repo,
+                declared,
+                expected_head="a" * 40,
+                expected_base_head="b" * 40,
+                review_diff=b"",
+            )
+
+        self.assertEqual(argv, ["sandbox"])
+        self.assertIsNone(contract)
+        self.assertIsNone(prompt_bytes)
+        normalized = prepare.call_args.args[0]
+        self.assertEqual(normalized[-2:], ["exec", "review this"])
+        self.assertEqual(normalized[:-2], declared[:-1])
+        self.assertEqual(sandbox_argv.call_args.args[1], list(prepared.command))
+        self.assertEqual(sandbox_argv.call_args.kwargs["declared_command"], declared)
+
+    def test_codex_review_sandbox_preserves_existing_exec(self) -> None:
+        repo = Path("/tmp/repo")
+        declared = [
+            "codex",
+            "--model",
+            "gpt-5.6-sol",
+            "--sandbox",
+            "read-only",
+            "--ask-for-approval",
+            "never",
+            "exec",
+            "review this",
+        ]
+        prepared = PreparedSandboxCommand(
+            command=("/usr/bin/python3", "-I", "codex-launcher", "exec", "review this")
+        )
+        with (
+            mock.patch.object(
+                role, "prepare_external_agent_command", return_value=prepared
+            ) as prepare,
+            mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]),
+        ):
+            role._review_sandbox_argv(
+                repo,
+                declared,
+                expected_head="a" * 40,
+                expected_base_head="b" * 40,
+                review_diff=b"",
+            )
+
+        prepare.assert_called_once_with(declared)
+
+    def test_codex_review_sandbox_preserves_existing_noninteractive_subcommands(self) -> None:
+        repo = Path("/tmp/repo")
+        for subcommand in ("e", "review"):
+            with self.subTest(subcommand=subcommand):
+                declared = ["codex", subcommand, "review this"]
+                prepared = PreparedSandboxCommand(
+                    command=("/usr/bin/python3", "-I", "codex-launcher", subcommand, "review this")
+                )
+                with (
+                    mock.patch.object(
+                        role, "prepare_external_agent_command", return_value=prepared
+                    ) as prepare,
+                    mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]),
+                ):
+                    role._review_sandbox_argv(
+                        repo,
+                        declared,
+                        expected_head="a" * 40,
+                        expected_base_head="b" * 40,
+                        review_diff=b"",
+                    )
+
+                prepare.assert_called_once_with(declared)
+
+    def test_codex_review_subcommand_detection_skips_global_option_values(self) -> None:
+        declared = ["codex", "--model", "review", "review this"]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            ["codex", "--model", "review", "exec", "review this"],
+        )
+
+    def test_codex_review_subcommand_detection_preserves_exec_with_subcommand_options(self) -> None:
+        declared = ["codex", "exec", "--json", "review this"]
+        self.assertEqual(role._codex_declared_subcommand(declared), "exec")
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            declared,
+        )
+
+    def test_codex_review_root_image_options_are_normalized_before_exec(self) -> None:
+        declared = [
+            "codex",
+            "--image",
+            "shot.png",
+            "detail.png",
+            "--model",
+            "gpt-5.6-sol",
+            "review this",
+        ]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            [
+                "codex",
+                "--image=shot.png",
+                "--image=detail.png",
+                "--model",
+                "gpt-5.6-sol",
+                "exec",
+                "review this",
+            ],
+        )
+
+    def test_codex_review_attached_short_option_values_are_supported(self) -> None:
+        for option in ("-mgpt-5.6-sol", "-sread-only", "-creview=true"):
+            with self.subTest(option=option):
+                declared = ["codex", option, "review this"]
+                self.assertIsNone(role._codex_declared_subcommand(declared))
+                self.assertEqual(
+                    role._codex_review_command_for_headless_execution(declared),
+                    ["codex", option, "exec", "review this"],
+                )
+
+    def test_codex_review_attached_image_value_is_normalized_before_exec(self) -> None:
+        declared = ["codex", "-ishot.png", "review this"]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            ["codex", "--image=shot.png", "exec", "review this"],
+        )
+
+    def test_codex_review_attached_image_equals_value_is_normalized_before_exec(self) -> None:
+        declared = ["codex", "-i=shot.png", "review this"]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            ["codex", "--image=shot.png", "exec", "review this"],
+        )
+
+    def test_codex_review_attached_image_values_preserve_variadic_group(self) -> None:
+        for first in ("-ishot.png", "--image=shot.png"):
+            with self.subTest(first=first):
+                declared = ["codex", first, "detail.png", "review this"]
+                self.assertIsNone(role._codex_declared_subcommand(declared))
+                self.assertEqual(
+                    role._codex_review_command_for_headless_execution(declared),
+                    [
+                        "codex",
+                        "--image=shot.png",
+                        "--image=detail.png",
+                        "exec",
+                        "review this",
+                    ],
+                )
+
+    def test_codex_review_variadic_images_stop_at_headless_subcommand(self) -> None:
+        declared = [
+            "codex",
+            "--image=shot.png",
+            "detail.png",
+            "exec",
+            "--json",
+            "review this",
+        ]
+        self.assertEqual(role._codex_declared_subcommand(declared), "exec")
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            declared,
+        )
+
+    def test_codex_review_variadic_images_stop_at_unsupported_root_subcommand(self) -> None:
+        for subcommand in ("login", "mcp-server"):
+            with self.subTest(subcommand=subcommand):
+                declared = [
+                    "codex",
+                    "--image=shot.png",
+                    "detail.png",
+                    subcommand,
+                    "review this",
+                ]
+                self.assertEqual(role._codex_declared_subcommand(declared), subcommand)
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    f"Codex review command declares unsupported subcommand: {subcommand}",
+                ):
+                    role._codex_review_command_for_headless_execution(declared)
+
+    def test_codex_review_attached_image_empty_equals_is_rejected(self) -> None:
+        declared = ["codex", "-i=", "review this"]
+        with self.assertRaisesRegex(RuntimeError, "Codex global option -i is missing its value"):
+            role._codex_review_command_for_headless_execution(declared)
+
+    def test_codex_review_prompt_separator_is_preserved_after_exec(self) -> None:
+        declared = ["codex", "--", "--version"]
+        self.assertIsNone(role._codex_declared_subcommand(declared))
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            ["codex", "exec", "--", "--version"],
+        )
+
+    def test_codex_review_prompt_separator_rejects_extra_positionals(self) -> None:
+        declared = ["codex", "--", "review", "review this"]
+        with self.assertRaisesRegex(RuntimeError, "extra positional arguments after --"):
+            role._codex_review_command_for_headless_execution(declared)
+
+    def test_codex_review_preserves_headless_subcommand_after_attached_global_option(self) -> None:
+        declared = ["codex", "-mgpt-5.6-sol", "review", "review this"]
+        self.assertEqual(role._codex_declared_subcommand(declared), "review")
+        self.assertEqual(
+            role._codex_review_command_for_headless_execution(declared),
+            declared,
+        )
 
     def test_review_sandbox_preserves_declared_command_for_provenance(self) -> None:
         repo = Path("/tmp/repo")

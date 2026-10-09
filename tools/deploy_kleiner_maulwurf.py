@@ -22,6 +22,9 @@ MCP_PORT = 18182
 INGRESS_PORT = 18180
 CANONICAL_RUNTIME = Path.home() / ".local/share/grabowski-mcp"
 CANONICAL_SELECTOR = ingress.DEFAULT_SELECTOR_FILE
+FLEET_CONFIG = Path.home() / ".config/grabowski/fleet.json"
+CANONICAL_FLEET_HOST = "commonserver"
+LEGACY_FLEET_HOST = "wg-prod-1"
 
 
 class KleinerMaulwurfDeployError(RuntimeError):
@@ -120,6 +123,42 @@ def _runtime_release(runtime: Path) -> Path:
         ) from exc
 
 
+def _require_canonical_fleet_identity() -> None:
+    path = FLEET_CONFIG
+    try:
+        if path.is_symlink():
+            _fail("local fleet registry may not be a symlink")
+        metadata = path.stat()
+        if not path.is_file() or metadata.st_size > 512 * 1024:
+            _fail("local fleet registry is not a bounded regular file")
+        registry = json.loads(path.read_text(encoding="utf-8"))
+    except KleinerMaulwurfDeployError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise KleinerMaulwurfDeployError(
+            "local fleet registry is unavailable or invalid"
+        ) from exc
+    hosts = registry.get("hosts") if isinstance(registry, dict) else None
+    if (
+        not isinstance(registry, dict)
+        or registry.get("schema_version") != 1
+        or not isinstance(hosts, dict)
+    ):
+        _fail("local fleet registry schema is invalid")
+    canonical = hosts.get(CANONICAL_FLEET_HOST)
+    if (
+        not isinstance(canonical, dict)
+        or canonical.get("transport") != "local"
+        or canonical.get("enabled") is not True
+    ):
+        _fail("canonical commonserver fleet host must be enabled and local")
+    if LEGACY_FLEET_HOST in hosts:
+        _fail(
+            "legacy wg-prod-1 may remain a public DNS/Funnel identity "
+            "but not a fleet host"
+        )
+
+
 def _require_stack_active() -> None:
     inactive = [service for service in START_ORDER if not _service_active(service)]
     if inactive:
@@ -195,6 +234,9 @@ def _verify_pre_cutover_preimage(state: CutoverState) -> None:
     ):
         _fail("routing selector no longer matches the serving preimage")
     _require_stack_active()
+    # Keep fleet identity as the last read-only pre-cutover gate so drift during
+    # release construction is rejected before any service-stop effect begins.
+    _require_canonical_fleet_identity()
 
 
 def _verify_pointer_before_activation(state: CutoverState) -> None:
@@ -213,6 +255,7 @@ def _prepare_deploy(repo: Path, expected_head: str) -> CutoverState:
             f"{snapshot.repo_head} != {expected_head}"
         )
 
+    _require_canonical_fleet_identity()
     _require_stack_active()
     old_pointer = core.capture_pointer(runtime)
     if old_pointer.kind != "symlink":

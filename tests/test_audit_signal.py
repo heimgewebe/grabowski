@@ -254,6 +254,439 @@ class AuditSignalTests(unittest.TestCase):
         self.assertEqual(uncertain["severity"], "critical")
         self.assertEqual(uncertain["count"], 1)
 
+    def test_incomplete_audit_window_fails_closed_for_audit_signals(self) -> None:
+        now = 1_800_000_000
+        record = {
+            "operation": "runtime-state-retention-intent",
+            "record_sha256": "a" * 64,
+        }
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            result = signal.build_projection(
+                [(record, now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 1)],
+                as_of_unix=now,
+                audit_source_binding={},
+                audit_window_complete=False,
+            )
+
+        by_id = {item["id"]: item for item in result["signals"]}
+        uncertain = by_id["uncertain_outcome"]
+        self.assertEqual(uncertain["status"], "indeterminate")
+        self.assertEqual(uncertain["severity"], "unknown")
+        self.assertIsNone(uncertain["count"])
+        self.assertFalse(uncertain["details"]["audit_window_complete"])
+
+        transition = by_id["transition_gap"]
+        self.assertEqual(transition["status"], "indeterminate")
+        self.assertEqual(transition["severity"], "unknown")
+        self.assertIsNone(transition["count"])
+        self.assertEqual(transition["observed_count"], 1)
+        self.assertEqual(
+            transition["evidence_quality"],
+            "partial_verified_audit_window",
+        )
+        self.assertFalse(transition["details"]["audit_window_complete"])
+        self.assertEqual(transition["details"]["partial_status"], "observed")
+        self.assertEqual(transition["details"]["partial_count"], 1)
+        self.assertEqual(
+            transition["recommended_action"],
+            "inspect a complete verified audit window before classifying transition gaps",
+        )
+        self.assertIn(
+            "absence_or_presence_of_transition_gaps_across_the_scan_boundary",
+            transition["does_not_establish"],
+        )
+
+    def test_incomplete_audit_window_keeps_clear_transition_gap_indeterminate(self) -> None:
+        now = 1_800_000_000
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            result = signal.build_projection(
+                [],
+                as_of_unix=now,
+                audit_source_binding={},
+                audit_window_complete=False,
+            )
+
+        by_id = {item["id"]: item for item in result["signals"]}
+        transition = by_id["transition_gap"]
+        self.assertEqual(transition["status"], "indeterminate")
+        self.assertEqual(transition["severity"], "unknown")
+        self.assertIsNone(transition["count"])
+        self.assertEqual(transition["observed_count"], 0)
+        self.assertFalse(transition["details"]["audit_window_complete"])
+        self.assertEqual(transition["details"]["partial_status"], "clear")
+        self.assertEqual(transition["details"]["partial_count"], 0)
+        self.assertIn(
+            "absence_or_presence_of_transition_gaps_across_the_scan_boundary",
+            transition["does_not_establish"],
+        )
+
+    def test_incomplete_audit_window_masks_prefix_dependent_receipt_rebinding(self) -> None:
+        now = 1_800_000_000
+
+        def intent(plan: str, identity: int) -> dict[str, object]:
+            return {
+                "operation": "runtime-state-retention-intent",
+                "plan_sha256": plan * 64,
+                "attempt": 1,
+                "record_sha256": f"{identity:064x}",
+            }
+
+        # Prefix/suffix ownership follows verified audit append order, not a
+        # timestamp sort. The skew here is deliberate: it exercises receipt
+        # rebinding across a truncated chain boundary.
+        prefix = [(intent("b", 2), now - 1_999)]
+        suffix = [
+            (
+                intent("b", 3),
+                now - signal.AUDIT_SIGNAL_WINDOW_SECONDS - 1_998,
+            ),
+            (
+                {
+                    "operation": signal.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+                    "plan_sha256": "b" * 64,
+                    "attempt": 1,
+                    "record_sha256": f"{4:064x}",
+                    "receipt_sha256": "d" * 64,
+                    "intent_record_sha256": f"{3:064x}",
+                    "reconciliation_kind": "completion_audit_gap",
+                    "completed": True,
+                    "retention_effect_retried": False,
+                },
+                now - 1_997,
+            ),
+            (intent("a", 5), now - 1_996),
+            (
+                {
+                    "operation": "runtime-state-retention-complete",
+                    "plan_sha256": "a" * 64,
+                    "attempt": 1,
+                    "record_sha256": f"{11:064x}",
+                    "receipt_sha256": "d" * 64,
+                },
+                now - 1_990,
+            ),
+        ]
+        false_positive_ref = "audit-record-sha256:" + f"{5:064x}"
+
+        raw_suffix = signal._audit_transition_gap_signal(
+            suffix,
+            start_unix=now - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+            end_unix=now,
+        )
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            full = signal.build_projection(
+                prefix + suffix,
+                as_of_unix=now,
+                audit_source_binding={},
+                audit_window_complete=True,
+            )
+            partial = signal.build_projection(
+                suffix,
+                as_of_unix=now,
+                audit_source_binding={},
+                audit_window_complete=False,
+            )
+
+        full_gap = next(item for item in full["signals"] if item["id"] == "transition_gap")
+        partial_gap = next(
+            item for item in partial["signals"] if item["id"] == "transition_gap"
+        )
+
+        self.assertNotIn(false_positive_ref, full_gap["evidence_refs"])
+        self.assertEqual(
+            (raw_suffix["status"], raw_suffix["severity"], raw_suffix["count"]),
+            ("observed", "high", 1),
+        )
+        self.assertEqual(raw_suffix["evidence_refs"], [false_positive_ref])
+        self.assertEqual(
+            (partial_gap["status"], partial_gap["severity"], partial_gap["count"]),
+            ("indeterminate", "unknown", None),
+        )
+        self.assertEqual(raw_suffix["observed_count"], 2)
+        self.assertEqual(
+            partial_gap["observed_count"],
+            raw_suffix["observed_count"],
+        )
+        self.assertEqual(partial_gap["evidence_refs"], [])
+        self.assertFalse(partial_gap["evidence_refs_truncated"])
+        self.assertIsNone(partial_gap["details"]["execution_gap_count"])
+        self.assertIsNone(partial_gap["details"]["completion_audit_gap_count"])
+        self.assertEqual(partial_gap["details"]["unmatched_intents_by_transition"], {})
+        self.assertEqual(partial_gap["details"]["completed_pairs_by_transition"], {})
+        self.assertEqual(
+            partial_gap["details"]["completion_audit_gaps_by_transition"], {}
+        )
+        self.assertEqual(partial_gap["details"]["partial_status"], "observed")
+        self.assertEqual(partial_gap["details"]["partial_count"], 1)
+        self.assertEqual(
+            partial_gap["details"]["partial_observed_count"],
+            raw_suffix["observed_count"],
+        )
+        self.assertEqual(
+            partial_gap["details"]["partial_evidence_refs"],
+            [false_positive_ref],
+        )
+        self.assertFalse(
+            partial_gap["details"]["partial_evidence_refs_truncated"]
+        )
+        self.assertEqual(
+            partial_gap["details"]["partial_unmatched_intents_by_transition"],
+            raw_suffix["details"]["unmatched_intents_by_transition"],
+        )
+        self.assertEqual(
+            partial_gap["details"]["partial_completed_pairs_by_transition"],
+            raw_suffix["details"]["completed_pairs_by_transition"],
+        )
+        self.assertIn(
+            "absence_or_presence_of_transition_gaps_across_the_scan_boundary",
+            partial_gap["does_not_establish"],
+        )
+
+    def test_incomplete_audit_window_preserves_prefix_monotonic_deploy_gap(self) -> None:
+        now = 1_800_000_000
+        retention_ref = "a" * 64
+        deploy_ref = "b" * 64
+        second_retention_ref = "c" * 64
+        completion_ref = "d" * 64
+        records = [
+            (
+                {
+                    "operation": "runtime-state-retention-intent",
+                    "record_sha256": retention_ref,
+                },
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 5,
+            ),
+            (
+                {
+                    "operation": "runtime-state-retention-intent",
+                    "record_sha256": second_retention_ref,
+                },
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 4,
+            ),
+            (
+                {
+                    "operation": "runtime-state-retention-complete",
+                    "record_sha256": completion_ref,
+                    "receipt_sha256": "e" * 64,
+                },
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 3,
+            ),
+            (
+                {
+                    "operation": "runtime-deploy-schedule-intent",
+                    "record_sha256": deploy_ref,
+                },
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 1,
+            ),
+        ]
+
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            result = signal.build_projection(
+                records,
+                as_of_unix=now,
+                audit_source_binding={},
+                audit_window_complete=False,
+            )
+
+        transition = next(
+            item for item in result["signals"] if item["id"] == "transition_gap"
+        )
+        self.assertEqual(
+            (transition["status"], transition["severity"], transition["count"]),
+            ("observed", "high", 1),
+        )
+        self.assertEqual(transition["observed_count"], 1)
+        self.assertEqual(
+            transition["evidence_refs"],
+            ["audit-record-sha256:" + deploy_ref],
+        )
+        self.assertEqual(
+            transition["evidence_quality"],
+            "partial_verified_audit_window_prefix_monotonic_positive_evidence",
+        )
+        self.assertEqual(transition["details"]["partial_status"], "observed")
+        self.assertEqual(transition["details"]["partial_count"], 2)
+        self.assertEqual(transition["details"]["partial_observed_count"], 2)
+        self.assertEqual(
+            transition["details"]["prefix_monotonic_execution_gap_count"], 1
+        )
+        self.assertEqual(
+            transition["details"]["prefix_monotonic_unmatched_intents_by_transition"],
+            {"runtime-deploy-schedule-intent": 1},
+        )
+        self.assertEqual(transition["details"]["execution_gap_count"], 1)
+        self.assertEqual(transition["details"]["completion_audit_gap_count"], 0)
+        self.assertEqual(
+            transition["details"]["unmatched_intents_by_transition"],
+            {"runtime-deploy-schedule-intent": 1},
+        )
+        self.assertEqual(transition["details"]["completed_pairs_by_transition"], {})
+        self.assertEqual(
+            transition["details"]["partial_completed_pairs_by_transition"],
+            {"runtime-state-retention-intent": 1},
+        )
+        self.assertEqual(
+            transition["details"]["execution_gap_evidence_refs"],
+            ["audit-record-sha256:" + deploy_ref],
+        )
+        self.assertEqual(transition["details"]["partial_execution_gap_count"], 2)
+        self.assertEqual(
+            transition["details"]["partial_unmatched_intents_by_transition"],
+            {
+                "runtime-deploy-schedule-intent": 1,
+                "runtime-state-retention-intent": 1,
+            },
+        )
+        self.assertIn(
+            "absence_or_presence_of_retention_transition_gaps_across_the_scan_boundary",
+            transition["does_not_establish"],
+        )
+
+    def test_incomplete_audit_window_preserves_partial_ref_truncation_metadata(self) -> None:
+        now = 1_800_000_000
+        total = signal.AUDIT_SIGNAL_MAX_EVIDENCE_REFS + 5
+        records = [
+            (
+                {
+                    "operation": "runtime-deploy-schedule-intent",
+                    "record_sha256": f"{index + 1:064x}",
+                },
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - total + index - 1,
+            )
+            for index in range(total)
+        ]
+
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            result = signal.build_projection(
+                records,
+                as_of_unix=now,
+                audit_source_binding={},
+                audit_window_complete=False,
+            )
+
+        transition = next(
+            item for item in result["signals"] if item["id"] == "transition_gap"
+        )
+        self.assertEqual(
+            (transition["status"], transition["severity"], transition["count"]),
+            ("observed", "high", total),
+        )
+        self.assertEqual(
+            len(transition["evidence_refs"]),
+            signal.AUDIT_SIGNAL_MAX_EVIDENCE_REFS,
+        )
+        self.assertTrue(transition["evidence_refs_truncated"])
+        self.assertTrue(
+            transition["details"]["execution_gap_evidence_refs_truncated"]
+        )
+        self.assertEqual(
+            transition["details"]["execution_gap_evidence_refs_omitted_count"],
+            5,
+        )
+        self.assertTrue(
+            transition["details"]["partial_evidence_refs_truncated"]
+        )
+        self.assertTrue(
+            transition["details"]["partial_execution_gap_evidence_refs_truncated"]
+        )
+        self.assertEqual(
+            transition["details"][
+                "partial_execution_gap_evidence_refs_omitted_count"
+            ],
+            5,
+        )
+
+    def test_incomplete_audit_window_partials_completion_audit_gap_with_deploy_gap(
+        self,
+    ) -> None:
+        now = 1_800_000_000
+        retention_ref = "a" * 64
+        reconciliation_ref = "b" * 64
+        deploy_ref = "c" * 64
+        records = [
+            (
+                {
+                    "operation": "runtime-state-retention-intent",
+                    "plan_sha256": "1" * 64,
+                    "attempt": 1,
+                    "record_sha256": retention_ref,
+                },
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 3,
+            ),
+            (
+                {
+                    "operation": signal.RETENTION_COMPLETION_AUDIT_RECONCILIATION_OPERATION,
+                    "plan_sha256": "1" * 64,
+                    "attempt": 1,
+                    "record_sha256": reconciliation_ref,
+                    "receipt_sha256": "2" * 64,
+                    "intent_record_sha256": retention_ref,
+                    "reconciliation_kind": "completion_audit_gap",
+                    "completed": True,
+                    "retention_effect_retried": False,
+                },
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 2,
+            ),
+            (
+                {
+                    "operation": "runtime-deploy-schedule-intent",
+                    "record_sha256": deploy_ref,
+                },
+                now - signal.AUDIT_SIGNAL_GRACE_SECONDS - 1,
+            ),
+        ]
+
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            result = signal.build_projection(
+                records,
+                as_of_unix=now,
+                audit_source_binding={},
+                audit_window_complete=False,
+            )
+
+        transition = next(
+            item for item in result["signals"] if item["id"] == "transition_gap"
+        )
+        self.assertEqual(
+            (transition["status"], transition["severity"], transition["count"]),
+            ("observed", "high", 1),
+        )
+        self.assertEqual(
+            transition["details"]["completion_audit_gap_count"],
+            0,
+        )
+        self.assertEqual(
+            transition["details"]["completion_audit_gaps_by_transition"],
+            {},
+        )
+        self.assertEqual(
+            transition["details"]["completion_audit_gap_evidence_refs"],
+            [],
+        )
+        self.assertEqual(
+            transition["details"]["partial_completion_audit_gap_count"],
+            1,
+        )
+        self.assertEqual(
+            transition["details"]["partial_completion_audit_gaps_by_transition"],
+            {"runtime-state-retention-intent": 1},
+        )
+        self.assertEqual(
+            transition["details"]["partial_completion_audit_gap_evidence_refs"],
+            ["audit-record-sha256:" + reconciliation_ref],
+        )
+        self.assertFalse(
+            transition["details"][
+                "partial_completion_audit_gap_evidence_refs_truncated"
+            ]
+        )
+        self.assertEqual(
+            transition["details"][
+                "partial_completion_audit_gap_evidence_refs_omitted_count"
+            ],
+            0,
+        )
+
     def test_contract_contradiction_requires_conflict_language(self) -> None:
         normal = {
             "failure_class": "contract_error",

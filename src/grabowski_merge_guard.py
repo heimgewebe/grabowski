@@ -98,6 +98,8 @@ _TRUSTED_REVIEW_FINDING_ACTORS = _CODEX_REVIEW_ACTORS | _CLAUDE_REVIEW_ACTORS
 _CODEX_REQUEST_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 _CODEX_REVIEW_MAX_PAGES = 10
 _CODEX_REVIEW_MAX_ITEMS = 1000
+_CODEX_THREAD_MAX_PAGES = 10
+_CODEX_THREAD_MAX_ITEMS = 1000
 _CODEX_REQUEST_RE = re.compile(
     r"<!--\s*grabowski-codex-review-request:v1\s*(\{.*?\})\s*-->",
     re.DOTALL,
@@ -125,7 +127,7 @@ _CODEX_CLEAN_RESULT_RE = re.compile(
     + r"\Z"
 )
 _CODEX_THREADS_QUERY = """
-query($owner: String!, $name: String!, $number: Int!) {
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
       reviews(last: 100) {
@@ -138,7 +140,7 @@ query($owner: String!, $name: String!, $number: Int!) {
         }
         pageInfo { hasPreviousPage }
       }
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $after) {
         nodes {
           id
           isResolved
@@ -153,7 +155,7 @@ query($owner: String!, $name: String!, $number: Int!) {
             pageInfo { hasNextPage }
           }
         }
-        pageInfo { hasNextPage }
+        pageInfo { hasNextPage endCursor }
       }
     }
   }
@@ -3707,6 +3709,110 @@ class CaptainMergeGuardRunner:
             errors=errors,
         )
 
+    def _codex_paginated_review_threads(
+        self,
+        *,
+        owner: str,
+        name: str,
+        pr_number: int,
+        observations: list[dict[str, Any]],
+        errors: list[str],
+    ) -> dict[str, Any] | None:
+        nodes: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        seen_cursors: set[str] = set()
+        after: str | None = None
+        pages = 0
+        first_payload: dict[str, Any] | None = None
+
+        while True:
+            if pages >= _CODEX_THREAD_MAX_PAGES:
+                errors.append("merge_guard_codex_threads_truncated")
+                return None
+            args = [
+                "api",
+                "graphql",
+                "-f",
+                f"query={_CODEX_THREADS_QUERY}",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+                "-F",
+                f"number={pr_number}",
+            ]
+            if after is not None:
+                args.extend(["-f", f"after={after}"])
+            payload = self._codex_api_json(
+                args,
+                label="threads",
+                observations=observations,
+                errors=errors,
+            )
+            if not isinstance(payload, dict):
+                return None
+            if first_payload is None:
+                first_payload = payload
+            try:
+                connection = payload["data"]["repository"]["pullRequest"][
+                    "reviewThreads"
+                ]
+            except (KeyError, TypeError):
+                errors.append("merge_guard_codex_threads_shape_invalid")
+                return None
+            if not isinstance(connection, dict):
+                errors.append("merge_guard_codex_threads_shape_invalid")
+                return None
+            page_nodes = connection.get("nodes")
+            page_info = connection.get("pageInfo")
+            if (
+                not isinstance(page_nodes, list)
+                or any(not isinstance(item, dict) for item in page_nodes)
+                or not isinstance(page_info, dict)
+            ):
+                errors.append("merge_guard_codex_threads_shape_invalid")
+                return None
+            for item in page_nodes:
+                thread_id = item.get("id")
+                if not isinstance(thread_id, str) or not thread_id:
+                    errors.append("merge_guard_codex_thread_id_invalid")
+                    return None
+                if thread_id in seen_ids:
+                    errors.append("merge_guard_codex_threads_duplicate")
+                    return None
+                seen_ids.add(thread_id)
+                nodes.append(dict(item))
+                if len(nodes) > _CODEX_THREAD_MAX_ITEMS:
+                    errors.append("merge_guard_codex_threads_truncated")
+                    return None
+            pages += 1
+            has_next = page_info.get("hasNextPage")
+            if has_next is False:
+                break
+            if has_next is not True:
+                errors.append("merge_guard_codex_threads_shape_invalid")
+                return None
+            cursor = page_info.get("endCursor")
+            if (
+                not isinstance(cursor, str)
+                or not cursor
+                or cursor in seen_cursors
+            ):
+                errors.append("merge_guard_codex_threads_cursor_invalid")
+                return None
+            seen_cursors.add(cursor)
+            after = cursor
+
+        assert first_payload is not None
+        first_payload["data"]["repository"]["pullRequest"]["reviewThreads"] = {
+            "nodes": nodes,
+            "pageInfo": {
+                "hasNextPage": False,
+                "pages_loaded": pages,
+            },
+        }
+        return first_payload
+
     def _review_thread_sets(
         self,
         threads_payload: Any,
@@ -3969,20 +4075,10 @@ class CaptainMergeGuardRunner:
         if not owner or separator != "/" or not name:
             errors.append("merge_guard_review_findings_repository_invalid")
             return self._review_thread_sets(None, head_sha=head_sha, errors=errors)
-        threads_payload = self._codex_api_json(
-            [
-                "api",
-                "graphql",
-                "-f",
-                f"query={_CODEX_THREADS_QUERY}",
-                "-F",
-                f"owner={owner}",
-                "-F",
-                f"name={name}",
-                "-F",
-                f"number={pr_number}",
-            ],
-            label="threads",
+        threads_payload = self._codex_paginated_review_threads(
+            owner=owner,
+            name=name,
+            pr_number=pr_number,
             observations=observations,
             errors=errors,
         )

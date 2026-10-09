@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -39,6 +40,400 @@ def task_payload() -> dict:
 
 
 class CurrentWorkSurfaceTests(unittest.TestCase):
+    def test_reconciliation_payload_adds_complete_task_checkout_presence(self) -> None:
+        database = {
+            "snapshot_sha256": "a" * 64,
+            "bindings": [
+                {
+                    "checkout_key": "checkout-bound",
+                    "repo_path": REPOSITORY,
+                    "owner_id": "task:bound-task",
+                },
+                {
+                    "checkout_key": "checkout-other-owner",
+                    "repo_path": REPOSITORY,
+                    "owner_id": "lane:example",
+                },
+            ],
+            "retentions": [
+                {
+                    "checkout_key": "checkout-retained",
+                    "repo_path": REPOSITORY,
+                    "owner_id": "task:retained-task",
+                }
+            ],
+        }
+        database_reads = 0
+        reconciliation_snapshots: list[object] = []
+
+        def collect_database() -> dict:
+            nonlocal database_reads
+            database_reads += 1
+            return database
+
+        def reconcile(**kwargs: object) -> dict:
+            reconciliation_snapshots.append(kwargs.get("_database_snapshot"))
+            return {
+                "bindings": [],
+                "pagination": {"has_more": True},
+                "total_count": 101,
+                "source_snapshot": {
+                    "database_snapshot_sha256": "a" * 64,
+                },
+            }
+
+        reconciler = SimpleNamespace(
+            MAX_PAGE_LIMIT=100,
+            _validated_database_snapshot=lambda snapshot: snapshot,
+            reconcile_checkout_bindings=reconcile,
+            collect_git_worktrees_for_repos=lambda *_args, **_kwargs: {
+                "worktrees": [
+                    {"checkout_key": "checkout-bound"},
+                    {"checkout_key": "checkout-retained"},
+                    {"checkout_key": "checkout-other-owner"},
+                ],
+                "observable_repo_paths": [REPOSITORY],
+                "errors": [],
+                "errors_truncated": False,
+            },
+            collect_lifecycle_bindings_from_db=collect_database,
+        )
+
+        with patch.object(surface, "_module", return_value=reconciler):
+            result = surface._reconciliation_payload([REPOSITORY])
+
+        self.assertEqual(2, database_reads)
+        self.assertEqual([database], reconciliation_snapshots)
+        self.assertTrue(result["task_checkout_presence_complete"])
+        self.assertEqual(
+            result["task_checkout_presence"],
+            {
+                "bound-task": ["checkout-bound"],
+                "retained-task": ["checkout-retained"],
+            },
+        )
+
+    def test_task_checkout_presence_revalidates_injected_database_snapshot(
+        self,
+    ) -> None:
+        database = {
+            "snapshot_sha256": "a" * 64,
+            "bindings": [],
+            "retentions": [],
+        }
+        validation_calls: list[object] = []
+
+        def validate(snapshot: object) -> dict:
+            validation_calls.append(snapshot)
+            raise RuntimeError("tampered injected snapshot")
+
+        reconciler = SimpleNamespace(
+            _validated_database_snapshot=validate,
+            collect_lifecycle_bindings_from_db=lambda: (
+                (_ for _ in ()).throw(
+                    AssertionError(
+                        "database read must not precede snapshot validation"
+                    )
+                )
+            ),
+            collect_git_worktrees_for_repos=lambda *_args, **_kwargs: (
+                (_ for _ in ()).throw(
+                    AssertionError(
+                        "Git observation must not precede snapshot validation"
+                    )
+                )
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "tampered injected snapshot"):
+            surface._task_checkout_presence(
+                [REPOSITORY],
+                reconciler=reconciler,
+                reconciliation_payload={
+                    "source_snapshot": {
+                        "database_snapshot_sha256": "a" * 64,
+                    }
+                },
+                database_snapshot=database,
+            )
+
+        self.assertEqual(validation_calls, [database])
+
+    def test_task_checkout_presence_observes_task_owned_repository_outside_scope(
+        self,
+    ) -> None:
+        other_repository = "/home/alex/repos/other"
+        observed_targets: list[list[str]] = []
+        database = {
+            "snapshot_sha256": "b" * 64,
+            "bindings": [
+                {
+                    "checkout_key": "checkout-other",
+                    "repo_path": other_repository,
+                    "owner_id": "task:other-task",
+                }
+            ],
+            "retentions": [],
+        }
+        reconciler = SimpleNamespace(
+            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_git_worktrees_for_repos=lambda targets, **_kwargs: (
+                observed_targets.append(list(targets))
+                or {
+                    "worktrees": [{"checkout_key": "checkout-other"}],
+                    "observable_repo_paths": [REPOSITORY, other_repository],
+                    "errors": [],
+                    "errors_truncated": False,
+                }
+            ),
+        )
+
+        presence, complete = surface._task_checkout_presence(
+            [REPOSITORY],
+            reconciler=reconciler,
+            reconciliation_payload={
+                "source_snapshot": {
+                    "database_snapshot_sha256": "b" * 64,
+                }
+            },
+        )
+
+        self.assertTrue(complete)
+        self.assertEqual(
+            observed_targets,
+            [[REPOSITORY, other_repository]],
+        )
+        self.assertEqual(presence, {"other-task": ["checkout-other"]})
+
+    def test_task_checkout_presence_fails_closed_when_combined_scope_exceeds_bound(
+        self,
+    ) -> None:
+        other_repository = "/home/alex/repos/other"
+        database = {
+            "snapshot_sha256": "d" * 64,
+            "bindings": [
+                {
+                    "checkout_key": "checkout-other",
+                    "repo_path": other_repository,
+                    "owner_id": "task:other-task",
+                }
+            ],
+            "retentions": [],
+        }
+        reconciler = SimpleNamespace(
+            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_git_worktrees_for_repos=lambda *_args, **_kwargs: (
+                (_ for _ in ()).throw(
+                    AssertionError("Git observation must not exceed repository bound")
+                )
+            ),
+        )
+
+        with patch.object(surface.current_work, "MAX_REPOSITORIES", 1):
+            presence, complete = surface._task_checkout_presence(
+                [REPOSITORY],
+                reconciler=reconciler,
+                reconciliation_payload={
+                    "source_snapshot": {
+                        "database_snapshot_sha256": "d" * 64,
+                    }
+                },
+            )
+
+        self.assertEqual(presence, {})
+        self.assertFalse(complete)
+
+    def test_task_checkout_presence_accepts_repository_subpath_observation(
+        self,
+    ) -> None:
+        requested = REPOSITORY + "/src"
+        database = {
+            "snapshot_sha256": "c" * 64,
+            "bindings": [
+                {
+                    "checkout_key": "checkout-bound",
+                    "repo_path": REPOSITORY,
+                    "owner_id": "task:bound-task",
+                }
+            ],
+            "retentions": [],
+        }
+        reconciler = SimpleNamespace(
+            collect_lifecycle_bindings_from_db=lambda: database,
+            collect_git_worktrees_for_repos=lambda _targets, **_kwargs: {
+                "worktrees": [{"checkout_key": "checkout-bound"}],
+                "observable_repo_paths": [requested, REPOSITORY],
+                "errors": [],
+                "errors_truncated": False,
+            },
+        )
+
+        presence, complete = surface._task_checkout_presence(
+            [requested],
+            reconciler=reconciler,
+            reconciliation_payload={
+                "source_snapshot": {
+                    "database_snapshot_sha256": "c" * 64,
+                }
+            },
+        )
+
+        self.assertTrue(complete)
+        self.assertEqual(presence, {"bound-task": ["checkout-bound"]})
+
+    def test_attention_payload_uses_bounded_projection_only_for_current_work(
+        self,
+    ) -> None:
+        calls: list[tuple[dict, dict]] = []
+
+        def reconcile(parameters: dict, **kwargs: object) -> dict:
+            calls.append((parameters, kwargs))
+            return {"records": [], "pagination": {"has_more": False}}
+
+        fake_attention = SimpleNamespace(
+            MAX_PAGE_LIMIT=100,
+            reconcile_attention=reconcile,
+        )
+        with patch.object(surface, "_module", return_value=fake_attention):
+            surface._attention_payload("current")
+            surface._attention_payload(
+                "current",
+                current_work_task_ids={"abc123"},
+            )
+            surface._attention_payload("history")
+
+        self.assertEqual(
+            (
+                {"limit": 100, "view": "current"},
+                {"_bounded_current_projection": True},
+            ),
+            calls[0],
+        )
+        self.assertEqual(
+            (
+                {"limit": 100, "view": "current"},
+                {
+                    "_bounded_current_projection": True,
+                    "_current_work_task_ids": {"abc123"},
+                },
+            ),
+            calls[1],
+        )
+        self.assertEqual(
+            ({"limit": 100, "view": "history"}, {}),
+            calls[2],
+        )
+
+    def test_current_work_attention_task_ids_require_complete_binding_sources(
+        self,
+    ) -> None:
+        tasks_payload = task_payload()
+        resources_payload = {
+            "leases": [
+                {
+                    "owner_id": "task:lease-task",
+                    "resource_key": "path:/tmp/lease-task",
+                }
+            ],
+            "count": 1,
+            "truncated": False,
+        }
+        reconciliation_payload = {
+            "task_checkout_presence": {
+                "checkout-task": ["checkout-key"],
+            },
+            "task_checkout_presence_complete": True,
+        }
+
+        task_ids = surface._current_work_attention_task_ids(
+            tasks_payload,
+            resources_payload,
+            reconciliation_payload,
+            lease_task_ids=["lease-task"],
+            lease_task_ids_truncated=False,
+        )
+
+        self.assertEqual(
+            task_ids,
+            {"abc123", "lease-task", "checkout-task"},
+        )
+        self.assertIsNone(
+            surface._current_work_attention_task_ids(
+                tasks_payload,
+                {**resources_payload, "truncated": True},
+                reconciliation_payload,
+                lease_task_ids=["lease-task"],
+                lease_task_ids_truncated=False,
+            )
+        )
+        self.assertIsNone(
+            surface._current_work_attention_task_ids(
+                tasks_payload,
+                resources_payload,
+                {
+                    "task_checkout_presence": {},
+                    "task_checkout_presence_complete": False,
+                },
+                lease_task_ids=["lease-task"],
+                lease_task_ids_truncated=False,
+            )
+        )
+
+    def test_current_work_caps_parallel_source_workers(self) -> None:
+        real_executor = surface.ThreadPoolExecutor
+        observed_max_workers: list[int] = []
+
+        def executor_factory(*args: object, **kwargs: object):
+            observed_max_workers.append(int(kwargs["max_workers"]))
+            return real_executor(*args, **kwargs)
+
+        operator = SimpleNamespace(
+            _require_operator_capability=lambda capability: None
+        )
+        with patch.object(
+            surface,
+            "ThreadPoolExecutor",
+            side_effect=executor_factory,
+        ), patch.object(
+            surface, "_operator", return_value=operator
+        ), patch.object(
+            surface, "_task_payload", return_value=task_payload()
+        ), patch.object(
+            surface,
+            "_attention_payload",
+            return_value={"records": [], "pagination": {"has_more": False}},
+        ), patch.object(
+            surface,
+            "_resources_payload",
+            return_value={"leases": [], "count": 0, "truncated": False},
+        ), patch.object(
+            surface,
+            "_checkout_payloads",
+            return_value=[{"repository": REPOSITORY, "worktrees": []}],
+        ), patch.object(
+            surface,
+            "_reconciliation_payload",
+            return_value={
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            },
+        ), patch.object(
+            surface, "_tmux_payload", return_value={"returncode": 0, "stdout": ""}
+        ), patch.object(
+            surface, "_process_payload", return_value={"returncode": 0, "lines": []}
+        ), patch.object(
+            surface,
+            "_worker_payload",
+            side_effect=lambda kind, view: {"workers": [], "has_more": False},
+        ):
+            surface.grabowski_current_work([REPOSITORY])
+
+        self.assertEqual(
+            [surface.CURRENT_WORK_MAX_PARALLEL_SOURCES],
+            observed_max_workers,
+        )
+
     def test_surface_collects_sources_without_creating_a_second_truth(self) -> None:
         operator = SimpleNamespace(_require_operator_capability=lambda capability: None)
         with patch.object(surface, "_operator", return_value=operator), patch.object(
@@ -141,6 +536,166 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         )
         self.assertEqual(set(seen_sources), declared)
         self.assertEqual(len(seen_sources), len(declared))
+
+    def test_independent_sources_overlap_without_dropping_evidence(self) -> None:
+        operator = SimpleNamespace(_require_operator_capability=lambda capability: None)
+        rendezvous = threading.Barrier(2)
+
+        def overlap(value: object) -> object:
+            rendezvous.wait(timeout=2)
+            return value
+
+        with patch.object(surface, "_operator", return_value=operator), patch.object(
+            surface, "_task_payload", return_value=task_payload()
+        ), patch.object(
+            surface,
+            "_attention_payload",
+            return_value={"records": [], "pagination": {"has_more": False}},
+        ), patch.object(
+            surface,
+            "_resources_payload",
+            return_value={"leases": [], "count": 0, "truncated": False},
+        ), patch.object(
+            surface,
+            "_checkout_payloads",
+            side_effect=lambda _repositories, _errors: overlap(
+                [{"repository": REPOSITORY, "worktrees": []}]
+            ),
+        ), patch.object(
+            surface,
+            "_reconciliation_payload",
+            return_value={
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            },
+        ), patch.object(
+            surface,
+            "_tmux_payload",
+            side_effect=lambda: overlap({"returncode": 0, "stdout": ""}),
+        ), patch.object(
+            surface, "_process_payload", return_value={"returncode": 0, "lines": []}
+        ), patch.object(
+            surface,
+            "_worker_payload",
+            side_effect=lambda kind, view: {"workers": [], "has_more": False},
+        ):
+            result = surface.grabowski_current_work([REPOSITORY])
+
+        overlapping_errors = [
+            item
+            for item in result["source_errors"]
+            if item["source"] in {"checkouts", "tmux"}
+        ]
+        self.assertEqual(overlapping_errors, [])
+
+    def test_attention_reads_after_task_generation_advances(self) -> None:
+        operator = SimpleNamespace(_require_operator_capability=lambda capability: None)
+        generation = {"value": 1}
+        attention_generations: list[int] = []
+
+        def load_tasks(
+            _view: str,
+            _task_ids: list[str],
+            *,
+            required_ids_truncated: bool = False,
+        ) -> dict:
+            self.assertFalse(required_ids_truncated)
+            generation["value"] = 2
+            payload = task_payload()
+            payload["tasks"][0]["attempt"] = 2
+            return payload
+
+        def load_attention(_view: str) -> dict:
+            attention_generations.append(generation["value"])
+            return {"records": [], "pagination": {"has_more": False}}
+
+        with patch.object(surface, "_operator", return_value=operator), patch.object(
+            surface, "_task_payload", side_effect=load_tasks
+        ), patch.object(
+            surface, "_attention_payload", side_effect=load_attention
+        ), patch.object(
+            surface,
+            "_resources_payload",
+            return_value={"leases": [], "count": 0, "truncated": False},
+        ), patch.object(
+            surface,
+            "_checkout_payloads",
+            return_value=[{"repository": REPOSITORY, "worktrees": []}],
+        ), patch.object(
+            surface,
+            "_reconciliation_payload",
+            return_value={
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            },
+        ), patch.object(
+            surface, "_tmux_payload", return_value={"returncode": 0, "stdout": ""}
+        ), patch.object(
+            surface, "_process_payload", return_value={"returncode": 0, "lines": []}
+        ), patch.object(
+            surface,
+            "_worker_payload",
+            side_effect=lambda kind, view: {"workers": [], "has_more": False},
+        ):
+            result = surface.grabowski_current_work([REPOSITORY])
+
+        self.assertEqual(attention_generations, [2])
+        self.assertEqual(result["work"][0]["work_id"], "task:abc123")
+        self.assertFalse(
+            any(item["source"] == "attention" for item in result["source_errors"])
+        )
+
+    def test_checkout_reconciliation_waits_for_checkout_inventory(self) -> None:
+        operator = SimpleNamespace(_require_operator_capability=lambda capability: None)
+        checkout_finished = threading.Event()
+        reconciliation_started = threading.Event()
+
+        def load_checkouts(
+            _repositories: list[str],
+            _errors: list[dict],
+        ) -> list[dict]:
+            self.assertFalse(reconciliation_started.is_set())
+            checkout_finished.set()
+            return [{"repository": REPOSITORY, "worktrees": []}]
+
+        def load_reconciliation(_repositories: list[str]) -> dict:
+            self.assertTrue(checkout_finished.is_set())
+            reconciliation_started.set()
+            return {
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            }
+
+        with patch.object(surface, "_operator", return_value=operator), patch.object(
+            surface, "_task_payload", return_value=task_payload()
+        ), patch.object(
+            surface,
+            "_attention_payload",
+            return_value={"records": [], "pagination": {"has_more": False}},
+        ), patch.object(
+            surface,
+            "_resources_payload",
+            return_value={"leases": [], "count": 0, "truncated": False},
+        ), patch.object(
+            surface, "_checkout_payloads", side_effect=load_checkouts
+        ), patch.object(
+            surface, "_reconciliation_payload", side_effect=load_reconciliation
+        ), patch.object(
+            surface, "_tmux_payload", return_value={"returncode": 0, "stdout": ""}
+        ), patch.object(
+            surface, "_process_payload", return_value={"returncode": 0, "lines": []}
+        ), patch.object(
+            surface,
+            "_worker_payload",
+            side_effect=lambda kind, view: {"workers": [], "has_more": False},
+        ):
+            surface.grabowski_current_work([REPOSITORY])
+
+        self.assertTrue(checkout_finished.is_set())
+        self.assertTrue(reconciliation_started.is_set())
 
     def test_source_capability_failure_is_visible_as_partial_evidence(self) -> None:
         def gate(capability: str) -> None:
@@ -323,8 +878,15 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         reconciler = SimpleNamespace(
             MAX_PAGE_LIMIT=100,
             reconcile_checkout_bindings=reconcile,
+            collect_lifecycle_bindings_from_db=lambda: {
+                "snapshot_sha256": "a" * 64,
+            },
         )
-        with patch.object(surface, "_module", return_value=reconciler):
+        with patch.object(
+            surface, "_module", return_value=reconciler
+        ), patch.object(
+            surface, "_task_checkout_presence", return_value=({}, True)
+        ):
             result = surface._reconciliation_payload([REPOSITORY])
 
         self.assertEqual(result["bindings"], [])

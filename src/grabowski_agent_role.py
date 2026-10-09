@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 import stat
 import subprocess
 import sys
+import uuid
 from typing import Any
 
 from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
@@ -31,6 +32,8 @@ GROK_REVIEW_TOOLS = "todo_write"
 GROK_REVIEW_DISALLOWED_TOOLS = "todo_write,search_tool,use_tool,run_terminal_cmd,run_terminal_command"
 GROK_REVIEW_MAX_TURNS = 2
 GROK_REVIEW_PROMPT_TARGET = Path("/tmp/grabowski-bound-review-prompt")
+REVIEW_ATTEMPT_UNIT = __import__("re").compile(r"^grabowski-job-[0-9a-f]{12}$")
+REVIEW_ATTEMPT_RECEIPT_NAME = "review-role-attempt.json"
 GROK_REVIEW_EVENT_TYPES = frozenset(
     {
         "text",
@@ -283,55 +286,76 @@ def current_binding(repo: Path, base: str) -> tuple[str, str, bool]:
 
 def write_receipt(path: Path, payload: dict[str, Any], *, create_only: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory_fd = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    temporary_name = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        metadata = None
-    if metadata is not None:
+        parent = os.fstat(directory_fd)
         if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_uid != os.getuid()
-            or stat.S_IMODE(metadata.st_mode) & 0o077
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.getuid()
+            or stat.S_IMODE(parent.st_mode) & 0o077
         ):
-            raise PermissionError("role receipt target must be one owner-controlled regular file")
-        if create_only:
-            raise FileExistsError("role attempt receipt already exists")
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:
+            raise PermissionError("role receipt parent must be owner-private")
         try:
-            handle = os.fdopen(descriptor, "w", encoding="utf-8")
-        except BaseException:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-            raise
-        with handle:
-            json.dump(payload, handle, ensure_ascii=True, sort_keys=True, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        if create_only:
-            try:
-                os.link(temporary, path, follow_symlinks=False)
-            except FileExistsError as exc:
-                raise FileExistsError("role attempt receipt already exists") from exc
-            temporary.unlink()
-        else:
-            os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            existing = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if (
+                not stat.S_ISREG(existing.st_mode)
+                or existing.st_nlink != 1
+                or existing.st_uid != os.getuid()
+                or stat.S_IMODE(existing.st_mode) & 0o077
+            ):
+                raise PermissionError("role receipt target must be one owner-controlled regular file")
+            if create_only:
+                raise FileExistsError("role attempt receipt already exists")
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=directory_fd,
+        )
         try:
+            try:
+                handle = os.fdopen(descriptor, "w", encoding="utf-8")
+            except BaseException:
+                # Ownership transfers only after fdopen returns successfully.
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                raise
+            with handle:
+                json.dump(payload, handle, ensure_ascii=True, sort_keys=True, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            if create_only:
+                try:
+                    os.link(
+                        temporary_name, path.name, src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd, follow_symlinks=False,
+                    )
+                except FileExistsError as exc:
+                    raise FileExistsError("role attempt receipt already exists") from exc
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            else:
+                os.replace(
+                    temporary_name, path.name,
+                    src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+                )
             os.fsync(directory_fd)
         finally:
-            os.close(directory_fd)
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-
+        os.close(directory_fd)
 
 def _declared_virtualenv_binding(repo: Path, command: list[str]) -> tuple[list[tuple[Path, Path]], list[Path]]:
     """Bind one explicitly invoked Python virtualenv read-only, never a broad home tree."""
@@ -646,6 +670,216 @@ def _grok_streaming_review_command(
     return tuple(command), prompt
 
 
+_CODEX_NONINTERACTIVE_SUBCOMMANDS = frozenset({"exec", "e", "review"})
+_CODEX_ROOT_SUBCOMMANDS = _CODEX_NONINTERACTIVE_SUBCOMMANDS | frozenset(
+    {
+        "agents",
+        "login",
+        "logout",
+        "mcp",
+        "mcp-server",
+        "plugin",
+        "app-server",
+        "remote-control",
+        "completion",
+        "update",
+        "doctor",
+        "sandbox",
+        "debug",
+        "apply",
+        "a",
+        "resume",
+        "queue",
+        "archive",
+        "delete",
+        "migrate-rollouts",
+        "unarchive",
+        "fork",
+        "cloud",
+        "exec-server",
+        "features",
+        "help",
+    }
+)
+_CODEX_GLOBAL_OPTIONS_WITH_VALUE = frozenset(
+    {
+        "-a",
+        "--add-dir",
+        "--ask-for-approval",
+        "-C",
+        "--cd",
+        "-c",
+        "--config",
+        "--disable",
+        "--enable",
+        "-i",
+        "--image",
+        "--local-provider",
+        "-m",
+        "--model",
+        "-p",
+        "--profile",
+        "--remote",
+        "--remote-auth-token-env",
+        "-s",
+        "--sandbox",
+    }
+)
+_CODEX_VARIADIC_GLOBAL_OPTIONS = frozenset({"-i", "--image"})
+_CODEX_GLOBAL_FLAGS = frozenset(
+    {
+        "--approve-for-me",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "-h",
+        "--help",
+        "--no-alt-screen",
+        "--oss",
+        "--search",
+        "--strict-config",
+        "-V",
+        "--version",
+        "--worktree",
+    }
+)
+_CODEX_LONG_OPTIONS_WITH_VALUE = tuple(
+    option
+    for option in _CODEX_GLOBAL_OPTIONS_WITH_VALUE
+    if option.startswith("--")
+)
+_CODEX_SHORT_OPTIONS_WITH_VALUE = tuple(
+    option
+    for option in _CODEX_GLOBAL_OPTIONS_WITH_VALUE
+    if option.startswith("-") and not option.startswith("--")
+)
+
+
+def _codex_attached_short_option(token: str) -> str | None:
+    return next(
+        (
+            option
+            for option in _CODEX_SHORT_OPTIONS_WITH_VALUE
+            if token != option and token.startswith(option)
+        ),
+        None,
+    )
+
+
+def _codex_append_image_values(
+    arguments: list[str],
+    index: int,
+    normalized: list[str],
+) -> tuple[int, int]:
+    image_count = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value.startswith("-") or value in _CODEX_ROOT_SUBCOMMANDS:
+            break
+        normalized.append(f"--image={value}")
+        image_count += 1
+        index += 1
+    return index, image_count
+
+
+def _codex_review_prefix(
+    command: list[str],
+) -> tuple[str | None, list[str], bool]:
+    """Classify root Codex argv and preserve a prompt-only separator."""
+    arguments = command[1:-1]
+    normalized: list[str] = []
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token == "--":
+            if index != len(arguments) - 1:
+                raise RuntimeError(
+                    "Codex review command has extra positional arguments after --"
+                )
+            return None, normalized, True
+        if token in _CODEX_GLOBAL_OPTIONS_WITH_VALUE:
+            if index + 1 >= len(arguments):
+                raise RuntimeError(f"Codex global option {token} is missing its value")
+            if token in _CODEX_VARIADIC_GLOBAL_OPTIONS:
+                index, image_count = _codex_append_image_values(
+                    arguments, index + 1, normalized
+                )
+                if image_count == 0:
+                    raise RuntimeError(f"Codex global option {token} is missing its value")
+                continue
+            normalized.extend((token, arguments[index + 1]))
+            index += 2
+            continue
+        long_option = next(
+            (
+                option
+                for option in _CODEX_LONG_OPTIONS_WITH_VALUE
+                if token.startswith(f"{option}=")
+            ),
+            None,
+        )
+        if long_option is not None:
+            if long_option in _CODEX_VARIADIC_GLOBAL_OPTIONS:
+                image_value = token[len(long_option) + 1 :]
+                if not image_value:
+                    raise RuntimeError(
+                        f"Codex global option {long_option} is missing its value"
+                    )
+                normalized.append(f"--image={image_value}")
+                index, _image_count = _codex_append_image_values(
+                    arguments, index + 1, normalized
+                )
+                continue
+            normalized.append(token)
+            index += 1
+            continue
+        short_option = _codex_attached_short_option(token)
+        if short_option is not None:
+            if short_option == "-i":
+                image_value = token[len(short_option):]
+                if image_value.startswith("="):
+                    image_value = image_value[1:]
+                if not image_value:
+                    raise RuntimeError("Codex global option -i is missing its value")
+                normalized.append(f"--image={image_value}")
+                index, _image_count = _codex_append_image_values(
+                    arguments, index + 1, normalized
+                )
+                continue
+            normalized.append(token)
+            index += 1
+            continue
+        if token in _CODEX_GLOBAL_FLAGS:
+            normalized.append(token)
+            index += 1
+            continue
+        if token.startswith("-"):
+            raise RuntimeError(
+                f"unsupported Codex global option before review subcommand: {token}"
+            )
+        return token, normalized, False
+    return None, normalized, False
+
+
+def _codex_declared_subcommand(command: list[str]) -> str | None:
+    """Return the actual Codex subcommand before the final review prompt."""
+    subcommand, _normalized, _prompt_separator = _codex_review_prefix(command)
+    return subcommand
+
+
+def _codex_review_command_for_headless_execution(command: list[str]) -> list[str]:
+    """Turn one direct Codex review command into its non-interactive form."""
+    if len(command) < 2:
+        raise RuntimeError("Codex review command must include a prompt")
+    subcommand, normalized, prompt_separator = _codex_review_prefix(command)
+    if subcommand in _CODEX_NONINTERACTIVE_SUBCOMMANDS:
+        return list(command)
+    if subcommand is not None:
+        raise RuntimeError(
+            f"Codex review command declares unsupported subcommand: {subcommand}"
+        )
+    prompt = ["--", command[-1]] if prompt_separator else [command[-1]]
+    return [command[0], *normalized, "exec", *prompt]
+
 
 def _review_sandbox_argv(
     repo: Path,
@@ -655,7 +889,20 @@ def _review_sandbox_argv(
     expected_base_head: str,
     review_diff: bytes,
 ) -> tuple[list[str], str | None, bytes | None]:
-    if Path(command[0]).name != "grok":
+    executable_name = Path(command[0]).name
+    if executable_name == "codex":
+        normalized = _codex_review_command_for_headless_execution(command)
+        prepared = prepare_external_agent_command(normalized)
+        return (
+            sandbox_argv(
+                repo,
+                list(prepared.command),
+                declared_command=command,
+            ),
+            None,
+            None,
+        )
+    if executable_name != "grok":
         return sandbox_argv(repo, command), None, None
     prepared = prepare_external_agent_command(command)
     actual, prompt_bytes = _grok_streaming_review_command(
@@ -861,6 +1108,24 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("invalid command or binding")
     expected_dirty = args.expected_dirty == "true"
+    # Validate the trusted job envelope before spawning an external reviewer.
+    attempt_unit = os.environ.get("GRABOWSKI_REVIEW_ATTEMPT_UNIT")
+    if attempt_unit is not None:
+        origin_sha256 = os.environ.get("GRABOWSKI_JOB_ORIGIN_SHA256")
+        job_directory = Path(os.environ.get("GRABOWSKI_JOB_DIRECTORY", ""))
+        if (
+            args.role != "review"
+            or REVIEW_ATTEMPT_UNIT.fullmatch(attempt_unit) is None
+            or os.environ.get("GRABOWSKI_JOB_UNIT") != attempt_unit
+            or os.environ.get("GRABOWSKI_JOB_ID") != attempt_unit.removeprefix("grabowski-job-")
+            or origin_sha256 is None
+            or SHA256.fullmatch(origin_sha256) is None
+            or not job_directory.is_absolute()
+            or job_directory.name != attempt_unit
+            or output != job_directory / REVIEW_ATTEMPT_RECEIPT_NAME
+        ):
+            raise RuntimeError("job-owned review attempt binding is invalid")
+
     review_artifact_values = (
         args.review_input_root, args.review_input_path, args.review_input_sha256
     )
@@ -1022,6 +1287,9 @@ def main(argv: list[str] | None = None) -> int:
                     payload["returncode"] = 126
                     payload["error"] = "non-PASS review must contain findings"
     payload["failure_classification"] = classify_result(args.role, command, repo, payload)
+    if attempt_unit is not None:
+        payload["review_attempt_unit"] = attempt_unit
+        payload["review_attempt_origin_sha256"] = origin_sha256
     stable = dict(payload)
     payload["receipt_sha256"] = digest(stable)
     write_receipt(output, payload, create_only=True)

@@ -329,6 +329,235 @@ class ResourceTests(unittest.TestCase):
                 ).fetchone()
             )
 
+    def test_schema_v3_missing_reconcile_revision_contract_is_backed_up_and_promoted(self) -> None:
+        resources.acquire_resources(
+            "owner-before-reconcile-contract",
+            ["component:reconcile-contract-fixture"],
+            purpose="preserve resource store before reconcile revision promotion",
+            ttl_seconds=120,
+        )
+        with sqlite3.connect(self.database) as connection:
+            trigger_names = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'resource_reconcile_%_v1'"
+                )
+            ]
+            for trigger_name in trigger_names:
+                connection.execute(f'DROP TRIGGER "{trigger_name}"')
+            connection.execute(
+                "DELETE FROM metadata WHERE key IN (?, ?)",
+                (
+                    resources.RESOURCE_RECONCILE_REVISION_CONTRACT_METADATA_KEY,
+                    resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,
+                ),
+            )
+            connection.commit()
+
+        self.assertEqual(
+            "3:reconcile-revision-contract-missing",
+            resources._preflight_resource_store(),
+        )
+
+        self.assertEqual(1, resources.count_resources())
+
+        with sqlite3.connect(self.database) as connection:
+            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            self.assertEqual(
+                resources.RESOURCE_RECONCILE_REVISION_CONTRACT_VERSION,
+                metadata[resources.RESOURCE_RECONCILE_REVISION_CONTRACT_METADATA_KEY],
+            )
+            revision_token = metadata[
+                resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY
+            ]
+            self.assertRegex(revision_token, r"\A[0-9a-f]{64}\Z")
+            observed_triggers = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'resource_reconcile_%_v1'"
+                )
+            }
+        self.assertEqual(
+            set(resources._resource_reconcile_revision_trigger_sql()),
+            observed_triggers,
+        )
+
+        backups = self._resource_migration_backups()
+        self.assertEqual(1, len(backups))
+        with sqlite3.connect(backups[0]) as backup:
+            backup_metadata = dict(backup.execute("SELECT key, value FROM metadata"))
+            self.assertNotIn(
+                resources.RESOURCE_RECONCILE_REVISION_CONTRACT_METADATA_KEY,
+                backup_metadata,
+            )
+            self.assertNotIn(
+                resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,
+                backup_metadata,
+            )
+            self.assertEqual(
+                [],
+                backup.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='trigger' AND name LIKE 'resource_reconcile_%_v1'"
+                ).fetchall(),
+            )
+
+    def test_resource_reconcile_revision_trigger_tracks_direct_sql_mutation(self) -> None:
+        terminalization = self._pending_terminalization(
+            "d" * 24,
+            prepared_at_unix=100,
+        )
+        before = resources._reconcile_revision_snapshot()
+        self.assertIsNotNone(before)
+        assert before is not None
+        before_revision = before["revision"]
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE task_terminalizations "
+                "SET recovery_status='recovered_legacy_row_first' "
+                "WHERE task_id=?",
+                (terminalization["task_id"],),
+            )
+            connection.commit()
+
+        after = resources._reconcile_revision_snapshot()
+        self.assertIsNotNone(after)
+        assert after is not None
+        self.assertRegex(before_revision, r"\A[0-9a-f]{64}\Z")
+        self.assertRegex(after["revision"], r"\A[0-9a-f]{64}\Z")
+        self.assertNotEqual(before_revision, after["revision"])
+
+    def test_resource_reconcile_revision_trigger_rejects_malformed_token(self) -> None:
+        terminalization = self._pending_terminalization(
+            "e" * 24,
+            prepared_at_unix=101,
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE metadata SET value='broken' WHERE key=?",
+                (resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "resource reconcile revision token is invalid",
+            ):
+                connection.execute(
+                    "UPDATE task_terminalizations "
+                    "SET recovery_status='recovered_legacy_row_first' "
+                    "WHERE task_id=?",
+                    (terminalization["task_id"],),
+                )
+            connection.rollback()
+
+        with sqlite3.connect(self.database) as connection:
+            recovery_status = connection.execute(
+                "SELECT recovery_status FROM task_terminalizations WHERE task_id=?",
+                (terminalization["task_id"],),
+            ).fetchone()[0]
+        self.assertNotEqual("recovered_legacy_row_first", recovery_status)
+
+
+    def test_resource_reconcile_revision_trigger_rejects_blob_token(self) -> None:
+        terminalization = self._pending_terminalization(
+            "f" * 24,
+            prepared_at_unix=102,
+        )
+        with sqlite3.connect(self.database) as connection:
+            before_status = connection.execute(
+                "SELECT recovery_status FROM task_terminalizations WHERE task_id=?",
+                (terminalization["task_id"],),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE metadata SET value=zeroblob(64) WHERE key=?",
+                (resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+            )
+            self.assertEqual(
+                ("blob", 64),
+                connection.execute(
+                    "SELECT typeof(value), length(value) FROM metadata WHERE key=?",
+                    (resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+                ).fetchone(),
+            )
+            with self.assertRaisesRegex(
+                sqlite3.IntegrityError,
+                "resource reconcile revision token is invalid",
+            ):
+                connection.execute(
+                    "UPDATE task_terminalizations "
+                    "SET recovery_status='recovered_legacy_row_first' "
+                    "WHERE task_id=?",
+                    (terminalization["task_id"],),
+                )
+            connection.rollback()
+
+        with sqlite3.connect(self.database) as connection:
+            after_status = connection.execute(
+                "SELECT recovery_status FROM task_terminalizations WHERE task_id=?",
+                (terminalization["task_id"],),
+            ).fetchone()[0]
+        self.assertEqual(before_status, after_status)
+
+    def test_resource_reconcile_revision_tracks_replace_task_lease_to_non_task(
+        self,
+    ) -> None:
+        resource_key = "service:reconcile-resource-replace.service"
+        resources.acquire_resources(
+            "task:replace-resource-owner",
+            [resource_key],
+            purpose="prove REPLACE cannot bypass reconcile revision tracking",
+            ttl_seconds=60,
+        )
+        before = resources._reconcile_revision_snapshot()
+        self.assertIsNotNone(before)
+        assert before is not None
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("PRAGMA recursive_triggers=OFF")
+            self.assertEqual(
+                0, connection.execute("PRAGMA recursive_triggers").fetchone()[0]
+            )
+            columns = [
+                str(row[1]) for row in connection.execute("PRAGMA table_info(leases)")
+            ]
+            row = list(
+                connection.execute(
+                    "SELECT * FROM leases WHERE resource_key=?", (resource_key,)
+                ).fetchone()
+            )
+            row[columns.index("owner_id")] = "operator:replacement-proof"
+            names = ", ".join(f'"{name}"' for name in columns)
+            placeholders = ", ".join("?" for _ in columns)
+            connection.execute(
+                f"INSERT OR REPLACE INTO leases ({names}) VALUES ({placeholders})",
+                row,
+            )
+            connection.commit()
+
+        after = resources._reconcile_revision_snapshot()
+        self.assertIsNotNone(after)
+        assert after is not None
+        self.assertNotEqual(before["revision"], after["revision"])
+
+    def test_resource_reconcile_revision_ignores_unrelated_lease(self) -> None:
+        with resources._database():
+            pass
+        before = resources._reconcile_revision_snapshot()
+        self.assertIsNotNone(before)
+        assert before is not None
+        resources.acquire_resources(
+            "reconcile-non-task-owner",
+            ["component:reconcile-non-task-lease"],
+            purpose="prove unrelated leases do not churn reconcile cursors",
+            ttl_seconds=60,
+        )
+        after = resources._reconcile_revision_snapshot()
+        self.assertIsNotNone(after)
+        assert after is not None
+        self.assertEqual(before["revision"], after["revision"])
+
     def test_lease_projection_read_guard_pins_contract_and_rows_to_one_snapshot(self) -> None:
         key = "component:lease-snapshot-proof"
         resources.acquire_resources(
@@ -569,6 +798,26 @@ class ResourceTests(unittest.TestCase):
             )
         self.assertEqual(0, resources.count_resources())
 
+    def test_public_resource_acquire_rejects_spoofed_user_systemd_subtree_authority(
+        self,
+    ) -> None:
+        with patch.object(resources.operator, "_require_operator_mutation"):
+            with self.assertRaisesRegex(
+                ValueError, "unit_file_config_root.*server-owned authority surface"
+            ):
+                resources.grabowski_resource_acquire(
+                    "operator:spoof-user-systemd-scope",
+                    ["path:/"],
+                    "spoofed user-systemd subtree authority",
+                    60,
+                    {
+                        "unit": "demo.service",
+                        "action": "enable",
+                        "unit_file_config_root": "/",
+                    },
+                )
+        self.assertEqual(0, resources.count_resources())
+
     def test_public_resource_acquire_rejects_spoofed_bureau_publication_authority_metadata(
         self,
     ) -> None:
@@ -767,6 +1016,345 @@ class ResourceTests(unittest.TestCase):
                 ttl_seconds=60,
                 metadata=lane_metadata,
             )
+
+    def test_user_systemd_fence_blocks_work_lane_parent_scope(self) -> None:
+        repository = self.root / "repo"
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment_path = repository / "units" / unit
+        fragment_key = f"path:{fragment_path}"
+        fence_owner = "operator:user-systemd-fence-parent-scope"
+        lease = resources.acquire_resources(
+            fence_owner,
+            [service_key, fragment_key],
+            purpose="uncertain unit mutation",
+            ttl_seconds=120,
+            metadata={"unit": unit, "action": "restart"},
+        )
+        fence = resources.prepare_user_systemd_uncertainty_fence(
+            fence_owner,
+            [service_key, fragment_key],
+            expected_leases=lease["leases"],
+            unit=unit,
+            action="restart",
+        )
+        resources.release_resources(
+            fence_owner,
+            [service_key, fragment_key],
+            expected_leases=lease["leases"],
+        )
+
+        lane_id = "9" * 32
+        parent_key = f"path:{fragment_path.parent}"
+        lane_metadata = self.work_lane_metadata(
+            repository, target=self.root / "lane-fence-parent", lane_id=lane_id
+        )
+        with self.assertRaises(resources.ResourceUncertaintyConflict) as raised:
+            resources.acquire_resources(
+                f"lane:{lane_id}",
+                [parent_key],
+                purpose="lane parent scope must respect durable fence",
+                ttl_seconds=60,
+                metadata=lane_metadata,
+            )
+        self.assertEqual(fragment_key, raised.exception.resource_key)
+        active = resources.user_systemd_uncertainty_status([fragment_key])
+        self.assertIsNotNone(active)
+        self.assertEqual(fence["fence_id"], active["fence_id"])
+
+    def test_user_systemd_unit_file_live_scope_blocks_config_child_writer(self) -> None:
+        repository = self.root / "repo"
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment_path = self.root / "vendor" / "systemd" / "user" / unit
+        fragment_key = f"path:{fragment_path}"
+        config_root = repository / "xdg" / "systemd" / "user"
+        config_key = f"path:{config_root}"
+        owner = "operator:user-systemd-enable-live"
+        resources.acquire_resources(
+            owner,
+            [service_key, fragment_key, config_key],
+            purpose="live unit-file enable scope",
+            ttl_seconds=120,
+            metadata={
+                "unit": unit,
+                "action": "enable",
+                "unit_file_config_root": str(config_root),
+            },
+        )
+
+        child_key = f"path:{config_root / 'default.target.wants' / unit}"
+        with self.assertRaises(resources.ResourceConflict) as raised:
+            resources.acquire_resources(
+                "ordinary-config-child-writer",
+                [child_key],
+                purpose="must not overlap live unit-file mutation",
+                ttl_seconds=60,
+            )
+        self.assertEqual(config_key, raised.exception.resource_key)
+
+    def test_existing_config_child_writer_blocks_user_systemd_unit_file_scope(self) -> None:
+        repository = self.root / "repo"
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment_path = self.root / "vendor" / "systemd" / "user" / unit
+        fragment_key = f"path:{fragment_path}"
+        config_root = repository / "xdg" / "systemd" / "user"
+        config_key = f"path:{config_root}"
+        child_key = f"path:{config_root / 'default.target.wants' / unit}"
+        child_lease = resources.acquire_resources(
+            "ordinary-config-child-before-enable",
+            [child_key],
+            purpose="existing config child writer",
+            ttl_seconds=60,
+        )
+
+        with self.assertRaises(resources.ResourceConflict) as raised:
+            resources.acquire_resources(
+                "operator:user-systemd-enable-after-child",
+                [service_key, fragment_key, config_key],
+                purpose="enable must respect existing child writer",
+                ttl_seconds=120,
+                metadata={
+                    "unit": unit,
+                    "action": "enable",
+                    "unit_file_config_root": str(config_root),
+                },
+            )
+        self.assertEqual(child_key, raised.exception.resource_key)
+        resources.release_resources(
+            child_lease["owner_id"],
+            [child_key],
+            expected_leases=child_lease["leases"],
+        )
+
+    def test_non_unit_file_fence_rejects_second_path_authority(self) -> None:
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        first_path = f"path:{self.root / 'one' / unit}"
+        second_path = f"path:{self.root / 'two' / unit}"
+        owner = "operator:user-systemd-restart-authority-bound"
+        keys = [service_key, first_path, second_path]
+        lease = resources.acquire_resources(
+            owner,
+            keys,
+            purpose="restart authority bound",
+            ttl_seconds=120,
+            metadata={"unit": unit, "action": "restart"},
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported authority keys"):
+            resources.prepare_user_systemd_uncertainty_fence(
+                owner,
+                keys,
+                expected_leases=lease["leases"],
+                unit=unit,
+                action="restart",
+            )
+        resources.release_resources(
+            owner,
+            keys,
+            expected_leases=lease["leases"],
+        )
+
+    def test_user_systemd_unit_file_fence_blocks_config_child_writer(self) -> None:
+        repository = self.root / "repo"
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment_path = self.root / "vendor" / "systemd" / "user" / unit
+        fragment_key = f"path:{fragment_path}"
+        config_root = repository / "xdg" / "systemd" / "user"
+        config_key = f"path:{config_root}"
+        owner = "operator:user-systemd-disable-fence"
+        keys = [service_key, fragment_key, config_key]
+        lease = resources.acquire_resources(
+            owner,
+            keys,
+            purpose="uncertain unit-file disable",
+            ttl_seconds=120,
+            metadata={
+                "unit": unit,
+                "action": "disable",
+                "unit_file_config_root": str(config_root),
+            },
+        )
+        fence = resources.prepare_user_systemd_uncertainty_fence(
+            owner,
+            keys,
+            expected_leases=lease["leases"],
+            unit=unit,
+            action="disable",
+        )
+        resources.release_resources(
+            owner,
+            keys,
+            expected_leases=lease["leases"],
+        )
+
+        child_key = f"path:{config_root / 'default.target.wants' / unit}"
+        with self.assertRaises(resources.ResourceUncertaintyConflict) as raised:
+            resources.acquire_resources(
+                "ordinary-config-child-after-lease",
+                [child_key],
+                purpose="durable unit-file fence owns config subtree",
+                ttl_seconds=60,
+            )
+        self.assertEqual(config_key, raised.exception.resource_key)
+        active = resources.user_systemd_uncertainty_status([service_key])
+        self.assertIsNotNone(active)
+        self.assertEqual(fence["fence_id"], active["fence_id"])
+        self.assertIn(config_key, active["resource_keys"])
+
+    def test_user_systemd_unit_file_fence_blocks_work_lane_parent_scope(self) -> None:
+        repository = self.root / "repo"
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment_path = self.root / "vendor" / "systemd" / "user" / unit
+        fragment_key = f"path:{fragment_path}"
+        config_root = repository / "xdg" / "systemd" / "user"
+        config_key = f"path:{config_root}"
+        owner = "operator:user-systemd-enable-fence-lane"
+        keys = [service_key, fragment_key, config_key]
+        lease = resources.acquire_resources(
+            owner,
+            keys,
+            purpose="uncertain unit-file enable",
+            ttl_seconds=120,
+            metadata={
+                "unit": unit,
+                "action": "enable",
+                "unit_file_config_root": str(config_root),
+            },
+        )
+        resources.prepare_user_systemd_uncertainty_fence(
+            owner,
+            keys,
+            expected_leases=lease["leases"],
+            unit=unit,
+            action="enable",
+        )
+        resources.release_resources(
+            owner,
+            keys,
+            expected_leases=lease["leases"],
+        )
+
+        lane_id = "8" * 32
+        parent_key = f"path:{config_root.parent}"
+        lane_metadata = self.work_lane_metadata(
+            repository,
+            target=self.root / "lane-unit-file-parent",
+            lane_id=lane_id,
+        )
+        with self.assertRaises(resources.ResourceUncertaintyConflict) as raised:
+            resources.acquire_resources(
+                f"lane:{lane_id}",
+                [parent_key],
+                purpose="lane parent scope must respect unit-file fence",
+                ttl_seconds=60,
+                metadata=lane_metadata,
+            )
+        self.assertEqual(config_key, raised.exception.resource_key)
+
+    def test_cleared_user_systemd_fence_moves_out_of_active_scan(self) -> None:
+        unit = "grabowski-cleared-fence-history.service"
+        service_key = f"service:user-systemd:{unit}"
+        owner = "operator:user-systemd-cleared-history"
+        lease = resources.acquire_resources(
+            owner,
+            [service_key],
+            purpose="cleared fence history fixture",
+            ttl_seconds=120,
+            metadata={"unit": unit, "action": "restart"},
+        )
+        fence = resources.prepare_user_systemd_uncertainty_fence(
+            owner,
+            [service_key],
+            expected_leases=lease["leases"],
+            unit=unit,
+            action="restart",
+        )
+        resources.release_resources(
+            owner,
+            [service_key],
+            expected_leases=lease["leases"],
+        )
+
+        cleared = resources.clear_user_systemd_uncertainty_fence(
+            fence["fence_id"],
+            outcome="terminal_readback",
+            evidence_sha256="c" * 64,
+        )
+
+        self.assertIsNone(
+            resources.user_systemd_uncertainty_status([service_key])
+        )
+        with resources._database() as connection:
+            active = connection.execute(
+                "SELECT key FROM metadata WHERE key GLOB ?",
+                (f"{resources.USER_SYSTEMD_UNCERTAINTY_METADATA_PREFIX}*",),
+            ).fetchall()
+            history = connection.execute(
+                "SELECT key FROM metadata WHERE key GLOB ?",
+                (f"{resources.USER_SYSTEMD_UNCERTAINTY_HISTORY_METADATA_PREFIX}*",),
+            ).fetchall()
+        self.assertEqual(active, [])
+        self.assertEqual(
+            [resources._user_systemd_uncertainty_history_metadata_key(fence["fence_id"])],
+            [str(row[0]) for row in history],
+        )
+        replay = resources.clear_user_systemd_uncertainty_fence(
+            fence["fence_id"],
+            outcome="terminal_readback",
+            evidence_sha256="c" * 64,
+        )
+        self.assertEqual(cleared, replay)
+
+        replacement = resources.acquire_resources(
+            "operator:user-systemd-after-clear",
+            [service_key],
+            purpose="active scan ignores cleared history",
+            ttl_seconds=60,
+        )
+        resources.release_resources(
+            replacement["owner_id"],
+            [service_key],
+            expected_leases=replacement["leases"],
+        )
+
+    def test_user_systemd_fence_does_not_redefine_exact_path_identity(self) -> None:
+        repository = self.root / "repo"
+        unit = "demo.service"
+        service_key = f"service:user-systemd:{unit}"
+        fragment_key = f"path:{repository / 'units' / unit}"
+        fence_owner = "operator:user-systemd-fence-exact-path"
+        lease = resources.acquire_resources(
+            fence_owner,
+            [service_key, fragment_key],
+            purpose="uncertain unit mutation",
+            ttl_seconds=120,
+            metadata={"unit": unit, "action": "restart"},
+        )
+        resources.prepare_user_systemd_uncertainty_fence(
+            fence_owner,
+            [service_key, fragment_key],
+            expected_leases=lease["leases"],
+            unit=unit,
+            action="restart",
+        )
+        resources.release_resources(
+            fence_owner,
+            [service_key, fragment_key],
+            expected_leases=lease["leases"],
+        )
+
+        parent_key = f"path:{repository / 'units'}"
+        acquired = resources.acquire_resources(
+            "owner-exact-parent",
+            [parent_key],
+            purpose="exact parent remains exact outside Work Lane scope",
+            ttl_seconds=60,
+        )
+        self.assertEqual(parent_key, acquired["leases"][0]["resource_key"])
 
     def test_same_owner_may_hold_nested_work_lane_paths(self) -> None:
         repository = self.root / "repo"
@@ -3216,6 +3804,97 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual(before_names, sorted(item.name for item in self.database.parent.iterdir()))
 
+
+    def test_resource_schema_inventory_requires_missing_reconcile_revision_contract(
+        self,
+    ) -> None:
+        connection = resources._database()
+        connection.close()
+        with sqlite3.connect(self.database) as connection:
+            for trigger_name in resources._resource_reconcile_revision_trigger_sql():
+                connection.execute(f'DROP TRIGGER "{trigger_name}"')
+            connection.execute(
+                "DELETE FROM metadata WHERE key IN (?, ?)",
+                (
+                    resources.RESOURCE_RECONCILE_REVISION_CONTRACT_METADATA_KEY,
+                    resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,
+                ),
+            )
+            connection.commit()
+        before = self.database.read_bytes()
+
+        inventory = resources.grabowski_resource_list(schema_only=True)
+
+        self.assertEqual("3", inventory["observed_version"])
+        self.assertEqual("1", inventory["lease_contract_observed_version"])
+        self.assertEqual("current", inventory["lease_contract_status"])
+        self.assertIsNone(
+            inventory["reconcile_revision_contract_observed_version"]
+        )
+        self.assertEqual(
+            "1", inventory["reconcile_revision_contract_current_version"]
+        )
+        self.assertEqual(
+            "missing", inventory["reconcile_revision_contract_status"]
+        )
+        self.assertEqual(
+            "reconcile_revision_contract_required", inventory["status"]
+        )
+        self.assertTrue(inventory["migration_required"])
+        self.assertFalse(inventory["write_compatible"])
+        self.assertEqual(
+            "open_with_current_runtime_to_publish_reconcile_revision_contract",
+            inventory["required_action"],
+        )
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_resource_schema_inventory_blocks_missing_reconcile_revision_trigger(
+        self,
+    ) -> None:
+        connection = resources._database()
+        connection.close()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("DROP TRIGGER resource_reconcile_leases_update_v1")
+            connection.commit()
+
+        inventory = resources.grabowski_resource_list(schema_only=True)
+
+        self.assertEqual("blocked", inventory["status"])
+        self.assertEqual(
+            "blocked", inventory["reconcile_revision_contract_status"]
+        )
+        self.assertFalse(inventory["write_compatible"])
+        self.assertFalse(inventory["migration_required"])
+        self.assertIn(
+            "Resource reconcile revision triggers are incomplete or drifted",
+            inventory["error"],
+        )
+
+    def test_resource_schema_inventory_blocks_malformed_reconcile_revision_token(
+        self,
+    ) -> None:
+        connection = resources._database()
+        connection.close()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE metadata SET value='broken' WHERE key=?",
+                (resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+            )
+            connection.commit()
+
+        inventory = resources.grabowski_resource_list(schema_only=True)
+
+        self.assertEqual("blocked", inventory["status"])
+        self.assertEqual(
+            "blocked", inventory["reconcile_revision_contract_status"]
+        )
+        self.assertFalse(inventory["write_compatible"])
+        self.assertFalse(inventory["migration_required"])
+        self.assertIn(
+            "Resource reconcile revision token is malformed",
+            inventory["error"],
+        )
+
     def test_resource_schema_inventory_blocks_if_wal_appears_during_immutable_read(self) -> None:
         connection = resources._database()
         connection.close()
@@ -5039,6 +5718,141 @@ class ResourceTests(unittest.TestCase):
 
         self.assertEqual(assessor_calls, [])
         self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_internal_convergence_mode_accepts_converge_first(self) -> None:
+        (self.root / ".git").mkdir()
+        calls: list[dict[str, object]] = []
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            calls.append(dict(kwargs))
+            return {
+                "schema_version": 1,
+                "decision": "converge_first",
+                "assessment_sha256": "d" * 64,
+                "blocker_codes": ["worktree-convergence-required"],
+                "blockers": [
+                    {
+                        "code": "worktree-convergence-required",
+                        "path": str(self.root / "retained"),
+                        "state": "completed_retained",
+                    }
+                ],
+                "read_only": True,
+            }
+
+        result = resources.acquire_resources(
+            "owner-a",
+            [f"repo:{self.root}"],
+            purpose="internal convergence operation",
+            ttl_seconds=60,
+            admission_assessor=assessor,
+            _work_admission_mode="convergence",
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["mode"], "convergence")
+        self.assertEqual(result["work_admission"][0]["decision"], "converge_first")
+        self.assertIsNotNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_internal_convergence_mode_rejects_reconciliation_converge_first(self) -> None:
+        (self.root / ".git").mkdir()
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            self.assertEqual(kwargs["mode"], "convergence")
+            return {
+                "schema_version": 1,
+                "decision": "converge_first",
+                "assessment_sha256": "e" * 64,
+                "blocker_codes": ["binding-reconciliation-blocking"],
+                "blockers": [
+                    {
+                        "code": "binding-reconciliation-blocking",
+                        "checkout_key": "checkout-a",
+                        "state": "managed_lifecycle_drift",
+                    }
+                ],
+                "read_only": True,
+            }
+
+        with self.assertRaises(work_admission.WorkAdmissionBlocked):
+            resources.acquire_resources(
+                "owner-a",
+                [f"repo:{self.root}"],
+                purpose="reject reconciliation during convergence",
+                ttl_seconds=60,
+                admission_assessor=assessor,
+                _work_admission_mode="convergence",
+            )
+        self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_internal_convergence_mode_rejects_nonterminal_worktree(self) -> None:
+        (self.root / ".git").mkdir()
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            self.assertEqual(kwargs["mode"], "convergence")
+            return {
+                "schema_version": 1,
+                "decision": "converge_first",
+                "assessment_sha256": "f" * 64,
+                "blocker_codes": ["worktree-convergence-required"],
+                "blockers": [
+                    {
+                        "code": "worktree-convergence-required",
+                        "path": str(self.root / "active"),
+                        "state": "managed_active_attention",
+                    }
+                ],
+                "read_only": True,
+            }
+
+        with self.assertRaises(work_admission.WorkAdmissionBlocked):
+            resources.acquire_resources(
+                "owner-a",
+                [f"repo:{self.root}"],
+                purpose="reject nonterminal worktree during convergence",
+                ttl_seconds=60,
+                admission_assessor=assessor,
+                _work_admission_mode="convergence",
+            )
+        self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_internal_convergence_mode_still_rejects_blocked(self) -> None:
+        (self.root / ".git").mkdir()
+        assessment = {
+            "schema_version": 1,
+            "decision": "blocked",
+            "assessment_sha256": "e" * 64,
+            "blocker_codes": ["dirty-worktree"],
+            "blockers": [{"code": "dirty-worktree", "path": str(self.root)}],
+            "read_only": True,
+        }
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            self.assertEqual(kwargs["mode"], "convergence")
+            raise work_admission.WorkAdmissionBlocked(assessment)
+
+        with self.assertRaises(work_admission.WorkAdmissionBlocked):
+            resources.acquire_resources(
+                "owner-a",
+                [f"repo:{self.root}"],
+                purpose="blocked convergence operation",
+                ttl_seconds=60,
+                admission_assessor=assessor,
+                _work_admission_mode="convergence",
+            )
+        self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_internal_work_admission_mode_rejects_unknown_value(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "_work_admission_mode must be normal or convergence"
+        ):
+            resources.acquire_resources(
+                "owner-a",
+                ["component:invalid-internal-admission-mode"],
+                purpose="invalid internal mode",
+                ttl_seconds=60,
+                _work_admission_mode="unsafe",
+            )
 
     def test_broad_repository_lease_without_scope_still_runs_admission(self) -> None:
         (self.root / ".git").mkdir()
