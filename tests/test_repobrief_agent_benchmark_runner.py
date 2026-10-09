@@ -1336,7 +1336,6 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             ("repository", "heimgewebe/repo"),
             ("repo_id", "repo"),
             ("name", "heimgewebe/repo.git"),
-            ("repository", "other-owner/repo"),
         ):
             with self.subTest(field=field, good=good), tempfile.TemporaryDirectory() as directory:
                 value = request(condition="treatment")
@@ -1372,7 +1371,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         sha = "c" * 40
         forms = (
             "repo.git",
-            "owner/repo",
+            "heimgewebe/repo",
             "owner__repo__main",
             f"owner__repo__main--{sha}",
             f"owner__repo__main--{'d' * 64}--recovery-0123456789ab",
@@ -1412,6 +1411,45 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             )
             with self.assertRaises(runner.RunnerError):
                 runner._bound_repoground_manifest(value)
+
+    def test_bound_manifest_never_binds_foreign_owner_identity(self) -> None:
+        foreign = {"repository": "other/repo", "git_commit": "b" * 40}
+        cases = {
+            "singleton": [foreign],
+            "multi_only_unmatched": [
+                foreign,
+                {"repository": "owner__other__main", "git_commit": "c" * 40},
+            ],
+            "multi_two_foreign": [
+                foreign,
+                {"repository": "third/repo", "git_commit": "c" * 40},
+            ],
+            "mixed_fields": [
+                {"repository": "other/repo", "name": "repo", "git_commit": COMMIT}
+            ],
+        }
+        for label, repositories in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                value = self._bind_repositories(directory, repositories)
+                with self.assertRaises(runner.RunnerError):
+                    runner._bound_repoground_manifest(value)
+                self.assertIsNone(runner._optional_repoground_manifest_binding(value))
+                messages = runner.parse_jsonl(
+                    stream(value, tool_name="mcp__repobrief__ask_context")
+                )
+                self.assertIsNone(
+                    runner.normalize_repoground_evidence(
+                        value, messages, runner.normalize_tool_calls(value, messages)
+                    )
+                )
+        # Exactly one real match: a foreign entry is ignored, not ambiguous.
+        with tempfile.TemporaryDirectory() as directory:
+            value = self._bind_repositories(
+                directory,
+                [foreign, {"repository": "heimgewebe/repo", "git_commit": COMMIT}],
+            )
+            _, _, commit, _ = runner._bound_repoground_manifest(value)
+            self.assertEqual(commit, COMMIT)
 
     def test_bound_manifest_rejects_ambiguous_normalized_aliases(self) -> None:
         for first, second in (

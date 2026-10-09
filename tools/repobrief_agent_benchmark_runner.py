@@ -1372,7 +1372,8 @@ def _provenance_match(item: Mapping[str, Any], requested: set[str]) -> str | Non
     hits: list[str] = []
     for identity in _provenance_identities(item):
         if identity in requested:
-            return "match"
+            hits.append("match")
+            continue
         if any(identity.endswith(f"/{segment}") for segment in segments):
             hits.append("foreign")
             continue
@@ -1391,9 +1392,11 @@ def _provenance_match(item: Mapping[str, Any], requested: set[str]) -> str | Non
             hits.append("match")
         elif identity in segments:
             hits.append("match")
-    if "match" in hits:
-        return "match"
-    return "foreign" if hits else None
+    # Any explicitly foreign-owner identity disqualifies the entry; callers
+    # must bind only on "match".
+    if "foreign" in hits:
+        return "foreign"
+    return "match" if hits else None
 
 
 def _bound_repoground_manifest(
@@ -1441,26 +1444,23 @@ def _bound_repoground_manifest(
         # A singleton without any identity field stays an anonymous legacy
         # fallback; an explicit identity must match the requested repository
         # (same rule as grabowski_repobrief._snapshot_repository_matches).
-        if _provenance_identities(selected) and not _provenance_match(
-            selected, requested
+        if (
+            _provenance_identities(selected)
+            and _provenance_match(selected, requested) != "match"
         ):
             raise RunnerError(
                 "RepoGround manifest repository binding does not match request"
             )
     else:
+        # "foreign" (explicit different owner) is never a binding candidate.
         matches = [
-            (item, hit)
+            item
             for item in repositories
-            if (hit := _provenance_match(item, requested))
+            if _provenance_match(item, requested) == "match"
         ]
-        # An owner-qualified identity naming a different owner only loses to
-        # candidates that are not themselves conflicting; bare or canonical
-        # aliases stay ambiguous with qualified ones.
-        if any(hit != "foreign" for _, hit in matches):
-            matches = [pair for pair in matches if pair[1] != "foreign"]
         if len(matches) != 1:
             raise RunnerError("RepoGround manifest repository binding is ambiguous")
-        selected = matches[0][0]
+        selected = matches[0]
 
     commit = (
         selected.get("git_commit") or selected.get("commit") or selected.get("head")
