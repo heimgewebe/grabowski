@@ -710,6 +710,252 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
                 resources.RESOURCE_DB = original_db
 
 
+
+class MboxDiffIdentityTests(unittest.TestCase):
+    @staticmethod
+    def _evidence():
+        head = "b" * 40
+        first = (
+            "diff --git a/one.txt b/one.txt\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/one.txt\n"
+            "+++ b/one.txt\n"
+            "@@ -1 +1 @@\n"
+            "-before\n"
+            "+after\n"
+        )
+        second = (
+            "diff --git a/two.txt b/two.txt\n"
+            "index 3333333..4444444 100644\n"
+            "--- a/two.txt\n"
+            "+++ b/two.txt\n"
+            "@@ -1 +1 @@\n"
+            "-before\n"
+            "+after\n"
+        )
+        prefix = (
+            "From {sha} Mon Sep 17 00:00:00 2001\n"
+            "From: Test Author <test@example.com>\n"
+            "Date: Fri, 9 Oct 2026 00:00:00 +0000\n"
+            "Subject: [PATCH] test\n"
+            "\n"
+            "---\n"
+            " 1 file changed\n"
+            "\n"
+        )
+        patch = (
+            prefix.format(sha="a" * 40) + first + "\n"
+            + prefix.format(sha=head) + second
+        )
+        return head, (first + second).encode(), patch.encode()
+
+    def test_accepts_only_proven_equivalent_mbox_patch(self):
+        head, plain, mbox = self._evidence()
+        self.assertNotEqual(
+            merge_guard.github_pr_diff_identity_sha256(plain),
+            merge_guard.github_pr_diff_identity_sha256(mbox),
+        )
+        self.assertTrue(
+            merge_guard._merge_guard_mbox_patch_matches_diff(mbox, plain, head)
+        )
+
+    def test_rejects_drifted_patch_or_unbound_head(self):
+        head, plain, mbox = self._evidence()
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                mbox.replace(b"+after\n", b"+unreviewed\n", 1), plain, head
+            )
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(mbox, plain, "c" * 40)
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                b"not a GitHub patch", plain, head
+            )
+        )
+
+    def test_format_patch_footer_must_match_hunks(self):
+        head, plain, mbox = self._evidence()
+        separator = b"\nFrom " + head.encode("ascii")
+        self.assertIn(separator, mbox)
+        with_footer = mbox.replace(
+            separator,
+            b"-- \n2.43.0\n\nFrom " + head.encode("ascii"),
+            1,
+        ) + b"\n-- \n2.43.0\n"
+        self.assertTrue(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                with_footer, plain, head
+            )
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                with_footer.replace(b"+after\n", b"+changed\n", 1), plain, head
+            )
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                with_footer + b"unexpected content", plain, head
+            )
+        )
+
+    def test_accepts_header_terminated_patch_without_stats_separator(self):
+        head, plain, _mbox = self._evidence()
+        first = plain.split(b"diff --git a/two.txt", 1)[0]
+        patch = (
+            f"From {head} Mon Sep 17 00:00:00 2001\n"
+            "From: Author <author@example.com>\n"
+            "Subject: [PATCH] A markdown section\n\n"
+            "A commit message can contain a separator:\n"
+            "---\n"
+            "It is not the patch boundary.\n\n"
+        ).encode() + first
+        self.assertTrue(
+            merge_guard._merge_guard_mbox_patch_matches_diff(patch, first, head)
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                patch.replace(b"Subject: [PATCH] A markdown section\n\n",
+                              b"Subject: [PATCH] A markdown section\n", 1),
+                first, head,
+            )
+        )
+
+    def test_rejects_forged_diff_in_commit_message(self):
+        head, plain, mbox = self._evidence()
+        forged = mbox.replace(
+            b"Subject: [PATCH] test\n\n---\n",
+            (b"Subject: [PATCH] test\n\n"
+             b"diff --git a/forged.txt b/forged.txt\n"
+             b"---\n"),
+            1,
+        )
+        self.assertNotEqual(forged, mbox)
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                forged, plain, head
+            )
+        )
+
+    def test_rejects_forged_mbox_boundary_in_message(self):
+        head, plain, mbox = self._evidence()
+        injected = mbox.replace(
+            b"Subject: [PATCH] test\n\n",
+            (b"Subject: [PATCH] test\n\n"
+             b"From " + b"c" * 40 +
+             b" Mon Sep 17 00:00:00 2001\n"),
+            1,
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                injected, plain, head
+            )
+        )
+
+    def test_rejects_overlapping_commits_against_net_diff(self):
+        head, plain, mbox = self._evidence()
+        same_path = mbox.replace(
+            b"diff --git a/two.txt b/two.txt",
+            b"diff --git a/one.txt b/one.txt",
+            1,
+        )
+        net_diff = plain.split(b"diff --git a/two.txt", 1)[0]
+        self.assertNotEqual(same_path, mbox)
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                same_path, net_diff, head
+            )
+        )
+
+    def test_rejects_binary_patch_against_binary_summary(self):
+        head, plain, mbox = self._evidence()
+        binary = mbox.replace(
+            b"-before\n+after\n",
+            b"GIT binary patch\nliteral 3\nAAAA\n",
+            1,
+        )
+        summary = plain.replace(
+            b"-before\n+after\n",
+            b"Binary files a/one.txt and b/one.txt differ\n",
+            1,
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                binary, summary, head
+            )
+        )
+
+    def test_crlf_mail_headers_and_footer_do_not_change_hunks(self):
+        head, plain, _mbox = self._evidence()
+        first = plain.split(b"diff --git a/two.txt", 1)[0]
+        patch = (
+            (f"From {head} Mon Sep 17 00:00:00 2001\r\n"
+             "From: Author <author@example.com>\r\n"
+             "Subject: [PATCH] test\r\n\r\n"
+             "---\r\n"
+             " 1 file changed\r\n\r\n").encode()
+            + first
+            + b"\n-- \r\n2.43.0\r\n"
+        )
+        self.assertTrue(
+            merge_guard._merge_guard_mbox_patch_matches_diff(patch, first, head)
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_mbox_patch_matches_diff(
+                patch, first.replace(b"+after\n", b"+changed\n"), head
+            )
+        )
+
+    def test_live_bindings_accepts_exact_proven_patch_hash_only(self):
+        gh = _RenamePrGh()
+        gh.diff_text = (
+            "diff --git a/new-name.txt b/new-name.txt\n"
+            "index 1234567..abcdef0 100644\n"
+            "--- a/new-name.txt\n"
+            "+++ b/new-name.txt\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        mbox = (
+            f"From {gh.head_sha} Mon Sep 17 00:00:00 2001\n"
+            "From: Test <test@example.com>\n"
+            "Subject: [PATCH] rename\n\n"
+            "---\n 1 file changed\n\n" + gh.diff_text
+        )
+        standard_runner = gh.__call__
+
+        def github(repo: Path, argv: list[str]) -> dict[str, object]:
+            if argv[:2] == ["pr", "diff"] and "--patch" in argv:
+                return {"returncode": 0, "stdout": mbox, "stderr": ""}
+            return standard_runner(repo, argv)
+
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.action = {"target": {"repo": "heimgewebe/commonworld", "pr": 212, "base": "main"}}
+        runner.parameters = {
+            "expected_head": gh.head_sha,
+            "expected_base_sha": gh.base_sha,
+            "diff_sha256": merge_guard.github_pr_diff_identity_sha256(mbox.encode()),
+        }
+        runner.static_errors = []
+        runner.repo_path = Path.cwd()
+        runner.github_runner = github
+        runner.receipt = {}
+        runner.execution_intent_sha256 = "1" * 64
+        runner._revalidate_codex_review = lambda _bindings, phase: []
+
+        bindings, errors = runner._live_bindings()
+
+        self.assertEqual([], errors)
+        self.assertIsNotNone(bindings)
+        assert bindings is not None
+        self.assertEqual("mbox-patch-proven-equivalent", bindings["diff_identity_mode"])
+        self.assertEqual(
+            runner.parameters["diff_sha256"], bindings["patch_diff_sha256"]
+        )
+
+
 _PLAN_LIMIT_403 = (
     "gh: Upgrade to GitHub Pro or make this repository public to enable this feature. "
     "(HTTP 403)"
