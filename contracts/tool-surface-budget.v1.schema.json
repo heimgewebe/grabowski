@@ -10,6 +10,7 @@
     "sources",
     "baseline",
     "accepted_additions",
+    "accepted_semantic_corrections",
     "retired_tools",
     "operation_catalog",
     "policy",
@@ -170,6 +171,15 @@
         "type": "string",
         "minLength": 1,
         "maxLength": 512
+      }
+    },
+    "accepted_semantic_corrections": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,127}$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/semantic_correction"
       }
     }
   },
@@ -401,6 +411,32 @@
         "target_operation_family": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9-]{0,63}$"
+        }
+      }
+    },
+    "semantic_correction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "original_semantics_sha256",
+        "tool_contract",
+        "rationale",
+        "evidence_refs"
+      ],
+      "properties": {
+        "original_semantics_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "tool_contract": {
+          "$ref": "#/$defs/tool_projection"
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 24,
+          "maxLength": 4096
+        },
+        "evidence_refs": {
+          "$ref": "#/$defs/string_list"
         }
       }
     }

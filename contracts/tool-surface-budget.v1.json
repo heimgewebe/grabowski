@@ -3658,5 +3658,70 @@
     "operation_catalog": "config/operations.example.json",
     "operation_metadata": "contracts/operation-catalog.v1.json",
     "runtime_entrypoint": "config/runtime-entrypoint.json"
+  },
+  "accepted_semantic_corrections": {
+    "grabowski_resource_list": {
+      "original_semantics_sha256": "d3e817e32df87eef13246c7e1b974969c2c724745fc53dac66848f947b8eab82",
+      "tool_contract": {
+        "tool": "grabowski_resource_list",
+        "category": "resource",
+        "authority_class": "mutation",
+        "risk_class": "low",
+        "read_only": false,
+        "effects": [
+          "schema-migration"
+        ],
+        "reversibility": "not-applicable"
+      },
+      "rationale": "Document the observed hidden state changes and require an explicit operator mutation gate instead of a misleading READ_ONLY annotation; historical baseline remains unchanged.",
+      "evidence_refs": [
+        "https://github.com/heimgewebe/grabowski/issues/1407",
+        "src/grabowski_resources.py:1238-1314",
+        "src/grabowski_resources.py:8467-8492"
+      ]
+    },
+    "grabowski_task_list": {
+      "original_semantics_sha256": "14021cf8ae4016e51b2a3c35aa473cf8894e28996435568006d59f869240b915",
+      "tool_contract": {
+        "tool": "grabowski_task_list",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "low",
+        "read_only": false,
+        "effects": [
+          "schema-migration",
+          "terminalization-recovery"
+        ],
+        "reversibility": "not-applicable"
+      },
+      "rationale": "Document the observed hidden state changes and require an explicit operator mutation gate instead of a misleading READ_ONLY annotation; historical baseline remains unchanged.",
+      "evidence_refs": [
+        "https://github.com/heimgewebe/grabowski/issues/1407",
+        "src/grabowski_tasks.py:12215-12249",
+        "src/grabowski_tasks.py:7113-7172"
+      ]
+    },
+    "grabowski_task_status": {
+      "original_semantics_sha256": "ba95d919769c0e626cd698adf624e06a854e62408ce4f521f9acd1abb8580f01",
+      "tool_contract": {
+        "tool": "grabowski_task_status",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "low",
+        "read_only": false,
+        "effects": [
+          "lease-reacquire",
+          "lease-renew",
+          "state-refresh"
+        ],
+        "reversibility": "not-applicable"
+      },
+      "rationale": "Document the observed hidden state changes and require an explicit operator mutation gate instead of a misleading READ_ONLY annotation; historical baseline remains unchanged.",
+      "evidence_refs": [
+        "https://github.com/heimgewebe/grabowski/issues/1407",
+        "src/grabowski_tasks.py:5734-5794",
+        "src/grabowski_tasks.py:9688-9705"
+      ]
+    }
   }
 }

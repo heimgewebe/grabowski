@@ -874,7 +874,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "task",
         "purpose": "Observe one persistent task and refresh its recorded state.",
         "risk_class": "low",
-        "effects": ["state-refresh"],
+        "effects": ["lease-reacquire", "lease-renew", "state-refresh"],
         "reversibility": "not-applicable",
     },
     "grabowski_task_logs": {
@@ -902,7 +902,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "task",
         "purpose": "List recent persistent task records with optional state filtering.",
         "risk_class": "low",
-        "effects": [],
+        "effects": ["schema-migration", "terminalization-recovery"],
         "reversibility": "not-applicable",
     },
     "grabowski_chronik_outbox_import": {
@@ -1014,7 +1014,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "resource",
         "purpose": "List bounded typed resource leases with optional owner filtering.",
         "risk_class": "low",
-        "effects": [],
+        "effects": ["schema-migration"],
         "reversibility": "not-applicable",
     },
     "grabowski_artifact_stat": {

@@ -24,7 +24,7 @@ BASELINE_TOOL_COUNT = 125
 BASELINE_TOOL_NAMES_SHA256 = "a84638ec397aa635aa55546d579f009c237f64ffed39eafe2bff525762f46418"
 BASELINE_TOOL_SEMANTICS_SHA256 = "ed7e499ec8f243ac9be7d67ba60b83b6866b2a4644d249ead7982db8450dc0dd"
 TOOL_SURFACE_SCHEMA_SHA256 = (
-    "44e47b96f6adc2d0015dfdf9fd65db18f05d150c1bf7436297e7d1247121f534"
+    "f835d56e53da042468cc151301e5be746f87bce8f6ff7436155cc265ba454c6b"
 )
 ADDITION_KINDS = frozenset(
     {
@@ -342,6 +342,7 @@ def build_initial_contract(
             "tools": baseline,
         },
         "accepted_additions": {},
+        "accepted_semantic_corrections": {},
         "retired_tools": {},
         "operation_catalog": {
             "schema_version": operation_schema,
@@ -420,6 +421,42 @@ def _validate_addition(name: str, value: Any, capability: Mapping[str, Any]) -> 
     return projected
 
 
+def _validate_semantic_correction(
+    name: str,
+    value: Any,
+    historical: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Preserve historical proof; allow only explicitly evidenced stricter effects."""
+    if not isinstance(value, dict) or set(value) != {
+        "original_semantics_sha256", "tool_contract", "rationale", "evidence_refs"
+    }:
+        raise ToolSurfaceBudgetError(f"semantic correction keys invalid: {name}")
+    if value["original_semantics_sha256"] != _sha256(historical):
+        raise ToolSurfaceBudgetError(f"semantic correction history mismatch: {name}")
+    if value["tool_contract"] != current:
+        raise ToolSurfaceBudgetError(f"semantic correction current projection drift: {name}")
+    if (
+        historical.get("read_only") is not True
+        or historical.get("authority_class") != "read"
+        or current.get("read_only") is not False
+        or current.get("authority_class") != "mutation"
+    ):
+        raise ToolSurfaceBudgetError(f"semantic correction must strengthen read boundary: {name}")
+    for field in ("tool", "category", "risk_class", "reversibility"):
+        if current.get(field) != historical.get(field):
+            raise ToolSurfaceBudgetError(f"semantic correction changes unrelated field {field}: {name}")
+    old_effects = set(historical.get("effects", []))
+    new_effects = set(current.get("effects", []))
+    if not new_effects or not old_effects <= new_effects:
+        raise ToolSurfaceBudgetError(f"semantic correction must preserve all existing effects: {name}")
+    _text(value["rationale"], label=f"{name}.semantic correction rationale", minimum=24)
+    refs = _string_list(value["evidence_refs"], label=f"{name}.semantic correction evidence", maximum=8)
+    if not refs:
+        raise ToolSurfaceBudgetError(f"semantic correction missing evidence: {name}")
+    return dict(current)
+
+
 def _validate_retirement(name: str, value: Any) -> None:
     tool = _tool_name(name, label="retired tool")
     if not isinstance(value, dict) or set(value) != {"reason", "evidence_refs", "compatibility"}:
@@ -446,6 +483,7 @@ def validate_contract(
             "sources",
             "baseline",
             "accepted_additions",
+            "accepted_semantic_corrections",
             "retired_tools",
             "operation_catalog",
             "policy",
@@ -508,9 +546,10 @@ def validate_contract(
             )
 
         additions_raw = contract.get("accepted_additions")
+        corrections_raw = contract.get("accepted_semantic_corrections")
         retirements_raw = contract.get("retired_tools")
-        if not isinstance(additions_raw, dict) or not isinstance(retirements_raw, dict):
-            raise ToolSurfaceBudgetError("accepted_additions and retired_tools must be objects")
+        if not all(isinstance(item, dict) for item in (additions_raw, corrections_raw, retirements_raw)):
+            raise ToolSurfaceBudgetError("additions, semantic corrections and retirements must be objects")
         additions: dict[str, dict[str, Any]] = {}
         for name, value in additions_raw.items():
             if name in baseline_tools:
@@ -522,6 +561,17 @@ def validate_contract(
             if name not in baseline_tools:
                 raise ToolSurfaceBudgetError(f"only baseline tools may be retired: {name}")
             _validate_retirement(name, value)
+        if len(corrections_raw) > 8:
+            raise ToolSurfaceBudgetError("semantic corrections exceed bounded review limit")
+        corrections: dict[str, dict[str, Any]] = {}
+        for name, value in sorted(corrections_raw.items()):
+            if name not in baseline_tools or name in retirements_raw:
+                raise ToolSurfaceBudgetError(f"semantic correction requires live historical tool: {name}")
+            if name not in capabilities:
+                raise ToolSurfaceBudgetError(f"semantic correction lacks capability: {name}")
+            corrections[name] = _validate_semantic_correction(
+                name, value, baseline_tools[name], capabilities[name]
+            )
 
         expected_current = (set(baseline_tools) - set(retirements_raw)) | set(additions)
         actual_current = set(runtime_tools)
@@ -532,7 +582,7 @@ def validate_contract(
         if missing:
             raise ToolSurfaceBudgetError(f"budgeted-tools-missing-from-runtime: {missing}")
         for name in sorted(actual_current):
-            expected_projection = baseline_tools.get(name) or additions.get(name)
+            expected_projection = corrections.get(name) or baseline_tools.get(name) or additions.get(name)
             if expected_projection != capabilities[name]:
                 raise ToolSurfaceBudgetError(f"tool capability semantics drift: {name}")
 
@@ -597,6 +647,7 @@ def validate_contract(
             "baseline_tool_count": len(baseline_tools),
             "current_tool_count": len(actual_current),
             "accepted_addition_count": len(additions),
+            "accepted_semantic_correction_count": len(corrections),
             "retired_tool_count": len(retirements_raw),
             "operation_count": len(operation_values),
             "migration_candidate_count": len(migration_candidates),

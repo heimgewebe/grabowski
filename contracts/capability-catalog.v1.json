@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "2e158ca751ea852a8191e978d4689b4fc39fb351120f08423dbf126faf934a3c",
+  "capability_source_sha256": "8f0cadc240dd7c9f1dcd865910c87437d57ea91e9973484610a57ce36bfdddd6",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "2681d2593edcdc23e200aa0fa3e6eec2cbda1b9c1794b1d9faf87fc81801c567",
   "integrity": {
@@ -1443,6 +1443,8 @@
       "category": "task",
       "description": "Observe and persist one task state; lease maintenance may mutate resources.",
       "effects": [
+        "lease-reacquire",
+        "lease-renew",
         "state-refresh"
       ],
       "id": "grabowski_task_status",
@@ -1495,7 +1497,10 @@
     {
       "category": "task",
       "description": "List persistent tasks or inspect store-schema compatibility read-only.",
-      "effects": [],
+      "effects": [
+        "schema-migration",
+        "terminalization-recovery"
+      ],
       "id": "grabowski_task_list",
       "purpose": "List recent persistent task records with optional state filtering.",
       "read_only": false,
@@ -2089,7 +2094,9 @@
     {
       "category": "resource",
       "description": "List bounded leases or inspect store-schema compatibility read-only.",
-      "effects": [],
+      "effects": [
+        "schema-migration"
+      ],
       "id": "grabowski_resource_list",
       "purpose": "List bounded typed resource leases with optional owner filtering.",
       "read_only": false,
