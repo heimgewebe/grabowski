@@ -111,6 +111,9 @@ SNAPSHOT_BINDING_PENDING = "bound_to_predecessor"
 SNAPSHOT_BINDING_DONE = "rebound_by_this_lineage"
 SNAPSHOT_BINDING_FOREIGN = "foreign"
 SNAPSHOT_BINDING_UNREADABLE = "unreadable"
+# Must stay aligned with grabowski_client_snapshot.SNAPSHOT_CLOCK_SKEW_SECONDS.
+# Recovery cannot import that parser here without recreating a module cycle.
+SNAPSHOT_CLOCK_SKEW_SECONDS = 120
 
 
 def observe_client_snapshot_binding(
@@ -174,6 +177,7 @@ def observe_client_snapshot_binding(
     return {
         **observed,
         "state": state,
+        "source_evidence_time": source_evidence_time,
         "transition_sha256": observed.get("publication_transition_sha256"),
     }
 
@@ -340,6 +344,158 @@ def activation_observation(receipt: dict[str, Any]) -> dict[str, Any]:
         "observation_sha256": activation["observation_sha256"],
         "state": details["state"],
     }
+
+
+def historical_terminal_activation_observation(
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Recover platform_converged only from an evidence-complete terminal cutover."""
+    validated = validate_cutover_receipt(receipt)
+    observations = validated.get("observations")
+    if not isinstance(observations, list):
+        raise MidCutoverEvidenceError("blue-green receipt observations are missing")
+    matches: list[dict[str, Any]] = []
+    for index, observation in enumerate(observations):
+        if not isinstance(observation, dict):
+            raise MidCutoverEvidenceError(
+                f"blue-green observation {index} is not an object"
+            )
+        declared = observation.get("observation_sha256")
+        material = {
+            key: item for key, item in observation.items() if key != "observation_sha256"
+        }
+        if (
+            not isinstance(declared, str)
+            or SHA256_RE.fullmatch(declared) is None
+            or canonical_json_sha256(material) != declared
+        ):
+            raise MidCutoverEvidenceError(
+                f"blue-green observation {index} hash mismatch"
+            )
+        if observation.get("phase") == "platform_publication_activation":
+            matches.append(dict(observation))
+    if len(matches) != 1:
+        raise MidCutoverEvidenceError(
+            "blue-green receipt requires exactly one publication activation observation"
+        )
+    activation = matches[0]
+    observed_at = activation.get("observed_at_unix")
+    details = activation.get("details")
+    if (
+        isinstance(observed_at, bool)
+        or not isinstance(observed_at, int)
+        or observed_at < 0
+        or not isinstance(details, dict)
+        or details.get("state") != "platform_converged"
+        or not isinstance(details.get("request_id"), str)
+        or CUTOVER_ID_RE.fullmatch(details["request_id"]) is None
+    ):
+        raise MidCutoverEvidenceError(
+            "historical terminal activation observation is invalid"
+        )
+    switch = _switch_evidence(validated)
+    rebind = validated.get("snapshot_rebind")
+    readback = validated.get("authoritative_readback")
+    recovery = validated.get("recovery")
+    readiness = validated.get("green_readiness")
+    if (
+        validated.get("outcome") != RESUMABLE_OUTCOME
+        or validated.get("phase") != RESUMABLE_OUTCOME
+        or switch is None
+        or not isinstance(rebind, dict)
+        or not isinstance(readback, dict)
+        or not isinstance(recovery, dict)
+        or recovery.get("automatic_rollback_forbidden") is not True
+        or not isinstance(readiness, dict)
+    ):
+        raise MidCutoverEvidenceError(
+            "historical terminal activation evidence is incomplete"
+        )
+    cutover_binding = rebind.get("cutover_binding")
+    transition = rebind.get("cutover_transition")
+    if (
+        rebind.get("state") != "matched"
+        or rebind.get("verified") is not True
+        or rebind.get("cutover_rebind") is not True
+        or SHA256_RE.fullmatch(str(rebind.get("receipt_sha256") or "")) is None
+        or SHA256_RE.fullmatch(str(rebind.get("source_snapshot_receipt_sha256") or "")) is None
+        or SHA256_RE.fullmatch(str(rebind.get("source_client_declaration_sha256") or "")) is None
+        or not isinstance(cutover_binding, dict)
+        or cutover_binding != {
+            "cutover_id": validated.get("cutover_id"),
+            "cutover_generation": validated.get("cutover_generation"),
+            "rebind_role": "blue-green-cutover",
+        }
+        or not isinstance(transition, dict)
+        or transition.get("from_release_id") != validated.get("blue_release_id")
+        or transition.get("to_release_id") != validated.get("green_release_id")
+        or transition.get("to_repo_head") != validated.get("expected_head")
+        or isinstance(transition.get("source_created_at_unix"), bool)
+        or not isinstance(transition.get("source_created_at_unix"), int)
+        or isinstance(transition.get("source_evidence_time"), bool)
+        or not isinstance(transition.get("source_evidence_time"), int)
+        or isinstance(transition.get("source_expires_at_unix"), bool)
+        or not isinstance(transition.get("source_expires_at_unix"), int)
+        or not (
+            transition["source_created_at_unix"] - SNAPSHOT_CLOCK_SKEW_SECONDS
+            <= transition["source_evidence_time"]
+            <= transition["source_expires_at_unix"]
+        )
+        or transition.get("green_readiness_sha256") != canonical_json_sha256(readiness)
+        or rebind.get("target_release_id") != validated.get("green_release_id")
+        or rebind.get("target_repo_head") != validated.get("expected_head")
+    ):
+        raise MidCutoverEvidenceError(
+            "historical terminal snapshot rebind evidence is invalid"
+        )
+    readback_material = dict(readback)
+    declared_readback_sha256 = readback_material.pop("readback_sha256", None)
+    readback_selector = readback.get("selector")
+    ingress = readback.get("ingress")
+    if (
+        readback.get("authoritative") is not True
+        or set(readback) != {"authoritative", "selector", "ingress", "readback_sha256"}
+        or SHA256_RE.fullmatch(str(declared_readback_sha256 or "")) is None
+        or canonical_json_sha256(readback_material) != declared_readback_sha256
+        or not isinstance(readback_selector, dict)
+        or SHA256_RE.fullmatch(str(readback_selector.get("selector_sha256") or "")) is None
+        or readback_selector.get("selected_slot") != CANONICAL_SLOT
+        or readback_selector.get("upstream_port") != CANONICAL_UPSTREAM_PORT
+        or readback_selector.get("generation") != int(switch["generation"]) + 1
+        or readback_selector.get("cutover_id") != validated.get("cutover_id")
+        or readback_selector.get("previous_selector_sha256") != switch.get("selector_sha256")
+        or readback_selector.get("runtime_binding_sha256") != switch.get("runtime_binding_sha256")
+        or readback_selector.get("release_id") != validated.get("green_release_id")
+        or readback_selector.get("repo_head") != validated.get("expected_head")
+        or not isinstance(ingress, dict)
+        or ingress.get("selector_sha256") != readback_selector.get("selector_sha256")
+        or ingress.get("selector_generation") != readback_selector.get("generation")
+        or ingress.get("selected_slot") != CANONICAL_SLOT
+        or ingress.get("upstream_port") != CANONICAL_UPSTREAM_PORT
+        or ingress.get("runtime_binding_sha256") != switch.get("runtime_binding_sha256")
+        or ingress.get("release_id") != validated.get("green_release_id")
+        or ingress.get("repo_head") != validated.get("expected_head")
+    ):
+        raise MidCutoverEvidenceError(
+            "historical terminal authoritative readback evidence is invalid"
+        )
+    return {
+        "source_evidence_time": observed_at,
+        "publication_request_id": details["request_id"],
+        "observation_sha256": activation["observation_sha256"],
+        "state": details["state"],
+        "historical_terminal_evidence": True,
+        "historical_terminal_selector_sha256": readback_selector["selector_sha256"],
+        "snapshot_source_evidence_time": transition["source_evidence_time"],
+    }
+
+
+def recovery_activation_observation(receipt: dict[str, Any]) -> dict[str, Any]:
+    """Return ordinary activation or narrowly proven legacy terminal activation."""
+    try:
+        return activation_observation(receipt)
+    except MidCutoverEvidenceError:
+        return historical_terminal_activation_observation(receipt)
 
 
 def validate_resume_receipt(value: Any) -> dict[str, Any]:
@@ -1033,7 +1189,7 @@ def collect_classification_inputs(
             connect_timeout_seconds=0.01,
         )
         try:
-            activation = activation_observation(cutover)
+            activation = recovery_activation_observation(cutover)
             readiness = cutover.get("green_readiness")
             if not isinstance(readiness, dict):
                 raise MidCutoverEvidenceError(
@@ -1046,7 +1202,12 @@ def collect_classification_inputs(
                 blue_repo_head=str((blue_observation or {}).get("repo_head") or ""),
                 green_release_id=str(cutover.get("green_release_id") or ""),
                 target_head=str(cutover.get("expected_head") or ""),
-                source_evidence_time=activation["source_evidence_time"],
+                source_evidence_time=int(
+                    activation.get(
+                        "snapshot_source_evidence_time",
+                        activation["source_evidence_time"],
+                    )
+                ),
                 publication_request_id=activation["publication_request_id"],
                 registered_tool_count=int(
                     readiness.get("complete_schema_count") or 0
@@ -1257,6 +1418,9 @@ _RESUME_BINDING_V2_KEYS = frozenset(
         "binding_sha256",
     }
 )
+_RESUME_BINDING_V2_SNAPSHOT_TIME_KEYS = frozenset(
+    {*_RESUME_BINDING_V2_KEYS, "snapshot_source_evidence_time"}
+)
 _LEGACY_TERMINAL_BINDING_KEYS = frozenset(
     _RESUME_BINDING_V2_KEYS
     - {
@@ -1347,7 +1511,10 @@ def _validated_resume_binding(
     keys = frozenset(binding)
     is_v2 = binding.get("resume_binding_schema_version") == 2
     if is_v2:
-        if keys != _RESUME_BINDING_V2_KEYS:
+        if keys not in {
+            _RESUME_BINDING_V2_KEYS,
+            _RESUME_BINDING_V2_SNAPSHOT_TIME_KEYS,
+        }:
             return None
     elif not allow_legacy_terminal or keys != _LEGACY_TERMINAL_BINDING_KEYS:
         return None
@@ -1373,6 +1540,14 @@ def _validated_resume_binding(
         item = binding.get(key)
         minimum = 0 if key == "source_evidence_time" else 1
         if isinstance(item, bool) or not isinstance(item, int) or item < minimum:
+            return None
+    if "snapshot_source_evidence_time" in binding:
+        snapshot_time = binding.get("snapshot_source_evidence_time")
+        if (
+            isinstance(snapshot_time, bool)
+            or not isinstance(snapshot_time, int)
+            or snapshot_time < 0
+        ):
             return None
     if (
         CUTOVER_ID_RE.fullmatch(str(binding.get("cutover_id") or "")) is None
@@ -1663,6 +1838,11 @@ def _completed_lineage_binding(receipt: dict[str, Any]) -> dict[str, Any] | None
         != binding["source_client_declaration_sha256"]
         or final_snapshot.get("classified_snapshot_receipt_sha256")
         != rebind.get("receipt_sha256")
+        or (
+            "snapshot_source_evidence_time" in binding
+            and final_snapshot.get("source_evidence_time")
+            != binding["snapshot_source_evidence_time"]
+        )
     ):
         return None
     schema_changed = final_snapshot.get("schema_changed")
@@ -1716,7 +1896,7 @@ def _lineage_resolved(
     """True only for a completed resume bound to *this exact* cutover receipt."""
     try:
         cutover = validate_cutover_receipt(cutover)
-        activation = activation_observation(cutover)
+        activation = recovery_activation_observation(cutover)
     except MidCutoverEvidenceError:
         return False
     switch = _switch_evidence(cutover)
@@ -1752,6 +1932,14 @@ def _lineage_resolved(
             != switch.get("runtime_binding_sha256")
             or binding.get("source_evidence_time")
             != activation.get("source_evidence_time")
+            or binding.get(
+                "snapshot_source_evidence_time",
+                binding.get("source_evidence_time"),
+            )
+            != activation.get(
+                "snapshot_source_evidence_time",
+                activation.get("source_evidence_time"),
+            )
             or binding.get("activation_observation_sha256")
             != activation.get("observation_sha256")
             or binding.get("publication_request_id")
@@ -2076,17 +2264,27 @@ def classify_recovery_lane(
             and isinstance(generation, int)
             and generation >= 1
         )
-        checks["activation_observation_valid"] = bool(
+        activation_shape_valid = bool(
             activation_error is None
             and isinstance(activation, dict)
             and isinstance(activation.get("source_evidence_time"), int)
-            and activation.get("state") in PLATFORM_PUBLICATION_ACTIVATED_STATES
             and isinstance(activation.get("publication_request_id"), str)
             and SHA256_RE.fullmatch(
                 str(activation.get("observation_sha256") or "")
             )
             is not None
         )
+        ordinary_activation_valid = bool(
+            activation_shape_valid
+            and activation.get("state") in PLATFORM_PUBLICATION_ACTIVATED_STATES
+        )
+        if (
+            isinstance(activation, dict)
+            and activation.get("historical_terminal_evidence") is True
+        ):
+            checks["historical_terminal_selector_is_canonical"] = (
+                slot == CANONICAL_SLOT
+            )
         checks["blue_release_artifact_matches_predecessor"] = bool(
             isinstance(blue_head, str)
             and HEAD_RE.fullmatch(blue_head)
@@ -2139,6 +2337,24 @@ def classify_recovery_lane(
         evidence["pointer_promoted"] = pointer_promoted
         evidence["green_retired"] = green_retired
         receipt_summary["resume_phase"] = phase
+
+        historical_terminal_activation_valid = bool(
+            activation_shape_valid
+            and activation.get("state") == "platform_converged"
+            and activation.get("historical_terminal_evidence") is True
+            and slot == CANONICAL_SLOT
+            and pointer_promoted
+            and snapshot_rebound
+            and phase in {PHASE_RETIRE_GREEN, PHASE_CLOSEOUT}
+            and activation.get("historical_terminal_selector_sha256")
+            == selector.get("selector_sha256")
+        )
+        checks["activation_observation_valid"] = bool(
+            ordinary_activation_valid or historical_terminal_activation_valid
+        )
+        evidence["historical_terminal_activation_admitted"] = (
+            historical_terminal_activation_valid
+        )
 
         checks["stable_pointer_classifiable"] = pointer_state in {"blue", "target"}
         checks["client_snapshot_classifiable"] = snapshot_state in {
@@ -2277,6 +2493,10 @@ def classify_recovery_lane(
                 "expected_upstream_port": selector.get("upstream_port"),
                 "source_identity_sha256": candidate.get("source_identity_sha256"),
                 "source_evidence_time": activation.get("source_evidence_time"),
+                "snapshot_source_evidence_time": activation.get(
+                    "snapshot_source_evidence_time",
+                    activation.get("source_evidence_time"),
+                ),
                 "activation_observation_sha256": activation.get(
                     "observation_sha256"
                 ),

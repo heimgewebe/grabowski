@@ -436,15 +436,6 @@ class CaptainMergeMethodTests(unittest.TestCase):
             ),
             mock.patch.object(
                 grips,
-                "_captain_pr_merge_effect_scope_decision",
-                return_value={
-                    "decision": "passed",
-                    "reasons": [],
-                    "configured_automatic_effects": [],
-                },
-            ),
-            mock.patch.object(
-                grips,
                 "_captain_pr_merge_post_view",
                 return_value=({"state": "MERGED"}, [], [], {}),
             ),

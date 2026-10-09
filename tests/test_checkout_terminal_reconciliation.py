@@ -1521,6 +1521,61 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self.assertFalse(preview["safe_to_apply"])
         self.assertIn("active-coordination", preview["blockers"])
 
+    def test_missing_blocked_followup_lane_applies_without_bureau_binding(self) -> None:
+        lane_id = "d" * 32
+        binding = self._missing_binding(
+            source_kind="work_lane",
+            source_id=lane_id,
+        )
+        checkout_key = str(binding["checkout_key"])
+        core = {
+            "schema_version": 1,
+            "kind": "work_lane",
+            "source_id": lane_id,
+            "terminal_state": "blocked_with_durable_followup",
+            "checkout_key": checkout_key,
+            "reason_codes": ["durable_followup_bound"],
+            "lane_receipt_sha256": "1" * 64,
+            "assessment_sha256": "2" * 64,
+            "terminal_head_sha": self.head,
+            "lease_release_ready": False,
+            "terminal_closeout_audit_record_sha256": "3" * 64,
+        }
+        evidence = {
+            **core,
+            "evidence_sha256": checkouts._sha256_json(core),
+        }
+        with (
+            patch.object(
+                sources,
+                "source_terminal_evidence",
+                return_value=evidence,
+            ),
+            patch.object(
+                sources,
+                "blocked_followup_binding_authority",
+                side_effect=AssertionError(
+                    "missing checkout must not resolve present-capacity authority"
+                ),
+            ) as capacity_authority,
+        ):
+            preview = reconciliation.preview(checkout_key)
+            self.assertTrue(preview["safe_to_apply"])
+            self.assertEqual("missing", preview["checkout_observation"]["mode"])
+            result = reconciliation.apply(
+                checkout_key,
+                "owner-a",
+                str(preview["preview_sha256"]),
+                int(preview["preview_created_at_unix"]),
+                reconciliation.CONFIRMATION,
+            )
+
+        self.assertEqual("applied", result["status"])
+        after = checkouts._lifecycle_bindings([checkout_key])[checkout_key]
+        self.assertEqual("externally_terminal_missing", after["phase"])
+        self.assertNotIn("blocked_followup_capacity_authority", preview)
+        capacity_authority.assert_not_called()
+
     def test_external_terminal_phase_never_becomes_cleanup_candidate(self) -> None:
         binding = self._missing_binding()
         preview = self._preview(binding)
@@ -1694,6 +1749,106 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         ):
             sources.work_lane_terminal_evidence(lane_id)
 
+    def test_work_lane_source_projects_successor_handoff_binding(self) -> None:
+        lane_id = "a" * 32
+        successor_lane_id = "b" * 32
+        binding = {
+            "schema_version": 1,
+            "kind": "grabowski.work_lane_successor_handoff",
+            "predecessor_lane_id": lane_id,
+            "successor_lane_id": successor_lane_id,
+            "predecessor_head_sha": "1" * 40,
+            "successor_head_sha": "2" * 40,
+            "successor_receipt_sha256": "3" * 64,
+            "pr_number": 1330,
+        }
+        assessment = {
+            "closeout_state": "successor_handoff",
+            "assessment_sha256": "4" * 64,
+            "observed_at_unix": 200,
+            "terminal_head_sha": "1" * 40,
+            "lease_release_ready": True,
+            "successor_handoff": binding,
+        }
+        record = {
+            "lane_id": lane_id,
+            "state": "ready",
+            "receipt_sha256": "5" * 64,
+            "created_at_unix": 100,
+            "inputs": {"source": {"kind": "thread_focus", "id": "thread-focus-id"}},
+        }
+        with (
+            patch.object(work_acquire, "_read_state", return_value=record),
+            patch.object(
+                work_acquire, "_terminal_closeout_assessment", return_value=assessment
+            ),
+            patch.object(
+                work_acquire, "_terminal_closeout_audit_event", return_value={}
+            ),
+            patch.object(
+                work_acquire, "_find_terminal_closeout_audit", return_value="6" * 64
+            ),
+        ):
+            evidence = sources.work_lane_terminal_evidence(lane_id)
+
+        self.assertEqual("successor_handoff", evidence["terminal_state"])
+        self.assertEqual(binding, evidence["successor_handoff"])
+        self.assertEqual(
+            evidence["evidence_sha256"],
+            checkouts._sha256_json(
+                {
+                    key: value
+                    for key, value in evidence.items()
+                    if key != "evidence_sha256"
+                }
+            ),
+        )
+
+    def test_work_lane_source_projects_sha256_successor_handoff_binding(self) -> None:
+        lane_id = "a" * 32
+        successor_lane_id = "b" * 32
+        binding = {
+            "schema_version": 1,
+            "kind": "grabowski.work_lane_successor_handoff",
+            "predecessor_lane_id": lane_id,
+            "successor_lane_id": successor_lane_id,
+            "predecessor_head_sha": "1" * 64,
+            "successor_head_sha": "2" * 64,
+            "successor_receipt_sha256": "3" * 64,
+            "pr_number": 1330,
+        }
+        assessment = {
+            "closeout_state": "successor_handoff",
+            "assessment_sha256": "4" * 64,
+            "observed_at_unix": 200,
+            "terminal_head_sha": "1" * 64,
+            "lease_release_ready": True,
+            "successor_handoff": binding,
+        }
+        record = {
+            "lane_id": lane_id,
+            "state": "ready",
+            "receipt_sha256": "5" * 64,
+            "created_at_unix": 100,
+            "inputs": {"source": {"kind": "thread_focus", "id": "thread-focus-id"}},
+        }
+        with (
+            patch.object(work_acquire, "_read_state", return_value=record),
+            patch.object(
+                work_acquire, "_terminal_closeout_assessment", return_value=assessment
+            ),
+            patch.object(
+                work_acquire, "_terminal_closeout_audit_event", return_value={}
+            ),
+            patch.object(
+                work_acquire, "_find_terminal_closeout_audit", return_value="6" * 64
+            ),
+        ):
+            evidence = sources.work_lane_terminal_evidence(lane_id)
+
+        self.assertEqual("successor_handoff", evidence["terminal_state"])
+        self.assertEqual(binding, evidence["successor_handoff"])
+
     def test_operator_obligation_accepts_historical_resolution(self) -> None:
         status = {
             "state": "blocked",
@@ -1797,6 +1952,401 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self.assertEqual("terminal_work_lanes", evidence["completion_basis"])
         self.assertEqual(lane_id, evidence["work_lanes"][0]["lane_id"])
         self.assertEqual("c" * 64, evidence["work_lanes"][0]["terminal_closeout_audit_record_sha256"])
+
+    def test_thread_focus_follows_bound_successor_handoff_to_completion(self) -> None:
+        source_id = "thread-focus-id"
+        predecessor_lane_id = "a" * 32
+        successor_lane_id = "b" * 32
+        predecessor_head = "1" * 40
+        successor_head = "2" * 40
+        successor_receipt = "3" * 64
+        lane_root = self.root / "work-lanes"
+        lane_root.mkdir()
+        for lane_id in (predecessor_lane_id, successor_lane_id):
+            (lane_root / f"{lane_id}.json").write_text("{}\n", encoding="utf-8")
+        records = {
+            f"{predecessor_lane_id}.json": {
+                "lane_id": predecessor_lane_id,
+                "receipt_sha256": "4" * 64,
+                "inputs": {
+                    "source": {"kind": "thread_focus", "id": source_id},
+                },
+            },
+            f"{successor_lane_id}.json": {
+                "lane_id": successor_lane_id,
+                "receipt_sha256": "f" * 64,
+                "inputs": {
+                    "source": {"kind": "work_lane", "id": predecessor_lane_id},
+                    "base_head": successor_head,
+                },
+                "terminal_closeout": {
+                    "expected_receipt_sha256": successor_receipt,
+                },
+            },
+        }
+        evidence_by_lane = {
+            predecessor_lane_id: {
+                "schema_version": 1,
+                "kind": "work_lane",
+                "source_id": predecessor_lane_id,
+                "terminal_state": "successor_handoff",
+                "source_binding": {"kind": "thread_focus", "id": source_id},
+                "terminal_head_sha": predecessor_head,
+                "assessment_sha256": "5" * 64,
+                "terminal_closeout_audit_record_sha256": "6" * 64,
+                "successor_handoff": {
+                    "schema_version": 1,
+                    "kind": "grabowski.work_lane_successor_handoff",
+                    "predecessor_lane_id": predecessor_lane_id,
+                    "successor_lane_id": successor_lane_id,
+                    "predecessor_head_sha": predecessor_head,
+                    "successor_head_sha": successor_head,
+                    "successor_receipt_sha256": successor_receipt,
+                    "pr_number": 1330,
+                },
+                "evidence_sha256": "7" * 64,
+            },
+            successor_lane_id: {
+                "schema_version": 1,
+                "kind": "work_lane",
+                "source_id": successor_lane_id,
+                "terminal_state": "pr_merged",
+                "source_binding": {
+                    "kind": "work_lane",
+                    "id": predecessor_lane_id,
+                },
+                "terminal_head_sha": successor_head,
+                "assessment_sha256": "8" * 64,
+                "terminal_closeout_audit_record_sha256": "9" * 64,
+                "evidence_sha256": "a" * 64,
+            },
+        }
+
+        def read_state(path: Path):
+            return records[path.name]
+
+        with (
+            patch.object(
+                sources.operator_obligation,
+                "list_obligations",
+                return_value={
+                    "scan_truncated": False,
+                    "integrity_errors": [],
+                    "attention_required": False,
+                    "records": [],
+                },
+            ),
+            patch.object(work_acquire, "_state_root", return_value=lane_root),
+            patch.object(work_acquire, "_read_state", side_effect=read_state),
+            patch.object(
+                sources,
+                "work_lane_terminal_evidence",
+                side_effect=lambda lane_id: evidence_by_lane[lane_id],
+            ) as terminal_lane,
+        ):
+            evidence = sources.thread_focus_terminal_evidence(source_id)
+
+        self.assertEqual(
+            [predecessor_lane_id, successor_lane_id],
+            [call.args[0] for call in terminal_lane.call_args_list],
+        )
+        lane = evidence["work_lanes"][0]
+        self.assertEqual(predecessor_lane_id, lane["lane_id"])
+        self.assertEqual("successor_handoff", lane["terminal_state"])
+        self.assertEqual(successor_lane_id, lane["completion_lane_id"])
+        self.assertEqual("pr_merged", lane["completion_terminal_state"])
+        self.assertEqual(successor_lane_id, lane["successor_chain"][0]["lane_id"])
+
+    def test_thread_focus_rejects_missing_successor_handoff_lane(self) -> None:
+        source_id = "thread-focus-id"
+        predecessor_lane_id = "a" * 32
+        successor_lane_id = "b" * 32
+        lane_root = self.root / "work-lanes"
+        lane_root.mkdir()
+        (lane_root / f"{predecessor_lane_id}.json").write_text(
+            "{}\n", encoding="utf-8"
+        )
+        record = {
+            "lane_id": predecessor_lane_id,
+            "receipt_sha256": "4" * 64,
+            "inputs": {"source": {"kind": "thread_focus", "id": source_id}},
+        }
+        terminal = {
+            "schema_version": 1,
+            "kind": "work_lane",
+            "source_id": predecessor_lane_id,
+            "terminal_state": "successor_handoff",
+            "source_binding": {"kind": "thread_focus", "id": source_id},
+            "terminal_head_sha": "1" * 40,
+            "assessment_sha256": "5" * 64,
+            "terminal_closeout_audit_record_sha256": "6" * 64,
+            "successor_handoff": {
+                "schema_version": 1,
+                "kind": "grabowski.work_lane_successor_handoff",
+                "predecessor_lane_id": predecessor_lane_id,
+                "successor_lane_id": successor_lane_id,
+                "predecessor_head_sha": "1" * 40,
+                "successor_head_sha": "2" * 40,
+                "successor_receipt_sha256": "3" * 64,
+                "pr_number": 1330,
+            },
+            "evidence_sha256": "7" * 64,
+        }
+        with (
+            patch.object(
+                sources.operator_obligation,
+                "list_obligations",
+                return_value={
+                    "scan_truncated": False,
+                    "integrity_errors": [],
+                    "attention_required": False,
+                    "records": [],
+                },
+            ),
+            patch.object(work_acquire, "_state_root", return_value=lane_root),
+            patch.object(work_acquire, "_read_state", return_value=record),
+            patch.object(
+                sources, "work_lane_terminal_evidence", return_value=terminal
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "successor lane is missing from bounded scan"
+            ),
+        ):
+            sources.thread_focus_terminal_evidence(source_id)
+
+    def test_thread_focus_allows_successor_receipt_to_advance_before_completion(self) -> None:
+        source_id = "thread-focus-id"
+        predecessor_lane_id = "a" * 32
+        successor_lane_id = "b" * 32
+        predecessor_head = "1" * 40
+        successor_head = "2" * 40
+        handoff_successor_receipt = "3" * 64
+        terminal_successor_preimage = "f" * 64
+        lane_root = self.root / "work-lanes"
+        lane_root.mkdir()
+        for lane_id in (predecessor_lane_id, successor_lane_id):
+            (lane_root / f"{lane_id}.json").write_text("{}\n", encoding="utf-8")
+        records = {
+            f"{predecessor_lane_id}.json": {
+                "lane_id": predecessor_lane_id,
+                "receipt_sha256": "4" * 64,
+                "inputs": {
+                    "source": {"kind": "thread_focus", "id": source_id},
+                },
+            },
+            f"{successor_lane_id}.json": {
+                "lane_id": successor_lane_id,
+                "receipt_sha256": "e" * 64,
+                "inputs": {
+                    "source": {"kind": "work_lane", "id": predecessor_lane_id},
+                    "base_head": successor_head,
+                },
+                "terminal_closeout": {
+                    "expected_receipt_sha256": terminal_successor_preimage,
+                },
+            },
+        }
+        evidence_by_lane = {
+            predecessor_lane_id: {
+                "schema_version": 1,
+                "kind": "work_lane",
+                "source_id": predecessor_lane_id,
+                "terminal_state": "successor_handoff",
+                "source_binding": {"kind": "thread_focus", "id": source_id},
+                "terminal_head_sha": predecessor_head,
+                "assessment_sha256": "5" * 64,
+                "terminal_closeout_audit_record_sha256": "6" * 64,
+                "successor_handoff": {
+                    "schema_version": 1,
+                    "kind": "grabowski.work_lane_successor_handoff",
+                    "predecessor_lane_id": predecessor_lane_id,
+                    "successor_lane_id": successor_lane_id,
+                    "predecessor_head_sha": predecessor_head,
+                    "successor_head_sha": successor_head,
+                    "successor_receipt_sha256": handoff_successor_receipt,
+                    "pr_number": 1330,
+                },
+                "evidence_sha256": "7" * 64,
+            },
+            successor_lane_id: {
+                "schema_version": 1,
+                "kind": "work_lane",
+                "source_id": successor_lane_id,
+                "terminal_state": "pr_merged",
+                "source_binding": {
+                    "kind": "work_lane",
+                    "id": predecessor_lane_id,
+                },
+                "terminal_head_sha": successor_head,
+                "assessment_sha256": "8" * 64,
+                "terminal_closeout_audit_record_sha256": "9" * 64,
+                "evidence_sha256": "a" * 64,
+            },
+        }
+
+        self.assertNotEqual(handoff_successor_receipt, terminal_successor_preimage)
+
+        def read_state(path: Path):
+            return records[path.name]
+
+        with (
+            patch.object(
+                sources.operator_obligation,
+                "list_obligations",
+                return_value={
+                    "scan_truncated": False,
+                    "integrity_errors": [],
+                    "attention_required": False,
+                    "records": [],
+                },
+            ),
+            patch.object(work_acquire, "_state_root", return_value=lane_root),
+            patch.object(work_acquire, "_read_state", side_effect=read_state),
+            patch.object(
+                sources,
+                "work_lane_terminal_evidence",
+                side_effect=lambda lane_id: evidence_by_lane[lane_id],
+            ),
+        ):
+            evidence = sources.thread_focus_terminal_evidence(source_id)
+
+        lane = evidence["work_lanes"][0]
+        self.assertEqual(successor_lane_id, lane["completion_lane_id"])
+        self.assertEqual("pr_merged", lane["completion_terminal_state"])
+
+    def test_thread_focus_rejects_successor_cycle_by_lineage(self) -> None:
+        source_id = "thread-focus-id"
+        predecessor_lane_id = "a" * 32
+        successor_lane_id = "b" * 32
+        predecessor_head = "1" * 40
+        successor_head = "2" * 40
+        predecessor_receipt = "3" * 64
+        successor_receipt = "4" * 64
+        lane_root = self.root / "work-lanes"
+        lane_root.mkdir()
+        for lane_id in (predecessor_lane_id, successor_lane_id):
+            (lane_root / f"{lane_id}.json").write_text("{}\n", encoding="utf-8")
+        records = {
+            f"{predecessor_lane_id}.json": {
+                "lane_id": predecessor_lane_id,
+                "receipt_sha256": "5" * 64,
+                "inputs": {
+                    "source": {"kind": "thread_focus", "id": source_id},
+                },
+                "terminal_closeout": {
+                    "expected_receipt_sha256": predecessor_receipt,
+                },
+            },
+            f"{successor_lane_id}.json": {
+                "lane_id": successor_lane_id,
+                "receipt_sha256": "6" * 64,
+                "inputs": {
+                    "source": {"kind": "work_lane", "id": predecessor_lane_id},
+                    "base_head": successor_head,
+                },
+                "terminal_closeout": {
+                    "expected_receipt_sha256": successor_receipt,
+                },
+            },
+        }
+        evidence_by_lane = {
+            predecessor_lane_id: {
+                "schema_version": 1,
+                "kind": "work_lane",
+                "source_id": predecessor_lane_id,
+                "terminal_state": "successor_handoff",
+                "source_binding": {"kind": "thread_focus", "id": source_id},
+                "terminal_head_sha": predecessor_head,
+                "assessment_sha256": "7" * 64,
+                "terminal_closeout_audit_record_sha256": "8" * 64,
+                "successor_handoff": {
+                    "schema_version": 1,
+                    "kind": "grabowski.work_lane_successor_handoff",
+                    "predecessor_lane_id": predecessor_lane_id,
+                    "successor_lane_id": successor_lane_id,
+                    "predecessor_head_sha": predecessor_head,
+                    "successor_head_sha": successor_head,
+                    "successor_receipt_sha256": successor_receipt,
+                    "pr_number": 1331,
+                },
+                "evidence_sha256": "9" * 64,
+            },
+            successor_lane_id: {
+                "schema_version": 1,
+                "kind": "work_lane",
+                "source_id": successor_lane_id,
+                "terminal_state": "successor_handoff",
+                "source_binding": {
+                    "kind": "work_lane",
+                    "id": predecessor_lane_id,
+                },
+                "terminal_head_sha": successor_head,
+                "assessment_sha256": "a" * 64,
+                "terminal_closeout_audit_record_sha256": "b" * 64,
+                "successor_handoff": {
+                    "schema_version": 1,
+                    "kind": "grabowski.work_lane_successor_handoff",
+                    "predecessor_lane_id": successor_lane_id,
+                    "successor_lane_id": predecessor_lane_id,
+                    "predecessor_head_sha": successor_head,
+                    "successor_head_sha": predecessor_head,
+                    "successor_receipt_sha256": predecessor_receipt,
+                    "pr_number": 1331,
+                },
+                "evidence_sha256": "c" * 64,
+            },
+        }
+
+        def read_state(path: Path):
+            return records[path.name]
+
+        with (
+            patch.object(
+                sources.operator_obligation,
+                "list_obligations",
+                return_value={
+                    "scan_truncated": False,
+                    "integrity_errors": [],
+                    "attention_required": False,
+                    "records": [],
+                },
+            ),
+            patch.object(work_acquire, "_state_root", return_value=lane_root),
+            patch.object(work_acquire, "_read_state", side_effect=read_state),
+            patch.object(
+                sources,
+                "work_lane_terminal_evidence",
+                side_effect=lambda lane_id: evidence_by_lane[lane_id],
+            ),
+            self.assertRaisesRegex(RuntimeError, "successor lane binding differs"),
+        ):
+            sources.thread_focus_terminal_evidence(source_id)
+
+    def test_thread_focus_work_lane_scan_limit_is_hard(self) -> None:
+        source_id = "thread-focus-id"
+        lane_root = self.root / "work-lanes"
+        lane_root.mkdir()
+        for lane_id in ("a" * 32, "b" * 32):
+            (lane_root / f"{lane_id}.json").write_text("{}\n", encoding="utf-8")
+        with (
+            patch.object(
+                sources.operator_obligation,
+                "list_obligations",
+                return_value={
+                    "scan_truncated": False,
+                    "integrity_errors": [],
+                    "attention_required": False,
+                    "records": [],
+                },
+            ),
+            patch.object(work_acquire, "_state_root", return_value=lane_root),
+            patch.object(sources, "THREAD_FOCUS_WORK_LANE_SCAN_LIMIT", 1),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "thread focus work-lane evidence scan is incomplete",
+            ),
+        ):
+            sources.thread_focus_terminal_evidence(source_id)
 
     def test_thread_focus_rejects_terminal_work_lane_that_requires_continuation(self) -> None:
         source_id = "thread-focus-id"

@@ -7,13 +7,16 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import stat
+import subprocess
 import time
 import uuid
 from typing import Any, Callable, Iterator
 
 import grabowski_checkouts as checkouts
 import grabowski_execution_plan as execution_plan_contract
+import grabowski_git_preimage as git_preimage
 import grabowski_lane_closeout as lane_closeout
 import grabowski_operator_obligation as operator_obligation
 import grabowski_operator_core as operator
@@ -33,12 +36,19 @@ SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 SUCCESS_STATES = frozenset({"CREATED", "ALREADY_CORRECT"})
 DIRECT_SOURCE_KINDS = frozenset({"direct", "direct-user"})
+WORK_SOURCE_KINDS = frozenset(
+    DIRECT_SOURCE_KINDS | checkouts.TERMINAL_EVIDENCE_SOURCE_KINDS
+)
 MAX_WRITE_PATHS = 256
 MAX_WRITER_ARGV = 256
 MAX_WRITER_ARGUMENT_BYTES = 8192
 MAX_TERMINAL_OWNER_LEASES = 512
 MAX_RESOURCE_RELEASE_BATCH = 64
+SUCCESSOR_HANDOFF_MIN_LEASE_REMAINING_SECONDS = 30
 DEFERRED_RESOURCE_RELEASE_CLOSEOUT_STATES = frozenset({"candidate_adopted"})
+SYSTEMD_PROVEN_TERMINAL_SCOPED_WRITER_STATUSES = frozenset(
+    {"succeeded", "failed"}
+)
 
 
 class ScopedWriterStartPreflight(ValueError):
@@ -281,21 +291,71 @@ def _closeout_inputs(parameters: dict[str, Any], lane_id: str) -> dict[str, Any]
     return inputs
 
 
-def _terminal_assessment_replay_sha256(assessment: dict[str, Any]) -> str:
+def _terminal_assessment_replay_projection(
+    assessment: dict[str, Any],
+) -> dict[str, Any]:
     validated = lane_closeout.validate_terminal_assessment(assessment)
-    material = {
+    return {
         key: item
         for key, item in validated.items()
         if key
         not in {
             "observed_at_unix",
             "terminal_head_sha",
+            "legacy_observation_sha256",
             "assessment_sha256",
             "audit_record_sha256",
             "does_not_establish",
         }
     }
-    return _sha(material)
+
+
+def _terminal_assessment_replay_sha256(assessment: dict[str, Any]) -> str:
+    return _sha(_terminal_assessment_replay_projection(assessment))
+
+
+def _legacy_blocked_followup_id_transition(
+    stored: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    return (
+        stored.get("closeout_state") == "blocked_with_durable_followup"
+        and current.get("closeout_state") == "blocked_with_durable_followup"
+        and "durable_followup_id" not in stored
+        and isinstance(current.get("durable_followup_id"), str)
+        and bool(current.get("durable_followup_id"))
+        and isinstance(current.get("legacy_observation_sha256"), str)
+    )
+
+
+def _terminal_assessment_replay_equivalent(
+    stored: dict[str, Any],
+    current: dict[str, Any],
+) -> bool:
+    stored_projection = _terminal_assessment_replay_projection(stored)
+    current_projection = _terminal_assessment_replay_projection(current)
+    if stored_projection == current_projection:
+        return True
+    stored_validated = lane_closeout.validate_terminal_assessment(stored)
+    current_validated = lane_closeout.validate_terminal_assessment(current)
+    if not _legacy_blocked_followup_id_transition(
+        stored_validated,
+        current_validated,
+    ):
+        return False
+    if (
+        stored_validated.get("observation_sha256")
+        != current_validated.get("legacy_observation_sha256")
+    ):
+        return False
+    for field in (
+        "durable_followup_id",
+        "observation_sha256",
+        "legacy_observation_sha256",
+    ):
+        stored_projection.pop(field, None)
+        current_projection.pop(field, None)
+    return stored_projection == current_projection
 
 
 def _terminal_pending_retry_projection(
@@ -310,6 +370,7 @@ def _terminal_pending_retry_projection(
         not in {
             "observed_at_unix",
             "observation_sha256",
+            "legacy_observation_sha256",
             "assessment_sha256",
             "audit_record_sha256",
             "does_not_establish",
@@ -326,11 +387,24 @@ def _terminal_pending_retry_equivalent(
     """Allow only the expected post-release observation transition on retry."""
     pending_validated = lane_closeout.validate_terminal_assessment(pending)
     current_validated = lane_closeout.validate_terminal_assessment(current)
-    if (
-        _terminal_pending_retry_projection(pending_validated)
-        != _terminal_pending_retry_projection(current_validated)
-    ):
-        return False
+    pending_projection = _terminal_pending_retry_projection(pending_validated)
+    current_projection = _terminal_pending_retry_projection(current_validated)
+    legacy_followup_transition = _legacy_blocked_followup_id_transition(
+        pending_validated,
+        current_validated,
+    )
+    if pending_projection != current_projection:
+        if not legacy_followup_transition:
+            return False
+        pending_projection.pop("durable_followup_id", None)
+        current_projection.pop("durable_followup_id", None)
+        if pending_projection != current_projection:
+            return False
+    if legacy_followup_transition:
+        return (
+            pending_validated.get("observation_sha256")
+            == current_validated.get("legacy_observation_sha256")
+        )
     if (
         pending_validated.get("observation_sha256")
         == current_validated.get("observation_sha256")
@@ -672,11 +746,73 @@ def _converge_terminal_checkout_lifecycle(
     repo_value = inputs.get("repo")
     if not isinstance(repo_value, str) or not repo_value:
         raise RuntimeError("terminal Work Lane repository identity is missing")
-    _, _, worktree = checkouts._worktree_for_path(Path(repo_value), Path(checkout_path))
+    top_level, common_dir, worktree = checkouts._worktree_for_path(
+        Path(repo_value), Path(checkout_path)
+    )
     if worktree.get("checkout_key") != checkout_key:
         raise RuntimeError("terminal Work Lane checkout key drifted")
     checkouts._require_clean_linked(worktree)
     checkouts._require_expected(worktree, head, expected_branch)
+
+    if (
+        current_lifecycle is not None
+        and current_lifecycle.get("phase") == "archived"
+    ):
+        if current_lifecycle.get("expected_head") != head:
+            raise RuntimeError(
+                "terminal Work Lane archived lifecycle head drifted"
+            )
+        retention = checkouts._retention_records([checkout_key]).get(checkout_key)
+        if (
+            not isinstance(retention, dict)
+            or retention.get("checkout_key") != checkout_key
+            or retention.get("repo_common_dir") != str(common_dir)
+            or retention.get("repo_path") != str(top_level)
+            or retention.get("checkout_path") != checkout_path
+            or retention.get("owner_id") != owner_id
+            or retention.get("expected_head") != head
+            or retention.get("expected_branch") != expected_branch
+        ):
+            raise RuntimeError(
+                "terminal Work Lane archived lifecycle retention evidence drifted"
+            )
+        archive = checkouts._latest_archive_for_key(checkout_key)
+        if (
+            not isinstance(archive, dict)
+            or not isinstance(archive.get("archive_id"), str)
+            or archive.get("checkout_key") != checkout_key
+            or archive.get("owner_id") != owner_id
+            or archive.get("repo_path") != str(top_level)
+            or archive.get("checkout_path") != checkout_path
+            or archive.get("head") != head
+            or archive.get("branch") != expected_branch
+            or archive.get("cleaned_at_unix") is not None
+            or archive.get("cleanup_plan_id") is not None
+        ):
+            raise RuntimeError(
+                "terminal Work Lane archived lifecycle archive evidence drifted"
+            )
+        verified_refs = checkouts._verify_recovery_refs(
+            top_level, archive.get("recovery_refs", [])
+        )
+        if not verified_refs or not all(
+            item.get("present") is True for item in verified_refs
+        ):
+            raise RuntimeError(
+                "terminal Work Lane archived lifecycle recovery refs are incomplete"
+            )
+        return {
+            "state": "archived",
+            "checkout_key": checkout_key,
+            "owner_id": owner_id,
+            "expected_head": head,
+            "expected_branch": expected_branch,
+            "archive_id": archive["archive_id"],
+            "active_capacity_released": True,
+            "retention_preserved": True,
+            "archive_preserved": True,
+        }
+
     binding = checkouts._mark_checkout_completed_retained(
         checkout_key=checkout_key,
         owner_id=owner_id,
@@ -1103,13 +1239,14 @@ def converge_terminal_resource_closeout(
         }
 
 
-def persist_terminal_closeout(
+def _persist_terminal_closeout_impl(
     lane_id: str,
     assessment: dict[str, Any],
     *,
     expected_receipt_sha256: str,
     audit_fn: Callable[[dict[str, Any]], str | None] | None = None,
     audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None = None,
+    _successor_handoff_guard: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """CAS-persist one terminal assessment and converge release-ready lane leases.
 
@@ -1136,10 +1273,7 @@ def persist_terminal_closeout(
 
         existing = _terminal_closeout_assessment(record)
         if existing is not None:
-            if (
-                _terminal_assessment_replay_sha256(existing)
-                != _terminal_assessment_replay_sha256(validated)
-            ):
+            if not _terminal_assessment_replay_equivalent(existing, validated):
                 raise RuntimeError("work-lane already records another terminal assessment")
             lifecycle = _converge_terminal_checkout_lifecycle(
                 record, assessment=existing
@@ -1167,6 +1301,14 @@ def persist_terminal_closeout(
             if resource_closeout is not None:
                 result["resource_lease_closeout"] = resource_closeout
             return result
+
+        if (
+            validated.get("closeout_state") == "successor_handoff"
+            and _successor_handoff_guard is None
+        ):
+            raise RuntimeError(
+                "successor handoff terminal effects require persist_successor_handoff_closeout"
+            )
 
         pending = _terminal_closeout_pending_assessment(record)
         terminal_physical_identity: dict[str, Any] | None
@@ -1197,10 +1339,19 @@ def persist_terminal_closeout(
                 raise RuntimeError(
                     "work-lane already records another terminal closeout intent"
                 )
-            # The pending wrapper is continuation/CAS evidence only.  Effects
-            # must use the caller's freshly recomputed terminal assessment so
-            # task/process/Git liveness cannot go stale across retries.
-            effective = validated
+            # The pending wrapper is continuation/CAS evidence only. Normally
+            # effects use the caller's freshly recomputed terminal assessment so
+            # task/process/Git liveness cannot go stale across retries. For the
+            # one format transition where legacy blocked-followup evidence lacks
+            # durable_followup_id, exact legacy-observation reproduction above
+            # proves the old pending assessment still describes the current
+            # observation. Preserve that assessment as the canonical terminal
+            # evidence so an already-created Bureau TaskSpec reproduction stays
+            # bound to the original lane_assessment_sha256.
+            if _legacy_blocked_followup_id_transition(pending, validated):
+                effective = pending
+            else:
+                effective = validated
         else:
             if record.get("receipt_sha256") != expected_receipt_sha256:
                 raise RuntimeError("work-lane terminal closeout CAS preimage changed")
@@ -1231,6 +1382,8 @@ def persist_terminal_closeout(
         # The durable pending intent prevents normal work-acquire replay from
         # re-entering execution while terminal effects converge.  Checkout
         # validation comes first so dirty/head drift fails before lease release.
+        if _successor_handoff_guard is not None:
+            _successor_handoff_guard(record, effective)
         lifecycle = _converge_terminal_checkout_lifecycle(
             record, assessment=effective
         )
@@ -1276,6 +1429,618 @@ def persist_terminal_closeout(
         if resource_closeout is not None:
             result["resource_lease_closeout"] = resource_closeout
         return result
+
+
+def persist_terminal_closeout(
+    lane_id: str,
+    assessment: dict[str, Any],
+    *,
+    expected_receipt_sha256: str,
+    audit_fn: Callable[[dict[str, Any]], str | None] | None = None,
+    audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None = None,
+) -> dict[str, Any]:
+    """Persist ordinary terminal closeout; successor handoff has one typed entrypoint."""
+    validated = lane_closeout.validate_terminal_assessment(assessment)
+    if validated.get("closeout_state") == "successor_handoff":
+        raise RuntimeError(
+            "successor handoff closeout must use persist_successor_handoff_closeout"
+        )
+    return _persist_terminal_closeout_impl(
+        lane_id,
+        validated,
+        expected_receipt_sha256=expected_receipt_sha256,
+        audit_fn=audit_fn,
+        audit_lookup_fn=audit_lookup_fn,
+    )
+
+
+def _successor_handoff_binding(assessment: dict[str, Any]) -> dict[str, Any]:
+    validated = lane_closeout.validate_terminal_assessment(assessment)
+    if validated.get("closeout_state") != "successor_handoff":
+        raise RuntimeError("successor handoff requires successor_handoff terminal state")
+    binding = validated.get("successor_handoff")
+    required = {
+        "schema_version",
+        "kind",
+        "predecessor_lane_id",
+        "successor_lane_id",
+        "predecessor_head_sha",
+        "successor_head_sha",
+        "successor_receipt_sha256",
+        "pr_number",
+    }
+    if not isinstance(binding, dict) or set(binding) != required:
+        raise RuntimeError("successor handoff assessment binding is invalid")
+    if (
+        binding.get("schema_version") != 1
+        or binding.get("kind") != "grabowski.work_lane_successor_handoff"
+        or binding.get("predecessor_lane_id") != validated.get("lane_id")
+        or binding.get("predecessor_head_sha") != validated.get("terminal_head_sha")
+    ):
+        raise RuntimeError("successor handoff assessment identity is invalid")
+    _text(
+        binding.get("predecessor_lane_id"),
+        "predecessor_lane_id",
+        pattern=re.compile(r"[0-9a-f]{32}\Z"),
+    )
+    _text(
+        binding.get("successor_lane_id"),
+        "successor_lane_id",
+        pattern=re.compile(r"[0-9a-f]{32}\Z"),
+    )
+    _text(
+        binding.get("predecessor_head_sha"),
+        "predecessor_head_sha",
+        pattern=SHA40_RE,
+    )
+    _text(
+        binding.get("successor_head_sha"),
+        "successor_head_sha",
+        pattern=SHA40_RE,
+    )
+    _text(
+        binding.get("successor_receipt_sha256"),
+        "successor_receipt_sha256",
+        pattern=re.compile(r"[0-9a-f]{64}\Z"),
+    )
+    pr_number = binding.get("pr_number")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        raise RuntimeError("successor handoff pr_number is invalid")
+    if binding["predecessor_lane_id"] == binding["successor_lane_id"]:
+        raise RuntimeError("successor handoff cannot target the predecessor lane")
+    return dict(binding)
+
+
+def _successor_handoff_live_leases(
+    record: dict[str, Any],
+    *,
+    expected_owner: str | None = None,
+    expected_registered: list[str] | None = None,
+    expected_leases: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[str], list[dict[str, Any]], int]:
+    owner, registered, leases = _terminal_lane_resource_observation(record)
+    if [item["resource_key"] for item in leases] != registered:
+        raise RuntimeError("successor handoff successor lease set is incomplete or extended")
+    if not leases:
+        raise RuntimeError("successor handoff successor has no live resource leases")
+    if expected_owner is not None and owner != expected_owner:
+        raise RuntimeError("successor handoff successor lease owner drifted")
+    if expected_registered is not None and registered != expected_registered:
+        raise RuntimeError("successor handoff successor registered lease set drifted")
+    if expected_leases is not None and leases != expected_leases:
+        raise RuntimeError("successor handoff successor lease snapshot drifted")
+    lease_now = int(time.time())
+    minimum_expiry = min(int(item["expires_at_unix"]) for item in leases)
+    minimum_remaining = minimum_expiry - lease_now
+    if minimum_remaining < SUCCESSOR_HANDOFF_MIN_LEASE_REMAINING_SECONDS:
+        raise RuntimeError("successor handoff successor leases are too close to expiry")
+    return owner, registered, leases, minimum_remaining
+
+
+def _github_pr_exact_head(
+    repo: Path,
+    *,
+    pr_number: int,
+    branch: str,
+    head: str,
+    required_state: str,
+) -> dict[str, Any]:
+    """Require one exact GitHub PR publication for the successor head."""
+    if required_state not in {"OPEN", "MERGED"}:
+        raise RuntimeError("successor handoff PR state requirement is invalid")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        raise RuntimeError("successor handoff PR number is invalid")
+    _text(branch, "successor handoff PR branch")
+    _text(head, "successor handoff PR head", pattern=SHA40_RE)
+    origin = _git_runner(repo, ["config", "--get-all", "remote.origin.url"])
+    if (
+        origin.get("timed_out") is True
+        or int(origin.get("returncode", 1)) != 0
+        or origin.get("stdout_truncated") is True
+    ):
+        raise RuntimeError("successor handoff could not verify GitHub origin")
+    urls = [
+        line.strip()
+        for line in str(origin.get("stdout") or "").splitlines()
+        if line.strip()
+    ]
+    if len(urls) != 1:
+        raise RuntimeError("successor handoff requires one exact origin remote")
+    github_repo = checkouts._github_repository_slug_from_remote_url(urls[0])
+    if github_repo is None:
+        raise RuntimeError("successor handoff origin is not one supported GitHub repository")
+    viewed = operator._run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(pr_number),
+            "--repo",
+            github_repo,
+            "--json",
+            "number,state,headRefName,headRefOid",
+        ],
+        cwd=repo,
+        timeout_seconds=30,
+        max_output_bytes=64 * 1024,
+    )
+    if (
+        viewed.get("timed_out") is True
+        or int(viewed.get("returncode", 1)) != 0
+        or viewed.get("stdout_truncated") is True
+    ):
+        raise RuntimeError("successor handoff GitHub PR readback failed")
+    try:
+        payload = json.loads(str(viewed.get("stdout") or ""))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("successor handoff GitHub PR readback returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("successor handoff GitHub PR readback returned invalid payload")
+    if payload.get("number") != pr_number:
+        raise RuntimeError("successor handoff GitHub PR number drifted")
+    if payload.get("state") != required_state:
+        if required_state == "OPEN":
+            raise RuntimeError("successor handoff requires the bound PR to remain open")
+        raise RuntimeError("successor handoff pending retry requires the bound PR to be merged")
+    if payload.get("headRefName") != branch:
+        raise RuntimeError("successor handoff GitHub PR branch drifted")
+    observed_head = payload.get("headRefOid")
+    if not isinstance(observed_head, str) or observed_head.lower() != head:
+        raise RuntimeError("successor handoff GitHub PR head drifted")
+    return {
+        "repository": github_repo,
+        "pr_number": pr_number,
+        "state": required_state,
+        "head_ref_name": branch,
+        "head_sha": head,
+    }
+
+
+def _github_open_pr_exact_head(
+    repo: Path,
+    *,
+    pr_number: int,
+    branch: str,
+    head: str,
+) -> dict[str, Any]:
+    return _github_pr_exact_head(
+        repo,
+        pr_number=pr_number,
+        branch=branch,
+        head=head,
+        required_state="OPEN",
+    )
+
+
+def _github_merged_pr_exact_head(
+    repo: Path,
+    *,
+    pr_number: int,
+    branch: str,
+    head: str,
+) -> dict[str, Any]:
+    return _github_pr_exact_head(
+        repo,
+        pr_number=pr_number,
+        branch=branch,
+        head=head,
+        required_state="MERGED",
+    )
+
+
+def _verify_successor_handoff_locked(
+    predecessor_record: dict[str, Any],
+    successor_record: dict[str, Any],
+    assessment: dict[str, Any],
+    *,
+    successor_receipt_path: Path | None = None,
+    allow_terminal_successor_retry: bool = False,
+) -> dict[str, Any]:
+    binding = _successor_handoff_binding(assessment)
+    predecessor_lane_id = str(binding["predecessor_lane_id"])
+    successor_lane_id = str(binding["successor_lane_id"])
+    if predecessor_record.get("lane_id") != predecessor_lane_id:
+        raise RuntimeError("successor handoff predecessor lane changed")
+    predecessor_inputs = predecessor_record.get("inputs")
+    successor_inputs = successor_record.get("inputs")
+    if (
+        not isinstance(predecessor_inputs, dict)
+        or predecessor_record.get("inputs_sha256") != _sha(predecessor_inputs)
+        or predecessor_inputs.get("lane_id") != predecessor_lane_id
+        or predecessor_inputs.get("lease_owner_id") != f"lane:{predecessor_lane_id}"
+    ):
+        raise RuntimeError("successor handoff predecessor inputs are invalid")
+    if (
+        successor_record.get("lane_id") != successor_lane_id
+        or not isinstance(successor_inputs, dict)
+        or successor_record.get("inputs_sha256") != _sha(successor_inputs)
+        or successor_inputs.get("lane_id") != successor_lane_id
+        or successor_inputs.get("lease_owner_id") != f"lane:{successor_lane_id}"
+    ):
+        raise RuntimeError("successor handoff successor inputs are invalid")
+    successor_terminal = _terminal_closeout_assessment(successor_record)
+    if successor_terminal is not None:
+        if not allow_terminal_successor_retry:
+            raise RuntimeError("successor handoff requires one active ready successor lane")
+        pending_retry = _terminal_closeout_pending_assessment(predecessor_record)
+        if (
+            pending_retry is None
+            or _successor_handoff_binding(pending_retry) != binding
+        ):
+            raise RuntimeError(
+                "successor handoff terminal retry requires matching durable pending intent"
+            )
+        pending_observed_at = pending_retry.get("observed_at_unix")
+        terminal_observed_at = successor_terminal.get("observed_at_unix")
+        # Equality is deliberately fail-closed: second-granularity timestamps
+        # cannot prove that pending intent existed before terminalization.
+        if (
+            type(pending_observed_at) is not int
+            or type(terminal_observed_at) is not int
+            or pending_observed_at >= terminal_observed_at
+        ):
+            raise RuntimeError(
+                "successor handoff pending intent does not predate successor terminalization"
+            )
+    bound_successor_receipt = binding["successor_receipt_sha256"]
+    current_successor_receipt = successor_record.get("receipt_sha256")
+    if current_successor_receipt != bound_successor_receipt:
+        terminal_wrapper = successor_record.get("terminal_closeout")
+        terminal_preimage_receipt = (
+            terminal_wrapper.get("expected_receipt_sha256")
+            if isinstance(terminal_wrapper, dict)
+            else None
+        )
+        if (
+            not allow_terminal_successor_retry
+            or successor_terminal is None
+            or terminal_preimage_receipt != bound_successor_receipt
+        ):
+            raise RuntimeError("successor handoff successor receipt changed")
+    if successor_terminal is None:
+        if (
+            successor_record.get("state") != "ready"
+            or successor_record.get("terminal_closeout_pending") is not None
+        ):
+            raise RuntimeError("successor handoff requires one active ready successor lane")
+    else:
+        if successor_record.get("terminal_closeout_pending") is not None:
+            raise RuntimeError("successor handoff terminal successor has pending closeout state")
+        if successor_terminal.get("closeout_state") not in {"pr_merged", "deployed"}:
+            raise RuntimeError(
+                "successor handoff pending retry requires a merged or deployed successor"
+            )
+        if successor_terminal.get("terminal_head_sha") != binding["successor_head_sha"]:
+            raise RuntimeError("successor handoff terminal successor head drifted")
+        if successor_terminal.get("action_required") is not False:
+            raise RuntimeError("successor handoff terminal successor still requires action")
+    if successor_inputs.get("source") != {
+        "kind": "work_lane",
+        "id": predecessor_lane_id,
+    }:
+        raise RuntimeError("successor handoff successor source does not name predecessor")
+    if successor_inputs.get("repo") != predecessor_inputs.get("repo"):
+        raise RuntimeError("successor handoff lanes belong to different repositories")
+    if successor_inputs.get("base_head") != binding["successor_head_sha"]:
+        raise RuntimeError("successor handoff successor base does not match bound head")
+    predecessor_created = predecessor_record.get("created_at_unix")
+    successor_created = successor_record.get("created_at_unix")
+    if (
+        type(predecessor_created) is not int
+        or type(successor_created) is not int
+        or successor_created <= predecessor_created
+    ):
+        raise RuntimeError("successor handoff successor is not newer than predecessor")
+
+    if successor_terminal is None:
+        (
+            successor_owner,
+            successor_registered,
+            successor_leases,
+            _initial_minimum_remaining,
+        ) = _successor_handoff_live_leases(successor_record)
+    else:
+        (
+            successor_owner,
+            successor_registered,
+            successor_leases,
+        ) = _terminal_lane_resource_observation(successor_record)
+        if successor_leases:
+            raise RuntimeError(
+                "successor handoff terminal successor still owns live resource leases"
+            )
+
+    repo = Path(str(predecessor_inputs["repo"]))
+    predecessor_path = Path(str(predecessor_inputs["target_path"]))
+    successor_path = Path(str(successor_inputs["target_path"]))
+    predecessor_top, predecessor_common, predecessor_checkout = (
+        checkouts._worktree_for_path(repo, predecessor_path)
+    )
+    successor_top, successor_common, successor_checkout = checkouts._worktree_for_path(
+        repo, successor_path
+    )
+    checkouts._require_clean_linked(predecessor_checkout)
+    checkouts._require_expected(
+        predecessor_checkout,
+        str(binding["predecessor_head_sha"]),
+        str(predecessor_inputs["branch"]),
+    )
+    checkouts._require_clean_linked(successor_checkout)
+    checkouts._require_expected(
+        successor_checkout,
+        str(binding["successor_head_sha"]),
+        str(successor_inputs["branch"]),
+    )
+    predecessor_coordination = checkouts._linked_checkout_coordination(
+        predecessor_path,
+        predecessor_top,
+        predecessor_common,
+        branch=predecessor_checkout.get("branch"),
+        include_processes=True,
+        include_tasks=True,
+        include_resources=True,
+        ignored_lease_owner_ids=[str(predecessor_inputs["lease_owner_id"])],
+    )
+    successor_coordination = checkouts._linked_checkout_coordination(
+        successor_path,
+        successor_top,
+        successor_common,
+        branch=successor_checkout.get("branch"),
+        include_processes=True,
+        include_tasks=True,
+        include_resources=True,
+        ignored_lease_owner_ids=[successor_owner],
+    )
+    checkouts._require_no_blockers(predecessor_coordination)
+    checkouts._require_no_blockers(successor_coordination)
+    ancestry = _git_runner(
+        repo,
+        [
+            "--no-replace-objects",
+            "merge-base",
+            "--is-ancestor",
+            str(binding["predecessor_head_sha"]),
+            str(binding["successor_head_sha"]),
+        ],
+    )
+    if int(ancestry.get("returncode", 1)) != 0:
+        raise RuntimeError("successor handoff successor head is not a descendant")
+    # Publication deliberately keeps the predecessor PR branch name while
+    # the exact head SHA comes from the successor lane after base convergence.
+    # A first-time handoff still requires an open PR. Only a retry whose pending
+    # intent predated successor terminalization may accept that same exact PR as
+    # already merged.
+    publication = (
+        _github_open_pr_exact_head(
+            repo,
+            pr_number=int(binding["pr_number"]),
+            branch=str(predecessor_inputs["branch"]),
+            head=str(binding["successor_head_sha"]),
+        )
+        if successor_terminal is None
+        else _github_merged_pr_exact_head(
+            repo,
+            pr_number=int(binding["pr_number"]),
+            branch=str(predecessor_inputs["branch"]),
+            head=str(binding["successor_head_sha"]),
+        )
+    )
+
+    # The GitHub read above crosses a network boundary. Re-orient the successor
+    # afterwards so local checkout drift cannot hide behind an otherwise-stable
+    # lease snapshot while predecessor authority is being released.
+    (
+        final_successor_top,
+        final_successor_common,
+        final_successor_checkout,
+    ) = checkouts._worktree_for_path(repo, successor_path)
+    checkouts._require_clean_linked(final_successor_checkout)
+    checkouts._require_expected(
+        final_successor_checkout,
+        str(binding["successor_head_sha"]),
+        str(successor_inputs["branch"]),
+    )
+    final_successor_coordination = checkouts._linked_checkout_coordination(
+        successor_path,
+        final_successor_top,
+        final_successor_common,
+        branch=final_successor_checkout.get("branch"),
+        include_processes=True,
+        include_tasks=True,
+        include_resources=True,
+        ignored_lease_owner_ids=[successor_owner],
+    )
+    checkouts._require_no_blockers(final_successor_coordination)
+    final_successor_record = successor_record
+    if successor_receipt_path is not None:
+        reread = _read_state(successor_receipt_path)
+        if reread is None or reread.get("lane_id") != successor_lane_id:
+            raise RuntimeError("successor Work Lane receipt disappeared after publication")
+        final_terminal = _terminal_closeout_assessment(reread)
+        if reread.get("receipt_sha256") != binding["successor_receipt_sha256"]:
+            terminal_wrapper = reread.get("terminal_closeout")
+            terminal_preimage_receipt = (
+                terminal_wrapper.get("expected_receipt_sha256")
+                if isinstance(terminal_wrapper, dict)
+                else None
+            )
+            if (
+                not allow_terminal_successor_retry
+                or final_terminal is None
+                or terminal_preimage_receipt
+                != binding["successor_receipt_sha256"]
+            ):
+                raise RuntimeError(
+                    "successor handoff successor receipt changed after publication"
+                )
+        final_successor_record = reread
+    if successor_terminal is None:
+        (
+            _final_owner,
+            _final_registered,
+            _final_leases,
+            minimum_remaining,
+        ) = _successor_handoff_live_leases(
+            final_successor_record,
+            expected_owner=successor_owner,
+            expected_registered=successor_registered,
+            expected_leases=successor_leases,
+        )
+    else:
+        final_terminal = _terminal_closeout_assessment(final_successor_record)
+        if (
+            final_terminal is None
+            or final_terminal.get("assessment_sha256")
+            != successor_terminal.get("assessment_sha256")
+            or final_terminal.get("terminal_head_sha")
+            != binding["successor_head_sha"]
+        ):
+            raise RuntimeError(
+                "successor handoff terminal successor changed after publication"
+            )
+        (
+            final_owner,
+            final_registered,
+            final_leases,
+        ) = _terminal_lane_resource_observation(final_successor_record)
+        if (
+            final_owner != successor_owner
+            or final_registered != successor_registered
+            or final_leases
+        ):
+            raise RuntimeError(
+                "successor handoff terminal successor lease state changed after publication"
+            )
+        minimum_remaining = None
+    return {
+        "schema_version": 1,
+        "kind": "grabowski.work_lane_successor_handoff_verification",
+        "predecessor_lane_id": predecessor_lane_id,
+        "successor_lane_id": successor_lane_id,
+        "predecessor_head_sha": binding["predecessor_head_sha"],
+        "successor_head_sha": binding["successor_head_sha"],
+        "successor_receipt_sha256": binding["successor_receipt_sha256"],
+        "successor_resource_key_count": len(successor_registered),
+        "successor_minimum_lease_remaining_seconds": minimum_remaining,
+        "publication": publication,
+        "predecessor_coordination_blocking": False,
+        "successor_coordination_blocking": False,
+        "ancestry": "ancestor",
+    }
+
+
+def persist_successor_handoff_closeout(
+    lane_id: str,
+    *,
+    successor_lane_id: str,
+    expected_predecessor_head: str,
+    expected_successor_head: str,
+    expected_successor_receipt_sha256: str,
+    expected_pr_number: int,
+    expected_receipt_sha256: str,
+    audit_fn: Callable[[dict[str, Any]], str | None] | None = None,
+    audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None = None,
+) -> dict[str, Any]:
+    """Terminalize a predecessor only while its exact live successor is locked."""
+    assessment = lane_closeout.assess_successor_handoff(
+        lane_id=lane_id,
+        successor_lane_id=successor_lane_id,
+        predecessor_head_sha=expected_predecessor_head,
+        successor_head_sha=expected_successor_head,
+        successor_receipt_sha256=expected_successor_receipt_sha256,
+        pr_number=expected_pr_number,
+    )
+    _successor_handoff_binding(assessment)
+
+    # Terminal replay must remain independent of later successor lifetime.
+    with _lane_lock(lane_id) as predecessor_receipt_path:
+        predecessor_record = _read_state(predecessor_receipt_path)
+        if predecessor_record is None or predecessor_record.get("lane_id") != lane_id:
+            raise RuntimeError("work-lane receipt is missing or bound to another lane")
+        existing = _terminal_closeout_assessment(predecessor_record)
+        retrying_pending = (
+            _terminal_closeout_pending_assessment(predecessor_record) is not None
+        )
+    if existing is not None:
+        result = _persist_terminal_closeout_impl(
+            lane_id,
+            assessment,
+            expected_receipt_sha256=expected_receipt_sha256,
+            audit_fn=audit_fn,
+            audit_lookup_fn=audit_lookup_fn,
+        )
+        return {
+            **result,
+            "replayed": True,
+            "successor_handoff_verification": None,
+        }
+
+    # Check immutable lineage before nested locking. This makes the only valid
+    # lock direction successor -> predecessor and prevents reverse-handoff cycles.
+    successor_inputs = _stored_lane_inputs(successor_lane_id)
+    if successor_inputs.get("source") != {"kind": "work_lane", "id": lane_id}:
+        raise RuntimeError("successor handoff successor source does not name predecessor")
+
+    verification: dict[str, Any] = {}
+    with _lane_lock(successor_lane_id) as successor_receipt_path:
+        successor_record = _read_state(successor_receipt_path)
+        if successor_record is None:
+            raise RuntimeError("successor Work Lane receipt is missing")
+
+        def pre_effect_guard(
+            predecessor_record_value: dict[str, Any],
+            assessment_value: dict[str, Any],
+        ) -> None:
+            current_successor = _read_state(successor_receipt_path)
+            if current_successor is None:
+                raise RuntimeError("successor Work Lane disappeared during handoff")
+            current = _verify_successor_handoff_locked(
+                predecessor_record_value,
+                current_successor,
+                assessment_value,
+                successor_receipt_path=successor_receipt_path,
+                allow_terminal_successor_retry=retrying_pending,
+            )
+            verification.clear()
+            verification.update(current)
+
+        result = _persist_terminal_closeout_impl(
+            lane_id,
+            assessment,
+            expected_receipt_sha256=expected_receipt_sha256,
+            audit_fn=audit_fn,
+            audit_lookup_fn=audit_lookup_fn,
+            _successor_handoff_guard=pre_effect_guard,
+        )
+    if result.get("replayed") is True and not verification:
+        return {
+            **result,
+            "replayed": True,
+            "successor_handoff_verification": None,
+        }
+    if not verification:
+        raise RuntimeError("successor handoff verification was not produced")
+    return {**result, "successor_handoff_verification": dict(verification)}
 
 
 def _write_path_resource_keys(repo: Path, value: Any) -> list[str]:
@@ -1391,6 +2156,88 @@ def _writer_job_receipt(result: dict[str, Any]) -> dict[str, Any]:
         "final_status": result.get("final_status"),
     }
     return {**receipt, "receipt_sha256": _sha(receipt)}
+
+
+def _read_scoped_writer_status(unit: str) -> dict[str, Any]:
+    """Read one existing scoped writer through the canonical durable job contract."""
+
+    result = operator.grabowski_job_status(unit)
+    if not isinstance(result, dict):
+        raise RuntimeError("scoped writer durable status readback is invalid")
+    return result
+
+
+def _scoped_writer_liveness(
+    writer_job: dict[str, Any],
+    read_writer_status_fn: Callable[[str], dict[str, Any]],
+) -> dict[str, Any]:
+    """Project only exact durable evidence needed to exclude a concurrent writer."""
+
+    unit = writer_job.get("unit")
+    if not isinstance(unit, str) or not unit:
+        raise RuntimeError("scoped writer durable unit identity is invalid")
+    status = read_writer_status_fn(unit)
+    if not isinstance(status, dict) or status.get("unit") != unit:
+        raise RuntimeError("scoped writer durable status is bound to another unit")
+    final_status = status.get("final_status")
+    terminalization = status.get("terminalization_evidence")
+    systemd_visible = status.get("systemd_visible")
+    if (
+        not isinstance(final_status, str)
+        or not final_status
+        or not isinstance(systemd_visible, bool)
+        or not isinstance(terminalization, dict)
+        or terminalization.get("final_status") != final_status
+        or terminalization.get("systemd_visible") is not systemd_visible
+    ):
+        raise RuntimeError("scoped writer durable finalization evidence is invalid")
+
+    finalization_receipt = status.get("finalization_receipt")
+    collected_terminal = bool(
+        not systemd_visible
+        and final_status in SYSTEMD_PROVEN_TERMINAL_SCOPED_WRITER_STATUSES
+        and terminalization.get("source") == "persisted-runner-receipt"
+        and terminalization.get("query_valid") is True
+        and terminalization.get("receipt_valid") is True
+        and isinstance(finalization_receipt, dict)
+        and finalization_receipt.get("valid") is True
+        and finalization_receipt.get("final_status") == final_status
+        and terminalization.get("receipt_sha256")
+        == finalization_receipt.get("receipt_sha256")
+        and terminalization.get("payload_sha256")
+        == finalization_receipt.get("payload_sha256")
+    )
+
+    # A visible terminal unit is direct quiescence evidence. After systemd has
+    # already collected a short-lived unit, accept only a fresh valid not-found
+    # observation that the canonical job-status path paired with the exact
+    # bound finalization receipt. A receipt by itself remains insufficient.
+    if systemd_visible and final_status in SYSTEMD_PROVEN_TERMINAL_SCOPED_WRITER_STATUSES:
+        terminality_basis = "systemd_visible_terminal"
+    elif collected_terminal:
+        terminality_basis = "collected_bound_finalization"
+    elif not systemd_visible and final_status == "launch_failed":
+        terminality_basis = "proven_nonstart"
+    else:
+        terminality_basis = "unproven"
+    terminal = terminality_basis != "unproven"
+    material = {
+        "unit": unit,
+        "final_status": final_status,
+        "systemd_visible": systemd_visible,
+        "terminality_basis": terminality_basis,
+        "terminalization_evidence_sha256": _sha(terminalization),
+        "finalization_receipt_sha256": (
+            _sha(finalization_receipt)
+            if isinstance(finalization_receipt, dict)
+            else None
+        ),
+    }
+    return {
+        **material,
+        "terminal": terminal,
+        "status_sha256": _sha(material),
+    }
 
 
 def _normalize(
@@ -1524,16 +2371,87 @@ def _lifecycle_source(inputs: dict[str, Any]) -> dict[str, str]:
     return {"kind": kind, "id": source_id}
 
 
-def _git_runner(cwd: Path, arguments: list[str]) -> dict[str, Any]:
+def _git_runner(
+    cwd: Path,
+    arguments: list[str],
+    *,
+    timeout_seconds: int | float = 60,
+) -> dict[str, Any]:
     command = ["git", "-C", str(cwd), *arguments]
     command = operator._validate_argv(command, cwd=cwd)
     return operator._run(
         command,
         cwd=cwd,
-        timeout_seconds=60,
+        timeout_seconds=timeout_seconds,
         max_output_bytes=250_000,
         environment=operator._git_environment(),
     )
+
+
+def _bounded_raw_nul_git_probe(
+    cwd: Path,
+    arguments: list[str],
+    *,
+    max_records: int,
+    max_stdout_bytes: int,
+    timeout_seconds: int | float = 30,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one byte-preserving Git read with pre-buffer record and byte bounds."""
+
+    if max_records < 1 or max_stdout_bytes < 1 or timeout_seconds < 1:
+        raise ValueError("bounded raw Git probe limits must be positive")
+    command = [
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        *arguments,
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=operator._git_environment(),
+    )
+    assert process.stdout is not None
+    output = bytearray()
+    record_count = 0
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("bounded raw Git probe timed out")
+            ready, _, _ = select.select([process.stdout], [], [], remaining)
+            if not ready:
+                raise RuntimeError("bounded raw Git probe timed out")
+            chunk = os.read(process.stdout.fileno(), 64 * 1024)
+            if not chunk:
+                break
+            output.extend(chunk)
+            record_count += chunk.count(b"\0")
+            if record_count > max_records:
+                raise RuntimeError("bounded raw Git probe record limit exceeded")
+            if len(output) > max_stdout_bytes:
+                raise RuntimeError("bounded raw Git probe byte limit exceeded")
+        remaining = max(0.001, deadline - time.monotonic())
+        returncode = process.wait(timeout=remaining)
+        return subprocess.CompletedProcess(
+            command,
+            returncode,
+            bytes(output),
+            b"",
+        )
+    except Exception:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        raise
+    finally:
+        process.stdout.close()
 
 
 def _effect_observed(output: dict[str, Any]) -> bool:
@@ -1546,6 +2464,681 @@ def _effect_observed(output: dict[str, Any]) -> bool:
             or isinstance(post.get("branch_ref_head"), str)
         )
     )
+
+
+@contextmanager
+def _continuation_lifecycle_guard(timeout_seconds: float) -> Iterator[None]:
+    """Exclude managed checkout-registry and lifecycle writers through authorization."""
+
+    if timeout_seconds <= 0:
+        raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+    guard_deadline = time.monotonic() + timeout_seconds
+    # Lock order is checkout operation lock -> lifecycle DB transaction. All
+    # supported Grabowski worktree-admin mutations use the same operation lock,
+    # so registry uniqueness stays stable through the guarded yield.
+    remaining = guard_deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+    with checkouts._operation_lock(deadline_monotonic=guard_deadline):
+        connection = checkouts._database()
+        try:
+            remaining = guard_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+            timeout_ms = max(1, min(10_000, int(remaining * 1000)))
+            connection.execute(f"PRAGMA busy_timeout={timeout_ms}")
+            connection.execute("BEGIN IMMEDIATE")
+            if time.monotonic() >= guard_deadline:
+                raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+            yield
+        finally:
+            if connection.in_transaction:
+                connection.rollback()
+            connection.close()
+
+
+@contextmanager
+def _continuation_authorization_guard(
+    continuation_preimage: dict[str, Any] | None,
+    *,
+    timeout_seconds: float = 10.0,
+) -> Iterator[None]:
+    """Revalidate lifecycle and effective Git worktree through authorization."""
+
+    if continuation_preimage is None:
+        yield
+        return
+    checkout_key = continuation_preimage.get("checkout_key")
+    checkout_path = continuation_preimage.get("checkout_path")
+    expected_lifecycle_sha256 = continuation_preimage.get("lifecycle_sha256")
+    expected_retention_until_unix = continuation_preimage.get(
+        "lifecycle_retention_until_unix"
+    )
+    expected_branch_preimage_sha256 = continuation_preimage.get(
+        "branch_preimage_sha256"
+    )
+    expected_index_sha256 = continuation_preimage.get("index_sha256")
+    expected_tracked_worktree_sha256 = continuation_preimage.get(
+        "tracked_worktree_sha256"
+    )
+    expected_untracked_preimage_sha256 = continuation_preimage.get(
+        "untracked_preimage_sha256"
+    )
+    expected_untracked_worktree_sha256 = continuation_preimage.get(
+        "untracked_worktree_sha256"
+    )
+    expected_untracked_count = continuation_preimage.get("untracked_count")
+    expected_registered_git_dir = continuation_preimage.get("registered_git_dir")
+    expected_hashes = (
+        expected_branch_preimage_sha256,
+        expected_index_sha256,
+        expected_tracked_worktree_sha256,
+        expected_untracked_preimage_sha256,
+        expected_untracked_worktree_sha256,
+    )
+    if (
+        not isinstance(checkout_key, str)
+        or not isinstance(checkout_path, str)
+        or not checkout_path
+        or not Path(checkout_path).is_absolute()
+        or not isinstance(expected_lifecycle_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_lifecycle_sha256) is None
+        or any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in expected_hashes
+        )
+        or isinstance(expected_untracked_count, bool)
+        or not isinstance(expected_untracked_count, int)
+        or expected_untracked_count < 0
+        or not isinstance(expected_registered_git_dir, dict)
+        or not isinstance(expected_registered_git_dir.get("path"), str)
+        or not isinstance(expected_registered_git_dir.get("device"), int)
+        or not isinstance(expected_registered_git_dir.get("inode"), int)
+        or isinstance(expected_retention_until_unix, bool)
+        or not isinstance(expected_retention_until_unix, int)
+    ):
+        raise RuntimeError(
+            "managed worktree continuation authorization evidence is invalid"
+        )
+    authorization_deadline = time.monotonic() + timeout_seconds
+
+    def remaining_authorization_seconds() -> float:
+        remaining = authorization_deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "managed worktree continuation authorization deadline exceeded"
+            )
+        return remaining
+
+    def authorization_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                *argv,
+            ],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=remaining_authorization_seconds(),
+            env=operator._git_environment(),
+        )
+
+    def authorization_index_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _bounded_raw_nul_git_probe(
+            cwd,
+            argv,
+            max_records=100_000,
+            max_stdout_bytes=32 * 1024 * 1024,
+            timeout_seconds=remaining_authorization_seconds(),
+        )
+
+    def authorization_untracked_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _bounded_raw_nul_git_probe(
+            cwd,
+            argv,
+            max_records=100,
+            max_stdout_bytes=512 * 1024,
+            timeout_seconds=remaining_authorization_seconds(),
+        )
+
+    with _continuation_lifecycle_guard(remaining_authorization_seconds()):
+        lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
+        if (
+            not isinstance(lifecycle, dict)
+            or _sha(lifecycle) != expected_lifecycle_sha256
+        ):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle authority changed before authorization"
+            )
+        retention_until_unix = lifecycle.get("retention_until_unix")
+        if (
+            retention_until_unix != expected_retention_until_unix
+            or retention_until_unix <= int(time.time())
+        ):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle retention expired before authorization"
+            )
+        checkout = Path(checkout_path)
+        try:
+            git_preimage._require_effective_git_toplevel(
+                checkout,
+                authorization_probe,
+                deadline_monotonic=authorization_deadline,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation effective Git worktree changed before authorization"
+            ) from exc
+        try:
+            current_branch_preimage = git_preimage.capture_branch_preimage(
+                checkout,
+                authorization_probe,
+                require_attached=True,
+                index_probe=authorization_index_probe,
+                max_tracked_paths=25_000,
+                max_tracked_bytes=1024 * 1024 * 1024,
+                deadline_monotonic=authorization_deadline,
+                reject_gitlinks=True,
+            )
+            current_untracked_preimage = git_preimage.capture_untracked_preimage(
+                checkout,
+                authorization_untracked_probe,
+                max_paths=100,
+                max_total_bytes=256 * 1024 * 1024,
+                deadline_monotonic=authorization_deadline,
+            )
+            index_flags = authorization_index_probe(
+                checkout, ["ls-files", "-v", "-z"]
+            )
+            if index_flags.returncode != 0:
+                raise RuntimeError(
+                    "managed worktree continuation index flags could not be revalidated"
+                )
+            index_flag_entries = [
+                entry for entry in index_flags.stdout.split(b"\0") if entry
+            ]
+            index_flag_tags = [
+                chr(entry[0]) for entry in index_flag_entries if entry
+            ]
+            if any(tag.islower() for tag in index_flag_tags):
+                raise RuntimeError(
+                    "managed worktree continuation has assume-unchanged index entries before authorization"
+                )
+            if any(tag.upper() == "S" for tag in index_flag_tags):
+                raise RuntimeError(
+                    "managed worktree continuation has skip-worktree index entries before authorization"
+                )
+            current_physical = current_branch_preimage.get("physical_checkout")
+            current_common_dir = (
+                current_physical.get("common_dir")
+                if isinstance(current_physical, dict)
+                else None
+            )
+            current_common_path = (
+                current_common_dir.get("path")
+                if isinstance(current_common_dir, dict)
+                else None
+            )
+            if not isinstance(current_common_path, str):
+                raise RuntimeError(
+                    "managed worktree continuation physical common directory is invalid before authorization"
+                )
+            current_registered_git_dir = (
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    current_common_path, checkout
+                )
+            )
+            git_preimage._require_effective_git_toplevel(
+                checkout,
+                authorization_probe,
+                deadline_monotonic=authorization_deadline,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation Git state could not be revalidated before authorization"
+            ) from exc
+        if current_registered_git_dir != expected_registered_git_dir:
+            raise RuntimeError(
+                "managed worktree continuation registered Git directory changed before authorization"
+            )
+        current_git_state = (
+            current_branch_preimage.get("preimage_sha256"),
+            current_branch_preimage.get("index_sha256"),
+            current_branch_preimage.get("worktree_sha256"),
+            current_untracked_preimage.get("preimage_sha256"),
+            current_untracked_preimage.get("worktree_sha256"),
+            current_untracked_preimage.get("count"),
+        )
+        expected_git_state = (
+            expected_branch_preimage_sha256,
+            expected_index_sha256,
+            expected_tracked_worktree_sha256,
+            expected_untracked_preimage_sha256,
+            expected_untracked_worktree_sha256,
+            expected_untracked_count,
+        )
+        if current_git_state != expected_git_state:
+            raise RuntimeError(
+                "managed worktree continuation Git state changed before authorization"
+            )
+        try:
+            physical_checkout.verify_physical_checkout_identity(current_physical)
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation physical checkout changed before authorization"
+            ) from exc
+        remaining_authorization_seconds()
+        if retention_until_unix <= int(time.time()):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle retention expired before authorization"
+            )
+        remaining_authorization_seconds()
+        yield
+
+
+def _continuation_preimage(
+    existing: dict[str, Any] | None,
+    inputs: dict[str, Any],
+    lifecycle_source: dict[str, str],
+    runner: Callable[[Path, list[str]], dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Bind live Git state when resuming an already prepared managed work lane."""
+
+    if not isinstance(existing, dict):
+        return None
+    resumable_continuation = existing.get("state") == "ready" or (
+        existing.get("state") == "blocked"
+        and existing.get("error_class") == "WORKTREE_CONTINUATION_CONFLICT"
+    )
+    if not resumable_continuation:
+        return None
+    prior = existing.get("worktree_receipt")
+    if not isinstance(prior, dict) or prior.get("result_state") not in SUCCESS_STATES:
+        return None
+    prior_lifecycle = prior.get("lifecycle")
+    if not isinstance(prior_lifecycle, dict):
+        return None
+    prior_physical = prior_lifecycle.get("physical_checkout")
+    if not isinstance(prior_physical, dict):
+        raise RuntimeError(
+            "managed worktree continuation lacks ensure-time physical identity"
+        )
+
+    target = Path(inputs["target_path"])
+    repo = Path(inputs["repo"])
+    _top_level, registered_common_dir, record = checkouts._worktree_for_path(repo, target)
+    checkouts._require_linked(record)
+    checkout_key = record.get("checkout_key")
+    if not isinstance(checkout_key, str) or checkout_key != prior_lifecycle.get("checkout_key"):
+        raise RuntimeError("managed worktree continuation checkout identity drifted")
+    try:
+        expected_physical = physical_checkout.verify_physical_checkout_identity(
+            prior_physical
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "managed worktree continuation differs from ensure-time physical identity"
+        ) from exc
+    physical_common = expected_physical.get("common_dir")
+    if (
+        not isinstance(physical_common, dict)
+        or physical_common.get("path") != str(registered_common_dir)
+    ):
+        raise RuntimeError(
+            "managed worktree continuation ensure-time identity is not bound to the registered Git common directory"
+        )
+    try:
+        current_registered_git_dir = (
+            physical_checkout.capture_registered_linked_worktree_git_dir(
+                registered_common_dir, target
+            )
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "managed worktree continuation registered Git directory could not be resolved"
+        ) from exc
+    if current_registered_git_dir != expected_physical.get("git_dir"):
+        raise RuntimeError(
+            "managed worktree continuation registered Git directory drifted"
+        )
+
+    expected_lifecycle = {
+        "checkout_path": str(target),
+        "owner_id": inputs["lease_owner_id"],
+        "source": lifecycle_source,
+        "artifact_class": inputs["artifact_class"],
+        "phase": "active",
+        "expected_branch": inputs["branch"],
+    }
+    if record.get("branch") != inputs["branch"] or record.get("detached"):
+        raise RuntimeError("managed worktree continuation branch identity drifted")
+
+    snapshot_deadline = time.monotonic() + 30.0
+
+    def remaining_snapshot_seconds() -> float:
+        remaining = snapshot_deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("managed worktree continuation preimage deadline exceeded")
+        return remaining
+
+    def capture_lifecycle() -> dict[str, Any]:
+        remaining_snapshot_seconds()
+        lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
+        remaining_snapshot_seconds()
+        if not isinstance(lifecycle, dict) or any(
+            lifecycle.get(field) != value
+            for field, value in expected_lifecycle.items()
+        ):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle authority drifted"
+            )
+        prior_head = lifecycle.get("expected_head")
+        if not isinstance(prior_head, str) or SHA40_RE.fullmatch(prior_head) is None:
+            raise RuntimeError(
+                "managed worktree continuation prior HEAD evidence is invalid"
+            )
+        require_active_lifecycle_retention(lifecycle)
+        return lifecycle
+
+    def require_active_lifecycle_retention(lifecycle: dict[str, Any]) -> int:
+        retention_until_unix = lifecycle.get("retention_until_unix")
+        if (
+            isinstance(retention_until_unix, bool)
+            or not isinstance(retention_until_unix, int)
+        ):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle retention evidence is invalid"
+            )
+        if retention_until_unix <= int(time.time()):
+            raise RuntimeError(
+                "managed worktree continuation lifecycle retention expired"
+            )
+        return retention_until_unix
+
+    def raw_probe(cwd: Path, argv: list[str]) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *argv],
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=remaining_snapshot_seconds(),
+            env=operator._git_environment(),
+        )
+
+    def bounded_tracked_index_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _bounded_raw_nul_git_probe(
+            cwd,
+            argv,
+            max_records=100_000,
+            max_stdout_bytes=32 * 1024 * 1024,
+            timeout_seconds=remaining_snapshot_seconds(),
+        )
+
+    def bounded_untracked_probe(
+        cwd: Path, argv: list[str]
+    ) -> subprocess.CompletedProcess[bytes]:
+        return _bounded_raw_nul_git_probe(
+            cwd,
+            argv,
+            max_records=100,
+            max_stdout_bytes=512 * 1024,
+            timeout_seconds=remaining_snapshot_seconds(),
+        )
+
+    def snapshot_runner(arguments: list[str]) -> dict[str, Any]:
+        timeout_seconds = remaining_snapshot_seconds()
+        if runner is _git_runner:
+            result = _git_runner(
+                target,
+                arguments,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            result = runner(target, arguments)
+        remaining_snapshot_seconds()
+        return result
+
+    def capture_snapshot() -> dict[str, Any]:
+        lifecycle = capture_lifecycle()
+        prior_head = lifecycle["expected_head"]
+        status = snapshot_runner(
+            ["status", "--short", "--branch", "--untracked-files=normal"]
+        )
+        head = snapshot_runner(["rev-parse", "--verify", "HEAD^{commit}"])
+        tracked_index = snapshot_runner(["diff-index", "--quiet", "HEAD", "--"])
+        tracked_files = snapshot_runner(["diff-files", "--quiet", "--"])
+        index_flags = snapshot_runner(["ls-files", "-v", "-z"])
+        preimage_reads = (status, head, index_flags)
+        if any(result.get("returncode") != 0 for result in preimage_reads):
+            raise RuntimeError("managed worktree continuation Git readback failed")
+        if (
+            tracked_index.get("returncode") not in (0, 1)
+            or tracked_files.get("returncode") not in (0, 1)
+        ):
+            raise RuntimeError("managed worktree continuation tracked state readback failed")
+        if any(
+            result.get("stdout_truncated") is True
+            or result.get("stderr_truncated") is True
+            for result in preimage_reads
+        ):
+            raise RuntimeError("managed worktree continuation Git readback was truncated")
+
+        status_lines = [
+            line for line in str(status.get("stdout") or "").splitlines() if line
+        ]
+        status_entries = status_lines[1:] if status_lines else []
+        head_sha = str(head.get("stdout") or "").strip().lower()
+        if SHA40_RE.fullmatch(head_sha) is None:
+            raise RuntimeError("managed worktree continuation HEAD is invalid")
+
+        try:
+            branch_preimage = git_preimage.capture_branch_preimage(
+                target,
+                raw_probe,
+                require_attached=True,
+                index_probe=bounded_tracked_index_probe,
+                max_tracked_paths=25_000,
+                max_tracked_bytes=1024 * 1024 * 1024,
+                deadline_monotonic=snapshot_deadline,
+                reject_gitlinks=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation raw Git preimage capture failed"
+            ) from exc
+        branch_physical = branch_preimage.get("physical_checkout")
+        if (
+            not isinstance(branch_physical, dict)
+            or branch_physical.get("physical_identity_sha256")
+            != expected_physical.get("physical_identity_sha256")
+        ):
+            raise RuntimeError("managed worktree continuation physical identity drifted")
+        if branch_preimage.get("branch") != inputs["branch"]:
+            raise RuntimeError("managed worktree continuation raw branch identity drifted")
+        if branch_preimage.get("head") != head_sha:
+            raise RuntimeError("managed worktree continuation raw HEAD identity drifted")
+        if branch_preimage.get("operation_refs"):
+            raise RuntimeError("managed worktree continuation has in-progress Git operation")
+
+        index_entries = [
+            entry for entry in str(index_flags.get("stdout") or "").split("\0") if entry
+        ]
+        tags = [entry[0] for entry in index_entries]
+        if any(tag.islower() for tag in tags):
+            raise RuntimeError(
+                "managed worktree continuation has assume-unchanged index entries"
+            )
+        if any(tag.upper() == "S" for tag in tags):
+            raise RuntimeError(
+                "managed worktree continuation has skip-worktree index entries"
+            )
+
+        ancestry = raw_probe(
+            target,
+            [
+                "--no-replace-objects",
+                "merge-base",
+                "--is-ancestor",
+                prior_head,
+                head_sha,
+            ],
+        )
+        if ancestry.returncode != 0:
+            raise RuntimeError(
+                "managed worktree continuation HEAD is not a descendant of ensure"
+            )
+        try:
+            untracked_preimage = git_preimage.capture_untracked_preimage(
+                target,
+                bounded_untracked_probe,
+                max_paths=100,
+                max_total_bytes=256 * 1024 * 1024,
+                deadline_monotonic=snapshot_deadline,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation untracked preimage capture failed"
+            ) from exc
+        try:
+            git_preimage._require_effective_git_toplevel(
+                target,
+                raw_probe,
+                deadline_monotonic=snapshot_deadline,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation effective Git worktree changed after untracked capture"
+            ) from exc
+        remaining_snapshot_seconds()
+        try:
+            snapshot_registered_git_dir = (
+                physical_checkout.capture_registered_linked_worktree_git_dir(
+                    registered_common_dir, target
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation registered Git directory changed during snapshot"
+            ) from exc
+        remaining_snapshot_seconds()
+        if snapshot_registered_git_dir != expected_physical.get("git_dir"):
+            raise RuntimeError(
+                "managed worktree continuation registered Git directory changed during snapshot"
+            )
+        remaining_snapshot_seconds()
+        try:
+            snapshot_physical = (
+                physical_checkout.verify_physical_checkout_identity(
+                    prior_physical
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "managed worktree continuation physical identity changed during preimage capture"
+            ) from exc
+        remaining_snapshot_seconds()
+
+        return {
+            "lifecycle": lifecycle,
+            "lifecycle_sha256": _sha(lifecycle),
+            "head": head_sha,
+            "status_header": status_lines[0] if status_lines else "",
+            "status_entries": status_entries[:100],
+            "branch_preimage_sha256": branch_preimage["preimage_sha256"],
+            "index_sha256": branch_preimage["index_sha256"],
+            "tracked_worktree_sha256": branch_preimage["worktree_sha256"],
+            "tracked_index_dirty": tracked_index.get("returncode") == 1,
+            "tracked_worktree_dirty": tracked_files.get("returncode") == 1,
+            "untracked_preimage_sha256": untracked_preimage["preimage_sha256"],
+            "untracked_worktree_sha256": untracked_preimage["worktree_sha256"],
+            "untracked_count": untracked_preimage["count"],
+            "registered_git_dir": snapshot_registered_git_dir,
+            "physical_identity_sha256": snapshot_physical[
+                "physical_identity_sha256"
+            ],
+        }
+
+    first_snapshot = capture_snapshot()
+    with _continuation_lifecycle_guard(remaining_snapshot_seconds()):
+        stable_snapshot = capture_snapshot()
+        authority_fields = (
+            "head",
+            "branch_preimage_sha256",
+            "index_sha256",
+            "tracked_worktree_sha256",
+            "tracked_index_dirty",
+            "tracked_worktree_dirty",
+            "untracked_preimage_sha256",
+            "untracked_worktree_sha256",
+            "untracked_count",
+            "registered_git_dir",
+            "physical_identity_sha256",
+        )
+        if any(
+            first_snapshot[field] != stable_snapshot[field]
+            for field in authority_fields
+        ):
+            raise RuntimeError(
+                "managed worktree continuation Git state changed during stable readback"
+            )
+
+        if first_snapshot["lifecycle_sha256"] != stable_snapshot["lifecycle_sha256"]:
+            raise RuntimeError(
+                "managed worktree continuation lifecycle authority changed during stable readback"
+            )
+
+        stable_retention_until_unix = require_active_lifecycle_retention(
+            stable_snapshot["lifecycle"]
+        )
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski.work_lane_continuation_preimage",
+            "lane_id": inputs["lane_id"],
+            "checkout_key": checkout_key,
+            "checkout_path": str(target),
+            "physical_identity_sha256": expected_physical["physical_identity_sha256"],
+            "branch": inputs["branch"],
+            "head": stable_snapshot["head"],
+            "ensure_head": stable_snapshot["lifecycle"]["expected_head"],
+            "dirty": bool(stable_snapshot["status_entries"]),
+            "status_header": stable_snapshot["status_header"],
+            "status_entries": stable_snapshot["status_entries"],
+            "branch_preimage_sha256": stable_snapshot["branch_preimage_sha256"],
+            "index_sha256": stable_snapshot["index_sha256"],
+            "tracked_worktree_sha256": stable_snapshot["tracked_worktree_sha256"],
+            "tracked_index_dirty": stable_snapshot["tracked_index_dirty"],
+            "tracked_worktree_dirty": stable_snapshot["tracked_worktree_dirty"],
+            "untracked_preimage_sha256": stable_snapshot["untracked_preimage_sha256"],
+            "untracked_worktree_sha256": stable_snapshot["untracked_worktree_sha256"],
+            "untracked_count": stable_snapshot["untracked_count"],
+            "registered_git_dir": stable_snapshot["registered_git_dir"],
+            "prior_worktree_receipt_sha256": prior.get("durable_receipt_sha256"),
+            "lifecycle_sha256": stable_snapshot["lifecycle_sha256"],
+            "lifecycle_retention_until_unix": stable_retention_until_unix,
+            "lifecycle_updated_at_unix": stable_snapshot["lifecycle"].get(
+                "updated_at_unix"
+            ),
+        }
+        result = {**material, "preimage_sha256": _sha(material)}
+        require_active_lifecycle_retention(stable_snapshot["lifecycle"])
+        return result
 
 
 def _resource_acquisition_plan(resource_keys: list[str]) -> list[dict[str, Any]]:
@@ -1845,12 +3438,17 @@ def acquire_work(
     ensure_worktree_fn: Callable[..., dict[str, Any]] = worktree_ensure.ensure_worktree,
     runner: Callable[[Path, list[str]], dict[str, Any]] = _git_runner,
     start_writer_fn: Callable[..., dict[str, Any]] = _start_scoped_writer,
+    read_writer_status_fn: Callable[[str], dict[str, Any]] = _read_scoped_writer_status,
     audit_fn: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     inputs = _normalize(parameters)
     writer_argv = inputs.pop("_scoped_writer_argv")
     lane_id = inputs["lane_id"]
     inputs_sha256 = _sha(inputs)
+    source_kind = inputs["source"]["kind"]
+    if source_kind not in WORK_SOURCE_KINDS:
+        allowed = ", ".join(sorted(WORK_SOURCE_KINDS))
+        raise ValueError(f"source_kind must be one of {allowed}")
     lifecycle_source = _lifecycle_source(inputs)
     acquisition_plan = _resource_acquisition_plan(inputs["resource_keys"])
     with _lane_lock(lane_id) as receipt_path:
@@ -2127,6 +3725,163 @@ def acquire_work(
         )
         group_evidence = _group_evidence_fields(acquisition_plan, acquisitions)
 
+        def continuation_conflict(
+            exc: Exception,
+            worktree_receipt: dict[str, Any] | None,
+            *,
+            error_class: str = "WORKTREE_CONTINUATION_CONFLICT",
+            writer_liveness: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            preserve_writer_authority = (
+                existing_writer_job is not None
+                and (
+                    writer_liveness is None
+                    or writer_liveness.get("terminal") is not True
+                )
+            )
+            if preserve_writer_authority:
+                record = _write_state(
+                    receipt_path,
+                    {
+                        **base_record,
+                        "state": "outcome_unknown",
+                        "decision": "HARD_BLOCK",
+                        "lease_receipt": acquired,
+                        **group_evidence,
+                        "worktree_receipt": worktree_receipt,
+                        "writer_job": existing_writer_job,
+                        **(
+                            {"writer_start": existing_writer_start}
+                            if isinstance(existing_writer_start, dict)
+                            else {}
+                        ),
+                        "error_class": error_class,
+                        "error": str(exc)[:2048],
+                        **(
+                            {"writer_liveness": writer_liveness}
+                            if writer_liveness is not None
+                            else {}
+                        ),
+                        "effect_observed": True,
+                        "compensation": None,
+                        "next_action": "readback_scoped_writer_before_retry",
+                    },
+                )
+                if audit_fn is not None:
+                    audit_fn(
+                        {
+                            "operation": "work-acquire",
+                            "lane_id": lane_id,
+                            "state": "outcome_unknown",
+                            "decision": "HARD_BLOCK",
+                            "inputs_sha256": inputs_sha256,
+                            "effect_observed": True,
+                        }
+                    )
+                return {
+                    **record,
+                    "durable_receipt_path": str(receipt_path),
+                    "replayed": existing is not None,
+                }
+
+            compensation, compensation_complete = _compensate_acquisitions(
+                owner_id=inputs["lease_owner_id"],
+                plan=acquisition_plan,
+                acquisitions=acquisitions,
+                release_resources_fn=release_resources_fn,
+                receipt_path=receipt_path,
+                base_record=base_record,
+                lease_receipt=acquired,
+            )
+            state = "blocked" if compensation_complete else "outcome_unknown"
+            record = _write_state(
+                receipt_path,
+                {
+                    **base_record,
+                    "state": state,
+                    "decision": "HARD_BLOCK",
+                    "lease_receipt": acquired,
+                    **group_evidence,
+                    "worktree_receipt": worktree_receipt,
+                    "error_class": error_class,
+                    "error": str(exc)[:2048],
+                    **(
+                        {"writer_liveness": writer_liveness}
+                        if writer_liveness is not None
+                        else {}
+                    ),
+                    "effect_observed": False,
+                    "compensation": compensation,
+                    "next_action": (
+                        "reconcile_managed_worktree_continuation"
+                        if compensation_complete
+                        else "reconcile_lease_compensation_before_retry"
+                    ),
+                },
+            )
+            if audit_fn is not None:
+                audit_fn(
+                    {
+                        "operation": "work-acquire",
+                        "lane_id": lane_id,
+                        "state": state,
+                        "decision": "HARD_BLOCK",
+                        "inputs_sha256": inputs_sha256,
+                        "effect_observed": False,
+                    }
+                )
+            return {
+                **record,
+                "durable_receipt_path": str(receipt_path),
+                "replayed": existing is not None,
+            }
+
+        writer_liveness: dict[str, Any] | None = None
+        if existing_writer_job is not None:
+            try:
+                writer_liveness = _scoped_writer_liveness(
+                    existing_writer_job, read_writer_status_fn
+                )
+            except Exception as exc:
+                return continuation_conflict(
+                    exc,
+                    (
+                        existing.get("worktree_receipt")
+                        if isinstance(existing, dict)
+                        else None
+                    ),
+                    error_class="SCOPED_WRITER_STATUS_UNCLEAR",
+                )
+            if writer_liveness["terminal"] is not True:
+                return continuation_conflict(
+                    RuntimeError(
+                        "existing scoped writer is not proven terminal: "
+                        + str(writer_liveness["final_status"])
+                    ),
+                    (
+                        existing.get("worktree_receipt")
+                        if isinstance(existing, dict)
+                        else None
+                    ),
+                    error_class="SCOPED_WRITER_NOT_TERMINAL",
+                    writer_liveness=writer_liveness,
+                )
+
+        try:
+            continuation_preimage = _continuation_preimage(
+                existing, inputs, lifecycle_source, runner
+            )
+        except Exception as exc:
+            return continuation_conflict(
+                exc,
+                (
+                    existing.get("worktree_receipt")
+                    if isinstance(existing, dict)
+                    else None
+                ),
+                writer_liveness=writer_liveness,
+            )
+
         ensure_parameters = {
             "repo": inputs["repo"],
             "target_path": inputs["target_path"],
@@ -2145,11 +3900,14 @@ def acquire_work(
             ],
         }
         try:
-            output = ensure_worktree_fn(
-                ensure_parameters,
-                runner,
-                inspect_resource_fn,
-            )
+            if continuation_preimage is not None:
+                output = existing["worktree_receipt"]
+            else:
+                output = ensure_worktree_fn(
+                    ensure_parameters,
+                    runner,
+                    inspect_resource_fn,
+                )
         except worktree_ensure.WorktreeEnsurePreflight as exc:
             compensation, compensation_complete = _compensate_acquisitions(
                 owner_id=inputs["lease_owner_id"],
@@ -2246,7 +4004,9 @@ def acquire_work(
         if result_state in SUCCESS_STATES:
             admission = output.get("work_admission")
             decision = (
-                "ISOLATE_AND_EXECUTE"
+                "CONTINUE_EXISTING"
+                if continuation_preimage is not None
+                else "ISOLATE_AND_EXECUTE"
                 if work_admission.has_verified_isolation_evidence(admission)
                 else "AUTO_PREPARE_AND_EXECUTE"
                 if result_state == "CREATED"
@@ -2272,6 +4032,7 @@ def acquire_work(
                 ],
                 "single_writer_scope": "overlapping-resource-lane",
             }
+            continuation_authorized = continuation_preimage is None
             writer_job = existing_writer_job
             writer_start: dict[str, Any] | None = None
             if writer_job is not None:
@@ -2280,20 +4041,30 @@ def acquire_work(
                     "job_receipt_sha256": writer_job.get("receipt_sha256"),
                 }
             elif writer_argv is not None:
-                _write_state(
-                    receipt_path,
-                    {
-                        **base_record,
-                        "state": "writer_starting",
-                        "decision": decision,
-                        "lease_receipt": acquired,
-                        **group_evidence,
-                        "worktree_receipt": output,
-                        "authority": authority,
-                        "writer_start": {"state": "starting"},
-                        "next_action": "start_scoped_writer",
-                    },
-                )
+                try:
+                    with _continuation_authorization_guard(continuation_preimage):
+                        _write_state(
+                            receipt_path,
+                            {
+                                **base_record,
+                                "state": "writer_starting",
+                                "decision": decision,
+                                "lease_receipt": acquired,
+                                **group_evidence,
+                                "worktree_receipt": output,
+                                **(
+                                    {"continuation_preimage": continuation_preimage}
+                                    if continuation_preimage is not None
+                                    else {}
+                                ),
+                                "authority": authority,
+                                "writer_start": {"state": "starting"},
+                                "next_action": "start_scoped_writer",
+                            },
+                        )
+                    continuation_authorized = True
+                except Exception as exc:
+                    return continuation_conflict(exc, output)
                 try:
                     writer_result = start_writer_fn(
                         writer_argv,
@@ -2312,6 +4083,7 @@ def acquire_work(
                             "lease_receipt": acquired,
                             **group_evidence,
                             "worktree_receipt": output,
+                            **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                             "authority": authority,
                             "writer_start": {
                                 "state": "preflight_failed",
@@ -2336,6 +4108,7 @@ def acquire_work(
                             "lease_receipt": acquired,
                             **group_evidence,
                             "worktree_receipt": output,
+                            **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                             "authority": authority,
                             "writer_start": {
                                 "state": "outcome_unknown",
@@ -2360,6 +4133,7 @@ def acquire_work(
                             "lease_receipt": acquired,
                             **group_evidence,
                             "worktree_receipt": output,
+                            **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                             "authority": authority,
                             "writer_start": {
                                 "state": "outcome_unknown",
@@ -2386,6 +4160,7 @@ def acquire_work(
                             "lease_receipt": acquired,
                             **group_evidence,
                             "worktree_receipt": output,
+                            **({"continuation_preimage": continuation_preimage} if continuation_preimage is not None else {}),
                             "authority": authority,
                             "writer_start": {
                                 "state": "outcome_unknown",
@@ -2404,27 +4179,99 @@ def acquire_work(
                     "state": "started",
                     "job_receipt_sha256": writer_job["receipt_sha256"],
                 }
-            record = _write_state(
-                receipt_path,
-                {
-                    **base_record,
-                    "state": "ready",
-                    "decision": decision,
-                    "lease_receipt": acquired,
-                    **group_evidence,
-                    "worktree_receipt": output,
-                    "authority": authority,
-                    **({"writer_job": writer_job} if writer_job is not None else {}),
-                    **({"writer_start": writer_start} if writer_start is not None else {}),
-                    "next_action": (
-                        "writer_started"
-                        if writer_job is not None
-                        else "start_scoped_writer"
-                        if inputs["scoped_writer"]
-                        else "controller_execute"
-                    ),
-                },
-            )
+            ready_payload = {
+                **base_record,
+                "state": "ready",
+                "decision": decision,
+                "lease_receipt": acquired,
+                **group_evidence,
+                "worktree_receipt": output,
+                **(
+                    {"continuation_preimage": continuation_preimage}
+                    if continuation_preimage is not None
+                    else {}
+                ),
+                "authority": authority,
+                **(
+                    {"writer_liveness": writer_liveness}
+                    if writer_liveness is not None
+                    else {}
+                ),
+                **({"writer_job": writer_job} if writer_job is not None else {}),
+                **({"writer_start": writer_start} if writer_start is not None else {}),
+                "next_action": (
+                    "writer_started"
+                    if writer_job is not None
+                    else "start_scoped_writer"
+                    if inputs["scoped_writer"]
+                    else "controller_execute"
+                ),
+            }
+            try:
+                if continuation_authorized:
+                    record = _write_state(receipt_path, ready_payload)
+                else:
+                    with _continuation_authorization_guard(continuation_preimage):
+                        record = _write_state(receipt_path, ready_payload)
+                    continuation_authorized = True
+            except Exception as exc:
+                if existing_writer_job is not None:
+                    return continuation_conflict(
+                        exc,
+                        output,
+                        writer_liveness=writer_liveness,
+                    )
+                if writer_job is None:
+                    return continuation_conflict(exc, output)
+                record = _write_state(
+                    receipt_path,
+                    {
+                        **base_record,
+                        "state": "outcome_unknown",
+                        "decision": "HARD_BLOCK",
+                        "lease_receipt": acquired,
+                        **group_evidence,
+                        "worktree_receipt": output,
+                        **(
+                            {"continuation_preimage": continuation_preimage}
+                            if continuation_preimage is not None
+                            else {}
+                        ),
+                        "authority": authority,
+                        **(
+                            {"writer_liveness": writer_liveness}
+                            if writer_liveness is not None
+                            else {}
+                        ),
+                        "writer_job": writer_job,
+                        **(
+                            {"writer_start": writer_start}
+                            if writer_start is not None
+                            else {}
+                        ),
+                        "error_class": type(exc).__name__,
+                        "error": str(exc)[:2048],
+                        "effect_observed": True,
+                        "compensation": None,
+                        "next_action": "readback_scoped_writer_before_retry",
+                    },
+                )
+                if audit_fn is not None:
+                    audit_fn(
+                        {
+                            "operation": "work-acquire",
+                            "lane_id": lane_id,
+                            "state": "outcome_unknown",
+                            "decision": "HARD_BLOCK",
+                            "inputs_sha256": inputs_sha256,
+                            "effect_observed": True,
+                        }
+                    )
+                return {
+                    **record,
+                    "durable_receipt_path": str(receipt_path),
+                    "replayed": existing is not None,
+                }
             if audit_fn is not None:
                 audit_fn({"operation": "work-acquire", "lane_id": lane_id, "state": "ready", "decision": decision, "inputs_sha256": inputs_sha256, "worktree_receipt_sha256": output.get("durable_receipt_sha256")})
             return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
@@ -2490,7 +4337,12 @@ def grabowski_work_acquire(
     ttl_seconds: int = 7200,
     terminal_closeout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Acquire a work lane, persist terminal closeout, or repair only its missing audit."""
+    """Acquire a work lane, persist terminal closeout, or repair only its missing audit.
+
+    New acquisitions accept source_kind only from bureau_task, github_issue,
+    operator_obligation, thread_focus, work_lane, direct, or direct-user.
+    Direct sources bind checkout lifecycle evidence to the Work Lane itself.
+    """
     parameters = {
         "source_kind": source_kind,
         "source_id": source_id,
@@ -2538,12 +4390,51 @@ def grabowski_work_acquire(
                 audit_fn=operator.base._append_audit_with_digest,
                 audit_lookup_fn=_find_terminal_closeout_audit,
             )
+        successor_handoff_keys = {
+            "expected_receipt_sha256",
+            "successor_handoff",
+        }
+        if set(terminal_closeout) == successor_handoff_keys:
+            handoff = terminal_closeout["successor_handoff"]
+            if not isinstance(handoff, dict) or set(handoff) != {
+                "lane_id",
+                "successor_lane_id",
+                "expected_predecessor_head",
+                "expected_successor_head",
+                "expected_successor_receipt_sha256",
+                "expected_pr_number",
+            }:
+                raise ValueError("terminal_closeout.successor_handoff shape is invalid")
+            lane_id = handoff["lane_id"]
+            if not isinstance(lane_id, str):
+                raise ValueError(
+                    "terminal_closeout.successor_handoff.lane_id must be a string"
+                )
+            inputs = _closeout_inputs(parameters, lane_id)
+            operator._require_operator_mutation(
+                "resource_lease", path=inputs["target_path"], repo=inputs["repo"]
+            )
+            return persist_successor_handoff_closeout(
+                inputs["lane_id"],
+                successor_lane_id=handoff["successor_lane_id"],
+                expected_predecessor_head=handoff["expected_predecessor_head"],
+                expected_successor_head=handoff["expected_successor_head"],
+                expected_successor_receipt_sha256=handoff[
+                    "expected_successor_receipt_sha256"
+                ],
+                expected_pr_number=handoff["expected_pr_number"],
+                expected_receipt_sha256=terminal_closeout[
+                    "expected_receipt_sha256"
+                ],
+                audit_fn=operator.base._append_audit_with_digest,
+                audit_lookup_fn=_find_terminal_closeout_audit,
+            )
         if set(terminal_closeout) != {
             "expected_receipt_sha256",
             "observation",
         }:
             raise ValueError(
-                "terminal_closeout must contain either expected_receipt_sha256 + observation or expected_receipt_sha256 + lane_id + reconcile_audit_only"
+                "terminal_closeout must contain expected_receipt_sha256 plus observation, successor_handoff, or lane_id + reconcile_audit_only"
             )
         observation = terminal_closeout["observation"]
         if not isinstance(observation, dict):

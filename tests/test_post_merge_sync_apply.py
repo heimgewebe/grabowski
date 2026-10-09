@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
@@ -40,6 +41,7 @@ if "mcp" not in sys.modules:
 
 
 import grabowski_post_merge_sync_apply as sync_apply  # noqa: E402
+import grabowski_physical_checkout as physical_checkout  # noqa: E402
 
 
 def git(repo: Path, argv: list[str]) -> dict[str, object]:
@@ -72,6 +74,7 @@ class LeaseHarness:
         self.live: dict[str, dict[str, object]] = {}
         self.acquire_calls = 0
         self.work_admission_modes: list[str] = []
+        self.metadatas: list[dict[str, object] | None] = []
         self.release_calls = 0
         self.release_expected_leases: list[dict[str, object]] | None = None
 
@@ -82,10 +85,12 @@ class LeaseHarness:
         *,
         purpose: str,
         ttl_seconds: int,
+        metadata: dict[str, object] | None = None,
         _work_admission_mode: str = "normal",
     ) -> dict[str, object]:
         self.acquire_calls += 1
         self.work_admission_modes.append(_work_admission_mode)
+        self.metadatas.append(metadata)
         if self.acquire_effect is not None:
             self.acquire_effect()
         leases = []
@@ -142,10 +147,12 @@ class ConcurrentLeaseHarness(LeaseHarness):
         *,
         purpose: str,
         ttl_seconds: int,
+        metadata: dict[str, object] | None = None,
         _work_admission_mode: str = "normal",
     ) -> dict[str, object]:
         self.acquire_calls += 1
         self.work_admission_modes.append(_work_admission_mode)
+        self.metadatas.append(metadata)
         self.owner_ids.append(owner_id)
         if self.live:
             live_owners = {
@@ -182,6 +189,44 @@ class ConcurrentLeaseHarness(LeaseHarness):
             self.nested_result = callback()
         return {"leases": leases}
 
+
+
+
+class ExactConflictLeaseHarness(LeaseHarness):
+    """Conflict only when two owners request at least one identical resource key."""
+
+    def acquire(
+        self,
+        owner_id: str,
+        resource_keys: list[str],
+        *,
+        purpose: str,
+        ttl_seconds: int,
+        metadata: dict[str, object] | None = None,
+        _work_admission_mode: str = "normal",
+    ) -> dict[str, object]:
+        self.acquire_calls += 1
+        self.work_admission_modes.append(_work_admission_mode)
+        self.metadatas.append(metadata)
+        for key in resource_keys:
+            existing = self.live.get(key)
+            if existing is not None and existing["owner_id"] != owner_id:
+                raise RuntimeError(f"resource conflict: {key}")
+        leases = []
+        for key in resource_keys:
+            lease = {
+                "resource_key": key,
+                "owner_id": owner_id,
+                "purpose": purpose,
+                "acquired_at_unix": 1,
+                "updated_at_unix": 1,
+                "expires_at_unix": 1 + ttl_seconds,
+                "metadata_sha256": "a" * 64,
+                "reclaimed_from_owner": None,
+            }
+            self.live[key] = lease
+            leases.append(lease)
+        return {"leases": leases}
 
 
 @contextmanager
@@ -392,11 +437,13 @@ class PostMergeSyncApplyTests(unittest.TestCase):
         runner=git,
         remote_reader=None,
     ) -> dict[str, object]:
+        physical = physical_checkout.capture_physical_checkout_identity(repo)
         return sync_apply.apply(
             repo=repo,
             target_branch="main",
             expected_local_head=local_head,
             expected_remote_head=remote_head,
+            expected_physical_identity_sha256=physical["physical_identity_sha256"],
             remote="origin",
             remote_target=str(remote),
             confirmation=sync_apply.CONFIRMATION,
@@ -404,6 +451,962 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             remote_head_reader=remote_reader or self.remote_reader(remote),
             pinned_target_factory=self.pinned(remote),
         )
+
+    def test_physical_identity_mismatch_blocks_before_leases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            leases = LeaseHarness()
+            changed = {**expected, "physical_identity_sha256": "0" * 64}
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "capture_physical_checkout_identity",
+                    return_value=changed,
+                ),
+            ):
+                result = sync_apply.apply(
+                    repo=repo,
+                    target_branch="main",
+                    expected_local_head=base,
+                    expected_remote_head=target,
+                    expected_physical_identity_sha256=expected[
+                        "physical_identity_sha256"
+                    ],
+                    remote="origin",
+                    remote_target=str(remote),
+                    confirmation=sync_apply.CONFIRMATION,
+                    runner=git,
+                    remote_head_reader=self.remote_reader(remote),
+                    pinned_target_factory=self.pinned(remote),
+                )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual("physical_checkout_identity_mismatch", result["state"])
+            self.assertFalse(result["effect_started"])
+            self.assertEqual(0, leases.acquire_calls)
+
+    def test_early_block_after_physical_identity_preserves_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            result = sync_apply.apply(
+                repo=repo,
+                target_branch="main",
+                expected_local_head=base,
+                expected_remote_head=target,
+                expected_physical_identity_sha256=expected[
+                    "physical_identity_sha256"
+                ],
+                remote="origin",
+                remote_target=str(remote),
+                confirmation="wrong-confirmation",
+                runner=git,
+                remote_head_reader=self.remote_reader(remote),
+                pinned_target_factory=self.pinned(remote),
+            )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual("confirmation_mismatch", result["state"])
+            self.assertTrue(result["physical_identity_verified"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+
+    def test_physical_identity_drift_after_lease_blocks_before_git_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            changed = {**expected, "physical_identity_sha256": "0" * 64}
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "capture_physical_checkout_identity",
+                    side_effect=[expected, changed],
+                ),
+            ):
+                result = sync_apply.apply(
+                    repo=repo,
+                    target_branch="main",
+                    expected_local_head=base,
+                    expected_remote_head=target,
+                    expected_physical_identity_sha256=expected[
+                        "physical_identity_sha256"
+                    ],
+                    remote="origin",
+                    remote_target=str(remote),
+                    confirmation=sync_apply.CONFIRMATION,
+                    runner=git,
+                    remote_head_reader=self.remote_reader(remote),
+                    pinned_target_factory=self.pinned(remote),
+                )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual(
+                "physical_checkout_identity_drift_after_lease",
+                result["state"],
+            )
+            self.assertFalse(result["effect_started"])
+            self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(1, leases.release_calls)
+
+    def test_bind_physical_checkout_failure_after_lease_blocks_before_git_effect(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "bind_physical_checkout",
+                    side_effect=physical_checkout.PhysicalCheckoutIdentityError(
+                        "synthetic bind failure"
+                    ),
+                ),
+            ):
+                result = sync_apply.apply(
+                    repo=repo,
+                    target_branch="main",
+                    expected_local_head=base,
+                    expected_remote_head=target,
+                    expected_physical_identity_sha256=expected[
+                        "physical_identity_sha256"
+                    ],
+                    remote="origin",
+                    remote_target=str(remote),
+                    confirmation=sync_apply.CONFIRMATION,
+                    runner=git,
+                    remote_head_reader=self.remote_reader(remote),
+                    pinned_target_factory=self.pinned(remote),
+                )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual(
+                "physical_checkout_identity_drift_after_lease",
+                result["state"],
+            )
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result.get("worktree_effect_started", False))
+            self.assertFalse(result.get("branch_cas_started", False))
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(1, leases.release_calls)
+
+    def test_physical_identity_drift_at_final_readback_never_reports_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            expected = physical_checkout.capture_physical_checkout_identity(repo)
+            changed = {**expected, "physical_identity_sha256": "0" * 64}
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "capture_physical_checkout_identity",
+                    side_effect=[expected, expected, expected, changed],
+                ),
+            ):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("physical_checkout_identity_drift_final", result["state"])
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertTrue(result["readback_required"])
+            self.assertEqual(
+                "authoritative physical, local and remote readback before any new intent",
+                result["next_action"],
+            )
+            self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual(1, leases.release_calls)
+
+    def test_bound_checkout_close_failure_cannot_preserve_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            real_bind = physical_checkout.bind_physical_checkout
+
+            def bind_with_failing_close(path: Path):
+                inner = real_bind(path)
+
+                class CloseFailingBound:
+                    identity = inner.identity
+                    effect_root = inner.effect_root
+                    effect_git_dir = inner.effect_git_dir
+
+                    def close(self) -> None:
+                        inner.close()
+                        raise physical_checkout.PhysicalCheckoutIdentityError(
+                            "injected bound checkout close failure"
+                        )
+
+                return CloseFailingBound()
+
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "bind_physical_checkout",
+                    side_effect=bind_with_failing_close,
+                ),
+            ):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("bound_checkout_release_failed", result["state"])
+            self.assertTrue(result["bound_checkout_release_failed"])
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(1, leases.release_calls)
+
+    def test_bound_checkout_close_failure_is_recorded_on_prior_block(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            real_bind = physical_checkout.bind_physical_checkout
+
+            def bind_with_failing_close(path: Path):
+                inner = real_bind(path)
+
+                class CloseFailingBound:
+                    identity = inner.identity
+                    effect_root = inner.effect_root
+                    effect_git_dir = inner.effect_git_dir
+
+                    def close(self) -> None:
+                        inner.close()
+                        raise physical_checkout.PhysicalCheckoutIdentityError(
+                            "injected bound checkout close failure"
+                        )
+
+                return CloseFailingBound()
+
+            def drifting_remote(stage: str, _effect_started: bool) -> str:
+                return base if stage == "locked" else target
+
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "bind_physical_checkout",
+                    side_effect=bind_with_failing_close,
+                ),
+            ):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=drifting_remote,
+                )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual("remote_head_drift_after_lease", result["state"])
+            self.assertTrue(result["bound_checkout_release_failed"])
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(1, leases.release_calls)
+
+    def test_git_effects_are_routed_through_fd_bound_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+            calls: list[tuple[Path, list[str]]] = []
+
+            def recording_runner(run_repo: Path, argv: list[str]) -> dict[str, object]:
+                calls.append((run_repo, list(argv)))
+                return git(run_repo, argv)
+
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    runner=recording_runner,
+                )
+
+            self.assertEqual("passed", result["receipt_status"])
+            effect_calls = [
+                (run_repo, argv)
+                for run_repo, argv in calls
+                if any(token in argv for token in {"fetch", "read-tree", "update-ref"})
+            ]
+            self.assertGreaterEqual(len(effect_calls), 3)
+            for run_repo, argv in effect_calls:
+                self.assertTrue(
+                    str(run_repo).startswith("/proc/"),
+                    (run_repo, argv),
+                )
+                self.assertTrue(
+                    any(arg.startswith("--git-dir=/proc/") for arg in argv),
+                    argv,
+                )
+                self.assertTrue(
+                    any(arg.startswith("--work-tree=/proc/") for arg in argv),
+                    argv,
+                )
+
+    def test_renamed_checkout_cannot_reenter_with_disjoint_path_leases(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, remote, base, target = self.fixture(root)
+            retired = root / "retired"
+            leases = ExactConflictLeaseHarness()
+            nested_result: dict[str, object] | None = None
+            swapped = False
+
+            def outer_runner(
+                run_repo: Path,
+                argv: list[str],
+            ) -> dict[str, object]:
+                nonlocal nested_result, swapped
+                if (
+                    not swapped
+                    and str(run_repo).startswith("/proc/")
+                    and "fetch" in argv
+                ):
+                    repo.rename(retired)
+                    renamed_physical = (
+                        physical_checkout.capture_physical_checkout_identity(retired)
+                    )
+                    nested_result = sync_apply.apply(
+                        repo=retired,
+                        target_branch="main",
+                        expected_local_head=base,
+                        expected_remote_head=target,
+                        expected_physical_identity_sha256=renamed_physical[
+                            "physical_identity_sha256"
+                        ],
+                        remote="origin",
+                        remote_target=str(remote),
+                        confirmation=sync_apply.CONFIRMATION,
+                        runner=git,
+                        remote_head_reader=self.remote_reader(remote),
+                        pinned_target_factory=self.pinned(remote),
+                    )
+                    swapped = True
+                return git(run_repo, argv)
+
+            with patched_leases(leases):
+                outer_result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    runner=outer_runner,
+                )
+
+            self.assertTrue(swapped)
+            self.assertIsNotNone(nested_result)
+            assert nested_result is not None
+            self.assertEqual("blocked", nested_result["receipt_status"])
+            self.assertEqual("lease_acquisition_blocked", nested_result["state"])
+            self.assertEqual(
+                "physical-checkout-root:"
+                + str(os.stat(retired).st_dev)
+                + ":"
+                + str(os.stat(retired).st_ino),
+                next(
+                    key.removeprefix("component:")
+                    for key in outer_result["resource_keys"]
+                    if key.startswith("component:physical-checkout-root:")
+                ),
+            )
+            self.assertEqual(target, git_stdout(retired, "rev-parse", "HEAD"))
+
+    def test_physical_resource_keys_collide_on_moved_git_directory_inode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_a, _remote, _base, _target = self.fixture(root)
+            repo_b = root / "repo-b"
+            repo_b.mkdir()
+            before = physical_checkout.capture_physical_checkout_identity(repo_a)
+
+            (repo_a / ".git").rename(repo_b / ".git")
+            after = physical_checkout.capture_physical_checkout_identity(repo_b)
+
+            before_keys = set(sync_apply._physical_checkout_resource_keys(before))
+            after_keys = set(sync_apply._physical_checkout_resource_keys(after))
+            self.assertNotEqual(before["root"]["inode"], after["root"]["inode"])
+            self.assertEqual(before["git_dir"]["inode"], after["git_dir"]["inode"])
+            self.assertEqual(before["common_dir"]["inode"], after["common_dir"]["inode"])
+            self.assertEqual(
+                1,
+                len(
+                    {
+                        key
+                        for key in before_keys & after_keys
+                        if key.startswith("component:physical-git-common-dir:")
+                    }
+                ),
+            )
+
+    def test_same_path_replacement_during_effect_cannot_receive_git_effects(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, remote, base, target = self.fixture(root)
+            retired = root / "retired"
+            leases = LeaseHarness()
+            swapped = False
+
+            def swapping_runner(
+                run_repo: Path,
+                argv: list[str],
+            ) -> dict[str, object]:
+                nonlocal swapped
+                if (
+                    not swapped
+                    and str(run_repo).startswith("/proc/")
+                    and "fetch" in argv
+                ):
+                    repo.rename(retired)
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "-q",
+                            "-b",
+                            "main",
+                            str(remote),
+                            str(repo),
+                        ],
+                        check=True,
+                    )
+                    subprocess.run(
+                        ["git", "-C", str(repo), "reset", "-q", "--hard", base],
+                        check=True,
+                    )
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/remotes/origin/main",
+                            base,
+                        ],
+                        check=True,
+                    )
+                    swapped = True
+                return git(run_repo, argv)
+
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    runner=swapping_runner,
+                )
+
+            self.assertTrue(swapped)
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual(
+                "physical_checkout_identity_drift_final",
+                result["state"],
+            )
+            self.assertTrue(result["readback_required"])
+            self.assertEqual(target, result["readback"]["head"])
+            self.assertEqual(target, git_stdout(retired, "rev-parse", "HEAD"))
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
+
+    def test_already_synced_rebinds_original_checkout_before_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, remote, base, target = self.fixture(root)
+            retired = root / "retired"
+            replacement = root / "replacement"
+            swapped = False
+            restored = False
+
+            def swapping_runner(
+                run_repo: Path,
+                argv: list[str],
+            ) -> dict[str, object]:
+                nonlocal swapped
+                if not swapped:
+                    repo.rename(retired)
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "-q",
+                            "-b",
+                            "main",
+                            str(remote),
+                            str(repo),
+                        ],
+                        check=True,
+                    )
+                    swapped = True
+                return git(run_repo, argv)
+
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def restoring_remote_reader(stage: str, effect_started: bool) -> str:
+                nonlocal restored
+                if stage == "before" and not restored:
+                    repo.rename(replacement)
+                    retired.rename(repo)
+                    restored = True
+                return ordinary_remote_reader(stage, effect_started)
+
+            result = self.apply(
+                repo,
+                remote,
+                base,
+                target,
+                runner=swapping_runner,
+                remote_reader=restoring_remote_reader,
+            )
+
+            self.assertTrue(swapped)
+            self.assertTrue(restored)
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual(
+                "replay_readback_drift_before_success",
+                result["state"],
+            )
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
+            self.assertEqual(target, git_stdout(replacement, "rev-parse", "HEAD"))
+
+    def test_already_synced_rechecks_remote_immediately_before_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            first_leases = LeaseHarness()
+            with patched_leases(first_leases):
+                first = self.apply(repo, remote, base, target)
+            self.assertEqual("synced", first["state"])
+
+            stages: list[str] = []
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def drifting_remote_reader(stage: str, effect_started: bool) -> str:
+                stages.append(stage)
+                if stage == "replay-final":
+                    return base
+                return ordinary_remote_reader(stage, effect_started)
+
+            replay_leases = LeaseHarness()
+            with patched_leases(replay_leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    target,
+                    target,
+                    remote_reader=drifting_remote_reader,
+                )
+
+            self.assertEqual(["before", "replay-final"], stages)
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual("remote_head_mismatch", result["state"])
+            self.assertEqual(base, result["actual_remote_head"])
+            self.assertFalse(result["remote_head_verified"])
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(0, replay_leases.acquire_calls)
+
+    def test_already_synced_final_remote_read_failure_blocks_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            first_leases = LeaseHarness()
+            with patched_leases(first_leases):
+                first = self.apply(repo, remote, base, target)
+            self.assertEqual("synced", first["state"])
+
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def failing_remote_reader(stage: str, effect_started: bool) -> str:
+                if stage == "replay-final":
+                    raise RuntimeError("injected final replay remote read failure")
+                return ordinary_remote_reader(stage, effect_started)
+
+            replay_leases = LeaseHarness()
+            with patched_leases(replay_leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    target,
+                    target,
+                    remote_reader=failing_remote_reader,
+                )
+
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual("remote_read_failed", result["state"])
+            self.assertFalse(result["remote_head_verified"])
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual("RuntimeError", result["error_class"])
+            self.assertEqual(0, replay_leases.acquire_calls)
+
+    def test_in_place_local_drift_during_replay_final_remote_read_blocks_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            first_leases = LeaseHarness()
+            with patched_leases(first_leases):
+                first = self.apply(repo, remote, base, target)
+            self.assertEqual("synced", first["state"])
+
+            changed = False
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def drifting_remote_reader(stage: str, effect_started: bool) -> str:
+                nonlocal changed
+                if stage == "replay-final" and not changed:
+                    (repo / "state.txt").write_text(
+                        "in-place replay drift\n",
+                        encoding="utf-8",
+                    )
+                    changed = True
+                return ordinary_remote_reader(stage, effect_started)
+
+            replay_leases = LeaseHarness()
+            with patched_leases(replay_leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    target,
+                    target,
+                    remote_reader=drifting_remote_reader,
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual(
+                "replay_readback_drift_before_success",
+                result["state"],
+            )
+            self.assertTrue(result["remote_head_verified"])
+            self.assertTrue(result["physical_identity_verified"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(0, replay_leases.acquire_calls)
+            self.assertIn("state.txt", git_stdout(repo, "status", "--porcelain"))
+
+    def test_replay_rechecks_local_after_terminal_physical_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            first_leases = LeaseHarness()
+            with patched_leases(first_leases):
+                first = self.apply(repo, remote, base, target)
+            self.assertEqual("synced", first["state"])
+
+            replay_final_seen = False
+            changed = False
+            ordinary_remote_reader = self.remote_reader(remote)
+            real_capture = physical_checkout.capture_physical_checkout_identity
+
+            def observing_remote_reader(stage: str, effect_started: bool) -> str:
+                nonlocal replay_final_seen
+                if stage == "replay-final":
+                    replay_final_seen = True
+                return ordinary_remote_reader(stage, effect_started)
+
+            def capture_with_in_place_drift(path: Path):
+                nonlocal changed
+                identity = real_capture(path)
+                if replay_final_seen and not changed:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/heads/main",
+                            base,
+                            target,
+                        ],
+                        check=True,
+                    )
+                    changed = True
+                return identity
+
+            replay_leases = LeaseHarness()
+            with (
+                patched_leases(replay_leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "capture_physical_checkout_identity",
+                    side_effect=capture_with_in_place_drift,
+                ),
+            ):
+                result = self.apply(
+                    repo,
+                    remote,
+                    target,
+                    target,
+                    remote_reader=observing_remote_reader,
+                )
+
+            self.assertTrue(replay_final_seen)
+            self.assertTrue(changed)
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual(
+                "replay_readback_drift_before_success",
+                result["state"],
+            )
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+            self.assertEqual(0, replay_leases.acquire_calls)
+
+    def test_path_replacement_during_replay_final_remote_read_cannot_report_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, remote, base, target = self.fixture(root)
+            first_leases = LeaseHarness()
+            with patched_leases(first_leases):
+                first = self.apply(repo, remote, base, target)
+            self.assertEqual("synced", first["state"])
+
+            retired = root / "retired-replay"
+            swapped = False
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def swapping_remote_reader(stage: str, effect_started: bool) -> str:
+                nonlocal swapped
+                if stage == "replay-final" and not swapped:
+                    repo.rename(retired)
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "-q",
+                            "-b",
+                            "main",
+                            str(remote),
+                            str(repo),
+                        ],
+                        check=True,
+                    )
+                    swapped = True
+                return ordinary_remote_reader(stage, effect_started)
+
+            replay_leases = LeaseHarness()
+            with patched_leases(replay_leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    target,
+                    target,
+                    remote_reader=swapping_remote_reader,
+                )
+
+            self.assertTrue(swapped)
+            self.assertEqual("blocked", result["receipt_status"])
+            self.assertEqual(
+                "physical_checkout_identity_drift_before_replay_success",
+                result["state"],
+            )
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertFalse(result["effect_started"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(0, replay_leases.acquire_calls)
+            self.assertEqual(target, git_stdout(retired, "rev-parse", "HEAD"))
+            self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
+
+    def test_in_place_branch_drift_during_final_remote_read_cannot_report_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            changed = False
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def drifting_remote_reader(stage: str, effect_started: bool) -> str:
+                nonlocal changed
+                if stage == "final" and not changed:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/heads/main",
+                            base,
+                            target,
+                        ],
+                        check=True,
+                    )
+                    changed = True
+                return ordinary_remote_reader(stage, effect_started)
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=drifting_remote_reader,
+                )
+
+            self.assertTrue(changed)
+            self.assertNotEqual("passed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+            self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(1, leases.release_calls)
+
+    def test_synced_rechecks_local_after_terminal_physical_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            final_remote_seen = False
+            changed = False
+            ordinary_remote_reader = self.remote_reader(remote)
+            real_capture = physical_checkout.capture_physical_checkout_identity
+
+            def observing_remote_reader(stage: str, effect_started: bool) -> str:
+                nonlocal final_remote_seen
+                if stage == "final":
+                    final_remote_seen = True
+                return ordinary_remote_reader(stage, effect_started)
+
+            def capture_with_in_place_drift(path: Path):
+                nonlocal changed
+                identity = real_capture(path)
+                if final_remote_seen and not changed:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/heads/main",
+                            base,
+                            target,
+                        ],
+                        check=True,
+                    )
+                    changed = True
+                return identity
+
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "capture_physical_checkout_identity",
+                    side_effect=capture_with_in_place_drift,
+                ),
+            ):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=observing_remote_reader,
+                )
+
+            self.assertTrue(final_remote_seen)
+            self.assertTrue(changed)
+            self.assertNotEqual("passed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+            self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(1, leases.release_calls)
+
+    def test_path_replacement_during_final_remote_read_cannot_report_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo, remote, base, target = self.fixture(root)
+            retired = root / "retired"
+            swapped = False
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def swapping_remote_reader(stage: str, effect_started: bool) -> str:
+                nonlocal swapped
+                if stage == "final" and not swapped:
+                    repo.rename(retired)
+                    subprocess.run(
+                        [
+                            "git",
+                            "clone",
+                            "-q",
+                            "-b",
+                            "main",
+                            str(remote),
+                            str(repo),
+                        ],
+                        check=True,
+                    )
+                    subprocess.run(
+                        ["git", "-C", str(repo), "reset", "-q", "--hard", base],
+                        check=True,
+                    )
+                    swapped = True
+                return ordinary_remote_reader(stage, effect_started)
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=swapping_remote_reader,
+                )
+
+            self.assertTrue(swapped)
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual(
+                "physical_checkout_identity_drift_final",
+                result["state"],
+            )
+            self.assertFalse(result["physical_identity_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(target, git_stdout(retired, "rev-parse", "HEAD"))
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
 
     def test_successful_clean_fast_forward(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -415,7 +1418,9 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("passed", result["receipt_status"])
             self.assertEqual("synced", result["state"])
             self.assertTrue(result["serialization_verified"])
-            self.assertTrue(result["remote_head_verified"])
+            self.assertFalse(result["remote_head_verified"])
+            self.assertTrue(result["remote_head_bound_observed"])
+            self.assertEqual("final", result["remote_head_observation_stage"])
             self.assertTrue(result["fast_forward_verified"])
             self.assertTrue(result["preimage_verified"])
             self.assertEqual(target, git_stdout(repo, "rev-parse", "HEAD"))
@@ -574,7 +1579,12 @@ class PostMergeSyncApplyTests(unittest.TestCase):
 
             self.assertEqual("passed", second["receipt_status"])
             self.assertEqual("already_synced", second["state"])
-            self.assertTrue(second["remote_head_verified"])
+            self.assertFalse(second["remote_head_verified"])
+            self.assertTrue(second["remote_head_bound_observed"])
+            self.assertEqual(
+                "replay-final",
+                second["remote_head_observation_stage"],
+            )
             self.assertTrue(second["idempotent"])
             self.assertEqual(0, second_leases.acquire_calls)
 
@@ -584,7 +1594,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             leases = LeaseHarness()
 
             def failing_runner(path: Path, argv: list[str]) -> dict[str, object]:
-                if argv == ["update-ref", "refs/heads/main", target, base]:
+                if argv[-4:] == ["update-ref", "refs/heads/main", target, base]:
                     return {
                         "returncode": 1,
                         "stdout": "",
@@ -628,7 +1638,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             leases = LeaseHarness()
 
             def failing_runner(path: Path, argv: list[str]) -> dict[str, object]:
-                if argv == ["update-ref", "refs/heads/main", target, base]:
+                if argv[-4:] == ["update-ref", "refs/heads/main", target, base]:
                     return {
                         "returncode": 1,
                         "stdout": "",
@@ -700,6 +1710,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 *,
                 purpose: str,
                 ttl_seconds: int,
+                metadata: dict[str, object] | None = None,
                 _work_admission_mode: str = "normal",
             ) -> dict[str, object]:
                 acquired = leases.acquire(
@@ -707,6 +1718,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                     resource_keys,
                     purpose=purpose,
                     ttl_seconds=ttl_seconds,
+                    metadata=metadata,
                     _work_admission_mode=_work_admission_mode,
                 )
                 snapshots = list(acquired["leases"])
@@ -755,7 +1767,21 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 result["lease_cleanup_next_action"],
             )
             self.assertEqual(1, leases.release_calls)
-            self.assertEqual(3, len(leases.live))
+            self.assertEqual(5, len(leases.live))
+            self.assertEqual(
+                1,
+                sum(
+                    key.startswith("component:physical-checkout-root:")
+                    for key in leases.live
+                ),
+            )
+            self.assertEqual(
+                1,
+                sum(
+                    key.startswith("component:physical-git-common-dir:")
+                    for key in leases.live
+                ),
+            )
             self.assertEqual(base, git_stdout(repo, "rev-parse", "HEAD"))
             self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
 
@@ -953,7 +1979,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 path: Path,
                 argv: list[str],
             ) -> dict[str, object]:
-                if argv == [
+                if argv[-4:] == [
                     "show-ref",
                     "--verify",
                     "--hash",
@@ -993,6 +2019,253 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
             self.assertEqual(target, result["readback"]["tracking_head"])
             self.assertEqual(1, leases.release_calls)
+
+    def test_error_readback_success_records_bound_remote_observation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            stages: list[str] = []
+            ordinary_remote_reader = self.remote_reader(remote)
+
+            def recovering_remote(stage: str, effect_started: bool) -> str:
+                stages.append(stage)
+                if stage == "final":
+                    raise RuntimeError("injected final remote read failure")
+                return ordinary_remote_reader(stage, effect_started)
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=recovering_remote,
+                )
+
+            self.assertEqual("passed", result["receipt_status"])
+            self.assertEqual("effect_confirmed_after_error", result["state"])
+            self.assertFalse(result["remote_head_verified"])
+            self.assertTrue(result["remote_head_bound_observed"])
+            self.assertEqual(
+                "error_readback",
+                result["remote_head_observation_stage"],
+            )
+            self.assertTrue(result["post_state_verified"])
+            self.assertIn("error_readback", stages)
+            self.assertFalse(result["retry_authorized"])
+
+    def test_error_readback_rechecks_local_state_after_remote_read(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            changed = False
+
+            def recovering_remote(stage: str, _effect_started: bool) -> str:
+                nonlocal changed
+                if stage == "final":
+                    raise RuntimeError("injected final remote read failure")
+                if stage == "error_readback" and not changed:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/heads/main",
+                            base,
+                            target,
+                        ],
+                        check=True,
+                    )
+                    changed = True
+                    return target
+                return target
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=recovering_remote,
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(target, result["remote_readback"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+            self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(1, leases.release_calls)
+
+    def test_error_readback_rechecks_local_after_physical_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            error_readback_seen = False
+            changed = False
+            real_capture = physical_checkout.capture_physical_checkout_identity
+
+            def recovering_remote(stage: str, _effect_started: bool) -> str:
+                nonlocal error_readback_seen
+                if stage == "final":
+                    raise RuntimeError("injected final remote read failure")
+                if stage == "error_readback":
+                    error_readback_seen = True
+                return target
+
+            def capture_with_in_place_drift(path: Path):
+                nonlocal changed
+                identity = real_capture(path)
+                if error_readback_seen and not changed:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/heads/main",
+                            base,
+                            target,
+                        ],
+                        check=True,
+                    )
+                    changed = True
+                return identity
+
+            leases = LeaseHarness()
+            with (
+                patched_leases(leases),
+                patch.object(
+                    sync_apply.physical_checkout,
+                    "capture_physical_checkout_identity",
+                    side_effect=capture_with_in_place_drift,
+                ),
+            ):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=recovering_remote,
+                )
+
+            self.assertTrue(error_readback_seen)
+            self.assertTrue(changed)
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertFalse(result["local_post_state_verified"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(target, result["remote_readback"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+            self.assertEqual(1, leases.acquire_calls)
+            self.assertEqual(1, leases.release_calls)
+
+    def test_error_readback_remote_drift_rechecks_local_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            changed = False
+
+            def drifting_remote(stage: str, _effect_started: bool) -> str:
+                nonlocal changed
+                if stage == "final":
+                    return base
+                if stage == "error_readback" and not changed:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/heads/main",
+                            base,
+                            target,
+                        ],
+                        check=True,
+                    )
+                    changed = True
+                    return base
+                return target
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=drifting_remote,
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertFalse(result["local_post_state_verified"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual(base, result["remote_readback"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
+
+    def test_error_readback_unreadable_rechecks_local_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            changed = False
+
+            def unreadable_remote(stage: str, _effect_started: bool) -> str:
+                nonlocal changed
+                if stage == "final":
+                    raise RuntimeError("injected final remote read failure")
+                if stage == "error_readback" and not changed:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-C",
+                            str(repo),
+                            "update-ref",
+                            "refs/heads/main",
+                            base,
+                            target,
+                        ],
+                        check=True,
+                    )
+                    changed = True
+                    raise RuntimeError("injected recovery remote read failure")
+                return target
+
+            leases = LeaseHarness()
+            with patched_leases(leases):
+                result = self.apply(
+                    repo,
+                    remote,
+                    base,
+                    target,
+                    remote_reader=unreadable_remote,
+                )
+
+            self.assertTrue(changed)
+            self.assertEqual("failed", result["receipt_status"])
+            self.assertEqual("outcome_unknown", result["state"])
+            self.assertFalse(result["local_post_state_verified"])
+            self.assertFalse(result["post_state_verified"])
+            self.assertTrue(result["readback_required"])
+            self.assertFalse(result["retry_authorized"])
+            self.assertEqual("RuntimeError", result["remote_readback_error_type"])
+            self.assertEqual(base, git_stdout(repo, "rev-parse", "refs/heads/main"))
 
     def test_final_remote_drift_blocks_even_when_local_effect_is_exact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1113,6 +2386,35 @@ class PostMergeSyncApplyTests(unittest.TestCase):
             self.assertEqual("", git_stdout(repo, "status", "--porcelain"))
 
 
+    def test_sync_lease_binds_exact_canonical_checkout_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, remote, base, target = self.fixture(Path(tmp))
+            leases = LeaseHarness()
+
+            with patched_leases(leases):
+                result = self.apply(repo, remote, base, target)
+
+            self.assertEqual("synced", result["state"])
+            self.assertEqual(["convergence"], leases.work_admission_modes)
+            self.assertEqual(1, len(leases.metadatas))
+            metadata = leases.metadatas[0]
+            self.assertIsInstance(metadata, dict)
+            scope = metadata["scope_manifest"]
+            self.assertEqual(str(repo), scope["repository"])
+            self.assertEqual(str(repo), scope["worktree"])
+            self.assertEqual("main", scope["branch"])
+            self.assertEqual(base, scope["base_head"])
+            self.assertEqual(target, scope["head"])
+            self.assertEqual(["worktree-admin"], scope["effects"])
+            self.assertEqual([str(repo)], scope["paths"])
+            self.assertEqual(
+                ["repository-worktree-admin"],
+                scope["shared_gates"],
+            )
+            self.assertIn(f"repo:{repo}", result["resource_keys"])
+            self.assertIn(f"path:{repo}", result["resource_keys"])
+            self.assertIn(f"path:{repo / '.git'}", result["resource_keys"])
+
     def test_foreign_repository_guard_conflict_blocks_before_git_effect(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo, remote, base, target = self.fixture(Path(tmp))
@@ -1124,6 +2426,7 @@ class PostMergeSyncApplyTests(unittest.TestCase):
                 *,
                 purpose: str,
                 ttl_seconds: int,
+                metadata: dict[str, object] | None = None,
                 _work_admission_mode: str = "normal",
             ) -> dict[str, object]:
                 self.assertEqual("convergence", _work_admission_mode)

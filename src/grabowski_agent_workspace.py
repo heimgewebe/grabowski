@@ -2770,7 +2770,8 @@ def _remove_created_worktree(
         worktree_head = _git_head(runner, worktree)
         if worktree_head != expected_base_head:
             return False
-        removed = runner(repo, ["git", "worktree", "remove", str(worktree)])
+        with checkouts._operation_lock():
+            removed = runner(repo, ["git", "worktree", "remove", str(worktree)])
         if int(removed.get("returncode", 1)) != 0 or worktree.exists():
             return False
     branch_head = _local_branch_head(repo, branch, runner)
@@ -7654,20 +7655,21 @@ def grabowski_agent_workspace_create(
             )
             _write_manifest(manifest)
             worktree_create_attempted = True
-            _checked(
-                _run,
-                repo,
-                [
-                    "git",
-                    "worktree",
-                    "add",
-                    "-b",
-                    str(plan["writer_branch"]),
-                    str(worktree),
-                    str(plan["expected_base_head"]),
-                ],
-                label="writer worktree creation",
-            )
+            with checkouts._operation_lock():
+                _checked(
+                    _run,
+                    repo,
+                    [
+                        "git",
+                        "worktree",
+                        "add",
+                        "-b",
+                        str(plan["writer_branch"]),
+                        str(worktree),
+                        str(plan["expected_base_head"]),
+                    ],
+                    label="writer worktree creation",
+                )
             worktree_created = True
         initial_preflights: dict[str, Any] = {}
         for preflight_role in ("writer", "tests", "review"):

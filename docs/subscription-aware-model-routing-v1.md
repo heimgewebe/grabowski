@@ -19,12 +19,12 @@ Codex has a dedicated `codex-sol-review-high` route in addition to its contrast 
 
 ## Verified subscription baselines
 
-Baseline observations are from 2026-07-29; xAI model discovery was refreshed on 2026-08-22:
+The subscription baseline observations date from 2026-07-29; xAI model discovery was refreshed on 2026-08-22. The catalog snapshot dated 2026-09-29 incorporates the recorded Claude Opus 5.5 exact-model and alias-resolution evidence from that day. This scoped Claude refresh does not re-date the other providers’ entitlement or quota observations:
 
 | Provider | Canonical local plan label | Live evidence | Included routing surface | Excluded cost surfaces |
 | --- | --- | --- | --- | --- |
 | OpenAI | ChatGPT Pro | owner assertion; `codex login status` reports ChatGPT login; `gpt-5.6-sol` xhigh smoke passed | Codex CLI review and contrast | OpenAI API, purchased Codex credits |
-| Anthropic | Claude Pro | `claude auth status` reports `subscriptionType: pro`; Sonnet 5 and Opus 5 smokes passed | Claude Code review and contrast | Anthropic API, usage credits |
+| Anthropic | Claude Pro | `claude auth status` reports `subscriptionType: pro`; Sonnet 5 and Opus 5 smokes passed; recorded Opus 5.5 exact-model and alias evidence refreshed on 2026-09-29 | Claude Code review and contrast | Anthropic API, usage credits |
 | Google | Google AI subscription | owner assertion; Antigravity `gemini-3.1-pro-high` smoke passed | Antigravity and Jules baseline | Vertex AI API, Google AI Studio API, purchased AI credits |
 | xAI | SuperGrok | Grok authentication reports `subscription_tier: SuperGrok`; authenticated `grok models` readback exposes `grok-4.6` | Grok Build review and contrast | xAI API, extra usage credits, pay-as-you-go overage |
 
@@ -36,7 +36,7 @@ The user-facing phrase “Claude Plus” is normalized to the server-reported pr
 
 The live harness probes supersede stale catalog generations:
 
-- Claude alias `opus` resolves to Claude Opus 5.
+- Claude alias `opus` resolves to Claude Opus 5.5.
 - Claude alias `sonnet` resolves to Claude Sonnet 5.
 - Fable 5 returns `usage-credits-required`; it is not part of the Claude Pro baseline.
 - Antigravity exposes Gemini 3.1 Pro and Gemini 3.6 Flash.
@@ -60,7 +60,7 @@ Provider diversity is used only when it improves independence or technical cover
 
 ### Review routes
 
-- `claude-opus-5-high`: judgment-heavy, security, architecture, and critical review through the Claude Pro baseline.
+- `claude-opus-5.5-high`: judgment-heavy, security, architecture, and critical review through the Claude Pro baseline.
 - `antigravity-gemini-pro-review-high`: independent Google-family review through the Google AI baseline.
 - `grok-4.6-review-high`: independent xAI review through SuperGrok; one turn, no web search, no subagents, no memory, no tools, and schema-constrained structured output.
 - `codex-sol-review-high`: GPT-5.6 Sol review through the ChatGPT Pro Codex baseline; it is a real reviewer route, but same-OpenAI-provider work is excluded by the existing independence gate.

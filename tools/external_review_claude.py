@@ -24,7 +24,7 @@ from grabowski_pr_diff import github_pr_diff_identity_sha256  # noqa: E402
 VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
 SEVERITIES = {"critical", "high", "medium", "low"}
 DEFAULT_TIMEOUT_MINUTES = 30
-DEFAULT_MODEL = "opus"
+DEFAULT_MODEL = "claude-opus-5-5"
 DEFAULT_EFFORT = "high"
 DEFAULT_MAX_BUDGET_USD = 0.0
 EXTERNAL_PROVIDER_BUDGET_CAP_ENV = "GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD"

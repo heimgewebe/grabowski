@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import importlib.util
 import json
 import os
@@ -48,6 +48,9 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
         self.canonical = self.root / "canonical"
         self.recovery_root = self.root / "recovery-worktrees"
         self.recovery_root.mkdir(mode=0o700)
+        self.checkout_state_root = self.root / "state"
+        self.checkout_state_root.mkdir(mode=0o700)
+        self.checkout_operation_lock = self.checkout_state_root / "checkouts.lock"
         self._git("init", "--initial-branch=main", str(self.canonical), cwd=self.root)
         self._git("config", "user.email", "test@example.invalid", cwd=self.canonical)
         self._git("config", "user.name", "Bootstrap Test", cwd=self.canonical)
@@ -92,6 +95,7 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
             CANONICAL_REPOSITORY=self.canonical,
             CANONICAL_ORIGIN_URL=self.origin_url,
             RECOVERY_WORKTREE_ROOT=self.recovery_root,
+            CHECKOUT_OPERATION_LOCK=self.checkout_operation_lock,
             DEPLOY_UID=os.getuid(),
             DEPLOY_GID=os.getgid(),
         )
@@ -580,6 +584,11 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
             )
         self.assertTrue(path.is_dir())
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o700)
+        self.assertTrue(self.checkout_operation_lock.is_file())
+        self.assertEqual(
+            os.stat(self.checkout_operation_lock).st_mode & 0o777,
+            0o600,
+        )
         self.assertEqual(self._git_output("rev-parse", "HEAD", cwd=path), self.head)
         branch = subprocess.run(
             ["/usr/bin/git", "symbolic-ref", "-q", "HEAD"],
@@ -589,6 +598,54 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(branch.returncode, 1)
+
+    def test_recovery_worktree_mutations_hold_shared_checkout_operation_lock(self) -> None:
+        state = {"held": False}
+        observed = {"add": False, "remove": False}
+        original_git = helper._git
+
+        @contextmanager
+        def checkout_lock():
+            self.assertFalse(state["held"])
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+        def observed_git(repository: Path, *arguments: str, **kwargs):
+            if arguments[:2] == ("worktree", "add"):
+                observed["add"] = True
+                self.assertTrue(state["held"])
+            if arguments[:2] == ("worktree", "remove"):
+                observed["remove"] = True
+                self.assertTrue(state["held"])
+            return original_git(repository, *arguments, **kwargs)
+
+        with (
+            self._patch_repository_constants(),
+            mock.patch.object(
+                helper,
+                "_checkout_operation_lock",
+                checkout_lock,
+            ),
+            mock.patch.object(
+                helper,
+                "_git",
+                side_effect=observed_git,
+            ),
+        ):
+            path, _common = helper._create_recovery_worktree(
+                self.head,
+                "e" * 24,
+            )
+            removed = helper._remove_recovery_worktree(path)
+
+        self.assertEqual(removed.returncode, 0)
+        self.assertTrue(observed["add"])
+        self.assertTrue(observed["remove"])
+        self.assertFalse(state["held"])
+        self.assertFalse(path.exists())
 
     def test_deploy_exact_invokes_existing_dual_engine_with_expected_head(self) -> None:
         worktree = self.root / "worktree"

@@ -104,11 +104,13 @@ DEFAULT_EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
 # Bootstrap policies are sticky code-owned defaults until a base-side catalog exists.
 BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
     "heimgewebe/audio": ("safety",),
+    "heimgewebe/asr": ("validate (3.10)", "validate (3.12)"),
     "heimgewebe/chronik": ("repo-root", "templates"),
     "heimgewebe/hauski": ("Detect changes",),
     "heimgewebe/hauski-audio": ("scan",),
     "hall-of-memory/hall-of-memory": ("verify",),
     "alexdermohr/livia": ("quality",),
+    "alexdermohr/mark-api": ("verify",),
     "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
     "heimgewebe/mitschreiber": ("ci / reusable-ci",),
     "heimgewebe/systemkatalog": ("Repository Contract", "Secret Scan"),
@@ -1593,7 +1595,7 @@ def _claude_packet_review_command_matches(command: Any) -> bool:
         "--no-session-persistence",
         "--safe-mode",
         "--model",
-        "opus",
+        "claude-opus-5-5",
         "--effort",
         "high",
         "--max-budget-usd",
@@ -1909,8 +1911,8 @@ def _claude_cli_external_review_failures(review: dict[str, Any], prompt_sha256: 
         failures.append("tool_version is missing")
     if not _claude_packet_review_command_matches(review.get("command")):
         failures.append("command is not the allowed Claude packet-review command")
-    if review.get("model") != "opus":
-        failures.append("model is not opus")
+    if review.get("model") != "claude-opus-5-5":
+        failures.append("model is not claude-opus-5-5")
     if review.get("effort") != "high":
         failures.append("effort is not high")
     stdin_sha256 = review.get("stdin_sha256")

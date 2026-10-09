@@ -23,6 +23,8 @@ MAX_COMMENT_PAGES = 10
 MAX_COMMENT_ITEMS = MAX_ITEMS * MAX_COMMENT_PAGES
 MAX_REVIEW_PAGES = 10
 MAX_REVIEW_ITEMS = MAX_ITEMS * MAX_REVIEW_PAGES
+MAX_THREAD_PAGES = 10
+MAX_THREAD_ITEMS = MAX_ITEMS * MAX_THREAD_PAGES
 TRUSTED_CODEX_ACTORS = frozenset(
     {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 )
@@ -234,7 +236,7 @@ query($owner: String!, $name: String!, $number: Int!) {
             pageInfo { hasNextPage }
           }
         }
-        pageInfo { hasNextPage }
+        pageInfo { hasNextPage endCursor }
       }
     }
   }
@@ -283,6 +285,33 @@ query($owner: String!, $name: String!, $number: Int!, $before: String!) {
           commit { oid }
         }
         pageInfo { hasPreviousPage startCursor }
+      }
+    }
+  }
+}
+""".strip()
+
+
+REVIEW_THREADS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $after: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        nodes {
+          id
+          isResolved
+          comments(first: 100) {
+            nodes {
+              databaseId
+              createdAt
+              author { login }
+              commit { oid }
+              pullRequestReview { databaseId }
+            }
+            pageInfo { hasNextPage }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
       }
     }
   }
@@ -502,6 +531,94 @@ def _collect_reviews(
     }
 
 
+
+def _collect_review_threads(
+    repo: Path, owner: str, name: str, pr_number: int, initial: Any
+) -> dict[str, Any]:
+    if not isinstance(initial, dict):
+        raise SettlementError("reviewThreads connection is missing")
+    nodes = _list_nodes(initial, label="reviewThreads")
+    page = initial.get("pageInfo")
+    if not isinstance(page, dict):
+        raise SettlementError("reviewThreads pageInfo is missing")
+    pages = 1
+    cursors: set[str] = set()
+    seen_ids: set[str] = set()
+
+    def remember(items: list[dict[str, Any]]) -> None:
+        for item in items:
+            thread_id = item.get("id")
+            if not isinstance(thread_id, str) or not thread_id:
+                raise SettlementError("review thread id is missing or invalid")
+            if thread_id in seen_ids:
+                raise SettlementError(
+                    "reviewThreads pagination returned duplicate identities"
+                )
+            seen_ids.add(thread_id)
+
+    remember(nodes)
+    if len(nodes) > MAX_THREAD_ITEMS:
+        raise SettlementError(
+            f"reviewThreads exceed the bounded {MAX_THREAD_ITEMS}-item history"
+        )
+    while page.get("hasNextPage") is True:
+        if pages >= MAX_THREAD_PAGES:
+            raise SettlementError(
+                f"reviewThreads exceed the bounded {MAX_THREAD_ITEMS}-item history"
+            )
+        after = page.get("endCursor")
+        if not isinstance(after, str) or not after or after in cursors:
+            raise SettlementError(
+                "reviewThreads pagination cursor is missing or repeated"
+            )
+        cursors.add(after)
+        payload = _run_json(
+            repo,
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={REVIEW_THREADS_QUERY}",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+                "-F",
+                f"number={pr_number}",
+                "-f",
+                f"after={after}",
+            ],
+        )
+        try:
+            connection = payload["data"]["repository"]["pullRequest"][
+                "reviewThreads"
+            ]
+        except (KeyError, TypeError) as exc:
+            raise SettlementError(
+                "GitHub GraphQL response lacks review thread history"
+            ) from exc
+        if not isinstance(connection, dict):
+            raise SettlementError("pull-request review threads do not exist")
+        newer = _list_nodes(connection, label="reviewThreads")
+        remember(newer)
+        nodes.extend(newer)
+        if len(nodes) > MAX_THREAD_ITEMS:
+            raise SettlementError(
+                f"reviewThreads exceed the bounded {MAX_THREAD_ITEMS}-item history"
+            )
+        page = connection.get("pageInfo")
+        if not isinstance(page, dict):
+            raise SettlementError("reviewThreads pageInfo is missing")
+        pages += 1
+    if page.get("hasNextPage") is not False:
+        raise SettlementError("reviewThreads pagination state is invalid")
+    return {
+        "nodes": nodes,
+        "pageInfo": {"hasNextPage": False, "pages_loaded": pages},
+    }
+
+
 def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
     _, owner, name = _normalize_repo(repository)
     payload = _run_json(
@@ -532,6 +649,9 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
     )
     pull_request["reviews"] = _collect_reviews(
         repo, owner, name, pr_number, pull_request.get("reviews")
+    )
+    pull_request["reviewThreads"] = _collect_review_threads(
+        repo, owner, name, pr_number, pull_request.get("reviewThreads")
     )
     diff_bytes = subprocess.run(
         ["gh", "pr", "diff", str(pr_number), "--repo", repository],

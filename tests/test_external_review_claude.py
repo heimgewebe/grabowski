@@ -125,7 +125,7 @@ class ExternalReviewClaudeTests(unittest.TestCase):
         repo_before: str = "heimgewebe/grabowski",
         repo_after: str = "heimgewebe/grabowski",
         returncode: int = 0,
-        model: str = "opus",
+        model: str = "claude-opus-5-5",
         effort: str = "high",
         max_prompt_bytes: int = 750_000,
         subprocess_side_effect: BaseException | None = None,
@@ -229,7 +229,7 @@ class ExternalReviewClaudeTests(unittest.TestCase):
                 "4" * 32,
             ).encode("utf-8")
             self.assertEqual(review["source"], "claude-cli:packet-review")
-            self.assertEqual(review["model"], "opus")
+            self.assertEqual(review["model"], "claude-opus-5-5")
             self.assertEqual(review["effort"], "high")
             self.assertEqual(review["verdict"], "PASS")
             self.assertEqual(review["finding_count"], 0)
@@ -414,7 +414,7 @@ class ExternalReviewClaudeTests(unittest.TestCase):
 
     def test_wrong_model_is_rejected_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(claude_review.ClaudeReviewError, "requires model opus"):
+            with self.assertRaisesRegex(claude_review.ClaudeReviewError, "requires model claude-opus-5-5"):
                 self._run(Path(directory), _envelope(), model="sonnet")
 
     def test_wrong_effort_is_rejected_before_execution(self) -> None:
@@ -452,7 +452,7 @@ class ExternalReviewClaudeTests(unittest.TestCase):
         with self.assertRaisesRegex(claude_review.ClaudeReviewError, "zero-cost policy blocks"):
             claude_review.build_command(
                 claude_bin="claude",
-                model="opus",
+                model="claude-opus-5-5",
                 effort="high",
                 max_budget_usd=claude_review.DEFAULT_MAX_BUDGET_USD,
             )
@@ -466,7 +466,7 @@ class ExternalReviewClaudeTests(unittest.TestCase):
             with self.assertRaisesRegex(claude_review.ClaudeReviewError, "policy cap of 0 USD"):
                 claude_review.build_command(
                     claude_bin="claude",
-                    model="opus",
+                    model="claude-opus-5-5",
                     effort="high",
                     max_budget_usd=1.0,
                 )
@@ -480,7 +480,7 @@ class ExternalReviewClaudeTests(unittest.TestCase):
             with self.assertRaisesRegex(claude_review.ClaudeReviewError, "must be a finite number"):
                 claude_review.build_command(
                     claude_bin="claude",
-                    model="opus",
+                    model="claude-opus-5-5",
                     effort="high",
                     max_budget_usd=1.0,
                 )
@@ -489,7 +489,7 @@ class ExternalReviewClaudeTests(unittest.TestCase):
         self.assertEqual(claude_review.REVIEW_SCHEMA, review_gate.CLAUDE_PACKET_REVIEW_SCHEMA)
         command = self._authorized_build_command(
             claude_bin="claude",
-            model="opus",
+            model="claude-opus-5-5",
             effort="high",
             max_budget_usd=2.0,
         )
@@ -517,7 +517,7 @@ class ExternalReviewClaudeTests(unittest.TestCase):
     def test_unknown_command_shape_is_rejected(self) -> None:
         command = self._authorized_build_command(
             claude_bin="claude",
-            model="opus",
+            model="claude-opus-5-5",
             effort="high",
             max_budget_usd=2.0,
         )

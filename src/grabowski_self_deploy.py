@@ -1508,6 +1508,8 @@ def _references_runtime_runner(command: list[str], runner: Path) -> bool:
 def _bootstrap_deploy_index(
     jobs_root: Path,
     _repository: Path | None = None,
+    *,
+    read_only: bool = False,
 ) -> dict[str, Any]:
     entries = sorted(
         (entry for entry in jobs_root.iterdir() if _durable_job_unit(entry.name)),
@@ -1552,16 +1554,26 @@ def _bootstrap_deploy_index(
             or metadata.get("final_status") not in TERMINAL_JOB_STATUSES
         ):
             units.append(entry.name)
+    if read_only:
+        if len(units) > MAX_DEPLOY_INDEX_ENTRIES:
+            raise RuntimeError("runtime deploy index exceeds its bounded entry count")
+        return {
+            "schema_version": 1,
+            "units": units,
+            "pending_unit": None,
+            "updated_at_unix": int(time.time()),
+        }
     return _write_deploy_index(jobs_root, units=units, pending_unit=None)
 
 
-def _deploy_index(
+def _deploy_index_with_pending_promotion_evidence(
     jobs_root: Path,
     _repository: Path | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     index = _read_deploy_index(jobs_root)
     if index is None:
         index = _bootstrap_deploy_index(jobs_root)
+    promotion: dict[str, Any] | None = None
     pending = index["pending_unit"]
     if pending is not None:
         pending_entry = jobs_root / pending
@@ -1571,10 +1583,109 @@ def _deploy_index(
             if not pending_entry.is_dir():
                 raise RuntimeError("pending runtime deploy job path is not a directory")
             units = sorted(set(index["units"]) | {pending})
-        else:
-            units = list(index["units"])
-        index = _write_deploy_index(jobs_root, units=units, pending_unit=None)
+            index = _write_deploy_index(jobs_root, units=units, pending_unit=None)
+            material = {
+                "schema_version": 1,
+                "kind": "grabowski_runtime_deploy_pending_unit_promotion",
+                "unit": pending,
+                "deploy_index_updated": True,
+                "index_updated_at_unix": index["updated_at_unix"],
+            }
+            promotion = {
+                **material,
+                "evidence_sha256": _source_identity_sha256(material),
+            }
+    return index, promotion
+
+
+def _deploy_index(
+    jobs_root: Path,
+    _repository: Path | None = None,
+    *,
+    read_only: bool = False,
+) -> dict[str, Any]:
+    if read_only:
+        index = _read_deploy_index(jobs_root)
+        return index if index is not None else _bootstrap_deploy_index(
+            jobs_root, _repository, read_only=True
+        )
+    index, _promotion = _deploy_index_with_pending_promotion_evidence(
+        jobs_root,
+        _repository,
+    )
     return index
+
+
+def _reconcile_stale_pending_reservation(
+    jobs_root: Path,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+]:
+    """Clear one pre-dispatch reservation only when no unit could have started.
+
+    Callers must already hold the deploy schedule lock. Lock-free readers keep
+    treating every pending reservation as blocking. _start_job creates the
+    durable job directory and metadata before it invokes systemd-run, so a
+    missing directory plus an authoritative not_started unit readback is the
+    narrow proof that this reservation never crossed the dispatch boundary.
+
+    The second return value is present only after both the stale-reservation
+    index clear and its audit append succeeded. The third return value reports
+    an earlier pending-unit promotion performed while reading the index, so
+    callers do not lose evidence of that local mutation when later work fails.
+    """
+    index, index_mutation = _deploy_index_with_pending_promotion_evidence(jobs_root)
+    pending = index["pending_unit"]
+    if pending is None:
+        return index, None, index_mutation
+    entry = jobs_root / pending
+    if entry.is_symlink():
+        raise RuntimeError("pending runtime deploy job path is a symlink")
+    if entry.exists():
+        return index, None, index_mutation
+    readback = operator._unit_dispatch_readback(pending)
+    if not isinstance(readback, dict) or readback.get("outcome") != "not_started":
+        return index, None, index_mutation
+    reconciled = _write_deploy_index(
+        jobs_root,
+        units=list(index["units"]),
+        pending_unit=None,
+    )
+    effect_material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+        "unit": pending,
+        "dispatch_outcome": "not_started",
+        "deploy_index_updated": True,
+        "audit_recorded": False,
+        "index_updated_at_unix": reconciled["updated_at_unix"],
+    }
+    try:
+        _append_deploy_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "runtime-deploy-stale-pending-cleared",
+                "unit": pending,
+                "dispatch_readback": readback,
+            }
+        )
+    except Exception as exc:
+        effect = {
+            **effect_material,
+            "evidence_sha256": _source_identity_sha256(effect_material),
+        }
+        raise DeployScheduleFailureAfterLocalMutation(
+            f"stale pending reservation audit failed after deploy-index clear: {exc}",
+            local_mutation_evidence=effect,
+        ) from exc
+    effect_material["audit_recorded"] = True
+    effect = {
+        **effect_material,
+        "evidence_sha256": _source_identity_sha256(effect_material),
+    }
+    return reconciled, effect, index_mutation
 
 
 def _validated_deploy_job_receipt(entry: Path, metadata: dict[str, Any]) -> dict[str, str]:
@@ -1596,6 +1707,96 @@ def _validated_deploy_job_receipt(entry: Path, metadata: dict[str, Any]) -> dict
         "metadata_path": expected["metadata_path"],
         "stdout_path": expected["stdout_path"],
         "stderr_path": expected["stderr_path"],
+    }
+
+
+class DeploySchedulePreEffectRefusal(RuntimeError):
+    """Scheduling was refused before job registration or a Git-ref effect began."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        local_mutation_evidence: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.local_mutation_evidence = (
+            None
+            if local_mutation_evidence is None
+            else dict(local_mutation_evidence)
+        )
+
+
+class DeployScheduleFailureAfterLocalMutation(RuntimeError):
+    """Scheduling failed after one local reconciliation mutation was already observed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        local_mutation_evidence: dict[str, Any],
+    ) -> None:
+        super().__init__(message)
+        self.local_mutation_evidence = dict(local_mutation_evidence)
+
+
+def _rootbroker_authority_effect_evidence(
+    authority: Any,
+    expected_head: str,
+) -> dict[str, Any] | None:
+    if (
+        not isinstance(authority, dict)
+        or authority.get("effect_started") is not True
+        or authority.get("success") is not True
+        or authority.get("expected_head") != expected_head
+        or authority.get("attested_head") != expected_head
+    ):
+        return None
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_rootbroker_authority_effect",
+        "expected_head": expected_head,
+        "outcome": authority.get("outcome"),
+        "attested_head": authority.get("attested_head"),
+        "effect_started": True,
+        "request_id": authority.get("request_id"),
+        "reference_sha256": authority.get("reference_sha256"),
+    }
+    return {
+        **material,
+        "evidence_sha256": _source_identity_sha256(material),
+    }
+
+
+def _tracked_runtime_deploy_local_mutation_evidence(
+    tracker: dict[str, Any],
+) -> dict[str, Any] | None:
+    effects: list[dict[str, Any]] = []
+    for key in (
+        "deploy_index_mutation",
+        "stale_pending_reconciliation",
+        "origin_main_refresh",
+        "rootbroker_authority",
+        "auto_source_materialization",
+    ):
+        value = tracker.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise RuntimeError(f"tracked local mutation evidence {key} is malformed")
+        effects.append(dict(value))
+    if not effects:
+        return None
+    if len(effects) == 1:
+        return effects[0]
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_local_mutation_bundle",
+        "effects": effects,
+    }
+    return {
+        **material,
+        "evidence_sha256": _source_identity_sha256(material),
     }
 
 
@@ -2217,7 +2418,10 @@ def _missing_finalization_deploy_is_noeffect_proven(
 
 
 def inflight_runtime_job_evidence(
-    command: list[str] | None = None, *, prune: bool = False
+    command: list[str] | None = None,
+    *,
+    prune: bool = False,
+    reconcile_stale_pending: bool = False,
 ) -> dict[str, Any]:
     """Project the deploy index for a gate, without deciding for it.
 
@@ -2237,12 +2441,33 @@ def inflight_runtime_job_evidence(
         "idempotent_match": None,
         "ambiguous_identical_units": [],
         "pruned_units": [],
+        "deploy_index_mutation": None,
+        "stale_pending_reconciliation": None,
         "error": None,
     }
     expected_sha256 = _deploy_command_sha256(command) if command else None
     try:
         jobs_root = operator._jobs_root()
-        index = _deploy_index(jobs_root)
+        if reconcile_stale_pending:
+            index, reconciliation, index_mutation = _reconcile_stale_pending_reservation(
+                jobs_root
+            )
+            evidence["deploy_index_mutation"] = index_mutation
+            evidence["stale_pending_reconciliation"] = reconciliation
+        else:
+            # Assessments must not normalize reservations or persist a bootstrap
+            # before an authorized, locked recheck can track those effects.
+            # A pending reservation remains blocking even if its directory exists.
+            index = _deploy_index(jobs_root, read_only=True)
+    except DeployScheduleFailureAfterLocalMutation as exc:
+        evidence["stale_pending_reconciliation"] = dict(
+            exc.local_mutation_evidence
+        )
+        evidence["error"] = (
+            "deployment stale-pending reconciliation failed after a known "
+            f"local mutation: {exc}"
+        )
+        return evidence
     except (OSError, RuntimeError, ValueError) as exc:
         evidence["error"] = f"deployment job index is unreadable: {exc}"
         return evidence
@@ -2323,6 +2548,12 @@ def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict
     )
     jobs_root = operator._jobs_root()
     index = _deploy_index(jobs_root)
+    pending = index["pending_unit"]
+    if pending is not None:
+        raise RuntimeError(
+            "runtime deploy dispatch outcome is still pending; refusing a blind retry: "
+            f"{pending}"
+        )
     entries = [jobs_root / unit for unit in index["units"]]
 
     matches: list[dict[str, Any]] = []
@@ -2452,11 +2683,13 @@ def _schedule_result(
     effective_delay_seconds: int,
     job: dict[str, Any],
     intent: dict[str, Any] | None,
-    scheduled: dict[str, Any],
+    scheduled: dict[str, Any] | None,
     already_scheduled: bool,
     source_identity: dict[str, Any],
     automatic_source: dict[str, Any] | None = None,
+    local_mutation_evidence: dict[str, Any] | None = None,
     deployment_observer_capability: str | None = None,
+    post_dispatch_warnings: list[str] | None = None,
 ) -> dict[str, Any]:
     contract = job.get("deployment_observer_contract")
     observer_available = (
@@ -2466,12 +2699,18 @@ def _schedule_result(
     return {
         "scheduled": True,
         "already_scheduled": already_scheduled,
+        "post_dispatch_warnings": list(post_dispatch_warnings or []),
         "expected_head": expected_head,
         "requested_delay_seconds": requested_delay_seconds,
         "delay_seconds": effective_delay_seconds,
         "source_identity": source_identity,
         "source_identity_sha256": source_identity["identity_sha256"],
         "automatic_source": automatic_source,
+        "local_mutation_evidence": (
+            None
+            if local_mutation_evidence is None
+            else dict(local_mutation_evidence)
+        ),
         "effective_source_identity_sha256": job.get(
             "source_identity_sha256", source_identity["identity_sha256"]
         ),
@@ -2581,9 +2820,14 @@ def _resource_inspect(resource_key: str) -> dict[str, Any]:
 
 
 def _mutating_git_result(repository: Path, *arguments: str) -> dict[str, Any]:
-    operator._require_operator_mutation(
-        "git_cli", path=str(repository), repo=str(repository), fresh_preflight=True
-    )
+    try:
+        operator._require_operator_mutation(
+            "git_cli", path=str(repository), repo=str(repository), fresh_preflight=True
+        )
+    except Exception as exc:
+        # No process has been launched. Preserve this known boundary for callers
+        # that must release source reservations after a fresh policy refusal.
+        raise DeploySchedulePreEffectRefusal(str(exc)) from exc
     command = [
         "/usr/bin/git",
         "-c",
@@ -2596,12 +2840,22 @@ def _mutating_git_result(repository: Path, *arguments: str) -> dict[str, Any]:
         str(repository),
         *arguments,
     ]
-    return operator._run(
-        command,
-        cwd=repository,
-        timeout_seconds=60,
-        max_output_bytes=65_536,
-    )
+
+    def run() -> dict[str, Any]:
+        return operator._run(
+            command,
+            cwd=repository,
+            timeout_seconds=60,
+            max_output_bytes=65_536,
+        )
+
+    if arguments[:1] == ("worktree",):
+        # Import lazily to avoid the grabowski_mcp/self-deploy import cycle.
+        import grabowski_checkouts as checkouts
+
+        with checkouts._operation_lock():
+            return run()
+    return run()
 
 
 def _worktree_registration_present(repository: Path, target: Path) -> bool:
@@ -2632,12 +2886,14 @@ def _worktree_registration_present(repository: Path, target: Path) -> bool:
     return False
 
 
+
 def _canonical_main_refresh_state(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         key: snapshot.get(key)
         for key in (
             "canonical_repository",
             "current_head",
+            "current_branch",
             "target_head",
             "origin_main",
             "clean",
@@ -2687,24 +2943,40 @@ def _canonical_main_refresh_candidate(
         _git_result(canonical, "rev-parse", "--is-shallow-repository"),
         "canonical shallow-repository lookup",
     )
-    if branch != "main":
-        raise RuntimeError(
-            f"current-main refresh requires canonical main, found {branch}"
-        )
+    target_object = _git_result(
+        canonical,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"{expected_head}^{{commit}}",
+    )
+    target_object_returncode = target_object.get("returncode")
+    if (
+        target_object.get("timed_out") is True
+        or isinstance(target_object_returncode, bool)
+        or target_object_returncode not in {0, 1}
+    ):
+        raise RuntimeError("protected-main target object presence probe failed")
     if status:
-        raise RuntimeError("current-main refresh requires a clean canonical checkout")
+        raise RuntimeError(
+            "protected-main ref refresh requires a clean canonical checkout"
+        )
     if shallow != "false":
-        raise RuntimeError("current-main refresh requires a non-shallow canonical repository")
+        raise RuntimeError(
+            "protected-main ref refresh requires a non-shallow canonical repository"
+        )
     for label, value in (("HEAD", head), ("origin/main", origin_main)):
         if OBJECT_ID_RE.fullmatch(value) is None:
             raise RuntimeError(f"canonical {label} is not a full Git object ID")
     return {
         "canonical_repository": str(canonical),
         "current_head": head,
+        "current_branch": branch,
         "target_head": expected_head,
         "origin_main": origin_main,
         "clean": True,
         "shallow": False,
+        "target_object_present": target_object_returncode == 0,
         "lease_evidence": lease_evidence,
     }
 
@@ -2714,13 +2986,18 @@ def _origin_main_refresh_plan(expected_head: str) -> dict[str, Any]:
         CANONICAL_REPOSITORY,
         label="canonical repository",
     )
+    common_dir = _git_common_directory(canonical)
     generation = uuid.uuid4().hex[:12]
     return {
         "canonical_repository": canonical,
+        "git_common_directory": common_dir,
         "generation": generation,
         "owner_id": f"runtime-deploy-ref:{expected_head[:12]}:{generation}",
         "operation_key": f"repo:{canonical}:operation:{ORIGIN_MAIN_REFRESH_OPERATION}",
-        "path_key": f"path:{canonical}",
+        "canonical_key": f"path:{canonical}",
+        "common_dir_key": f"path:{common_dir}",
+        "objects_key": f"path:{common_dir / 'objects'}",
+        "origin_main_ref_key": f"path:{common_dir / 'refs/remotes/origin/main'}",
     }
 
 
@@ -2736,14 +3013,37 @@ def _acquire_origin_main_refresh_resources(
         effect_class="deploy",
         operation_class="deploy",
     )
-    return resources.acquire_resources(
-        plan["owner_id"],
-        [plan["operation_key"], plan["path_key"]],
-        purpose=f"refresh exact protected-main deployment object {expected_head[:12]}",
-        ttl_seconds=ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS,
-        metadata={"operation_scope": operation_scope},
-    )
+    try:
+        return resources.acquire_resources(
+            plan["owner_id"],
+            [
+                plan["operation_key"],
+                plan["canonical_key"],
+                plan["common_dir_key"],
+                plan["objects_key"],
+                plan["origin_main_ref_key"],
+            ],
+            purpose=f"refresh exact protected-main deployment object {expected_head[:12]}",
+            ttl_seconds=ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS,
+            metadata={"operation_scope": operation_scope},
+        )
+    except resources.ResourceConflict as exc:
+        raise DeploySchedulePreEffectRefusal(
+            "protected-main ref refresh resources are busy before mutation"
+        ) from exc
 
+
+def _require_origin_main_refresh_checkout_certainty(plan: dict[str, Any]) -> None:
+    import grabowski_checkouts as checkouts
+
+    try:
+        checkouts._require_no_checkout_operation_uncertainty(
+            [plan["common_dir_key"]]
+        )
+    except RuntimeError as exc:
+        raise DeploySchedulePreEffectRefusal(
+            "protected-main ref refresh is blocked before mutation by checkout uncertainty"
+        ) from exc
 
 def _release_origin_main_refresh_resources(
     plan: dict[str, Any],
@@ -2757,27 +3057,151 @@ def _release_origin_main_refresh_resources(
     )
 
 
+def _origin_main_fetch_effect_evidence(
+    *,
+    plan: dict[str, Any],
+    pre_fetch_snapshot: dict[str, Any],
+    expected_head: str,
+    resolved_target: str,
+    fetch_result: dict[str, Any],
+    public_before_fetch: str,
+) -> dict[str, Any]:
+    if (
+        pre_fetch_snapshot.get("target_object_present") is not False
+        or resolved_target != expected_head
+        or public_before_fetch != expected_head
+        or fetch_result.get("timed_out") is True
+        or fetch_result.get("returncode") != 0
+    ):
+        raise RuntimeError(
+            "protected-main fetch effect evidence is not bound to an observed object-store mutation"
+        )
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_origin_main_fetch_effect",
+        "canonical_repository": str(plan["canonical_repository"]),
+        "expected_head": expected_head,
+        "previous_head": pre_fetch_snapshot["current_head"],
+        "previous_branch": pre_fetch_snapshot.get("current_branch"),
+        "previous_origin_main": pre_fetch_snapshot["origin_main"],
+        "owner_id": plan["owner_id"],
+        "operation_resource_key": plan["operation_key"],
+        "canonical_resource_key": plan["canonical_key"],
+        "common_dir_resource_key": plan["common_dir_key"],
+        "objects_resource_key": plan["objects_key"],
+        "origin_main_ref_resource_key": plan["origin_main_ref_key"],
+        "target_object": {
+            "before_fetch_present": False,
+            "after_fetch_commit": resolved_target,
+        },
+        "fetch": {
+            "returncode": fetch_result.get("returncode"),
+            "timed_out": fetch_result.get("timed_out") is True,
+        },
+        "public_github_main": {"before_fetch": public_before_fetch},
+        "effect_observed": True,
+    }
+    return {
+        **material,
+        "evidence_sha256": _source_identity_sha256(material),
+    }
+
+
+def _origin_main_refresh_effect_evidence(
+    *,
+    plan: dict[str, Any],
+    initial_snapshot: dict[str, Any],
+    expected_head: str,
+    observed_origin_main: str,
+    fetch_result: dict[str, Any],
+    update_result: dict[str, Any],
+    public_before_fetch: str,
+    public_after_fetch: str,
+) -> dict[str, Any]:
+    if (
+        observed_origin_main != expected_head
+        or public_before_fetch != expected_head
+        or public_after_fetch != expected_head
+        or fetch_result.get("timed_out") is True
+        or fetch_result.get("returncode") != 0
+    ):
+        raise RuntimeError(
+            "protected-main ref refresh effect evidence is not bound to an observed target CAS"
+        )
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_origin_main_refresh_effect",
+        "canonical_repository": str(plan["canonical_repository"]),
+        "expected_head": expected_head,
+        "previous_head": initial_snapshot["current_head"],
+        "previous_branch": initial_snapshot.get("current_branch"),
+        "previous_origin_main": initial_snapshot["origin_main"],
+        "observed_origin_main": observed_origin_main,
+        "owner_id": plan["owner_id"],
+        "operation_resource_key": plan["operation_key"],
+        "canonical_resource_key": plan["canonical_key"],
+        "common_dir_resource_key": plan["common_dir_key"],
+        "objects_resource_key": plan["objects_key"],
+        "origin_main_ref_resource_key": plan["origin_main_ref_key"],
+        "fetch": {
+            "returncode": fetch_result.get("returncode"),
+            "timed_out": fetch_result.get("timed_out") is True,
+        },
+        "update_ref": {
+            "returncode": update_result.get("returncode"),
+            "timed_out": update_result.get("timed_out") is True,
+            "reported_success": (
+                update_result.get("timed_out") is not True
+                and update_result.get("returncode") == 0
+            ),
+        },
+        "public_github_main": {
+            "before_fetch": public_before_fetch,
+            "after_fetch": public_after_fetch,
+        },
+        "effect_observed": True,
+    }
+    return {
+        **material,
+        "evidence_sha256": _source_identity_sha256(material),
+    }
+
+
 def _refresh_canonical_origin_main(
     expected_head: str,
     initial_snapshot: dict[str, Any],
 ) -> dict[str, Any]:
     if initial_snapshot.get("origin_main") == expected_head:
-        raise RuntimeError("current-main refresh was requested for an already-current origin/main")
+        raise RuntimeError(
+            "protected-main ref refresh was requested for an already-current origin/main"
+        )
     plan = _origin_main_refresh_plan(expected_head)
     canonical = plan["canonical_repository"]
     if initial_snapshot.get("canonical_repository") != str(canonical):
-        raise RuntimeError("current-main refresh snapshot repository mismatch")
+        raise RuntimeError("protected-main ref refresh snapshot repository mismatch")
     operation_lease: dict[str, Any] | None = None
-    path_lease: dict[str, Any] | None = None
+    canonical_lease: dict[str, Any] | None = None
+    common_dir_lease: dict[str, Any] | None = None
+    objects_lease: dict[str, Any] | None = None
+    origin_main_ref_lease: dict[str, Any] | None = None
+    observed_effect_evidence: dict[str, Any] | None = None
     try:
         acquisition = _acquire_origin_main_refresh_resources(plan, expected_head)
         operation_lease = _lease_for_key(acquisition, plan["operation_key"])
-        path_lease = _lease_for_key(acquisition, plan["path_key"])
+        canonical_lease = _lease_for_key(acquisition, plan["canonical_key"])
+        common_dir_lease = _lease_for_key(acquisition, plan["common_dir_key"])
+        objects_lease = _lease_for_key(acquisition, plan["objects_key"])
+        origin_main_ref_lease = _lease_for_key(
+            acquisition, plan["origin_main_ref_key"]
+        )
+        _require_origin_main_refresh_checkout_certainty(plan)
         locked = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
         if _canonical_main_refresh_state(locked) != _canonical_main_refresh_state(
             initial_snapshot
         ):
-            raise RuntimeError("canonical main state drifted before exact object refresh")
+            raise RuntimeError(
+                "canonical checkout state drifted before exact protected-main refresh"
+            )
         public_before_fetch = _fresh_public_github_main(expected_head)
         if public_before_fetch != expected_head:
             raise RuntimeError(
@@ -2787,6 +3211,7 @@ def _refresh_canonical_origin_main(
         fetch_result = _mutating_git_result(
             canonical,
             "fetch",
+            "--no-auto-maintenance",
             "--no-tags",
             "--no-write-fetch-head",
             "--no-recurse-submodules",
@@ -2795,13 +3220,6 @@ def _refresh_canonical_origin_main(
         )
         if fetch_result.get("timed_out") is True or fetch_result.get("returncode") != 0:
             raise RuntimeError("exact protected-main object fetch failed")
-        after_fetch = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
-        if _canonical_main_refresh_state(after_fetch) != _canonical_main_refresh_state(
-            initial_snapshot
-        ):
-            raise RuntimeError(
-                "canonical main or origin/main changed during exact object fetch"
-            )
         resolved_target = _required_stdout(
             _git_result(
                 canonical,
@@ -2813,27 +3231,57 @@ def _refresh_canonical_origin_main(
         )
         if resolved_target != expected_head:
             raise RuntimeError("fetched protected-main object does not match expected head")
-        for label, predecessor in (
-            ("canonical HEAD", str(initial_snapshot["current_head"])),
-            ("origin/main", str(initial_snapshot["origin_main"])),
+        if locked.get("target_object_present") is False:
+            observed_effect_evidence = _origin_main_fetch_effect_evidence(
+                plan=plan,
+                pre_fetch_snapshot=locked,
+                expected_head=expected_head,
+                resolved_target=resolved_target,
+                fetch_result=fetch_result,
+                public_before_fetch=public_before_fetch,
+            )
+        after_fetch = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if _canonical_main_refresh_state(after_fetch) != _canonical_main_refresh_state(
+            initial_snapshot
         ):
-            ancestor = _git_result(
+            raise RuntimeError(
+                "canonical checkout or origin/main changed during exact object fetch"
+            )
+        if initial_snapshot.get("current_branch") == "main":
+            head_ancestor = _git_result(
                 canonical,
                 "merge-base",
                 "--is-ancestor",
-                predecessor,
+                str(initial_snapshot["current_head"]),
                 expected_head,
             )
-            if ancestor.get("timed_out") is True or ancestor.get("returncode") != 0:
+            if (
+                head_ancestor.get("timed_out") is True
+                or head_ancestor.get("returncode") != 0
+            ):
                 raise RuntimeError(
-                    f"current-main refresh requires {label} to be an ancestor of the deployment target"
+                    "protected-main ref refresh requires current canonical main to be an "
+                    "ancestor of the deployment target"
                 )
+        ancestor = _git_result(
+            canonical,
+            "merge-base",
+            "--is-ancestor",
+            str(initial_snapshot["origin_main"]),
+            expected_head,
+        )
+        if ancestor.get("timed_out") is True or ancestor.get("returncode") != 0:
+            raise RuntimeError(
+                "protected-main ref refresh requires prior origin/main to be an "
+                "ancestor of the deployment target"
+            )
         public_after_fetch = _fresh_public_github_main(expected_head)
         if public_after_fetch != expected_head:
             raise RuntimeError(
                 "public GitHub main drifted after exact object fetch: "
                 f"expected {expected_head}, found {public_after_fetch}"
             )
+        _require_target_deploy_runner(canonical, expected_head)
         update_result = _mutating_git_result(
             canonical,
             "update-ref",
@@ -2853,14 +3301,28 @@ def _refresh_canonical_origin_main(
         if observed_origin_main != expected_head:
             if observed_origin_main == initial_snapshot.get("origin_main"):
                 raise RuntimeError("origin/main CAS update produced no effect")
-            raise RuntimeError("origin/main changed to an unexpected commit during CAS update")
+            raise RuntimeError(
+                "origin/main changed to an unexpected commit during CAS update"
+            )
+        observed_effect_evidence = _origin_main_refresh_effect_evidence(
+            plan=plan,
+            initial_snapshot=initial_snapshot,
+            expected_head=expected_head,
+            observed_origin_main=observed_origin_main,
+            fetch_result=fetch_result,
+            update_result=update_result,
+            public_before_fetch=public_before_fetch,
+            public_after_fetch=public_after_fetch,
+        )
         after_cas = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
         expected_after = {
             **_canonical_main_refresh_state(initial_snapshot),
             "origin_main": expected_head,
         }
         if _canonical_main_refresh_state(after_cas) != expected_after:
-            raise RuntimeError("canonical state drifted during origin/main CAS update")
+            raise RuntimeError(
+                "canonical checkout state drifted during origin/main CAS update"
+            )
         public_after_cas = _fresh_public_github_main(expected_head)
         if public_after_cas != expected_head:
             _append_deploy_audit(
@@ -2884,11 +3346,15 @@ def _refresh_canonical_origin_main(
             "canonical_repository": str(canonical),
             "expected_head": expected_head,
             "previous_head": initial_snapshot["current_head"],
+            "previous_branch": initial_snapshot.get("current_branch"),
             "previous_origin_main": initial_snapshot["origin_main"],
             "observed_origin_main": observed_origin_main,
             "owner_id": plan["owner_id"],
             "operation_resource_key": plan["operation_key"],
-            "path_resource_key": plan["path_key"],
+            "canonical_resource_key": plan["canonical_key"],
+            "common_dir_resource_key": plan["common_dir_key"],
+            "objects_resource_key": plan["objects_key"],
+            "origin_main_ref_resource_key": plan["origin_main_ref_key"],
             "fetch": {
                 "returncode": fetch_result.get("returncode"),
                 "timed_out": fetch_result.get("timed_out") is True,
@@ -2917,6 +3383,7 @@ def _refresh_canonical_origin_main(
                 "operation": "runtime-deploy-origin-main-refreshed",
                 "expected_head": expected_head,
                 "previous_head": initial_snapshot["current_head"],
+                "previous_branch": initial_snapshot.get("current_branch"),
                 "previous_origin_main": initial_snapshot["origin_main"],
                 "observed_origin_main": observed_origin_main,
                 "receipt_sha256": receipt["receipt_sha256"],
@@ -2928,7 +3395,14 @@ def _refresh_canonical_origin_main(
         release_leases: list[dict[str, Any]] = []
         for label, resource_key, candidate_lease in (
             ("operation", plan["operation_key"], operation_lease),
-            ("path", plan["path_key"], path_lease),
+            ("canonical-repository", plan["canonical_key"], canonical_lease),
+            ("git-common-directory", plan["common_dir_key"], common_dir_lease),
+            ("objects", plan["objects_key"], objects_lease),
+            (
+                "origin-main-ref",
+                plan["origin_main_ref_key"],
+                origin_main_ref_lease,
+            ),
         ):
             if candidate_lease is None:
                 try:
@@ -2936,7 +3410,9 @@ def _refresh_canonical_origin_main(
                         resource_key, plan["owner_id"]
                     )
                 except Exception as cleanup_error:
-                    cleanup_failures.append((f"{label}-lease-readback", cleanup_error))
+                    cleanup_failures.append(
+                        (f"{label}-lease-readback", cleanup_error)
+                    )
                     candidate_lease = None
             if candidate_lease is not None:
                 release_keys.append(resource_key)
@@ -2951,26 +3427,67 @@ def _refresh_canonical_origin_main(
                     cleanup_failures.append(
                         (
                             "resource-release",
-                            RuntimeError("current-main refresh cleanup release was incomplete"),
+                            RuntimeError(
+                                "protected-main ref refresh cleanup release was incomplete"
+                            ),
                         )
                     )
             except Exception as cleanup_error:
                 cleanup_failures.append(("resource-release", cleanup_error))
         if cleanup_failures:
-            raise RuntimeError(
+            message = (
                 f"{type(exc).__name__}: {exc}; cleanup failures: "
                 + _cleanup_failure_text(cleanup_failures)
+            )
+            if observed_effect_evidence is not None:
+                raise DeployScheduleFailureAfterLocalMutation(
+                    message,
+                    local_mutation_evidence=observed_effect_evidence,
+                ) from exc
+            raise RuntimeError(message) from exc
+        if observed_effect_evidence is not None:
+            raise DeployScheduleFailureAfterLocalMutation(
+                str(exc),
+                local_mutation_evidence=observed_effect_evidence,
             ) from exc
         raise
-    assert operation_lease is not None and path_lease is not None
-    release = _release_origin_main_refresh_resources(
-        plan,
-        [plan["operation_key"], plan["path_key"]],
-        [operation_lease, path_lease],
+    assert (
+        operation_lease is not None
+        and canonical_lease is not None
+        and common_dir_lease is not None
+        and objects_lease is not None
+        and origin_main_ref_lease is not None
     )
-    released = release.get("released")
-    if not isinstance(released, list) or len(released) != 2:
-        raise RuntimeError("current-main refresh resource release was incomplete")
+    try:
+        release = _release_origin_main_refresh_resources(
+            plan,
+            [
+                plan["operation_key"],
+                plan["canonical_key"],
+                plan["common_dir_key"],
+                plan["objects_key"],
+                plan["origin_main_ref_key"],
+            ],
+            [
+                operation_lease,
+                canonical_lease,
+                common_dir_lease,
+                objects_lease,
+                origin_main_ref_lease,
+            ],
+        )
+        released = release.get("released")
+        if not isinstance(released, list) or len(released) != 5:
+            raise RuntimeError(
+                "protected-main ref refresh resource release was incomplete"
+            )
+    except Exception as exc:
+        if observed_effect_evidence is not None:
+            raise DeployScheduleFailureAfterLocalMutation(
+                str(exc),
+                local_mutation_evidence=observed_effect_evidence,
+            ) from exc
+        raise
     return receipt
 
 
@@ -2980,6 +3497,7 @@ def _canonical_stale_snapshot_state(snapshot: dict[str, Any]) -> dict[str, Any]:
         for key in (
             "canonical_repository",
             "current_head",
+            "current_branch",
             "target_head",
             "origin_main",
             "clean",
@@ -3019,40 +3537,39 @@ def _canonical_stale_main_snapshot(expected_head: str) -> dict[str, Any] | None:
         ),
         "canonical worktree status",
     )
-    if branch != "main":
-        raise RuntimeError(
-            f"automatic deployment source requires canonical main, found {branch}"
-        )
     if status:
-        raise RuntimeError("automatic deployment source requires a clean canonical checkout")
+        raise RuntimeError(
+            "automatic deployment source requires a clean canonical checkout"
+        )
     if origin_main != expected_head:
         raise RuntimeError(
             "automatic deployment source requires refs/remotes/origin/main to match "
             f"the deployment target: expected {expected_head}, found {origin_main}"
         )
-    if head == expected_head:
+    if head == expected_head and branch == "main":
         return None
-    ancestor = _git_result(
-        canonical,
-        "merge-base",
-        "--is-ancestor",
-        head,
-        expected_head,
-    )
-    if ancestor.get("timed_out") or ancestor.get("returncode") != 0:
-        raise RuntimeError(
-            "automatic deployment source requires current canonical main to be an "
-            "ancestor of the deployment target"
+    if branch == "main":
+        ancestor = _git_result(
+            canonical,
+            "merge-base",
+            "--is-ancestor",
+            head,
+            expected_head,
         )
+        if ancestor.get("timed_out") or ancestor.get("returncode") != 0:
+            raise RuntimeError(
+                "automatic deployment source requires current canonical main to be an "
+                "ancestor of the deployment target"
+            )
     return {
         "canonical_repository": str(canonical),
         "current_head": head,
+        "current_branch": branch,
         "target_head": expected_head,
         "origin_main": origin_main,
         "clean": True,
         "lease_evidence": lease_evidence,
     }
-
 
 def _auto_deploy_source_plan(expected_head: str) -> dict[str, Any]:
     canonical = _validated_repository_path(
@@ -3087,6 +3604,7 @@ def _auto_deploy_source_plan(expected_head: str) -> dict[str, Any]:
 
 
 def _acquire_auto_deploy_source_resources(plan: dict[str, Any], expected_head: str) -> dict[str, Any]:
+    import grabowski_checkouts as checkouts
     import grabowski_resources as resources
 
     operation_scope = resources.operation_scope_contract(
@@ -3095,13 +3613,92 @@ def _acquire_auto_deploy_source_resources(plan: dict[str, Any], expected_head: s
         effect_class="worktree_admin",
         operation_class="worktree-admin",
     )
-    return resources.acquire_resources(
-        plan["owner_id"],
-        [plan["operation_key"], plan["path_key"]],
-        purpose=f"materialize detached runtime deploy source {expected_head[:12]}",
-        ttl_seconds=AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS,
-        metadata={"operation_scope": operation_scope},
+    common_dir = _git_common_directory(plan["canonical_repository"])
+    common_dir_key = f"path:{common_dir}"
+    resource_keys = [plan["operation_key"], plan["path_key"], common_dir_key]
+    try:
+        acquisition = resources.acquire_resources(
+            plan["owner_id"],
+            resource_keys,
+            purpose=f"materialize detached runtime deploy source {expected_head[:12]}",
+            ttl_seconds=AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS,
+            metadata={"operation_scope": operation_scope},
+        )
+    except resources.ResourceConflict as exc:
+        raise DeploySchedulePreEffectRefusal(
+            "automatic deployment source resources are busy before mutation"
+        ) from exc
+    try:
+        checkouts._require_no_checkout_operation_uncertainty([common_dir_key])
+        path_lease = _lease_for_key(acquisition, plan["path_key"])
+        common_dir_lease = _lease_for_key(acquisition, common_dir_key)
+        uncertainty_fence = checkouts._persist_checkout_operation_uncertainty(
+            lease={
+                "owner_id": plan["owner_id"],
+                "leases": [path_lease, common_dir_lease],
+            },
+            checkout_key=checkouts._checkout_key(common_dir, plan["target"]),
+            owner_id=plan["owner_id"],
+            operation="materialize",
+            operation_id=plan["generation"],
+            evidence={
+                "repo": str(plan["canonical_repository"]),
+                "git_common_dir": str(common_dir),
+                "checkout_path": str(plan["target"]),
+                "checkout_key": checkouts._checkout_key(common_dir, plan["target"]),
+                "owner_id": plan["owner_id"],
+                "expected_head": expected_head,
+                "expected_branch": None,
+                "obligation_id": plan["obligation_id"],
+            },
+        )
+    except Exception as exc:
+        leases = acquisition.get("leases")
+        if not isinstance(leases, list) or len(leases) != len(resource_keys):
+            raise RuntimeError(
+                "automatic deployment source lease receipt is malformed during pre-effect refusal"
+            ) from exc
+        try:
+            resources.release_resources(
+                plan["owner_id"],
+                resource_keys,
+                expected_leases=leases,
+            )
+        except Exception as cleanup_error:
+            raise RuntimeError(
+                "automatic deployment source pre-effect refusal "
+                f"could not release serialization leases: {type(cleanup_error).__name__}: "
+                f"{str(cleanup_error)[:256]}"
+            ) from exc
+        raise DeploySchedulePreEffectRefusal(
+            "automatic deployment source is blocked before mutation by checkout coordination"
+        ) from exc
+    return {
+        **acquisition,
+        "common_dir_key": common_dir_key,
+        "checkout_uncertainty_fence": uncertainty_fence,
+    }
+
+
+def _clear_auto_deploy_source_uncertainty(
+    fence: dict[str, Any],
+    *,
+    outcome: str,
+    reason: str,
+) -> dict[str, Any]:
+    import grabowski_checkouts as checkouts
+
+    fence_id = fence.get("fence_id")
+    if not isinstance(fence_id, str) or re.fullmatch(r"[0-9a-f]{32}", fence_id) is None:
+        raise RuntimeError("automatic deployment source uncertainty fence is malformed")
+    cleared = checkouts._clear_checkout_operation_uncertainty(
+        fence_id,
+        outcome=outcome,
+        evidence={"reason": reason},
     )
+    if not isinstance(cleared, dict) or cleared.get("cleared_at_unix") is None:
+        raise RuntimeError("automatic deployment source uncertainty fence did not clear")
+    return cleared
 
 
 def _release_auto_deploy_source_resources(
@@ -3241,6 +3838,47 @@ def _block_auto_deploy_source_obligation(
     )
 
 
+def _resolve_auto_deploy_source_obligation_no_effect(
+    plan: dict[str, Any],
+    blocked: dict[str, Any],
+) -> dict[str, Any]:
+    import grabowski_operator_obligation as obligations
+
+    close_file_sha256 = blocked.get("close_file_sha256")
+    if (
+        blocked.get("state") != "blocked"
+        or not isinstance(close_file_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", close_file_sha256) is None
+    ):
+        raise RuntimeError(
+            "automatic deployment source blocked obligation lacks terminal close evidence"
+        )
+    resolved = obligations.resolve_obligation(
+        {
+            "obligation_id": plan["obligation_id"],
+            "disposition": "resolved",
+            "evidence": [
+                {
+                    "source": "receipt",
+                    "reference": (
+                        "auto-deploy-source-pre-effect:"
+                        + str(plan["generation"])
+                    ),
+                    "sha256": close_file_sha256,
+                }
+            ],
+        }
+    )
+    if (
+        resolved.get("resolution_disposition") != "resolved"
+        or resolved.get("continuation_required") is not False
+    ):
+        raise RuntimeError(
+            "automatic deployment source no-effect obligation did not settle terminally"
+        )
+    return resolved
+
+
 def _reserve_auto_deploy_source_lifecycle(
     plan: dict[str, Any],
     expected_head: str,
@@ -3262,6 +3900,60 @@ def _reserve_auto_deploy_source_lifecycle(
         expected_head=expected_head,
         expected_branch=None,
     )
+
+
+def _read_auto_deploy_source_lifecycle_after_reservation_error(
+    plan: dict[str, Any],
+    expected_head: str,
+    uncertainty_fence: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    import grabowski_checkouts as checkouts
+
+    if not isinstance(uncertainty_fence, dict):
+        raise RuntimeError(
+            "automatic deployment source lifecycle reservation outcome lacks a recovery fence"
+        )
+    checkout_key = uncertainty_fence.get("checkout_key")
+    if (
+        not isinstance(checkout_key, str)
+        or re.fullmatch(r"[0-9a-f]{64}", checkout_key) is None
+    ):
+        raise RuntimeError(
+            "automatic deployment source lifecycle reservation recovery key is malformed"
+        )
+    lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
+    if lifecycle is None:
+        return None
+    expected_contract = {
+        "checkout_key": checkout_key,
+        "repo_path": str(plan["canonical_repository"]),
+        "checkout_path": str(plan["target"]),
+        "owner_id": plan["owner_id"],
+        "purpose": f"detached runtime deploy source {expected_head[:12]}",
+        "source_kind": "operator_obligation",
+        "source_id": plan["obligation_id"],
+        "artifact_class": "deployment-source-worktree",
+        "phase": "active",
+        "expected_head": expected_head,
+        "expected_branch": None,
+    }
+    mismatches = [
+        field
+        for field, expected_value in expected_contract.items()
+        if lifecycle.get(field) != expected_value
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "automatic deployment source lifecycle reservation readback conflicts: "
+            + ",".join(sorted(mismatches))
+        )
+    for field in ("created_at_unix", "updated_at_unix"):
+        value = lifecycle.get(field)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise RuntimeError(
+                "automatic deployment source lifecycle reservation readback is incomplete"
+            )
+    return lifecycle
 
 
 def _bind_auto_deploy_source_retention(
@@ -3344,8 +4036,117 @@ def _live_auto_deploy_source_lease_snapshot(
     return {field: lease[field] for field in fields}
 
 
+def _require_auto_deploy_source_mutation_leases(
+    owner_id: str,
+    expected_leases: list[dict[str, Any]],
+) -> None:
+    import grabowski_resources as resources
+
+    fields = (
+        "resource_key",
+        "owner_id",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
+    )
+    expected_by_key: dict[str, dict[str, Any]] = {}
+    for lease in expected_leases:
+        if not isinstance(lease, dict) or any(field not in lease for field in fields):
+            raise RuntimeError(
+                "automatic deployment source mutation lease snapshot is malformed"
+            )
+        resource_key = lease["resource_key"]
+        if (
+            not isinstance(resource_key, str)
+            or not resource_key
+            or lease["owner_id"] != owner_id
+            or resource_key in expected_by_key
+        ):
+            raise RuntimeError(
+                "automatic deployment source mutation lease snapshot is malformed"
+            )
+        expected_by_key[resource_key] = {field: lease[field] for field in fields}
+    if not expected_by_key:
+        raise RuntimeError(
+            "automatic deployment source mutation lease snapshots are missing"
+        )
+    try:
+        live_leases = resources.inspect_resources(expected_by_key)
+    except Exception as exc:
+        raise DeploySchedulePreEffectRefusal(
+            "automatic deployment source leases could not be revalidated before Git mutation"
+        ) from exc
+    if set(live_leases) != set(expected_by_key):
+        raise DeploySchedulePreEffectRefusal(
+            "automatic deployment source lease expired or disappeared before Git mutation"
+        )
+    for resource_key, expected_snapshot in expected_by_key.items():
+        live = live_leases.get(resource_key)
+        if not isinstance(live, dict) or any(field not in live for field in fields):
+            raise DeploySchedulePreEffectRefusal(
+                "automatic deployment source live lease snapshot is malformed before Git mutation"
+            )
+        current_snapshot = {field: live[field] for field in fields}
+        if current_snapshot != expected_snapshot:
+            raise DeploySchedulePreEffectRefusal(
+                "automatic deployment source lease changed before Git mutation"
+            )
+
+
+def _auto_deploy_source_effect_evidence(
+    plan: dict[str, Any],
+    expected_head: str,
+    repository: Path,
+    source_identity: dict[str, Any],
+    lifecycle: dict[str, Any] | None,
+    uncertainty_fence: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(lifecycle, dict) or not isinstance(uncertainty_fence, dict):
+        raise RuntimeError("automatic deployment source effect recovery binding is malformed")
+    source_identity_sha256 = source_identity.get("identity_sha256")
+    lifecycle_checkout_key = lifecycle.get("checkout_key")
+    fence_id = uncertainty_fence.get("fence_id")
+    fence_evidence_sha256 = uncertainty_fence.get("evidence_sha256")
+    if repository != plan.get("target"):
+        raise RuntimeError("automatic deployment source effect repository drifted")
+    if (
+        not isinstance(source_identity_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_identity_sha256) is None
+        or not isinstance(lifecycle_checkout_key, str)
+        or re.fullmatch(r"[0-9a-f]{64}", lifecycle_checkout_key) is None
+        or not isinstance(fence_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", fence_id) is None
+        or not isinstance(fence_evidence_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", fence_evidence_sha256) is None
+        or uncertainty_fence.get("checkout_key") != lifecycle_checkout_key
+        or uncertainty_fence.get("owner_id") != plan.get("owner_id")
+        or uncertainty_fence.get("operation") != "materialize"
+        or uncertainty_fence.get("operation_id") != plan.get("generation")
+        or uncertainty_fence.get("cleared_at_unix") is not None
+    ):
+        raise RuntimeError("automatic deployment source effect evidence is malformed")
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_auto_source_effect",
+        "expected_head": expected_head,
+        "repository": str(repository),
+        "owner_id": plan["owner_id"],
+        "generation": plan["generation"],
+        "path_resource_key": plan["path_key"],
+        "source_identity_sha256": source_identity_sha256,
+        "lifecycle_checkout_key": lifecycle_checkout_key,
+        "uncertainty_fence_id": fence_id,
+        "uncertainty_evidence_sha256": fence_evidence_sha256,
+        "effect_observed": True,
+    }
+    return {**material, "evidence_sha256": _source_identity_sha256(material)}
+
+
 def _materialize_auto_deploy_source(
     expected_head: str,
+    *,
+    local_mutation_tracker: dict[str, Any] | None = None,
 ) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
     stale_snapshot = _canonical_stale_main_snapshot(expected_head)
     if stale_snapshot is None:
@@ -3359,25 +4160,83 @@ def _materialize_auto_deploy_source(
     acquisition: dict[str, Any] | None = None
     operation_lease: dict[str, Any] | None = None
     path_lease: dict[str, Any] | None = None
+    common_dir_key: str | None = None
+    common_dir_lease: dict[str, Any] | None = None
+    uncertainty_fence: dict[str, Any] | None = None
+    uncertainty_fence_cleared = False
+    preserve_uncertainty_fence = False
     created = False
     mutation_attempted = False
     recovery_asset_present = False
+    observed_effect_evidence: dict[str, Any] | None = None
     lifecycle: dict[str, Any] | None = None
     obligation_opened = False
     obligation_completed = False
+    obligation_blocked: dict[str, Any] | None = None
     operation_lease_released = False
+    common_dir_lease_released = False
     try:
+        # Establish durable recovery authority before opening the obligation.
+        # If the process dies after this point but before open_obligation()
+        # completes, the fence still makes the proven-no-effect gap discoverable.
         acquisition = _acquire_auto_deploy_source_resources(plan, expected_head)
         operation_lease = _lease_for_key(acquisition, plan["operation_key"])
         path_lease = _lease_for_key(acquisition, plan["path_key"])
-        obligation = _open_auto_deploy_source_obligation(plan, expected_head)
+        raw_common_dir_key = acquisition.get("common_dir_key")
+        if raw_common_dir_key is not None:
+            if not isinstance(raw_common_dir_key, str) or not raw_common_dir_key:
+                raise RuntimeError(
+                    "automatic deployment source common-dir lease key is malformed"
+                )
+            common_dir_key = raw_common_dir_key
+            common_dir_lease = _lease_for_key(acquisition, common_dir_key)
+            raw_uncertainty_fence = acquisition.get("checkout_uncertainty_fence")
+            if (
+                not isinstance(raw_uncertainty_fence, dict)
+                or not isinstance(raw_uncertainty_fence.get("fence_id"), str)
+            ):
+                raise RuntimeError(
+                    "automatic deployment source checkout uncertainty fence is missing"
+                )
+            uncertainty_fence = dict(raw_uncertainty_fence)
+        try:
+            obligation = _open_auto_deploy_source_obligation(plan, expected_head)
+        except Exception as open_error:
+            import grabowski_operator_obligation as obligations
+
+            try:
+                obligation = obligations.status_obligation(plan["obligation_id"])
+            except FileNotFoundError:
+                raise open_error
+            except Exception:
+                preserve_uncertainty_fence = True
+                raise open_error
+            if (
+                not isinstance(obligation, dict)
+                or obligation.get("obligation_id") != plan["obligation_id"]
+                or obligation.get("state") != "open"
+            ):
+                preserve_uncertainty_fence = True
+                raise open_error
         obligation_state = obligation.get("state")
         if obligation_state != "open":
             raise RuntimeError(
                 "fresh automatic deployment source obligation is not open"
             )
         obligation_opened = True
-        lifecycle = _reserve_auto_deploy_source_lifecycle(plan, expected_head)
+        try:
+            lifecycle = _reserve_auto_deploy_source_lifecycle(plan, expected_head)
+        except Exception as reservation_error:
+            try:
+                lifecycle = _read_auto_deploy_source_lifecycle_after_reservation_error(
+                    plan,
+                    expected_head,
+                    uncertainty_fence,
+                )
+            except Exception:
+                preserve_uncertainty_fence = True
+                raise reservation_error
+            raise
         locked_snapshot = _canonical_stale_main_snapshot(expected_head)
         if (
             locked_snapshot is None
@@ -3391,6 +4250,12 @@ def _materialize_auto_deploy_source(
             raise RuntimeError(
                 "automatic deployment source target appeared after lease acquisition"
             )
+        mutation_leases = [operation_lease, path_lease]
+        if common_dir_lease is not None:
+            mutation_leases.append(common_dir_lease)
+        _require_auto_deploy_source_mutation_leases(
+            plan["owner_id"], mutation_leases
+        )
         mutation_attempted = True
         # Once the Git effect boundary is entered, preserve recovery authority by
         # default. Only successful observation of both an absent target path and
@@ -3420,8 +4285,19 @@ def _materialize_auto_deploy_source(
                 and mutation_result.get("timed_out") is True
             )
         )
+        effect_may_still_be_running = bool(
+            (
+                mutation_error is not None
+                and not isinstance(mutation_error, DeploySchedulePreEffectRefusal)
+            )
+            or (
+                mutation_result is not None
+                and mutation_result.get("timed_out") is True
+                and mutation_result.get("returncode") is None
+            )
+        )
         recovery_asset_present = bool(
-            uncertain_mutation_outcome
+            effect_may_still_be_running
             or target_present_after_mutation
             or registration_present_after_mutation
         )
@@ -3444,7 +4320,26 @@ def _materialize_auto_deploy_source(
             and source_identity is not None
             and registration_present_after_mutation
         )
+        if exact_post_state:
+            assert source_identity is not None
+            observed_effect_evidence = _auto_deploy_source_effect_evidence(
+                plan,
+                expected_head,
+                target,
+                source_identity,
+                lifecycle,
+                uncertainty_fence,
+            )
+            if local_mutation_tracker is not None:
+                local_mutation_tracker["auto_source_materialization"] = dict(
+                    observed_effect_evidence
+                )
         if uncertain_mutation_outcome:
+            if not recovery_asset_present:
+                raise DeploySchedulePreEffectRefusal(
+                    "automatic deployment source mutation had no observed effect "
+                    "after the Git invocation stopped or was refused before launch"
+                ) from mutation_error
             raise RuntimeError(
                 "automatic deployment source mutation outcome is uncertain; "
                 "retain lifecycle and leases for recovery"
@@ -3495,15 +4390,24 @@ def _materialize_auto_deploy_source(
             lifecycle,
             expected_head,
         )
+        release_keys = [plan["operation_key"]]
+        release_leases = [operation_lease]
+        if common_dir_key is not None and common_dir_lease is not None:
+            release_keys.append(common_dir_key)
+            release_leases.append(common_dir_lease)
         release = _release_auto_deploy_source_resources(
             plan["owner_id"],
-            [plan["operation_key"]],
-            [operation_lease],
+            release_keys,
+            release_leases,
         )
         released = release.get("released")
-        if not isinstance(released, list) or len(released) != 1:
-            raise RuntimeError("automatic deployment source operation lease release was incomplete")
+        if not isinstance(released, list) or len(released) != len(release_keys):
+            raise RuntimeError(
+                "automatic deployment source serialization lease release was incomplete"
+            )
         operation_lease_released = True
+        if common_dir_key is not None:
+            common_dir_lease_released = True
         repository, runner, source_identity = _deployment_source_preflight(
             expected_head,
             str(target),
@@ -3585,12 +4489,19 @@ def _materialize_auto_deploy_source(
                 "materialization_receipt_sha256": materialization["receipt_sha256"],
             }
         )
+        if uncertainty_fence is not None and not uncertainty_fence_cleared:
+            _clear_auto_deploy_source_uncertainty(
+                uncertainty_fence,
+                outcome="confirmed_success",
+                reason="exact detached deployment source finalization completed",
+            )
+            uncertainty_fence_cleared = True
         return repository, runner, source_identity, materialization
     except Exception as exc:
         cleanup_failures: list[tuple[str, Exception]] = []
         if obligation_opened and not obligation_completed:
             try:
-                _block_auto_deploy_source_obligation(plan, exc)
+                obligation_blocked = _block_auto_deploy_source_obligation(plan, exc)
             except Exception as cleanup_error:
                 cleanup_failures.append(("obligation-block", cleanup_error))
         preserve_recovery_asset = bool(mutation_attempted and recovery_asset_present)
@@ -3620,6 +4531,25 @@ def _materialize_auto_deploy_source(
             if candidate_operation_lease is not None:
                 release_keys.append(plan["operation_key"])
                 release_leases.append(candidate_operation_lease)
+        if (
+            common_dir_key is not None
+            and not common_dir_lease_released
+            and not preserve_recovery_asset
+        ):
+            candidate_common_dir_lease = common_dir_lease
+            if candidate_common_dir_lease is None and not mutation_attempted:
+                try:
+                    candidate_common_dir_lease = _live_auto_deploy_source_lease_snapshot(
+                        common_dir_key, plan["owner_id"]
+                    )
+                except Exception as cleanup_error:
+                    cleanup_failures.append(
+                        ("common-dir-lease-readback", cleanup_error)
+                    )
+                    candidate_common_dir_lease = None
+            if candidate_common_dir_lease is not None:
+                release_keys.append(common_dir_key)
+                release_leases.append(candidate_common_dir_lease)
         if not preserve_recovery_asset:
             candidate_path_lease = path_lease
             if candidate_path_lease is None and not mutation_attempted:
@@ -3642,10 +4572,48 @@ def _materialize_auto_deploy_source(
                 )
             except Exception as cleanup_error:
                 cleanup_failures.append(("resource-release", cleanup_error))
+        if (
+            obligation_blocked is not None
+            and not preserve_recovery_asset
+            and not cleanup_failures
+        ):
+            try:
+                _resolve_auto_deploy_source_obligation_no_effect(
+                    plan, obligation_blocked
+                )
+            except Exception as cleanup_error:
+                cleanup_failures.append(("obligation-resolve", cleanup_error))
+        if (
+            uncertainty_fence is not None
+            and not uncertainty_fence_cleared
+            and not preserve_recovery_asset
+            and not preserve_uncertainty_fence
+            and not cleanup_failures
+        ):
+            try:
+                _clear_auto_deploy_source_uncertainty(
+                    uncertainty_fence,
+                    outcome="confirmed_no_effect",
+                    reason="automatic deployment source mutation had no observed effect",
+                )
+                uncertainty_fence_cleared = True
+            except Exception as cleanup_error:
+                cleanup_failures.append(("uncertainty-fence-clear", cleanup_error))
         if cleanup_failures:
-            raise RuntimeError(
+            message = (
                 f"{type(exc).__name__}: {exc}; cleanup failures: "
                 + _cleanup_failure_text(cleanup_failures)
+            )
+            if observed_effect_evidence is not None:
+                raise DeployScheduleFailureAfterLocalMutation(
+                    message,
+                    local_mutation_evidence=observed_effect_evidence,
+                ) from exc
+            raise RuntimeError(message) from exc
+        if observed_effect_evidence is not None:
+            raise DeployScheduleFailureAfterLocalMutation(
+                str(exc),
+                local_mutation_evidence=observed_effect_evidence,
             ) from exc
         raise
 
@@ -3655,6 +4623,7 @@ def _cleanup_auto_deploy_source_before_dispatch(
     source_identity: dict[str, Any],
     materialization: dict[str, Any],
 ) -> dict[str, Any]:
+    import grabowski_checkouts as checkouts
     import grabowski_resources as resources
 
     if materialization.get("expected_head") != expected_head:
@@ -3700,19 +4669,66 @@ def _cleanup_auto_deploy_source_before_dispatch(
         effect_class="worktree_admin",
         operation_class="worktree-admin",
     )
+    common_dir = _git_common_directory(canonical)
+    common_dir_key = f"path:{common_dir}"
     cleanup_lease: dict[str, Any] | None = None
+    common_dir_lease: dict[str, Any] | None = None
+    uncertainty_fence: dict[str, Any] | None = None
+    uncertainty_fence_cleared = False
     mutation_attempted = False
     mutation_result: dict[str, Any] | None = None
     mutation_error: Exception | None = None
     try:
         acquisition = resources.acquire_resources(
             owner_id,
-            [cleanup_key],
+            [cleanup_key, common_dir_key],
             purpose=f"remove unused detached runtime deploy source {expected_head[:12]}",
             ttl_seconds=AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS,
             metadata={"operation_scope": cleanup_scope},
         )
         cleanup_lease = _lease_for_key(acquisition, cleanup_key)
+        common_dir_lease = _lease_for_key(acquisition, common_dir_key)
+        try:
+            checkouts._require_no_checkout_operation_uncertainty([common_dir_key])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "automatic deployment source cleanup is blocked before mutation "
+                "by checkout coordination"
+            ) from exc
+        checkout_key = checkouts._checkout_key(common_dir, repository)
+        if checkout_key != str(lifecycle["checkout_key"]):
+            raise RuntimeError(
+                "automatic deployment source cleanup lifecycle checkout key drift"
+            )
+        uncertainty_fence = checkouts._persist_checkout_operation_uncertainty(
+            lease={
+                "owner_id": owner_id,
+                "leases": [cleanup_lease, common_dir_lease],
+            },
+            checkout_key=checkout_key,
+            owner_id=owner_id,
+            operation="auto-source-cleanup",
+            operation_id=source_identity_sha256,
+            evidence={
+                "kind": "grabowski_auto_runtime_deploy_source_cleanup_uncertainty",
+                "repo": str(canonical),
+                "git_common_dir": str(common_dir),
+                "checkout_path": str(repository),
+                "checkout_key": checkout_key,
+                "owner_id": owner_id,
+                "expected_head": expected_head,
+                "expected_branch": None,
+                "source_identity_sha256": source_identity_sha256,
+                "lifecycle": lifecycle,
+                "retention": retention,
+                "path_resource_key": path_key,
+                "path_lease": dict(path_lease),
+                "effect_leases": [
+                    dict(cleanup_lease),
+                    dict(common_dir_lease),
+                ],
+            },
+        )
         mutation_attempted = True
         try:
             mutation_result = _mutating_git_result(
@@ -3744,11 +4760,11 @@ def _cleanup_auto_deploy_source_before_dispatch(
         try:
             release = _release_auto_deploy_source_resources(
                 owner_id,
-                [cleanup_key, path_key],
-                [cleanup_lease, path_lease],
+                [cleanup_key, common_dir_key, path_key],
+                [cleanup_lease, common_dir_lease, path_lease],
             )
             released = release.get("released")
-            if not isinstance(released, list) or len(released) != 2:
+            if not isinstance(released, list) or len(released) != 3:
                 post_remove_failures.append(
                     (
                         "resource-release",
@@ -3819,25 +4835,61 @@ def _cleanup_auto_deploy_source_before_dispatch(
                 "cleanup_receipt_sha256": receipt["receipt_sha256"],
             }
         )
+        if uncertainty_fence is not None and not uncertainty_fence_cleared:
+            checkouts._clear_checkout_operation_uncertainty(
+                uncertainty_fence["fence_id"],
+                outcome="confirmed_success",
+                evidence={
+                    "reason": "automatic deployment source cleanup finalized",
+                    "cleanup_receipt_sha256": receipt["receipt_sha256"],
+                },
+            )
+            uncertainty_fence_cleared = True
         return receipt
     except Exception as exc:
         cleanup_failures: list[tuple[str, Exception]] = []
+        if (
+            uncertainty_fence is not None
+            and not uncertainty_fence_cleared
+            and not mutation_attempted
+        ):
+            try:
+                checkouts._clear_checkout_operation_uncertainty(
+                    uncertainty_fence["fence_id"],
+                    outcome="confirmed_no_effect",
+                    evidence={
+                        "reason": "automatic deployment source cleanup stopped before mutation",
+                    },
+                )
+                uncertainty_fence_cleared = True
+            except Exception as cleanup_error:
+                cleanup_failures.append(("cleanup-uncertainty-fence-clear", cleanup_error))
         if not mutation_attempted:
-            candidate_cleanup_lease = cleanup_lease
-            if candidate_cleanup_lease is None:
-                try:
-                    candidate_cleanup_lease = _live_auto_deploy_source_lease_snapshot(
-                        cleanup_key, owner_id
-                    )
-                except Exception as cleanup_error:
-                    cleanup_failures.append(("cleanup-lease-readback", cleanup_error))
-                    candidate_cleanup_lease = None
-            if candidate_cleanup_lease is not None:
+            release_keys: list[str] = []
+            release_leases: list[dict[str, Any]] = []
+            for label, resource_key, candidate_lease in (
+                ("cleanup", cleanup_key, cleanup_lease),
+                ("common-dir", common_dir_key, common_dir_lease),
+            ):
+                if candidate_lease is None:
+                    try:
+                        candidate_lease = _live_auto_deploy_source_lease_snapshot(
+                            resource_key, owner_id
+                        )
+                    except Exception as cleanup_error:
+                        cleanup_failures.append(
+                            (f"{label}-lease-readback", cleanup_error)
+                        )
+                        candidate_lease = None
+                if candidate_lease is not None:
+                    release_keys.append(resource_key)
+                    release_leases.append(candidate_lease)
+            if release_keys:
                 try:
                     _release_auto_deploy_source_resources(
                         owner_id,
-                        [cleanup_key],
-                        [candidate_cleanup_lease],
+                        release_keys,
+                        release_leases,
                     )
                 except Exception as cleanup_error:
                     cleanup_failures.append(("cleanup-operation-release", cleanup_error))
@@ -3912,6 +4964,40 @@ def _source_identity_sha256(identity: dict[str, Any]) -> str:
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _require_target_deploy_runner(
+    repository: Path,
+    expected_head: str,
+) -> None:
+    if OBJECT_ID_RE.fullmatch(expected_head) is None:
+        raise RuntimeError("target deployment runner binding is invalid")
+    relative = RUNNER_RELATIVE_PATH.as_posix()
+    listing = _required_stdout(
+        _git_result(
+            repository,
+            "ls-tree",
+            "--full-tree",
+            expected_head,
+            "--",
+            relative,
+        ),
+        "target deployment runner lookup",
+    )
+    lines = [line for line in listing.splitlines() if line]
+    if len(lines) != 1:
+        raise RuntimeError("scheduled deployment runner is unavailable in target commit")
+    metadata, separator, path = lines[0].partition("\t")
+    fields = metadata.split()
+    if (
+        separator != "\t"
+        or path != relative
+        or len(fields) != 3
+        or fields[0] not in {"100644", "100755"}
+        or fields[1] != "blob"
+        or OBJECT_ID_RE.fullmatch(fields[2]) is None
+    ):
+        raise RuntimeError("scheduled deployment runner is unavailable in target commit")
 
 
 def _deployment_source_preflight(
@@ -4016,6 +5102,131 @@ def _deployment_source_preflight(
     }
 
 
+
+def _deployment_schedule_preflight(
+    expected_head: str,
+    source_repository: str | None,
+    source_lease_owner_id: str | None,
+) -> dict[str, Any]:
+    public_main = _fresh_public_github_main(expected_head)
+    if public_main != expected_head:
+        raise RuntimeError(
+            "fresh public GitHub main differs from deployment target: "
+            f"expected {expected_head}, found {public_main}"
+        )
+    if source_repository is not None:
+        repository, runner, source_identity = _deployment_source_preflight(
+            expected_head,
+            source_repository,
+            source_lease_owner_id,
+        )
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_schedule_preflight",
+            "resolution_mode": "bound-source",
+            "expected_head": expected_head,
+            "public_github_main": public_main,
+            "repository": str(repository),
+            "runner": str(runner),
+            "source_identity": source_identity,
+            "source_identity_sha256": source_identity["identity_sha256"],
+            "origin_main_refresh_required": False,
+            "canonical_state": None,
+            "ready": True,
+        }
+
+    try:
+        repository, runner, source_identity = _deployment_source_preflight(
+            expected_head,
+            None,
+            None,
+        )
+    except RuntimeError as canonical_error:
+        try:
+            canonical_state = _canonical_main_refresh_candidate(expected_head)
+        except Exception as fallback_error:
+            raise canonical_error from fallback_error
+        if (
+            canonical_state["current_head"] == expected_head
+            and canonical_state["current_branch"] == "main"
+            and canonical_state["origin_main"] == expected_head
+        ):
+            raise canonical_error
+        if (
+            canonical_state["current_branch"] == "main"
+            and canonical_state["origin_main"] == expected_head
+        ):
+            ancestor = _git_result(
+                Path(str(canonical_state["canonical_repository"])),
+                "merge-base",
+                "--is-ancestor",
+                str(canonical_state["current_head"]),
+                expected_head,
+            )
+            if ancestor.get("timed_out") or ancestor.get("returncode") != 0:
+                raise RuntimeError(
+                    "automatic deployment source requires current canonical main to be an "
+                    "ancestor of the deployment target"
+                )
+        materialization_required = (
+            canonical_state["current_head"] != expected_head
+            or canonical_state["current_branch"] != "main"
+        )
+        if materialization_required:
+            try:
+                root = AUTO_DEPLOY_SOURCE_ROOT
+                if root.is_symlink() or not root.is_dir():
+                    raise RuntimeError(
+                        f"automatic deployment source root is unavailable: {root}"
+                    )
+                resolved_root = root.resolve(strict=True)
+                if resolved_root != root or not resolved_root.is_dir():
+                    raise RuntimeError(
+                        "automatic deployment source root must be an exact real directory"
+                    )
+                if (
+                    canonical_state["current_head"] == expected_head
+                    or canonical_state["origin_main"] == expected_head
+                ):
+                    _require_target_deploy_runner(
+                        Path(str(canonical_state["canonical_repository"])),
+                        expected_head,
+                    )
+            except Exception as fallback_error:
+                raise canonical_error from fallback_error
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_schedule_preflight",
+            "resolution_mode": "scheduler-auto-source",
+            "expected_head": expected_head,
+            "public_github_main": public_main,
+            "repository": None,
+            "runner": None,
+            "source_identity": None,
+            "source_identity_sha256": None,
+            "origin_main_refresh_required": (
+                canonical_state["origin_main"] != expected_head
+            ),
+            "canonical_state": _canonical_main_refresh_state(canonical_state),
+            "ready": True,
+        }
+
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_schedule_preflight",
+        "resolution_mode": "bound-source",
+        "expected_head": expected_head,
+        "public_github_main": public_main,
+        "repository": str(repository),
+        "runner": str(runner),
+        "source_identity": source_identity,
+        "source_identity_sha256": source_identity["identity_sha256"],
+        "origin_main_refresh_required": False,
+        "canonical_state": None,
+        "ready": True,
+    }
+
+
 def _fresh_public_github_main(expected_head: str) -> str:
     if re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
         raise ValueError("public GitHub main verification requires one full SHA-1 commit id")
@@ -4082,18 +5293,107 @@ def _canonical_preflight(expected_head: str) -> tuple[Path, Path]:
     return repository, runner
 
 
-@mcp.tool(name="grabowski_runtime_deploy_schedule", annotations=DEPLOY_MUTATING)
-def grabowski_runtime_deploy_schedule(
+def _reconcile_inflight_auto_deploy_source(
+    expected_head: str,
+    inflight_units: list[Any],
+) -> tuple[Path, Path, dict[str, Any], str] | None:
+    if len(inflight_units) != 1:
+        return None
+    unit = inflight_units[0]
+    if not isinstance(unit, str) or not unit:
+        return None
+    try:
+        metadata = operator._read_job_metadata(unit)
+    except (OSError, PermissionError, ValueError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    command = metadata.get("argv")
+    fields = _deploy_command_fields(command)
+    if (
+        fields is None
+        or fields["expected_head"] != expected_head
+        or fields["source_kind"] != "detached-worktree"
+    ):
+        return None
+    repository = Path(fields["repository"])
+    prefix = f"{AUTO_DEPLOY_SOURCE_PREFIX}-{expected_head[:12]}-"
+    if repository.parent != AUTO_DEPLOY_SOURCE_ROOT or not repository.name.startswith(
+        prefix
+    ):
+        return None
+    generation = repository.name[len(prefix) :]
+    if re.fullmatch(r"[0-9a-f]{12}", generation) is None:
+        return None
+    owner_id = f"runtime-deploy-source:{expected_head[:12]}:{generation}"
+    observed_repository, runner, source_identity = _deployment_source_preflight(
+        expected_head,
+        str(repository),
+        owner_id,
+    )
+    if source_identity["identity_sha256"] != fields["source_identity_sha256"]:
+        raise RuntimeError(
+            "in-flight automatic deployment source identity drifted before retry"
+        )
+    return observed_repository, runner, source_identity, owner_id
+
+
+def _recovered_auto_deploy_source_binding(
+    expected_head: str,
+    repository: Path,
+    owner_id: str,
+    source_identity: dict[str, Any],
+) -> dict[str, Any]:
+    resource_key = f"path:{repository}"
+    lease_evidence = source_identity.get("lease_evidence")
+    if (
+        not isinstance(lease_evidence, dict)
+        or lease_evidence.get("resource_key") != resource_key
+    ):
+        raise RuntimeError(
+            "recovered automatic deployment source has malformed lease evidence"
+        )
+    path_lease = lease_evidence.get("lease")
+    required_lease_fields = (
+        "resource_key",
+        "owner_id",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
+    )
+    if (
+        not isinstance(path_lease, dict)
+        or path_lease.get("resource_key") != resource_key
+        or path_lease.get("owner_id") != owner_id
+        or any(path_lease.get(field) is None for field in required_lease_fields)
+    ):
+        raise RuntimeError(
+            "recovered automatic deployment source lease binding drifted"
+        )
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_auto_runtime_deploy_source_binding",
+        "repository": str(repository),
+        "owner_id": owner_id,
+        "expected_head": expected_head,
+        "path_resource_key": resource_key,
+        "path_lease": {
+            field: path_lease[field] for field in required_lease_fields
+        },
+    }
+
+
+def _grabowski_runtime_deploy_schedule_impl(
     expected_head: ExpectedHead,
     delay_seconds: DelaySeconds = 8,
     source_repository: SourceRepository | None = None,
     source_lease_owner_id: SourceLeaseOwner | None = None,
     ctx: Context | None = None,
+    *,
+    local_mutation_tracker: dict[str, Any],
 ) -> dict[str, Any]:
-    """Schedule one source-identity-bound self-deployment, reusing an identical in-flight job."""
-    operator._require_operator_mutation("durable_job")
-    operator._require_operator_capability("git_cli")
-    operator._require_operator_capability("privileged_reference")
+    """Implement one source-identity-bound self-deployment schedule attempt."""
     with _deploy_schedule_lock():
         public_github_main_before = _fresh_public_github_main(expected_head)
         if public_github_main_before != expected_head:
@@ -4102,6 +5402,7 @@ def grabowski_runtime_deploy_schedule(
                 f"expected {expected_head}, found {public_github_main_before}"
             )
         automatic_source: dict[str, Any] | None = None
+        automatic_source_binding: dict[str, Any] | None = None
         automatic_source_needed = False
         origin_main_refresh: dict[str, Any] | None = None
         canonical_refresh_snapshot: dict[str, Any] | None = None
@@ -4130,6 +5431,7 @@ def grabowski_runtime_deploy_schedule(
                     canonical_refresh_snapshot = refresh_candidate
                     automatic_source_needed = (
                         refresh_candidate["current_head"] != expected_head
+                        or refresh_candidate.get("current_branch") != "main"
                     )
                 else:
                     if stale_snapshot is None:
@@ -4141,17 +5443,138 @@ def grabowski_runtime_deploy_schedule(
                 source_repository,
                 source_lease_owner_id,
             )
-        if canonical_refresh_snapshot is not None:
-            origin_main_refresh = _refresh_canonical_origin_main(
-                expected_head, canonical_refresh_snapshot
+
+        # Classify every pending/running deployment before any shared-ref refresh.
+        # The schedule lock prevents a cooperating scheduler from entering after
+        # this snapshot; stale pre-dispatch reservations are reconciled here for
+        # both automatic and explicitly bound sources.
+        inflight_before_resolution = inflight_runtime_job_evidence(
+            reconcile_stale_pending=True
+        )
+        deploy_index_mutation = inflight_before_resolution.get(
+            "deploy_index_mutation"
+        )
+        if deploy_index_mutation is not None and not isinstance(
+            deploy_index_mutation, dict
+        ):
+            raise RuntimeError(
+                "deployment source preflight returned malformed deploy-index mutation evidence"
             )
+        if deploy_index_mutation is not None:
+            local_mutation_tracker["deploy_index_mutation"] = dict(
+                deploy_index_mutation
+            )
+        local_mutation_evidence = inflight_before_resolution.get(
+            "stale_pending_reconciliation"
+        )
+        if local_mutation_evidence is not None and not isinstance(
+            local_mutation_evidence, dict
+        ):
+            raise RuntimeError(
+                "deployment source preflight returned malformed local mutation evidence"
+            )
+        if local_mutation_evidence is not None:
+            local_mutation_tracker["stale_pending_reconciliation"] = dict(
+                local_mutation_evidence
+            )
+        inflight_error = inflight_before_resolution.get("error")
+        if inflight_error:
+            raise RuntimeError(
+                "deployment source preflight could not classify in-flight runtime jobs: "
+                f"{inflight_error}"
+            )
+        inflight_units = inflight_before_resolution.get("inflight_units")
+        if not isinstance(inflight_units, list):
+            raise RuntimeError(
+                "deployment source preflight returned malformed in-flight runtime evidence"
+            )
+        if source_repository is None and inflight_units:
+            recovered_source = _reconcile_inflight_auto_deploy_source(
+                expected_head,
+                inflight_units,
+            )
+            if recovered_source is not None:
+                (
+                    repository,
+                    runner,
+                    source_identity,
+                    recovered_owner_id,
+                ) = recovered_source
+                effective_source_repository = str(repository)
+                effective_source_lease_owner_id = recovered_owner_id
+                automatic_source_binding = _recovered_auto_deploy_source_binding(
+                    expected_head,
+                    repository,
+                    recovered_owner_id,
+                    source_identity,
+                )
+                automatic_source_needed = False
+                # Reusing the already scheduled detached source must not mutate
+                # Git-common refs underneath that running deployment.
+                canonical_refresh_snapshot = None
+            elif canonical_refresh_snapshot is not None or automatic_source_needed:
+                raise RuntimeError(
+                    "automatic deployment source refuses to refresh or materialize while "
+                    "a runtime job is already in flight: "
+                    + ", ".join(str(unit) for unit in inflight_units)
+                )
+
+        if canonical_refresh_snapshot is not None:
+            try:
+                origin_main_refresh = _refresh_canonical_origin_main(
+                    expected_head, canonical_refresh_snapshot
+                )
+                local_mutation_tracker["origin_main_refresh"] = dict(
+                    origin_main_refresh
+                )
+            except DeployScheduleFailureAfterLocalMutation as exc:
+                local_mutation_tracker["origin_main_refresh"] = dict(
+                    exc.local_mutation_evidence
+                )
+                combined_evidence = _tracked_runtime_deploy_local_mutation_evidence(
+                    local_mutation_tracker
+                )
+                if not isinstance(combined_evidence, dict):
+                    raise
+                raise DeployScheduleFailureAfterLocalMutation(
+                    str(exc),
+                    local_mutation_evidence=combined_evidence,
+                ) from exc
+            except DeploySchedulePreEffectRefusal as exc:
+                reconciliation = inflight_before_resolution.get(
+                    "stale_pending_reconciliation"
+                )
+                if reconciliation is None:
+                    raise
+                if not isinstance(reconciliation, dict):
+                    raise RuntimeError(
+                        "stale pending reconciliation evidence is malformed"
+                    ) from exc
+                raise DeploySchedulePreEffectRefusal(
+                    str(exc),
+                    local_mutation_evidence=reconciliation,
+                ) from exc
             if not automatic_source_needed:
                 repository, runner, source_identity = _deployment_source_preflight(
                     expected_head,
                     None,
                     None,
                 )
-        authority = privileged.ensure_rootbroker_authority(expected_head)
+        try:
+            authority = privileged.ensure_rootbroker_authority(expected_head)
+        except Exception as exc:
+            authority_result = getattr(exc, "authority_result", None)
+            authority_effect = _rootbroker_authority_effect_evidence(
+                authority_result, expected_head
+            )
+            if authority_effect is not None:
+                local_mutation_tracker["rootbroker_authority"] = authority_effect
+            raise
+        authority_effect = _rootbroker_authority_effect_evidence(
+            authority, expected_head
+        )
+        if authority_effect is not None:
+            local_mutation_tracker["rootbroker_authority"] = authority_effect
         if not authority.get("success"):
             raise RuntimeError(
                 "Rootbroker authority refresh failed before deployment scheduling: "
@@ -4185,31 +5608,39 @@ def grabowski_runtime_deploy_schedule(
                 effective_source_repository = None
                 effective_source_lease_owner_id = None
         if automatic_source_needed:
-            inflight_before_materialization = inflight_runtime_job_evidence()
-            inflight_error = inflight_before_materialization.get("error")
-            if inflight_error:
-                raise RuntimeError(
-                    "automatic deployment source preflight could not classify "
-                    f"in-flight runtime jobs: {inflight_error}"
+            _require_target_deploy_runner(
+                _validated_repository_path(
+                    CANONICAL_REPOSITORY,
+                    label="canonical repository",
+                ),
+                expected_head,
+            )
+            try:
+                (
+                    repository,
+                    runner,
+                    source_identity,
+                    automatic_source,
+                ) = _materialize_auto_deploy_source(
+                    expected_head,
+                    local_mutation_tracker=local_mutation_tracker,
                 )
-            inflight_units = inflight_before_materialization.get("inflight_units")
-            if not isinstance(inflight_units, list):
-                raise RuntimeError(
-                    "automatic deployment source preflight returned malformed in-flight runtime evidence"
+            except DeployScheduleFailureAfterLocalMutation as exc:
+                local_mutation_tracker["auto_source_materialization"] = dict(
+                    exc.local_mutation_evidence
                 )
-            if inflight_units:
-                raise RuntimeError(
-                    "automatic deployment source refuses to materialize while a runtime job is already in flight: "
-                    + ", ".join(str(unit) for unit in inflight_units)
+                combined_evidence = _tracked_runtime_deploy_local_mutation_evidence(
+                    local_mutation_tracker
                 )
-            (
-                repository,
-                runner,
-                source_identity,
-                automatic_source,
-            ) = _materialize_auto_deploy_source(expected_head)
+                if not isinstance(combined_evidence, dict):
+                    raise
+                raise DeployScheduleFailureAfterLocalMutation(
+                    str(exc),
+                    local_mutation_evidence=combined_evidence,
+                ) from exc
             effective_source_repository = str(repository)
             effective_source_lease_owner_id = automatic_source["owner_id"]
+            automatic_source_binding = automatic_source
         if repository is None or runner is None or source_identity is None:
             raise RuntimeError("deployment source resolution did not produce a bound source")
         try:
@@ -4333,7 +5764,10 @@ def grabowski_runtime_deploy_schedule(
                 scheduled=observed,
                 already_scheduled=True,
                 source_identity=source_identity,
-                automatic_source=automatic_source,
+                automatic_source=automatic_source_binding,
+                local_mutation_evidence=_tracked_runtime_deploy_local_mutation_evidence(
+                    local_mutation_tracker
+                ),
             )
 
         intent = {
@@ -4343,7 +5777,7 @@ def grabowski_runtime_deploy_schedule(
             "delay_seconds": delay_seconds,
             "source_identity": source_identity,
             "source_identity_sha256": source_identity["identity_sha256"],
-            "automatic_source": automatic_source,
+            "automatic_source": automatic_source_binding,
             "origin_main_refresh": origin_main_refresh,
             "public_github_main": {
                 "repository": PUBLIC_GITHUB_REPOSITORY_URL,
@@ -4448,11 +5882,19 @@ def grabowski_runtime_deploy_schedule(
                 ) from exc
             raise
         assert jobs_root is not None and index is not None and reserved_unit is not None
-        _write_deploy_index(
-            jobs_root,
-            units=[*index["units"], reserved_unit],
-            pending_unit=None,
-        )
+        # A returned job is registered. Later bookkeeping must retain its
+        # identity and source authority instead of reporting a failed dispatch.
+        post_dispatch_warnings = list(job.get("post_dispatch_warnings") or [])
+        try:
+            _write_deploy_index(
+                jobs_root,
+                units=[*index["units"], reserved_unit],
+                pending_unit=None,
+            )
+        except Exception as exc:  # noqa: BLE001 - effect already dispatched
+            post_dispatch_warnings.append(
+                f"deploy index bookkeeping failed, pending_unit may be stale: {exc}"
+            )
         scheduled = {
             "timestamp_unix": int(time.time()),
             "operation": "runtime-deploy-scheduled",
@@ -4462,7 +5904,11 @@ def grabowski_runtime_deploy_schedule(
             "argv_sha256": job["argv_sha256"],
             "source_identity_sha256": source_identity["identity_sha256"],
         }
-        _append_deploy_audit(scheduled)
+        try:
+            _append_deploy_audit(scheduled)
+        except Exception as exc:  # noqa: BLE001 - effect already dispatched
+            post_dispatch_warnings.append(f"scheduled audit append failed: {exc}")
+            scheduled = None
         return _schedule_result(
             expected_head=expected_head,
             requested_delay_seconds=delay_seconds,
@@ -4472,6 +5918,55 @@ def grabowski_runtime_deploy_schedule(
             scheduled=scheduled,
             already_scheduled=False,
             source_identity=source_identity,
-            automatic_source=automatic_source,
+            automatic_source=automatic_source_binding,
+            local_mutation_evidence=_tracked_runtime_deploy_local_mutation_evidence(
+                local_mutation_tracker
+            ),
             deployment_observer_capability=observer_capability,
+            post_dispatch_warnings=post_dispatch_warnings,
         )
+
+@mcp.tool(name="grabowski_runtime_deploy_schedule", annotations=DEPLOY_MUTATING)
+def grabowski_runtime_deploy_schedule(
+    expected_head: ExpectedHead,
+    delay_seconds: DelaySeconds = 8,
+    source_repository: SourceRepository | None = None,
+    source_lease_owner_id: SourceLeaseOwner | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Schedule one source-identity-bound self-deployment, reusing an identical in-flight job."""
+    operator._require_operator_mutation("durable_job")
+    operator._require_operator_capability("git_cli")
+    operator._require_operator_capability("privileged_reference")
+    local_mutation_tracker: dict[str, Any] = {}
+    try:
+        return _grabowski_runtime_deploy_schedule_impl(
+            expected_head,
+            delay_seconds,
+            source_repository,
+            source_lease_owner_id,
+            ctx,
+            local_mutation_tracker=local_mutation_tracker,
+        )
+    except DeploySchedulePreEffectRefusal as exc:
+        evidence = _tracked_runtime_deploy_local_mutation_evidence(
+            local_mutation_tracker
+        )
+        if evidence is None or getattr(exc, "local_mutation_evidence", None) is not None:
+            raise
+        raise DeploySchedulePreEffectRefusal(
+            str(exc),
+            local_mutation_evidence=evidence,
+        ) from exc
+    except DeployScheduleFailureAfterLocalMutation:
+        raise
+    except Exception as exc:
+        evidence = _tracked_runtime_deploy_local_mutation_evidence(
+            local_mutation_tracker
+        )
+        if not isinstance(evidence, dict):
+            raise
+        raise DeployScheduleFailureAfterLocalMutation(
+            str(exc),
+            local_mutation_evidence=evidence,
+        ) from exc

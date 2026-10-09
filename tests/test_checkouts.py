@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -46,6 +47,7 @@ if "mcp" not in sys.modules:
 
 
 import grabowski_checkouts as checkouts
+import grabowski_operator_obligation as obligations
 import grabowski_work_admission as work_admission
 
 
@@ -73,6 +75,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
             patch.object(checkouts, "CHECKOUT_DB", self.checkout_db),
             patch.object(checkouts, "ARCHIVE_ROOT", self.archive_root),
             patch.object(checkouts, "CHECKOUT_LOCK", self.root / "state" / "checkouts.lock"),
+            patch.object(
+                checkouts,
+                "AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK",
+                self.root / "state" / "runtime-deploy-schedule.lock",
+            ),
             patch.object(checkouts.resources, "RESOURCE_DB", self.resource_db),
             patch.object(checkouts.tasks, "TASK_DB", self.task_db),
             patch.object(checkouts.operator, "_safe_environment", return_value=os.environ.copy()),
@@ -80,6 +87,15 @@ class CheckoutLifecycleTests(unittest.TestCase):
             patch.object(checkouts.operator, "_require_operator_capability"),
             patch.object(checkouts.base, "_append_audit"),
             patch.object(checkouts, "_processes_under", return_value=[]),
+            patch.dict(
+                os.environ,
+                {
+                    "GRABOWSKI_OPERATOR_OBLIGATION_ROOT": str(
+                        self.root / "state" / "operator-obligations"
+                    )
+                },
+            ),
+            patch.object(obligations.alert_outbox, "enqueue_and_schedule"),
         ]
         for item in self.patches:
             item.start()
@@ -96,6 +112,37 @@ class CheckoutLifecycleTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+        )
+
+    def test_operation_lock_deadline_uses_nonblocking_bounded_wait(self) -> None:
+        lock_attempt = checkouts.fcntl.LOCK_EX | checkouts.fcntl.LOCK_NB
+        calls: list[int] = []
+
+        def flock(_descriptor: int, operation: int) -> None:
+            calls.append(operation)
+            if operation == lock_attempt:
+                raise BlockingIOError
+            self.fail(f"unexpected flock operation: {operation}")
+
+        with (
+            patch.object(checkouts.fcntl, "flock", side_effect=flock),
+            patch.object(
+                checkouts.time,
+                "monotonic",
+                side_effect=[0.0, 1.0],
+            ),
+            patch.object(checkouts.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Checkout operation lock deadline exceeded",
+            ),
+        ):
+            with checkouts._operation_lock(deadline_monotonic=1.0):
+                self.fail("deadline-bounded checkout lock must not be acquired")
+
+        self.assertEqual(calls, [lock_attempt])
+        sleep.assert_called_once_with(
+            checkouts.CHECKOUT_OPERATION_LOCK_POLL_SECONDS
         )
 
     def _publish_remote(self) -> None:
@@ -153,6 +200,145 @@ class CheckoutLifecycleTests(unittest.TestCase):
             archive["retention_until_unix"] = created_at
         return result
 
+    def _expire_uncertainty_lease(self, fence: dict[str, object]) -> None:
+        with checkouts.resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET expires_at_unix=? WHERE owner_id=?",
+                (int(time.time()) - 1, fence["lease_owner_id"]),
+            )
+            connection.commit()
+
+    def _partial_archive_after_manifest_without_db(
+        self,
+        *,
+        managed: bool = True,
+        retention_until_unix: int | None = None,
+        advance_managed_checkout: bool = False,
+        source_kind: str = "bureau_task",
+        source_id: str = "GRABOWSKI-OPERATOR-SURFACE-V1-T095",
+        completed_retained: bool = False,
+        blocked_followup_reconciliation: bool = False,
+    ) -> dict[str, object]:
+        archive_head = self.head
+        if managed:
+            managed_binding = self._managed_binding(
+                owner="owner-a",
+                source_kind=source_kind,
+                source_id=source_id,
+            )
+            if completed_retained:
+                checkouts._mark_checkout_completed_retained(
+                    checkout_key=str(managed_binding["checkout_key"]),
+                    owner_id="owner-a",
+                    expected_head=self.head,
+                    expected_branch="topic",
+                )
+                if blocked_followup_reconciliation:
+                    self._record_terminal_reconciliation(
+                        managed_binding,
+                        terminal_state="blocked_with_durable_followup",
+                        lease_release_ready=False,
+                    )
+            if advance_managed_checkout:
+                self._git(
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "advance managed checkout",
+                    cwd=self.checkout,
+                )
+                archive_head = self._git(
+                    "rev-parse", "HEAD", cwd=self.checkout
+                ).stdout.strip()
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+        real_database = checkouts._database
+        real_write = checkouts._write_json_evidence
+        manifest_written = [False]
+
+        def write_and_mark(path, payload):
+            real_write(path, payload)
+            manifest_written[0] = True
+
+        def database_after_manifest():
+            if manifest_written[0]:
+                raise sqlite3.OperationalError(
+                    "simulated archive database failure after manifest"
+                )
+            return real_database()
+
+        with (
+            patch.object(checkouts, "_write_json_evidence", side_effect=write_and_mark),
+            patch.object(checkouts, "_database", side_effect=database_after_manifest),
+        ):
+            with self.assertRaisesRegex(
+                sqlite3.OperationalError,
+                "database failure after manifest",
+            ):
+                checkouts.grabowski_checkout_archive(
+                    str(self.repo),
+                    str(self.checkout),
+                    "owner-a",
+                    "partial archive completion fixture",
+                    (
+                        int(time.time()) + 3600
+                        if retention_until_unix is None
+                        else retention_until_unix
+                    ),
+                    archive_head,
+                    "topic",
+                    expected_physical_identity=expected_identity,
+                )
+        fences = checkouts._active_checkout_operation_uncertainties()
+        self.assertEqual(len(fences), 1)
+        fence = fences[0]
+        self._expire_uncertainty_lease(fence)
+        return fence
+
+    def _strand_recovery_lease_after_archive_commit(
+        self,
+    ) -> tuple[dict[str, object], str]:
+        fence = self._partial_archive_after_manifest_without_db()
+        real_release = checkouts.resources.release_resources
+        stranded_owner = [None]
+
+        def fail_recovery_release(owner_id, resource_keys, **kwargs):
+            if str(owner_id).startswith("checkout-reconcile:"):
+                stranded_owner[0] = str(owner_id)
+                raise RuntimeError("simulated recovery release crash")
+            return real_release(owner_id, resource_keys, **kwargs)
+
+        with patch.object(
+            checkouts.resources,
+            "release_resources",
+            side_effect=fail_recovery_release,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "simulated recovery release crash",
+            ):
+                checkouts.grabowski_checkout_uncertainty_reconcile(
+                    fence["fence_id"],
+                    "reconcile-checkout-operation-outcome",
+                )
+        owner = stranded_owner[0]
+        self.assertIsInstance(owner, str)
+        archive = checkouts._load_archive(fence["operation_id"])
+        self.assertEqual(archive["head"], self.head)
+        self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)
+        with checkouts.resources._database() as connection:
+            rows = connection.execute(
+                "SELECT * FROM leases WHERE owner_id=? ORDER BY resource_key",
+                (owner,),
+            ).fetchall()
+        self.assertEqual(
+            {row["resource_key"] for row in rows},
+            set(fence["resource_keys"]),
+        )
+        return fence, owner
+
+
     def _insert_running_task(
         self, *, marker: str, cwd: Path, resource_keys: list[str]
     ) -> None:
@@ -200,6 +386,8 @@ class CheckoutLifecycleTests(unittest.TestCase):
         *,
         owner: str = "owner-a",
         retention_seconds: int = 3600,
+        source_kind: str = "bureau_task",
+        source_id: str = "GRABOWSKI-OPERATOR-SURFACE-V1-T095",
     ) -> dict[str, object]:
         common_dir = self._common_dir()
         retained_until = int(time.time()) + retention_seconds
@@ -209,8 +397,8 @@ class CheckoutLifecycleTests(unittest.TestCase):
             checkout_path=self.checkout,
             owner_id=owner,
             purpose="managed lifecycle fixture",
-            source_kind="bureau_task",
-            source_id="GRABOWSKI-OPERATOR-SURFACE-V1-T095",
+            source_kind=source_kind,
+            source_id=source_id,
             artifact_class="implementation_worktree",
             retention_until_unix=retained_until,
             expected_head=self.head,
@@ -228,6 +416,84 @@ class CheckoutLifecycleTests(unittest.TestCase):
             expected_branch="topic",
         )
         return binding
+
+    def _record_terminal_reconciliation(
+        self,
+        binding: dict[str, object],
+        *,
+        terminal_state: str,
+        lease_release_ready: bool,
+    ) -> dict[str, object]:
+        checkout_key = str(binding["checkout_key"])
+        lifecycle = checkouts._strict_lifecycle_binding(checkout_key)
+        self.assertIsNotNone(lifecycle)
+        assert lifecycle is not None
+        retention = checkouts._retention_records([checkout_key])[checkout_key]
+        source = lifecycle["source"]
+        self.assertIsInstance(source, dict)
+        source_core = {
+            "schema_version": 1,
+            "kind": "work_lane",
+            "source_id": source["id"],
+            "terminal_state": terminal_state,
+            "lease_release_ready": lease_release_ready,
+        }
+        if terminal_state == "blocked_with_durable_followup":
+            source_core["checkout_key"] = checkout_key
+        source_evidence = {
+            **source_core,
+            "evidence_sha256": checkouts._sha256_json(source_core),
+        }
+        preview_sha256 = checkouts._sha256_json(
+            {"checkout_key": checkout_key, "terminal_state": terminal_state}
+        )
+        receipt_core = {
+            "schema_version": 1,
+            "kind": "checkout_terminal_reconciliation_receipt",
+            "checkout_key": checkout_key,
+            "reconciliation_mode": "present_retained",
+            "checkout_preserved": True,
+            "owner_id": lifecycle["owner_id"],
+            "binding_after": lifecycle,
+            "binding_after_sha256": checkouts._sha256_json(lifecycle),
+            "retention_after": retention,
+            "retention_after_sha256": checkouts._sha256_json(retention),
+            "source_evidence": source_evidence,
+            "source_evidence_sha256": source_evidence["evidence_sha256"],
+            "preview_sha256": preview_sha256,
+        }
+        receipt = {
+            **receipt_core,
+            "receipt_sha256": checkouts._sha256_json(receipt_core),
+        }
+        now = int(time.time())
+        with checkouts._database() as connection:
+            connection.execute(
+                """
+                INSERT INTO terminal_reconciliations(
+                    checkout_key, owner_id, binding_before_sha256,
+                    retention_sha256, source_evidence_json,
+                    source_evidence_sha256, preview_sha256,
+                    preview_created_at_unix, applied_at_unix,
+                    receipt_json, receipt_sha256
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    checkout_key,
+                    lifecycle["owner_id"],
+                    checkouts._sha256_json(lifecycle),
+                    checkouts._sha256_json(retention),
+                    checkouts._canonical_json(source_evidence),
+                    source_evidence["evidence_sha256"],
+                    preview_sha256,
+                    now,
+                    now,
+                    checkouts._canonical_json(receipt),
+                    receipt["receipt_sha256"],
+                ),
+            )
+            connection.commit()
+        return receipt
 
     def _repo_path_drift_managed_checkout(self) -> dict[str, object]:
         binding = self._managed_binding(owner="owner-a")
@@ -408,6 +674,366 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(archive["audit"]["coordination_checked"]["processes"], 0)
 
 
+    def test_archive_ordinary_completed_work_lane_does_not_reread_terminal_source(self) -> None:
+        lane_id = "9" * 32
+        binding = self._managed_binding(
+            source_kind="work_lane",
+            source_id=lane_id,
+        )
+        checkouts._mark_checkout_completed_retained(
+            checkout_key=str(binding["checkout_key"]),
+            owner_id="owner-a",
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        self._record_terminal_reconciliation(
+            binding,
+            terminal_state="pr_opened",
+            lease_release_ready=True,
+        )
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                side_effect=RuntimeError("historical lane unavailable"),
+            ) as source_evidence,
+            patch(
+                "grabowski_checkout_terminal_sources.blocked_followup_binding_authority",
+            ) as archive_authority,
+        ):
+            result = checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "ordinary terminal lane remains archivable",
+                int(time.time()) + 3600,
+                self.head,
+                "topic",
+            )
+        source_evidence.assert_not_called()
+        archive_authority.assert_not_called()
+        self.assertEqual("archived", result["lifecycle_binding"]["phase"])
+        self.assertIsNone(result["audit"]["blocked_followup_archive_evidence"])
+
+    def test_archive_blocks_nonterminal_followup_after_capacity_release(self) -> None:
+        lane_id = "a" * 32
+        binding = self._managed_binding(
+            source_kind="work_lane",
+            source_id=lane_id,
+        )
+        checkouts._mark_checkout_completed_retained(
+            checkout_key=str(binding["checkout_key"]),
+            owner_id="owner-a",
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        self._record_terminal_reconciliation(
+            binding,
+            terminal_state="blocked_with_durable_followup",
+            lease_release_ready=False,
+        )
+        evidence = {
+            "terminal_state": "blocked_with_durable_followup",
+        }
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=evidence,
+            ),
+            patch(
+                "grabowski_checkout_terminal_sources.blocked_followup_binding_authority",
+                return_value=None,
+            ) as archive_gate,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "capacity release does not authorize checkout archive",
+            ),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "must stay retained while followup is open",
+                int(time.time()) + 3600,
+                self.head,
+                "topic",
+            )
+        archive_gate.assert_called_once_with(
+            evidence,
+            str(binding["checkout_key"]),
+            require_terminal_task=True,
+        )
+        current = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("completed_retained", current["phase"])
+        self.assertEqual({}, checkouts._latest_archives([str(binding["checkout_key"])]))
+
+    def test_archive_allows_capacity_released_lane_after_followup_is_terminal(self) -> None:
+        lane_id = "b" * 32
+        binding = self._managed_binding(
+            source_kind="work_lane",
+            source_id=lane_id,
+        )
+        checkouts._mark_checkout_completed_retained(
+            checkout_key=str(binding["checkout_key"]),
+            owner_id="owner-a",
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        self._record_terminal_reconciliation(
+            binding,
+            terminal_state="blocked_with_durable_followup",
+            lease_release_ready=False,
+        )
+        evidence = {
+            "terminal_state": "blocked_with_durable_followup",
+        }
+        followup_authority = {
+            "kind": "work_lane_blocked_followup_authority",
+            "authority_sha256": "a" * 64,
+        }
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=evidence,
+            ),
+            patch(
+                "grabowski_checkout_terminal_sources.blocked_followup_binding_authority",
+                return_value=followup_authority,
+            ) as archive_gate,
+        ):
+            result = checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "followup is terminal",
+                int(time.time()) + 3600,
+                self.head,
+                "topic",
+            )
+        self.assertEqual(3, archive_gate.call_count)
+        for call in archive_gate.call_args_list:
+            self.assertEqual(
+                call.args,
+                (evidence, str(binding["checkout_key"])),
+            )
+            self.assertEqual(call.kwargs, {"require_terminal_task": True})
+        self.assertEqual("archived", result["lifecycle_binding"]["phase"])
+        archive_evidence = result["audit"]["blocked_followup_archive_evidence"]
+        self.assertEqual(evidence, archive_evidence["source_evidence"])
+        self.assertEqual(
+            followup_authority,
+            archive_evidence["followup_authority"],
+        )
+        self.assertEqual(
+            checkouts._sha256_json(
+                {
+                    "source_evidence": evidence,
+                    "followup_authority": followup_authority,
+                }
+            ),
+            archive_evidence["authority_sha256"],
+        )
+
+    def test_archive_revalidates_followup_authority_after_resource_acquisition(self) -> None:
+        lane_id = "c" * 32
+        binding = self._managed_binding(
+            source_kind="work_lane",
+            source_id=lane_id,
+        )
+        checkout_key = str(binding["checkout_key"])
+        checkouts._mark_checkout_completed_retained(
+            checkout_key=checkout_key,
+            owner_id="owner-a",
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        self._record_terminal_reconciliation(
+            binding,
+            terminal_state="blocked_with_durable_followup",
+            lease_release_ready=False,
+        )
+        evidence = {
+            "terminal_state": "blocked_with_durable_followup",
+        }
+        followup_authority = {
+            "kind": "work_lane_blocked_followup_authority",
+            "authority_sha256": "a" * 64,
+        }
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=evidence,
+            ),
+            patch(
+                "grabowski_checkout_terminal_sources.blocked_followup_binding_authority",
+                side_effect=[followup_authority, None],
+            ) as archive_gate,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "capacity release does not authorize checkout archive",
+            ),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "followup changed after lease acquisition",
+                int(time.time()) + 3600,
+                self.head,
+                "topic",
+            )
+        self.assertEqual(2, archive_gate.call_count)
+        current = checkouts._lifecycle_bindings([checkout_key])[checkout_key]
+        self.assertEqual("completed_retained", current["phase"])
+        self.assertEqual({}, checkouts._latest_archives([checkout_key]))
+
+    def test_archive_rejects_followup_evidence_drift_after_resource_acquisition(self) -> None:
+        lane_id = "d" * 32
+        binding = self._managed_binding(
+            source_kind="work_lane",
+            source_id=lane_id,
+        )
+        checkout_key = str(binding["checkout_key"])
+        checkouts._mark_checkout_completed_retained(
+            checkout_key=checkout_key,
+            owner_id="owner-a",
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        self._record_terminal_reconciliation(
+            binding,
+            terminal_state="blocked_with_durable_followup",
+            lease_release_ready=False,
+        )
+        evidence = {
+            "terminal_state": "blocked_with_durable_followup",
+            "evidence_sha256": "e" * 64,
+        }
+        authority_before = {
+            "kind": "work_lane_blocked_followup_authority",
+            "durable_followup_binding": {
+                "task_revision": 3,
+                "task_spec_sha256": "a" * 64,
+                "task_state": "verified",
+            },
+            "authority_sha256": "1" * 64,
+        }
+        authority_after = {
+            "kind": "work_lane_blocked_followup_authority",
+            "durable_followup_binding": {
+                "task_revision": 4,
+                "task_spec_sha256": "b" * 64,
+                "task_state": "verified",
+            },
+            "authority_sha256": "2" * 64,
+        }
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=evidence,
+            ) as source_evidence,
+            patch(
+                "grabowski_checkout_terminal_sources.blocked_followup_binding_authority",
+                side_effect=[authority_before, authority_after],
+            ) as archive_authority,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "archive authority changed during archive preflight",
+            ),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "followup authority changed after lease acquisition",
+                int(time.time()) + 3600,
+                self.head,
+                "topic",
+            )
+        self.assertEqual(2, source_evidence.call_count)
+        self.assertEqual(2, archive_authority.call_count)
+        current = checkouts._lifecycle_bindings([checkout_key])[checkout_key]
+        self.assertEqual("completed_retained", current["phase"])
+        self.assertEqual({}, checkouts._latest_archives([checkout_key]))
+
+    def test_archive_revalidates_followup_authority_at_commit_boundary(self) -> None:
+        lane_id = "e" * 32
+        binding = self._managed_binding(
+            source_kind="work_lane",
+            source_id=lane_id,
+        )
+        checkout_key = str(binding["checkout_key"])
+        checkouts._mark_checkout_completed_retained(
+            checkout_key=checkout_key,
+            owner_id="owner-a",
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        self._record_terminal_reconciliation(
+            binding,
+            terminal_state="blocked_with_durable_followup",
+            lease_release_ready=False,
+        )
+        evidence = {
+            "terminal_state": "blocked_with_durable_followup",
+            "evidence_sha256": "e" * 64,
+        }
+        authority_before = {
+            "kind": "work_lane_blocked_followup_authority",
+            "durable_followup_binding": {
+                "task_revision": 3,
+                "task_spec_sha256": "a" * 64,
+                "task_state": "verified",
+            },
+            "authority_sha256": "1" * 64,
+        }
+        authority_at_commit = {
+            "kind": "work_lane_blocked_followup_authority",
+            "durable_followup_binding": {
+                "task_revision": 4,
+                "task_spec_sha256": "b" * 64,
+                "task_state": "verified",
+            },
+            "authority_sha256": "2" * 64,
+        }
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=evidence,
+            ),
+            patch(
+                "grabowski_checkout_terminal_sources.blocked_followup_binding_authority",
+                side_effect=[
+                    authority_before,
+                    authority_before,
+                    authority_at_commit,
+                ],
+            ) as archive_authority,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "archive authority changed at archive commit boundary",
+            ),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "followup changes during archive materialization",
+                int(time.time()) + 3600,
+                self.head,
+                "topic",
+            )
+
+        self.assertEqual(3, archive_authority.call_count)
+        current = checkouts._lifecycle_bindings([checkout_key])[checkout_key]
+        self.assertEqual("completed_retained", current["phase"])
+        self.assertEqual({}, checkouts._latest_archives([checkout_key]))
+        self.assertEqual(
+            1,
+            len(checkouts._active_checkout_operation_uncertainties()),
+        )
+
     def test_archive_converges_managed_binding_to_terminal_identity(self) -> None:
         self._managed_binding()
         (self.checkout / "README.md").write_text("terminal head\n", encoding="utf-8")
@@ -465,6 +1091,117 @@ class CheckoutLifecycleTests(unittest.TestCase):
             self._publish_remote()
         self._git("checkout", "--detach", merge_head, cwd=self.checkout)
         return topic_head, merge_head
+
+    def test_partial_terminal_detached_archive_reconciles_bound_transition(self) -> None:
+        binding = self._managed_binding()
+        topic_head, merge_head = self._detached_merged_topic()
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=self._terminal_source_evidence(),
+            ),
+            patch.object(
+                checkouts,
+                "_mark_checkout_archived_in_connection",
+                side_effect=RuntimeError("simulated detached lifecycle failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated detached lifecycle failure"),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "partial terminal detached archive",
+                int(time.time()) + 3600,
+                merge_head,
+                None,
+                expected_physical_identity=expected_identity,
+            )
+
+        fence = checkouts._active_checkout_operation_uncertainties()[0]
+        transition = fence["evidence"].get("terminal_detached_transition")
+        self.assertIsInstance(transition, dict)
+        self.assertEqual(transition["expected_head"], binding["expected_head"])
+        self.assertEqual(transition["expected_branch"], "topic")
+        self.assertEqual(transition["branch_head"], topic_head)
+        self.assertEqual(transition["detached_head"], merge_head)
+
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["terminal_detached_transition"], transition)
+
+        unbound_evidence = dict(fence["evidence"])
+        unbound_evidence.pop("terminal_detached_transition")
+        self.assertEqual(
+            checkouts._partial_archive_manifest(unbound_evidence)["state"],
+            "invalid",
+        )
+
+        self._expire_uncertainty_lease(fence)
+        readback = checkouts._archive_uncertainty_readback(fence)
+        self.assertEqual(readback["state"], "recoverable_complete")
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(reconciliation["state"], "reconciled")
+        self.assertEqual(reconciliation["outcome"], "reconciled_success")
+        lifecycle = checkouts._strict_lifecycle_binding(fence["checkout_key"])
+        self.assertIsNotNone(lifecycle)
+        self.assertEqual(lifecycle["phase"], "archived")
+        self.assertEqual(lifecycle["expected_head"], merge_head)
+        self.assertIsNone(lifecycle["expected_branch"])
+
+    def test_partial_terminal_detached_archive_branch_drift_stays_fenced(self) -> None:
+        self._managed_binding()
+        _topic_head, merge_head = self._detached_merged_topic()
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=self._terminal_source_evidence(),
+            ),
+            patch.object(
+                checkouts,
+                "_mark_checkout_archived_in_connection",
+                side_effect=RuntimeError("simulated detached lifecycle failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated detached lifecycle failure"),
+        ):
+            checkouts.grabowski_checkout_archive(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                "partial detached branch drift",
+                int(time.time()) + 3600,
+                merge_head,
+                None,
+                expected_physical_identity=expected_identity,
+            )
+
+        fence = checkouts._active_checkout_operation_uncertainties()[0]
+        self._expire_uncertainty_lease(fence)
+        moved = self._git("commit", "--allow-empty", "-m", "move detached source branch").stdout
+        moved = self._git("rev-parse", "HEAD").stdout.strip()
+        self._git("update-ref", "refs/heads/topic", moved)
+
+        readback = checkouts._archive_uncertainty_readback(fence)
+
+        self.assertEqual(readback["state"], "still_fenced")
+        self.assertEqual(readback["partial_state"], "contradictory")
+        self.assertEqual(
+            readback["partial_reason"],
+            "archive-terminal-detached-branch-drift",
+        )
 
     def test_archive_allows_terminal_remote_secured_detached_merge_descendant(self) -> None:
         self._managed_binding()
@@ -1731,6 +2468,1107 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 checkouts._active_checkout_operation_uncertainties()
         self.assertTrue(connection.closed)
 
+    def _materialize_uncertainty_fixture(
+        self,
+        *,
+        create_worktree: bool,
+        expire_leases: bool = True,
+    ) -> tuple[Path, dict[str, object], dict[str, object], str]:
+        target = self.root / "worktrees" / "materialized"
+        common_dir = checkouts._git_common_dir(self.repo)
+        owner = "runtime-deploy-source:materialize-test"
+        checkout_key = checkouts._checkout_key(common_dir, target)
+        lifecycle = checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=target,
+            owner_id=owner,
+            purpose="materialize uncertainty test",
+            source_kind="operator_obligation",
+            source_id="goo-runtime-deploy-source-materialize-test",
+            artifact_class="deployment-source-worktree",
+            retention_until_unix=int(time.time()) + 3600,
+            expected_head=self.head,
+            expected_branch=None,
+        )
+        common_dir_key = f"path:{common_dir}"
+        path_key = f"path:{target}"
+        acquisition = checkouts.resources.acquire_resources(
+            owner,
+            [path_key, common_dir_key],
+            purpose="materialize uncertainty test",
+            ttl_seconds=120,
+        )
+        fence = checkouts._persist_checkout_operation_uncertainty(
+            lease={"owner_id": owner, "leases": acquisition["leases"]},
+            checkout_key=checkout_key,
+            owner_id=owner,
+            operation="materialize",
+            operation_id="materialize-test",
+            evidence={
+                "repo": str(self.repo.resolve()),
+                "git_common_dir": str(common_dir),
+                "checkout_path": str(target),
+                "checkout_key": checkout_key,
+                "owner_id": owner,
+                "expected_head": self.head,
+                "expected_branch": None,
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+            },
+        )
+        if create_worktree:
+            self._git("worktree", "add", "--detach", str(target), self.head)
+        obligations.open_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "objective": "Materialize the exact detached deployment source.",
+                "acceptance": [
+                    {
+                        "id": "source-materialized",
+                        "description": "The exact detached source exists.",
+                    }
+                ],
+                "origin": {
+                    "source": "grabowski_runtime_deploy_schedule",
+                    "repo": "heimgewebe/grabowski",
+                },
+            }
+        )
+        self.assertTrue(
+            obligations.status_obligation(
+                "goo-runtime-deploy-source-materialize-test"
+            )["continuation_required"]
+        )
+        with self.assertRaisesRegex(RuntimeError, "durably fenced"):
+            checkouts._require_no_checkout_operation_uncertainty([common_dir_key])
+        if expire_leases:
+            self._expire_uncertainty_lease(fence)
+        return target, fence, lifecycle, common_dir_key
+
+    def test_materialize_uncertainty_reconcile_removes_exact_created_worktree(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        self.assertTrue(target.exists())
+        self.assertEqual(
+            checkouts._materialize_uncertainty_readback(fence)["state"],
+            "recoverable_created",
+        )
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "reconciled_success")
+        self.assertFalse(target.exists())
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+        obligation_status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertFalse(obligation_status["continuation_required"])
+        self.assertEqual(obligation_status["resolution_disposition"], "resolved")
+
+    def test_materialize_uncertainty_reconcile_respects_git_mutation_freeze(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        mutation_gate = checkouts.operator._require_operator_mutation
+        mutation_gate.reset_mock()
+
+        def reject_git_mutation(capability: str, **_kwargs) -> None:
+            if capability == "git_cli":
+                raise PermissionError("git mutation frozen")
+
+        mutation_gate.side_effect = reject_git_mutation
+        try:
+            with self.assertRaisesRegex(PermissionError, "git mutation frozen"):
+                checkouts.grabowski_checkout_uncertainty_reconcile(
+                    fence["fence_id"],
+                    "reconcile-checkout-operation-outcome",
+                )
+        finally:
+            mutation_gate.side_effect = None
+
+        self.assertEqual(
+            [item.args[0] for item in mutation_gate.call_args_list],
+            ["resource_lease", "git_cli"],
+        )
+        git_gate = mutation_gate.call_args_list[1]
+        self.assertEqual(git_gate.kwargs["path"], str(target))
+        self.assertEqual(git_gate.kwargs["repo"], str(self.repo.resolve()))
+        self.assertTrue(target.exists())
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
+    def _materialize_uncertainty_retention(
+        self,
+        target: Path,
+        lifecycle: dict[str, object],
+    ) -> dict[str, object]:
+        return checkouts._upsert_retention(
+            checkout_key=str(lifecycle["checkout_key"]),
+            repo_common_dir=checkouts._git_common_dir(self.repo),
+            repo_path=self.repo,
+            checkout_path=target,
+            owner_id=str(lifecycle["owner_id"]),
+            purpose=f"detached runtime deploy source {self.head[:12]}",
+            retention_until_unix=int(lifecycle["retention_until_unix"]),
+            expected_head=self.head,
+            expected_branch=None,
+        )
+
+    def test_materialize_uncertainty_reconcile_preserves_completed_source(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "source-materialized",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": (
+                            f"runtime-deploy-source-materialized:{self.head}:"
+                            "materialize-test"
+                        ),
+                        "sha256": "8" * 64,
+                    }
+                ],
+                "closure_classification": {
+                    "convergence_required": False,
+                    "reason": "process_only",
+                },
+            }
+        )
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_success")
+        self.assertTrue(target.exists())
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+        obligation_status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(obligation_status["state"], "completed")
+        self.assertFalse(obligation_status["continuation_required"])
+
+
+    def test_materialize_uncertainty_reconcile_preserves_live_completed_source_path_lease(self) -> None:
+        target, fence, lifecycle, common_dir_key = (
+            self._materialize_uncertainty_fixture(
+                create_worktree=True,
+                expire_leases=False,
+            )
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        owner = "runtime-deploy-source:materialize-test"
+        path_key = f"path:{target}"
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "source-materialized",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": (
+                            f"runtime-deploy-source-materialized:{self.head}:"
+                            "materialize-test"
+                        ),
+                        "sha256": "8" * 64,
+                    }
+                ],
+                "closure_classification": {
+                    "convergence_required": False,
+                    "reason": "process_only",
+                },
+            }
+        )
+        common_lease = checkouts.resources.inspect_resource(common_dir_key)
+        self.assertIsNotNone(common_lease)
+        checkouts.resources.release_resources(
+            owner,
+            [common_dir_key],
+            expected_leases=[common_lease],
+        )
+        path_lease_before = checkouts.resources.inspect_resource(path_key)
+        self.assertIsNotNone(path_lease_before)
+
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_success")
+        self.assertTrue(target.exists())
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertIsNone(checkouts.resources.inspect_resource(common_dir_key))
+        self.assertEqual(checkouts.resources.inspect_resource(path_key), path_lease_before)
+    def test_materialize_uncertainty_reconcile_removes_expired_completed_source(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "source-materialized",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": (
+                            f"runtime-deploy-source-materialized:{self.head}:"
+                            "materialize-test"
+                        ),
+                        "sha256": "8" * 64,
+                    }
+                ],
+                "closure_classification": {
+                    "convergence_required": False,
+                    "reason": "process_only",
+                },
+            }
+        )
+        with patch.object(
+            checkouts,
+            "_now",
+            return_value=int(retention["retention_until_unix"]),
+        ):
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "reconciled_success")
+        self.assertTrue(result["readback"]["expired_completed_source_removed"])
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["state"], "completed")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_expired_completed_source_cleanup_retry_preserves_completed_obligation(
+        self,
+    ) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "source-materialized",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": (
+                            f"runtime-deploy-source-materialized:{self.head}:"
+                            "materialize-test"
+                        ),
+                        "sha256": "8" * 64,
+                    }
+                ],
+                "closure_classification": {
+                    "convergence_required": False,
+                    "reason": "process_only",
+                },
+            }
+        )
+        deadline = int(retention["retention_until_unix"])
+        with patch.object(
+            checkouts,
+            "_now",
+            return_value=deadline,
+        ), patch.object(
+            checkouts,
+            "_release_retention_exact",
+            return_value=False,
+        ) as release_retention:
+            first = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(first["state"], "still_fenced")
+        self.assertIn(
+            "materialize-recovery-retention-release-failed",
+            first["readback"]["reason"],
+        )
+        release_retention.assert_called_once_with(retention)
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            obligations.status_obligation(
+                "goo-runtime-deploy-source-materialize-test"
+            )["state"],
+            "completed",
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
+        with patch.object(checkouts, "_now", return_value=deadline):
+            retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(retry["state"], "reconciled")
+        self.assertEqual(retry["outcome"], "reconciled_success")
+        self.assertTrue(retry["readback"]["removed_recovery_worktree"])
+        self.assertTrue(retry["readback"]["expired_completed_source_removed"])
+        self.assertIsNotNone(retry["readback"]["recovery_removal_intent"])
+        self.assertEqual(
+            retry["readback"]["completed_obligation"]["state"],
+            "completed",
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["state"], "completed")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_materialize_uncertainty_reconcile_removes_bound_retention(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "reconciled_success")
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(retention["expected_head"], self.head)
+
+    def test_materialize_uncertainty_reconcile_retries_retention_release(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=True)
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        with patch.object(
+            checkouts,
+            "_release_retention_exact",
+            return_value=False,
+            create=True,
+        ) as release_retention:
+            first = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        self.assertEqual(first["state"], "still_fenced")
+        self.assertIn("retention-release-failed", first["readback"]["reason"])
+        release_retention.assert_called_once_with(retention)
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
+        retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(retry["state"], "reconciled")
+        self.assertEqual(retry["outcome"], "reconciled_success")
+        self.assertTrue(retry["readback"]["removed_recovery_worktree"])
+        self.assertIsNotNone(retry["readback"]["recovery_removal_intent"])
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+
+    def _auto_source_cleanup_uncertainty_fixture(
+        self,
+        *,
+        remove_source: bool,
+    ) -> tuple[Path, dict[str, object], dict[str, object], dict[str, object], str]:
+        target, materialize_fence, lifecycle, common_dir_key = (
+            self._materialize_uncertainty_fixture(
+                create_worktree=True,
+                expire_leases=False,
+            )
+        )
+        retention = self._materialize_uncertainty_retention(target, lifecycle)
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "source-materialized",
+                        "status": "passed",
+                        "source": "receipt",
+                        "reference": (
+                            f"runtime-deploy-source-materialized:{self.head}:"
+                            "materialize-test"
+                        ),
+                        "sha256": "8" * 64,
+                    }
+                ],
+                "closure_classification": {
+                    "convergence_required": False,
+                    "reason": "process_only",
+                },
+            }
+        )
+        owner = "runtime-deploy-source:materialize-test"
+        path_key = f"path:{target}"
+        path_lease = checkouts.resources.inspect_resource(path_key)
+        common_lease = checkouts.resources.inspect_resource(common_dir_key)
+        self.assertIsNotNone(path_lease)
+        self.assertIsNotNone(common_lease)
+        checkouts._clear_checkout_operation_uncertainty(
+            materialize_fence["fence_id"],
+            outcome="confirmed_success",
+            evidence={"test": "materialization-finalized"},
+        )
+        checkouts.resources.release_resources(
+            owner,
+            [common_dir_key],
+            expected_leases=[common_lease],
+        )
+        cleanup_key = f"repo:{self.repo}:operation:worktree-remove:{target.name}"
+        acquisition = checkouts.resources.acquire_resources(
+            owner,
+            [cleanup_key, common_dir_key],
+            purpose="test auto source cleanup uncertainty",
+            ttl_seconds=7200,
+        )
+        checkouts.AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK.parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        checkouts.AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK.touch(exist_ok=True)
+        cleanup_fence = checkouts._persist_checkout_operation_uncertainty(
+            lease=acquisition,
+            checkout_key=str(lifecycle["checkout_key"]),
+            owner_id=owner,
+            operation="auto-source-cleanup",
+            operation_id="9" * 64,
+            evidence={
+                "kind": "grabowski_auto_runtime_deploy_source_cleanup_uncertainty",
+                "repo": str(self.repo.resolve()),
+                "git_common_dir": str(checkouts._git_common_dir(self.repo)),
+                "checkout_path": str(target),
+                "checkout_key": str(lifecycle["checkout_key"]),
+                "owner_id": owner,
+                "expected_head": self.head,
+                "expected_branch": None,
+                "path_resource_key": path_key,
+                "path_lease": path_lease,
+                "effect_leases": [dict(item) for item in acquisition["leases"]],
+                "source_identity_sha256": "9" * 64,
+            },
+        )
+        if remove_source:
+            self._git("worktree", "remove", str(target))
+        return target, cleanup_fence, lifecycle, retention, path_key
+
+    def test_auto_source_cleanup_uncertainty_reconciles_no_effect_under_live_leases(self) -> None:
+        target, fence, lifecycle, retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=False)
+        )
+        path_lease_before = checkouts.resources.inspect_resource(path_key)
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_no_effect")
+        self.assertTrue(target.exists())
+        self.assertEqual(
+            checkouts.resources.inspect_resource(path_key),
+            path_lease_before,
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_auto_source_cleanup_uncertainty_stays_fenced_while_owner_active(self) -> None:
+        target, fence, lifecycle, retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=False)
+        )
+        path_lease_before = checkouts.resources.inspect_resource(path_key)
+        descriptor = os.open(
+            checkouts.AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK,
+            os.O_RDWR | os.O_CLOEXEC,
+        )
+        try:
+            checkouts.fcntl.flock(descriptor, checkouts.fcntl.LOCK_EX)
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        finally:
+            checkouts.fcntl.flock(descriptor, checkouts.fcntl.LOCK_UN)
+            os.close(descriptor)
+        self.assertEqual(result["state"], "still_fenced")
+        self.assertEqual(
+            result["readback"]["reason"],
+            "auto-source-cleanup-owner-still-active",
+        )
+        self.assertTrue(target.exists())
+        self.assertEqual(
+            checkouts.resources.inspect_resource(path_key),
+            path_lease_before,
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
+    def test_auto_source_cleanup_uncertainty_stays_fenced_after_effect_leases_drop_while_owner_active(
+        self,
+    ) -> None:
+        target, fence, lifecycle, retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=True)
+        )
+        path_lease_before = checkouts.resources.inspect_resource(path_key)
+        effect_leases = [dict(item) for item in fence["evidence"]["effect_leases"]]
+        checkouts.resources.release_resources(
+            str(fence["lease_owner_id"]),
+            [str(item["resource_key"]) for item in effect_leases],
+            expected_leases=effect_leases,
+        )
+        descriptor = os.open(
+            checkouts.AUTO_SOURCE_CLEANUP_ACTIVITY_LOCK,
+            os.O_RDWR | os.O_CLOEXEC,
+        )
+        try:
+            checkouts.fcntl.flock(descriptor, checkouts.fcntl.LOCK_EX)
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        finally:
+            checkouts.fcntl.flock(descriptor, checkouts.fcntl.LOCK_UN)
+            os.close(descriptor)
+
+        self.assertEqual(result["state"], "still_fenced")
+        self.assertEqual(
+            result["readback"]["reason"],
+            "auto-source-cleanup-owner-still-active",
+        )
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts.resources.inspect_resource(path_key),
+            path_lease_before,
+        )
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {str(lifecycle["checkout_key"]): retention},
+        )
+        self.assertIsNotNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+
+    def test_auto_source_cleanup_uncertainty_clears_dead_lease_fence_under_activity_guard(
+        self,
+    ) -> None:
+        target, fence, lifecycle, _retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=True)
+        )
+        effect_leases = [dict(item) for item in fence["evidence"]["effect_leases"]]
+        checkouts.resources.release_resources(
+            str(fence["lease_owner_id"]),
+            [str(item["resource_key"]) for item in effect_leases],
+            expected_leases=effect_leases,
+        )
+        activity = {"depth": 0}
+
+        @checkouts.contextmanager
+        def tracked_activity_guard(_fence):
+            activity["depth"] += 1
+            try:
+                yield True
+            finally:
+                activity["depth"] -= 1
+
+        real_clear = checkouts._clear_checkout_operation_uncertainty
+
+        def clear_while_guarded(*args, **kwargs):
+            self.assertGreater(activity["depth"], 0)
+            return real_clear(*args, **kwargs)
+
+        with (
+            patch.object(
+                checkouts,
+                "_auto_source_cleanup_activity_guard",
+                tracked_activity_guard,
+            ),
+            patch.object(
+                checkouts,
+                "_clear_checkout_operation_uncertainty",
+                side_effect=clear_while_guarded,
+            ),
+        ):
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_success")
+        self.assertEqual(activity["depth"], 0)
+        self.assertFalse(target.exists())
+        self.assertIsNone(checkouts.resources.inspect_resource(path_key))
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_auto_source_cleanup_uncertainty_reconciles_success_under_live_leases(self) -> None:
+        target, fence, lifecycle, _retention, path_key = (
+            self._auto_source_cleanup_uncertainty_fixture(remove_source=True)
+        )
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_success")
+        self.assertFalse(target.exists())
+        self.assertIsNone(checkouts.resources.inspect_resource(path_key))
+        self.assertEqual(
+            checkouts._retention_records([str(lifecycle["checkout_key"])]),
+            {},
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+    def test_materialize_uncertainty_reconcile_clears_proven_no_effect(self) -> None:
+        target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            checkouts._materialize_uncertainty_readback(fence)["state"],
+            "confirmed_no_effect",
+        )
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_no_effect")
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+        obligation_status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertFalse(obligation_status["continuation_required"])
+        self.assertEqual(obligation_status["resolution_disposition"], "resolved")
+
+    def test_materialize_uncertainty_reconcile_resolves_existing_blocked_obligation(self) -> None:
+        _target, fence, _lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "materialization-failed",
+                        "detail": "Original scheduler already classified materialization as blocked.",
+                        "reference": "auto-deploy-source:test",
+                        "sha256": "7" * 64,
+                    }
+                ],
+                "next_action": "Reconcile the durable checkout uncertainty fence.",
+            }
+        )
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_no_effect")
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_materialize_uncertainty_reconcile_preserves_already_resolved_no_effect_obligation(
+        self,
+    ) -> None:
+        _target, fence, _lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        blocked = obligations.close_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "materialization-failed",
+                        "detail": "Scheduler proved the materialization had no effect.",
+                        "reference": "auto-deploy-source:test",
+                        "sha256": "7" * 64,
+                    }
+                ],
+                "next_action": "No continuation is required after no-effect cleanup.",
+            }
+        )
+        resolved = obligations.resolve_obligation(
+            {
+                "obligation_id": "goo-runtime-deploy-source-materialize-test",
+                "disposition": "resolved",
+                "evidence": [
+                    {
+                        "source": "receipt",
+                        "reference": "auto-deploy-source-pre-effect:test",
+                        "sha256": blocked["close_file_sha256"],
+                    }
+                ],
+            }
+        )
+        resolution_sha256 = resolved["resolution_file_sha256"]
+
+        result = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(result["state"], "reconciled")
+        self.assertEqual(result["outcome"], "confirmed_no_effect")
+        self.assertEqual(
+            result["readback"]["obligation_recovery"]["obligation_state"],
+            "blocked_terminal_preserved",
+        )
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["state"], "blocked")
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+        self.assertEqual(status["resolution_file_sha256"], resolution_sha256)
+        self.assertEqual(
+            status["resolution_evidence"],
+            [
+                {
+                    "source": "receipt",
+                    "reference": "auto-deploy-source-pre-effect:test",
+                    "sha256": blocked["close_file_sha256"],
+                }
+            ],
+        )
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_materialize_recovery_preserves_strategically_settled_obligation_states(
+        self,
+    ) -> None:
+        _target, fence, _lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        cases = [
+            ("open", "deferred"),
+            ("open", "superseded"),
+            ("blocked", "deferred"),
+        ]
+        for state, disposition in cases:
+            with self.subTest(state=state, disposition=disposition):
+                status = {
+                    "state": state,
+                    "resolution_disposition": disposition,
+                    "continuation_required": False,
+                    "close_file_sha256": "c" * 64 if state == "blocked" else None,
+                    "resolution_file_sha256": "d" * 64,
+                }
+                with (
+                    patch.object(
+                        obligations,
+                        "status_obligation",
+                        return_value=status,
+                    ),
+                    patch.object(obligations, "close_obligation") as close_obligation,
+                    patch.object(obligations, "resolve_obligation") as resolve_obligation,
+                ):
+                    result = checkouts._resolve_materialize_recovery_obligation(
+                        fence,
+                        recovery_state="confirmed_no_effect",
+                    )
+
+                self.assertEqual(
+                    result["obligation_state"],
+                    f"{state}_resolution_preserved",
+                )
+                self.assertEqual(
+                    result["resolution_file_sha256"],
+                    status["resolution_file_sha256"],
+                )
+                close_obligation.assert_not_called()
+                resolve_obligation.assert_not_called()
+
+    def test_materialize_no_effect_recovery_accepts_missing_preopen_obligation(self) -> None:
+        fence = {
+            "fence_id": "f" * 32,
+            "evidence": {
+                "obligation_id": "goo-runtime-deploy-source-missing-test",
+                "checkout_key": "a" * 64,
+                "expected_head": "b" * 40,
+            },
+        }
+        with patch.object(
+            obligations,
+            "status_obligation",
+            side_effect=FileNotFoundError("obligation was never opened"),
+        ), patch.object(
+            obligations, "close_obligation"
+        ) as close_obligation, patch.object(
+            obligations, "resolve_obligation"
+        ) as resolve_obligation:
+            result = checkouts._resolve_materialize_recovery_obligation(
+                fence,
+                recovery_state="confirmed_no_effect",
+            )
+        self.assertEqual(result["obligation_state"], "absent_before_open")
+        self.assertEqual(result["obligation_id"], fence["evidence"]["obligation_id"])
+        close_obligation.assert_not_called()
+        resolve_obligation.assert_not_called()
+
+    def test_materialize_recovery_evidence_is_stable_across_retry_states(self) -> None:
+        _target, fence, _lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        first = checkouts._resolve_materialize_recovery_obligation(
+            fence, recovery_state="reconciled_success"
+        )
+        second = checkouts._resolve_materialize_recovery_obligation(
+            fence, recovery_state="confirmed_no_effect"
+        )
+        self.assertEqual(first["recovery_sha256"], second["recovery_sha256"])
+        status = obligations.status_obligation(
+            "goo-runtime-deploy-source-materialize-test"
+        )
+        self.assertEqual(status["resolution_disposition"], "resolved")
+        self.assertFalse(status["continuation_required"])
+
+    def test_materialize_uncertainty_reconcile_keeps_fence_when_obligation_recovery_fails(self) -> None:
+        _target, fence, lifecycle, _common_dir_key = (
+            self._materialize_uncertainty_fixture(create_worktree=False)
+        )
+        with patch.object(
+            checkouts,
+            "_resolve_materialize_recovery_obligation",
+            side_effect=RuntimeError("obligation close unavailable"),
+        ):
+            result = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        self.assertEqual(result["state"], "still_fenced")
+        self.assertIn(
+            "obligation-recovery-failed",
+            result["readback"]["reason"],
+        )
+        self.assertEqual(
+            [item["fence_id"] for item in checkouts._active_checkout_operation_uncertainties()],
+            [fence["fence_id"]],
+        )
+        self.assertIsNone(
+            checkouts._strict_lifecycle_binding(str(lifecycle["checkout_key"]))
+        )
+        self.assertTrue(
+            obligations.status_obligation(
+                "goo-runtime-deploy-source-materialize-test"
+            )["continuation_required"]
+        )
+
+    def test_uncertainty_persist_has_no_post_commit_secondary_readback(self) -> None:
+        target = self.root / "worktrees" / "materialize-readback"
+        common_dir = checkouts._git_common_dir(self.repo)
+        owner = "runtime-deploy-source:materialize-readback"
+        checkout_key = checkouts._checkout_key(common_dir, target)
+        resource_keys = [f"path:{target}", f"path:{common_dir}"]
+        acquisition = checkouts.resources.acquire_resources(
+            owner,
+            resource_keys,
+            purpose="materialize uncertainty committed receipt",
+            ttl_seconds=120,
+        )
+        with patch.object(
+            checkouts,
+            "_load_checkout_operation_uncertainty",
+            side_effect=AssertionError("post-commit secondary readback must not run"),
+        ):
+            fence = checkouts._persist_checkout_operation_uncertainty(
+                lease={
+                    "owner_id": owner,
+                    "leases": acquisition["leases"],
+                },
+                checkout_key=checkout_key,
+                owner_id=owner,
+                operation="materialize",
+                operation_id="materialize-readback",
+                evidence={
+                    "repo": str(self.repo.resolve()),
+                    "git_common_dir": str(common_dir),
+                    "checkout_path": str(target),
+                    "checkout_key": checkout_key,
+                    "owner_id": owner,
+                    "expected_head": self.head,
+                    "expected_branch": None,
+                    "obligation_id": "goo-runtime-deploy-source-materialize-readback",
+                },
+            )
+        self.assertRegex(fence["fence_id"], r"^[0-9a-f]{32}$")
+        stored = checkouts._load_checkout_operation_uncertainty(fence["fence_id"])
+        self.assertEqual(stored, fence)
+        self.assertEqual(set(fence["resource_keys"]), set(resource_keys))
+        self.assertIsNone(fence["cleared_at_unix"])
+
+    def test_uncertainty_clear_has_no_post_commit_secondary_readback(self) -> None:
+        target = self.root / "worktrees" / "clear-readback"
+        common_dir = checkouts._git_common_dir(self.repo)
+        owner = "runtime-deploy-source:clear-readback"
+        checkout_key = checkouts._checkout_key(common_dir, target)
+        resource_keys = [f"path:{target}", f"path:{common_dir}"]
+        acquisition = checkouts.resources.acquire_resources(
+            owner,
+            resource_keys,
+            purpose="materialize uncertainty clearance receipt",
+            ttl_seconds=120,
+        )
+        fence = checkouts._persist_checkout_operation_uncertainty(
+            lease={"owner_id": owner, "leases": acquisition["leases"]},
+            checkout_key=checkout_key,
+            owner_id=owner,
+            operation="materialize",
+            operation_id="clear-readback",
+            evidence={
+                "repo": str(self.repo.resolve()),
+                "git_common_dir": str(common_dir),
+                "checkout_path": str(target),
+                "checkout_key": checkout_key,
+                "owner_id": owner,
+                "expected_head": self.head,
+                "expected_branch": None,
+                "obligation_id": "goo-runtime-deploy-source-clear-readback",
+            },
+        )
+        with patch.object(
+            checkouts,
+            "_load_checkout_operation_uncertainty",
+            side_effect=AssertionError("post-commit secondary readback must not run"),
+        ):
+            cleared = checkouts._clear_checkout_operation_uncertainty(
+                fence["fence_id"],
+                outcome="confirmed_no_effect",
+                evidence={"reason": "test"},
+            )
+        self.assertIsNotNone(cleared["cleared_at_unix"])
+        stored = checkouts._load_checkout_operation_uncertainty(fence["fence_id"])
+        self.assertEqual(stored, cleared)
+        self.assertEqual(stored["clearance"]["outcome"], "confirmed_no_effect")
+
     def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:
         self._publish_remote()
         archive = self._archive()["archive"]
@@ -2147,6 +3985,1087 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(
             len(checkouts._active_checkout_operation_uncertainties()), 1
         )
+
+    def test_archive_confirmed_success_requires_exact_archived_lifecycle_identity(self) -> None:
+        self._managed_binding(owner="owner-a")
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+
+        def fail_archive_audit(record):
+            if record.get("operation") == "checkout-archive":
+                raise RuntimeError("simulated archive audit failure")
+
+        with patch.object(checkouts.base, "_append_audit", side_effect=fail_archive_audit):
+            with self.assertRaisesRegex(RuntimeError, "archive audit failure"):
+                checkouts.grabowski_checkout_archive(
+                    str(self.repo),
+                    str(self.checkout),
+                    "owner-a",
+                    "lifecycle exact-success binding",
+                    int(time.time()) + 3600,
+                    self.head,
+                    "topic",
+                    expected_physical_identity=expected_identity,
+                )
+        fence = checkouts._active_checkout_operation_uncertainties()[0]
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET repo_path=? WHERE checkout_key=?",
+                (str(self.checkout.resolve()), fence["checkout_key"]),
+            )
+            connection.commit()
+
+        readback = checkouts._archive_uncertainty_readback(fence)
+
+        self.assertEqual(readback["state"], "still_fenced")
+        self.assertEqual(readback["reason"], "archive-readback-mismatch")
+
+    def test_partial_archive_manifest_and_refs_complete_atomically(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        checkouts.base._append_audit.reset_mock()
+
+        readback = checkouts._archive_uncertainty_readback(fence)
+        self.assertEqual(readback["state"], "recoverable_complete")
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(reconciliation["state"], "reconciled")
+        self.assertEqual(reconciliation["outcome"], "reconciled_success")
+        archive = checkouts._load_archive(fence["operation_id"])
+        self.assertEqual(archive["head"], self.head)
+        self.assertEqual(archive["branch"], "topic")
+        lifecycle = checkouts._strict_lifecycle_binding(fence["checkout_key"])
+        self.assertIsNotNone(lifecycle)
+        self.assertEqual(lifecycle["phase"], "archived")
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+        checkouts.base._append_audit.assert_called_once()
+        self.assertEqual(
+            checkouts.base._append_audit.call_args.args[0]["outcome"],
+            "reconciled_success",
+        )
+
+    def test_partial_archive_recovery_uses_captured_database_preimages(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db(
+            advance_managed_checkout=True
+        )
+        evidence = fence["evidence"]
+        lifecycle_preimage = evidence["lifecycle_preimage"]
+        retention_preimage = evidence["retention_preimage"]
+
+        self.assertIsInstance(lifecycle_preimage, dict)
+        self.assertIsInstance(retention_preimage, dict)
+        self.assertNotEqual(
+            lifecycle_preimage["expected_head"],
+            evidence["expected_head"],
+        )
+        self.assertNotEqual(
+            retention_preimage["expected_head"],
+            evidence["expected_head"],
+        )
+
+        readback = checkouts._archive_uncertainty_readback(fence)
+        self.assertEqual(readback["state"], "recoverable_complete")
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(reconciliation["state"], "reconciled")
+        self.assertEqual(reconciliation["outcome"], "reconciled_success")
+        archive = checkouts._load_archive(fence["operation_id"])
+        self.assertEqual(archive["head"], evidence["expected_head"])
+        lifecycle = checkouts._strict_lifecycle_binding(fence["checkout_key"])
+        self.assertIsNotNone(lifecycle)
+        self.assertEqual(lifecycle["phase"], "archived")
+        self.assertEqual(lifecycle["expected_head"], evidence["expected_head"])
+
+    def test_partial_archive_missing_database_preimages_fails_closed(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        legacy_fence = dict(fence)
+        legacy_evidence = dict(fence["evidence"])
+        legacy_evidence.pop("lifecycle_preimage")
+        legacy_evidence.pop("retention_preimage")
+        legacy_fence["evidence"] = legacy_evidence
+
+        assessment = checkouts._archive_partial_completion_assessment(legacy_fence)
+
+        self.assertEqual(assessment["state"], "foreign_or_ambiguous")
+        self.assertEqual(
+            assessment["reason"],
+            "archive-fence-missing-database-preimages",
+        )
+
+    def test_partial_archive_manifest_timestamp_may_cross_archive_id_second(self) -> None:
+        base = datetime.now(timezone.utc).replace(microsecond=0)
+        archive_id = f"{base.strftime('%Y%m%dT%H%M%SZ')}-abcdef123456"
+        manifest_time = (base + timedelta(seconds=1)).isoformat()
+        with (
+            patch.object(checkouts, "_new_archive_id", return_value=archive_id),
+            patch.object(checkouts, "_utc_timestamp", return_value=manifest_time),
+        ):
+            fence = self._partial_archive_after_manifest_without_db()
+
+        readback = checkouts._archive_uncertainty_readback(fence)
+
+        self.assertEqual(readback["state"], "recoverable_complete")
+
+    def test_partial_archive_retention_may_expire_during_setup(self) -> None:
+        base = int(time.time())
+        retention_until = base + 5
+        archive_started = datetime.fromtimestamp(base + 10, timezone.utc)
+        archive_id = (
+            f"{archive_started.strftime('%Y%m%dT%H%M%SZ')}-abcdef123456"
+        )
+        manifest_time = datetime.fromtimestamp(
+            base + 11, timezone.utc
+        ).isoformat()
+        with (
+            patch.object(checkouts, "_now", return_value=base),
+            patch.object(checkouts, "_new_archive_id", return_value=archive_id),
+            patch.object(checkouts, "_utc_timestamp", return_value=manifest_time),
+        ):
+            fence = self._partial_archive_after_manifest_without_db(
+                retention_until_unix=retention_until
+            )
+
+        self.assertEqual(
+            fence["evidence"]["archive_intent_validated_at_unix"],
+            base,
+        )
+        self.assertLess(
+            fence["evidence"]["archive_retention_until_unix"],
+            int(archive_started.timestamp()),
+        )
+        readback = checkouts._archive_uncertainty_readback(fence)
+        self.assertEqual(readback["state"], "recoverable_complete")
+
+    def test_symbolic_recovery_ref_is_never_accepted_as_durable_pin(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        ref = fence["evidence"]["planned_recovery_refs"][0]["ref"]
+        self._git("update-ref", "-d", ref)
+        self._git("symbolic-ref", ref, "refs/heads/topic")
+
+        verified = checkouts._verify_recovery_refs(
+            self.repo,
+            fence["evidence"]["planned_recovery_refs"],
+        )
+        symbolic = next(item for item in verified if item["ref"] == ref)
+        self.assertTrue(symbolic["exists"])
+        self.assertFalse(symbolic["direct"])
+        self.assertFalse(symbolic["present"])
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(reconciliation["state"], "still_fenced")
+
+    def test_partial_archive_completion_records_recovery_time(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_created = int(
+            datetime.fromisoformat(manifest["created_at"]).timestamp()
+        )
+        recovered_at = manifest_created + 120
+
+        with patch.object(checkouts, "_now", return_value=recovered_at):
+            reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(reconciliation["outcome"], "reconciled_success")
+        self.assertEqual(
+            reconciliation["readback"]["manifest_created_at_unix"],
+            manifest_created,
+        )
+        self.assertEqual(
+            reconciliation["readback"]["completed_at_unix"],
+            recovered_at,
+        )
+        archive = checkouts._load_archive(fence["operation_id"])
+        self.assertEqual(archive["created_at_unix"], recovered_at)
+        lifecycle = checkouts._strict_lifecycle_binding(fence["checkout_key"])
+        self.assertIsNotNone(lifecycle)
+        self.assertEqual(lifecycle["archived_at_unix"], recovered_at)
+
+    def test_partial_archive_fence_binds_purpose_and_retention(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            fence["evidence"]["archive_purpose"],
+            manifest["purpose"],
+        )
+        self.assertEqual(
+            fence["evidence"]["archive_retention_until_unix"],
+            manifest["retention_until_unix"],
+        )
+
+    def test_partial_archive_manifest_purpose_tamper_stays_fenced(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["purpose"] = manifest["purpose"] + " tampered"
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        readback = checkouts._archive_uncertainty_readback(fence)
+
+        self.assertEqual(readback["state"], "still_fenced")
+        self.assertEqual(readback["partial_state"], "foreign_or_ambiguous")
+        self.assertEqual(
+            readback["partial_reason"],
+            "archive-manifest-metadata-binding-mismatch",
+        )
+
+    def test_partial_archive_manifest_retention_tamper_stays_fenced(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["retention_until_unix"] += 60
+        manifest_path.write_text(
+            json.dumps(manifest, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        readback = checkouts._archive_uncertainty_readback(fence)
+
+        self.assertEqual(readback["state"], "still_fenced")
+        self.assertEqual(readback["partial_state"], "foreign_or_ambiguous")
+        self.assertEqual(
+            readback["partial_reason"],
+            "archive-manifest-metadata-binding-mismatch",
+        )
+
+    def test_partial_archive_legacy_metadata_uses_exact_audit_proof(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        legacy_evidence = dict(fence["evidence"])
+        legacy_evidence.pop("archive_purpose")
+        legacy_evidence.pop("archive_retention_until_unix")
+        arguments = {
+            "repo": str(self.repo),
+            "checkout_path": str(self.checkout),
+            "owner_id": "owner-a",
+            "purpose": manifest["purpose"],
+            "retention_until_unix": manifest["retention_until_unix"],
+            "expected_head": self.head,
+            "expected_branch": "topic",
+            "expected_physical_identity": legacy_evidence[
+                "expected_physical_identity"
+            ],
+        }
+        arguments_sha256 = (
+            checkouts.transport_roundtrip.canonical_arguments_sha256(arguments)
+        )
+        admitted = int(fence["created_at_unix"]) - 1
+        admission_sha256 = "a" * 64
+        records = [
+            {
+                "operation": "effect-admission",
+                "tool": "grabowski_checkout_archive",
+                "effect_class": "mutating",
+                "arguments_sha256": arguments_sha256,
+                "admission_sha256": admission_sha256,
+                "admitted_at_unix": admitted,
+                "timestamp_unix": admitted,
+                "record_sha256": "b" * 64,
+            },
+            {
+                "operation": "effect-completion",
+                "admission_sha256": admission_sha256,
+                "completion_class": "outcome_unknown",
+                "completed_at_unix": int(fence["created_at_unix"]),
+                "timestamp_unix": int(fence["created_at_unix"]),
+                "record_sha256": "c" * 64,
+            },
+        ]
+
+        with patch.object(
+            checkouts,
+            "_legacy_archive_audit_records",
+            return_value=records,
+        ):
+            observed = checkouts._partial_archive_manifest(
+                legacy_evidence,
+                fence_created_at_unix=int(fence["created_at_unix"]),
+            )
+
+        self.assertEqual(observed["state"], "valid")
+        self.assertEqual(
+            observed["metadata_binding"]["source"],
+            "verified-audit-effect-admission",
+        )
+        self.assertEqual(
+            observed["metadata_binding"]["arguments_sha256"],
+            arguments_sha256,
+        )
+
+    def test_partial_archive_legacy_repo_alias_without_raw_arguments_fails_closed(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = (
+            checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        legacy_evidence = dict(fence["evidence"])
+        legacy_evidence.pop("archive_purpose")
+        legacy_evidence.pop("archive_retention_until_unix")
+        legacy_evidence.pop("archive_intent_validated_at_unix")
+        alias_arguments = {
+            "repo": str(self.repo / ".git" / ".."),
+            "checkout_path": str(self.checkout),
+            "owner_id": "owner-a",
+            "purpose": manifest["purpose"],
+            "retention_until_unix": manifest["retention_until_unix"],
+            "expected_head": self.head,
+            "expected_branch": "topic",
+            "expected_physical_identity": legacy_evidence[
+                "expected_physical_identity"
+            ],
+        }
+        alias_sha = checkouts.transport_roundtrip.canonical_arguments_sha256(
+            alias_arguments
+        )
+        created = int(fence["created_at_unix"])
+        records = [
+            {
+                "operation": "effect-admission",
+                "tool": "grabowski_checkout_archive",
+                "effect_class": "mutating",
+                "arguments_sha256": alias_sha,
+                "admission_sha256": "a" * 64,
+                "admitted_at_unix": created - 1,
+                "timestamp_unix": created - 1,
+                "record_sha256": "b" * 64,
+            },
+            {
+                "operation": "effect-completion",
+                "admission_sha256": "a" * 64,
+                "completion_class": "outcome_unknown",
+                "completed_at_unix": created,
+                "timestamp_unix": created,
+                "record_sha256": "c" * 64,
+            },
+        ]
+
+        with patch.object(
+            checkouts,
+            "_legacy_archive_audit_records",
+            return_value=records,
+        ):
+            observed = checkouts._partial_archive_manifest(
+                legacy_evidence,
+                fence_created_at_unix=created,
+            )
+
+        self.assertEqual(observed["state"], "invalid")
+        self.assertEqual(
+            observed["reason"],
+            "legacy-archive-audit-proof-not-unique",
+        )
+
+    def test_partial_archive_legacy_metadata_ambiguous_audit_proof_fails_closed(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        manifest_path = checkouts.ARCHIVE_ROOT / fence["operation_id"] / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        legacy_evidence = dict(fence["evidence"])
+        legacy_evidence.pop("archive_purpose")
+        legacy_evidence.pop("archive_retention_until_unix")
+        candidates = checkouts._legacy_archive_argument_candidates(
+            legacy_evidence,
+            purpose=manifest["purpose"],
+            retention_until_unix=manifest["retention_until_unix"],
+        )
+        arguments_sha256 = next(iter(candidates))
+        created = int(fence["created_at_unix"])
+        records = []
+        for admission_sha256, marker in (("a" * 64, "b"), ("d" * 64, "e")):
+            records.extend(
+                [
+                    {
+                        "operation": "effect-admission",
+                        "tool": "grabowski_checkout_archive",
+                        "effect_class": "mutating",
+                        "arguments_sha256": arguments_sha256,
+                        "admission_sha256": admission_sha256,
+                        "admitted_at_unix": created - 1,
+                        "timestamp_unix": created - 1,
+                        "record_sha256": marker * 64,
+                    },
+                    {
+                        "operation": "effect-completion",
+                        "admission_sha256": admission_sha256,
+                        "completion_class": "outcome_unknown",
+                        "completed_at_unix": created,
+                        "timestamp_unix": created,
+                        "record_sha256": ("c" if marker == "b" else "f") * 64,
+                    },
+                ]
+            )
+
+        with patch.object(
+            checkouts,
+            "_legacy_archive_audit_records",
+            return_value=records,
+        ):
+            observed = checkouts._partial_archive_manifest(
+                legacy_evidence,
+                fence_created_at_unix=created,
+            )
+
+        self.assertEqual(observed["state"], "invalid")
+        self.assertEqual(
+            observed["reason"],
+            "legacy-archive-audit-proof-not-unique",
+        )
+
+    def test_partial_archive_all_refs_without_manifest_is_rollback_candidate(self) -> None:
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+        with patch.object(
+            checkouts,
+            "_archive_directory",
+            side_effect=RuntimeError("simulated archive directory failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "archive directory failure"):
+                checkouts.grabowski_checkout_archive(
+                    str(self.repo),
+                    str(self.checkout),
+                    "owner-a",
+                    "refs only",
+                    int(time.time()) + 3600,
+                    self.head,
+                    "topic",
+                    expected_physical_identity=expected_identity,
+                )
+        fence = checkouts._active_checkout_operation_uncertainties()[0]
+        self._expire_uncertainty_lease(fence)
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(reconciliation["state"], "still_fenced")
+        self.assertEqual(reconciliation["readback"]["partial_state"], "rollback_candidate")
+        self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)
+
+    def test_partial_archive_branch_ref_only_is_rollback_candidate(self) -> None:
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+        with patch.object(
+            checkouts,
+            "_create_recovery_ref",
+            side_effect=RuntimeError("simulated first archive ref failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "first archive ref failure"):
+                checkouts.grabowski_checkout_archive(
+                    str(self.repo),
+                    str(self.checkout),
+                    "owner-a",
+                    "branch ref only",
+                    int(time.time()) + 3600,
+                    self.head,
+                    "topic",
+                    expected_physical_identity=expected_identity,
+                )
+        fence = checkouts._active_checkout_operation_uncertainties()[0]
+        branch_ref = fence["evidence"]["planned_recovery_refs"][1]["ref"]
+        self._git("update-ref", branch_ref, self.head)
+        self._expire_uncertainty_lease(fence)
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(reconciliation["state"], "still_fenced")
+        self.assertEqual(reconciliation["readback"]["partial_state"], "rollback_candidate")
+
+    def test_partial_archive_wrong_ref_target_is_contradictory(self) -> None:
+        expected_identity = checkouts.physical_checkout.capture_physical_checkout_identity(
+            self.checkout
+        )
+        with patch.object(
+            checkouts,
+            "_archive_directory",
+            side_effect=RuntimeError("simulated archive directory failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "archive directory failure"):
+                checkouts.grabowski_checkout_archive(
+                    str(self.repo),
+                    str(self.checkout),
+                    "owner-a",
+                    "wrong ref target",
+                    int(time.time()) + 3600,
+                    self.head,
+                    "topic",
+                    expected_physical_identity=expected_identity,
+                )
+        fence = checkouts._active_checkout_operation_uncertainties()[0]
+        self._git("commit", "--allow-empty", "-m", "alternate target")
+        alternate = self._git("rev-parse", "HEAD").stdout.strip()
+        head_ref = fence["evidence"]["planned_recovery_refs"][0]["ref"]
+        self._git("update-ref", head_ref, alternate)
+        self._expire_uncertainty_lease(fence)
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(reconciliation["state"], "still_fenced")
+        self.assertEqual(reconciliation["readback"]["partial_state"], "contradictory")
+
+    def test_partial_archive_unexpected_archive_entry_is_ambiguous(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        archive_dir = checkouts.ARCHIVE_ROOT / fence["operation_id"]
+        (archive_dir / "foreign-effect").write_text("unexpected\n", encoding="utf-8")
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(reconciliation["state"], "still_fenced")
+        self.assertEqual(
+            reconciliation["readback"]["partial_state"], "foreign_or_ambiguous"
+        )
+
+    def test_partial_archive_dirty_checkout_stays_fenced(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        (self.checkout / "README.md").write_text("dirty\n", encoding="utf-8")
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(reconciliation["state"], "still_fenced")
+        self.assertEqual(reconciliation["readback"]["partial_state"], "contradictory")
+
+    def test_partial_archive_clean_head_drift_stays_fenced(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        self._git("commit", "--allow-empty", "-m", "checkout drift", cwd=self.checkout)
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(reconciliation["state"], "still_fenced")
+        self.assertEqual(reconciliation["readback"]["partial_state"], "contradictory")
+
+    def test_partial_archive_lifecycle_owner_drift_stays_fenced(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET owner_id='owner-b' WHERE checkout_key=?",
+                (fence["checkout_key"],),
+            )
+            connection.commit()
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(reconciliation["state"], "still_fenced")
+        self.assertEqual(reconciliation["readback"]["partial_state"], "contradictory")
+
+    def test_partial_archive_retention_preimage_drift_stays_fenced(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET purpose='tampered retention' WHERE checkout_key=?",
+                (fence["checkout_key"],),
+            )
+            connection.commit()
+
+        reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(reconciliation["state"], "still_fenced")
+        self.assertEqual(reconciliation["readback"]["partial_state"], "contradictory")
+        self.assertEqual(
+            reconciliation["readback"]["partial_reason"],
+            "archive-retention-preimage-mismatch",
+        )
+
+    def test_partial_archive_recovery_is_retry_safe_after_audit_failure(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+
+        def fail_reconcile_audit(record):
+            if record.get("operation") == "checkout-operation-uncertainty-reconcile":
+                raise RuntimeError("simulated reconcile audit failure")
+
+        with patch.object(
+            checkouts.base, "_append_audit", side_effect=fail_reconcile_audit
+        ):
+            with self.assertRaisesRegex(RuntimeError, "reconcile audit failure"):
+                checkouts.grabowski_checkout_uncertainty_reconcile(
+                    fence["fence_id"],
+                    "reconcile-checkout-operation-outcome",
+                )
+
+        self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)
+        archive = checkouts._load_archive(fence["operation_id"])
+        self.assertEqual(archive["head"], self.head)
+        retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+        self.assertEqual(retry["state"], "reconciled")
+        self.assertEqual(retry["outcome"], "confirmed_success")
+        self.assertEqual(checkouts._active_checkout_operation_uncertainties(), [])
+
+    def test_partial_archive_recovery_audits_committed_completion_before_blocked_release(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        blocked = {
+            "state": "blocked",
+            "reason": "resource-lease-residue-conflict",
+            "leases": [
+                {
+                    "resource_key": fence["resource_keys"][0],
+                    "owner_id": "foreign-owner",
+                    "expires_at_unix": int(time.time()) + 600,
+                }
+            ],
+        }
+        checkouts.base._append_audit.reset_mock()
+
+        with patch.object(
+            checkouts,
+            "_prepare_uncertainty_fence_release",
+            return_value=blocked,
+        ):
+            reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(reconciliation["state"], "still_fenced")
+        self.assertEqual(reconciliation["reason"], "resource-lease-residue-conflict")
+        self.assertEqual(reconciliation["readback"]["state"], "reconciled_success")
+        archive = checkouts._load_archive(fence["operation_id"])
+        self.assertEqual(archive["head"], self.head)
+        self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)
+        checkouts.base._append_audit.assert_called_once()
+        audit = checkouts.base._append_audit.call_args.args[0]
+        self.assertEqual(audit["operation"], "checkout-operation-uncertainty-reconcile")
+        self.assertEqual(audit["outcome"], "reconciled_success")
+        self.assertEqual(audit["lease_preparation"], blocked)
+        self.assertEqual(reconciliation["audit"], audit)
+
+    def test_partial_archive_recovery_audits_committed_completion_when_postcondition_fails(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        real_readback = checkouts._archive_uncertainty_readback
+        real_release = checkouts.resources.release_resources
+        released_owners: list[str] = []
+
+        def postcommit_readback(bound_fence, *, ignored_lease_owner_ids=()):
+            if ignored_lease_owner_ids:
+                return {
+                    "state": "still_fenced",
+                    "reason": "simulated-postcommit-readback-drift",
+                }
+            return real_readback(
+                bound_fence,
+                ignored_lease_owner_ids=ignored_lease_owner_ids,
+            )
+
+        def record_release(owner_id, resource_keys, **kwargs):
+            released_owners.append(str(owner_id))
+            return real_release(owner_id, resource_keys, **kwargs)
+
+        checkouts.base._append_audit.reset_mock()
+        with (
+            patch.object(
+                checkouts,
+                "_archive_uncertainty_readback",
+                side_effect=postcommit_readback,
+            ),
+            patch.object(
+                checkouts.resources,
+                "release_resources",
+                side_effect=record_release,
+            ),
+            patch.object(
+                checkouts,
+                "_prepare_uncertainty_fence_release",
+            ) as prepare_release,
+        ):
+            reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        prepare_release.assert_not_called()
+        self.assertEqual(reconciliation["state"], "still_fenced")
+        self.assertEqual(
+            reconciliation["reason"],
+            "partial-archive-completion-postcondition-failed",
+        )
+        self.assertEqual(
+            reconciliation["readback"]["state"],
+            "completion_committed_still_fenced",
+        )
+        self.assertTrue(
+            reconciliation["readback"]["durable_completion_committed"]
+        )
+        self.assertFalse(reconciliation["readback"]["postcondition_confirmed"])
+        self.assertFalse(reconciliation["readback"]["fence_release_allowed"])
+        self.assertEqual(
+            reconciliation["readback"]["readback"]["reason"],
+            "simulated-postcommit-readback-drift",
+        )
+
+        archive = checkouts._load_archive(fence["operation_id"])
+        self.assertEqual(archive["head"], self.head)
+        retention = checkouts._retention_records([fence["checkout_key"]])[
+            fence["checkout_key"]
+        ]
+        self.assertEqual(retention["expected_head"], self.head)
+        lifecycle = checkouts._strict_lifecycle_binding(fence["checkout_key"])
+        self.assertIsNotNone(lifecycle)
+        self.assertEqual(lifecycle["phase"], "archived")
+        self.assertEqual(lifecycle["expected_head"], self.head)
+        self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)
+
+        checkouts.base._append_audit.assert_called_once()
+        audit = checkouts.base._append_audit.call_args.args[0]
+        self.assertEqual(
+            audit["operation"],
+            "checkout-operation-uncertainty-reconcile",
+        )
+        self.assertEqual(audit["outcome"], "completion_committed_still_fenced")
+        self.assertTrue(audit["durable_completion_committed"])
+        self.assertFalse(audit["postcondition_confirmed"])
+        self.assertFalse(audit["fence_release_attempted"])
+        self.assertEqual(audit["lease_preparation"]["state"], "not_attempted")
+        self.assertEqual(reconciliation["audit"], audit)
+        self.assertTrue(released_owners)
+        self.assertTrue(
+            all(
+                owner.startswith(
+                    f"checkout-reconcile:{fence['fence_id'][:16]}:"
+                )
+                for owner in released_owners
+            )
+        )
+
+    def test_partial_archive_recovery_revalidates_followup_authority_at_commit(self) -> None:
+        lane_id = "f" * 32
+        evidence = {
+            "terminal_state": "blocked_with_durable_followup",
+            "evidence_sha256": "e" * 64,
+        }
+        authority_before = {
+            "kind": "work_lane_blocked_followup_authority",
+            "durable_followup_binding": {
+                "task_revision": 3,
+                "task_spec_sha256": "a" * 64,
+                "task_state": "verified",
+            },
+            "authority_sha256": "1" * 64,
+        }
+        authority_at_commit = {
+            "kind": "work_lane_blocked_followup_authority",
+            "durable_followup_binding": {
+                "task_revision": 4,
+                "task_spec_sha256": "b" * 64,
+                "task_state": "verified",
+            },
+            "authority_sha256": "2" * 64,
+        }
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=evidence,
+            ),
+            patch(
+                "grabowski_checkout_terminal_sources.blocked_followup_binding_authority",
+                return_value=authority_before,
+            ),
+        ):
+            fence = self._partial_archive_after_manifest_without_db(
+                source_kind="work_lane",
+                source_id=lane_id,
+                completed_retained=True,
+                blocked_followup_reconciliation=True,
+            )
+            assessment = checkouts._archive_partial_completion_assessment(fence)
+        self.assertEqual("recoverable_complete", assessment["state"])
+        self.assertEqual(
+            fence["evidence"]["blocked_followup_archive_evidence"],
+            assessment["blocked_followup_archive_evidence"],
+        )
+        self.assertEqual(
+            authority_before,
+            assessment["blocked_followup_archive_evidence"]["followup_authority"],
+        )
+
+        with (
+            patch(
+                "grabowski_checkout_terminal_sources.source_terminal_evidence",
+                return_value=evidence,
+            ),
+            patch(
+                "grabowski_checkout_terminal_sources.blocked_followup_binding_authority",
+                side_effect=[authority_before, authority_at_commit],
+            ) as archive_authority,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "archive authority changed during recovery commit",
+            ),
+        ):
+            checkouts._complete_partial_archive(
+                fence,
+                expected_assessment_sha256=assessment["assessment_sha256"],
+            )
+
+        self.assertEqual(2, archive_authority.call_count)
+        current = checkouts._lifecycle_bindings([fence["checkout_key"]])[
+            fence["checkout_key"]
+        ]
+        self.assertEqual("completed_retained", current["phase"])
+        self.assertEqual({}, checkouts._latest_archives([fence["checkout_key"]]))
+        self.assertEqual(
+            1,
+            len(checkouts._active_checkout_operation_uncertainties()),
+        )
+
+    def test_partial_archive_recovery_database_failure_rolls_back_and_retries(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        real_mark = checkouts._mark_checkout_archived_in_connection
+        checkouts.base._append_audit.reset_mock()
+
+        with patch.object(
+            checkouts,
+            "_mark_checkout_archived_in_connection",
+            side_effect=RuntimeError("simulated recovery database failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "recovery database failure"):
+                checkouts.grabowski_checkout_uncertainty_reconcile(
+                    fence["fence_id"],
+                    "reconcile-checkout-operation-outcome",
+                )
+
+        with self.assertRaises(ValueError):
+            checkouts._load_archive(fence["operation_id"])
+        self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)
+        checkouts.base._append_audit.assert_not_called()
+        with patch.object(
+            checkouts,
+            "_mark_checkout_archived_in_connection",
+            side_effect=real_mark,
+        ):
+            retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+        self.assertEqual(retry["state"], "reconciled")
+        self.assertEqual(retry["outcome"], "reconciled_success")
+        checkouts.base._append_audit.assert_called_once()
+
+
+    def test_partial_archive_readback_can_ignore_exact_recovery_owner(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        recovery = checkouts._acquire_uncertainty_recovery_resources(fence)
+        try:
+            blocked = checkouts._archive_uncertainty_readback(fence)
+            self.assertEqual(blocked["state"], "still_fenced")
+            self.assertEqual(blocked["partial_state"], "foreign_or_ambiguous")
+            self.assertEqual(
+                blocked["partial_reason"],
+                "archive-recovery-coordination-blocked",
+            )
+
+            ignored = checkouts._archive_uncertainty_readback(
+                fence,
+                ignored_lease_owner_ids=(str(recovery["owner_id"]),),
+            )
+            self.assertEqual(ignored["state"], "recoverable_complete")
+        finally:
+            checkouts.resources.release_resources(
+                recovery["owner_id"],
+                [item["resource_key"] for item in recovery["leases"]],
+                expected_leases=list(recovery["leases"]),
+            )
+
+    def test_partial_archive_completion_postcommit_readback_ignores_recovery_owner(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        assessment = checkouts._archive_partial_completion_assessment(fence)
+        self.assertEqual(assessment["state"], "recoverable_complete")
+        observed_owner_ids: list[tuple[str, ...]] = []
+
+        def confirmed_readback(bound_fence, *, ignored_lease_owner_ids=()):
+            self.assertEqual(bound_fence["fence_id"], fence["fence_id"])
+            observed_owner_ids.append(tuple(ignored_lease_owner_ids))
+            return {
+                "state": "confirmed_success",
+                "verified_recovery_refs": assessment["verified_recovery_refs"],
+            }
+
+        with patch.object(
+            checkouts,
+            "_archive_uncertainty_readback",
+            side_effect=confirmed_readback,
+        ):
+            completed = checkouts._complete_partial_archive(
+                fence,
+                expected_assessment_sha256=assessment["assessment_sha256"],
+            )
+
+        self.assertEqual(completed["state"], "reconciled_success")
+        self.assertEqual(len(observed_owner_ids), 1)
+        self.assertEqual(len(observed_owner_ids[0]), 1)
+        self.assertTrue(
+            observed_owner_ids[0][0].startswith(
+                f"checkout-reconcile:{fence['fence_id'][:16]}:"
+            )
+        )
+
+    def test_partial_archive_concurrent_recovery_attempt_conflicts(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        first = checkouts._acquire_uncertainty_recovery_resources(fence)
+        try:
+            with self.assertRaises(checkouts.resources.ResourceConflict):
+                checkouts._acquire_uncertainty_recovery_resources(fence)
+        finally:
+            checkouts.resources.release_resources(
+                first["owner_id"],
+                [item["resource_key"] for item in first["leases"]],
+                expected_leases=list(first["leases"]),
+            )
+
+    def test_partial_archive_recovery_release_is_snapshot_guarded(self) -> None:
+        fence = self._partial_archive_after_manifest_without_db()
+        real_release = checkouts.resources.release_resources
+        recovery_releases: list[list[dict[str, object]] | None] = []
+
+        def release(owner_id, resource_keys, **kwargs):
+            if str(owner_id).startswith("checkout-reconcile:"):
+                recovery_releases.append(kwargs.get("expected_leases"))
+            return real_release(owner_id, resource_keys, **kwargs)
+
+        with patch.object(
+            checkouts.resources,
+            "release_resources",
+            side_effect=release,
+        ):
+            reconciliation = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(reconciliation["state"], "reconciled")
+        self.assertEqual(reconciliation["outcome"], "reconciled_success")
+        self.assertEqual(len(recovery_releases), 1)
+        snapshots = recovery_releases[0]
+        self.assertIsInstance(snapshots, list)
+        self.assertEqual(
+            {item["resource_key"] for item in snapshots},
+            set(fence["resource_keys"]),
+        )
+        self.assertTrue(
+            all(
+                item["owner_id"].startswith("checkout-reconcile:")
+                for item in snapshots
+            )
+        )
+
+    def test_partial_archive_retry_reclaims_expired_owned_recovery_residue(self) -> None:
+        fence, recovery_owner = self._strand_recovery_lease_after_archive_commit()
+        with checkouts.resources._database() as connection:
+            row = connection.execute(
+                "SELECT MAX(expires_at_unix) AS expires_at_unix "
+                "FROM leases WHERE owner_id=?",
+                (recovery_owner,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        expired_now = int(row["expires_at_unix"]) + 1
+
+        with patch.object(checkouts, "_now", return_value=expired_now):
+            retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(retry["state"], "reconciled")
+        self.assertEqual(retry["outcome"], "confirmed_success")
+        reclaimed = retry["lease_preparation"]["reclaimed_recovery_leases"]
+        self.assertEqual(
+            {item["resource_key"] for item in reclaimed},
+            set(fence["resource_keys"]),
+        )
+        with checkouts.resources._database() as connection:
+            remaining = connection.execute(
+                "SELECT 1 FROM leases WHERE owner_id=?",
+                (recovery_owner,),
+            ).fetchall()
+        self.assertEqual(remaining, [])
+
+    def test_partial_archive_retry_blocks_live_recovery_residue(self) -> None:
+        fence, recovery_owner = self._strand_recovery_lease_after_archive_commit()
+
+        retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+            fence["fence_id"],
+            "reconcile-checkout-operation-outcome",
+        )
+
+        self.assertEqual(retry["state"], "still_fenced")
+        self.assertEqual(retry["reason"], "recovery-lease-still-live")
+        self.assertEqual(
+            {item["owner_id"] for item in retry["lease_preparation"]["leases"]},
+            {recovery_owner},
+        )
+        self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)
+
+    def test_partial_archive_retry_keeps_expired_foreign_residue_fenced(self) -> None:
+        fence, recovery_owner = self._strand_recovery_lease_after_archive_commit()
+        foreign_owner = "foreign-recovery-residue"
+        with checkouts.resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET owner_id=? WHERE owner_id=?",
+                (foreign_owner, recovery_owner),
+            )
+            row = connection.execute(
+                "SELECT MAX(expires_at_unix) AS expires_at_unix "
+                "FROM leases WHERE owner_id=?",
+                (foreign_owner,),
+            ).fetchone()
+            connection.commit()
+        self.assertIsNotNone(row)
+        expired_now = int(row["expires_at_unix"]) + 1
+
+        with patch.object(checkouts, "_now", return_value=expired_now):
+            retry = checkouts.grabowski_checkout_uncertainty_reconcile(
+                fence["fence_id"],
+                "reconcile-checkout-operation-outcome",
+            )
+
+        self.assertEqual(retry["state"], "still_fenced")
+        self.assertEqual(retry["reason"], "resource-lease-residue-conflict")
+        self.assertEqual(
+            {item["owner_id"] for item in retry["lease_preparation"]["leases"]},
+            {foreign_owner},
+        )
+        self.assertEqual(len(checkouts._active_checkout_operation_uncertainties()), 1)
 
     def test_cleanup_unknown_outcome_remains_durably_fenced_after_lease_expiry(self) -> None:
         archive = self._archive()["archive"]

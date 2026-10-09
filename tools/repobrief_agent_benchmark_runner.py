@@ -581,6 +581,7 @@ def _git_environment() -> dict[str, str]:
             "GIT_CONFIG_SYSTEM": "/dev/null",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_NO_LAZY_FETCH": "1",
         }
     )
     return environment

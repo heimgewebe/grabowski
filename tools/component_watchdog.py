@@ -42,7 +42,7 @@ TUNNEL_METRICS_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 CONTROL_PLANE_POLL_METRIC = "commands_poll_last_successful_timestamp_seconds"
 TUNNEL_RECOVERY_PHASES = frozenset({"idle", "degraded", "restarting", "connector-convergence"})
 PROTOCOL_VERSION = "2025-06-18"
-MCP_HEALTH_TOOL = "grabowski_runtime_health"
+MCP_HEALTH_TOOL = "grabowski_mcp_liveness"
 MCP_MAX_RESPONSE_BYTES = 65536
 MCP_STDIO_SHUTDOWN_TIMEOUT = 2.0
 CONNECTOR_SNAPSHOT_REFRESH_MAX_OUTPUT_BYTES = 64 * 1024
@@ -1133,9 +1133,20 @@ def mcp_stdio_probe(
         if is_error:
             raise McpProbeFailure("mcp-tool-error")
         payload = tool_health_payload(result)
-        if payload is None or not isinstance(payload.get("healthy"), bool):
+        if (
+            payload is None
+            or type(payload.get("schema_version")) is not int
+            or payload["schema_version"] != 1
+            or payload.get("health_scope") != "mcp_tool_dispatch"
+            or payload.get("integrity_evaluated") is not False
+            or type(payload.get("dispatch_healthy")) is not bool
+            or any(field in payload for field in (
+                "healthy", "deployment_complete", "deployment_integrity_valid",
+                "audit_valid", "audit_writable", "kill_switch_engaged",
+            ))
+        ):
             raise McpProbeFailure("mcp-tool-shape-invalid")
-        if payload["healthy"] is not True:
+        if payload["dispatch_healthy"] is not True:
             raise McpProbeFailure("mcp-runtime-unhealthy")
     except McpProbeFailure as failure:
         primary_failure = failure.reason

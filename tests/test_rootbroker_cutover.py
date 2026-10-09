@@ -151,6 +151,14 @@ def _platform_connector_capture_action() -> dict[str, object]:
     return _bound_action(cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION)
 
 
+def _critical_user_data_inventory_action() -> dict[str, object]:
+    return _bound_action(cutover.CRITICAL_USER_DATA_INVENTORY_ACTION)
+
+
+def _critical_user_data_inventory_read_action() -> dict[str, object]:
+    return _bound_action(cutover.CRITICAL_USER_DATA_INVENTORY_READ_ACTION)
+
+
 def _local_backup_ntfs_actions() -> dict[str, dict[str, object]]:
     return {name: _bound_action(name) for name in cutover.LOCAL_BACKUP_STORAGE_ACTIONS}
 
@@ -205,6 +213,8 @@ def _example_config_text() -> str:
                 cutover.ROOT_TASK_ACTION: _root_task_action(),
                 cutover.PROCESS_OBSERVER_ACTION: _bound_action(cutover.PROCESS_OBSERVER_ACTION),
                 cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
+                cutover.CRITICAL_USER_DATA_INVENTORY_ACTION: _critical_user_data_inventory_action(),
+                cutover.CRITICAL_USER_DATA_INVENTORY_READ_ACTION: _critical_user_data_inventory_read_action(),
                 cutover.BOOTSTRAP_RECOVERY_ACTION: _bootstrap_recovery_action(),
                 cutover.OPERATOR_SERVICE_CONTROL_ACTION: _operator_service_control_action(),
                 cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
@@ -594,6 +604,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
             self._typed_blockade_marker(kind="path", value="/etc/grabowski"),
             self._typed_blockade_marker(
                 kind="path",
+                value=str(cutover.CRITICAL_USER_DATA_INVENTORY_TARGET),
+            ),
+            self._typed_blockade_marker(
+                kind="path",
                 value=str(cutover.AUTOMATIC_STAGING_ROOT / "future-helper.py"),
             ),
             self._typed_blockade_marker(
@@ -864,6 +878,17 @@ class RootbrokerCutoverTests(unittest.TestCase):
         self.assertEqual(artifact.mode, 0o644)
         self.assertTrue(artifact.python_source)
 
+    def test_cutover_artifacts_include_flowlines_operator_dropin(self) -> None:
+        artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
+
+        artifact = artifacts[cutover.OPERATOR_FLOWLINES_DROPIN_TARGET]
+        self.assertEqual(
+            artifact.source_relative,
+            "systemd/grabowski-operator.service.d/80-flowlines.conf.example",
+        )
+        self.assertEqual(artifact.mode, 0o644)
+        self.assertFalse(artifact.python_source)
+
     def test_cutover_artifacts_include_runtime_bootstrap_recovery_helper(self) -> None:
         artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
 
@@ -890,6 +915,8 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
                 cutover.SECRET_PTY_ACTION: _secret_pty_action(),
                 cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
+                cutover.CRITICAL_USER_DATA_INVENTORY_ACTION: _critical_user_data_inventory_action(),
+                cutover.CRITICAL_USER_DATA_INVENTORY_READ_ACTION: _critical_user_data_inventory_read_action(),
                 **_local_backup_ntfs_actions(),
             },
         }
@@ -899,8 +926,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
             "secret_pty_module": cutover.SECRET_PTY_MODULE_TARGET,
             "broker_wrapper": cutover.BROKER_WRAPPER_TARGET,
             "platform_connector_capture": cutover.PLATFORM_CONNECTOR_CAPTURE_TARGET,
+            "critical_user_data_inventory": cutover.CRITICAL_USER_DATA_INVENTORY_TARGET,
             "cutover_helper": cutover.CUTOVER_HELPER_TARGET,
             "operator_service": cutover.OPERATOR_SERVICE_TARGET,
+            "operator_flowlines_dropin": cutover.OPERATOR_FLOWLINES_DROPIN_TARGET,
         }.items():
             data = (label + "\n").encode("utf-8")
             source_artifacts[target] = (data, 0o644, hashlib.sha256(data).hexdigest())
@@ -922,6 +951,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
             attestation["artifact_sha256"]["operator_service"],
             source_artifacts[cutover.OPERATOR_SERVICE_TARGET][2],
         )
+        self.assertEqual(
+            attestation["artifact_sha256"]["operator_flowlines_dropin"],
+            source_artifacts[cutover.OPERATOR_FLOWLINES_DROPIN_TARGET][2],
+        )
         self.assertIn(
             cutover.LOCAL_BACKUP_NTFS_CHECK_ACTION, attestation["action_sha256"]
         )
@@ -942,6 +975,18 @@ class RootbrokerCutoverTests(unittest.TestCase):
             attestation["action_sha256"],
         )
         self.assertIn(cutover.SECRET_PTY_ACTION, attestation["action_sha256"])
+        self.assertIn(
+            cutover.CRITICAL_USER_DATA_INVENTORY_ACTION,
+            attestation["action_sha256"],
+        )
+        self.assertIn(
+            cutover.CRITICAL_USER_DATA_INVENTORY_READ_ACTION,
+            attestation["action_sha256"],
+        )
+        self.assertEqual(
+            attestation["artifact_sha256"]["critical_user_data_inventory"],
+            source_artifacts[cutover.CRITICAL_USER_DATA_INVENTORY_TARGET][2],
+        )
         unsigned = dict(attestation)
         digest = unsigned.pop("attestation_sha256")
         self.assertEqual(digest, cutover._sha256(cutover._canonical_json(unsigned)))
@@ -960,6 +1005,8 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover.ROOTBROKER_CUTOVER_ACTION: _rootbroker_cutover_action(),
                 cutover.SECRET_PTY_ACTION: _secret_pty_action(),
                 cutover.PLATFORM_CONNECTOR_CAPTURE_ACTION: _platform_connector_capture_action(),
+                cutover.CRITICAL_USER_DATA_INVENTORY_ACTION: _critical_user_data_inventory_action(),
+                cutover.CRITICAL_USER_DATA_INVENTORY_READ_ACTION: _critical_user_data_inventory_read_action(),
             },
         }
         source_artifacts = {}
@@ -968,8 +1015,10 @@ class RootbrokerCutoverTests(unittest.TestCase):
             cutover.SECRET_PTY_MODULE_TARGET,
             cutover.BROKER_WRAPPER_TARGET,
             cutover.PLATFORM_CONNECTOR_CAPTURE_TARGET,
+            cutover.CRITICAL_USER_DATA_INVENTORY_TARGET,
             cutover.CUTOVER_HELPER_TARGET,
             cutover.OPERATOR_SERVICE_TARGET,
+            cutover.OPERATOR_FLOWLINES_DROPIN_TARGET,
         ):
             data = (str(target) + "\n").encode("utf-8")
             source_artifacts[target] = (data, 0o644, hashlib.sha256(data).hexdigest())
@@ -997,7 +1046,6 @@ class RootbrokerCutoverTests(unittest.TestCase):
         )
         self.assertIn("WantedBy=multi-user.target", unit)
         self.assertNotIn("%h", unit)
-
     def test_source_artifact_validation_rejects_missing_local_dependency(self) -> None:
         broker_target = Path("/usr/local/lib/grabowski/grabowski_privileged_broker.py")
         broker_data = b"import grabowski_command_identity\n"
@@ -1493,7 +1541,11 @@ class RootbrokerCutoverTests(unittest.TestCase):
     def test_automatic_cutover_bind_paths_include_canonical_grabowski_repo(self) -> None:
         self.assertEqual(
             cutover.AUTOMATIC_CUTOVER_BIND_PATHS,
-            ("/home/alex/repos/grabowski",),
+            (
+                "/home/alex/repos/grabowski",
+                "/home/alex/repos/.repoground-sources/"
+                "heimgewebe__heim-pc__main--d6d4b3c4337d8bd51758d10d83975c9d61fd18d7",
+            ),
         )
         self.assertNotIn(
             "/home/alex/repos/grabowski",
@@ -1949,6 +2001,96 @@ class RootbrokerCutoverTests(unittest.TestCase):
             backup_manifests = list(Path(layout["backup_root"]).rglob("manifest.json"))
             self.assertEqual(len(backup_manifests), 1)
 
+    def test_apply_creates_missing_flowlines_dropin_parent_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            layout = self._layout(root)
+            systemd_system = root / "installed" / "etc" / "systemd" / "system"
+            systemd_system.mkdir(parents=True)
+            systemd_system.chmod(0o700)
+            dropin_parent = systemd_system / "grabowski-operator.service.d"
+            dropin_target = dropin_parent / "80-flowlines.conf"
+            dropin_data = b"FLOWLINES_ENABLED = True\n"
+            artifacts = dict(layout["artifacts"])
+            artifacts[dropin_target] = (
+                dropin_data,
+                0o644,
+                hashlib.sha256(dropin_data).hexdigest(),
+            )
+
+            with patch.object(
+                cutover,
+                "OPERATOR_FLOWLINES_DROPIN_TARGET",
+                dropin_target,
+            ):
+                receipt = cutover.apply_cutover(
+                    repository=layout["repository"],
+                    expected_head=HEAD,
+                    backup_root=layout["backup_root"],
+                    receipt_root=layout["receipt_root"],
+                    config_target=layout["config_target"],
+                    artifact_targets=artifacts,
+                    lock_path=layout["lock_path"],
+                    runner=FakeRunner(active=True),
+                    require_root=False,
+                )
+
+            self.assertEqual(dropin_target.read_bytes(), dropin_data)
+            self.assertEqual(dropin_target.stat().st_mode & 0o777, 0o644)
+            self.assertEqual(dropin_parent.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(
+                receipt["created_install_directories"],
+                [str(dropin_parent)],
+            )
+
+    def test_failure_removes_flowlines_dropin_parent_created_by_cutover(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            layout = self._layout(root)
+            systemd_system = root / "installed" / "etc" / "systemd" / "system"
+            systemd_system.mkdir(parents=True)
+            systemd_system.chmod(0o700)
+            dropin_parent = systemd_system / "grabowski-operator.service.d"
+            dropin_target = dropin_parent / "80-flowlines.conf"
+            dropin_data = b"FLOWLINES_ENABLED = True\n"
+            artifacts = dict(layout["artifacts"])
+            artifacts[dropin_target] = (
+                dropin_data,
+                0o644,
+                hashlib.sha256(dropin_data).hexdigest(),
+            )
+
+            with (
+                patch.object(
+                    cutover,
+                    "OPERATOR_FLOWLINES_DROPIN_TARGET",
+                    dropin_target,
+                ),
+                self.assertRaisesRegex(cutover.CutoverError, "injected start failure"),
+            ):
+                cutover.apply_cutover(
+                    repository=layout["repository"],
+                    expected_head=HEAD,
+                    backup_root=layout["backup_root"],
+                    receipt_root=layout["receipt_root"],
+                    config_target=layout["config_target"],
+                    artifact_targets=artifacts,
+                    lock_path=layout["lock_path"],
+                    runner=FakeRunner(active=True, fail_first_start=True),
+                    require_root=False,
+                )
+
+            self.assertFalse(dropin_target.exists())
+            self.assertFalse(dropin_parent.exists())
+            receipts = list(Path(layout["receipt_root"]).glob("*.json"))
+            self.assertEqual(len(receipts), 1)
+            failure = json.loads(receipts[0].read_text())
+            self.assertTrue(failure["rollback_complete"])
+            self.assertEqual(
+                failure["created_install_directories"],
+                [str(dropin_parent)],
+            )
+
     def test_failure_restores_every_preimage_and_records_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             layout = self._layout(Path(raw))
@@ -1997,7 +2139,6 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 0o644,
                 hashlib.sha256(invalid).hexdigest(),
             )
-
             with self.assertRaisesRegex(cutover.CutoverError, "not valid Python"):
                 cutover.apply_cutover(
                     repository=layout["repository"],

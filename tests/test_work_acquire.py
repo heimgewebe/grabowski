@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import inspect
+import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import time
@@ -19,6 +22,18 @@ import grabowski_lane_closeout as closeout
 import grabowski_work_acquire as work_acquire
 
 SHA = "a" * 40
+PHYSICAL = {
+    "schema_version": 1,
+    "kind": "grabowski.physical_checkout_identity",
+    "root": {"path": "/registered/root", "device": 1, "inode": 1},
+    "git_dir": {
+        "path": "/registered/common/worktrees/lane",
+        "device": 1,
+        "inode": 2,
+    },
+    "common_dir": {"path": "/registered/common", "device": 1, "inode": 3},
+    "physical_identity_sha256": "f" * 64,
+}
 
 
 class WorkAcquireTests(unittest.TestCase):
@@ -33,9 +48,19 @@ class WorkAcquireTests(unittest.TestCase):
         self.retention = int(time.time()) + 3600
         self.previous = os.environ.get("GRABOWSKI_WORK_LANE_ROOT")
         os.environ["GRABOWSKI_WORK_LANE_ROOT"] = str(self.state)
+        self.previous_checkout_db = work_acquire.checkouts.CHECKOUT_DB
+        work_acquire.checkouts.CHECKOUT_DB = self.state / "checkouts.sqlite3"
+        self.effective_toplevel_patcher = patch.object(
+            work_acquire.git_preimage,
+            "_require_effective_git_toplevel",
+            return_value=str(self.target),
+        )
+        self.effective_toplevel_patcher.start()
+        self.addCleanup(self.effective_toplevel_patcher.stop)
         self.addCleanup(self._restore_env)
 
     def _restore_env(self) -> None:
+        work_acquire.checkouts.CHECKOUT_DB = self.previous_checkout_db
         if self.previous is None:
             os.environ.pop("GRABOWSKI_WORK_LANE_ROOT", None)
         else:
@@ -318,6 +343,46 @@ class WorkAcquireTests(unittest.TestCase):
             )
         acquire.assert_not_called()
         ensure.assert_not_called()
+
+    def test_unsupported_source_kind_blocks_before_resource_or_worktree_effect(self) -> None:
+        for source_kind in ("chat-thread", "github-pr"):
+            with self.subTest(source_kind=source_kind):
+                params = self.parameters()
+                params["source_kind"] = source_kind
+                acquire = Mock()
+                ensure = Mock()
+                with self.assertRaisesRegex(ValueError, "source_kind must be one of"):
+                    work_acquire.acquire_work(
+                        params,
+                        acquire_resources_fn=acquire,
+                        release_resources_fn=Mock(),
+                        inspect_resource_fn=Mock(),
+                        ensure_worktree_fn=ensure,
+                        runner=Mock(),
+                    )
+                acquire.assert_not_called()
+                ensure.assert_not_called()
+                self.assertFalse(self.state.exists())
+
+    def test_lifecycle_source_preserves_historical_noncanonical_binding(self) -> None:
+        params = self.parameters()
+        params["source_kind"] = "github-pr"
+        params["source_id"] = "heimgewebe/grabowski#1361"
+        normalized = work_acquire._normalize(params)
+        self.assertEqual(
+            work_acquire._lifecycle_source(normalized),
+            {"kind": "github-pr", "id": "heimgewebe/grabowski#1361"},
+        )
+
+    def test_supported_terminal_source_kind_is_preserved_for_lifecycle(self) -> None:
+        params = self.parameters()
+        params["source_kind"] = "github_issue"
+        params["source_id"] = "heimgewebe/grabowski#1"
+        normalized = work_acquire._normalize(params)
+        self.assertEqual(
+            work_acquire._lifecycle_source(normalized),
+            {"kind": "github_issue", "id": "heimgewebe/grabowski#1"},
+        )
 
     def test_acquires_narrow_resources_and_returns_ready_lane(self) -> None:
         seen: dict[str, object] = {}
@@ -1100,6 +1165,31 @@ class WorkAcquireTests(unittest.TestCase):
             "final_status": "launch_submitted",
         }
 
+    @staticmethod
+    def writer_status(
+        unit: str,
+        final_status: str,
+        *,
+        systemd_visible: bool | None = None,
+    ) -> dict[str, object]:
+        if systemd_visible is None:
+            systemd_visible = final_status not in {
+                "launch_failed",
+                "missing_finalization_evidence",
+                "timed_out",
+                "signalled",
+            }
+        return {
+            "unit": unit,
+            "final_status": final_status,
+            "systemd_visible": systemd_visible,
+            "terminalization_evidence": {
+                "source": "test",
+                "final_status": final_status,
+                "systemd_visible": systemd_visible,
+            },
+        }
+
     def test_optional_scoped_writer_starts_and_binds_durable_job(self) -> None:
         params = self.parameters()
         params["scoped_writer_argv"] = ["writer", "--once"]
@@ -1139,6 +1229,9 @@ class WorkAcquireTests(unittest.TestCase):
         params["scoped_writer_argv"] = ["writer", "--once"]
         params["scoped_writer_runtime_seconds"] = 600
         start = Mock(return_value=self.writer_result(self.target))
+        read_status = Mock(
+            return_value=self.writer_status("grabowski-job-123456789abc", "succeeded")
+        )
         acquire = Mock(side_effect=self.acquire)
         ensure = Mock(
             side_effect=[
@@ -1167,6 +1260,7 @@ class WorkAcquireTests(unittest.TestCase):
             "ensure_worktree_fn": ensure,
             "runner": Mock(),
             "start_writer_fn": start,
+            "read_writer_status_fn": read_status,
         }
         first = work_acquire.acquire_work(params, **kwargs)
         second = work_acquire.acquire_work(params, **kwargs)
@@ -1174,8 +1268,1985 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(second["writer_start"]["state"], "reused")
         self.assertTrue(second["replayed"])
         self.assertEqual(start.call_count, 1)
+        self.assertEqual(read_status.call_count, 1)
+        self.assertTrue(second["writer_liveness"]["terminal"])
+        self.assertEqual(second["writer_liveness"]["final_status"], "succeeded")
+        self.assertTrue(second["writer_liveness"]["systemd_visible"])
         self.assertEqual(acquire.call_count, 2)
         self.assertEqual(ensure.call_count, 2)
+
+    def test_running_existing_writer_blocks_before_continuation_snapshot_and_replay_is_inert(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        start = Mock(return_value=self.writer_result(self.target))
+        read_status = Mock(
+            return_value=self.writer_status("grabowski-job-123456789abc", "running")
+        )
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock()
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {
+                    "target_registered": True,
+                    "target_path_exists": True,
+                },
+            }
+        )
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+            "start_writer_fn": start,
+            "read_writer_status_fn": read_status,
+        }
+        first = work_acquire.acquire_work(params, **kwargs)
+        self.assertEqual(first["state"], "ready")
+        preimage = Mock(side_effect=AssertionError("preimage must not run"))
+        with patch.object(work_acquire, "_continuation_preimage", preimage):
+            blocked = work_acquire.acquire_work(params, **kwargs)
+            acquire_calls_after_block = acquire.call_count
+            status_calls_after_block = read_status.call_count
+            start_calls_after_block = start.call_count
+            replay = work_acquire.acquire_work(params, **kwargs)
+
+        self.assertEqual(blocked["state"], "outcome_unknown")
+        self.assertEqual(blocked["decision"], "HARD_BLOCK")
+        self.assertEqual(blocked["error_class"], "SCOPED_WRITER_NOT_TERMINAL")
+        self.assertEqual(
+            blocked["next_action"], "readback_scoped_writer_before_retry"
+        )
+        self.assertEqual(blocked["writer_liveness"]["final_status"], "running")
+        self.assertTrue(blocked["writer_liveness"]["systemd_visible"])
+        self.assertFalse(blocked["writer_liveness"]["terminal"])
+        self.assertIsNone(blocked["compensation"])
+        self.assertTrue(blocked["effect_observed"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["receipt_sha256"], blocked["receipt_sha256"])
+        self.assertEqual(acquire.call_count, acquire_calls_after_block)
+        self.assertEqual(read_status.call_count, status_calls_after_block)
+        self.assertEqual(start.call_count, start_calls_after_block)
+        self.assertEqual(acquire.call_count, 2)
+        self.assertEqual(read_status.call_count, 1)
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(ensure.call_count, 1)
+        release.assert_not_called()
+        preimage.assert_not_called()
+
+    def test_unclear_existing_writer_status_fails_closed_before_continuation_snapshot(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        start = Mock(return_value=self.writer_result(self.target))
+        read_status = Mock(
+            return_value=self.writer_status(
+                "grabowski-job-123456789abc", "missing_finalization_evidence"
+            )
+        )
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock()
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {
+                    "target_registered": True,
+                    "target_path_exists": True,
+                },
+            }
+        )
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+            "start_writer_fn": start,
+            "read_writer_status_fn": read_status,
+        }
+        work_acquire.acquire_work(params, **kwargs)
+        preimage = Mock(side_effect=AssertionError("preimage must not run"))
+        with patch.object(work_acquire, "_continuation_preimage", preimage):
+            blocked = work_acquire.acquire_work(params, **kwargs)
+
+        self.assertEqual(blocked["state"], "outcome_unknown")
+        self.assertEqual(blocked["error_class"], "SCOPED_WRITER_NOT_TERMINAL")
+        self.assertEqual(
+            blocked["writer_liveness"]["final_status"],
+            "missing_finalization_evidence",
+        )
+        self.assertFalse(blocked["writer_liveness"]["systemd_visible"])
+        self.assertFalse(blocked["writer_liveness"]["terminal"])
+        self.assertIsNone(blocked["compensation"])
+        self.assertEqual(acquire.call_count, 2)
+        self.assertEqual(read_status.call_count, 1)
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(ensure.call_count, 1)
+        release.assert_not_called()
+        preimage.assert_not_called()
+
+    def test_persisted_terminal_receipt_does_not_establish_writer_quiescence(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        start = Mock(return_value=self.writer_result(self.target))
+        persisted_status = self.writer_status(
+            "grabowski-job-123456789abc",
+            "succeeded",
+            systemd_visible=False,
+        )
+        persisted_status["terminalization_evidence"]["source"] = "persisted-runner-receipt"
+        persisted_status["terminalization_evidence"]["does_not_establish"] = [
+            "live_process_status"
+        ]
+        read_status = Mock(return_value=persisted_status)
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock()
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {
+                    "target_registered": True,
+                    "target_path_exists": True,
+                },
+            }
+        )
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+            "start_writer_fn": start,
+            "read_writer_status_fn": read_status,
+        }
+        work_acquire.acquire_work(params, **kwargs)
+        preimage = Mock(side_effect=AssertionError("preimage must not run"))
+        with patch.object(work_acquire, "_continuation_preimage", preimage):
+            blocked = work_acquire.acquire_work(params, **kwargs)
+
+        self.assertEqual(blocked["state"], "outcome_unknown")
+        self.assertEqual(blocked["error_class"], "SCOPED_WRITER_NOT_TERMINAL")
+        self.assertEqual(blocked["writer_liveness"]["final_status"], "succeeded")
+        self.assertFalse(blocked["writer_liveness"]["systemd_visible"])
+        self.assertFalse(blocked["writer_liveness"]["terminal"])
+        self.assertIsNone(blocked["compensation"])
+        self.assertEqual(acquire.call_count, 2)
+        self.assertEqual(read_status.call_count, 1)
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(ensure.call_count, 1)
+        release.assert_not_called()
+        preimage.assert_not_called()
+
+    def test_collected_writer_with_bound_finalization_is_terminal(self) -> None:
+        unit = "grabowski-job-123456789abc"
+        status = self.writer_status(unit, "succeeded", systemd_visible=False)
+        status["terminalization_evidence"] = {
+            "source": "persisted-runner-receipt",
+            "query_valid": True,
+            "systemd_visible": False,
+            "final_status": "succeeded",
+            "receipt_valid": True,
+            "receipt_sha256": "a" * 64,
+            "payload_sha256": "b" * 64,
+        }
+        status["finalization_receipt"] = {
+            "valid": True,
+            "final_status": "succeeded",
+            "receipt_sha256": "a" * 64,
+            "payload_sha256": "b" * 64,
+        }
+
+        liveness = work_acquire._scoped_writer_liveness(
+            self.writer_result(self.target),
+            Mock(return_value=status),
+        )
+
+        self.assertTrue(liveness["terminal"])
+        self.assertFalse(liveness["systemd_visible"])
+        self.assertEqual(
+            liveness["terminality_basis"], "collected_bound_finalization"
+        )
+
+    def test_collected_writer_receipt_digest_mismatch_stays_nonterminal(self) -> None:
+        unit = "grabowski-job-123456789abc"
+        status = self.writer_status(unit, "succeeded", systemd_visible=False)
+        status["terminalization_evidence"] = {
+            "source": "persisted-runner-receipt",
+            "query_valid": True,
+            "systemd_visible": False,
+            "final_status": "succeeded",
+            "receipt_valid": True,
+            "receipt_sha256": "a" * 64,
+            "payload_sha256": "b" * 64,
+        }
+        status["finalization_receipt"] = {
+            "valid": True,
+            "final_status": "succeeded",
+            "receipt_sha256": "c" * 64,
+            "payload_sha256": "b" * 64,
+        }
+
+        liveness = work_acquire._scoped_writer_liveness(
+            self.writer_result(self.target),
+            Mock(return_value=status),
+        )
+
+        self.assertFalse(liveness["terminal"])
+        self.assertEqual(liveness["terminality_basis"], "unproven")
+
+    def test_invalid_existing_writer_status_evidence_fails_closed(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        start = Mock(return_value=self.writer_result(self.target))
+        read_status = Mock(
+            return_value={
+                "unit": "grabowski-job-123456789abc",
+                "final_status": "succeeded",
+                "systemd_visible": True,
+                "terminalization_evidence": {},
+            }
+        )
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock()
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {
+                    "target_registered": True,
+                    "target_path_exists": True,
+                },
+            }
+        )
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+            "start_writer_fn": start,
+            "read_writer_status_fn": read_status,
+        }
+        work_acquire.acquire_work(params, **kwargs)
+        preimage = Mock(side_effect=AssertionError("preimage must not run"))
+        with patch.object(work_acquire, "_continuation_preimage", preimage):
+            blocked = work_acquire.acquire_work(params, **kwargs)
+
+        self.assertEqual(blocked["state"], "outcome_unknown")
+        self.assertEqual(blocked["error_class"], "SCOPED_WRITER_STATUS_UNCLEAR")
+        self.assertIn("finalization evidence is invalid", blocked["error"])
+        self.assertIsNone(blocked["compensation"])
+        self.assertEqual(acquire.call_count, 2)
+        self.assertEqual(read_status.call_count, 1)
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(ensure.call_count, 1)
+        release.assert_not_called()
+        preimage.assert_not_called()
+
+    def test_identical_dirty_lane_continues_without_rerunning_ensure(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        ensure = Mock(return_value={
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {"target_registered": True, "target_path_exists": True},
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
+                "checkout_path": str(self.target),
+                "owner_id": inputs["lease_owner_id"],
+                "source": lifecycle_source,
+                "artifact_class": inputs["artifact_class"],
+                "expected_branch": inputs["branch"],
+            },
+        })
+        kwargs = {
+            "acquire_resources_fn": self.acquire,
+            "release_resources_fn": Mock(),
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+        }
+        first = work_acquire.acquire_work(params, runner=Mock(), **kwargs)
+        self.assertEqual(first["state"], "ready")
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {
+                    "returncode": 0,
+                    "stdout": "## feat/authority-p0\n M src/example.py\n",
+                }
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "diff-index":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "diff-files":
+                return {"returncode": 1, "stdout": ""}
+            if argv[0] == "write-tree":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "ls-files" and "--stage" in argv:
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "merge-base":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        record = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),
+            patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
+            patch.object(
+                work_acquire,
+                "_bounded_raw_nul_git_probe",
+                return_value=__import__("subprocess").CompletedProcess([], 0, b"", b""),
+            ),
+            patch.object(work_acquire.git_preimage, "capture_untracked_preimage", return_value={"count": 0, "worktree_sha256": "1" * 64, "preimage_sha256": "2" * 64}),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+        ):
+            second = work_acquire.acquire_work(params, runner=runner, **kwargs)
+
+        self.assertEqual(second["decision"], "CONTINUE_EXISTING")
+        self.assertTrue(second["continuation_preimage"]["dirty"])
+        self.assertEqual(second["continuation_preimage"]["head"], SHA)
+        self.assertEqual(second["continuation_preimage"]["checkout_key"], checkout_key)
+        self.assertEqual(ensure.call_count, 1)
+
+    def test_continuation_raw_probe_uses_sanitized_git_environment(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {"checkout_key": checkout_key, "physical_checkout": PHYSICAL},
+            },
+        }
+        record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "merge-base":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        sanitized = {"PATH": "/usr/bin", "GIT_TERMINAL_PROMPT": "0"}
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with (
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
+            patch.object(work_acquire.operator, "_git_environment", return_value=sanitized),
+            patch.object(work_acquire.subprocess, "run", return_value=completed) as run,
+            patch.object(work_acquire.git_preimage, "capture_untracked_preimage", return_value={"count": 0, "worktree_sha256": "1" * 64, "preimage_sha256": "2" * 64}),
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}) as capture,
+        ):
+            work_acquire._continuation_preimage(prior, inputs, lifecycle_source, runner)
+            raw_probe = capture.call_args.args[1]
+            raw_probe(self.target, ["ls-files", "--stage", "-z"])
+
+        self.assertEqual(run.call_args.kwargs["env"], sanitized)
+        self.assertNotIn("GIT_INDEX_FILE", run.call_args.kwargs["env"])
+        self.assertTrue(
+            any("--no-replace-objects" in call.args[0] for call in run.call_args_list)
+        )
+        self.assertIsNotNone(capture.call_args.kwargs["index_probe"])
+        self.assertEqual(capture.call_args.kwargs["max_tracked_paths"], 25_000)
+        self.assertEqual(
+            capture.call_args.kwargs["max_tracked_bytes"], 1024 * 1024 * 1024
+        )
+        self.assertTrue(capture.call_args.kwargs["reject_gitlinks"])
+
+    def test_default_snapshot_git_reads_share_remaining_deadline(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+        timeouts: list[float] = []
+
+        def operator_run(command: list[str], **kwargs: object) -> dict[str, object]:
+            timeouts.append(float(kwargs["timeout_seconds"]))
+            args = command[3:]
+            if args[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if args[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if args[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if args[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(args)
+
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(
+                work_acquire.operator,
+                "_validate_argv",
+                side_effect=lambda command, cwd: command,
+            ),
+            patch.object(
+                work_acquire.operator,
+                "_git_environment",
+                return_value={"PATH": "/usr/bin"},
+            ),
+            patch.object(work_acquire.operator, "_run", side_effect=operator_run),
+            patch.object(work_acquire.subprocess, "run", return_value=completed),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                return_value={
+                    "branch": inputs["branch"],
+                    "head": SHA,
+                    "operation_refs": {},
+                    "physical_checkout": PHYSICAL,
+                    "preimage_sha256": "c" * 64,
+                    "index_sha256": "d" * 64,
+                    "worktree_sha256": "e" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "count": 0,
+                    "worktree_sha256": "1" * 64,
+                    "preimage_sha256": "2" * 64,
+                },
+            ),
+        ):
+            result = work_acquire._continuation_preimage(
+                prior,
+                inputs,
+                lifecycle_source,
+                work_acquire._git_runner,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(timeouts), 10)
+        self.assertTrue(all(0 < timeout <= 30 for timeout in timeouts))
+        self.assertEqual(timeouts, sorted(timeouts, reverse=True))
+
+    def test_continuation_rejects_registration_scan_past_snapshot_deadline(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        now = [100.0]
+        registration_calls = [0]
+
+        def monotonic() -> float:
+            return now[0]
+
+        def capture_registered(*_args: object, **_kwargs: object) -> dict[str, object]:
+            registration_calls[0] += 1
+            if registration_calls[0] == 3:
+                now[0] = 131.0
+            return PHYSICAL["git_dir"]
+
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(
+                    self.repo,
+                    Path(PHYSICAL["common_dir"]["path"]),
+                    record,
+                ),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                side_effect=capture_registered,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(work_acquire.time, "monotonic", side_effect=monotonic),
+            patch.object(work_acquire.subprocess, "run", return_value=completed),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                return_value={
+                    "branch": inputs["branch"],
+                    "head": SHA,
+                    "operation_refs": {},
+                    "physical_checkout": PHYSICAL,
+                    "preimage_sha256": "c" * 64,
+                    "index_sha256": "d" * 64,
+                    "worktree_sha256": "e" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "count": 0,
+                    "worktree_sha256": "1" * 64,
+                    "preimage_sha256": "2" * 64,
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "preimage deadline exceeded"),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, runner
+            )
+
+        self.assertEqual(registration_calls[0], 3)
+
+    def test_tracked_worktree_hash_enforces_path_byte_and_deadline_bounds(self) -> None:
+        first = b"100644 " + (b"a" * 40) + b" 0\tfirst.txt\0"
+        second = b"100644 " + (b"b" * 40) + b" 0\tsecond.txt\0"
+        with self.assertRaisesRegex(RuntimeError, "path limit exceeded"):
+            work_acquire.git_preimage._tracked_worktree_sha256(
+                self.repo,
+                first + second,
+                max_paths=1,
+            )
+
+        (self.repo / "first.txt").write_bytes(b"abcd")
+        with self.assertRaisesRegex(RuntimeError, "byte limit exceeded"):
+            work_acquire.git_preimage._tracked_worktree_sha256(
+                self.repo,
+                first,
+                max_total_bytes=1,
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "preimage deadline"):
+            work_acquire.git_preimage._tracked_worktree_sha256(
+                self.repo,
+                first,
+                deadline_monotonic=time.monotonic() - 1,
+            )
+
+    def test_continuation_rejects_raw_tracked_drift_between_readbacks(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {"checkout_key": checkout_key, "physical_checkout": PHYSICAL},
+            },
+        }
+        record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n M src/example.py\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "diff-index":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "diff-files":
+                return {"returncode": 1, "stdout": ""}
+            if argv[0] == "write-tree":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "ls-files" and "--stage" in argv:
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "merge-base":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        with (
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", side_effect=[{"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}, {"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "f" * 64, "index_sha256": "d" * 64, "worktree_sha256": "a" * 64}]),
+            patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
+            patch.object(work_acquire.git_preimage, "capture_untracked_preimage", return_value={"count": 0, "worktree_sha256": "1" * 64, "preimage_sha256": "2" * 64}),
+            self.assertRaisesRegex(RuntimeError, "changed during stable readback"),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, runner
+            )
+
+    def test_dirty_lane_continuation_rejects_truncated_preimage(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        ensure = Mock(return_value={
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {"target_registered": True, "target_path_exists": True},
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
+                "checkout_path": str(self.target),
+                "owner_id": inputs["lease_owner_id"],
+                "source": lifecycle_source,
+                "artifact_class": inputs["artifact_class"],
+                "expected_branch": inputs["branch"],
+            },
+        })
+        release = Mock(side_effect=self.release)
+        kwargs = {
+            "acquire_resources_fn": self.acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+        }
+        work_acquire.acquire_work(params, runner=Mock(), **kwargs)
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n M src/example.py\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "diff-index":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "diff-files":
+                return {"returncode": 1, "stdout": ""}
+            if argv[0] == "write-tree":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "ls-files" and "-v" in argv:
+                return {
+                    "returncode": 0,
+                    "stdout": "H src/example.py\0",
+                    "stdout_truncated": True,
+                }
+            if argv[0] == "ls-files" and "--stage" in argv:
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+        with (
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),
+            patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
+            patch.object(work_acquire.git_preimage, "capture_untracked_preimage", return_value={"count": 0, "worktree_sha256": "1" * 64, "preimage_sha256": "2" * 64}),
+            patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
+        ):
+            blocked = work_acquire.acquire_work(params, runner=runner, **kwargs)
+
+        self.assertEqual(blocked["state"], "blocked")
+        self.assertEqual(blocked["error_class"], "WORKTREE_CONTINUATION_CONFLICT")
+        self.assertIn("readback was truncated", blocked["error"])
+        self.assertEqual(blocked["compensation"]["state"], "complete")
+        release.assert_called_once()
+        self.assertEqual(ensure.call_count, 1)
+
+    def test_dirty_lane_continuation_rejects_hidden_index_entries(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        ensure = Mock(return_value={
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {"target_registered": True, "target_path_exists": True},
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
+                "checkout_path": str(self.target),
+                "owner_id": inputs["lease_owner_id"],
+                "source": lifecycle_source,
+                "artifact_class": inputs["artifact_class"],
+                "expected_branch": inputs["branch"],
+            },
+        })
+        release = Mock(side_effect=self.release)
+        kwargs = {
+            "acquire_resources_fn": self.acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+        }
+        work_acquire.acquire_work(params, runner=Mock(), **kwargs)
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "write-tree":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] == "ls-files" and "-v" in argv:
+                return {"returncode": 0, "stdout": "h src/example.py\0"}
+            if argv[0] == "ls-files" and "--stage" in argv:
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+        with (
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),
+            patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
+            patch.object(work_acquire.git_preimage, "capture_untracked_preimage", return_value={"count": 0, "worktree_sha256": "1" * 64, "preimage_sha256": "2" * 64}),
+            patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
+        ):
+            blocked = work_acquire.acquire_work(params, runner=runner, **kwargs)
+        self.assertEqual(blocked["state"], "blocked")
+        self.assertIn("assume-unchanged", blocked["error"])
+        self.assertEqual(blocked["compensation"]["state"], "complete")
+        release.assert_called_once()
+        self.assertEqual(ensure.call_count, 1)
+
+    def test_continuation_rejects_preexisting_unregistered_physical_checkout(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {"checkout_key": checkout_key, "physical_checkout": PHYSICAL},
+            },
+        }
+        record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, Path("/registered/common"), record),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                side_effect=work_acquire.physical_checkout.PhysicalCheckoutIdentityError(
+                    "git_dir changed"
+                ),
+            ),
+            self.assertRaisesRegex(RuntimeError, "ensure-time physical identity"),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, Mock()
+            )
+
+    def test_continuation_rejects_current_registered_git_dir_drift(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        replacement_git_dir = {
+            "path": "/registered/common/worktrees/replacement",
+            "device": 1,
+            "inode": 99,
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=replacement_git_dir,
+            ),
+            self.assertRaisesRegex(RuntimeError, "registered Git directory drifted"),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, Mock()
+            )
+
+    def test_continuation_rejects_registered_git_dir_drift_during_snapshot(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        replacement_git_dir = {
+            "path": "/registered/common/worktrees/replacement",
+            "device": 1,
+            "inode": 99,
+        }
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                side_effect=[PHYSICAL["git_dir"], replacement_git_dir],
+            ),
+            patch.object(work_acquire.subprocess, "run", return_value=completed),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                return_value={
+                    "branch": inputs["branch"],
+                    "head": SHA,
+                    "operation_refs": {},
+                    "physical_checkout": PHYSICAL,
+                    "preimage_sha256": "c" * 64,
+                    "index_sha256": "d" * 64,
+                    "worktree_sha256": "e" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "count": 0,
+                    "worktree_sha256": "1" * 64,
+                    "preimage_sha256": "2" * 64,
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "changed during snapshot"),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, runner
+            )
+
+    def test_continuation_rejects_physical_drift_in_second_snapshot(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                side_effect=[
+                    PHYSICAL,
+                    PHYSICAL,
+                    RuntimeError("checkout replaced"),
+                ],
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(work_acquire.subprocess, "run", return_value=completed),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                return_value={
+                    "branch": inputs["branch"],
+                    "head": SHA,
+                    "operation_refs": {},
+                    "physical_checkout": PHYSICAL,
+                    "preimage_sha256": "c" * 64,
+                    "index_sha256": "d" * 64,
+                    "worktree_sha256": "e" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "count": 0,
+                    "worktree_sha256": "1" * 64,
+                    "preimage_sha256": "2" * 64,
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "physical identity changed during preimage capture"),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, runner
+            )
+
+    def test_continuation_rejects_lifecycle_drift_after_stable_snapshots(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+        terminalized = {
+            **lifecycle,
+            "phase": "completed_retained",
+            "updated_at_unix": 124,
+        }
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(
+                    self.repo,
+                    Path(PHYSICAL["common_dir"]["path"]),
+                    record,
+                ),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                side_effect=[lifecycle, terminalized],
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(work_acquire.subprocess, "run", return_value=completed),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                return_value={
+                    "branch": inputs["branch"],
+                    "head": SHA,
+                    "operation_refs": {},
+                    "physical_checkout": PHYSICAL,
+                    "preimage_sha256": "c" * 64,
+                    "index_sha256": "d" * 64,
+                    "worktree_sha256": "e" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "count": 0,
+                    "worktree_sha256": "1" * 64,
+                    "preimage_sha256": "2" * 64,
+                },
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "lifecycle authority drifted",
+            ),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, runner
+            )
+
+    def test_continuation_rechecks_git_after_second_lifecycle_read(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+        state = {"git_changed": False, "lifecycle_reads": 0}
+
+        def lifecycle_read(_checkout_key: str) -> dict[str, object]:
+            state["lifecycle_reads"] += 1
+            if state["lifecycle_reads"] == 2:
+                state["git_changed"] = True
+            return lifecycle
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {
+                    "returncode": 1 if state["git_changed"] else 0,
+                    "stdout": "",
+                }
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+
+        def branch_preimage(*_args: object, **_kwargs: object) -> dict[str, object]:
+            changed = state["git_changed"]
+            return {
+                "branch": inputs["branch"],
+                "head": SHA,
+                "operation_refs": {},
+                "physical_checkout": PHYSICAL,
+                "preimage_sha256": ("f" if changed else "c") * 64,
+                "index_sha256": "d" * 64,
+                "worktree_sha256": ("0" if changed else "e") * 64,
+            }
+
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(
+                    self.repo,
+                    Path(PHYSICAL["common_dir"]["path"]),
+                    record,
+                ),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                side_effect=lifecycle_read,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(work_acquire.subprocess, "run", return_value=completed),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                side_effect=branch_preimage,
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "count": 0,
+                    "worktree_sha256": "1" * 64,
+                    "preimage_sha256": "2" * 64,
+                },
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Git state changed during stable readback",
+            ),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, runner
+            )
+
+        self.assertEqual(state["lifecycle_reads"], 2)
+
+    def test_continuation_rejects_effective_worktree_drift_after_untracked_capture(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(
+                    self.repo,
+                    Path(PHYSICAL["common_dir"]["path"]),
+                    record,
+                ),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(work_acquire.subprocess, "run", return_value=completed),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                return_value={
+                    "branch": inputs["branch"],
+                    "head": SHA,
+                    "operation_refs": {},
+                    "physical_checkout": PHYSICAL,
+                    "preimage_sha256": "c" * 64,
+                    "index_sha256": "d" * 64,
+                    "worktree_sha256": "e" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "count": 0,
+                    "worktree_sha256": "1" * 64,
+                    "preimage_sha256": "2" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "_require_effective_git_toplevel",
+                side_effect=[None, RuntimeError("redirected")],
+            ) as top_level,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "effective Git worktree changed after untracked capture",
+            ),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, runner
+            )
+
+        self.assertEqual(top_level.call_count, 2)
+
+    def test_continuation_lifecycle_guard_blocks_concurrent_checkout_db_writer(self) -> None:
+        with work_acquire._continuation_lifecycle_guard(1.0):
+            competitor = sqlite3.connect(
+                work_acquire.checkouts.CHECKOUT_DB,
+                timeout=0.0,
+            )
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    competitor.execute("BEGIN IMMEDIATE")
+            finally:
+                competitor.close()
+
+    def test_continuation_lifecycle_guard_holds_checkout_operation_lock_through_yield(self) -> None:
+        state = {"held": False}
+        deadlines: list[float] = []
+
+        @contextmanager
+        def operation_lock(*, deadline_monotonic: float | None = None):
+            self.assertIsInstance(deadline_monotonic, float)
+            assert deadline_monotonic is not None
+            deadlines.append(deadline_monotonic)
+            self.assertFalse(state["held"])
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+        with patch.object(
+            work_acquire.checkouts,
+            "_operation_lock",
+            operation_lock,
+        ):
+            with work_acquire._continuation_lifecycle_guard(1.0):
+                self.assertTrue(state["held"])
+        self.assertFalse(state["held"])
+        self.assertEqual(len(deadlines), 1)
+
+    def test_continuation_rejects_retention_expiring_after_final_snapshot(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {
+                    "checkout_key": checkout_key,
+                    "physical_checkout": PHYSICAL,
+                },
+            },
+        }
+        record = {
+            "checkout_key": checkout_key,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": 101,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+        state = {"guarded": False, "branch_preimages": 0}
+
+        @contextmanager
+        def tracked_guard(_timeout_seconds: float):
+            self.assertFalse(state["guarded"])
+            state["guarded"] = True
+            try:
+                yield
+            finally:
+                state["guarded"] = False
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        def branch_preimage(*_args: object, **_kwargs: object) -> dict[str, object]:
+            state["branch_preimages"] += 1
+            if state["branch_preimages"] == 1:
+                self.assertFalse(state["guarded"])
+            else:
+                self.assertTrue(state["guarded"])
+            return {
+                "branch": inputs["branch"],
+                "head": SHA,
+                "operation_refs": {},
+                "physical_checkout": PHYSICAL,
+                "preimage_sha256": "c" * 64,
+                "index_sha256": "d" * 64,
+                "worktree_sha256": "e" * 64,
+            }
+
+        completed = __import__("subprocess").CompletedProcess([], 0, b"", b"")
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(
+                    self.repo,
+                    Path(PHYSICAL["common_dir"]["path"]),
+                    record,
+                ),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                return_value=PHYSICAL,
+            ),
+            patch.object(work_acquire.subprocess, "run", return_value=completed),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                side_effect=branch_preimage,
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "count": 0,
+                    "worktree_sha256": "1" * 64,
+                    "preimage_sha256": "2" * 64,
+                },
+            ),
+            patch.object(
+                work_acquire,
+                "_continuation_lifecycle_guard",
+                tracked_guard,
+            ),
+            patch.object(
+                work_acquire.time,
+                "time",
+                side_effect=[100.0, 100.0, 102.0],
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "lifecycle retention expired",
+            ),
+        ):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, runner
+            )
+
+        self.assertEqual(state["branch_preimages"], 2)
+        self.assertFalse(state["guarded"])
+
+    def test_continuation_rejects_legacy_receipt_without_physical_identity(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {"checkout_key": "a" * 64},
+            },
+        }
+        with self.assertRaisesRegex(RuntimeError, "lacks ensure-time physical identity"):
+            work_acquire._continuation_preimage(
+                prior, inputs, lifecycle_source, Mock()
+            )
+
+    def test_bounded_raw_nul_probe_stops_after_record_limit(self) -> None:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"x\0" * 101)
+        os.close(write_fd)
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdout = os.fdopen(read_fd, "rb", closefd=True)
+                self.returncode = None
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            def wait(self, timeout: float | None = None) -> int:
+                if self.returncode is None:
+                    self.returncode = 0
+                return self.returncode
+
+        fake = FakeProcess()
+        with (
+            patch.object(work_acquire.subprocess, "Popen", return_value=fake),
+            patch.object(work_acquire.operator, "_git_environment", return_value={"PATH": "/usr/bin"}),
+            self.assertRaisesRegex(RuntimeError, "record limit exceeded"),
+        ):
+            work_acquire._bounded_raw_nul_git_probe(
+                self.repo,
+                ["ls-files", "--others", "--exclude-standard", "-z"],
+                max_records=100,
+                max_stdout_bytes=512 * 1024,
+                timeout_seconds=5,
+            )
+
+    def test_dirty_lane_continuation_rejects_physical_drift_after_preimage(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        prior = {
+            "state": "ready",
+            "worktree_receipt": {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "lifecycle": {"checkout_key": checkout_key, "physical_checkout": PHYSICAL},
+            },
+        }
+        record = {"checkout_key": checkout_key, "branch": inputs["branch"], "detached": False}
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+            "expected_head": SHA,
+            "updated_at_unix": 123,
+        }
+
+        def runner(_cwd: Path, argv: list[str]) -> dict[str, object]:
+            if argv[0] == "status":
+                return {"returncode": 0, "stdout": "## feat/authority-p0\n"}
+            if argv[0] == "rev-parse":
+                return {"returncode": 0, "stdout": SHA + "\n"}
+            if argv[0] in ("diff-index", "diff-files"):
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "ls-files":
+                return {"returncode": 0, "stdout": ""}
+            if argv[0] == "merge-base":
+                return {"returncode": 0, "stdout": ""}
+            raise AssertionError(argv)
+
+        with (
+            patch.object(work_acquire.checkouts, "_worktree_for_path", return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record)),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(
+                work_acquire.physical_checkout,
+                "verify_physical_checkout_identity",
+                side_effect=[PHYSICAL, RuntimeError("checkout replaced")],
+            ),
+            patch.object(work_acquire.checkouts, "_strict_lifecycle_binding", return_value=lifecycle),
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={
+                "branch": inputs["branch"],
+                "head": SHA,
+                "operation_refs": {},
+                "physical_checkout": PHYSICAL,
+                "preimage_sha256": "c" * 64,
+                "index_sha256": "d" * 64,
+                "worktree_sha256": "e" * 64,
+            }),
+            patch.object(work_acquire.git_preimage, "capture_untracked_preimage", return_value={
+                "count": 0,
+                "worktree_sha256": "1" * 64,
+                "preimage_sha256": "2" * 64,
+            }),
+            patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
+            self.assertRaisesRegex(RuntimeError, "physical identity changed during preimage capture"),
+        ):
+            work_acquire._continuation_preimage(prior, inputs, lifecycle_source, runner)
+
+    def test_dirty_lane_continuation_fails_closed_on_lifecycle_drift(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        lifecycle_source = work_acquire._lifecycle_source(inputs)
+        checkout_key = "a" * 64
+        ensure = Mock(return_value={
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {"target_registered": True, "target_path_exists": True},
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
+                "checkout_path": str(self.target),
+                "owner_id": inputs["lease_owner_id"],
+                "source": lifecycle_source,
+                "artifact_class": inputs["artifact_class"],
+                "expected_branch": inputs["branch"],
+            },
+        })
+        release = Mock(side_effect=self.release)
+        kwargs = {
+            "acquire_resources_fn": self.acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+        }
+        work_acquire.acquire_work(params, **kwargs)
+        record = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "branch": inputs["branch"],
+            "detached": False,
+        }
+        drifted = {
+            "checkout_key": checkout_key,
+            "physical_checkout": PHYSICAL,
+            "checkout_path": str(self.target),
+            "owner_id": "lane:" + "f" * 32,
+            "source": lifecycle_source,
+            "artifact_class": inputs["artifact_class"],
+            "phase": "active",
+            "retention_until_unix": self.retention,
+            "expected_branch": inputs["branch"],
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, Path(PHYSICAL["common_dir"]["path"]), record),
+            ),
+            patch.object(work_acquire.checkouts, "_require_linked"),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            patch.object(work_acquire.physical_checkout, "capture_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(work_acquire.physical_checkout, "verify_physical_checkout_identity", return_value=PHYSICAL),
+            patch.object(work_acquire.git_preimage, "capture_branch_preimage", return_value={"branch": inputs["branch"], "head": SHA, "operation_refs": {}, "physical_checkout": PHYSICAL, "preimage_sha256": "c" * 64, "index_sha256": "d" * 64, "worktree_sha256": "e" * 64}),
+            patch.object(work_acquire.subprocess, "run", return_value=__import__("subprocess").CompletedProcess([], 0, b"", b"")),
+            patch.object(work_acquire.git_preimage, "capture_untracked_preimage", return_value={"count": 0, "worktree_sha256": "1" * 64, "preimage_sha256": "2" * 64}),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=drifted,
+            ),
+        ):
+            blocked = work_acquire.acquire_work(params, **kwargs)
+        self.assertEqual(blocked["state"], "blocked")
+        self.assertEqual(blocked["decision"], "HARD_BLOCK")
+        self.assertEqual(
+            blocked["error_class"], "WORKTREE_CONTINUATION_CONFLICT"
+        )
+        self.assertIn("lifecycle authority drifted", blocked["error"])
+        self.assertEqual(
+            blocked["next_action"], "reconcile_managed_worktree_continuation"
+        )
+        self.assertEqual(blocked["compensation"]["state"], "complete")
+        release.assert_called_once()
+        self.assertEqual(ensure.call_count, 1)
 
     def test_writer_binding_survives_reacquire_block(self) -> None:
         params = self.parameters()
@@ -1451,6 +3522,979 @@ class WorkAcquireTests(unittest.TestCase):
             work_acquire.resources.LEASE_SNAPSHOT_KEYS,
         )
 
+    def test_continuation_authorization_guard_rejects_lifecycle_drift(self) -> None:
+        lifecycle = {
+            "checkout_key": "a" * 64,
+            "owner_id": "lane:" + "a" * 32,
+            "retention_until_unix": self.retention,
+        }
+        continuation_preimage = {
+            "checkout_key": lifecycle["checkout_key"],
+            "checkout_path": str(self.target),
+            "lifecycle_sha256": work_acquire._sha(lifecycle),
+            "lifecycle_retention_until_unix": self.retention,
+            "branch_preimage_sha256": "1" * 64,
+            "index_sha256": "2" * 64,
+            "tracked_worktree_sha256": "3" * 64,
+            "untracked_preimage_sha256": "4" * 64,
+            "untracked_worktree_sha256": "5" * 64,
+            "untracked_count": 0,
+            "registered_git_dir": PHYSICAL["git_dir"],
+        }
+        drifted = {**lifecycle, "owner_id": "lane:" + "b" * 32}
+
+        @contextmanager
+        def lifecycle_guard(_timeout_seconds: float):
+            yield
+
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_lifecycle_guard",
+                lifecycle_guard,
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=drifted,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "lifecycle authority changed before authorization",
+            ),
+        ):
+            with work_acquire._continuation_authorization_guard(
+                continuation_preimage
+            ):
+                self.fail("drifted lifecycle must not authorize continuation")
+
+    def test_continuation_authorization_guard_rejects_effective_worktree_drift(self) -> None:
+        lifecycle = {
+            "checkout_key": "a" * 64,
+            "owner_id": "lane:" + "a" * 32,
+            "retention_until_unix": self.retention,
+        }
+        continuation_preimage = {
+            "checkout_key": lifecycle["checkout_key"],
+            "checkout_path": str(self.target),
+            "lifecycle_sha256": work_acquire._sha(lifecycle),
+            "lifecycle_retention_until_unix": self.retention,
+            "branch_preimage_sha256": "1" * 64,
+            "index_sha256": "2" * 64,
+            "tracked_worktree_sha256": "3" * 64,
+            "untracked_preimage_sha256": "4" * 64,
+            "untracked_worktree_sha256": "5" * 64,
+            "untracked_count": 0,
+            "registered_git_dir": PHYSICAL["git_dir"],
+        }
+
+        @contextmanager
+        def lifecycle_guard(_timeout_seconds: float):
+            yield
+
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_lifecycle_guard",
+                lifecycle_guard,
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "_require_effective_git_toplevel",
+                side_effect=RuntimeError("redirected"),
+            ) as top_level,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "effective Git worktree changed before authorization",
+            ),
+        ):
+            with work_acquire._continuation_authorization_guard(
+                continuation_preimage
+            ):
+                self.fail("redirected Git worktree must not authorize continuation")
+
+        top_level.assert_called_once()
+
+    def test_continuation_authorization_guard_rejects_full_git_state_drift(self) -> None:
+        lifecycle = {
+            "checkout_key": "a" * 64,
+            "owner_id": "lane:" + "a" * 32,
+            "retention_until_unix": self.retention,
+        }
+        continuation_preimage = {
+            "checkout_key": lifecycle["checkout_key"],
+            "checkout_path": str(self.target),
+            "lifecycle_sha256": work_acquire._sha(lifecycle),
+            "lifecycle_retention_until_unix": self.retention,
+            "branch_preimage_sha256": "1" * 64,
+            "index_sha256": "2" * 64,
+            "tracked_worktree_sha256": "3" * 64,
+            "untracked_preimage_sha256": "4" * 64,
+            "untracked_worktree_sha256": "5" * 64,
+            "untracked_count": 0,
+            "registered_git_dir": PHYSICAL["git_dir"],
+        }
+
+        @contextmanager
+        def lifecycle_guard(_timeout_seconds: float):
+            yield
+
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_lifecycle_guard",
+                lifecycle_guard,
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_strict_lifecycle_binding",
+                return_value=lifecycle,
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "_require_effective_git_toplevel",
+                return_value=str(self.target),
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_branch_preimage",
+                return_value={
+                    "preimage_sha256": "9" * 64,
+                    "index_sha256": "2" * 64,
+                    "worktree_sha256": "3" * 64,
+                    "physical_checkout": PHYSICAL,
+                },
+            ),
+            patch.object(
+                work_acquire.git_preimage,
+                "capture_untracked_preimage",
+                return_value={
+                    "preimage_sha256": "4" * 64,
+                    "worktree_sha256": "5" * 64,
+                    "count": 0,
+                },
+            ),
+            patch.object(
+                work_acquire,
+                "_bounded_raw_nul_git_probe",
+                return_value=__import__("subprocess").CompletedProcess([], 0, b"", b""),
+            ),
+            patch.object(
+                work_acquire.physical_checkout,
+                "capture_registered_linked_worktree_git_dir",
+                return_value=PHYSICAL["git_dir"],
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Git state changed before authorization",
+            ),
+        ):
+            with work_acquire._continuation_authorization_guard(
+                continuation_preimage
+            ):
+                self.fail("stale continuation preimage must not authorize continuation")
+
+    def test_continuation_authorization_guard_revalidates_final_git_authority(self) -> None:
+        lifecycle = {
+            "checkout_key": "a" * 64,
+            "owner_id": "lane:" + "a" * 32,
+            "retention_until_unix": self.retention,
+        }
+        continuation_preimage = {
+            "checkout_key": lifecycle["checkout_key"],
+            "checkout_path": str(self.target),
+            "lifecycle_sha256": work_acquire._sha(lifecycle),
+            "lifecycle_retention_until_unix": self.retention,
+            "branch_preimage_sha256": "1" * 64,
+            "index_sha256": "2" * 64,
+            "tracked_worktree_sha256": "3" * 64,
+            "untracked_preimage_sha256": "4" * 64,
+            "untracked_worktree_sha256": "5" * 64,
+            "untracked_count": 0,
+            "registered_git_dir": PHYSICAL["git_dir"],
+        }
+
+        @contextmanager
+        def lifecycle_guard(_timeout_seconds: float):
+            yield
+
+        @contextmanager
+        def guard_dependencies(
+            *,
+            top_level: Mock,
+            flags: bytes = b"",
+            registered_git_dir: dict[str, object] = PHYSICAL["git_dir"],
+            physical_verify: Mock | None = None,
+        ):
+            if physical_verify is None:
+                physical_verify = Mock(return_value=PHYSICAL)
+            with (
+                patch.object(
+                    work_acquire,
+                    "_continuation_lifecycle_guard",
+                    lifecycle_guard,
+                ),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_strict_lifecycle_binding",
+                    return_value=lifecycle,
+                ),
+                patch.object(
+                    work_acquire.git_preimage,
+                    "_require_effective_git_toplevel",
+                    top_level,
+                ),
+                patch.object(
+                    work_acquire.git_preimage,
+                    "capture_branch_preimage",
+                    return_value={
+                        "preimage_sha256": "1" * 64,
+                        "index_sha256": "2" * 64,
+                        "worktree_sha256": "3" * 64,
+                        "physical_checkout": PHYSICAL,
+                    },
+                ),
+                patch.object(
+                    work_acquire.git_preimage,
+                    "capture_untracked_preimage",
+                    return_value={
+                        "preimage_sha256": "4" * 64,
+                        "worktree_sha256": "5" * 64,
+                        "count": 0,
+                    },
+                ),
+                patch.object(
+                    work_acquire,
+                    "_bounded_raw_nul_git_probe",
+                    return_value=__import__("subprocess").CompletedProcess(
+                        [], 0, flags, b""
+                    ),
+                ),
+                patch.object(
+                    work_acquire.physical_checkout,
+                    "capture_registered_linked_worktree_git_dir",
+                    return_value=registered_git_dir,
+                ),
+                patch.object(
+                    work_acquire.physical_checkout,
+                    "verify_physical_checkout_identity",
+                    physical_verify,
+                ),
+            ):
+                yield
+
+        top_level = Mock(
+            side_effect=[str(self.target), RuntimeError("redirected")]
+        )
+        with guard_dependencies(top_level=top_level):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Git state could not be revalidated before authorization",
+            ):
+                with work_acquire._continuation_authorization_guard(
+                    continuation_preimage
+                ):
+                    self.fail("redirected Git worktree must not authorize continuation")
+        self.assertEqual(top_level.call_count, 2)
+
+        replacement_git_dir = {
+            "path": "/registered/common/worktrees/replacement",
+            "device": 1,
+            "inode": 99,
+        }
+        with guard_dependencies(
+            top_level=Mock(return_value=str(self.target)),
+            registered_git_dir=replacement_git_dir,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "registered Git directory changed before authorization",
+            ):
+                with work_acquire._continuation_authorization_guard(
+                    continuation_preimage
+                ):
+                    self.fail("unregistered worktree must not authorize continuation")
+
+        physical_verify = Mock(
+            side_effect=work_acquire.physical_checkout.PhysicalCheckoutIdentityError(
+                "root replaced"
+            )
+        )
+        with guard_dependencies(
+            top_level=Mock(return_value=str(self.target)),
+            physical_verify=physical_verify,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "physical checkout changed before authorization",
+            ):
+                with work_acquire._continuation_authorization_guard(
+                    continuation_preimage
+                ):
+                    self.fail(
+                        "replaced physical checkout must not authorize continuation"
+                    )
+        physical_verify.assert_called_once_with(PHYSICAL)
+
+        deadline_state = {"expired": False}
+
+        def expire_after_physical_verify(_expected):
+            deadline_state["expired"] = True
+            return PHYSICAL
+
+        with (
+            guard_dependencies(
+                top_level=Mock(return_value=str(self.target)),
+                physical_verify=Mock(side_effect=expire_after_physical_verify),
+            ),
+            patch.object(
+                work_acquire.time,
+                "monotonic",
+                side_effect=lambda: 11.0 if deadline_state["expired"] else 0.0,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "authorization deadline exceeded",
+            ),
+        ):
+            with work_acquire._continuation_authorization_guard(
+                continuation_preimage
+            ):
+                self.fail(
+                    "physical verification completing after the deadline must not authorize continuation"
+                )
+
+        with (
+            guard_dependencies(
+                top_level=Mock(return_value=str(self.target)),
+            ),
+            patch.object(
+                work_acquire.time,
+                "time",
+                side_effect=[
+                    float(self.retention - 1),
+                    float(self.retention),
+                ],
+            ) as observed_time,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "lifecycle retention expired before authorization",
+            ),
+        ):
+            with work_acquire._continuation_authorization_guard(
+                continuation_preimage
+            ):
+                self.fail(
+                    "expired lifecycle retention must not authorize continuation"
+                )
+        self.assertEqual(observed_time.call_count, 2)
+
+        hidden_flags = (
+            (b"h tracked.txt" + bytes([0]), "assume-unchanged"),
+            (b"S tracked.txt" + bytes([0]), "skip-worktree"),
+        )
+        for flags, expected_error in hidden_flags:
+            with self.subTest(expected_error=expected_error):
+                with guard_dependencies(
+                    top_level=Mock(return_value=str(self.target)),
+                    flags=flags,
+                ):
+                    with self.assertRaises(RuntimeError) as caught:
+                        with work_acquire._continuation_authorization_guard(
+                            continuation_preimage
+                        ):
+                            self.fail(
+                                "hidden index flags must not authorize continuation"
+                            )
+                self.assertIn(
+                    "Git state could not be revalidated before authorization",
+                    str(caught.exception),
+                )
+                self.assertIsNotNone(caught.exception.__cause__)
+                self.assertIn(expected_error, str(caught.exception.__cause__))
+
+    def test_continuation_writer_authorization_is_persisted_under_guard(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs, stored = self.store_lane(params)
+        checkout_key = "a" * 64
+        worktree_receipt = {
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {
+                "target_registered": True,
+                "target_path_exists": True,
+            },
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
+            },
+        }
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {**stored, "worktree_receipt": worktree_receipt},
+        )
+        continuation_preimage = {
+            "checkout_key": checkout_key,
+            "lifecycle_sha256": "c" * 64,
+            "lifecycle_retention_until_unix": self.retention,
+            "preimage_sha256": "d" * 64,
+        }
+        state = {"guarded": False}
+        original_write_state = work_acquire._write_state
+
+        @contextmanager
+        def authorization_guard(_preimage: dict[str, object] | None):
+            self.assertFalse(state["guarded"])
+            state["guarded"] = True
+            try:
+                yield
+            finally:
+                state["guarded"] = False
+
+        def tracked_write_state(path: Path, payload: dict[str, object]):
+            if payload.get("state") == "writer_starting":
+                self.assertTrue(state["guarded"])
+            return original_write_state(path, payload)
+
+        start = Mock(return_value=self.writer_result(self.target))
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_preimage",
+                return_value=continuation_preimage,
+            ),
+            patch.object(
+                work_acquire,
+                "_continuation_authorization_guard",
+                authorization_guard,
+            ),
+            patch.object(
+                work_acquire,
+                "_write_state",
+                side_effect=tracked_write_state,
+            ),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=self.acquire,
+                release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=Mock(),
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(result["decision"], "CONTINUE_EXISTING")
+        self.assertFalse(state["guarded"])
+        start.assert_called_once()
+
+    def test_continuation_ready_persistence_failure_preserves_leases_after_writer_start(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs, stored = self.store_lane(params)
+        checkout_key = "a" * 64
+        worktree_receipt = {
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {
+                "target_registered": True,
+                "target_path_exists": True,
+            },
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
+            },
+        }
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {**stored, "worktree_receipt": worktree_receipt},
+        )
+        continuation_preimage = {
+            "checkout_key": checkout_key,
+            "lifecycle_sha256": "c" * 64,
+            "lifecycle_retention_until_unix": self.retention,
+            "preimage_sha256": "d" * 64,
+        }
+        original_write_state = work_acquire._write_state
+        ready_failed = False
+
+        @contextmanager
+        def authorization_guard(_preimage: dict[str, object] | None):
+            yield
+
+        def fail_first_ready_write(path: Path, payload: dict[str, object]):
+            nonlocal ready_failed
+            if payload.get("state") == "ready" and not ready_failed:
+                ready_failed = True
+                raise RuntimeError("lost final ready persistence")
+            return original_write_state(path, payload)
+
+        release = Mock(side_effect=self.release)
+        start = Mock(return_value=self.writer_result(self.target))
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_preimage",
+                return_value=continuation_preimage,
+            ),
+            patch.object(
+                work_acquire,
+                "_continuation_authorization_guard",
+                authorization_guard,
+            ),
+            patch.object(
+                work_acquire,
+                "_write_state",
+                side_effect=fail_first_ready_write,
+            ),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=self.acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=Mock(),
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+
+        self.assertTrue(ready_failed)
+        self.assertEqual(result["state"], "outcome_unknown")
+        self.assertEqual(result["decision"], "HARD_BLOCK")
+        self.assertIs(result["effect_observed"], True)
+        self.assertIsNone(result["compensation"])
+        self.assertEqual(
+            result["next_action"], "readback_scoped_writer_before_retry"
+        )
+        self.assertEqual(result["writer_start"]["state"], "started")
+        self.assertIsInstance(result["writer_job"], dict)
+        release.assert_not_called()
+        start.assert_called_once()
+        persisted = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["state"], "outcome_unknown")
+        self.assertIs(persisted["effect_observed"], True)
+
+    def test_continuation_double_persistence_failure_keeps_writer_starting_fail_closed(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs, stored = self.store_lane(params)
+        checkout_key = "a" * 64
+        worktree_receipt = {
+            "result_state": "CREATED",
+            "durable_receipt_sha256": "b" * 64,
+            "post_state": {
+                "target_registered": True,
+                "target_path_exists": True,
+            },
+            "lifecycle": {
+                "checkout_key": checkout_key,
+                "physical_checkout": PHYSICAL,
+            },
+        }
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {**stored, "worktree_receipt": worktree_receipt},
+        )
+        continuation_preimage = {
+            "checkout_key": checkout_key,
+            "lifecycle_sha256": "c" * 64,
+            "lifecycle_retention_until_unix": self.retention,
+            "preimage_sha256": "d" * 64,
+        }
+        original_write_state = work_acquire._write_state
+
+        @contextmanager
+        def authorization_guard(_preimage: dict[str, object] | None):
+            yield
+
+        def fail_post_effect_persistence(path: Path, payload: dict[str, object]):
+            if payload.get("state") in {"ready", "outcome_unknown"}:
+                raise RuntimeError("post-effect persistence unavailable")
+            return original_write_state(path, payload)
+
+        release = Mock(side_effect=self.release)
+        start = Mock(return_value=self.writer_result(self.target))
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_preimage",
+                return_value=continuation_preimage,
+            ),
+            patch.object(
+                work_acquire,
+                "_continuation_authorization_guard",
+                authorization_guard,
+            ),
+            patch.object(
+                work_acquire,
+                "_write_state",
+                side_effect=fail_post_effect_persistence,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "post-effect persistence unavailable"
+            ),
+        ):
+            work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=self.acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=Mock(),
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+
+        release.assert_not_called()
+        start.assert_called_once()
+        persisted = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["state"], "writer_starting")
+        self.assertEqual(persisted["writer_start"]["state"], "starting")
+
+        acquire_retry = Mock()
+        ensure_retry = Mock()
+        retry = work_acquire.acquire_work(
+            params,
+            acquire_resources_fn=acquire_retry,
+            release_resources_fn=release,
+            inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure_retry,
+            runner=Mock(),
+            start_writer_fn=start,
+        )
+        self.assertEqual(retry["state"], "outcome_unknown")
+        self.assertEqual(
+            retry["next_action"], "readback_scoped_writer_before_retry"
+        )
+        self.assertEqual(retry["writer_start"]["state"], "outcome_unknown")
+        self.assertEqual(start.call_count, 1)
+        acquire_retry.assert_not_called()
+        ensure_retry.assert_not_called()
+        release.assert_not_called()
+
+    def test_continuation_authorization_conflict_compensates_before_writer_start(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs, stored = self.store_lane(params)
+        checkout_key = "a" * 64
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {
+                **stored,
+                "worktree_receipt": {
+                    "result_state": "CREATED",
+                    "durable_receipt_sha256": "b" * 64,
+                    "post_state": {
+                        "target_registered": True,
+                        "target_path_exists": True,
+                    },
+                    "lifecycle": {
+                        "checkout_key": checkout_key,
+                        "physical_checkout": PHYSICAL,
+                    },
+                },
+            },
+        )
+        continuation_preimage = {
+            "checkout_key": checkout_key,
+            "lifecycle_sha256": "c" * 64,
+            "lifecycle_retention_until_unix": self.retention,
+            "preimage_sha256": "d" * 64,
+        }
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+        start = Mock()
+
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_preimage",
+                return_value=continuation_preimage,
+            ),
+            patch.object(
+                work_acquire,
+                "_continuation_authorization_guard",
+                side_effect=RuntimeError(
+                    "managed worktree continuation lifecycle authority changed before authorization"
+                ),
+            ),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+                start_writer_fn=start,
+            )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["decision"], "HARD_BLOCK")
+        self.assertEqual(
+            result["error_class"],
+            "WORKTREE_CONTINUATION_CONFLICT",
+        )
+        self.assertEqual(result["compensation"]["state"], "complete")
+        self.assertIn("before authorization", result["error"])
+        acquire.assert_called_once()
+        release.assert_called_once()
+        ensure.assert_not_called()
+        start.assert_not_called()
+
+    def test_terminal_existing_writer_authorization_conflict_compensates_reacquired_leases(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs, stored = self.store_lane(params)
+        writer_job = {
+            "job_id": "writer-job",
+            "unit": "writer-unit.service",
+            "owner": "uid:1000",
+            "argv_sha256": "a" * 64,
+            "cwd": str(self.target),
+            "runtime_seconds": 600,
+            "metadata_path": str(self.root / "writer-metadata.json"),
+            "expected_receipt": None,
+            "final_status": "launch_submitted",
+            "receipt_sha256": "b" * 64,
+        }
+        checkout_key = "a" * 64
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {
+                **stored,
+                "writer_job": writer_job,
+                "writer_start": {
+                    "state": "started",
+                    "job_receipt_sha256": writer_job["receipt_sha256"],
+                },
+                "worktree_receipt": {
+                    "result_state": "CREATED",
+                    "durable_receipt_sha256": "c" * 64,
+                    "post_state": {
+                        "target_registered": True,
+                        "target_path_exists": True,
+                    },
+                    "lifecycle": {
+                        "checkout_key": checkout_key,
+                        "physical_checkout": PHYSICAL,
+                    },
+                },
+            },
+        )
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+        continuation_preimage = {
+            "checkout_key": checkout_key,
+            "lifecycle_sha256": "d" * 64,
+            "lifecycle_retention_until_unix": self.retention,
+            "preimage_sha256": "e" * 64,
+        }
+
+        with (
+            patch.object(
+                work_acquire,
+                "_continuation_preimage",
+                return_value=continuation_preimage,
+            ),
+            patch.object(
+                work_acquire,
+                "_continuation_authorization_guard",
+                side_effect=RuntimeError(
+                    "managed worktree continuation registry authority changed before authorization"
+                ),
+            ),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+                read_writer_status_fn=Mock(
+                    return_value=self.writer_status(
+                        writer_job["unit"], "succeeded"
+                    )
+                ),
+            )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertFalse(result["effect_observed"])
+        self.assertEqual(result["compensation"]["state"], "complete")
+        self.assertTrue(result["writer_liveness"]["terminal"])
+        self.assertIn("before authorization", result["error"])
+        acquire.assert_called_once()
+        release.assert_called_once()
+        ensure.assert_not_called()
+
+    def test_continuation_conflict_after_reacquire_compensates_fresh_leases(self) -> None:
+        params = self.parameters()
+        self.store_lane(params)
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+
+        with patch.object(
+            work_acquire,
+            "_continuation_preimage",
+            side_effect=RuntimeError("continuation evidence drifted"),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+            )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["decision"], "HARD_BLOCK")
+        self.assertEqual(
+            result["error_class"], "WORKTREE_CONTINUATION_CONFLICT"
+        )
+        self.assertEqual(result["compensation"]["state"], "complete")
+        self.assertEqual(
+            result["next_action"], "reconcile_managed_worktree_continuation"
+        )
+        self.assertFalse(result["effect_observed"])
+        self.assertTrue(result["replayed"])
+        acquire.assert_called_once()
+        release.assert_called_once()
+        ensure.assert_not_called()
+        expected_leases = release.call_args.kwargs["expected_leases"]
+        self.assertTrue(expected_leases)
+        self.assertEqual(
+            set(expected_leases[0]),
+            work_acquire.resources.LEASE_SNAPSHOT_KEYS,
+        )
+
+    def test_continuation_conflict_compensates_reacquired_leases_for_terminal_existing_writer(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs, stored = self.store_lane(params)
+        writer_job = {
+            "job_id": "writer-job",
+            "unit": "writer-unit.service",
+            "owner": "uid:1000",
+            "argv_sha256": "a" * 64,
+            "cwd": str(self.target),
+            "runtime_seconds": 600,
+            "metadata_path": str(self.root / "writer-metadata.json"),
+            "expected_receipt": None,
+            "final_status": "launch_submitted",
+            "receipt_sha256": "b" * 64,
+        }
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {
+                **stored,
+                "writer_job": writer_job,
+                "writer_start": {
+                    "state": "started",
+                    "job_receipt_sha256": writer_job["receipt_sha256"],
+                },
+            },
+        )
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+
+        with patch.object(
+            work_acquire,
+            "_continuation_preimage",
+            side_effect=RuntimeError("continuation evidence drifted"),
+        ):
+            result = work_acquire.acquire_work(
+                params,
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+                read_writer_status_fn=Mock(
+                    return_value=self.writer_status(
+                        writer_job["unit"], "succeeded"
+                    )
+                ),
+            )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["decision"], "HARD_BLOCK")
+        self.assertEqual(
+            result["error_class"], "WORKTREE_CONTINUATION_CONFLICT"
+        )
+        self.assertFalse(result["effect_observed"])
+        self.assertEqual(result["compensation"]["state"], "complete")
+        self.assertEqual(result["writer_job"], writer_job)
+        self.assertTrue(result["writer_liveness"]["terminal"])
+        self.assertEqual(
+            result["next_action"], "reconcile_managed_worktree_continuation"
+        )
+        self.assertTrue(result["replayed"])
+        self.assertEqual(acquire.call_count, 1)
+        release.assert_called_once()
+        ensure.assert_not_called()
+
+    def test_continuation_conflict_with_uncertain_compensation_is_outcome_unknown(self) -> None:
+        params = self.parameters()
+        self.store_lane(params)
+        acquire = Mock(side_effect=self.acquire)
+        release = Mock(side_effect=RuntimeError("release response lost"))
+        ensure = Mock()
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+        }
+
+        with patch.object(
+            work_acquire,
+            "_continuation_preimage",
+            side_effect=RuntimeError("continuation evidence drifted"),
+        ):
+            first = work_acquire.acquire_work(params, **kwargs)
+            second = work_acquire.acquire_work(params, **kwargs)
+
+        self.assertEqual(first["state"], "outcome_unknown")
+        self.assertEqual(first["decision"], "HARD_BLOCK")
+        self.assertEqual(
+            first["error_class"], "WORKTREE_CONTINUATION_CONFLICT"
+        )
+        self.assertEqual(first["compensation"]["state"], "outcome_unknown")
+        self.assertEqual(
+            first["next_action"], "reconcile_lease_compensation_before_retry"
+        )
+        self.assertFalse(first["effect_observed"])
+        self.assertTrue(second["replayed"])
+        self.assertEqual(second["state"], "outcome_unknown")
+        self.assertEqual(acquire.call_count, 1)
+        self.assertEqual(release.call_count, 1)
+        ensure.assert_not_called()
+
     def test_non_object_result_is_durable_outcome_unknown(self) -> None:
         release = Mock()
         result = work_acquire.acquire_work(
@@ -1478,6 +4522,1363 @@ class WorkAcquireTests(unittest.TestCase):
             no_change_proven=True,
         ), observed_at_unix=observed_at)
 
+    def test_successor_handoff_assessment_is_terminal_and_exactly_bound(self) -> None:
+        assessment = closeout.assess_successor_handoff(
+            lane_id="a" * 32,
+            successor_lane_id="b" * 32,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        self.assertEqual("successor_handoff", assessment["closeout_state"])
+        self.assertTrue(assessment["lease_release_ready"])
+        self.assertEqual("c" * 40, assessment["terminal_head_sha"])
+        self.assertEqual(
+            "b" * 32,
+            assessment["successor_handoff"]["successor_lane_id"],
+        )
+        self.assertEqual(
+            assessment,
+            closeout.validate_terminal_assessment(assessment),
+        )
+
+    def test_successor_handoff_assessment_rejects_digest_valid_malformed_binding(self) -> None:
+        assessment = closeout.assess_successor_handoff(
+            lane_id="a" * 32,
+            successor_lane_id="b" * 32,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        malformed = dict(assessment)
+        binding = dict(assessment["successor_handoff"])
+        binding.pop("pr_number")
+        malformed["successor_handoff"] = binding
+        malformed["observation_sha256"] = closeout.sha256_json(binding)
+        material = {
+            key: value
+            for key, value in malformed.items()
+            if key not in {"assessment_sha256", "audit_record_sha256", "does_not_establish"}
+        }
+        malformed["assessment_sha256"] = closeout.sha256_json(material)
+        with self.assertRaisesRegex(
+            closeout.LaneCloseoutError,
+            "successor handoff assessment binding is invalid",
+        ):
+            closeout.validate_terminal_assessment(malformed)
+
+    def test_terminal_closeout_does_not_expose_generic_pre_effect_guard(self) -> None:
+        params = self.parameters()
+        _inputs, receipt = self.store_lane(params)
+        lane_id = str(receipt["lane_id"])
+        assessment = self.terminal_assessment(lane_id, 200)
+        self.assertNotIn(
+            "_pre_effect_guard",
+            inspect.signature(work_acquire.persist_terminal_closeout).parameters,
+        )
+        with self.assertRaises(TypeError):
+            work_acquire.persist_terminal_closeout(
+                lane_id,
+                assessment,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                _pre_effect_guard=lambda *_args: None,
+            )
+
+    def test_successor_handoff_cannot_bypass_live_pre_effect_guard(self) -> None:
+        params = self.parameters()
+        _inputs, receipt = self.store_lane(params)
+        lane_id = str(receipt["lane_id"])
+        assessment = closeout.assess_successor_handoff(
+            lane_id=lane_id,
+            successor_lane_id="b" * 32,
+            predecessor_head_sha=SHA,
+            successor_head_sha="c" * 40,
+            successor_receipt_sha256="d" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "must use persist_successor_handoff_closeout",
+        ):
+            work_acquire.persist_terminal_closeout(
+                lane_id,
+                assessment,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            )
+        stored = work_acquire._read_state(
+            work_acquire._state_root() / f"{lane_id}.json"
+        )
+        self.assertIsNotNone(stored)
+        assert stored is not None
+        self.assertIsNone(stored.get("terminal_closeout_pending"))
+        self.assertIsNone(stored.get("terminal_closeout"))
+
+    def test_successor_handoff_rejects_wrong_lineage_before_terminal_effect(self) -> None:
+        params = self.parameters()
+        _inputs, receipt = self.store_lane(params)
+        lane_id = str(receipt["lane_id"])
+        successor_id = "b" * 32
+        with (
+            patch.object(
+                work_acquire,
+                "_stored_lane_inputs",
+                return_value={"source": {"kind": "direct", "id": "other"}},
+            ),
+            patch.object(work_acquire, "_persist_terminal_closeout_impl") as persist,
+            self.assertRaisesRegex(
+                RuntimeError, "successor source does not name predecessor"
+            ),
+        ):
+            work_acquire.persist_successor_handoff_closeout(
+                lane_id,
+                successor_lane_id=successor_id,
+                expected_predecessor_head=SHA,
+                expected_successor_head="b" * 40,
+                expected_successor_receipt_sha256="c" * 64,
+                expected_pr_number=1329,
+                expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            )
+        persist.assert_not_called()
+
+    def test_successor_handoff_persist_happy_path_and_replay_are_stable(self) -> None:
+        predecessor_params = self.parameters()
+        predecessor_inputs, predecessor_receipt = self.store_lane(predecessor_params)
+        predecessor_id = str(predecessor_inputs["lane_id"])
+
+        successor_params = self.parameters()
+        successor_params.update(
+            source_kind="work_lane",
+            source_id=predecessor_id,
+            branch="feat/authority-successor",
+            target_path=str(self.root / "successor-worktree"),
+            base_head="b" * 40,
+            idempotency_key="authority-successor",
+        )
+        successor_inputs, successor_receipt = self.store_lane(successor_params)
+        successor_id = str(successor_inputs["lane_id"])
+        verification = {
+            "schema_version": 1,
+            "kind": "grabowski.work_lane_successor_handoff_verification",
+            "successor_lane_id": successor_id,
+        }
+
+        with (
+            patch.object(
+                work_acquire,
+                "_verify_successor_handoff_locked",
+                return_value=verification,
+            ) as verify,
+            patch.object(
+                work_acquire,
+                "_converge_terminal_checkout_lifecycle",
+                return_value=None,
+            ),
+            patch.object(
+                work_acquire,
+                "_converge_terminal_resource_leases",
+                return_value=None,
+            ),
+        ):
+            first = work_acquire.persist_successor_handoff_closeout(
+                predecessor_id,
+                successor_lane_id=successor_id,
+                expected_predecessor_head=SHA,
+                expected_successor_head="b" * 40,
+                expected_successor_receipt_sha256=str(
+                    successor_receipt["receipt_sha256"]
+                ),
+                expected_pr_number=1329,
+                expected_receipt_sha256=str(predecessor_receipt["receipt_sha256"]),
+            )
+            stored = work_acquire._read_state(
+                work_acquire._state_root() / f"{predecessor_id}.json"
+            )
+            self.assertIsNotNone(stored)
+            assert stored is not None
+            second = work_acquire.persist_successor_handoff_closeout(
+                predecessor_id,
+                successor_lane_id=successor_id,
+                expected_predecessor_head=SHA,
+                expected_successor_head="b" * 40,
+                expected_successor_receipt_sha256=str(
+                    successor_receipt["receipt_sha256"]
+                ),
+                expected_pr_number=1329,
+                expected_receipt_sha256=str(stored["receipt_sha256"]),
+            )
+
+        self.assertFalse(first["replayed"])
+        self.assertEqual(
+            verification,
+            first["successor_handoff_verification"],
+        )
+        self.assertEqual(
+            "successor_handoff",
+            first["terminal_closeout"]["closeout_state"],
+        )
+        self.assertTrue(second["replayed"])
+        self.assertIsNone(second["successor_handoff_verification"])
+        verify.assert_called_once()
+
+    def test_successor_handoff_pending_retry_enables_terminal_successor_path(self) -> None:
+        predecessor_params = self.parameters()
+        predecessor_inputs, predecessor_receipt = self.store_lane(predecessor_params)
+        predecessor_id = str(predecessor_inputs["lane_id"])
+
+        successor_params = self.parameters()
+        successor_params.update(
+            source_kind="work_lane",
+            source_id=predecessor_id,
+            branch="feat/authority-successor-pending",
+            target_path=str(self.root / "successor-pending-worktree"),
+            base_head="b" * 40,
+            idempotency_key="authority-successor-pending",
+        )
+        successor_inputs, successor_receipt = self.store_lane(successor_params)
+        successor_id = str(successor_inputs["lane_id"])
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha=SHA,
+            successor_head_sha="b" * 40,
+            successor_receipt_sha256=str(successor_receipt["receipt_sha256"]),
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        with work_acquire._lane_lock(predecessor_id) as receipt_path:
+            current = work_acquire._read_state(receipt_path)
+            self.assertIsNotNone(current)
+            assert current is not None
+            pending = {
+                "schema_version": 1,
+                "kind": work_acquire.TERMINAL_PENDING_KIND,
+                "closeout_state": "successor_handoff",
+                "assessment_sha256": assessment["assessment_sha256"],
+                "expected_receipt_sha256": predecessor_receipt["receipt_sha256"],
+                "assessment": assessment,
+            }
+            predecessor_pending = work_acquire._write_state(
+                receipt_path,
+                {
+                    **current,
+                    "terminal_closeout_pending": pending,
+                    "updated_at_unix": 200,
+                },
+            )
+
+        verification = {
+            "schema_version": 1,
+            "kind": "grabowski.work_lane_successor_handoff_verification",
+            "successor_lane_id": successor_id,
+        }
+        with (
+            patch.object(
+                work_acquire,
+                "_verify_successor_handoff_locked",
+                return_value=verification,
+            ) as verify,
+            patch.object(
+                work_acquire,
+                "_converge_terminal_checkout_lifecycle",
+                return_value=None,
+            ),
+            patch.object(
+                work_acquire,
+                "_converge_terminal_resource_leases",
+                return_value=None,
+            ),
+        ):
+            result = work_acquire.persist_successor_handoff_closeout(
+                predecessor_id,
+                successor_lane_id=successor_id,
+                expected_predecessor_head=SHA,
+                expected_successor_head="b" * 40,
+                expected_successor_receipt_sha256=str(
+                    successor_receipt["receipt_sha256"]
+                ),
+                expected_pr_number=1329,
+                expected_receipt_sha256=str(predecessor_pending["receipt_sha256"]),
+            )
+
+        self.assertTrue(result["replayed"])
+        self.assertEqual(verification, result["successor_handoff_verification"])
+        self.assertTrue(
+            verify.call_args.kwargs["allow_terminal_successor_retry"]
+        )
+
+    def test_successor_handoff_terminal_bootstrap_pending_does_not_enable_retry(self) -> None:
+        predecessor_params = self.parameters()
+        predecessor_inputs, predecessor_receipt = self.store_lane(predecessor_params)
+        predecessor_id = str(predecessor_inputs["lane_id"])
+
+        successor_params = self.parameters()
+        successor_params.update(
+            source_kind="work_lane",
+            source_id=predecessor_id,
+            branch="feat/authority-successor-terminal-bootstrap",
+            target_path=str(self.root / "successor-terminal-bootstrap-worktree"),
+            base_head="b" * 40,
+            idempotency_key="authority-successor-terminal-bootstrap",
+        )
+        successor_inputs, successor_receipt = self.store_lane(successor_params)
+        successor_id = str(successor_inputs["lane_id"])
+        terminal = closeout.assess(
+            closeout.LaneCloseoutObservation(
+                lane_id=successor_id,
+                repository=str(self.repo),
+                workspace=str(self.root / "successor-terminal-bootstrap-worktree"),
+                branch="feat/authority-successor-terminal-bootstrap",
+                base_revision="b" * 40,
+                writer_state="completed",
+                task_active=False,
+                process_active=False,
+                lease_active=False,
+                git_dirty=False,
+                head_sha="b" * 40,
+                remote_head_sha="b" * 40,
+                ahead_commits=0,
+                behind_commits=0,
+                deployed_sha="b" * 40,
+            ),
+            observed_at_unix=100,
+        )
+        with work_acquire._lane_lock(successor_id) as receipt_path:
+            current = work_acquire._read_state(receipt_path)
+            self.assertIsNotNone(current)
+            assert current is not None
+            work_acquire._write_state(
+                receipt_path,
+                {
+                    **current,
+                    "terminal_closeout": {
+                        "schema_version": 1,
+                        "kind": "grabowski.work_lane_terminal_closeout",
+                        "closeout_state": terminal["closeout_state"],
+                        "assessment_sha256": terminal["assessment_sha256"],
+                        "expected_receipt_sha256": successor_receipt["receipt_sha256"],
+                        "assessment": terminal,
+                    },
+                    "updated_at_unix": 100,
+                },
+            )
+
+        call_kwargs = {
+            "successor_lane_id": successor_id,
+            "expected_predecessor_head": SHA,
+            "expected_successor_head": "b" * 40,
+            "expected_successor_receipt_sha256": str(
+                successor_receipt["receipt_sha256"]
+            ),
+            "expected_pr_number": 1329,
+        }
+        with (
+            patch.object(closeout.time, "time", return_value=200),
+            self.assertRaisesRegex(RuntimeError, "active ready successor lane"),
+        ):
+            work_acquire.persist_successor_handoff_closeout(
+                predecessor_id,
+                expected_receipt_sha256=str(predecessor_receipt["receipt_sha256"]),
+                **call_kwargs,
+            )
+
+        with work_acquire._lane_lock(predecessor_id) as receipt_path:
+            pending_receipt = work_acquire._read_state(receipt_path)
+        self.assertIsNotNone(pending_receipt)
+        assert pending_receipt is not None
+        self.assertIsNotNone(pending_receipt.get("terminal_closeout_pending"))
+
+        with (
+            patch.object(closeout.time, "time", return_value=200),
+            self.assertRaisesRegex(
+                RuntimeError, "does not predate successor terminalization"
+            ),
+        ):
+            work_acquire.persist_successor_handoff_closeout(
+                predecessor_id,
+                expected_receipt_sha256=str(pending_receipt["receipt_sha256"]),
+                **call_kwargs,
+            )
+
+    def test_successor_handoff_verifier_requires_ready_newer_successor(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "e" * 64,
+            "created_at_unix": 101,
+            "state": "writer_starting",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        with self.assertRaisesRegex(RuntimeError, "active ready successor lane"):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
+
+        successor["state"] = "ready"
+        successor["created_at_unix"] = 100
+        with self.assertRaisesRegex(RuntimeError, "successor is not newer"):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
+
+    def test_successor_handoff_verifier_allows_terminal_successor_only_for_retry(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_path = self.root / "successor"
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(successor_path),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        terminal = closeout.assess(
+            closeout.LaneCloseoutObservation(
+                lane_id=successor_id,
+                repository=str(self.repo),
+                workspace=str(successor_path),
+                branch="topic-new",
+                base_revision="d" * 40,
+                writer_state="completed",
+                task_active=False,
+                process_active=False,
+                lease_active=False,
+                git_dirty=False,
+                head_sha="d" * 40,
+                remote_head_sha="d" * 40,
+                ahead_commits=0,
+                behind_commits=0,
+                deployed_sha="d" * 40,
+            ),
+            observed_at_unix=201,
+        )
+        self.assertEqual("deployed", terminal["closeout_state"])
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "f" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+            "terminal_closeout": {
+                "schema_version": 1,
+                "kind": "grabowski.work_lane_terminal_closeout",
+                "closeout_state": terminal["closeout_state"],
+                "assessment_sha256": terminal["assessment_sha256"],
+                "expected_receipt_sha256": "e" * 64,
+                "assessment": terminal,
+            },
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "active ready successor lane"):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
+
+        predecessor["terminal_closeout_pending"] = {
+            "schema_version": 1,
+            "kind": work_acquire.TERMINAL_PENDING_KIND,
+            "closeout_state": "successor_handoff",
+            "assessment_sha256": assessment["assessment_sha256"],
+            "expected_receipt_sha256": "9" * 64,
+            "assessment": assessment,
+        }
+
+        old_checkout = {"branch": "topic-old"}
+        new_checkout = {"branch": "topic-new"}
+        publication = {
+            "repository": "heimgewebe/grabowski",
+            "pr_number": 1329,
+            "state": "MERGED",
+            "head_ref_name": "topic-old",
+            "head_sha": "d" * 40,
+        }
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(
+                    f"lane:{successor_id}",
+                    ["path:/successor"],
+                    [],
+                ),
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                side_effect=[
+                    (self.repo, self.repo, old_checkout),
+                    (self.repo, self.repo, new_checkout),
+                    (self.repo, self.repo, new_checkout),
+                ],
+            ),
+            patch.object(work_acquire.checkouts, "_require_clean_linked"),
+            patch.object(work_acquire.checkouts, "_require_expected"),
+            patch.object(
+                work_acquire.checkouts,
+                "_linked_checkout_coordination",
+                return_value={"blocking": False},
+            ),
+            patch.object(work_acquire.checkouts, "_require_no_blockers"),
+            patch.object(
+                work_acquire,
+                "_git_runner",
+                return_value={"returncode": 0},
+            ),
+            patch.object(
+                work_acquire,
+                "_github_merged_pr_exact_head",
+                return_value=publication,
+            ) as merged_pr,
+        ):
+            result = work_acquire._verify_successor_handoff_locked(
+                predecessor,
+                successor,
+                assessment,
+                allow_terminal_successor_retry=True,
+            )
+
+        self.assertIsNone(result["successor_minimum_lease_remaining_seconds"])
+        self.assertEqual("MERGED", result["publication"]["state"])
+        merged_pr.assert_called_once()
+
+        broken = dict(successor)
+        broken["terminal_closeout"] = {
+            **successor["terminal_closeout"],
+            "expected_receipt_sha256": "9" * 64,
+        }
+        with self.assertRaisesRegex(RuntimeError, "successor receipt changed"):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor,
+                broken,
+                assessment,
+                allow_terminal_successor_retry=True,
+            )
+
+    def test_successor_handoff_verifier_requires_exact_successor_receipt(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "f" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        with self.assertRaisesRegex(RuntimeError, "successor receipt changed"):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
+
+    def test_successor_handoff_verifier_rejects_incomplete_successor_leases(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "e" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(f"lane:{successor_id}", ["path:/successor"], []),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError, "successor lease set is incomplete or extended"
+            ),
+        ):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
+
+    def test_successor_handoff_rejects_near_expiry_successor_leases(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "e" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(
+                    f"lane:{successor_id}",
+                    ["path:/successor"],
+                    [{"resource_key": "path:/successor", "expires_at_unix": 110}],
+                ),
+            ),
+            patch.object(work_acquire.time, "time", return_value=100),
+            self.assertRaisesRegex(RuntimeError, "too close to expiry"),
+        ):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
+
+    def test_successor_handoff_rejects_successor_lease_snapshot_drift(self) -> None:
+        successor_id = "b" * 32
+        observed = [
+            {
+                "resource_key": "path:/successor",
+                "owner_id": f"lane:{successor_id}",
+                "purpose": "verify",
+                "acquired_at_unix": 50,
+                "updated_at_unix": 60,
+                "expires_at_unix": 200,
+                "metadata_sha256": "a" * 64,
+            }
+        ]
+        expected = [dict(observed[0], expires_at_unix=190)]
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(
+                    f"lane:{successor_id}",
+                    ["path:/successor"],
+                    observed,
+                ),
+            ),
+            patch.object(work_acquire.time, "time", return_value=100),
+            self.assertRaisesRegex(RuntimeError, "lease snapshot drifted"),
+        ):
+            work_acquire._successor_handoff_live_leases(
+                {"lane_id": successor_id},
+                expected_owner=f"lane:{successor_id}",
+                expected_registered=["path:/successor"],
+                expected_leases=expected,
+            )
+
+    def test_successor_handoff_github_publication_requires_exact_open_pr_head(self) -> None:
+        origin = {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stdout": "git@github.com:heimgewebe/grabowski.git\n",
+        }
+        published = {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stdout": json.dumps(
+                {
+                    "number": 1329,
+                    "state": "OPEN",
+                    "headRefName": "topic-old",
+                    "headRefOid": "d" * 40,
+                }
+            ),
+        }
+        with (
+            patch.object(work_acquire, "_git_runner", return_value=origin),
+            patch.object(work_acquire.operator, "_run", return_value=published),
+        ):
+            result = work_acquire._github_open_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+        self.assertEqual("heimgewebe/grabowski", result["repository"])
+        self.assertEqual("d" * 40, result["head_sha"])
+
+        drifted = dict(published)
+        drifted["stdout"] = json.dumps(
+            {
+                "number": 1329,
+                "state": "OPEN",
+                "headRefName": "topic-old",
+                "headRefOid": "f" * 40,
+            }
+        )
+        with (
+            patch.object(work_acquire, "_git_runner", return_value=origin),
+            patch.object(work_acquire.operator, "_run", return_value=drifted),
+            self.assertRaisesRegex(RuntimeError, "PR head drifted"),
+        ):
+            work_acquire._github_open_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+
+    def test_successor_handoff_github_merged_publication_requires_exact_head(self) -> None:
+        origin = {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stdout": "git@github.com:heimgewebe/grabowski.git\n",
+        }
+        published = {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stdout": json.dumps(
+                {
+                    "number": 1329,
+                    "state": "MERGED",
+                    "headRefName": "topic-old",
+                    "headRefOid": "d" * 40,
+                }
+            ),
+        }
+        with (
+            patch.object(work_acquire, "_git_runner", return_value=origin),
+            patch.object(work_acquire.operator, "_run", return_value=published),
+        ):
+            result = work_acquire._github_merged_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+        self.assertEqual("MERGED", result["state"])
+
+        still_open = dict(published)
+        still_open["stdout"] = json.dumps(
+            {
+                "number": 1329,
+                "state": "OPEN",
+                "headRefName": "topic-old",
+                "headRefOid": "d" * 40,
+            }
+        )
+        with (
+            patch.object(work_acquire, "_git_runner", return_value=origin),
+            patch.object(work_acquire.operator, "_run", return_value=still_open),
+            self.assertRaisesRegex(RuntimeError, "bound PR to be merged"),
+        ):
+            work_acquire._github_merged_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+
+    def test_successor_handoff_github_publication_rejects_closed_timeout_and_bad_json(self) -> None:
+        origin = {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stdout": "git@github.com:heimgewebe/grabowski.git\n",
+        }
+        for state in ("CLOSED", "MERGED"):
+            with (
+                self.subTest(state=state),
+                patch.object(work_acquire, "_git_runner", return_value=origin),
+                patch.object(
+                    work_acquire.operator,
+                    "_run",
+                    return_value={
+                        "returncode": 0,
+                        "timed_out": False,
+                        "stdout_truncated": False,
+                        "stdout": json.dumps(
+                            {
+                                "number": 1329,
+                                "state": state,
+                                "headRefName": "topic-old",
+                                "headRefOid": "d" * 40,
+                            }
+                        ),
+                    },
+                ),
+                self.assertRaisesRegex(RuntimeError, "bound PR to remain open"),
+            ):
+                work_acquire._github_open_pr_exact_head(
+                    self.repo,
+                    pr_number=1329,
+                    branch="topic-old",
+                    head="d" * 40,
+                )
+
+        with (
+            patch.object(
+                work_acquire,
+                "_git_runner",
+                return_value={**origin, "stdout": "one\ntwo\n"},
+            ),
+            self.assertRaisesRegex(RuntimeError, "one exact origin remote"),
+        ):
+            work_acquire._github_open_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+
+        with (
+            patch.object(work_acquire, "_git_runner", return_value=origin),
+            patch.object(
+                work_acquire.operator,
+                "_run",
+                return_value={
+                    "returncode": 0,
+                    "timed_out": True,
+                    "stdout_truncated": False,
+                    "stdout": "",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "GitHub PR readback failed"),
+        ):
+            work_acquire._github_open_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+
+        with (
+            patch.object(work_acquire, "_git_runner", return_value=origin),
+            patch.object(
+                work_acquire.operator,
+                "_run",
+                return_value={
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout_truncated": False,
+                    "stdout": "{not-json",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "invalid JSON"),
+        ):
+            work_acquire._github_open_pr_exact_head(
+                self.repo,
+                pr_number=1329,
+                branch="topic-old",
+                head="d" * 40,
+            )
+
+    def test_successor_handoff_verifier_rejects_dirty_checkout_and_ancestry_miss(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "e" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        lease = {
+            "resource_key": "path:/successor",
+            "owner_id": f"lane:{successor_id}",
+            "purpose": "verify",
+            "acquired_at_unix": 50,
+            "updated_at_unix": 60,
+            "expires_at_unix": 200,
+            "metadata_sha256": "f" * 64,
+        }
+        worktrees = [
+            (self.repo, self.repo / ".git", {"branch": "topic-old"}),
+            (self.repo, self.repo / ".git", {"branch": "topic-new"}),
+        ]
+        for dirty_index, message in ((0, "dirty predecessor"), (1, "dirty successor")):
+            side_effect = [None, None]
+            side_effect[dirty_index] = RuntimeError(message)
+            with (
+                self.subTest(message=message),
+                patch.object(
+                    work_acquire,
+                    "_terminal_lane_resource_observation",
+                    return_value=(
+                        f"lane:{successor_id}",
+                        ["path:/successor"],
+                        [lease],
+                    ),
+                ),
+                patch.object(work_acquire.time, "time", return_value=100),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_worktree_for_path",
+                    side_effect=list(worktrees),
+                ),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_require_clean_linked",
+                    side_effect=side_effect,
+                ),
+                patch.object(work_acquire.checkouts, "_require_expected"),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                work_acquire._verify_successor_handoff_locked(
+                    predecessor, successor, assessment
+                )
+
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(
+                    f"lane:{successor_id}",
+                    ["path:/successor"],
+                    [lease],
+                ),
+            ),
+            patch.object(work_acquire.time, "time", return_value=100),
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                side_effect=list(worktrees),
+            ),
+            patch.object(work_acquire.checkouts, "_require_clean_linked"),
+            patch.object(work_acquire.checkouts, "_require_expected"),
+            patch.object(
+                work_acquire.checkouts,
+                "_linked_checkout_coordination",
+                return_value={},
+            ),
+            patch.object(work_acquire.checkouts, "_require_no_blockers"),
+            patch.object(
+                work_acquire,
+                "_git_runner",
+                return_value={"returncode": 1},
+            ),
+            self.assertRaisesRegex(RuntimeError, "successor head is not a descendant"),
+        ):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor, successor, assessment
+            )
+
+    def test_successor_handoff_rechecks_successor_checkout_after_publication(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "e" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        lease = {
+            "resource_key": "path:/successor",
+            "owner_id": f"lane:{successor_id}",
+            "purpose": "verify",
+            "acquired_at_unix": 50,
+            "updated_at_unix": 60,
+            "expires_at_unix": 200,
+            "metadata_sha256": "f" * 64,
+        }
+        worktrees = [
+            (self.repo, self.repo / ".git", {"branch": "topic-old"}),
+            (self.repo, self.repo / ".git", {"branch": "topic-new"}),
+            (self.repo, self.repo / ".git", {"branch": "topic-new"}),
+        ]
+        expected = Mock(
+            side_effect=[
+                None,
+                None,
+                RuntimeError("successor checkout head drifted after publication"),
+            ]
+        )
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(
+                    f"lane:{successor_id}",
+                    ["path:/successor"],
+                    [lease],
+                ),
+            ),
+            patch.object(work_acquire.time, "time", return_value=100),
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                side_effect=worktrees,
+            ) as worktree,
+            patch.object(work_acquire.checkouts, "_require_clean_linked"),
+            patch.object(
+                work_acquire.checkouts,
+                "_require_expected",
+                expected,
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_linked_checkout_coordination",
+                return_value={},
+            ),
+            patch.object(work_acquire.checkouts, "_require_no_blockers"),
+            patch.object(
+                work_acquire,
+                "_git_runner",
+                return_value={"returncode": 0},
+            ),
+            patch.object(
+                work_acquire,
+                "_github_open_pr_exact_head",
+                return_value={
+                    "repository": "heimgewebe/grabowski",
+                    "pr_number": 1329,
+                    "state": "OPEN",
+                    "head_ref_name": "topic-old",
+                    "head_sha": "d" * 40,
+                },
+            ) as publication,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "successor checkout head drifted after publication",
+            ),
+        ):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor,
+                successor,
+                assessment,
+            )
+        self.assertEqual(3, worktree.call_count)
+        publication.assert_called_once()
+
+    def test_successor_handoff_rereads_successor_receipt_after_publication(self) -> None:
+        predecessor_id = "a" * 32
+        successor_id = "b" * 32
+        predecessor_inputs = {
+            "lane_id": predecessor_id,
+            "lease_owner_id": f"lane:{predecessor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.target),
+            "branch": "topic-old",
+        }
+        successor_inputs = {
+            "lane_id": successor_id,
+            "lease_owner_id": f"lane:{successor_id}",
+            "repo": str(self.repo),
+            "target_path": str(self.root / "successor"),
+            "branch": "topic-new",
+            "base_head": "d" * 40,
+            "source": {"kind": "work_lane", "id": predecessor_id},
+            "resource_keys": ["path:/successor"],
+        }
+        predecessor = {
+            "lane_id": predecessor_id,
+            "inputs": predecessor_inputs,
+            "inputs_sha256": work_acquire._sha(predecessor_inputs),
+            "created_at_unix": 100,
+        }
+        successor = {
+            "lane_id": successor_id,
+            "inputs": successor_inputs,
+            "inputs_sha256": work_acquire._sha(successor_inputs),
+            "receipt_sha256": "e" * 64,
+            "created_at_unix": 101,
+            "state": "ready",
+        }
+        assessment = closeout.assess_successor_handoff(
+            lane_id=predecessor_id,
+            successor_lane_id=successor_id,
+            predecessor_head_sha="c" * 40,
+            successor_head_sha="d" * 40,
+            successor_receipt_sha256="e" * 64,
+            pr_number=1329,
+            observed_at_unix=200,
+        )
+        lease = {
+            "resource_key": "path:/successor",
+            "owner_id": f"lane:{successor_id}",
+            "purpose": "verify",
+            "acquired_at_unix": 50,
+            "updated_at_unix": 60,
+            "expires_at_unix": 200,
+            "metadata_sha256": "f" * 64,
+        }
+        worktrees = [
+            (self.repo, self.repo / ".git", {"branch": "topic-old"}),
+            (self.repo, self.repo / ".git", {"branch": "topic-new"}),
+            (self.repo, self.repo / ".git", {"branch": "topic-new"}),
+        ]
+        drifted_successor = {**successor, "receipt_sha256": "f" * 64}
+        with (
+            patch.object(
+                work_acquire,
+                "_terminal_lane_resource_observation",
+                return_value=(
+                    f"lane:{successor_id}",
+                    ["path:/successor"],
+                    [lease],
+                ),
+            ),
+            patch.object(work_acquire.time, "time", return_value=100),
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                side_effect=worktrees,
+            ),
+            patch.object(work_acquire.checkouts, "_require_clean_linked"),
+            patch.object(work_acquire.checkouts, "_require_expected"),
+            patch.object(
+                work_acquire.checkouts,
+                "_linked_checkout_coordination",
+                return_value={},
+            ),
+            patch.object(work_acquire.checkouts, "_require_no_blockers"),
+            patch.object(
+                work_acquire,
+                "_git_runner",
+                return_value={"returncode": 0},
+            ),
+            patch.object(
+                work_acquire,
+                "_github_open_pr_exact_head",
+                return_value={
+                    "repository": "heimgewebe/grabowski",
+                    "pr_number": 1329,
+                    "state": "OPEN",
+                    "head_ref_name": "topic-old",
+                    "head_sha": "d" * 40,
+                },
+            ) as publication,
+            patch.object(
+                work_acquire,
+                "_read_state",
+                return_value=drifted_successor,
+            ) as reread,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "successor receipt changed after publication",
+            ),
+        ):
+            work_acquire._verify_successor_handoff_locked(
+                predecessor,
+                successor,
+                assessment,
+                successor_receipt_path=self.root / "successor-receipt.json",
+            )
+        publication.assert_called_once()
+        reread.assert_called_once()
+
     def test_terminal_assessment_replay_hash_preserves_legacy_equivalence(self) -> None:
         assessment = self.terminal_assessment("a" * 32, 200)
         legacy = dict(assessment)
@@ -1491,6 +5892,219 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(
             work_acquire._terminal_assessment_replay_sha256(assessment),
             work_acquire._terminal_assessment_replay_sha256(legacy),
+        )
+
+    def test_terminal_assessment_replay_allows_legacy_followup_id_only_directionally(self) -> None:
+        lane_id = "a" * 32
+
+        def blocked(followup_id: str) -> dict[str, object]:
+            return closeout.assess(
+                closeout.LaneCloseoutObservation(
+                    lane_id=lane_id,
+                    repository=str(self.repo),
+                    workspace=str(self.target),
+                    branch="feat/authority-p0",
+                    base_revision=SHA,
+                    writer_state="outcome_unknown",
+                    task_active=False,
+                    process_active=False,
+                    lease_active=True,
+                    git_dirty=False,
+                    head_sha=SHA,
+                    remote_head_sha=SHA,
+                    ahead_commits=0,
+                    behind_commits=0,
+                    durable_followup_id=followup_id,
+                ),
+                observed_at_unix=200,
+            )
+
+        current = blocked("followup-1")
+        legacy = dict(current)
+        legacy.pop("durable_followup_id")
+        legacy.pop("legacy_observation_sha256")
+        legacy["observation_sha256"] = current["legacy_observation_sha256"]
+        material = {
+            key: value
+            for key, value in legacy.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        legacy["assessment_sha256"] = closeout.sha256_json(material)
+        tampered_legacy = dict(legacy)
+        tampered_legacy["observation_sha256"] = "0" * 64
+        tampered_material = {
+            key: value
+            for key, value in tampered_legacy.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        tampered_legacy["assessment_sha256"] = closeout.sha256_json(
+            tampered_material
+        )
+        modern_without_compat = dict(current)
+        modern_without_compat.pop("legacy_observation_sha256")
+        modern_material = {
+            key: value
+            for key, value in modern_without_compat.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        modern_without_compat["assessment_sha256"] = closeout.sha256_json(
+            modern_material
+        )
+        different = blocked("followup-2")
+
+        self.assertTrue(
+            work_acquire._terminal_assessment_replay_equivalent(
+                legacy,
+                current,
+            )
+        )
+        self.assertTrue(
+            work_acquire._terminal_assessment_replay_equivalent(
+                modern_without_compat,
+                current,
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_assessment_replay_equivalent(
+                current,
+                different,
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_assessment_replay_equivalent(
+                current,
+                legacy,
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_assessment_replay_equivalent(
+                tampered_legacy,
+                current,
+            )
+        )
+
+    def test_terminal_pending_retry_allows_legacy_followup_id_only_directionally(self) -> None:
+        lane_id = "b" * 32
+
+        def blocked(followup_id: str) -> dict[str, object]:
+            return closeout.assess(
+                closeout.LaneCloseoutObservation(
+                    lane_id=lane_id,
+                    repository=str(self.repo),
+                    workspace=str(self.target),
+                    branch="feat/authority-p0",
+                    base_revision=SHA,
+                    writer_state="outcome_unknown",
+                    task_active=False,
+                    process_active=False,
+                    lease_active=True,
+                    git_dirty=False,
+                    head_sha=SHA,
+                    remote_head_sha=SHA,
+                    ahead_commits=0,
+                    behind_commits=0,
+                    durable_followup_id=followup_id,
+                ),
+                observed_at_unix=200,
+            )
+
+        current = blocked("followup-1")
+        legacy = dict(current)
+        legacy.pop("durable_followup_id")
+        legacy.pop("legacy_observation_sha256")
+        legacy["observation_sha256"] = current["legacy_observation_sha256"]
+        material = {
+            key: value
+            for key, value in legacy.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        legacy["assessment_sha256"] = closeout.sha256_json(material)
+        tampered_legacy = dict(legacy)
+        tampered_legacy["observation_sha256"] = "0" * 64
+        tampered_material = {
+            key: value
+            for key, value in tampered_legacy.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        tampered_legacy["assessment_sha256"] = closeout.sha256_json(
+            tampered_material
+        )
+        modern_without_compat = dict(current)
+        modern_without_compat.pop("legacy_observation_sha256")
+        modern_material = {
+            key: value
+            for key, value in modern_without_compat.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        modern_without_compat["assessment_sha256"] = closeout.sha256_json(
+            modern_material
+        )
+        different = blocked("followup-2")
+
+        self.assertTrue(
+            work_acquire._terminal_pending_retry_equivalent(
+                legacy,
+                current,
+                record={},
+            )
+        )
+        self.assertTrue(
+            work_acquire._terminal_pending_retry_equivalent(
+                modern_without_compat,
+                current,
+                record={},
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_pending_retry_equivalent(
+                current,
+                different,
+                record={},
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_pending_retry_equivalent(
+                current,
+                legacy,
+                record={},
+            )
+        )
+        self.assertFalse(
+            work_acquire._terminal_pending_retry_equivalent(
+                tampered_legacy,
+                current,
+                record={},
+            )
         )
 
     def test_terminal_checkout_lifecycle_convergence_preserves_blocked_followup_capacity(self) -> None:
@@ -1649,6 +6263,336 @@ class WorkAcquireTests(unittest.TestCase):
             expected_branch=rebound_branch,
         )
 
+    def test_terminal_checkout_lifecycle_convergence_preserves_archived_lifecycle(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        checkout_key = "9" * 64
+        lifecycle_source = {"kind": "work_lane", "id": "a" * 32}
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "expected_branch": "feat/authority-p0",
+            "source": lifecycle_source,
+        }
+        record = {
+            "inputs": inputs,
+            "worktree_receipt": {"lifecycle": lifecycle},
+        }
+        current_lifecycle = {
+            **lifecycle,
+            "expected_head": SHA,
+            "phase": "archived",
+        }
+        observed = {
+            "checkout_key": checkout_key,
+            "head": SHA,
+            "branch": "feat/authority-p0",
+        }
+        recovery_refs = [
+            {
+                "role": "head",
+                "ref": "refs/grabowski/checkouts/test/archive/head",
+                "target": SHA,
+            }
+        ]
+        archive = {
+            "archive_id": "20260927T060000Z-123456789abc",
+            "checkout_key": checkout_key,
+            "owner_id": inputs["lease_owner_id"],
+            "repo_path": str(self.repo),
+            "checkout_path": str(self.target),
+            "head": SHA,
+            "branch": "feat/authority-p0",
+            "cleaned_at_unix": None,
+            "cleanup_plan_id": None,
+            "recovery_refs": recovery_refs,
+        }
+        retention = {
+            "checkout_key": checkout_key,
+            "repo_common_dir": str(self.repo / ".git"),
+            "repo_path": str(self.repo),
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "expected_head": SHA,
+            "expected_branch": "feat/authority-p0",
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_lifecycle_bindings",
+                return_value={checkout_key: current_lifecycle},
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, self.repo / ".git", observed),
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_require_clean_linked",
+                return_value={"dirty": False},
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_retention_records",
+                return_value={checkout_key: retention},
+            ) as retention_records,
+            patch.object(
+                work_acquire.checkouts,
+                "_latest_archive_for_key",
+                return_value=archive,
+            ) as latest_archive,
+            patch.object(
+                work_acquire.checkouts,
+                "_verify_recovery_refs",
+                return_value=[{"present": True}],
+            ) as verify_refs,
+            patch.object(
+                work_acquire.checkouts,
+                "_mark_checkout_completed_retained",
+            ) as mark,
+        ):
+            result = work_acquire._converge_terminal_checkout_lifecycle(
+                record,
+                assessment={
+                    "phase": "terminal",
+                    "lease_release_ready": True,
+                    "terminal_head_sha": SHA,
+                },
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["state"], "archived")
+        self.assertEqual(result["archive_id"], archive["archive_id"])
+        self.assertTrue(result["active_capacity_released"])
+        self.assertTrue(result["retention_preserved"])
+        self.assertTrue(result["archive_preserved"])
+        retention_records.assert_called_once_with([checkout_key])
+        latest_archive.assert_called_once_with(checkout_key)
+        verify_refs.assert_called_once_with(self.repo, recovery_refs)
+        mark.assert_not_called()
+
+    def test_terminal_checkout_lifecycle_convergence_rejects_archived_retention_drift(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        checkout_key = "7" * 64
+        lifecycle_source = {"kind": "work_lane", "id": "c" * 32}
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "expected_branch": "feat/authority-p0",
+            "source": lifecycle_source,
+        }
+        record = {
+            "inputs": inputs,
+            "worktree_receipt": {"lifecycle": lifecycle},
+        }
+        current_lifecycle = {
+            **lifecycle,
+            "expected_head": SHA,
+            "phase": "archived",
+        }
+        observed = {
+            "checkout_key": checkout_key,
+            "head": SHA,
+            "branch": "feat/authority-p0",
+        }
+        valid_retention = {
+            "checkout_key": checkout_key,
+            "repo_common_dir": str(self.repo / ".git"),
+            "repo_path": str(self.repo),
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "expected_head": SHA,
+            "expected_branch": "feat/authority-p0",
+        }
+        cases = {
+            "missing": {},
+            "owner_drift": {
+                checkout_key: {**valid_retention, "owner_id": "lane:" + "f" * 32}
+            },
+            "common_dir_drift": {
+                checkout_key: {
+                    **valid_retention,
+                    "repo_common_dir": str(self.root / "other.git"),
+                }
+            },
+            "repo_drift": {
+                checkout_key: {
+                    **valid_retention,
+                    "repo_path": str(self.root / "other-repo"),
+                }
+            },
+            "path_drift": {
+                checkout_key: {
+                    **valid_retention,
+                    "checkout_path": str(self.root / "different-worktree"),
+                }
+            },
+            "head_drift": {
+                checkout_key: {**valid_retention, "expected_head": "b" * 40}
+            },
+            "branch_drift": {
+                checkout_key: {**valid_retention, "expected_branch": "feat/other"}
+            },
+        }
+        for label, retention_rows in cases.items():
+            with (
+                patch.object(
+                    work_acquire.checkouts,
+                    "_lifecycle_bindings",
+                    return_value={checkout_key: current_lifecycle},
+                ),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_worktree_for_path",
+                    return_value=(self.repo, self.repo / ".git", observed),
+                ),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_require_clean_linked",
+                    return_value={"dirty": False},
+                ),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_retention_records",
+                    return_value=retention_rows,
+                ),
+                patch.object(
+                    work_acquire.checkouts,
+                    "_latest_archive_for_key",
+                ) as latest_archive,
+                patch.object(
+                    work_acquire.checkouts,
+                    "_verify_recovery_refs",
+                ) as verify_refs,
+                patch.object(
+                    work_acquire.checkouts,
+                    "_mark_checkout_completed_retained",
+                ) as mark,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "retention evidence drifted"
+                ):
+                    work_acquire._converge_terminal_checkout_lifecycle(
+                        record,
+                        assessment={
+                            "phase": "terminal",
+                            "lease_release_ready": True,
+                            "terminal_head_sha": SHA,
+                        },
+                    )
+                latest_archive.assert_not_called()
+                verify_refs.assert_not_called()
+                mark.assert_not_called()
+
+    def test_terminal_checkout_lifecycle_convergence_rejects_archived_archive_drift(self) -> None:
+        params = self.parameters()
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        checkout_key = "8" * 64
+        lifecycle_source = {"kind": "work_lane", "id": "b" * 32}
+        lifecycle = {
+            "checkout_key": checkout_key,
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "expected_branch": "feat/authority-p0",
+            "source": lifecycle_source,
+        }
+        record = {
+            "inputs": inputs,
+            "worktree_receipt": {"lifecycle": lifecycle},
+        }
+        current_lifecycle = {
+            **lifecycle,
+            "expected_head": SHA,
+            "phase": "archived",
+        }
+        observed = {
+            "checkout_key": checkout_key,
+            "head": SHA,
+            "branch": "feat/authority-p0",
+        }
+        archive = {
+            "archive_id": "20260927T060000Z-fedcba987654",
+            "checkout_key": checkout_key,
+            "owner_id": inputs["lease_owner_id"],
+            "repo_path": str(self.repo),
+            "checkout_path": str(self.root / "different-worktree"),
+            "head": SHA,
+            "branch": "feat/authority-p0",
+            "cleaned_at_unix": None,
+            "cleanup_plan_id": None,
+            "recovery_refs": [
+                {
+                    "role": "head",
+                    "ref": "refs/grabowski/checkouts/test/archive/head",
+                    "target": SHA,
+                }
+            ],
+        }
+        retention = {
+            "checkout_key": checkout_key,
+            "repo_common_dir": str(self.repo / ".git"),
+            "repo_path": str(self.repo),
+            "checkout_path": str(self.target),
+            "owner_id": inputs["lease_owner_id"],
+            "expected_head": SHA,
+            "expected_branch": "feat/authority-p0",
+        }
+        with (
+            patch.object(
+                work_acquire.checkouts,
+                "_lifecycle_bindings",
+                return_value={checkout_key: current_lifecycle},
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_worktree_for_path",
+                return_value=(self.repo, self.repo / ".git", observed),
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_require_clean_linked",
+                return_value={"dirty": False},
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_retention_records",
+                return_value={checkout_key: retention},
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_latest_archive_for_key",
+                return_value=archive,
+            ),
+            patch.object(
+                work_acquire.checkouts,
+                "_verify_recovery_refs",
+            ) as verify_refs,
+            patch.object(
+                work_acquire.checkouts,
+                "_mark_checkout_completed_retained",
+            ) as mark,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "archive evidence drifted"):
+                work_acquire._converge_terminal_checkout_lifecycle(
+                    record,
+                    assessment={
+                        "phase": "terminal",
+                        "lease_release_ready": True,
+                        "terminal_head_sha": SHA,
+                    },
+                )
+
+        verify_refs.assert_not_called()
+        mark.assert_not_called()
+
     def test_terminal_checkout_lifecycle_convergence_rejects_new_dirty_state(self) -> None:
         params = self.parameters()
         inputs = work_acquire._normalize(params)
@@ -1791,6 +6735,101 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(replay["next_action"], "retry_terminal_closeout")
         acquire.assert_not_called()
         ensure.assert_not_called()
+
+    def test_legacy_blocked_pending_retry_preserves_original_assessment_binding(self) -> None:
+        params = self.parameters()
+        _, receipt = self.store_lane(params)
+        lane_id = str(receipt["lane_id"])
+        current = closeout.assess(
+            closeout.LaneCloseoutObservation(
+                lane_id=lane_id,
+                repository=str(self.repo),
+                workspace=str(self.target),
+                branch="feat/authority-p0",
+                base_revision=SHA,
+                writer_state="outcome_unknown",
+                task_active=False,
+                process_active=False,
+                lease_active=True,
+                git_dirty=False,
+                head_sha=SHA,
+                remote_head_sha=SHA,
+                ahead_commits=0,
+                behind_commits=0,
+                durable_followup_id="followup-1",
+            ),
+            observed_at_unix=200,
+        )
+        legacy = dict(current)
+        legacy.pop("durable_followup_id")
+        legacy.pop("legacy_observation_sha256")
+        legacy["observation_sha256"] = current["legacy_observation_sha256"]
+        material = {
+            key: value
+            for key, value in legacy.items()
+            if key
+            not in {
+                "assessment_sha256",
+                "audit_record_sha256",
+                "does_not_establish",
+            }
+        }
+        legacy["assessment_sha256"] = closeout.sha256_json(material)
+
+        with patch.object(
+            work_acquire,
+            "_converge_terminal_checkout_lifecycle",
+            side_effect=RuntimeError("lifecycle temporarily unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "lifecycle temporarily unavailable",
+            ):
+                work_acquire.persist_terminal_closeout(
+                    lane_id,
+                    legacy,
+                    expected_receipt_sha256=str(receipt["receipt_sha256"]),
+                )
+
+        pending_record = work_acquire._read_state(
+            self.state / f"{lane_id}.json"
+        )
+        self.assertIsNotNone(pending_record)
+        assert pending_record is not None
+        pending = pending_record["terminal_closeout_pending"]["assessment"]
+        self.assertEqual(legacy["assessment_sha256"], pending["assessment_sha256"])
+        self.assertNotIn("durable_followup_id", pending)
+
+        with (
+            patch.object(
+                work_acquire,
+                "_converge_terminal_checkout_lifecycle",
+                return_value=None,
+            ),
+            patch.object(
+                work_acquire,
+                "_converge_terminal_resource_leases",
+                return_value=None,
+            ),
+        ):
+            stored = work_acquire.persist_terminal_closeout(
+                lane_id,
+                current,
+                expected_receipt_sha256=str(pending_record["receipt_sha256"]),
+            )
+
+        final_assessment = stored["terminal_closeout"]["assessment"]
+        self.assertEqual(
+            legacy["assessment_sha256"],
+            final_assessment["assessment_sha256"],
+        )
+        self.assertEqual(
+            legacy["observation_sha256"],
+            final_assessment["observation_sha256"],
+        )
+        self.assertNotIn("durable_followup_id", final_assessment)
+        self.assertNotIn("legacy_observation_sha256", final_assessment)
+        self.assertNotIn("terminal_closeout_pending", stored)
 
     def test_terminal_closeout_persists_managed_checkout_physical_identity(self) -> None:
         params = self.parameters()
@@ -2567,6 +7606,67 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(persist.call_args.args[0], lane_id)
         self.assertEqual(persist.call_args.args[1]["terminal_head_sha"], SHA)
         self.assertNotIn("terminal_head_sha", persist.call_args.kwargs)
+        acquire.assert_not_called()
+
+    def test_mcp_entry_routes_exact_successor_handoff_without_generic_assessment(self) -> None:
+        params = self.parameters()
+        stored_inputs, receipt = self.store_lane(params)
+        lane_id = str(stored_inputs["lane_id"])
+        expected = {"lane_id": lane_id, "closeout_state": "successor_handoff"}
+        with (
+            patch.object(work_acquire.operator, "_require_operator_mutation"),
+            patch.object(
+                work_acquire,
+                "persist_successor_handoff_closeout",
+                return_value=expected,
+            ) as persist,
+            patch.object(
+                work_acquire.lane_closeout,
+                "assess",
+                side_effect=AssertionError(
+                    "successor handoff must not use generic observation"
+                ),
+            ) as assess,
+            patch.object(work_acquire, "acquire_work") as acquire,
+        ):
+            result = work_acquire.grabowski_work_acquire(
+                source_kind=str(params["source_kind"]),
+                source_id=str(params["source_id"]),
+                controller_actor=str(params["controller_actor"]),
+                repo=str(params["repo"]),
+                base_head=str(params["base_head"]),
+                branch=str(params["branch"]),
+                target_path=str(params["target_path"]),
+                purpose=str(params["purpose"]),
+                retention_until_unix=int(params["retention_until_unix"]),
+                idempotency_key=str(params["idempotency_key"]),
+                scoped_writer_actor=str(params["scoped_writer_actor"]),
+                ttl_seconds=int(params["ttl_seconds"]),
+                terminal_closeout={
+                    "expected_receipt_sha256": str(receipt["receipt_sha256"]),
+                    "successor_handoff": {
+                        "lane_id": lane_id,
+                        "successor_lane_id": "b" * 32,
+                        "expected_predecessor_head": SHA,
+                        "expected_successor_head": "c" * 40,
+                        "expected_successor_receipt_sha256": "d" * 64,
+                        "expected_pr_number": 1329,
+                    },
+                },
+            )
+        self.assertEqual(expected, result)
+        persist.assert_called_once_with(
+            lane_id,
+            successor_lane_id="b" * 32,
+            expected_predecessor_head=SHA,
+            expected_successor_head="c" * 40,
+            expected_successor_receipt_sha256="d" * 64,
+            expected_pr_number=1329,
+            expected_receipt_sha256=str(receipt["receipt_sha256"]),
+            audit_fn=work_acquire.operator.base._append_audit_with_digest,
+            audit_lookup_fn=work_acquire._find_terminal_closeout_audit,
+        )
+        assess.assert_not_called()
         acquire.assert_not_called()
 
     def test_mcp_entry_reconciles_only_missing_terminal_audit_without_reassessment(self) -> None:

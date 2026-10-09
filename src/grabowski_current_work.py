@@ -553,7 +553,13 @@ def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
         command_class = "other"
         if workspace_id:
             command_class = "agent-workspace-pane"
-        elif executable.lower() in CODING_AGENT_EXECUTABLES:
+        # Zombies remain observable, but cannot execute provider work. Excluding
+        # them from coding-agent classification prevents unreadable zombie argv
+        # from making otherwise complete physical occupancy globally unavailable.
+        elif (
+            not state.startswith("Z")
+            and executable.lower() in CODING_AGENT_EXECUTABLES
+        ):
             command_class = "coding-agent"
         elif "grabowski_operator" in arguments:
             command_class = "operator-runtime"
@@ -931,6 +937,50 @@ def _reconciliation_has_more(payload: dict[str, Any] | None) -> bool:
         pagination,
         "checkout_binding_reconciliation.pagination",
     )
+
+
+def _task_checkout_presence(
+    payload: dict[str, Any] | None,
+) -> tuple[dict[str, list[str]], bool]:
+    if payload is None:
+        return {}, False
+    complete = payload.get("task_checkout_presence_complete", False)
+    if not isinstance(complete, bool):
+        raise CurrentWorkProjectionError(
+            "checkout_binding_reconciliation.task_checkout_presence_complete must be boolean"
+        )
+    raw = payload.get("task_checkout_presence", {})
+    if not isinstance(raw, dict) or len(raw) > MAX_TASKS:
+        raise CurrentWorkProjectionError(
+            "checkout_binding_reconciliation.task_checkout_presence must be a bounded object"
+        )
+    result: dict[str, list[str]] = {}
+    for raw_task_id, raw_checkout_keys in raw.items():
+        task_id = _identifier(
+            raw_task_id,
+            "checkout_binding_reconciliation.task_checkout_presence.task_id",
+        )
+        if (
+            not isinstance(raw_checkout_keys, list)
+            or len(raw_checkout_keys) > MAX_EVIDENCE
+            or not raw_checkout_keys
+        ):
+            raise CurrentWorkProjectionError(
+                "checkout_binding_reconciliation.task_checkout_presence checkout keys are invalid"
+            )
+        checkout_keys = [
+            _identifier(
+                item,
+                "checkout_binding_reconciliation.task_checkout_presence.checkout_key",
+            )
+            for item in raw_checkout_keys
+        ]
+        if len(checkout_keys) != len(set(checkout_keys)):
+            raise CurrentWorkProjectionError(
+                "checkout_binding_reconciliation.task_checkout_presence checkout keys are duplicated"
+            )
+        result[task_id] = sorted(checkout_keys)
+    return result, complete
 
 
 def _task_has_more(payload: dict[str, Any] | None) -> bool:
@@ -1774,13 +1824,26 @@ def _finalize_groups(
     view: str,
     source_truncation: dict[str, bool],
     source_errors: list[dict[str, Any]],
+    task_checkout_presence: dict[str, list[str]],
+    task_checkout_presence_complete: bool,
+    attention_current_work_filter_applied: bool,
 ) -> list[dict[str, Any]]:
     projected: list[dict[str, Any]] = []
     source_error_sources = {
         str(item.get("source", "unknown")) for item in source_errors
     }
     for group in groups.values():
-        task_item = tasks.get(group["binding"]["id"]) if group["binding"]["kind"] == "task" else None
+        task_id = (
+            group["binding"]["id"]
+            if group["binding"]["kind"] == "task"
+            else None
+        )
+        task_item = tasks.get(task_id) if task_id is not None else None
+        task_checkout_keys = (
+            task_checkout_presence.get(task_id, [])
+            if task_id is not None
+            else []
+        )
         has_live_surface = bool(
             group["lease_summary"]["count"]
             or group["checkout_refs"]
@@ -1796,6 +1859,18 @@ def _finalize_groups(
             and task_item is None
         ):
             _blocking(group, "task-lifecycle-unresolved-for-live-lease")
+        if task_item is None and task_checkout_keys:
+            for checkout_key in task_checkout_keys:
+                _append(
+                    group["authority_refs"],
+                    {
+                        "source": "checkout-lifecycle-presence",
+                        "task_id": task_id,
+                        "checkout_key": checkout_key,
+                        "authority": True,
+                    },
+                )
+            _blocking(group, "task-lifecycle-unresolved-for-live-checkout")
         archived_attention = bool(
             {"attention:decision_closed", "attention:decision_superseded"}
             & set(group["source_states"])
@@ -1872,6 +1947,44 @@ def _finalize_groups(
                 group["action_required"] = True
                 if "managed-active-retention-expired" not in group["action_reasons"]:
                     group["action_reasons"].append("managed-active-retention-expired")
+
+        current_binding_absence_sources = {
+            "tasks",
+            "resources",
+            "checkout_binding_reconciliation",
+        }
+        current_binding_absence_proven = (
+            task_checkout_presence_complete
+            and not task_checkout_keys
+            and not source_truncation.get("source_errors", False)
+            and not source_truncation.get("tasks", False)
+            and not source_truncation.get("resources", False)
+            and not (current_binding_absence_sources & source_error_sources)
+        )
+        attention_page_safe_to_suppress = bool(
+            not attention_current_work_filter_applied
+            and not source_truncation.get("attention", False)
+        )
+        attention_only_hygiene = (
+            group["binding"]["kind"] == "task"
+            and task_item is None
+            and group["projection_state"] == "hygiene"
+            and "attention-actionable" in group["action_reasons"]
+            and bool(group["authority_refs"])
+            and all(
+                ref.get("source") == "task-attention-decision-evidence"
+                for ref in group["authority_refs"]
+            )
+            and not group["heuristic_refs"]
+        )
+        if (
+            view == "current"
+            and attention_only_hygiene
+            and not has_live_surface
+            and current_binding_absence_proven
+            and attention_page_safe_to_suppress
+        ):
+            continue
 
         if view == "current" and group["projection_state"] == "terminal_archived" and not has_live_surface and not group["action_required"]:
             continue
@@ -2194,6 +2307,15 @@ def build_current_work_projection(
 
     task_rows = _records(tasks_payload, "tasks", MAX_TASKS, "tasks")
     attention_rows = _attention_records(attention_payload)
+    attention_current_work_filter_applied = bool(
+        attention_payload
+        and "current_work_orphan_filter_safe" in attention_payload
+    )
+    if attention_current_work_filter_applied:
+        _boolean(
+            attention_payload.get("current_work_orphan_filter_safe"),
+            "attention.current_work_orphan_filter_safe",
+        )
     lease_rows = _records(resources_payload, "leases", MAX_LEASES, "resources")
     browser_rows = _records(browser_payload, "workers", MAX_WORKERS, "browser")
     gui_rows = _records(gui_payload, "workers", MAX_WORKERS, "gui")
@@ -2202,6 +2324,9 @@ def build_current_work_projection(
         "bindings",
         MAX_WORKTREES,
         "checkout_binding_reconciliation",
+    )
+    task_checkout_presence, task_checkout_presence_complete = _task_checkout_presence(
+        reconciliation_payload
     )
     if checkout_payloads is None:
         checkout_payloads = []
@@ -2280,6 +2405,9 @@ def build_current_work_projection(
         view=view,
         source_truncation=source_truncation,
         source_errors=errors,
+        task_checkout_presence=task_checkout_presence,
+        task_checkout_presence_complete=task_checkout_presence_complete,
+        attention_current_work_filter_applied=attention_current_work_filter_applied,
     )
 
     _annotate_groups(

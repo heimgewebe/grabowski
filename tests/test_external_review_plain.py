@@ -2319,6 +2319,152 @@ class PlainExternalReviewTests(unittest.TestCase):
             self.assertFalse(output.with_suffix(".review.txt").exists())
             self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
+    def test_main_defaults_grok_to_canonical_native_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            stdout = io.StringIO()
+            evidence = {"reviews": [{"verdict": "PASS"}]}
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(home)},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    plain,
+                    "run_from_manifest",
+                    return_value=evidence,
+                ) as run,
+                contextlib.redirect_stdout(stdout),
+            ):
+                rc = plain.main(
+                    [
+                        "--manifest",
+                        str(manifest),
+                        "--output",
+                        str(output),
+                        "--provider",
+                        "grok",
+                        "--model",
+                        "grok-4.6",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                run.call_args.kwargs["executable"],
+                str(home / ".grok" / "bin" / "grok"),
+            )
+
+    def test_main_explicit_grok_executable_does_not_resolve_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            evidence = {"reviews": [{"verdict": "PASS"}]}
+
+            with (
+                mock.patch.object(
+                    plain.Path,
+                    "home",
+                    side_effect=RuntimeError("home unavailable"),
+                ) as home,
+                mock.patch.object(
+                    plain,
+                    "run_from_manifest",
+                    return_value=evidence,
+                ) as run,
+            ):
+                rc = plain.main(
+                    [
+                        "--manifest",
+                        str(manifest),
+                        "--output",
+                        str(output),
+                        "--provider",
+                        "grok",
+                        "--executable",
+                        "/private/grok",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            home.assert_not_called()
+            self.assertEqual(run.call_args.kwargs["executable"], "/private/grok")
+
+    def test_main_gemini_default_does_not_resolve_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            evidence = {"reviews": [{"verdict": "PASS"}]}
+
+            with (
+                mock.patch.object(
+                    plain.Path,
+                    "home",
+                    side_effect=RuntimeError("home unavailable"),
+                ) as home,
+                mock.patch.object(
+                    plain,
+                    "run_from_manifest",
+                    return_value=evidence,
+                ) as run,
+            ):
+                rc = plain.main(
+                    [
+                        "--manifest",
+                        str(manifest),
+                        "--output",
+                        str(output),
+                        "--provider",
+                        "gemini",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            home.assert_not_called()
+            self.assertEqual(run.call_args.kwargs["executable"], "agy")
+
+    def test_main_grok_home_resolution_failure_is_structured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            stderr = io.StringIO()
+
+            with (
+                mock.patch.object(
+                    plain.Path,
+                    "home",
+                    side_effect=RuntimeError("home unavailable"),
+                ),
+                mock.patch.object(plain, "run_from_manifest") as run,
+                contextlib.redirect_stderr(stderr),
+            ):
+                rc = plain.main(
+                    [
+                        "--manifest",
+                        str(manifest),
+                        "--output",
+                        str(output),
+                        "--provider",
+                        "grok",
+                    ]
+                )
+
+            self.assertEqual(rc, 2)
+            payload = json.loads(stderr.getvalue())
+            self.assertFalse(payload["ok"])
+            self.assertIn("cannot resolve the account home directory", payload["error"])
+            self.assertNotIn("Traceback", stderr.getvalue())
+            run.assert_not_called()
+
     def test_main_reports_provider_failure_without_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

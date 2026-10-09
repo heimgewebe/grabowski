@@ -1,19 +1,20 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "03ebb6191f56cf3eaf8e966ab4208fc6dabeb1d63c1c2c8ec587b688245d0f46"
+    "sha256": "2681d2593edcdc23e200aa0fa3e6eec2cbda1b9c1794b1d9faf87fc81801c567"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "95319ba572c41ec124b4f8309c9cdfb46352475419240585d0d8d382dd8a5440"
+    "sha256": "5a7396575d6f76ad96b63e01dcbbf72cf57c938a1af4d45a9f408cc9917de2ac"
   },
   "counts": {
-    "core": 23,
-    "full": 198,
-    "operator": 182
+    "core": 25,
+    "full": 203,
+    "operator": 187
   },
   "profiles": {
     "core": [
+      "report_outcome",
       "grabowski_verify_audit",
       "repoground_bundle_discover",
       "repoground_bundle_status",
@@ -21,6 +22,7 @@
       "repoground_context_pack",
       "repoground_context_compose",
       "grabowski_runtime_health",
+      "grabowski_mcp_liveness",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
       "grabowski_checkout_summary",
@@ -41,6 +43,7 @@
     "full": [
       "grabowski_status",
       "grabowski_context",
+      "report_outcome",
       "grip_list",
       "grip_run",
       "grabowski_list_directory",
@@ -76,6 +79,7 @@
       "repoground_get_callers",
       "repoground_get_callees",
       "grabowski_runtime_health",
+      "grabowski_mcp_liveness",
       "grabowski_audit_projection",
       "grabowski_deployment_identity",
       "grabowski_contract_drift",
@@ -122,6 +126,8 @@
       "grabowski_ports",
       "grabowski_tailscale_status",
       "grabowski_privileged_action_reference",
+      "grabowski_critical_user_data_inventory",
+      "grabowski_critical_user_data_inventory_read",
       "grabowski_power_run",
       "grabowski_fleet_list",
       "grabowski_fleet_run",
@@ -182,6 +188,7 @@
       "grabowski_host_capability_resolve",
       "grabowski_systemkatalog_query",
       "grabowski_operational_guidance",
+      "grabowski_bureau_acceptance_authenticate",
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
@@ -241,6 +248,7 @@
     "operator": [
       "grabowski_status",
       "grabowski_context",
+      "report_outcome",
       "grip_list",
       "grip_run",
       "grabowski_list_directory",
@@ -275,6 +283,7 @@
       "repoground_get_callers",
       "repoground_get_callees",
       "grabowski_runtime_health",
+      "grabowski_mcp_liveness",
       "grabowski_audit_projection",
       "grabowski_contract_drift",
       "grabowski_current_work",
@@ -309,6 +318,8 @@
       "grabowski_process_list",
       "grabowski_process_signal",
       "grabowski_privileged_action_reference",
+      "grabowski_critical_user_data_inventory",
+      "grabowski_critical_user_data_inventory_read",
       "grabowski_power_run",
       "grabowski_fleet_run",
       "grabowski_juno_status",
@@ -366,6 +377,7 @@
       "grabowski_host_capability_resolve",
       "grabowski_systemkatalog_query",
       "grabowski_operational_guidance",
+      "grabowski_bureau_acceptance_authenticate",
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
@@ -443,6 +455,7 @@
         "grabowski_git_status",
         "grabowski_github_checks",
         "grabowski_github_pr_view",
+        "grabowski_mcp_liveness",
         "grabowski_ports",
         "grabowski_privileged_broker_status",
         "grabowski_recovery_status",
@@ -455,7 +468,8 @@
         "repoground_bundle_status",
         "repoground_context_compose",
         "repoground_context_pack",
-        "repoground_freshness_check"
+        "repoground_freshness_check",
+        "report_outcome"
       ],
       "read_only": true,
       "risk_classes": [
@@ -470,12 +484,14 @@
       "orientation_tools": [
         "grabowski_audit_projection",
         "grabowski_contract_drift",
+        "grabowski_mcp_liveness",
         "grabowski_runtime_health",
         "repoground_bundle_discover",
         "repoground_bundle_status",
         "repoground_context_compose",
         "repoground_context_pack",
-        "repoground_freshness_check"
+        "repoground_freshness_check",
+        "report_outcome"
       ],
       "selection": "all tools not in core plus orientation tools"
     }

@@ -332,8 +332,7 @@ SOURCES: dict[str, dict[str, Any]] = {
         "historical": False,
         "max_sensitivity": "internal_operational",
         "does_not_establish": (
-            "deployment_authorization", "release_correctness",
-            "deployment_integrity", "audit_integrity", "mutation_readiness",
+            "deployment_authorization", "release_correctness", "mutation_readiness",
         ),
     },
     "grabowski_service_status": {

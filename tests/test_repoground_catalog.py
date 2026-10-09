@@ -5,6 +5,7 @@ from unittest.mock import patch
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -169,6 +170,25 @@ class CatalogFixture(unittest.TestCase):
 
 
 class RepoGroundCatalogResolverTests(CatalogFixture):
+    def test_canonical_catalog_accepts_sha256_source_commit(self) -> None:
+        commit = "c" * 64
+        manifest, _stem = self.write_canonical(
+            run_dir="20260718T120000Z-sha256",
+            created_at="2026-07-18T12:00:00Z",
+            commit=commit,
+            provenance_name=f"heimgewebe__demo__main--{commit}",
+        )
+
+        record, rejection = catalog.inspect_candidate(
+            manifest, self.canonical, self.legacy
+        )
+
+        self.assertIsNone(rejection)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(commit, record["source_provenance"]["git_commit"])
+        self.assertFalse(record["source_provenance"]["git_dirty"])
+
     def test_manifest_created_at_wins_over_filesystem_mtime(self) -> None:
         older, _older_stem = self.write_canonical(
             run_dir="20260718T120000Z-old",
@@ -273,6 +293,38 @@ class RepoGroundCatalogResolverTests(CatalogFixture):
         resolved = catalog.resolve_catalog(self.canonical, self.legacy, repo="demo")
 
         self.assertTrue(resolved["available"])
+
+    def test_canonical_sha256_revision_bound_provenance_is_accepted(self) -> None:
+        commit = "a" * 64
+        self.write_canonical(
+            run_dir="20260718T120000Z-sha256",
+            created_at="2026-07-18T12:00:00Z",
+            commit=commit,
+            provenance_name=f"heimgewebe__demo__main--{commit}",
+        )
+
+        resolved = catalog.resolve_catalog(self.canonical, self.legacy, repo="demo")
+
+        self.assertTrue(resolved["available"])
+        provenance = resolved["selected"][0]["source_provenance"]
+        self.assertEqual(commit, provenance["git_commit"])
+
+    def test_canonical_revision_bound_provenance_rejects_invalid_object_id_length(self) -> None:
+        commit = "a" * 63
+        self.write_canonical(
+            run_dir="20260718T120000Z-invalid-object-id",
+            created_at="2026-07-18T12:00:00Z",
+            commit=commit,
+            provenance_name=f"heimgewebe__demo__main--{commit}",
+        )
+
+        resolved = catalog.resolve_catalog(self.canonical, self.legacy, repo="demo")
+
+        self.assertFalse(resolved["available"])
+        self.assertIn(
+            "snapshot_repository_commit_absent",
+            {item["reason"] for item in resolved["rejected"]},
+        )
 
     def test_canonical_revision_bound_provenance_rejects_commit_mismatch(self) -> None:
         self.write_canonical(
@@ -756,9 +808,39 @@ class RepoGroundConsumerBindingTests(CatalogFixture):
         self.assertEqual("publication_source_dirty", result["reason"])
 
     def test_agent_surfaces_bind_the_same_manifest_sha(self) -> None:
+        repo = self.home / "repos" / "demo"
+        repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@example.invalid"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Grabowski Test"],
+            cwd=repo,
+            check=True,
+        )
+        (repo / "README.md").write_text("demo\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-qm", "fixture"],
+            cwd=repo,
+            check=True,
+        )
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            text=True,
+        ).strip()
         manifest, stem = self.write_canonical(
             run_dir="20260718T120000Z-bind",
             created_at="2026-07-18T12:00:00Z",
+            commit=head,
         )
         expected_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
         available = {

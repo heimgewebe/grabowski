@@ -77,9 +77,11 @@ make context-refresh
 make context-check
 ```
 
-`grabowski_runtime_health()` beantwortet zuerst nur, ob der MCP-Toolpfad
-ansprechbar ist. Für Audit- und Deploymentintegrität folgt bei Bedarf
-`grabowski_status(view="minimal")`; Vertragsdrift prüft `grabowski_contract_drift()`.
+`grabowski_mcp_liveness()` prüft kostengünstig nur den MCP-Tool-Dispatch
+(`dispatch_healthy`), ohne daraus Integritätsgesundheit abzuleiten.
+`grabowski_runtime_health()` behält den bisherigen `healthy`-Vertrag
+für Deployment-, Audit- und Kill-Switch-Integrität; die explizite Diagnose bietet
+auch `grabowski_status(view="minimal")`. Vertragsdrift prüft `grabowski_contract_drift()`.
 Wenn die Aufgabe den kombinierten Runtime-, Policy- und Checkout-Zustand
 benötigt, liefert `grabowski_context` ihn live:
 

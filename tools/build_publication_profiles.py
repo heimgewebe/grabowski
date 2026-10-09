@@ -15,8 +15,10 @@ OUTPUT = ROOT / "contracts" / "publication-profiles.v1.json"
 CORE_RISK_CLASSES = {"low", "medium"}
 CORE_ALLOWED_EFFECTS = {"remote-read"}
 CORE_TOOLS = {
+    "report_outcome",
     "grabowski_verify_audit",
     "grabowski_runtime_health",
+    "grabowski_mcp_liveness",
     "grabowski_deployment_identity",
     "grabowski_contract_drift",
     "grabowski_checkout_summary",
@@ -40,7 +42,9 @@ CORE_TOOLS = {
     "repoground_context_compose",
 }
 OPERATOR_ORIENTATION_TOOLS = {
+    "report_outcome",
     "grabowski_runtime_health",
+    "grabowski_mcp_liveness",
     "grabowski_audit_projection",
     "grabowski_contract_drift",
     "repoground_bundle_discover",

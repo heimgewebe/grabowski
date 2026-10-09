@@ -21,7 +21,7 @@ watchdog = importlib.util.module_from_spec(spec)
 sys.modules["component_watchdog_test"] = watchdog
 spec.loader.exec_module(watchdog)
 
-HEALTH_PAYLOAD = {"healthy": True, "audit_valid": True}
+HEALTH_PAYLOAD = {"schema_version": 1, "health_scope": "mcp_tool_dispatch", "dispatch_healthy": True, "integrity_evaluated": False}
 BOOT_ID = "11111111-2222-3333-8444-555555555555"
 
 
@@ -113,15 +113,21 @@ class McpLifecycleProbeTests(unittest.TestCase):
             )
 
     def test_versioned_dispatch_liveness_needs_no_integrity_verdict(self) -> None:
-        self.assertIsNone(self.probe(tool_payload={
-            "schema_version": 2,
-            "health_scope": "mcp_tool_dispatch",
-            "healthy": True,
-            "integrity_evaluated": False,
-            "audit_valid": None,
-            "audit_writable": None,
-            "deployment_integrity_valid": None,
-        }))
+        self.assertEqual(watchdog.MCP_HEALTH_TOOL, "grabowski_mcp_liveness")
+        self.assertIsNone(self.probe(tool_payload=HEALTH_PAYLOAD))
+        for invalid in (
+            {"healthy": True},
+            {**HEALTH_PAYLOAD, "healthy": True},
+            {**HEALTH_PAYLOAD, "schema_version": 2},
+            {**HEALTH_PAYLOAD, "schema_version": True},
+            {**HEALTH_PAYLOAD, "health_scope": "runtime_integrity"},
+            {**HEALTH_PAYLOAD, "dispatch_healthy": "true"},
+            {**HEALTH_PAYLOAD, "integrity_evaluated": True},
+            {**HEALTH_PAYLOAD, "audit_valid": True},
+            {key: value for key, value in HEALTH_PAYLOAD.items() if key != "dispatch_healthy"},
+        ):
+            with self.subTest(payload=invalid):
+                self.assertEqual("mcp-tool-shape-invalid", self.probe(tool_payload=invalid))
 
     def test_unrelated_jsonrpc_message_is_ignored(self) -> None:
         self.assertIsNone(self.probe(unrelated_before_initialize=True))
@@ -150,7 +156,7 @@ class McpLifecycleProbeTests(unittest.TestCase):
     def test_runtime_unhealthy_is_not_a_green_probe(self) -> None:
         self.assertEqual(
             "mcp-runtime-unhealthy",
-            self.probe(tool_payload={"healthy": False}),
+            self.probe(tool_payload={**HEALTH_PAYLOAD, "dispatch_healthy": False}),
         )
 
     def test_text_content_fallback_without_structured_content(self) -> None:

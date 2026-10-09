@@ -256,32 +256,39 @@ def _recreate_bureau_control_checkout(repository_root: Path) -> dict[str, Any]:
     if not _control_checkout_missing():
         raise BureauLeaseContractError("control-checkout-already-present")
     _prepare_bureau_worktree_root()
-    if _control_worktree_registered(repository_root):
+
+    # Import lazily because this lease helper participates in operator startup.
+    # Registry reads and mutations share the canonical global checkout lock with
+    # continuation authorization.
+    import grabowski_checkouts as checkout_store
+
+    with checkout_store._operation_lock():
+        if _control_worktree_registered(repository_root):
+            _run_control_git(
+                repository_root,
+                [
+                    "worktree",
+                    "remove",
+                    "--force",
+                    "--force",
+                    str(BUREAU_CONTROL_ROOT),
+                ],
+                timeout_seconds=60,
+            )
         _run_control_git(
             repository_root,
             [
                 "worktree",
-                "remove",
+                "add",
                 "--force",
                 "--force",
+                "-B",
+                BUREAU_CONTROL_BRANCH,
                 str(BUREAU_CONTROL_ROOT),
+                BUREAU_CONTROL_UPSTREAM,
             ],
-            timeout_seconds=60,
+            timeout_seconds=120,
         )
-    _run_control_git(
-        repository_root,
-        [
-            "worktree",
-            "add",
-            "--force",
-            "--force",
-            "-B",
-            BUREAU_CONTROL_BRANCH,
-            str(BUREAU_CONTROL_ROOT),
-            BUREAU_CONTROL_UPSTREAM,
-        ],
-        timeout_seconds=120,
-    )
     _run_control_git(
         BUREAU_CONTROL_ROOT,
         [

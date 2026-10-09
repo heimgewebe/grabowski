@@ -31,8 +31,19 @@ The rendered contract requires the agent to:
 
 1. treat live runtime state and concrete receipts as higher-authority than prose;
 2. use the narrowest typed read tool that can answer the question before broader
-   surfaces, without adding a connectivity-only health ping when that required
-   read can serve as the probe;
+   surfaces. For repository-crossing stable truth ownership, system roles,
+   responsibility boundaries, canonical entrypoints or stable relations, call
+   `grabowski_systemkatalog_query` with `operation=system` for a known system,
+   `operation=repository` for a known repository, `operation=truth-owner` for a known
+   authority-domain key, and `operation=relations` or `operation=entrypoints` for
+   those query classes. Use `operation=authority-matrix` only when no targeted
+   identifier applies and a broader authority map is required. Use RepoGround for
+   local repository, implementation or free-text content. Current runtime, PR and
+   CI truth remains with its owning live source. When a Systemkatalog result changes
+   or confirms a decision, record a hash-bound usage receipt through
+   `tools/systemkatalog_usage_receipt.py` using only its fixed metadata categories
+   and no conversation text or free prose. Do not add a connectivity-only health
+   ping when the required typed read can serve as the probe;
 3. reuse existing capability infrastructure before building a parallel path: prefer
    a native typed Grabowski capability first. For a host-local capability with no
    native surface, use `grabowski_host_capability_resolve`; only an explicit host
@@ -63,8 +74,8 @@ The rendered contract requires the agent to:
 9. use the normal mutating MCP call path and the server-owned transport-roundtrip
    continuation when a fresh challenge is returned; ambiguous mutation outcomes
    still require target readback before any retry;
-10. prefer typed operations to generic terminal, Git or GitHub calls when both can
-    express the effect;
+10. put typed operations first; use `grabowski_read_text` for ranges, not
+    `terminal_run`/`sed`; keep generic Git/GitHub calls last;
 11. use the platform GitHub connector as the normal control plane for PR reads and
     narrowly typed PR mutations. Local `gh` is a recovery fallback only after
     observed connector unavailability or authorization failure. A local `gh`
@@ -74,7 +85,10 @@ The rendered contract requires the agent to:
 12. at material choices, keep the user outcome above the current strategy. Use
     the minimum sufficient mechanism; persistent complexity requires proof of benefit.
     Compare a simpler path against fresh evidence, then explicitly choose `CONTINUE`,
-    `CHANGE` or `PARK/STOP`; a tool failure alone is not strategic evidence;
+    `CHANGE` or `PARK/STOP`; a tool failure alone is not strategic evidence. After
+    successful worktree ensure, a managed dirty checkout may continue only from exact
+    lane, lifecycle and checkout evidence with a fresh Git preimage; never reset, clean
+    or stash merely to make ensure pass;
 13. for nontrivial operator work, use the durable operator-obligation lifecycle to
     resume matching unfinished work and end only with completed, explicitly blocked
     or durably delegated evidence, or with an evidence-bound direct v2
@@ -84,7 +98,10 @@ The rendered contract requires the agent to:
     convergence when the convergence plan requires it; ordinary work completion is
     not itself a systemic-convergence claim;
 15. treat the instructions as non-authoritative: they grant no action, merge,
-    deploy, secret or retry authority.
+    deploy, secret or retry authority. For Flowlines observability, include non-empty
+    `reason` and stable `user_intent` on every ordinary tool call and invoke
+    `report_outcome` exactly once as the final tool call before every final answer,
+    including read-only, partial, failed or blocked work.
 
 The executable rules in `AGENT_INSTRUCTION_RULES` are the source of truth if
 this explanatory list drifts. Native Grabowski surfaces remain first-class
@@ -110,6 +127,12 @@ actually followed the rule. An open obligation reports `response_may_end=false`;
 completed and blocked evidence is SHA-256-bound, while the close grip itself
 live-observes and binds a durable task, workspace or job before delegation. See
 `docs/operator-obligation-contract-v1.md`.
+
+The Flowlines clause is a client-behavior contract, not export authority. Runtime
+export remains separately opt-in. During schema migration the published tool schemas
+may already advertise `reason` and `user_intent` while export is disabled and legacy
+calls remain executable; hard enforcement starts only when the Flowlines exporter is
+actually enabled.
 
 ## Rendering invariants
 

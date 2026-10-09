@@ -9,7 +9,8 @@
     "grabowski_deployment_identity",
     "grabowski_contract_drift",
     "grabowski_systemkatalog_query",
-    "grabowski_audit_projection"
+    "grabowski_audit_projection",
+    "report_outcome"
   ],
   "gateway_tools": [
     "maulwurfx_propose_finding"

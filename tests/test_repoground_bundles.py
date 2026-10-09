@@ -368,7 +368,8 @@ class RepoGroundBundleToolTests(unittest.TestCase):
                 )
 
     def test_owner_slash_repo_identity_matches_canonical_aliases(self) -> None:
-        manifest = self._write_canonical_bundle("demo")
+        _repo, head = self._git_repo("heimgewebe/demo")
+        manifest = self._write_canonical_bundle("demo", commit=head)
 
         short = mcp.repoground_bundle_discover(repo="demo")
         underscored = mcp.repoground_bundle_discover(repo="heimgewebe__demo")
@@ -380,14 +381,17 @@ class RepoGroundBundleToolTests(unittest.TestCase):
             self.assertEqual(result["candidates"][0]["repo_id"], "heimgewebe__demo")
 
         stem = slashed["candidates"][0]["stem"]
-        with patch.object(
-            mcp,
-            "_repoground_agent_preflight",
-            return_value={"available": True, "status": "pass"},
-        ):
-            preflight = mcp.repoground_preflight("heimgewebe/demo", stem=stem)
-        self.assertTrue(preflight["available"])
-        self.assertEqual(preflight["stem"], stem)
+        freshness, selected_stem, selected_path, error = (
+            mcp._repoground_selected_manifest_for_repo(
+                "heimgewebe/demo",
+                stem,
+                expected_commits=head,
+            )
+        )
+        self.assertIsNone(error)
+        self.assertEqual(selected_stem, stem)
+        self.assertEqual(selected_path, manifest)
+        self.assertEqual(freshness["bundle"]["git_commit"], head)
 
     def test_canonical_publication_precedes_legacy_for_all_consumers(self) -> None:
         _repo, head = self._git_repo("demo-repo")
@@ -1322,7 +1326,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         ):
             self.assertIn(withheld, determinism["does_not_establish"])
 
-    def test_context_pack_content_hash_tracks_nonvolatile_semantic_drift(self) -> None:
+    def test_context_pack_refuses_nonvolatile_semantic_drift(self) -> None:
         repo, head = self._git_repo("demo-repo")
         self._write_bundle("demo-repo-max-260701-1200", commit=head)
         preflight = {"status": "pass", "answer_compliance_template": {}}
@@ -1340,16 +1344,14 @@ class RepoGroundBundleToolTests(unittest.TestCase):
             )
             after = mcp.repoground_context_pack("demo-repo", "basic_repo_question")
 
+        self.assertTrue(before["available"])
         self.assertEqual(before["context_ref"]["freshness_status"], "fresh")
-        self.assertEqual(after["context_ref"]["freshness_status"], "stale")
-        self.assertNotEqual(
-            before["determinism"]["content_sha256"],
-            after["determinism"]["content_sha256"],
-        )
-        for pack in (before, after):
-            self.assertEqual(
-                pack["determinism"]["content_sha256"], _recomputed_content_sha256(pack)
-            )
+        self.assertFalse(after["available"])
+        self.assertEqual(after["reason"], "stale_context_refused")
+        self.assertEqual(after["freshness"]["freshness_status"], "stale")
+        self.assertEqual(after["bounded_evidence"]["snippets"], [])
+        self.assertEqual(after["bounded_evidence"]["ranges"], [])
+        self.assertNotIn("context_ref", after)
 
     def test_context_pack_rejects_cross_repo_stem(self) -> None:
         _repo, head = self._git_repo("demo-repo")
@@ -1637,6 +1639,14 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         )
 
         with (
+            patch.dict(
+                mcp.os.environ,
+                {
+                    "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
+                    "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "x-flowlines-api-key=trace-secret",
+                },
+                clear=False,
+            ),
             patch.object(mcp, "_repoground_repo", return_value=(repo, None)),
             patch.object(mcp.subprocess, "run", return_value=completed) as run,
         ):
@@ -1650,9 +1660,51 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(command[:3], ["python3", "-B", "-c"])
         self.assertEqual(run.call_args.kwargs["cwd"], repo)
         self.assertEqual(run.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertNotIn(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            run.call_args.kwargs["env"],
+        )
+        self.assertNotIn(
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+            run.call_args.kwargs["env"],
+        )
         self.assertIn("from merger.repoground.core", command[3])
         self.assertNotIn("merger.lenskit", command[3])
         self.assertTrue(result["available"])
+
+    def test_repoground_git_does_not_inherit_flowlines_exporter_header(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="ok\n",
+            stderr="",
+        )
+        with (
+            patch.dict(
+                mcp.os.environ,
+                {
+                    "OTEL_EXPORTER_OTLP_HEADERS": "x-flowlines-api-key=fixture-secret",
+                    "OTEL_EXPORTER_OTLP_TRACES_HEADERS": "x-flowlines-api-key=trace-secret",
+                },
+                clear=False,
+            ),
+            patch.object(mcp.subprocess, "run", return_value=completed) as run,
+        ):
+            returncode, stdout, stderr = mcp._repoground_git(
+                Path("/tmp/repository"),
+                ["status"],
+            )
+        self.assertEqual(returncode, 0)
+        self.assertEqual(stdout, "ok")
+        self.assertEqual(stderr, "")
+        self.assertNotIn(
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            run.call_args.kwargs["env"],
+        )
+        self.assertNotIn(
+            "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+            run.call_args.kwargs["env"],
+        )
 
     def test_core_manifest_binding_holds_snapshot_across_aba_rewrite(self) -> None:
         repoground_repo = self.home / "repos" / "repoground"
@@ -1839,6 +1891,15 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
                     "created_at": "2026-07-01T00:00:00Z",
                     "generator": {
                         "runtime": {"git_commit": commit, "git_dirty": False}
+                    },
+                    "snapshotProvenance": {
+                        "repositories": [
+                            {
+                                "repo": stem.rsplit("-max-", 1)[0],
+                                "git_commit": commit,
+                                "git_dirty": False,
+                            }
+                        ]
                     },
                     "artifacts": [
                         {"role": "canonical_md"},
@@ -2844,6 +2905,15 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
                     "run_id": f"{stem}-run",
                     "created_at": "2026-07-01T00:00:00Z",
                     "generator": {"runtime": {"git_commit": head, "git_dirty": False}},
+                    "snapshotProvenance": {
+                        "repositories": [
+                            {
+                                "repo": name,
+                                "git_commit": head,
+                                "git_dirty": False,
+                            }
+                        ]
+                    },
                     "artifacts": [
                         {"role": "canonical_md"},
                         {"role": "sqlite_index"},
@@ -3311,6 +3381,7 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
                 "manifest_path": str(manifest_a),
                 "manifest_sha256": sha_a,
                 "git_commit": target,
+                "git_dirty": False,
             },
             "live_repo": {"head": target},
         }
@@ -3423,9 +3494,9 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         original_select = mcp._repoground_selected_manifest_for_repo
         calls = {"count": 0}
 
-        def select(repo, stem):
+        def select(repo, stem, **kwargs):
             calls["count"] += 1
-            result = original_select(repo, stem)
+            result = original_select(repo, stem, **kwargs)
             if calls["count"] == 1:
                 document = json.loads(manifest.read_text(encoding="utf-8"))
                 document["changed_after_pin"] = True
@@ -3462,9 +3533,9 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         original_select = mcp._repoground_selected_manifest_for_repo
         calls = {"count": 0}
 
-        def select(repo, stem):
+        def select(repo, stem, **kwargs):
             calls["count"] += 1
-            result = original_select(repo, stem)
+            result = original_select(repo, stem, **kwargs)
             if calls["count"] == 1:
                 document = json.loads(manifest.read_text(encoding="utf-8"))
                 document["changed_after_pin"] = True
@@ -4187,23 +4258,29 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertEqual(result["retrieval_lanes"]["used"], ["direct_changes"])
         self.assertIn("diff_locality", result["retrieval_lanes"]["skipped"])
 
-    def test_context_compose_keeps_dirty_overlay_separate_from_revision_diff(self) -> None:
+    def test_context_compose_refuses_dirty_unbound_worktree(self) -> None:
         base, target = self._composer_fixture()
         repo = self.home / "repos" / "demo-repo"
         (repo / "src" / "app.py").write_text("dirty overlay\n", encoding="utf-8")
         with (
-            patch.object(mcp, "repoground_context_pack", return_value=self._composer_context_pack()),
-            patch.object(mcp, "_repoground_agent_impact_context", return_value=self._composer_impact()),
+            patch.object(mcp, "repoground_context_pack") as context_pack,
+            patch.object(mcp, "_repoground_agent_impact_context") as impact,
         ):
             result = mcp.repoground_context_compose(
                 "demo-repo", base, target, context_budget_bytes=1200
             )
 
+        self.assertFalse(result["available"])
+        self.assertEqual(result["reason"], "dirty_worktree_unbound")
         self.assertTrue(result["dirty_overlay"]["dirty"])
         self.assertFalse(result["dirty_overlay"]["included_in_revision_diff"])
         self.assertEqual(result["change_identity"]["changed_path_count"], 2)
         paths = [item["path"] for item in result["context"]["direct_changes"]]
         self.assertEqual(paths, ["src/app.py", "tests/test_app.py"])
+        self.assertEqual(result["fallback"]["mode"], "live_fallback")
+        self.assertTrue(result["fallback"]["live_fallback_required"])
+        context_pack.assert_not_called()
+        impact.assert_not_called()
 
 
 class RepoGroundAgentHandoffTests(unittest.TestCase):

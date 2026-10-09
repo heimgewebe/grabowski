@@ -21,6 +21,7 @@ class MaulwurfXPolicyTests(unittest.TestCase):
                 "grabowski_contract_drift",
                 "grabowski_systemkatalog_query",
                 "grabowski_audit_projection",
+                "report_outcome",
             },
         )
         self.assertEqual(policy["gateway_tools"], ["maulwurfx_propose_finding"])
