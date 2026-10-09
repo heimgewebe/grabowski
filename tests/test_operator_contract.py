@@ -3218,10 +3218,30 @@ class OperatorContractTests(unittest.TestCase):
                 operator, "JOBS_DIR", jobs
             ), patch.object(operator.decision_reviews, "LOCKS_ROOT", locks), patch.object(
                 operator.uuid, "uuid4", side_effect=next_uuid
-            ), patch.object(operator, "_run", return_value=launched):
+            ), patch.object(operator, "_run", return_value=launched) as launch_mock:
                 first = operator.grabowski_job_start(
                     argv, cwd=str(cwd), runtime_seconds=60, decision_review_binding=binding
                 )
+                with self.assertRaisesRegex(RuntimeError, "already in flight"):
+                    operator.grabowski_job_start(
+                        argv, cwd=str(cwd), runtime_seconds=60, decision_review_binding=binding
+                    )
+                self.assertEqual(launch_mock.call_count, 1)
+                self.assertEqual(len(list(jobs.glob("grabowski-job-*"))), 1)
+
+                # A verified terminal prior attempt is retained, not hidden,
+                # and permits a later review with its own create-only path.
+                receipt = {
+                    **first["finalization_contract"],
+                    "final_status": "succeeded",
+                    "completion_status": "complete",
+                    "failure_type": None,
+                    "timestamp_unix": 1_787_000_100,
+                }
+                receipt["payload_sha256"] = operator.decision_reviews.sha256_json(receipt)
+                final_path = jobs / first["unit"] / "finalization.json"
+                final_path.write_text(json.dumps(receipt), encoding="utf-8")
+                os.chmod(final_path, 0o600)
                 second = operator.grabowski_job_start(
                     argv, cwd=str(cwd), runtime_seconds=60, decision_review_binding=binding
                 )
@@ -6227,6 +6247,24 @@ class DurableJobFinalizationReceiptTests(unittest.TestCase):
                                 del prior_metadata["origin"]["scope"]["started_at_unix_ns"]
                                 prior_metadata["origin_sha256"] = operator._json_sha256(prior_metadata["origin"])
                                 prior_path.write_text(json.dumps(prior_metadata), encoding="utf-8")
+                            # The previous attempt is terminal before another
+                            # same-slot launch. Its immutable causal order entry
+                            # still advances the successor's logical frontier.
+                            prior_finalization = {
+                                **prior["finalization_contract"],
+                                "final_status": "succeeded",
+                                "completion_status": "complete",
+                                "failure_type": None,
+                                "timestamp_unix": frontier_second + 1,
+                            }
+                            prior_finalization["payload_sha256"] = operator._json_sha256(
+                                prior_finalization
+                            )
+                            prior_receipt = Path(prior["expected_receipt"]["finalization_path"])
+                            prior_receipt.write_text(
+                                json.dumps(prior_finalization), encoding="utf-8"
+                            )
+                            os.chmod(prior_receipt, 0o600)
                             with patch.object(
                                 operator.uuid, "uuid4",
                                 return_value=types.SimpleNamespace(hex="a11ce0000001" + "f" * 20),

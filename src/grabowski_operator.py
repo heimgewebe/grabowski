@@ -8476,6 +8476,14 @@ def grabowski_job_start(
             notify_on_done=notify_on_done,
         )
     with decision_reviews.decision_review_lock(normalized_binding):
+        active_units = decision_reviews.in_flight_review_units(
+            normalized_binding, jobs_root=_jobs_root()
+        )
+        if active_units:
+            raise RuntimeError(
+                "decision review already in flight for this PR/head/slot: "
+                + ", ".join(active_units)
+            )
         result = _start_job(
             argv,
             cwd=str(working_directory),

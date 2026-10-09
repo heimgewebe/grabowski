@@ -2021,5 +2021,94 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(reconciled["slots"][0]["independent_pass_count"], 1)
 
 
+    def test_in_flight_slot_guard_ignores_other_slots_and_terminal_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            pending = make_job(
+                jobs, suffix="a11111111111", slot="independent-reviewer",
+                terminal_status=None, review_result=None,
+                review_role=True, attempt_bound=True,
+            )
+            make_job(
+                jobs, suffix="b22222222222", slot="independent-claude-review",
+                terminal_status=None, review_result=None,
+                review_role=True, attempt_bound=True,
+            )
+            make_job(
+                jobs, suffix="c33333333333", slot="independent-reviewer",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True,
+            )
+            units = reviews.in_flight_review_units(
+                binding("independent-reviewer"), jobs_root=jobs
+            )
+            self.assertEqual(units, [pending.name])
+            other = reviews.in_flight_review_units(
+                binding("independent-claude-review"), jobs_root=jobs
+            )
+            self.assertEqual(other, ["grabowski-job-b22222222222"])
+
+    def test_in_flight_slot_guard_blocks_ambiguous_finalization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            pending = make_job(
+                jobs, suffix="d44444444444", slot="independent-reviewer",
+                terminal_status=None, review_result=None,
+                review_role=True, attempt_bound=True,
+            )
+            write_private(pending / "finalization.json", '{"final_status":"succeeded"}')
+            with self.assertRaisesRegex(ValueError, "unverified finalization"):
+                reviews.in_flight_review_units(
+                    binding("independent-reviewer"), jobs_root=jobs
+                )
+
+    def test_in_flight_slot_guard_allows_proven_never_started(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            pending = make_job(
+                jobs, suffix="e55555555555", slot="independent-reviewer",
+                terminal_status=None, review_result=None,
+            )
+            metadata_path = pending / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata.update({
+                "final_status": "launch_failed",
+                "dispatch_outcome": "not_started",
+                "terminalization_evidence": {
+                    "source": "systemd-run-launch",
+                    "query_valid": True,
+                    "final_status": "launch_failed",
+                    "systemd_visible": False,
+                },
+                "launcher_evidence": {"returncode": 1},
+            })
+            write_private(metadata_path, json.dumps(metadata))
+            self.assertEqual(
+                reviews.in_flight_review_units(
+                    binding("independent-reviewer"), jobs_root=jobs
+                ),
+                [],
+            )
+
+    def test_in_flight_slot_guard_fails_closed_at_inventory_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            for suffix in ("a11111111111", "b22222222222"):
+                make_job(
+                    jobs, suffix=suffix, slot="independent-reviewer",
+                    terminal_status="succeeded", review_result=None,
+                    review_role=True, attempt_bound=True,
+                )
+            with mock.patch.object(reviews, "MAX_JOB_DIRECTORIES", 1):
+                with self.assertRaisesRegex(ValueError, "inventory exceeds bound"):
+                    reviews.in_flight_review_units(
+                        binding("independent-reviewer"), jobs_root=jobs
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()
