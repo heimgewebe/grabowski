@@ -9013,6 +9013,36 @@ class TaskTests(unittest.TestCase):
                     finally:
                         self.database = previous
 
+    def test_task_list_denied_mutation_cannot_recover_or_open_store(self) -> None:
+        with (
+            patch.object(
+                tasks.operator,
+                "_require_operator_mutation",
+                side_effect=PermissionError("test mutation denied"),
+            ) as gate,
+            patch.object(tasks, "_recover_pending_task_terminalizations") as recover,
+            patch.object(tasks, "_database") as database,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test mutation denied"):
+                tasks.grabowski_task_list(state="active")
+        gate.assert_called_once_with("durable_job")
+        recover.assert_not_called()
+        database.assert_not_called()
+
+    def test_task_status_mcp_denies_before_task_lock_and_lease_work(self) -> None:
+        with (
+            patch.object(
+                tasks.operator,
+                "_require_operator_mutation",
+                side_effect=PermissionError("test mutation denied"),
+            ) as gate,
+            patch.object(tasks, "grabowski_task_status") as status,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test mutation denied"):
+                asyncio.run(tasks._grabowski_task_status_tool("0" * 24))
+        gate.assert_called_once_with("durable_job", task_id="0" * 24)
+        status.assert_not_called()
+
     def test_task_schema_only_inventory_reports_migration_without_mutation(self) -> None:
         self._create_task_schema_version("2")
         before = self.database.read_bytes()

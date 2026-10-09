@@ -12236,6 +12236,9 @@ def grabowski_task_list(
                 "schema_only cannot be combined with task-list filters or projections"
             )
         return _task_schema_inventory()
+    # Task-list may recover pending terminalizations and migrate task storage.
+    # Authorize before any database open, cursor update or recovery effect.
+    operator._require_operator_mutation("durable_job")
     if view == "managed_cargo_evidence":
         if state is not None or cursor is not None or fields is not None:
             raise ValueError(
@@ -12592,10 +12595,10 @@ async def _grabowski_task_start_tool(
     )
 
 
-@mcp.tool(name="grabowski_task_status", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_task_status", annotations=MUTATING)
 async def _grabowski_task_status_tool(task_id: str) -> dict[str, Any]:
-    """Observe one persistent task and refresh its recorded state."""
-    operator._require_operator_capability("durable_job")
+    """Observe and persist one task state; lease maintenance may mutate resources."""
+    operator._require_operator_mutation("durable_job", task_id=task_id)
     return await asyncio.to_thread(grabowski_task_status, task_id)
 
 
@@ -12643,7 +12646,7 @@ async def _grabowski_task_resume_tool(task_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(grabowski_task_resume, task_id)
 
 
-@mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_task_list", annotations=MUTATING)
 async def _grabowski_task_list_tool(
     limit: int = DEFAULT_TASK_LIST_LIMIT,
     state: str | None = None,

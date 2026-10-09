@@ -8463,7 +8463,7 @@ def grabowski_resource_inspect(resource_key: str) -> dict[str, Any]:
     return {"resource_key": normalize_resource_key(resource_key), "lease": lease}
 
 
-@mcp.tool(name="grabowski_resource_list", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_resource_list", annotations=MUTATING)
 def grabowski_resource_list(
     owner_id: str | None = None,
     include_expired: bool = False,
@@ -8484,6 +8484,8 @@ def grabowski_resource_list(
                 "schema_only cannot be combined with resource-list filters"
             )
         return _resource_schema_inventory()
+    # Ordinary listings can initialize or migrate the resource store.
+    operator._require_operator_mutation("resource_lease")
     leases = list_resources(
         owner_id=owner_id,
         include_expired=include_expired,

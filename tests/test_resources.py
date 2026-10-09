@@ -3728,6 +3728,21 @@ class ResourceTests(unittest.TestCase):
         )
         self.assertEqual([], self._resource_migration_backups())
 
+    def test_resource_list_denied_mutation_cannot_open_or_migrate_store(self) -> None:
+        with (
+            patch.object(
+                resources.operator,
+                "_require_operator_mutation",
+                side_effect=PermissionError("test mutation denied"),
+            ) as gate,
+            patch.object(resources, "list_resources") as listing,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test mutation denied"):
+                resources.grabowski_resource_list()
+        gate.assert_called_once_with("resource_lease")
+        listing.assert_not_called()
+        self.assertFalse(self.database.exists())
+
     def test_resource_schema_only_inventory_reports_migration_without_mutation(self) -> None:
         self._create_resource_schema_v1()
         before = self.database.read_bytes()

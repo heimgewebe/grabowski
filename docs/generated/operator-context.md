@@ -152,11 +152,11 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_privileged_broker_status` | privileged-reference | yes | low | Inspect the root-owned privileged broker installation without executing it. |
 | `grabowski_task_start` | task | no | variable | Start a persistent local or fleet task, or return a pre-dispatch typed-read reroute before persistence. |
 | `grabowski_task_routing_shadow_seal` | task | no | medium | Seal one terminal direct-task routing-shadow case with explicit semantic outcome or abstention and evidence-bound execution provenance. |
-| `grabowski_task_status` | task | yes | low | Observe one persistent task and refresh its recorded state. |
+| `grabowski_task_status` | task | no | low | Observe one persistent task and refresh its recorded state. |
 | `grabowski_task_logs` | task | yes | low | Read redacted journal output for one local or fleet task. |
 | `grabowski_task_cancel` | task | no | medium | Stop one task process group while retaining its persistent record. |
 | `grabowski_task_resume` | task | no | variable | Recreate a missing or stopped task unit from its persistent record. |
-| `grabowski_task_list` | task | yes | low | List recent persistent task records with optional state filtering. |
+| `grabowski_task_list` | task | no | low | List recent persistent task records with optional state filtering. |
 | `grabowski_chronik_outbox_import` | coding-memory | no | medium | Import one redacted Grabowski outbox JSONL into optional local Chronik. |
 | `grabowski_chronik_history` | coding-memory | yes | low | Read bounded historical coding events without asserting current truth. |
 | `grabowski_operator_historical_recall` | operator-recall | yes | low | Read evidence-bound operator recall derived from validated Chronik history. |
@@ -203,7 +203,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_resource_renew` | resource | no | medium | Renew live resource leases owned by one owner. |
 | `grabowski_resource_release` | resource | no | high | Release owner-bound resource leases with an explicit force override. |
 | `grabowski_resource_inspect` | resource | yes | low | Inspect one typed resource lease without returning private metadata. |
-| `grabowski_resource_list` | resource | yes | low | List bounded typed resource leases with optional owner filtering. |
+| `grabowski_resource_list` | resource | no | low | List bounded typed resource leases with optional owner filtering. |
 | `grabowski_artifact_stat` | artifact | yes | low | Read regular-file size and SHA-256 on one registered fleet host. |
 | `grabowski_artifact_push` | artifact | no | high | Push one hash-bound regular file to a registered SSH fleet host. |
 | `grabowski_artifact_pull` | artifact | no | high | Pull one hash-bound regular file from a registered SSH fleet host. |

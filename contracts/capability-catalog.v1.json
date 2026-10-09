@@ -1441,13 +1441,13 @@
     },
     {
       "category": "task",
-      "description": "Observe one persistent task and refresh its recorded state.",
+      "description": "Observe and persist one task state; lease maintenance may mutate resources.",
       "effects": [
         "state-refresh"
       ],
       "id": "grabowski_task_status",
       "purpose": "Observe one persistent task and refresh its recorded state.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_status"
@@ -1498,7 +1498,7 @@
       "effects": [],
       "id": "grabowski_task_list",
       "purpose": "List recent persistent task records with optional state filtering.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_list"
@@ -2092,7 +2092,7 @@
       "effects": [],
       "id": "grabowski_resource_list",
       "purpose": "List bounded typed resource leases with optional owner filtering.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_resource_list"
