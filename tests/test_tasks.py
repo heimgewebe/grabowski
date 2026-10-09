@@ -2776,7 +2776,7 @@ class TaskTests(unittest.TestCase):
         ) as admission, patch.object(tasks, "_launch") as launch, patch.object(
             tasks.base, "_append_audit"
         ):
-            with self.assertRaisesRegex(RuntimeError, "persisted agent read-only mode"):
+            with self.assertRaisesRegex(RuntimeError, "persisted agent effect profile"):
                 tasks.grabowski_task_resume(task_id)
         admission.assert_not_called()
         launch.assert_not_called()
@@ -2831,6 +2831,270 @@ class TaskTests(unittest.TestCase):
         launch.assert_not_called()
         renew.assert_not_called()
         self.assertEqual(tasks._row_raw(task_id)["attempt"], 1)
+
+
+    def test_coding_agent_resume_retains_effect_classification_across_retries(self) -> None:
+        argv = ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"]
+        admitted = {
+            "schema_version": 1, "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True, "admitted": True, "reason_code": "admitted",
+            "argv_sha256": "1" * 64, "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission", return_value=admitted
+        ), patch.object(tasks.base, "_append_audit"):
+            started = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60,
+                resume_policy="verify-then-retry",
+            )
+        task_id = str(started["task"]["task_id"])
+        initial = tasks._record_task_effect_classification(tasks._row_raw(task_id))
+        self.assertEqual(initial["effect_profile"], "workspace_write")
+        failed = {
+            "state": "failed", "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1), "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with patch.object(tasks, "_observe", return_value=failed), patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 148}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=admitted,
+        ) as admission, patch.object(
+            tasks, "_launch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"):
+            for expected_attempt in (2, 3):
+                resumed = tasks.grabowski_task_resume(task_id)
+                self.assertEqual(resumed["task"]["attempt"], expected_attempt)
+                self.assertEqual(
+                    tasks._record_task_effect_classification(tasks._row_raw(task_id)),
+                    initial,
+                )
+        self.assertEqual(admission.call_count, 2)
+
+    def test_coding_agent_resume_rejects_spoofed_effect_profiles(self) -> None:
+        argv = ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"]
+        admitted = {
+            "schema_version": 1, "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True, "admitted": True, "reason_code": "admitted",
+            "argv_sha256": "1" * 64, "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=admitted,
+        ), patch.object(tasks.base, "_append_audit"):
+            started = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60,
+                resume_policy="verify-then-retry",
+            )
+        task_id = str(started["task"]["task_id"])
+        row = tasks._row_raw(task_id)
+        initial_launcher = json.loads(str(row["launcher_json"]))
+        failed = {
+            "state": "failed", "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1), "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        for profile in ("unknown", "remote_write", "read_only", None):
+            with self.subTest(effect_profile=profile):
+                launcher = json.loads(json.dumps(initial_launcher))
+                if profile is None:
+                    launcher["task_effect_classification"].pop("effect_profile")
+                else:
+                    launcher["task_effect_classification"]["effect_profile"] = profile
+                with tasks._database_connection() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                        (tasks._canonical_json(launcher), task_id),
+                    )
+                with patch.object(tasks, "_observe", return_value=failed), patch.object(
+                    tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+                ), patch.object(
+                    tasks, "_require_recovery_gate", return_value={"checked_at_unix": 148}
+                ), patch.object(
+                    coding_agent_router, "coding_agent_pre_dispatch_admission",
+                    return_value=admitted,
+                ) as admission, patch.object(
+                    tasks, "_launch", return_value=_launcher()
+                ) as launch, patch.object(tasks.base, "_append_audit"):
+                    with self.assertRaisesRegex(RuntimeError, "effect profile"):
+                        tasks.grabowski_task_resume(task_id)
+                admission.assert_not_called()
+                launch.assert_not_called()
+                self.assertEqual(tasks._row_raw(task_id)["attempt"], 1)
+
+    def test_coding_agent_resume_rejects_renamed_binary(self) -> None:
+        argv = ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"]
+        admitted = {
+            "schema_version": 1, "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True, "admitted": True, "reason_code": "admitted",
+            "argv_sha256": "1" * 64, "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=admitted,
+        ), patch.object(tasks.base, "_append_audit"):
+            started = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60,
+                resume_policy="verify-then-retry",
+            )
+        task_id = str(started["task"]["task_id"])
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET argv_json=? WHERE task_id=?",
+                (tasks._canonical_json(["/bin/bash", "-c", "true"]), task_id),
+            )
+        failed = {
+            "state": "failed", "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1), "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with patch.object(tasks, "_observe", return_value=failed), patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 148}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=admitted,
+        ) as admission, patch.object(
+            tasks, "_launch", return_value=_launcher()
+        ) as launch, patch.object(tasks.base, "_append_audit"):
+            with self.assertRaisesRegex(RuntimeError, "agent identity"):
+                tasks.grabowski_task_resume(task_id)
+        admission.assert_not_called()
+        launch.assert_not_called()
+
+    def test_coding_agent_resume_rejects_missing_or_foreign_live_lease(self) -> None:
+        argv = ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"]
+        admitted = {
+            "schema_version": 1, "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True, "admitted": True, "reason_code": "admitted",
+            "argv_sha256": "1" * 64, "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=admitted,
+        ), patch.object(tasks.base, "_append_audit"):
+            started = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60,
+                resume_policy="verify-then-retry",
+            )
+        task_id = str(started["task"]["task_id"])
+        key = f"repo:{self.root}"
+        owner = str(started["task"]["lease_owner_id"])
+        tasks.resources.release_resources(owner, [key])
+        self.assertEqual(tasks._record_resource_keys(tasks._row_raw(task_id)), [key])
+        failed = {
+            "state": "failed", "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1), "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        for observed in ({}, {key: {"owner_id": "another-owner"}}):
+            with self.subTest(observed=observed):
+                with patch.object(tasks, "_observe", return_value=failed), patch.object(
+                    tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+                ), patch.object(
+                    tasks, "_require_recovery_gate", return_value={"checked_at_unix": 148}
+                ), patch.object(
+                    tasks.resources, "inspect_resources", return_value=observed
+                ), patch.object(
+                    coding_agent_router, "coding_agent_pre_dispatch_admission",
+                    return_value=admitted
+                ) as admission, patch.object(
+                    tasks, "_launch", return_value=_launcher()
+                ) as launch, patch.object(tasks.resources, "renew_resources") as renew, patch.object(
+                    tasks.base, "_append_audit"
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "workspace lease"):
+                        tasks.grabowski_task_resume(task_id)
+                admission.assert_not_called()
+                launch.assert_not_called()
+                renew.assert_not_called()
+                self.assertEqual(tasks._row_raw(task_id)["attempt"], 1)
+
+
+    def test_interrupted_coding_agent_resume_preserves_effect_before_launch(self) -> None:
+        argv = ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"]
+        admitted = {
+            "schema_version": 1, "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True, "admitted": True, "reason_code": "admitted",
+            "argv_sha256": "1" * 64, "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=admitted,
+        ), patch.object(tasks.base, "_append_audit"):
+            started = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60,
+                resume_policy="verify-then-retry",
+            )
+        task_id = str(started["task"]["task_id"])
+        classification = tasks._record_task_effect_classification(tasks._row_raw(task_id))
+        tasks._set_state(
+            task_id, "interrupted", observation={"state": "interrupted"}
+        )
+        failure = {
+            "state": "failed", "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1), "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        pending_classifications = []
+
+        def launch(candidate: dict[str, object]) -> dict[str, object]:
+            current = tasks._row_raw(task_id)
+            self.assertEqual(current["state"], "launching")
+            pending_classifications.append(
+                tasks._record_task_effect_classification(current)
+            )
+            return _launcher()
+
+        with patch.object(tasks, "_observe", return_value=failure), patch.object(
+            tasks, "_validate_interrupted_recovery_context",
+            return_value={"source_task_id": task_id},
+        ), patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 148}
+        ), patch.object(
+            coding_agent_router, "coding_agent_pre_dispatch_admission",
+            return_value=admitted,
+        ), patch.object(tasks, "_launch", side_effect=launch), patch.object(
+            tasks.base, "_append_audit"
+        ):
+            result = tasks.grabowski_task_resume(
+                task_id, _interrupted_recovery_context={"test": "valid"}
+            )
+        self.assertEqual(result["task"]["attempt"], 2)
+        self.assertEqual(pending_classifications, [classification])
+        self.assertEqual(
+            tasks._record_task_effect_classification(tasks._row_raw(task_id)),
+            classification,
+        )
 
     def test_legacy_local_resume_binds_managed_output_from_next_attempt(self) -> None:
         started = self._start()

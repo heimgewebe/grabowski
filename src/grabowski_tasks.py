@@ -9932,28 +9932,54 @@ def grabowski_task_resume(
     coding_agent_pre_dispatch_admission: dict[str, Any] | None = None
     task_effect_classification = _record_task_effect_classification(record)
     command_executable = Path(command[0]).name.lower()
-    # Derive the executing agent identity from actual argv, not editable
-    # persisted launcher metadata. Unknown legacy effects and previously
-    # read-only agent attempts lack a proven workspace lease for safe replay.
-    if command_executable in MUTATING_AGENT_EXECUTABLES:
+    persisted_executable = (
+        task_effect_classification.get("agent_executable")
+        if task_effect_classification is not None else None
+    )
+    # The original command identity is server-bound at task creation. Neither
+    # a replacement executable nor a forged stored agent name can evade it.
+    if command_identity.argv_sha256(command) != str(record["argv_sha256"]):
+        raise RuntimeError("persisted agent identity disagrees with original argv")
+    agent_executable = command_executable
+    agent_known = (
+        command_executable in MUTATING_AGENT_EXECUTABLES
+        or persisted_executable in MUTATING_AGENT_EXECUTABLES
+    )
+    if agent_known:
         if task_effect_classification is None:
             raise RuntimeError("unverified agent effect in legacy resume")
-        if task_effect_classification.get("agent_executable") != command_executable:
-            raise RuntimeError("persisted agent identity mismatches current executable")
-        if task_effect_classification.get("effect_profile") == "read_only":
-            raise RuntimeError("persisted agent read-only mode cannot authorize resume")
-    agent_executable = command_executable
-    if (
-        agent_executable in MUTATING_AGENT_EXECUTABLES
-        and fleet.fleet_host(str(record["host"]))["transport"] == "local"
-    ):
-        workspace = _mutating_agent_workspace(
-            str(record["host"]), command, cwd=str(record["cwd"])
-        )
-        if workspace is None or not _workspace_lease_resource_keys(
-            workspace, _record_resource_keys(record)
+        if (
+            command_executable not in MUTATING_AGENT_EXECUTABLES
+            or persisted_executable != command_executable
         ):
-            raise RuntimeError("persisted agent workspace lease is missing")
+            raise RuntimeError("persisted agent identity mismatches current executable")
+        transport = fleet.fleet_host(str(record["host"]))["transport"]
+        write_profiles = (
+            {"workspace_write", "repository_write"}
+            if transport == "local" else {"remote_write"}
+        )
+        if task_effect_classification.get("effect_profile") not in write_profiles:
+            raise RuntimeError("persisted agent effect profile is not write-capable")
+        if transport == "local":
+            workspace = _mutating_agent_workspace(
+                str(record["host"]), command, cwd=str(record["cwd"])
+            )
+            covering_keys = (
+                _workspace_lease_resource_keys(
+                    workspace, _record_resource_keys(record)
+                )
+                if workspace is not None else []
+            )
+            expected_owner = _lease_owner(task_id)
+            if str(record.get("lease_owner_id")) != expected_owner:
+                raise RuntimeError("persisted agent workspace lease owner mismatch")
+            active_leases = resources.inspect_resources(covering_keys)
+            if not covering_keys or not any(
+                active_leases.get(key, {}).get("owner_id") == expected_owner
+                for key in covering_keys
+            ):
+                raise RuntimeError("persisted agent workspace lease is missing or foreign")
+    if agent_known and transport == "local":
         import grabowski_coding_agent_router as coding_agent_router
 
         candidate_admission = coding_agent_router.coding_agent_pre_dispatch_admission(
@@ -10028,6 +10054,10 @@ def grabowski_task_resume(
             launcher={
                 "pending": True,
                 **(
+                    {"task_effect_classification": dict(task_effect_classification)}
+                    if task_effect_classification is not None else {}
+                ),
+                **(
                     {
                         "coding_agent_pre_dispatch_admission": dict(
                             coding_agent_pre_dispatch_admission
@@ -10082,6 +10112,11 @@ def grabowski_task_resume(
                 "reconciled" if lease_result.get("preserved") else "reacquired"
             )
     launcher = _launch(candidate)
+    if task_effect_classification is not None:
+        launcher = {
+            **launcher,
+            "task_effect_classification": dict(task_effect_classification),
+        }
     if coding_agent_pre_dispatch_admission is not None:
         launcher = {
             **launcher,
