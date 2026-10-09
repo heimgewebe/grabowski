@@ -22,11 +22,31 @@ The typed read surface removes that ambiguity without removing operator capabili
 ## Narrow context tools
 
 - `grabowski_runtime_health`
+- `grabowski_mcp_liveness`
 - `grabowski_deployment_identity`
 - `grabowski_contract_drift`
 - `grabowski_checkout_summary`
 
 These replace broad context retrieval when only health, identity, drift or checkout state is required.
+
+`grabowski_runtime_health` retains the original unversioned integrity contract:
+`healthy: true` requires a completed and integrity-valid deployment, a valid
+and writable audit chain, and a disengaged kill switch. Existing consumers of
+`healthy` therefore cannot mistake dispatch liveness for integrity. This
+integrity read can be expensive on large audit histories; use
+`grabowski_status(view="minimal")` for an explicit operational diagnostic.
+
+`grabowski_mcp_liveness` response version 1 is a separate bounded MCP tool
+dispatch read. Its `dispatch_healthy` is a boolean, `health_scope` equals
+`mcp_tool_dispatch` and `integrity_evaluated` is false. It does not expose
+`healthy` or assert deployment, audit, mutation readiness or systemd scope.
+Only a version- and scope-aware consumer such as the component watchdog may
+interpret this liveness response as proof of tool dispatch.
+
+Use `grabowski_deployment_identity` for exact release/manifest binding.
+The liveness tool performs no historical verification, workspace cleanup or
+task reconciliation. Explicit task reconciliation remains available through
+the existing reconciliation tools.
 
 `grabowski_status` additionally returns a live tool-contract summary with expected and registered counts, name-set hashes and bounded missing/unexpected lists. The runtime cannot inspect ChatGPT's frozen connector snapshot, but a client can compare its loaded tool count or hash with this summary and detect that a refresh is required.
 
