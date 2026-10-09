@@ -1607,9 +1607,9 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         forms = (
             "repo.git",
             "heimgewebe/repo",
-            "owner__repo__main",
-            f"owner__repo__main--{sha}",
-            f"owner__repo__main--{'d' * 64}--recovery-0123456789ab",
+            "heimgewebe__repo__main",
+            f"heimgewebe__repo__main--{sha}",
+            f"heimgewebe__repo__main--{'d' * 64}--recovery-0123456789ab",
         )
         for form in forms:
             for singleton in (True, False):
@@ -1662,17 +1662,57 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             "foreign",
         )
 
+    def test_canonical_provenance_owner_requires_exact_requested_owner(self) -> None:
+        cases = (
+            ("heimgewebe/bar", "bar", "owner__foo__bar__main", False),
+            ("heimgewebe/foo__bar", "foo__bar", "other__foo__bar__main", False),
+            ("heimgewebe/foo__bar", "foo__bar", "heimgewebe__foo__bar__main", True),
+            ("owner__foo/bar", "bar", "owner__foo__bar__main", True),
+            ("heimgewebe/repo", "repo", "repo__main", True),
+            ("heimgewebe/repo", "alias", "heimgewebe__alias__main", True),
+        )
+        for slug, repo_id, identity, accepted in cases:
+            with self.subTest(slug=slug, identity=identity), tempfile.TemporaryDirectory() as directory:
+                value = request(condition="treatment")
+                value["repository"]["id"] = repo_id
+                value["repository"]["repository"] = slug
+                bind_manifest(
+                    value, Path(directory),
+                    repositories=[{"repository": identity, "git_commit": COMMIT, "repo_root": "/tmp/repo"}],
+                )
+                if accepted:
+                    _, _, commit, _ = runner._bound_repoground_manifest(value)
+                    self.assertEqual(commit, COMMIT)
+                else:
+                    with self.assertRaisesRegex(runner.RunnerError, "does not match request"):
+                        runner._bound_repoground_manifest(value)
+                    self.assertIsNone(runner._optional_repoground_manifest_binding(value))
+
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            value["repository"]["id"] = "bar"
+            value["repository"]["repository"] = "heimgewebe/bar"
+            bind_manifest(
+                value, Path(directory),
+                repositories=[
+                    {"repository": "other__foo__bar__main", "git_commit": "b" * 40},
+                    {"repository": "heimgewebe__bar__main", "git_commit": COMMIT},
+                ],
+            )
+            _, _, commit, _ = runner._bound_repoground_manifest(value)
+            self.assertEqual(commit, COMMIT)
+
     def test_bound_manifest_double_underscore_repo_collision_and_ambiguity(self) -> None:
         sha = "e" * 40
         for requested_repo in ("foo__bar", "foo"):
             for repositories, expected in (
-                ([{"repository": "owner__foo__bar__main", "git_commit": COMMIT}], "foo__bar"),
-                ([{"repository": f"owner__foo__bar__main--{sha}", "git_commit": COMMIT},
+                ([{"repository": "heimgewebe__foo__bar__main", "git_commit": COMMIT}], "foo__bar"),
+                ([{"repository": f"heimgewebe__foo__bar__main--{sha}", "git_commit": COMMIT},
                   {"repository": "owner__other__main", "git_commit": "b" * 40}], "foo__bar"),
                 (
                     [
-                        {"repository": "owner__foo__bar__main", "git_commit": COMMIT},
-                        {"repository": "other__foo__bar__dev", "git_commit": "b" * 40},
+                        {"repository": "heimgewebe__foo__bar__main", "git_commit": COMMIT},
+                        {"repository": "heimgewebe__foo__bar__dev", "git_commit": "b" * 40},
                     ],
                     "ambiguous",
                 ),
@@ -1682,7 +1722,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     requested=requested_repo, expected=expected
                 ), tempfile.TemporaryDirectory() as directory:
                     value = self._bind_repositories(directory, repositories)
-                    value["repository"] = {**value.get("repository", {}), "id": requested_repo}
+                    value["repository"] = {**value.get("repository", {}), "id": requested_repo, "repository": f"heimgewebe/{requested_repo}"}
                     if requested_repo == "foo" or expected in {"ambiguous", "foreign"}:
                         with self.assertRaises(runner.RunnerError):
                             runner._bound_repoground_manifest(value)
@@ -1754,9 +1794,9 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
 
     def test_bound_manifest_rejects_ambiguous_normalized_aliases(self) -> None:
         for first, second in (
-            ("repo.git", "owner__repo__main"),
-            ("owner__repo__main", f"other__repo__dev--{'c' * 40}"),
-            ("owner__repo__main", "owner__repo__main--" + "c" * 64),
+            ("repo.git", "heimgewebe__repo__main"),
+            ("heimgewebe__repo__main", f"heimgewebe__repo__dev--{'c' * 40}"),
+            ("heimgewebe__repo__main", "heimgewebe__repo__main--" + "c" * 64),
             ("heimgewebe/repo", "heimgewebe__repo__main"),
         ):
             with self.subTest(first=first, second=second), tempfile.TemporaryDirectory() as directory:

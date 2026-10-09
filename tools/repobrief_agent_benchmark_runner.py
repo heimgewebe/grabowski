@@ -1375,6 +1375,8 @@ def _provenance_match(item: Mapping[str, Any], requested: set[str]) -> str | Non
     """
     segments = {name.rsplit("/", 1)[-1] for name in requested}
     segments.discard("")
+    # Full repository slugs carry the owner identity; plain local IDs do not.
+    owners = {name.rsplit("/", 1)[0] for name in requested if "/" in name and name.rsplit("/", 1)[0]}
     hits: list[str] = []
     for identity in _provenance_identities(item):
         if identity in requested:
@@ -1389,17 +1391,29 @@ def _provenance_match(item: Mapping[str, Any], requested: set[str]) -> str | Non
                 canonical = identity[:separator]
                 break
         prefix, separator_found, ref = canonical.rpartition("__")
-        if (
+        segment_match = (
             separator_found
-            and ref
+            and bool(ref)
             and "/" not in canonical
             and any(
                 prefix == segment
                 or (prefix.endswith(f"__{segment}") and len(prefix) > len(segment) + 2)
                 for segment in segments
             )
-        ):
-            hits.append("match")
+        )
+        if segment_match:
+            if prefix in segments or not owners:
+                hits.append("match")
+            elif any(
+                prefix == f"{owner}__{segment}"
+                for owner in owners
+                for segment in segments
+            ):
+                hits.append("match")
+            else:
+                # A canonical identity with an explicit different owner
+                # cannot authorize exposure for this requested repository.
+                hits.append("foreign")
         elif identity in segments:
             hits.append("match")
     # Any explicitly foreign-owner identity disqualifies the entry; callers
