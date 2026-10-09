@@ -272,7 +272,7 @@ für Navigation, Struktur oder Grounding als tatsächliches Treatment-Exposure
 zählen, entscheidet der RepoGround-Evaluator. Die Projektion bleibt an das
 digestgebundene Manifest gekoppelt. Für `ask_context` müssen Pack-Commit und
 same-call Live-Commit übereinstimmen; der projizierte Freshness-Status stammt aus
-dieser Live-Hülle, und nur Ranges mit `status=resolved` werden gezählt.
+dieser Live-Hülle, und nur Ranges mit `status=resolved` werden gezählt. Resolved Textranges brauchen nichtleeren `text_excerpt` plus Identität (`source_path`/`path` oder `range_ref.ref`/`range_ref.path`); resolved `language_structure_json`-Ranges tragen keinen Excerpt und brauchen stattdessen konsistente Strukturprovenienz (`range_ref.ref`, `range_ref.path` = `source_path`, ganzzahlige `start_line<=end_line` gleich in `range_ref.range` und `source_line_range`).
 Produktives `not_comparable` ohne Snapshot-Provenienz darf nur im
 `repo_root_not_configured`-Fall mit `implicit_refresh=false` auf den
 Manifest-Commit zurückfallen; `unknown` darf denselben Fallback nur nach einer

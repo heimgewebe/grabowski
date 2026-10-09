@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
+import copy
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
@@ -4473,6 +4474,99 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 )
             self.assertEqual(bound_manifest.call_count, 1)
             self.assertEqual(len(repeated["calls"]), 2)
+
+    def test_codex_structured_language_ranges_projection(self) -> None:
+        lang = {
+            "artifact_role": "language_structure_json",
+            "status": "resolved",
+            "range_ref": {
+                "ref": "rust:fn:main", "path": "src/main.rs",
+                "range": {"start_line": 3, "end_line": 9},
+            },
+            "source_path": "src/main.rs",
+            "source_line_range": {"start_line": 3, "end_line": 9},
+        }
+        canonical = {
+            "artifact_role": "canonical_md", "status": "resolved",
+            "range_ref": {"ref": "c1"}, "text_excerpt": "def example(): ...",
+        }
+        broken = copy.deepcopy(lang)
+        broken["range_ref"]["range"]["start_line"] = True
+        cases = [
+            ([lang, canonical], 2),
+            ([lang], 1),
+            ([{"status": "resolved"}], None),
+            ([{"status": "resolved", "range_ref": {"junk": "x"}, "text_excerpt": "fake"}], None),
+            ([{"artifact_role": "language_structure_json", "status": "resolved"}], None),
+            ([broken], None),
+            ([canonical, {**lang, "source_path": ""}], None),
+        ]
+        for ranges, expected in cases:
+            with self.subTest(ranges=ranges), tempfile.TemporaryDirectory() as directory:
+                value = request(condition="treatment")
+                manifest = bind_manifest(
+                    value, Path(directory), commit=COMMIT.upper(), repo_root="/tmp/repo"
+                )
+                payload = {
+                    "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+                    "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+                    "tool": "ask_context",
+                    "status": "ok",
+                    "context_pack": {
+                        "kind": "repobrief.ask_context_pack",
+                        "version": "1.0",
+                        "snapshot_ref": {
+                            "manifest_path": str(manifest),
+                            "manifest_sha256": value["repobrief"]["manifest_sha256"],
+                            "git_commit": COMMIT.upper(),
+                            "freshness_status": "fresh",
+                        },
+                        "freshness": {"status": "fresh"},
+                        "resolved_ranges": ranges,
+                        "budget": {"context_bytes_used": 10},
+                    },
+                    "live_freshness": {
+                        "kind": "repobrief.live_freshness",
+                        "version": "v1",
+                        "status": "fresh",
+                        "reason": "git_head_matches_snapshot",
+                        "bundle_manifest": str(manifest),
+                        "repo_root": "/tmp/repo",
+                        "read_only_git_probe": True,
+                        "implicit_refresh": False,
+                        "snapshot_provenance": {"git_commit": COMMIT.upper()},
+                    },
+                }
+                events = [{
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "ask_context",
+                        "arguments": {"query": "example"},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }]
+                calls = [{
+                    "sequence": 1, "name": "ask_context", "status": "success",
+                    "duration_ms": 0, "input_bytes": 1, "output_bytes": 1,
+                }]
+                with patch.object(
+                    runner,
+                    "_validated_treatment_structured_payload",
+                    return_value=payload,
+                ):
+                    evidence = runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                if expected is None:
+                    self.assertIsNone(evidence)
+                else:
+                    self.assertEqual(
+                        evidence["calls"][0]["resolved_range_count"], expected
+                    )
 
     def test_codex_manifest_bind_failure_omits_optional_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

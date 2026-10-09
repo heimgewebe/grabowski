@@ -1588,8 +1588,38 @@ def _validated_read_only_frontdoor_projection(value: Mapping[str, Any]) -> None:
         raise RunnerError("RepoGround treatment tool non-claim projection is malformed")
 
 
+def _nonempty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _line_range_pair(value: Any) -> tuple[int, int] | None:
+    if not isinstance(value, Mapping):
+        return None
+    start, end = value.get("start_line"), value.get("end_line")
+    if any(isinstance(n, bool) or not isinstance(n, int) or n < 0 for n in (start, end)):
+        return None
+    return (start, end) if start <= end else None
+
+
+def _structured_range_valid(item: Mapping[str, Any]) -> bool:
+    """language_structure_json ranges carry structure provenance, no excerpt."""
+    range_ref = item.get("range_ref")
+    if not isinstance(range_ref, Mapping):
+        return False
+    path = range_ref.get("path")
+    coords = _line_range_pair(range_ref.get("range"))
+    if (
+        not _nonempty_str(range_ref.get("ref"))
+        or not _nonempty_str(path)
+        or coords is None
+        or item.get("source_path") != path
+    ):
+        return False
+    return _line_range_pair(item.get("source_line_range")) == coords
+
+
 def _resolved_range_entries_valid(ranges: Any) -> bool:
-    """Frontdoor shape: a resolved range carries identity and excerpt text."""
+    """Frontdoor shape: resolved ranges carry identity plus excerpt or structure."""
     if not isinstance(ranges, list):
         return False
     for item in ranges:
@@ -1597,13 +1627,18 @@ def _resolved_range_entries_valid(ranges: Any) -> bool:
             return False
         if item.get("status") != "resolved":
             continue
-        excerpt = item.get("text_excerpt")
+        if item.get("artifact_role") == "language_structure_json":
+            if not _structured_range_valid(item):
+                return False
+            continue
         range_ref = item.get("range_ref")
-        source_path = item.get("source_path") or item.get("path")
-        has_identity = (
-            isinstance(range_ref, Mapping) and bool(range_ref)
-        ) or (isinstance(source_path, str) and bool(source_path.strip()))
-        if not isinstance(excerpt, str) or not excerpt.strip() or not has_identity:
+        has_identity = _nonempty_str(item.get("source_path")) or _nonempty_str(
+            item.get("path")
+        ) or (
+            isinstance(range_ref, Mapping)
+            and (_nonempty_str(range_ref.get("ref")) or _nonempty_str(range_ref.get("path")))
+        )
+        if not _nonempty_str(item.get("text_excerpt")) or not has_identity:
             return False
     return True
 

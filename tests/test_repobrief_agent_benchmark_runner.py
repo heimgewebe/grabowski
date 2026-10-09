@@ -1072,6 +1072,57 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         self.assertFalse(runner._resolved_range_entries_valid(None))
         self.assertFalse(runner._resolved_range_entries_valid({"status": "resolved"}))
 
+    def test_resolved_range_structured_language_evidence(self) -> None:
+        lang = {
+            "artifact_role": "language_structure_json",
+            "status": "resolved",
+            "range_ref": {
+                "ref": "rust:fn:main", "path": "src/main.rs",
+                "range": {"start_line": 3, "end_line": 9}, "language": "rust",
+            },
+            "source_path": "src/main.rs",
+            "source_line_range": {"start_line": 3, "end_line": 9, "display": "3-9"},
+        }
+        canonical = {
+            "artifact_role": "canonical_md", "status": "resolved",
+            "range_ref": {"ref": "c1"}, "text_excerpt": "x",
+        }
+        self.assertTrue(runner._resolved_range_entries_valid([lang, canonical]))
+        self.assertTrue(runner._resolved_range_entries_valid(
+            [{"status": "resolved", "range_ref": {"path": "a.md"}, "text_excerpt": "x"}]
+        ))
+
+        def mut(**changes):
+            entry = copy.deepcopy(lang)
+            for key, val in changes.items():
+                target = entry
+                *parents, last = key.split("__")
+                for part in parents:
+                    target = target[part]
+                target[last] = val
+            return entry
+
+        bad = [
+            {"artifact_role": "language_structure_json", "status": "resolved"},
+            {"status": "resolved", "range_ref": {"junk": "x"}, "text_excerpt": "fake"},
+            {"status": "resolved", "range_ref": {"junk": "x"}},
+            mut(range_ref__ref=""), mut(range_ref__ref=5), mut(range_ref__path=""),
+            mut(source_path="other.rs"), mut(source_path=""),
+            mut(range_ref__range={"start_line": True, "end_line": 9}),
+            mut(range_ref__range={"start_line": 3, "end_line": 2.0}),
+            mut(range_ref__range={"start_line": 9, "end_line": 3}),
+            mut(range_ref__range={"start_line": "3", "end_line": 9}),
+            mut(source_line_range={"start_line": 3, "end_line": 8}),
+            mut(source_line_range=None), mut(range_ref=["x"]),
+        ]
+        for entry in bad:
+            with self.subTest(entry=entry):
+                self.assertFalse(runner._resolved_range_entries_valid([entry]))
+                self.assertFalse(runner._resolved_range_entries_valid([canonical, entry]))
+        self.assertTrue(runner._resolved_range_entries_valid(
+            [{**lang, "status": "candidate", "range_ref": {}}]
+        ))
+
     def test_treatment_rejects_identityless_resolved_ranges_without_crash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
@@ -1132,6 +1183,12 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 [{"status": "resolved", "source_path": "src/a.py"}],
                 [{"status": "resolved", "text_excerpt": "x"}],
                 [{"status": "resolved", "text_excerpt": "x", "range_ref": {}}],
+                [{"status": "resolved", "text_excerpt": "fake", "range_ref": {"junk": "x"}}],
+                [{"artifact_role": "language_structure_json", "status": "resolved"}],
+                [{"artifact_role": "language_structure_json", "status": "resolved",
+                  "range_ref": {"ref": "r", "path": "a.rs", "range": {"start_line": True, "end_line": 2}},
+                  "source_path": "a.rs",
+                  "source_line_range": {"start_line": 1, "end_line": 2}}],
                 ["resolved"],
                 [None],
             ):
@@ -1145,6 +1202,20 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 "range_ref": {"ref": "a"},
             }])
             self.assertEqual(good["calls"][0]["resolved_range_count"], 1)
+            structured = evidence_for([
+                {
+                "artifact_role": "language_structure_json",
+                "status": "resolved",
+                "range_ref": {
+                    "ref": "rust:fn:main", "path": "src/main.rs",
+                    "range": {"start_line": 3, "end_line": 9}, "language": "rust",
+                },
+                "source_path": "src/main.rs",
+                "source_line_range": {"start_line": 3, "end_line": 9, "display": "3-9"},
+            },
+                {"status": "resolved", "range_ref": {"ref": "c"}, "text_excerpt": "x"},
+            ])
+            self.assertEqual(structured["calls"][0]["resolved_range_count"], 2)
             empty = evidence_for([])
             self.assertEqual(empty["calls"][0]["resolved_range_count"], 0)
 
