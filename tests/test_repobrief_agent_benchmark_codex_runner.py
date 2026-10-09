@@ -4275,10 +4275,104 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIsNone(arguments["repo"])
             self.assertIsNone(arguments["stem"])
 
+    def _codex_live_freshness_evidence(self, *, root: str | None, **overrides):
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(
+                value, Path(directory), repo_root=root
+            )
+            payload = {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "fresh",
+                "reason": "git_head_matches_snapshot",
+                "bundle_manifest": str(manifest),
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+                "does_not_establish": list(
+                    runner.EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH
+                ),
+                "freshness_values": list(runner.EXPECTED_REPOGROUND_FRESHNESS_VALUES),
+                "snapshot_provenance": {"git_commit": COMMIT},
+                "current_provenance": None,
+            }
+            payload.update(overrides)
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "live_freshness",
+                    "arguments": {},
+                    "result": {"structured_content": payload},
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{
+                "sequence": 1,
+                "name": "live_freshness",
+                "status": "success",
+                "duration_ms": 0,
+                "input_bytes": 1,
+                "output_bytes": 1,
+            }]
+            return runner._repoground_evidence_from_codex_events(value, events, calls)
+
+    def test_codex_fresh_evidence_requires_proven_read_only_probe(self) -> None:
+        valid = self._codex_live_freshness_evidence(root="/tmp/repo")
+        self.assertEqual(valid["calls"][0]["freshness_status"], "fresh")
+        for case, root, overrides in (
+            ("probe_false", "/tmp/repo", {"read_only_git_probe": False}),
+            ("root_none", "/tmp/repo", {"repo_root": None}),
+            ("root_mismatch", "/tmp/repo", {"repo_root": "/tmp/other"}),
+            ("manifest_without_root", None, {}),
+            ("stale_probe_false", "/tmp/repo", {"status": "stale", "read_only_git_probe": False}),
+        ):
+            with self.subTest(case=case):
+                self.assertIsNone(
+                    self._codex_live_freshness_evidence(root=root, **overrides)
+                )
+
+    def test_codex_preserves_unknown_and_not_comparable_fallbacks(self) -> None:
+        unknown = self._codex_live_freshness_evidence(
+            root="/tmp/repo",
+            status="unknown",
+            reason="git_probe_failed",
+            snapshot_provenance=None,
+        )
+        self.assertEqual(unknown["calls"][0]["freshness_status"], "unknown")
+        fallback = self._codex_live_freshness_evidence(
+            root=None,
+            status="not_comparable",
+            reason="repo_root_not_configured",
+            repo_root=None,
+            read_only_git_probe=False,
+            snapshot_provenance=None,
+        )
+        self.assertEqual(fallback["calls"][0]["freshness_status"], "not_comparable")
+
+    def test_codex_rejects_non_empty_mutation_boundary_writes(self) -> None:
+        with self.assertRaises(runner.RunnerError):
+            runner._validated_treatment_structured_payload(
+                {
+                    "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+                    "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+                    "tool": "ask_context",
+                    "mutation_boundary": {"writes": ["/tmp/x"]},
+                },
+                tool_name="ask_context",
+                expected_manifest=Path("/tmp/m.json"),
+                is_error=False,
+            )
+
     def test_codex_projects_bound_repoground_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
-            manifest = bind_manifest(value, Path(directory), commit=COMMIT.upper())
+            manifest = bind_manifest(
+                value, Path(directory), commit=COMMIT.upper(), repo_root="/tmp/repo"
+            )
             payload = {
                 "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
                 "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,

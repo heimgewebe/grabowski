@@ -99,7 +99,7 @@ def bind_manifest(
     repositories: list[dict] | None = None,
 ) -> Path:
     if repositories is None:
-        repositories = [{"git_commit": commit}]
+        repositories = [{"git_commit": commit, "repo_root": "/tmp/repo"}]
     manifest = {
         "kind": "repoground.bundle.manifest",
         "version": "2.0",
@@ -113,6 +113,70 @@ def bind_manifest(
     value["repobrief"]["manifest"] = str(path)
     value["repobrief"]["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
     return path
+
+
+def complete(payload: dict) -> dict:
+    """Fill the production contract fields a minimal fixture leaves out."""
+    value = copy.deepcopy(payload)
+    freshness = value if value.get("kind") == "repobrief.live_freshness" else value.get("live_freshness")
+    if isinstance(freshness, dict):
+        freshness.setdefault("does_not_establish", list(runner.EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH))
+        if "snapshot_provenance" in freshness:
+            freshness.setdefault("freshness_values", list(runner.EXPECTED_REPOGROUND_FRESHNESS_VALUES))
+            freshness.setdefault("current_provenance", None)
+    if value.get("kind") != runner.EXPECTED_REPOGROUND_READ_ONLY_KIND:
+        return value
+    value.setdefault("mutation_boundary", {"writes": []})
+    value.setdefault("does_not_establish", list(runner.EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH))
+    pack = value.get("context_pack")
+    if value.get("tool") == "ask_context":
+        value.setdefault("request_semantics", "repobrief.ask_request.v1")
+        value.setdefault("context_pack_semantics", "repobrief.ask_context_pack.v1")
+    if isinstance(pack, dict):
+        used = pack.get("budget", {}).get("context_bytes_used", 0)
+        defaults = {
+            "request_id": "0123456789abcdef",
+            "availability": {"status": "available"},
+            "required_reading": {},
+            "retrieval": {},
+            "retrieval_infrastructure": {"status": "available"},
+            "retrieval_hits": [],
+            "answer_scaffold": {
+                "citation_obligations": [],
+                "caveats_to_surface": [],
+                "non_claims_to_surface": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+            },
+            "forbidden_operations": list(runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS),
+            "does_not_establish": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+        }
+        for key, default in defaults.items():
+            pack.setdefault(key, default)
+        budget = pack["budget"]
+        for key in (
+            "max_context_tokens", "token_derived_byte_ceiling", "max_context_bytes",
+            "max_answer_tokens", "context_bytes_used",
+            "context_unicode_characters_used", "approx_context_chars_used",
+        ):
+            budget.setdefault(key, used)
+        budget.setdefault("byte_budget_is_hard", True)
+        budget.setdefault("unit", "utf8_bytes")
+        budget.setdefault("accounting", "utf8")
+        budget.setdefault("omissions", [])
+        budget.setdefault("truncated", False)
+        budget.setdefault("does_not_establish_quality", True)
+    verdict = value.get("verdict")
+    if isinstance(verdict, dict):
+        value.setdefault("declaration_semantics", "repobrief.answer_grounding_declaration.v1")
+        value.setdefault("verdict_semantics", "repobrief.answer_grounding_verdict.v1")
+        for key, default in {
+            "checked_declaration": {}, "snapshot_ref": {}, "citation_checks": [],
+            "range_checks": [], "required_reading_checks": [], "diagnostics": [],
+            "freshness_caveats": [], "availability_caveats": [],
+            "does_not_establish": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+        }.items():
+            verdict.setdefault(key, default)
+    return value
+
 
 def answer() -> dict:
     return {
@@ -765,7 +829,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 },
             }
             tool_result["content"] = json.dumps(
-                {"structuredContent": payload}, sort_keys=True
+                {"structuredContent": complete(payload)}, sort_keys=True
             )
             calls = runner.normalize_tool_calls(value, messages)
             self.assertEqual(
@@ -790,7 +854,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             unexpected = copy.deepcopy(payload)
             unexpected["live_freshness"]["bundle_manifest"] = str(unexpected_alias)
             tool_result["content"] = json.dumps(
-                {"structuredContent": unexpected}, sort_keys=True
+                {"structuredContent": complete(unexpected)}, sort_keys=True
             )
             self.assertIsNone(
                 runner.normalize_repoground_evidence(
@@ -798,13 +862,13 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 )
             )
             tool_result["content"] = json.dumps(
-                {"structuredContent": payload}, sort_keys=True
+                {"structuredContent": complete(payload)}, sort_keys=True
             )
 
             wrong = json.loads(json.dumps(payload))
             wrong["context_pack"]["snapshot_ref"]["manifest_sha256"] = "0" * 64
             tool_result["content"] = json.dumps(
-                {"structuredContent": wrong}, sort_keys=True
+                {"structuredContent": complete(wrong)}, sort_keys=True
             )
             self.assertIsNone(
                 runner.normalize_repoground_evidence(
@@ -922,7 +986,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 },
             }
             tool_result["content"] = json.dumps(
-                {"structuredContent": payload}, sort_keys=True
+                {"structuredContent": complete(payload)}, sort_keys=True
             )
             calls = runner.normalize_tool_calls(value, messages)
             evidence = runner.normalize_repoground_evidence(value, messages, calls)
@@ -932,7 +996,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             missing_live = copy.deepcopy(payload)
             missing_live.pop("live_freshness")
             tool_result["content"] = json.dumps(
-                {"structuredContent": missing_live}, sort_keys=True
+                {"structuredContent": complete(missing_live)}, sort_keys=True
             )
             self.assertIsNone(
                 runner.normalize_repoground_evidence(
@@ -955,7 +1019,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     for field in removals:
                         freshness.pop(field)
                     tool_result["content"] = json.dumps(
-                        {"structuredContent": invalid}, sort_keys=True
+                        {"structuredContent": complete(invalid)}, sort_keys=True
                     )
                     self.assertIsNone(
                         runner.normalize_repoground_evidence(
@@ -1000,7 +1064,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 "snapshot_provenance": {"git_commit": COMMIT},
             }
             tool_result["content"] = json.dumps(
-                {"structuredContent": payload}, sort_keys=True
+                {"structuredContent": complete(payload)}, sort_keys=True
             )
             second_use = copy.deepcopy(tool_use)
             second_use["id"] = "tool-2"
@@ -1298,7 +1362,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 },
             }
             tool_result["content"] = json.dumps(
-                {"structuredContent": payload}, sort_keys=True
+                {"structuredContent": complete(payload)}, sort_keys=True
             )
             calls = runner.normalize_tool_calls(value, messages)
             self.assertEqual(
@@ -1320,7 +1384,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             conflicting = copy.deepcopy(payload)
             conflicting["live_freshness"]["status"] = "stale"
             tool_result["content"] = json.dumps(
-                {"structuredContent": conflicting}, sort_keys=True
+                {"structuredContent": complete(conflicting)}, sort_keys=True
             )
             self.assertIsNone(
                 runner.normalize_repoground_evidence(
@@ -1328,14 +1392,14 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 )
             )
             tool_result["content"] = json.dumps(
-                {"structuredContent": payload}, sort_keys=True
+                {"structuredContent": complete(payload)}, sort_keys=True
             )
 
             payload["verdict"]["snapshot_ref"]["manifest_path"] = str(
                 Path(directory) / "other.bundle.manifest.json"
             )
             tool_result["content"] = json.dumps(
-                {"structuredContent": payload}, sort_keys=True
+                {"structuredContent": complete(payload)}, sort_keys=True
             )
             self.assertIsNone(
                 runner.normalize_repoground_evidence(
@@ -1348,7 +1412,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 Path(directory) / "other.bundle.manifest.json"
             )
             tool_result["content"] = json.dumps(
-                {"structuredContent": payload}, sort_keys=True
+                {"structuredContent": complete(payload)}, sort_keys=True
             )
             self.assertIsNone(
                 runner.normalize_repoground_evidence(
@@ -1359,7 +1423,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             payload["live_freshness"]["bundle_manifest"] = str(manifest)
             payload["live_freshness"]["status"] = "not_applicable"
             tool_result["content"] = json.dumps(
-                {"structuredContent": payload}, sort_keys=True
+                {"structuredContent": complete(payload)}, sort_keys=True
             )
             self.assertIsNone(
                 runner.normalize_repoground_evidence(
@@ -1447,7 +1511,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 if runner._mapping(block).get("type") == "tool_result"
             )
             tool_result["content"] = json.dumps(
-                {"structuredContent": {
+                {"structuredContent": complete({
                     "kind": "repobrief.live_freshness",
                     "version": "v1",
                     "status": "not_comparable",
@@ -1456,7 +1520,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     "repo_root": None,
                     "read_only_git_probe": False,
                     "implicit_refresh": False,
-                }},
+                })},
                 sort_keys=True,
             )
             calls = runner.normalize_tool_calls(value, messages)
@@ -1485,6 +1549,256 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     value, messages, runner.normalize_tool_calls(value, messages)
                 )
             )
+
+    def _evidence_for_payload(
+        self, tool: str, payload, *, root: str | None = "/tmp/repo", fill: bool = True
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            repositories = [{"git_commit": COMMIT}]
+            if root is not None:
+                repositories[0]["repo_root"] = root
+            manifest = bind_manifest(value, Path(directory), repositories=repositories)
+            messages = runner.parse_jsonl(
+                stream(value, tool_name=f"mcp__repobrief__{tool}")
+            )
+            tool_result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            built = payload(str(manifest))
+            pack = built.get("context_pack")
+            if isinstance(pack, dict):
+                pack["snapshot_ref"]["manifest_sha256"] = value["repobrief"][
+                    "manifest_sha256"
+                ]
+            tool_result["content"] = json.dumps(
+                {"structuredContent": complete(built) if fill else built},
+                sort_keys=True,
+            )
+            calls = runner.normalize_tool_calls(value, messages)
+            return runner.normalize_repoground_evidence(value, messages, calls)
+
+    @staticmethod
+    def _freshness(manifest: str, **overrides) -> dict:
+        value = {
+            "kind": "repobrief.live_freshness",
+            "version": "v1",
+            "status": "fresh",
+            "reason": "git_head_matches_snapshot",
+            "bundle_manifest": manifest,
+            "repo_root": "/tmp/repo",
+            "read_only_git_probe": True,
+            "implicit_refresh": False,
+            "snapshot_provenance": {"git_commit": COMMIT},
+        }
+        value.update(overrides)
+        return value
+
+    def test_live_freshness_fresh_and_stale_require_proven_probe(self) -> None:
+        for status in ("fresh", "stale"):
+            with self.subTest(status=status, case="valid"):
+                evidence = self._evidence_for_payload(
+                    "live_freshness",
+                    lambda m: self._freshness(m, status=status),
+                )
+                self.assertEqual(evidence["calls"][0]["freshness_status"], status)
+            for case, overrides in (
+                ("probe_false", {"read_only_git_probe": False}),
+                ("root_none", {"repo_root": None}),
+                ("root_empty", {"repo_root": ""}),
+                ("root_mismatch", {"repo_root": "/tmp/other-repo"}),
+                ("implicit_refresh", {"implicit_refresh": True}),
+            ):
+                with self.subTest(status=status, case=case):
+                    self.assertIsNone(
+                        self._evidence_for_payload(
+                            "live_freshness",
+                            lambda m: self._freshness(m, status=status, **overrides),
+                        )
+                    )
+        with self.subTest(case="manifest_without_repo_root"):
+            self.assertIsNone(
+                self._evidence_for_payload(
+                    "live_freshness", self._freshness, root=None
+                )
+            )
+
+    def test_live_freshness_preserves_unknown_and_not_comparable_fallbacks(self) -> None:
+        unknown = self._evidence_for_payload(
+            "live_freshness",
+            lambda m: self._freshness(
+                m, status="unknown", reason="git_probe_failed"
+            ),
+        )
+        self.assertEqual(unknown["calls"][0]["freshness_status"], "unknown")
+        fallback = self._evidence_for_payload(
+            "live_freshness",
+            lambda m: {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "not_comparable",
+                "reason": "repo_root_not_configured",
+                "bundle_manifest": m,
+                "repo_root": None,
+                "read_only_git_probe": False,
+                "implicit_refresh": False,
+            },
+        )
+        self.assertEqual(fallback["calls"][0]["freshness_status"], "not_comparable")
+
+    def test_claude_nested_live_freshness_requires_proven_probe(self) -> None:
+        def ask_context(manifest: str, **freshness) -> dict:
+            return {
+                "kind": "repobrief.mcp.read_only_frontdoor",
+                "version": "v1",
+                "tool": "ask_context",
+                "status": "ok",
+                "context_pack": {
+                    "kind": "repobrief.ask_context_pack",
+                    "version": "1.0",
+                    "snapshot_ref": {
+                        "manifest_path": manifest,
+                        "manifest_sha256": hashlib.sha256(b"x").hexdigest(),
+                        "git_commit": COMMIT,
+                        "freshness_status": "fresh",
+                    },
+                    "freshness": {"status": "fresh"},
+                    "resolved_ranges": [],
+                    "budget": {"context_bytes_used": 1},
+                },
+                "live_freshness": self._freshness(manifest, **freshness),
+            }
+
+        valid = self._evidence_for_payload("ask_context", ask_context)
+        self.assertEqual(valid["calls"][0]["tool"], "ask_context")
+        self.assertIsNone(
+            self._evidence_for_payload(
+                "ask_context",
+                lambda m: ask_context(m, read_only_git_probe=False),
+            )
+        )
+        self.assertIsNone(
+            self._evidence_for_payload(
+                "ask_context",
+                lambda m: ask_context(m, repo_root="/tmp/other-repo"),
+            )
+        )
+
+    def test_claude_payload_contract_rejects_invalid_forms_without_crashing(self) -> None:
+        def frontdoor(manifest: str, tool: str) -> dict:
+            if tool == "ask_context":
+                return {
+                    "kind": "repobrief.mcp.read_only_frontdoor",
+                    "version": "v1",
+                    "tool": "ask_context",
+                    "status": "ok",
+                    "context_pack": {
+                        "kind": "repobrief.ask_context_pack",
+                        "version": "1.0",
+                        "snapshot_ref": {
+                            "manifest_path": manifest,
+                            "git_commit": COMMIT,
+                            "freshness_status": "fresh",
+                        },
+                        "freshness": {"status": "fresh"},
+                        "resolved_ranges": [],
+                        "budget": {"context_bytes_used": 1},
+                    },
+                    "live_freshness": self._freshness(manifest),
+                }
+            return {
+                "kind": "repobrief.mcp.read_only_frontdoor",
+                "version": "v1",
+                "tool": "grounding_verify",
+                "status": "pass",
+                "verdict": {
+                    "kind": "repobrief.answer_grounding_verdict",
+                    "version": "1.0",
+                    "status": "pass",
+                    "snapshot_ref": {
+                        "manifest_path": manifest,
+                        "git_commit": COMMIT,
+                        "freshness_status": "fresh",
+                    },
+                },
+                "live_freshness": self._freshness(manifest),
+            }
+
+        for tool in ("ask_context", "grounding_verify"):
+            def mutate_writes(payload: dict) -> dict:
+                payload["mutation_boundary"] = {"writes": ["/tmp/x"]}
+                return payload
+
+            def drop_semantics(payload: dict) -> dict:
+                payload["verdict_semantics" if tool == "grounding_verify" else "context_pack_semantics"] = "wrong"
+                return payload
+
+            def drop_live(payload: dict) -> dict:
+                payload["live_freshness"].pop("does_not_establish", None)
+                payload["live_freshness"]["does_not_establish"] = []
+                return payload
+
+            for case, mutate in (
+                ("writes_not_empty", mutate_writes),
+                ("wrong_semantics", drop_semantics),
+                ("bad_live_non_claims", drop_live),
+            ):
+                with self.subTest(tool=tool, case=case):
+                    self.assertIsNone(
+                        self._evidence_for_payload(
+                            tool, lambda m: mutate(complete(frontdoor(m, tool)))
+                        )
+                    )
+        with self.subTest(case="missing_pack_field"):
+            def missing(manifest: str) -> dict:
+                payload = complete(frontdoor(manifest, "ask_context"))
+                payload["context_pack"].pop("request_id")
+                return payload
+
+            self.assertIsNone(
+                self._evidence_for_payload("ask_context", missing, fill=False)
+            )
+        with self.subTest(case="grounding_missing_verdict_field"):
+            def missing_verdict(manifest: str) -> dict:
+                payload = complete(frontdoor(manifest, "grounding_verify"))
+                payload["verdict"].pop("range_checks")
+                return payload
+
+            self.assertIsNone(
+                self._evidence_for_payload(
+                    "grounding_verify", missing_verdict, fill=False
+                )
+            )
+        with self.subTest(case="valid_production_forms"):
+            self.assertEqual(
+                self._evidence_for_payload(
+                    "ask_context", lambda m: frontdoor(m, "ask_context")
+                )["calls"][0]["tool"],
+                "ask_context",
+            )
+            self.assertEqual(
+                self._evidence_for_payload(
+                    "grounding_verify",
+                    lambda m: frontdoor(m, "grounding_verify"),
+                )["calls"][0]["grounding_status"],
+                "pass",
+            )
+
+    def test_malformed_claude_payload_shapes_do_not_raise(self) -> None:
+        for tool, payload in (
+            ("live_freshness", lambda m: {"kind": "repobrief.live_freshness", "bundle_manifest": m}),
+            ("ask_context", lambda m: {"live_freshness": [m], "context_pack": 1}),
+            ("grounding_verify", lambda m: {"live_freshness": {"bundle_manifest": m}, "verdict": []}),
+        ):
+            with self.subTest(tool=tool):
+                self.assertIsNone(
+                    self._evidence_for_payload(tool, payload, fill=False)
+                )
 
     def test_treatment_projects_strict_unknown_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1516,7 +1830,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 "implicit_refresh": False,
             }
             tool_result["content"] = json.dumps(
-                {"structuredContent": payload}, sort_keys=True
+                {"structuredContent": complete(payload)}, sort_keys=True
             )
             calls = runner.normalize_tool_calls(value, messages)
             evidence = runner.normalize_repoground_evidence(value, messages, calls)
@@ -1524,7 +1838,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
 
             payload["repo_root"] = "/tmp/other-repo"
             tool_result["content"] = json.dumps(
-                {"structuredContent": payload}, sort_keys=True
+                {"structuredContent": complete(payload)}, sort_keys=True
             )
             self.assertIsNone(
                 runner.normalize_repoground_evidence(
@@ -1535,7 +1849,7 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             payload["repo_root"] = "/tmp/repo"
             payload["implicit_refresh"] = True
             tool_result["content"] = json.dumps(
-                {"structuredContent": payload}, sort_keys=True
+                {"structuredContent": complete(payload)}, sort_keys=True
             )
             self.assertIsNone(
                 runner.normalize_repoground_evidence(

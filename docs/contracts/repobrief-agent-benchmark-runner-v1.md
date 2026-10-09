@@ -228,6 +228,16 @@ Der Receipt enthält:
   dabei die same-call `live_freshness`-Hülle, revisionsgebundene
   Resource-Reads zählen ihre tatsächlich gelesenen Inhaltsbytes, reines
   Resource-Listing bleibt Nicht-Evidence;
+  `fresh` und `stale` werden nur projiziert, wenn die `live_freshness`-Hülle
+  `read_only_git_probe: true`, ein nichtleeres `repo_root` exakt gleich dem
+  Manifest-`repo_root`, `implicit_refresh: false` und eine an den
+  Manifest-Commit gebundene `snapshot_provenance` belegt; gültige
+  `unknown`- und `not_comparable`-Fallbacks bleiben erhalten. Strukturierte
+  Payloads von `ask_context`, `grounding_verify` und `live_freshness`
+  durchlaufen im Claude- wie im Codex-Pfad denselben strengen Vertrag
+  (`_validated_treatment_structured_payload`, `mutation_boundary.writes == []`,
+  Pflichtfelder, Nichtaussagen); eine verletzende Payload erzeugt keine
+  Evidence und lässt die Receipt-Konstruktion nicht scheitern;
 - strukturierte Antwort, Pfade, Symbole, Belege und Claim-Labels;
 - Start, Ende, Gesamtdauer und Exitstatus;
 - hashgebundenes Transcript-Artefakt;
