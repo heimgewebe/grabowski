@@ -69,8 +69,8 @@ Der Operator-Watchdog kombiniert zwei voneinander unabhängige Belege:
    kurzlebigen stdio-Prozess. Dort läuft der vollständige MCP-Lebenszyklus mit
    `initialize`, `notifications/initialized` und exakt dem Read-Tool
    `grabowski_mcp_liveness`. Nur dessen eigenständiger v1-Vertrag mit
-   `health_scope: mcp_tool_dispatch`, booleschem `dispatch_healthy` und
-   `integrity_evaluated: false` wird akzeptiert. Die Probe führt keine
+   `service: grabowski-mcp`, `health_scope: mcp_tool_dispatch`, booleschem
+   `dispatch_healthy` und `integrity_evaluated: false` wird akzeptiert. Die Probe führt keine
    historische Audit- oder Deploymentintegritätsprüfung durch; ein bloßes
    `healthy: true` des bisherigen Integritätstools wird nicht akzeptiert.
    Dieser isolierte Pfad darf einen über HTTP

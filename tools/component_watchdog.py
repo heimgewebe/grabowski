@@ -1137,6 +1137,7 @@ def mcp_stdio_probe(
             payload is None
             or type(payload.get("schema_version")) is not int
             or payload["schema_version"] != 1
+            or payload.get("service") != "grabowski-mcp"
             or payload.get("health_scope") != "mcp_tool_dispatch"
             or payload.get("integrity_evaluated") is not False
             or type(payload.get("dispatch_healthy")) is not bool

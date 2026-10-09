@@ -21,7 +21,13 @@ watchdog = importlib.util.module_from_spec(spec)
 sys.modules["component_watchdog_test"] = watchdog
 spec.loader.exec_module(watchdog)
 
-HEALTH_PAYLOAD = {"schema_version": 1, "health_scope": "mcp_tool_dispatch", "dispatch_healthy": True, "integrity_evaluated": False}
+HEALTH_PAYLOAD = {
+    "schema_version": 1,
+    "service": "grabowski-mcp",
+    "health_scope": "mcp_tool_dispatch",
+    "dispatch_healthy": True,
+    "integrity_evaluated": False,
+}
 BOOT_ID = "11111111-2222-3333-8444-555555555555"
 
 
@@ -120,6 +126,8 @@ class McpLifecycleProbeTests(unittest.TestCase):
             {**HEALTH_PAYLOAD, "healthy": True},
             {**HEALTH_PAYLOAD, "schema_version": 2},
             {**HEALTH_PAYLOAD, "schema_version": True},
+            {**HEALTH_PAYLOAD, "service": "unrelated-service"},
+            {key: value for key, value in HEALTH_PAYLOAD.items() if key != "service"},
             {**HEALTH_PAYLOAD, "health_scope": "runtime_integrity"},
             {**HEALTH_PAYLOAD, "dispatch_healthy": "true"},
             {**HEALTH_PAYLOAD, "integrity_evaluated": True},
