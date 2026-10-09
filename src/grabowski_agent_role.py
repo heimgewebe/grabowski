@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 import stat
 import subprocess
 import sys
+import uuid
 from typing import Any
 
 from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
@@ -31,6 +32,8 @@ GROK_REVIEW_TOOLS = "todo_write"
 GROK_REVIEW_DISALLOWED_TOOLS = "todo_write,search_tool,use_tool,run_terminal_cmd,run_terminal_command"
 GROK_REVIEW_MAX_TURNS = 2
 GROK_REVIEW_PROMPT_TARGET = Path("/tmp/grabowski-bound-review-prompt")
+REVIEW_ATTEMPT_UNIT = __import__("re").compile(r"^grabowski-job-[0-9a-f]{12}$")
+REVIEW_ATTEMPT_RECEIPT_NAME = "review-role-attempt.json"
 GROK_REVIEW_EVENT_TYPES = frozenset(
     {
         "text",
@@ -283,55 +286,67 @@ def current_binding(repo: Path, base: str) -> tuple[str, str, bool]:
 
 def write_receipt(path: Path, payload: dict[str, Any], *, create_only: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory_fd = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    temporary_name = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        metadata = None
-    if metadata is not None:
+        parent = os.fstat(directory_fd)
         if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_uid != os.getuid()
-            or stat.S_IMODE(metadata.st_mode) & 0o077
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.getuid()
+            or stat.S_IMODE(parent.st_mode) & 0o077
         ):
-            raise PermissionError("role receipt target must be one owner-controlled regular file")
-        if create_only:
-            raise FileExistsError("role attempt receipt already exists")
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    try:
+            raise PermissionError("role receipt parent must be owner-private")
         try:
-            handle = os.fdopen(descriptor, "w", encoding="utf-8")
-        except BaseException:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-            raise
-        with handle:
-            json.dump(payload, handle, ensure_ascii=True, sort_keys=True, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        if create_only:
-            try:
-                os.link(temporary, path, follow_symlinks=False)
-            except FileExistsError as exc:
-                raise FileExistsError("role attempt receipt already exists") from exc
-            temporary.unlink()
-        else:
-            os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            existing = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if (
+                not stat.S_ISREG(existing.st_mode)
+                or existing.st_nlink != 1
+                or existing.st_uid != os.getuid()
+                or stat.S_IMODE(existing.st_mode) & 0o077
+            ):
+                raise PermissionError("role receipt target must be one owner-controlled regular file")
+            if create_only:
+                raise FileExistsError("role attempt receipt already exists")
+        descriptor = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=directory_fd,
+        )
         try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=True, sort_keys=True, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            if create_only:
+                try:
+                    os.link(
+                        temporary_name, path.name, src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd, follow_symlinks=False,
+                    )
+                except FileExistsError as exc:
+                    raise FileExistsError("role attempt receipt already exists") from exc
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            else:
+                os.replace(
+                    temporary_name, path.name,
+                    src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+                )
             os.fsync(directory_fd)
         finally:
-            os.close(directory_fd)
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
     finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-
+        os.close(directory_fd)
 
 def _declared_virtualenv_binding(repo: Path, command: list[str]) -> tuple[list[tuple[Path, Path]], list[Path]]:
     """Bind one explicitly invoked Python virtualenv read-only, never a broad home tree."""
@@ -1245,6 +1260,24 @@ def main(argv: list[str] | None = None) -> int:
                     payload["returncode"] = 126
                     payload["error"] = "non-PASS review must contain findings"
     payload["failure_classification"] = classify_result(args.role, command, repo, payload)
+    attempt_unit = os.environ.get("GRABOWSKI_REVIEW_ATTEMPT_UNIT")
+    if attempt_unit is not None:
+        origin_sha256 = os.environ.get("GRABOWSKI_JOB_ORIGIN_SHA256")
+        job_directory = Path(os.environ.get("GRABOWSKI_JOB_DIRECTORY", ""))
+        if (
+            args.role != "review"
+            or REVIEW_ATTEMPT_UNIT.fullmatch(attempt_unit) is None
+            or os.environ.get("GRABOWSKI_JOB_UNIT") != attempt_unit
+            or os.environ.get("GRABOWSKI_JOB_ID") != attempt_unit.removeprefix("grabowski-job-")
+            or origin_sha256 is None
+            or SHA256.fullmatch(origin_sha256) is None
+            or not job_directory.is_absolute()
+            or job_directory.name != attempt_unit
+            or output != job_directory / REVIEW_ATTEMPT_RECEIPT_NAME
+        ):
+            raise RuntimeError("job-owned review attempt binding is invalid")
+        payload["review_attempt_unit"] = attempt_unit
+        payload["review_attempt_origin_sha256"] = origin_sha256
     stable = dict(payload)
     payload["receipt_sha256"] = digest(stable)
     write_receipt(output, payload, create_only=True)

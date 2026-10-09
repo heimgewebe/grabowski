@@ -8114,6 +8114,11 @@ def _start_job(
     )
     metadata_temp_cleanup = _cleanup_stale_job_metadata_temps(_jobs_root())
     directory = _job_directory(unit, create=True)
+    if decision_review_binding is not None:
+        command = decision_reviews.bind_job_review_role_argv(
+            command, decision_review_binding,
+            cwd=working_directory, attempt_directory=directory,
+        )
     stdout_path = directory / "stdout.log"
     stderr_path = directory / "stderr.log"
     for path in (stdout_path, stderr_path):
@@ -8140,7 +8145,8 @@ def _start_job(
         scope["decision_bound_review"] = normalized_review_binding
         scope["started_at_unix_ns"] = started_at_unix_ns
         review_provenance = decision_reviews.review_role_provenance(
-            command, normalized_review_binding, cwd=working_directory
+            command, normalized_review_binding, cwd=working_directory,
+            attempt_directory=directory,
         )
         if review_provenance is not None:
             scope["decision_review_provenance"] = review_provenance
@@ -8293,6 +8299,11 @@ def _start_job(
         "GRABOWSKI_JOB_STDERR_PATH": finalization_contract["receipt_paths"]["stderr"],
         "GRABOWSKI_JOB_FINALIZATION_PATH": finalization_contract["receipt_paths"]["finalization"],
     }
+    if (
+        decision_review_binding is not None
+        and scope.get("decision_review_provenance", {}).get("schema_version") == 2
+    ):
+        environment["GRABOWSKI_REVIEW_ATTEMPT_UNIT"] = unit
     if "expected_head" in finalization_contract:
         environment["GRABOWSKI_JOB_EXPECTED_HEAD"] = finalization_contract["expected_head"]
     systemd_argv.extend(f"--setenv={key}={value}" for key, value in environment.items())
