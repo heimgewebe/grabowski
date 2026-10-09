@@ -155,11 +155,11 @@ class GrokReviewRoleTests(unittest.TestCase):
             }
             with (
                 mock.patch.dict(os.environ, environment),
-                mock.patch.object(role, "current_binding", side_effect=[(head, diff, False)] * 2),
+                mock.patch.object(role, "current_binding", side_effect=AssertionError("snapshot must not execute")) as current_binding,
                 mock.patch.object(role, "committed_diff", return_value=b"frozen diff"),
                 mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], None, None)),
                 mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
-                mock.patch.object(role, "run_bounded_capture", return_value=completed),
+                mock.patch.object(role, "run_bounded_capture", side_effect=AssertionError("reviewer must not execute")) as execute,
                 mock.patch.object(role, "classify_result", return_value="passed"),
                 self.assertRaisesRegex(RuntimeError, "attempt binding is invalid"),
             ):
@@ -170,6 +170,8 @@ class GrokReviewRoleTests(unittest.TestCase):
                     "--output", str(output), "--", "grok", "--model", "grok-4.6",
                     "Review the frozen diff",
                 ])
+            current_binding.assert_not_called()
+            execute.assert_not_called()
             self.assertFalse(output.exists())
 
     def test_streaming_review_command_embeds_bound_diff_without_repository_tools(self) -> None:

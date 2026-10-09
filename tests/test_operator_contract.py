@@ -3135,6 +3135,7 @@ class OperatorContractTests(unittest.TestCase):
             provenance = job["scope"]["decision_review_provenance"]
             expected_path = jobs / job["unit"] / operator.decision_reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
             self.assertEqual(provenance["schema_version"], 2)
+            self.assertEqual(job["scope"]["decision_review_attempt_epoch"], 2)
             self.assertEqual(provenance["attempt_unit"], job["unit"])
             self.assertEqual(provenance["role_receipt_path"], str(expected_path))
             self.assertNotEqual(provenance["role_receipt_path"], str(output))
@@ -3239,6 +3240,45 @@ class OperatorContractTests(unittest.TestCase):
                 self.assertEqual(job["scope"]["decision_review_provenance"]["attempt_unit"], job["unit"])
                 persisted = json.loads(Path(job["metadata_path"]).read_text(encoding="utf-8"))
                 self.assertEqual(persisted["origin_sha256"], job["origin_sha256"])
+
+
+    def test_noncanonical_review_module_cannot_create_job_directory(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, cwd = root / "state", root / "state/jobs", root / "cwd"
+            cwd.mkdir(mode=0o700)
+            binding = {
+                "schema_version": 1,
+                "kind": operator.decision_reviews.BINDING_KIND,
+                "repo": "heimgewebe/vibe-lab",
+                "pr": 350,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+                "diff_sha256": "c" * 64,
+                "slot": "independent-claude-review",
+            }
+            alternate = [
+                "/opt/immutable-release/.venv/bin/python",
+                "-I", "-m", "grabowski_agent_role",
+                "--role", "review", "--output", str(root / "shared.json"),
+            ]
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(
+                operator, "_validate_argv", return_value=alternate
+            ), patch.object(
+                operator.uuid, "uuid4",
+                return_value=types.SimpleNamespace(hex="a11111111111" + "f" * 20),
+            ), patch.object(
+                operator, "_run", side_effect=AssertionError("must not launch")
+            ):
+                with self.assertRaisesRegex(ValueError, "noncanonical"):
+                    operator._start_job(
+                        alternate, cwd=str(cwd), runtime_seconds=60,
+                        decision_review_binding=binding,
+                    )
+            self.assertEqual(list(jobs.glob("grabowski-job-*")), [])
 
     def test_broad_github_wrapper_blocks_merge_bypass_paths(self) -> None:
         operator = _load_operator_module()

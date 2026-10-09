@@ -155,6 +155,7 @@ def make_job(
     review_role: bool = False,
     attempt_bound: bool = False,
     origin_provenance: bool = True,
+    attempt_epoch: int | None = None,
     metadata_argv_override: list[str] | None = None,
     created_at_unix: int = 1_787_000_000,
     started_at_unix_ns: int | None = None,
@@ -215,6 +216,8 @@ def make_job(
     }
     if started_at_unix_ns is not None:
         scope["started_at_unix_ns"] = started_at_unix_ns
+    if attempt_epoch is not None:
+        scope["decision_review_attempt_epoch"] = attempt_epoch
     if review_role and origin_provenance:
         provenance = reviews.review_role_provenance(
             job_argv, normalized_binding, cwd=Path("/tmp/review"),
@@ -1805,6 +1808,106 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         attempts = {a["unit"]: a for a in outcome["attempts"]}
         self.assertEqual(attempts["grabowski-job-a66666666666"]["classification"], "invalid_result")
         self.assertEqual(attempts["grabowski-job-b77777777777"]["classification"], "pass")
+
+
+    def test_noncanonical_release_role_runner_is_rejected_before_start(self) -> None:
+        command = [
+            "/opt/grabowski-releases/release/.venv/bin/python", "-I",
+            "-m", reviews.REVIEW_ROLE_MODULE,
+            "--role", "review", "--output", "/tmp/shared-receipt.json",
+        ]
+        with self.assertRaisesRegex(ValueError, "noncanonical"):
+            reviews.bind_job_review_role_argv(
+                command, reviews.normalize_binding(binding("A")),
+                cwd=Path("/tmp/review"),
+                attempt_directory=Path("/tmp/grabowski-job-a11111111111"),
+            )
+        generic = ["python3", "-c", "print('safe generic decision marker')"]
+        self.assertEqual(
+            reviews.bind_job_review_role_argv(
+                generic, reviews.normalize_binding(binding("A")),
+                cwd=Path("/tmp/review"),
+                attempt_directory=Path("/tmp/grabowski-job-a11111111111"),
+            ),
+            generic,
+        )
+
+    def test_epoch_two_does_not_reconstruct_legacy_role_on_missing_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="b88888888888", slot="A",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, origin_provenance=False,
+                attempt_epoch=2,
+            )
+            outcome = self.reconcile(jobs)
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertEqual(outcome["attempts"][0]["review_role_verified"], False)
+        self.assertEqual(outcome["attempts"][0]["independence_verified"], False)
+
+    def test_epoch_two_rejects_historical_v1_role_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="c99999999999", slot="A",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, origin_provenance=True,
+                attempt_bound=False, attempt_epoch=2,
+            )
+            outcome = self.reconcile(jobs)
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertTrue(any(
+            error.startswith("decision_review_origin_invalid:grabowski-job-c99999999999:")
+            for error in outcome["errors"]
+        ))
+
+    def test_fifo_evidence_files_fail_without_blocking_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            fifo = directory / "metadata.json"
+            os.mkfifo(fifo, 0o600)
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                reviews._read_private_json(fifo, 1024)
+            fifo.unlink()
+            fifo = directory / "stdout.log"
+            os.mkfifo(fifo, 0o600)
+            with self.assertRaisesRegex(ValueError, "regular file"):
+                reviews._read_stdout_tail(fifo)
+
+    def test_stdout_tail_does_not_follow_mid_read_symlink_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            trusted = directory / "stdout.log"
+            trusted.write_bytes(b"trusted review marker")
+            os.chmod(trusted, 0o600)
+            # Keep a link to the opened inode so fstat(nlink == 1) holds
+            # after the pathname is replaced with an unrelated symlink.
+            held = directory / "held"
+            os.link(trusted, held)
+            outside = directory / "synthetic-secret"
+            outside.write_bytes(b"SYNTHETIC_CROSS_FILE_READ")
+            os.chmod(outside, 0o600)
+            real_open = os.open
+            swapped = False
+
+            def swap_after_fd_open(name, flags, *args, **kwargs):
+                nonlocal swapped
+                descriptor = real_open(name, flags, *args, **kwargs)
+                if name == "stdout.log" and not swapped:
+                    trusted.unlink()
+                    trusted.symlink_to(outside)
+                    swapped = True
+                return descriptor
+
+            with mock.patch.object(reviews.os, "open", side_effect=swap_after_fd_open):
+                content, digest = reviews._read_stdout_tail(trusted)
+            self.assertTrue(swapped)
+            self.assertEqual(content, "trusted review marker")
+            self.assertEqual(digest, hashlib.sha256(b"trusted review marker").hexdigest())
+            self.assertNotIn("SYNTHETIC_CROSS_FILE_READ", content)
 
 
 if __name__ == "__main__":

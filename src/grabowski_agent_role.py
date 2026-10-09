@@ -1099,6 +1099,24 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("invalid command or binding")
     expected_dirty = args.expected_dirty == "true"
+    # Validate the trusted job envelope before spawning an external reviewer.
+    attempt_unit = os.environ.get("GRABOWSKI_REVIEW_ATTEMPT_UNIT")
+    if attempt_unit is not None:
+        origin_sha256 = os.environ.get("GRABOWSKI_JOB_ORIGIN_SHA256")
+        job_directory = Path(os.environ.get("GRABOWSKI_JOB_DIRECTORY", ""))
+        if (
+            args.role != "review"
+            or REVIEW_ATTEMPT_UNIT.fullmatch(attempt_unit) is None
+            or os.environ.get("GRABOWSKI_JOB_UNIT") != attempt_unit
+            or os.environ.get("GRABOWSKI_JOB_ID") != attempt_unit.removeprefix("grabowski-job-")
+            or origin_sha256 is None
+            or SHA256.fullmatch(origin_sha256) is None
+            or not job_directory.is_absolute()
+            or job_directory.name != attempt_unit
+            or output != job_directory / REVIEW_ATTEMPT_RECEIPT_NAME
+        ):
+            raise RuntimeError("job-owned review attempt binding is invalid")
+
     review_artifact_values = (
         args.review_input_root, args.review_input_path, args.review_input_sha256
     )
@@ -1260,22 +1278,7 @@ def main(argv: list[str] | None = None) -> int:
                     payload["returncode"] = 126
                     payload["error"] = "non-PASS review must contain findings"
     payload["failure_classification"] = classify_result(args.role, command, repo, payload)
-    attempt_unit = os.environ.get("GRABOWSKI_REVIEW_ATTEMPT_UNIT")
     if attempt_unit is not None:
-        origin_sha256 = os.environ.get("GRABOWSKI_JOB_ORIGIN_SHA256")
-        job_directory = Path(os.environ.get("GRABOWSKI_JOB_DIRECTORY", ""))
-        if (
-            args.role != "review"
-            or REVIEW_ATTEMPT_UNIT.fullmatch(attempt_unit) is None
-            or os.environ.get("GRABOWSKI_JOB_UNIT") != attempt_unit
-            or os.environ.get("GRABOWSKI_JOB_ID") != attempt_unit.removeprefix("grabowski-job-")
-            or origin_sha256 is None
-            or SHA256.fullmatch(origin_sha256) is None
-            or not job_directory.is_absolute()
-            or job_directory.name != attempt_unit
-            or output != job_directory / REVIEW_ATTEMPT_RECEIPT_NAME
-        ):
-            raise RuntimeError("job-owned review attempt binding is invalid")
         payload["review_attempt_unit"] = attempt_unit
         payload["review_attempt_origin_sha256"] = origin_sha256
     stable = dict(payload)

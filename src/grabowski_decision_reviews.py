@@ -360,9 +360,9 @@ def decision_review_lock(binding: dict[str, Any]) -> Iterator[None]:
             os.close(descriptor)
 
 
-def _read_private_json(path: Path, max_bytes: int) -> dict[str, Any]:
-    """Read one stable owner-private inode without following the receipt path."""
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+def _read_private_bytes(path: Path, max_bytes: int) -> bytes:
+    """Read a size-bounded, owner-private regular file through a stable fd."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
     parent_fd = os.open(path.parent, flags | os.O_DIRECTORY)
     try:
         parent = os.fstat(parent_fd)
@@ -400,10 +400,16 @@ def _read_private_json(path: Path, max_bytes: int) -> dict[str, Any]:
                     after.st_size, after.st_mtime_ns, after.st_ctime_ns)
             ):
                 raise ValueError(f"{path.name} changed during read")
+            return bytes(content)
         finally:
             os.close(descriptor)
     finally:
         os.close(parent_fd)
+
+
+def _read_private_json(path: Path, max_bytes: int) -> dict[str, Any]:
+    """Read one stable owner-private JSON object without following its path."""
+    content = _read_private_bytes(path, max_bytes)
     try:
         value = json.loads(content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -414,16 +420,7 @@ def _read_private_json(path: Path, max_bytes: int) -> dict[str, Any]:
 
 
 def _read_stdout_tail(path: Path) -> tuple[str, str]:
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise ValueError("stdout.log is not one regular file")
-    if stat.S_IMODE(metadata.st_mode) & 0o077:
-        raise ValueError("stdout.log must be private")
-    if metadata.st_size > MAX_STDOUT_TAIL_BYTES:
-        raise ValueError("stdout.log exceeds the decision review output limit")
-    payload = path.read_bytes()
-    if len(payload) > MAX_STDOUT_TAIL_BYTES:
-        raise ValueError("stdout.log exceeds the decision review output limit")
+    payload = _read_private_bytes(path, MAX_STDOUT_TAIL_BYTES)
     return payload.decode("utf-8", errors="replace"), hashlib.sha256(payload).hexdigest()
 
 
@@ -488,11 +485,20 @@ def _validated_origin_binding(directory: Path) -> tuple[dict[str, Any], dict[str
     origin_cwd = scope.get("cwd")
     if not isinstance(origin_cwd, str) or not origin_cwd:
         raise ValueError("job origin cwd is invalid")
+    attempt_epoch = scope.get("decision_review_attempt_epoch")
+    if attempt_epoch is not None and attempt_epoch != 2:
+        raise ValueError("decision review attempt epoch is invalid")
     provenance = _normalize_review_role_provenance(
         scope.get("decision_review_provenance"), binding, cwd=origin_cwd,
         attempt_directory=directory,
     )
-    if provenance is None:
+    if (
+        attempt_epoch == 2
+        and provenance is not None
+        and provenance.get("schema_version") != 2
+    ):
+        raise ValueError("new decision review attempt cannot use historical role provenance")
+    if provenance is None and attempt_epoch is None:
         exact_argv = metadata.get("argv")
         if (
             isinstance(exact_argv, list)
@@ -743,6 +749,14 @@ def bind_job_review_role_argv(
 ) -> list[str]:
     """Bind one canonical independent reviewer to a unique job-owned receipt."""
     if tuple(argv[:4]) != REVIEW_ROLE_LAUNCHER_PREFIX:
+        # Accept generic, origin-bound review jobs, but never admit a role
+        # launcher under a release-python alias or other wrapper as V1.
+        if any(
+            item == REVIEW_ROLE_MODULE
+            or Path(item).name == f"{REVIEW_ROLE_MODULE}.py"
+            for item in argv
+        ):
+            raise ValueError("noncanonical decision-bound role launcher is not admitted")
         return argv
     if review_role_provenance(argv, binding, cwd=cwd) is None:
         raise ValueError("decision-bound role launcher is not a valid read-only reviewer")
