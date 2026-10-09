@@ -1724,5 +1724,99 @@ class CodexReviewSettlementTests(unittest.TestCase):
 
 
 
+    def test_collect_files_paginates_152_without_losing_changes(self) -> None:
+        files = [{"path": f"evidence/fixture-{index:03}.json"} for index in range(152)]
+        initial = connection(files[:100], hasNextPage=True, endCursor="file-cursor-100")
+        response = {
+            "data": {"repository": {"pullRequest": {
+                "headRefOid": HEAD,
+                "baseRefOid": BASE,
+                "changedFiles": 152,
+                "files": connection(files[100:], hasNextPage=False, endCursor="file-cursor-152"),
+            }}}
+        }
+        with mock.patch.object(settlement, "_run_json", return_value=response) as api:
+            result = settlement._collect_files(
+                ROOT, "heimgewebe", "grabowski", PR, initial,
+                changed_files=152, head_sha=HEAD, base_sha=BASE,
+            )
+        self.assertEqual([f["path"] for f in files], [f["path"] for f in result["nodes"]])
+        self.assertEqual({"hasNextPage": False, "pages_loaded": 2}, result["pageInfo"])
+        self.assertIn("after=file-cursor-100", api.call_args.args[1])
+
+    def test_collect_files_does_not_page_complete_100_items(self) -> None:
+        files = [{"path": f"evidence/{i}.json"} for i in range(100)]
+        with mock.patch.object(settlement, "_run_json") as api:
+            result = settlement._collect_files(
+                ROOT, "heimgewebe", "grabowski", PR,
+                connection(files, hasNextPage=False),
+                changed_files=100, head_sha=HEAD, base_sha=BASE,
+            )
+        self.assertEqual(100, len(result["nodes"]))
+        api.assert_not_called()
+
+    def test_collect_files_rejects_incomplete_or_duplicate_history(self) -> None:
+        initial = connection([{"path": "evidence/first.json"}], hasNextPage=False)
+        with self.assertRaisesRegex(settlement.SettlementError, "changedFiles"):
+            settlement._collect_files(
+                ROOT, "heimgewebe", "grabowski", PR, initial,
+                changed_files=152, head_sha=HEAD, base_sha=BASE,
+            )
+        duplicated = connection([
+            {"path": "evidence/first.json"}, {"path": "evidence/first.json"}
+        ], hasNextPage=False)
+        with self.assertRaisesRegex(settlement.SettlementError, "duplicate"):
+            settlement._collect_files(
+                ROOT, "heimgewebe", "grabowski", PR, duplicated,
+                changed_files=2, head_sha=HEAD, base_sha=BASE,
+            )
+
+    def test_collect_files_fails_closed_on_invalid_cursor(self) -> None:
+        for cursor in (None, "", 3):
+            initial = connection([{"path": "a"}], hasNextPage=True, endCursor=cursor)
+            with self.subTest(cursor=cursor), mock.patch.object(settlement, "_run_json") as api:
+                with self.assertRaisesRegex(settlement.SettlementError, "cursor"):
+                    settlement._collect_files(
+                        ROOT, "heimgewebe", "grabowski", PR, initial,
+                        changed_files=2, head_sha=HEAD, base_sha=BASE,
+                    )
+                api.assert_not_called()
+
+    def test_collect_files_rejects_revision_or_count_drift(self) -> None:
+        initial = connection([{"path": "a"}], hasNextPage=True, endCursor="next")
+        for field, value in (
+            ("headRefOid", "d" * 40),
+            ("baseRefOid", "e" * 40),
+            ("changedFiles", 3),
+        ):
+            response = {"headRefOid": HEAD, "baseRefOid": BASE, "changedFiles": 2,
+                        "files": connection([{"path": "b"}], hasNextPage=False)}
+            response[field] = value
+            payload = {"data": {"repository": {"pullRequest": response}}}
+            with self.subTest(field=field), mock.patch.object(
+                settlement, "_run_json", return_value=payload
+            ):
+                with self.assertRaisesRegex(settlement.SettlementError, "drift"):
+                    settlement._collect_files(
+                        ROOT, "heimgewebe", "grabowski", PR, initial,
+                        changed_files=2, head_sha=HEAD, base_sha=BASE,
+                    )
+
+    def test_collect_files_enforces_hard_page_bound(self) -> None:
+        initial = connection([{"path": "a"}], hasNextPage=True, endCursor="one")
+        payload = {"data": {"repository": {"pullRequest": {
+            "headRefOid": HEAD, "baseRefOid": BASE, "changedFiles": 2,
+            "files": connection([{"path": "b"}], hasNextPage=True, endCursor="two"),
+        }}}}
+        with mock.patch.object(settlement, "MAX_FILE_PAGES", 2), mock.patch.object(
+            settlement, "MAX_FILE_ITEMS", 200
+        ), mock.patch.object(settlement, "_run_json", return_value=payload):
+            with self.assertRaisesRegex(settlement.SettlementError, "bounded 200"):
+                settlement._collect_files(
+                    ROOT, "heimgewebe", "grabowski", PR, initial,
+                    changed_files=2, head_sha=HEAD, base_sha=BASE,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
