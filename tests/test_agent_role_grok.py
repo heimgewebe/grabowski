@@ -767,15 +767,153 @@ class GrokReviewRoleTests(unittest.TestCase):
                 self.assertIsNone(result)
                 self.assertIsNotNone(failure)
 
-    def test_claude_review_does_not_reuse_unbound_candidate_diff(self) -> None:
-        # Caller-provided review text must not substitute an exact Git three-dot
-        # diff; a dirty Claude candidate has no safely frozen input artifact.
+    def test_claude_review_selects_only_the_bound_route(self) -> None:
+        # Provider selection grants no authority to pass caller-supplied review text.
+        # Dirty Claude still requires the verified frozen-writer artifact.
         source = [
             "claude", "--model", "claude-opus-5-5", "--effort", "high",
             "--permission-mode", "plan", "Please review the current draft",
         ]
-        self.assertTrue(role._claude_review_requires_clean_source(source))
-        self.assertFalse(role._claude_review_requires_clean_source(["grok"]))
+        self.assertTrue(role._is_claude_review_route(source))
+        self.assertFalse(role._is_claude_review_route(["grok"]))
+
+    def test_dirty_claude_main_uses_same_verified_patch_as_grok(self) -> None:
+        head, base, binding = "a" * 40, "b" * 40, "c" * 64
+        patch = b"diff --git a/app.py b/app.py\n+frozen writer change\n"
+        envelope = json.dumps({
+            "type": "result", "subtype": "success", "is_error": False,
+            "structured_output": {"verdict": "PASS", "findings": []},
+        }).encode()
+        completed = SimpleNamespace(
+            returncode=0, stdout_sha256=hashlib.sha256(envelope).hexdigest(),
+            stderr_sha256=hashlib.sha256(b"").hexdigest(),
+            stdout_bytes=len(envelope), stderr_bytes=0,
+            stdout_tail="", stderr_tail="",
+            output_limit_exceeded=False, stdout_content_exceeded=False,
+            stdout_content=envelope,
+        )
+        routes = (
+            ("claude", "--model", "claude-opus-5-5", "--effort", "high",
+             "--permission-mode", "plan", "Review the frozen change"),
+            ("claude", "-p", "--safe-mode", "--permission-mode", "plan",
+             "--model", "claude-fable-5", "--effort", "high", "Review the frozen change"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "gaw-b2345678"
+            workspace.mkdir(mode=0o700)
+            artifact = workspace / "writer.patch"
+            artifact.write_bytes(patch)
+            os.chmod(artifact, 0o600)
+            sha = hashlib.sha256(patch).hexdigest()
+            for index, command in enumerate(routes):
+                with (
+                    self.subTest(command=command),
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch.object(role, "current_binding",
+                                      side_effect=[(head, binding, True)] * 2),
+                    mock.patch.object(role, "committed_diff") as committed,
+                    mock.patch.object(
+                        role, "_review_sandbox_argv",
+                        return_value=(["sandbox"], role.CLAUDE_REVIEW_JSON_CONTRACT, b"stdin"),
+                    ) as sandbox,
+                    mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                    mock.patch.object(role, "run_bounded_capture", return_value=completed),
+                ):
+                    receipt_path = root / f"review-{index}.json"
+                    self.assertEqual(role.main([
+                        "--role", "review", "--repository", str(ROOT),
+                        "--expected-head", head, "--expected-base-head", base,
+                        "--expected-diff-sha256", binding,
+                        "--expected-dirty", "true",
+                        "--review-input-root", str(root),
+                        "--review-input-path", str(artifact),
+                        "--review-input-sha256", sha,
+                        "--output", str(receipt_path), "--", *command,
+                    ]), 0)
+                    committed.assert_not_called()
+                    self.assertEqual(patch, sandbox.call_args.kwargs["review_diff"])
+                    self.assertEqual(
+                        "frozen_writer_patch", sandbox.call_args.kwargs["review_input_source"]
+                    )
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    self.assertEqual("frozen_writer_patch", receipt["review_input_source"])
+                    self.assertEqual(sha, receipt["review_input_sha256"])
+                    self.assertEqual("PASS", receipt["verdict"])
+
+    def test_dirty_claude_invalid_patch_hash_blocks_before_provider(self) -> None:
+        head, base, binding = "a" * 40, "b" * 40, "c" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "gaw-b2345678"
+            workspace.mkdir(mode=0o700)
+            artifact = workspace / "writer.patch"
+            artifact.write_bytes(b"diff --git a/file b/file\n+safe input\n")
+            os.chmod(artifact, 0o600)
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(role, "current_binding", return_value=(head, binding, True)),
+                mock.patch.object(role, "_review_sandbox_argv") as sandbox,
+                mock.patch.object(role, "run_bounded_capture") as execute,
+                self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"),
+            ):
+                role.main([
+                    "--role", "review", "--repository", str(ROOT),
+                    "--expected-head", head, "--expected-base-head", base,
+                    "--expected-diff-sha256", binding, "--expected-dirty", "true",
+                    "--review-input-root", str(root),
+                    "--review-input-path", str(artifact),
+                    "--review-input-sha256", "0" * 64,
+                    "--output", str(root / "invalid.json"), "--",
+                    "claude", "--model", "claude-opus-5-5",
+                    "--effort", "high", "--permission-mode", "plan", "Review this",
+                ])
+            sandbox.assert_not_called()
+            execute.assert_not_called()
+
+    def test_clean_claude_rejects_unexpected_frozen_patch(self) -> None:
+        head, base, binding = "a" * 40, "b" * 40, "c" * 64
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(role, "current_binding", return_value=(head, binding, False)),
+            mock.patch.object(role, "committed_diff") as committed,
+            mock.patch.object(role, "_review_sandbox_argv") as sandbox,
+            self.assertRaisesRegex(RuntimeError, "clean Claude review"),
+        ):
+            role.main([
+                "--role", "review", "--repository", str(ROOT),
+                "--expected-head", head, "--expected-base-head", base,
+                "--expected-diff-sha256", binding, "--expected-dirty", "false",
+                "--review-input-root", "/tmp/gaw-root",
+                "--review-input-path", "/tmp/gaw-root/gaw-b2345678/writer.patch",
+                "--review-input-sha256", "d" * 64,
+                "--output", "/tmp/claude-clean-unexpected-artifact.json", "--",
+                "claude", "--model", "claude-opus-5-5",
+                "--effort", "high", "--permission-mode", "plan", "Review this",
+            ])
+        committed.assert_not_called()
+        sandbox.assert_not_called()
+
+    def test_claude_prompt_identifies_frozen_patch_not_committed_diff(self) -> None:
+        declared = (
+            "/opt/grabowski-external/claude", "--model", "claude-opus-5-5",
+            "--effort", "high", "--permission-mode", "plan", "Review exact input",
+        )
+        diff = b"diff --git a/f b/f\n+frozen\n"
+        actual, prompt = role._claude_json_review_command(
+            declared, expected_head="a" * 40, expected_base_head="b" * 40,
+            review_diff=diff, review_input_source="frozen_writer_patch",
+        )
+        self.assertIn(b"verified frozen writer patch", prompt)
+        self.assertNotIn(b"committed Git diff", prompt)
+        self.assertIn(hashlib.sha256(diff).hexdigest().encode(), prompt)
+        self.assertIn(b"frozen", prompt)
+        self.assertNotIn("frozen", " ".join(actual))
+        with self.assertRaisesRegex(RuntimeError, "source"):
+            role._claude_json_review_command(
+                declared, expected_head="a" * 40, expected_base_head="b" * 40,
+                review_diff=diff, review_input_source="caller_supplied_text",
+            )
 
     def test_claude_main_emits_job_bound_receipt_from_success_envelope(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -871,7 +1009,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                 mock.patch.object(role, "committed_diff") as frozen,
                 mock.patch.object(role, "_review_sandbox_argv") as sandbox,
                 mock.patch.object(role, "run_bounded_capture") as execute,
-                self.assertRaisesRegex(RuntimeError, "clean committed diff"),
+                self.assertRaisesRegex(RuntimeError, "requires the frozen writer patch artifact"),
             ):
                 role.main([
                     "--role", "review", "--repository", str(ROOT),
