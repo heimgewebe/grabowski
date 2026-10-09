@@ -15,7 +15,7 @@ Vor jeder Mutation müssen mindestens vorliegen:
 
 ## Adaptive Einstiegskapsel
 
-Für konkrete Statusfragen zuerst den engsten zuständigen typisierten Read verwenden (`grabowski_runtime_health`, `grabowski_git_status`, `grabowski_github_pr_view`, `grabowski_task_status`, `grabowski_task_list(state="active")` oder `grabowski_resource_list`). `grabowski_context(profile="concise")` dient der tatsächlich erforderlichen quellenübergreifenden Orientierung; `grabowski_current_work` bleibt der kombinierten Arbeitslage über Tasks, Leases, Checkouts und Prozesse vorbehalten. Solche Lesewege sind keine Mutationsfreigabe: Vor Mutation oder Ressourcenkoordination weiterhin die zuständigen vollständigen Live-Gates für Arbeit, Leases, Audit, Kill-Switch, Review, Captain und Deployment prüfen.
+Für konkrete Statusfragen zuerst den engsten zuständigen typisierten Read verwenden (`grabowski_runtime_health`, `grabowski_git_status`, `grabowski_github_pr_view`, `grabowski_task_status`, `grabowski_task_list(state="active")` oder `grabowski_resource_list`). `grabowski_context(profile="concise")` dient der tatsächlich erforderlichen quellenübergreifenden Orientierung; `grabowski_current_work` bleibt der kombinierten Arbeitslage über Tasks, Leases, Checkouts und Prozesse vorbehalten. Solche Lesewege sind keine Mutationsfreigabe: Vor Mutation oder Ressourcenkoordination weiterhin die vollständigen, für die konkrete Aktion einschlägigen Live-Gates prüfen (Arbeit, Leases, Audit und Kill-Switch; Review, Captain und Deployment nur, wenn der jeweilige Vorgang diese Gates verlangt).
 
 Bei nicht trivialer, breiter, transportempfindlicher oder mutierender Arbeit zuerst den frischen Runtime- und Connector-Zustand lesen und anschließend `grabowski_agent_bootstrap` verwenden.
 
