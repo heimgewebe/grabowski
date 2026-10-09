@@ -986,6 +986,29 @@
         "tool": "grabowski_juno_status"
       }
     },
+    "grabowski_mcp_liveness": {
+      "evidence_refs": [
+        "docs:typed-read-surface.md",
+        "tests:test_component_watchdog.py",
+        "tests:test_read_surface.py"
+      ],
+      "exception_detail": {
+        "claim": "Dispatch liveness must be a separate named read response to protect existing integrity-health consumers.",
+        "evidence": "Strict watchdog schema and scope validation, restored legacy integrity regression and bounded liveness regression."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Overloading healthy on grabowski_runtime_health permits legacy consumers to silently treat dispatch success as deployment and audit integrity.",
+      "rationale": "A distinct versioned dispatch_healthy result is required to prevent a false integrity PASS while retaining the original health semantics and avoiding historical audit scans in the watchdog.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "context",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_mcp_liveness"
+      }
+    },
     "grabowski_merge_delivery_record": {
       "evidence_refs": [
         "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T048",

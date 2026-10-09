@@ -1183,6 +1183,72 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertFalse(health["audit_writable"])
         self.assertEqual(health["audit_state"], "storage_exhausted")
 
+    def test_mcp_dispatch_liveness_is_bounded_and_not_integrity(self) -> None:
+        with (
+            patch.object(read_surface.base, "_deployment_metadata", side_effect=AssertionError("deployment read")),
+            patch.object(read_surface.base, "_verify_audit_log", side_effect=AssertionError("audit read")),
+            patch.object(read_surface.base, "_audit_records_snapshot", side_effect=AssertionError("history snapshot")),
+            patch.object(read_surface.base, "_kill_switch_state", side_effect=AssertionError("kill-switch read")),
+            patch.object(read_surface.runtime_extensions, "runtime_service_model", side_effect=AssertionError("service projection")),
+        ):
+            liveness = read_surface.grabowski_mcp_liveness()
+        self.assertEqual(liveness["schema_version"], 1)
+        self.assertEqual(liveness["service"], "grabowski-mcp")
+        self.assertEqual(liveness["health_scope"], "mcp_tool_dispatch")
+        self.assertIs(liveness["dispatch_healthy"], True)
+        self.assertIs(liveness["integrity_evaluated"], False)
+        self.assertNotIn("healthy", liveness)
+        self.assertNotIn("audit_valid", liveness)
+        self.assertIn("mutation_readiness", liveness["does_not_establish"])
+
+    def test_mcp_liveness_has_no_history_size_dependency(self) -> None:
+        responses = []
+        for count in (0, 1_000, 1_000_000):
+            with (
+                patch.object(read_surface.base, "_deployment_metadata") as deployment,
+                patch.object(read_surface.base, "_verify_audit_log") as audit,
+                patch.object(read_surface.base, "_audit_records_snapshot") as snapshot,
+                patch.object(read_surface.base, "_kill_switch_state") as kill_switch,
+            ):
+                responses.append(read_surface.grabowski_mcp_liveness())
+                for provider in (deployment, audit, snapshot, kill_switch):
+                    provider.assert_not_called()
+        self.assertEqual(responses[0], responses[1])
+        self.assertEqual(responses[1], responses[2])
+
+    def test_runtime_health_preserves_integrity_contract_and_legacy_consumer(self) -> None:
+        deployment = {
+            "completion_status": "complete",
+            "release_id": "test-release",
+            "repo_head": "a" * 40,
+            **{field: True for field in read_surface.DEPLOYMENT_INTEGRITY_FIELDS},
+        }
+        audit = {"valid": True, "audit_writable": True, "audit_total_records": 10}
+        cases = (
+            (deployment, audit, {"engaged": False}, True),
+            (deployment, {**audit, "valid": False}, {"engaged": False}, False),
+            (deployment, {**audit, "audit_writable": False}, {"engaged": False}, False),
+            (deployment, audit, {"engaged": True}, False),
+            ({**deployment, "completion_status": "incomplete"}, audit, {"engaged": False}, False),
+            ({**deployment, read_surface.DEPLOYMENT_INTEGRITY_FIELDS[0]: False}, audit, {"engaged": False}, False),
+        )
+        for metadata, audit_result, switch, expected in cases:
+            with (
+                self.subTest(expected=expected, audit=audit_result, kill_switch=switch),
+                patch.object(read_surface.base, "_deployment_metadata", return_value=metadata),
+                patch.object(read_surface.base, "_verify_audit_log", return_value=audit_result),
+                patch.object(read_surface.base, "_kill_switch_state", return_value=switch),
+                patch.object(read_surface.runtime_extensions, "runtime_service_model", return_value={"scope": "logical"}),
+            ):
+                health = read_surface.grabowski_runtime_health()
+            self.assertIs(health["healthy"], expected)
+            self.assertIs(health["audit_valid"], audit_result["valid"])
+            self.assertIs(health["audit_writable"], audit_result["audit_writable"])
+            self.assertIs(health["kill_switch_engaged"], switch["engaged"])
+            self.assertEqual(health["release_id"], "test-release")
+            self.assertNotIn("health_scope", health)
+            self.assertIs(read_surface.grabowski_mcp_liveness()["dispatch_healthy"], True)
+
     def test_github_fields_exclude_body_and_comments(self) -> None:
         fields = set(read_surface.GITHUB_PR_FIELDS)
         self.assertNotIn("body", fields)
