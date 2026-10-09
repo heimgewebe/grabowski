@@ -15,7 +15,7 @@ Vor jeder Mutation müssen mindestens vorliegen:
 
 ## Adaptive Einstiegskapsel
 
-Für begrenzte read-only Operator-Orientierung zuerst `grabowski_context(profile="concise")` verwenden. Spezialisierte Reads nur nachladen, wenn die konkrete Entscheidung zusätzliche Autorität benötigt. Dieser kompakte Kontext ist keine Mutationsfreigabe; vor Mutation oder Ressourcenkoordination weiterhin die zuständigen Live-Autoritäten für Arbeit, Leases, Audit, Kill-Switch und die jeweilige Aktion lesen.
+Für konkrete Statusfragen zuerst den engsten zuständigen typisierten Read verwenden (`grabowski_runtime_health`, `grabowski_git_status`, `grabowski_github_pr_view`, `grabowski_task_status`, `grabowski_task_list(state="active")` oder `grabowski_resource_list`). `grabowski_context(profile="concise")` dient der tatsächlich erforderlichen quellenübergreifenden Orientierung; `grabowski_current_work` bleibt der kombinierten Arbeitslage über Tasks, Leases, Checkouts und Prozesse vorbehalten. Solche Lesewege sind keine Mutationsfreigabe: Vor Mutation oder Ressourcenkoordination weiterhin die zuständigen vollständigen Live-Gates für Arbeit, Leases, Audit, Kill-Switch, Review, Captain und Deployment prüfen.
 
 Bei nicht trivialer, breiter, transportempfindlicher oder mutierender Arbeit zuerst den frischen Runtime- und Connector-Zustand lesen und anschließend `grabowski_agent_bootstrap` verwenden.
 
