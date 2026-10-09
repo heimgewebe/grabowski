@@ -1358,6 +1358,79 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
             _, _, commit, _ = runner._bound_repoground_manifest(value)
             self.assertEqual(commit, COMMIT)
 
+    def _bind_repositories(self, directory: str, repositories: list[dict]) -> dict:
+        value = request(condition="treatment")
+        bind_manifest(
+            value,
+            Path(directory),
+            provenance_key="snapshotProvenance",
+            repositories=repositories,
+        )
+        return value
+
+    def test_bound_manifest_normalizes_canonical_identity_forms(self) -> None:
+        sha = "c" * 40
+        forms = (
+            "repo.git",
+            "owner/repo",
+            "owner__repo__main",
+            f"owner__repo__main--{sha}",
+            f"owner__repo__main--{'d' * 64}--recovery-0123456789ab",
+        )
+        for form in forms:
+            for singleton in (True, False):
+                with self.subTest(form=form, singleton=singleton), tempfile.TemporaryDirectory() as directory:
+                    repositories = [{"repository": form, "git_commit": COMMIT}]
+                    if not singleton:
+                        repositories.insert(
+                            0,
+                            {"repository": "owner__other__main", "git_commit": "b" * 40},
+                        )
+                    value = self._bind_repositories(directory, repositories)
+                    _, _, commit, _ = runner._bound_repoground_manifest(value)
+                    self.assertEqual(commit, COMMIT)
+
+    def test_bound_manifest_rejects_foreign_and_unknown_identities(self) -> None:
+        cases = (
+            [{"repository": "owner__other__main"}, {"repository": "x__y__main"}],
+            [{"repository": "owner__repo-x__main"}, {"repository": "owner/repo-x"}],
+            [{"repository": "repo__other__main"}, {"repository": "other"}],
+            [{"repository": "owner__repo"}, {"repository": "owner__repo__"}],
+            [{"repository": "owner__repo__main/x"}, {"repository": "other"}],
+        )
+        for repositories in cases:
+            with self.subTest(repositories=repositories), tempfile.TemporaryDirectory() as directory:
+                value = self._bind_repositories(
+                    directory,
+                    [dict(item, git_commit=COMMIT) for item in repositories],
+                )
+                with self.assertRaises(runner.RunnerError):
+                    runner._bound_repoground_manifest(value)
+        with tempfile.TemporaryDirectory() as directory:
+            value = self._bind_repositories(
+                directory, [{"repository": "owner__other__main", "git_commit": COMMIT}]
+            )
+            with self.assertRaises(runner.RunnerError):
+                runner._bound_repoground_manifest(value)
+
+    def test_bound_manifest_rejects_ambiguous_normalized_aliases(self) -> None:
+        for first, second in (
+            ("repo.git", "owner__repo__main"),
+            ("owner__repo__main", f"other__repo__dev--{'c' * 40}"),
+            ("owner__repo__main", "owner__repo__main--" + "c" * 64),
+            ("heimgewebe/repo", "heimgewebe__repo__main"),
+        ):
+            with self.subTest(first=first, second=second), tempfile.TemporaryDirectory() as directory:
+                value = self._bind_repositories(
+                    directory,
+                    [
+                        {"repository": first, "git_commit": COMMIT},
+                        {"repository": second, "git_commit": "b" * 40},
+                    ],
+                )
+                with self.assertRaises(runner.RunnerError):
+                    runner._bound_repoground_manifest(value)
+
     def test_mismatched_singleton_provenance_yields_no_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")

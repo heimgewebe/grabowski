@@ -1333,12 +1333,67 @@ def _decoded_resource_read_result(
     return None
 
 
+_SOURCE_RECOVERY_SUFFIX_RE = re.compile(
+    r"([0-9a-fA-F]{40}|[0-9a-fA-F]{64})(?:--recovery-[0-9a-f]{12})?\Z"
+)
+
+
 def _is_commit(value: Any) -> bool:
     return bool(
         isinstance(value, str)
         and len(value) in {40, 64}
         and all(char in "0123456789abcdefABCDEF" for char in value)
     )
+
+
+def _provenance_identities(item: Mapping[str, Any]) -> list[str]:
+    return [
+        value.strip().removesuffix(".git")
+        for value in (
+            item.get("repo"),
+            item.get("repository"),
+            item.get("repo_id"),
+            item.get("name"),
+        )
+        if isinstance(value, str) and value.strip()
+    ]
+
+
+def _provenance_match(item: Mapping[str, Any], requested: set[str]) -> str | None:
+    """Return "foreign", "match" or None for a provenance repository entry.
+
+    Normalization mirrors grabowski_repobrief._snapshot_repository_matches:
+    strip, drop ".git", match the repository segment, and accept canonical
+    "<owner>__<segment>__<ref>[--<commit>]" identities.  The request carries
+    no ref, so the ref part is any non-empty token after an explicit segment.
+    """
+    segments = {name.rsplit("/", 1)[-1] for name in requested}
+    segments.discard("")
+    hits: list[str] = []
+    for identity in _provenance_identities(item):
+        if identity in requested:
+            return "match"
+        if any(identity.endswith(f"/{segment}") for segment in segments):
+            hits.append("foreign")
+            continue
+        canonical = identity
+        for separator in reversed([m.start() for m in re.finditer(r"--", identity)]):
+            if _SOURCE_RECOVERY_SUFFIX_RE.fullmatch(identity[separator + 2 :]):
+                canonical = identity[:separator]
+                break
+        parts = canonical.split("__")
+        if (
+            len(parts) >= 3
+            and parts[-2] in segments
+            and parts[-1]
+            and "/" not in canonical
+        ):
+            hits.append("match")
+        elif identity in segments:
+            hits.append("match")
+    if "match" in hits:
+        return "match"
+    return "foreign" if hits else None
 
 
 def _bound_repoground_manifest(
@@ -1376,58 +1431,36 @@ def _bound_repoground_manifest(
         raise RunnerError("RepoGround manifest provenance is invalid")
 
     repository = _mapping(request.get("repository"))
-    requested_names = {
-        value
+    requested = {
+        value.strip().removesuffix(".git")
         for value in (repository.get("id"), repository.get("repository"))
-        if isinstance(value, str)
+        if isinstance(value, str) and value.strip().removesuffix(".git")
     }
     if len(repositories) == 1:
         selected = repositories[0]
-        identities = [
-            value.strip().removesuffix(".git")
-            for value in (
-                selected.get("repo"),
-                selected.get("repository"),
-                selected.get("repo_id"),
-                selected.get("name"),
-            )
-            if isinstance(value, str) and value.strip()
-        ]
         # A singleton without any identity field stays an anonymous legacy
         # fallback; an explicit identity must match the requested repository
         # (same rule as grabowski_repobrief._snapshot_repository_matches).
-        if identities:
-            segments = {
-                name.strip().removesuffix(".git").rsplit("/", 1)[-1]
-                for name in requested_names
-                if name.strip().removesuffix(".git")
-            }
-            if not any(
-                identity == segment or identity.endswith(f"/{segment}")
-                for identity in identities
-                for segment in segments
-            ):
-                raise RunnerError(
-                    "RepoGround manifest repository binding does not match request"
-                )
+        if _provenance_identities(selected) and not _provenance_match(
+            selected, requested
+        ):
+            raise RunnerError(
+                "RepoGround manifest repository binding does not match request"
+            )
     else:
-        matches = []
-        for item in repositories:
-            names = {
-                value
-                for value in (
-                    item.get("repo"),
-                    item.get("repository"),
-                    item.get("repo_id"),
-                    item.get("name"),
-                )
-                if isinstance(value, str)
-            }
-            if requested_names & names:
-                matches.append(item)
+        matches = [
+            (item, hit)
+            for item in repositories
+            if (hit := _provenance_match(item, requested))
+        ]
+        # An owner-qualified identity naming a different owner only loses to
+        # candidates that are not themselves conflicting; bare or canonical
+        # aliases stay ambiguous with qualified ones.
+        if any(hit != "foreign" for _, hit in matches):
+            matches = [pair for pair in matches if pair[1] != "foreign"]
         if len(matches) != 1:
             raise RunnerError("RepoGround manifest repository binding is ambiguous")
-        selected = matches[0]
+        selected = matches[0][0]
 
     commit = (
         selected.get("git_commit") or selected.get("commit") or selected.get("head")
