@@ -770,6 +770,17 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         )
         self.assertEqual(receipt["tool_calls"][0]["name"], "ask_context")
 
+    def test_legacy_manifest_version_rejects_explicit_null(self) -> None:
+        legacy = {"kind": runner._REPOGROUND_LEGACY_MANIFEST_KIND}
+        runner._require_repoground_manifest_envelope(legacy)
+        runner._require_repoground_manifest_envelope(
+            {**legacy, "version": runner._REPOGROUND_LEGACY_MANIFEST_VERSION}
+        )
+        with self.assertRaisesRegex(
+            runner.RunnerError, "RepoGround manifest version is invalid"
+        ):
+            runner._require_repoground_manifest_envelope({**legacy, "version": None})
+
     def test_treatment_projects_bound_repoground_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")

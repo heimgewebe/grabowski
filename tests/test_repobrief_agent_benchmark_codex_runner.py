@@ -4163,20 +4163,22 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         )
         foreign = json.loads(json.dumps(cases["grounding_verify"]))
         foreign["verdict"]["snapshot_ref"]["manifest_path"] = "/foreign/manifest.json"
-        rebound_foreign = runner._validated_treatment_tool_result(
-            {
-                "content": [{"type": "text", "text": "ok"}],
-                "structuredContent": foreign,
-                "isError": False,
-            },
-            tool_name="grounding_verify",
-            expected_manifest=manifest,
-            external_manifest=external_manifest,
-        )
-        self.assertEqual(
-            rebound_foreign["structuredContent"]["verdict"]["snapshot_ref"]["manifest_path"],
-            "/foreign/manifest.json",
-        )
+        for unexpected_path in ("/foreign/manifest.json", str(external_manifest)):
+            with self.subTest(non_staged_manifest=unexpected_path):
+                foreign["verdict"]["snapshot_ref"]["manifest_path"] = unexpected_path
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "grounding snapshot manifest does not match staged manifest"
+                ):
+                    runner._validated_treatment_tool_result(
+                        {
+                            "content": [{"type": "text", "text": "ok"}],
+                            "structuredContent": foreign,
+                            "isError": False,
+                        },
+                        tool_name="grounding_verify",
+                        expected_manifest=manifest,
+                        external_manifest=external_manifest,
+                    )
 
         nested_drifts = {
             "ask_context": "context_pack",

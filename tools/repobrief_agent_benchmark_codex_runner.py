@@ -1207,10 +1207,11 @@ def _validated_treatment_tool_result(
             snapshot_ref = (
                 verdict.get("snapshot_ref") if isinstance(verdict, dict) else None
             )
-            if (
-                isinstance(snapshot_ref, dict)
-                and snapshot_ref.get("manifest_path") == str(expected_manifest)
-            ):
+            if isinstance(snapshot_ref, dict) and "manifest_path" in snapshot_ref:
+                if snapshot_ref["manifest_path"] != str(expected_manifest):
+                    raise RunnerError(
+                        "RepoGround grounding snapshot manifest does not match staged manifest"
+                    )
                 snapshot_ref["manifest_path"] = str(external_manifest)
     return {
         "content": [{"type": "text", "text": canonical(structured)}],

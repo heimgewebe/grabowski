@@ -1429,7 +1429,10 @@ def _require_repoground_manifest_envelope(document: Mapping[str, Any]) -> None:
     if kind == _REPOGROUND_MANIFEST_KIND:
         valid = version == _REPOGROUND_MANIFEST_VERSION
     elif kind == _REPOGROUND_LEGACY_MANIFEST_KIND:
-        valid = version is None or version == _REPOGROUND_LEGACY_MANIFEST_VERSION
+        valid = (
+            "version" not in document
+            or version == _REPOGROUND_LEGACY_MANIFEST_VERSION
+        )
     else:
         raise RunnerError(
             "RepoGround manifest kind is invalid: expected "
