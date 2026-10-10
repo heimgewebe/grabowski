@@ -27,6 +27,7 @@ from grabowski_pr_diff import (  # noqa: E402
     canonicalize_github_pr_diff_identity_v1,
     github_pr_diff_identity_sha256,
     github_pr_diff_identity_sha256_v1,
+    bound_local_pr_git_diff,
 )
 
 try:
@@ -804,18 +805,8 @@ def _local_bound_pr_diff_bytes(repo: Path, view: Any) -> bytes:
         raise RuntimeError("local PR diff paths are not valid UTF-8") from exc
     if len(local_paths) != len(set(local_paths)) or local_paths != expected_paths:
         raise RuntimeError("local PR diff changed paths do not match GitHub file evidence")
-    raw_diff = _run_bytes(
-        repo,
-        _local_diff_git_argv(
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--no-color",
-            merge_base,
-            head,
-            "--",
-        ),
+    raw_diff = bound_local_pr_git_diff(
+        repo, merge_base=merge_base, head=head,
     )
     if not raw_diff:
         raise RuntimeError("local PR diff fallback produced an empty diff")

@@ -111,6 +111,7 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
                 return_value=(None, "command failed: gh pr diff 226", True),
             ),
             mock.patch.object(pr_review_gate, "_run_bytes", side_effect=fake_run_bytes),
+            mock.patch.object(pr_review_gate, "bound_local_pr_git_diff", return_value=local_diff),
         ):
             state = pr_review_gate.load_pr_state(Path("/tmp/commonworld"), 226)
 

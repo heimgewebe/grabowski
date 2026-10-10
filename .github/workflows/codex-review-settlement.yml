@@ -79,6 +79,7 @@ jobs:
           echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
 
       - name: Mark current head pending
+        id: pending
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -90,6 +91,8 @@ jobs:
             -f description="Checking current-head Codex review settlement"
 
       - name: Checkout trusted evaluator
+        id: trusted_checkout
+        continue-on-error: true
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -97,6 +100,9 @@ jobs:
           persist-credentials: false
 
       - name: Fetch exact PR history for local diff fallback
+        id: fetched_objects
+        if: steps.trusted_checkout.outcome == 'success'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
@@ -123,12 +129,28 @@ jobs:
 
       - name: Evaluate current-head settlement
         id: evaluate
+        if: always() && steps.pr.outcome == 'success' && steps.pending.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
+          CHECKOUT_OUTCOME: ${{ steps.trusted_checkout.outcome }}
+          FETCH_OUTCOME: ${{ steps.fetched_objects.outcome }}
         run: |
           set +e
-          if [ ! -f tools/codex_review_settlement.py ]; then
+          if [ "$CHECKOUT_OUTCOME" != "success" ] || [ "$FETCH_OUTCOME" != "success" ]; then
+            jq -nc \
+              --arg error "trusted Git checkout/fetch/pinning failed: checkout=$CHECKOUT_OUTCOME fetch=$FETCH_OUTCOME" \
+              '{
+                status:"block",
+                status_code:"trusted_pr_object_pinning_failed",
+                exit_code:2,
+                github_state:"failure",
+                description:"Trusted PR object pinning failed",
+                settled:false,
+                errors:[$error]
+              }' > codex-review-settlement.json
+            rc=2
+          elif [ ! -f tools/codex_review_settlement.py ]; then
             jq -nc \
               --arg error trusted_evaluator_missing_on_default_branch \
               '{
@@ -209,11 +231,12 @@ jobs:
           echo "description=$description" >> "$GITHUB_OUTPUT"
 
       - name: Publish settlement status
+        if: always() && steps.pr.outcome == 'success' && steps.pending.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          STATE: ${{ steps.evaluate.outputs.github_state }}
-          DESCRIPTION: ${{ steps.evaluate.outputs.description }}
+          STATE: ${{ steps.evaluate.outputs.github_state || 'failure' }}
+          DESCRIPTION: ${{ steps.evaluate.outputs.description || 'Trusted Codex settlement interrupted' }}
         run: |
           set -euo pipefail
           gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
@@ -223,5 +246,5 @@ jobs:
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
       - name: Fail blocked settlement
-        if: steps.evaluate.outputs.github_state == 'failure'
+        if: always() && steps.pending.outcome == 'success' && (steps.evaluate.outcome == 'failure' || steps.evaluate.outputs.github_state == 'failure' || steps.trusted_checkout.outcome != 'success' || steps.fetched_objects.outcome != 'success')
         run: exit 1

@@ -22,6 +22,8 @@ from grabowski_pr_diff import (
     canonicalize_github_pr_diff_identity,
     github_pr_diff_identity_sha256,
     github_pr_diff_identity_sha256_v1,
+    bound_local_pr_git_diff,
+    BoundLocalDiffError,
 )
 
 
@@ -1627,23 +1629,14 @@ def _merge_guard_local_diff_bytes(
         return b"", info, merge_base_errors
     info["merge_base_sha"] = merge_base
     try:
-        result = _merge_guard_local_git_bytes(
-            repo_path,
-            [
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-renames",
-                "--no-color",
-                merge_base,
-                head_sha,
-                "--",
-            ],
-            timeout=60,
+        bounded = bound_local_pr_git_diff(
+            repo_path, merge_base=merge_base, head=head_sha,
+            timeout=60, max_diff_bytes=_MERGE_GUARD_MAX_DIFF_BYTES,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, BoundLocalDiffError) as exc:
         info["error_class"] = type(exc).__name__
         return b"", info, [f"merge_guard_local_diff_exception:{type(exc).__name__}"]
+    result = {"returncode": 0, "stdout_bytes": bounded, "stderr_bytes": b""}
     stdout = result["stdout_bytes"]
     stderr = result["stderr_bytes"]
     info.update(

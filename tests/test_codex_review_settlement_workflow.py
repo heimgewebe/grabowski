@@ -87,6 +87,39 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn('" = "' + d + 'BASE_SHA"', fetch)
         self.assertIn('" = "' + d + 'HEAD_SHA"', fetch)
 
+    def test_object_pin_failure_publishes_terminal_failure(self) -> None:
+        pending = self.text.split(
+            "      - name: Mark current head pending\n", 1
+        )[1].split("      - name: Checkout trusted evaluator\n", 1)[0]
+        checkout = self.text.split(
+            "      - name: Checkout trusted evaluator\n", 1
+        )[1].split("      - name: Fetch exact PR history for local diff fallback\n", 1)[0]
+        fetch = self.text.split(
+            "      - name: Fetch exact PR history for local diff fallback\n", 1
+        )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
+        evaluate = self.text.split(
+            "      - name: Evaluate current-head settlement\n", 1
+        )[1].split("      - name: Publish settlement status\n", 1)[0]
+        publish = self.text.split(
+            "      - name: Publish settlement status\n", 1
+        )[1].split("      - name: Fail blocked settlement\n", 1)[0]
+        fail = self.text.split("      - name: Fail blocked settlement\n", 1)[1]
+        self.assertIn("id: pending", pending)
+        self.assertIn("id: trusted_checkout", checkout)
+        self.assertIn("continue-on-error: true", checkout)
+        self.assertIn("id: fetched_objects", fetch)
+        self.assertIn("continue-on-error: true", fetch)
+        self.assertIn("steps.trusted_checkout.outcome == 'success'", fetch)
+        self.assertIn("if: always()", evaluate)
+        self.assertIn('"$CHECKOUT_OUTCOME" != "success"', evaluate)
+        self.assertIn('"$FETCH_OUTCOME" != "success"', evaluate)
+        self.assertIn("trusted_pr_object_pinning_failed", evaluate)
+        self.assertIn('github_state:"failure"', evaluate)
+        self.assertIn("if: always()", publish)
+        self.assertIn("|| 'failure'", publish)
+        self.assertIn("if: always()", fail)
+        self.assertIn("steps.fetched_objects.outcome != 'success'", fail)
+
     def test_permissions_are_observer_only_except_status_publication(self) -> None:
         self.assertIn("  contents: read\n", self.text)
         self.assertIn("  issues: read\n", self.text)
