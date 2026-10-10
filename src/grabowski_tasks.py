@@ -11356,6 +11356,143 @@ def _reconcile_check_revision_snapshot(
     return {**material, "snapshot_sha256": _sha256_json(material)}
 
 
+
+# Only an explicitly authorized reconciliation may record this quiescent,
+# revision-bound readiness proof in the existing task metadata table.
+TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY = "task_reconcile_ready_evidence_v1"
+TASK_RECONCILE_READY_MAX_AGE_SECONDS = 300
+
+
+def _clear_task_reconcile_ready_evidence() -> None:
+    with _database_connection() as connection:
+        connection.execute(
+            "DELETE FROM metadata WHERE key=?",
+            (TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+        )
+
+
+def _publish_task_reconcile_ready_evidence(result: dict[str, Any]) -> None:
+    batch = result.get("batch")
+    if (
+        result.get("task_id")
+        or result.get("blocked")
+        or not isinstance(batch, dict)
+        or batch.get("cycle_completed") is not True
+        or "cursor_before" not in batch
+        or batch["cursor_before"] is not None
+        or not isinstance(batch.get("active_refresh"), dict)
+        or batch["active_refresh"].get("cycle_completed") is not True
+        or "cursor_before" not in batch["active_refresh"]
+        or batch["active_refresh"]["cursor_before"] is not None
+        or not isinstance(batch.get("terminalization_recovery"), dict)
+        or batch["terminalization_recovery"].get("cycle_completed") is not True
+        or "cursor_before" not in batch["terminalization_recovery"]
+        or batch["terminalization_recovery"]["cursor_before"] is not None
+        or batch["terminalization_recovery"].get("failed")
+    ):
+        # Final pages cannot attest errors on earlier pages. Certify only a
+        # single complete cycle beginning at all three initial cursors.
+        return
+    with _database_connection() as connection:
+        # Live process termination does not bump an SQLite revision. Therefore
+        # a persisted active task cannot be certified from a status snapshot.
+        if connection.execute(
+            "SELECT 1 FROM tasks WHERE state IN "
+            "('launching','running','outcome_unknown','interrupted') LIMIT 1"
+        ).fetchone() is not None:
+            return
+        task_revision = _task_reconcile_revision_contract(connection)
+        with resources._resource_readonly_snapshot() as resource_connection:
+            if resource_connection.execute(
+                "SELECT 1 FROM task_terminalizations "
+                "WHERE phase='leases_revoked' LIMIT 1"
+            ).fetchone() is not None:
+                return
+            resource_revision = resources._resource_reconcile_revision_contract(
+                resource_connection
+            )
+        if resource_revision is None:
+            return
+        material = {
+            "schema_version": 1,
+            "task_revision": task_revision["revision"],
+            "resource_revision": resource_revision["revision"],
+            "reconciled_at_unix": _now(),
+            "scope": "quiescent-active-tasks-and-terminalizations",
+        }
+        proof = {**material, "evidence_sha256": _sha256_json(material)}
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY, _canonical_json(proof)),
+        )
+
+
+def _task_reconcile_ready_evidence_snapshot(
+    task_connection: sqlite3.Connection,
+) -> dict[str, Any]:
+    """Verify prior authorized reconciliation without filesystem writes."""
+    try:
+        rows = task_connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+        ).fetchall()
+        if not rows:
+            return {"status": "missing"}
+        if len(rows) != 1 or not isinstance(rows[0][0], str):
+            return {"status": "invalid"}
+        proof = json.loads(rows[0][0])
+        expected_fields = {
+            "schema_version", "task_revision", "resource_revision",
+            "reconciled_at_unix", "scope", "evidence_sha256",
+        }
+        if not isinstance(proof, dict) or set(proof) != expected_fields:
+            return {"status": "invalid"}
+        material = {key: value for key, value in proof.items() if key != "evidence_sha256"}
+        timestamp = proof["reconciled_at_unix"]
+        now = _now()
+        if (
+            type(proof["schema_version"]) is not int
+            or proof["schema_version"] != 1
+            or proof["scope"] != "quiescent-active-tasks-and-terminalizations"
+            or type(timestamp) is not int
+            or not 0 <= now - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS
+            or proof["evidence_sha256"] != _sha256_json(material)
+        ):
+            return {"status": "invalid_or_stale"}
+        if task_connection.execute(
+            "SELECT 1 FROM tasks WHERE state IN "
+            "('launching','running','outcome_unknown','interrupted') LIMIT 1"
+        ).fetchone() is not None:
+            return {"status": "active_tasks"}
+        task_revision = _task_reconcile_revision_contract(task_connection)
+        with resources._resource_readonly_snapshot() as resource_connection:
+            resource_revision = resources._resource_reconcile_revision_contract(
+                resource_connection
+            )
+            pending = resource_connection.execute(
+                "SELECT 1 FROM task_terminalizations "
+                "WHERE phase='leases_revoked' LIMIT 1"
+            ).fetchone()
+        if (
+            resource_revision is None or pending is not None
+            or task_revision["revision"] != proof["task_revision"]
+            or resource_revision["revision"] != proof["resource_revision"]
+        ):
+            return {"status": "stale"}
+        return {"status": "verified", "reconciled_at_unix": timestamp}
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, sqlite3.Error) as exc:
+        return {"status": "unavailable", "error_type": type(exc).__name__}
+
+
+def task_reconcile_ready_evidence_readonly() -> dict[str, Any]:
+    """A bounded strict read for aggregate operator readiness only."""
+    operator._require_operator_capability("durable_job")
+    with _task_readonly_snapshot() as connection:
+        connection.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
+        return _task_reconcile_ready_evidence_snapshot(connection)
+
+
 def _reconcile_check_store_snapshots_for_legacy_cursor(
     task_connection: sqlite3.Connection,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -12168,6 +12305,7 @@ async def _grabowski_task_reconcile_check_tool(
 def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
+        _clear_task_reconcile_ready_evidence()
         result = _reconcile_tasks_refresh_locked(task_id=task_id)
         base._append_audit(
             {
@@ -12178,6 +12316,12 @@ def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
                 "released_count": len(result["released"]),
             }
         )
+        try:
+            _publish_task_reconcile_ready_evidence(result)
+        except Exception:
+            # A successful authorized refresh remains valid if supplementary
+            # readiness publication is unavailable. Readiness stays unproven.
+            pass
     return _attach_task_output_cleanup(result)
 
 
@@ -12250,6 +12394,7 @@ async def _grabowski_task_reconcile_resume_tool(
 def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
+        _clear_task_reconcile_ready_evidence()
         result, refresh = _reconcile_tasks_locked(auto_resume=auto_resume)
         base._append_audit(
             {
@@ -12261,6 +12406,11 @@ def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
                 "blocked_count": len(result["blocked"]),
             }
         )
+        if not auto_resume:
+            try:
+                _publish_task_reconcile_ready_evidence(refresh)
+            except Exception:
+                pass
     cleanup = _attach_task_output_cleanup(refresh)
     if "task_output_cleanup" in cleanup:
         result["task_output_cleanup"] = cleanup["task_output_cleanup"]

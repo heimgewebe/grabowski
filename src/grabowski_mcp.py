@@ -6392,6 +6392,13 @@ def _operator_system_overview(
             "unknown_state_count": task_payload.get("unknown_state_count"),
             "snapshot_complete": task_payload.get("state_counts_complete"),
             "reconciliation_performed": task_payload.get("reconciliation_performed"),
+            "reconciliation_evidence": (
+                grabowski_tasks.task_reconcile_ready_evidence_readonly()
+                if callable(
+                    getattr(grabowski_tasks, "task_reconcile_ready_evidence_readonly", None)
+                )
+                else task_payload.get("reconciliation_evidence", {"status": "missing"})
+            ),
         }
     except Exception as exc:  # pragma: no cover - defensive status boundary
         errors.append({"component": "tasks", "error": type(exc).__name__})
@@ -6495,12 +6502,15 @@ def _operator_system_overview(
     )
     coding_agent_catalog_ready = coding_agent_catalog.get("ready") is True
     unknown_state_count = tasks.get("unknown_state_count")
-    # Complete persisted state counts are not proof that live reconciliation ran.
+    # Read-only status never performs recovery. Only fresh, revision-bound
+    # evidence of an authorized quiescent reconciliation can prove readiness.
+    reconciliation_evidence = tasks.get("reconciliation_evidence") or {}
     truth_model_ready = (
         tasks.get("available") is True
         and tasks.get("snapshot_complete") is True
-        and tasks.get("reconciliation_performed") is True
+        and reconciliation_evidence.get("status") == "verified"
         and unknown_state_count == 0
+        and (tasks.get("projection_counts") or {}).get("active") == 0
     )
     components_observable = (
         not errors
@@ -6550,7 +6560,7 @@ def _operator_system_overview(
         next_action = "resolve unknown task states before relying on projections"
     elif not tasks.get("snapshot_complete"):
         next_action = "restore complete task state counts before relying on readiness"
-    elif tasks.get("reconciliation_performed") is not True:
+    elif reconciliation_evidence.get("status") != "verified":
         next_action = "reconcile live task outcomes through an authorized mutation-capable path"
     elif obligations.get("integrity_error_count"):
         next_action = "inspect operator obligation integrity errors"

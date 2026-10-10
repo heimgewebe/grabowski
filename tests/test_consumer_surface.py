@@ -816,11 +816,12 @@ class ConsumerSurfaceTests(unittest.TestCase):
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
                 "state_counts": {},
-                "projection_counts": {},
+                "projection_counts": {"active": 0},
                 "projection_counts_overlap": False,
                 "unknown_state_count": 0,
                 "state_counts_complete": True,
-                "reconciliation_performed": True,
+                "reconciliation_performed": False,
+                "reconciliation_evidence": {"status": "verified"},
             }
         )
         fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)
@@ -898,11 +899,12 @@ class ConsumerSurfaceTests(unittest.TestCase):
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
                 "state_counts": {},
-                "projection_counts": {},
+                "projection_counts": {"active": 0},
                 "projection_counts_overlap": False,
                 "unknown_state_count": 0,
                 "state_counts_complete": True,
-                "reconciliation_performed": True,
+                "reconciliation_performed": False,
+                "reconciliation_evidence": {"status": "verified"},
             }
         )
         fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)

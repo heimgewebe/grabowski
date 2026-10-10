@@ -5784,6 +5784,171 @@ class TaskTests(unittest.TestCase):
             )
         )
 
+    def test_reconcile_ready_proof_requires_authorized_quiescent_refresh_and_current_revisions(self) -> None:
+        # Build both existing stores without launching a process.
+        with tasks._database_connection():
+            pass
+        with tasks.resources._database():
+            pass
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+
+        incomplete = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": False,
+                "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=incomplete),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+
+        result = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True,
+                "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            proof = tasks._task_reconcile_ready_evidence_snapshot(connection)
+        self.assertEqual("verified", proof["status"])
+
+        # Finishing a later page does not prove earlier pages were successful.
+        later_page = {**result, "batch": {
+            **result["batch"], "cursor_before": (123, "earlier-task"),
+        }}
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=later_page),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+        # A later valid one-shot complete reconciliation can certify readiness.
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        self.assertIsInstance(proof["reconciled_at_unix"], int)
+
+        with patch.object(
+            tasks, "_now",
+            return_value=proof["reconciled_at_unix"] + tasks.TASK_RECONCILE_READY_MAX_AGE_SECONDS + 1,
+        ):
+            with tasks._task_readonly_snapshot() as connection:
+                self.assertEqual(
+                    "invalid_or_stale",
+                    tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+                )
+        # A directly changed resource revision invalidates existing evidence.
+        with tasks.resources._database() as connection:
+            connection.execute(
+                "UPDATE metadata SET value=lower(hex(randomblob(32))) WHERE key=?",
+                (tasks.resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+            )
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "stale",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+
+    def test_reconcile_ready_proof_not_published_with_active_task_or_failed_audit(self) -> None:
+        with tasks._database_connection():
+            pass
+        with tasks.resources._database():
+            pass
+        started = self._start(resource_keys=["service:reconcile-ready-live.service"])
+        self.assertEqual("running", started["task"]["state"])
+        result = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True,
+                "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit", side_effect=RuntimeError("audit unavailable")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
+                tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+        # An unresolved terminal outcome is not an active process, but it is
+        # still unknown execution truth and cannot produce a ready proof.
+        task_id = str(started["task"]["task_id"])
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE tasks SET state='outcome_unknown' WHERE task_id=?",
+                (task_id,),
+            )
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+
     def test_task_reconcile_revision_token_changes_only_for_candidate_rows(self) -> None:
         started = self._start(
             resource_keys=["service:reconcile-token-candidate.service"]
