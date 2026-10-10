@@ -5899,11 +5899,16 @@ class TaskTests(unittest.TestCase):
             patch.object(tasks.base, "_append_audit"),
         ):
             tasks._task_reconcile_refresh_after_guard("")
-        self.assertIsInstance(proof["reconciled_at_unix"], int)
+        # Expire the latest proof, not the one from the earlier refresh:
+        # the two reconciliations may cross a clock-second boundary.
+        with tasks._task_readonly_snapshot() as connection:
+            latest_proof = tasks._task_reconcile_ready_evidence_snapshot(connection)
+        self.assertEqual("verified", latest_proof["status"])
+        self.assertIsInstance(latest_proof["reconciled_at_unix"], int)
 
         with patch.object(
             tasks, "_now",
-            return_value=proof["reconciled_at_unix"] + tasks.TASK_RECONCILE_READY_MAX_AGE_SECONDS + 1,
+            return_value=latest_proof["reconciled_at_unix"] + tasks.TASK_RECONCILE_READY_MAX_AGE_SECONDS + 1,
         ):
             with tasks._task_readonly_snapshot() as connection:
                 self.assertEqual(
