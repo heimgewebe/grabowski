@@ -3822,6 +3822,71 @@ def _codex_workspace_argument(argv: list[str]) -> str | None:
             raise RuntimeError(
                 "Codex working directory cannot be authorized with extra writable roots"
             )
+        # Config overlays, profile files, remote app servers and output files
+        # can change the effective write surface without changing -C/--cd.
+        if (
+            token in {
+                "-p", "--profile", "-o", "--output-last-message",
+                "--remote", "--remote-auth-token-env",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
+            }
+            or token.startswith((
+                "--profile=", "--output-last-message=",
+                "--remote=", "--remote-auth-token-env=",
+            ))
+            or (
+                token.startswith(("-p", "-o"))
+                and not token.startswith("--")
+            )
+        ):
+            raise RuntimeError(
+                "Codex working directory cannot be authorized with unverified write controls"
+            )
+        # Harmless model selection stays supported; all unverified configuration
+        # keys are denied because they can modify sandbox/write-root policy.
+        config_override: str | None = None
+        if token in {"-c", "--config"}:
+            if index + 1 >= len(argv):
+                raise RuntimeError("Codex config option is missing its value")
+            config_override = argv[index + 1]
+            index += 2
+        elif token.startswith("--config="):
+            config_override = token[len("--config="):]
+            index += 1
+        elif token.startswith("-c") and token != "-C":
+            config_override = token[2:].removeprefix("=")
+            index += 1
+        if config_override is not None:
+            key, separator, value = config_override.partition("=")
+            if (
+                separator != "="
+                or not value
+                or key not in {"model", "model_reasoning_effort", "model_verbosity"}
+            ):
+                raise RuntimeError(
+                    "Codex working directory cannot be authorized with unverified config"
+                )
+            continue
+        if token in {"-s", "--sandbox"}:
+            if index + 1 >= len(argv) or argv[index + 1] not in {
+                "read-only", "workspace-write",
+            }:
+                raise RuntimeError("Codex sandbox must be workspace-confined")
+            index += 2
+            continue
+        if token.startswith("--sandbox=") or (
+            token.startswith("-s") and not token.startswith("--")
+        ):
+            mode = (
+                token[len("--sandbox="):]
+                if token.startswith("--sandbox=")
+                else token[2:].removeprefix("=")
+            )
+            if mode not in {"read-only", "workspace-write"}:
+                raise RuntimeError("Codex sandbox must be workspace-confined")
+            index += 1
+            continue
         if token in {"-C", "--cd"}:
             if index + 1 >= len(argv):
                 raise RuntimeError("Codex working directory option is missing its path")
@@ -4057,16 +4122,18 @@ def _verified_task_effect_start(
             in MUTATING_AGENT_EXECUTABLES
         )
     )
-    if not agent_known:
-        return launcher_classification
-    if command_identity.argv_sha256(command) != str(record["argv_sha256"]):
-        raise RuntimeError("persisted agent identity disagrees with original argv")
+    # Do not decide whether the original task was an agent using mutable
+    # argv_json/launcher_json: both can be spoofed to hide an agent attempt.
     with _database_connection() as connection:
         row = connection.execute(
             "SELECT value FROM metadata WHERE key=?",
             (f"{TASK_EFFECT_START_KEY_PREFIX}{record['task_id']}",),
         ).fetchone()
     if row is None:
+        # Preserve genuine non-agent legacy tasks, but fail closed whenever
+        # an unanchored task currently identifies as a coding agent.
+        if not agent_known:
+            return launcher_classification
         raise RuntimeError("unverified agent effect: original start decision is missing")
     try:
         original = json.loads(str(row["value"]))
@@ -4081,19 +4148,35 @@ def _verified_task_effect_start(
         or type(original["schema_version"]) is not int
         or original["schema_version"] != 1
         or original["task_id"] != record["task_id"]
-        or original["argv_sha256"] != record["argv_sha256"]
         or original["host"] != record["host"]
         or original["cwd"] != record["cwd"]
         or not isinstance(original["classification"], dict)
     ):
         raise RuntimeError("unverified agent effect: original start decision is invalid")
-    if original["agent_executable"] != executable:
+    # An anchored task with no agent at either boundary keeps its original
+    # non-agent resume contract. Agent origins still require strict comparison.
+    if original["agent_executable"] is None and not agent_known:
+        return launcher_classification
+    if (
+        command_identity.argv_sha256(command) != original["argv_sha256"]
+        or str(record["argv_sha256"]) != original["argv_sha256"]
+    ):
+        raise RuntimeError("persisted agent identity disagrees with original argv")
+    original_executable = original["agent_executable"]
+    if original_executable is None:
+        if agent_known or original["classification"].get("agent_executable") is not None:
+            raise RuntimeError("persisted agent identity mismatches original start decision")
+    elif (
+        not isinstance(original_executable, str)
+        or original_executable not in MUTATING_AGENT_EXECUTABLES
+        or original_executable != executable
+    ):
         raise RuntimeError("persisted agent identity mismatches original start decision")
     if original["transport"] != fleet.fleet_host(str(record["host"]))["transport"]:
         raise RuntimeError("original agent effect transport no longer matches host")
     if launcher_classification is None:
         raise RuntimeError("unverified agent effect: launcher classification is missing")
-    if launcher_classification.get("agent_executable") != executable:
+    if launcher_classification.get("agent_executable") != original_executable:
         raise RuntimeError("persisted agent identity mismatches original executable")
     if launcher_classification != original["classification"]:
         raise RuntimeError("persisted agent effect profile disagrees with original start decision")
