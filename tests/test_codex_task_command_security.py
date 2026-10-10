@@ -99,6 +99,22 @@ class CodexTaskCommandSecurityTests(unittest.TestCase):
                         cwd=str(self.root),
                     )
 
+    def test_conflicting_or_duplicate_sandbox_declarations_fail_closed(self) -> None:
+        duplicate = (
+            ("--sandbox", "read-only", "--sandbox", "workspace-write"),
+            ("--sandbox=workspace-write", "-s", "read-only"),
+            ("-sread-only", "--sandbox=workspace-write"),
+            ("-s=workspace-write", "-sread-only"),
+        )
+        with patch.object(tasks.fleet, "fleet_host", return_value=fixture.LOCAL_HOST):
+            for flags in duplicate:
+                with self.subTest(flags=flags), self.assertRaisesRegex(RuntimeError, "Codex"):
+                    tasks._mutating_agent_workspace(
+                        "local",
+                        ["/opt/codex", "-C", str(self.root), "exec", *flags, "prompt"],
+                        cwd=str(self.root),
+                    )
+
     def test_known_execution_and_explicit_payload_remain_accepted(self) -> None:
         permitted = (
             ["/opt/codex", "exec", "--sandbox", "workspace-write", "prompt"],

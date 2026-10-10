@@ -3809,6 +3809,7 @@ def _codex_workspace_argument(argv: list[str]) -> str | None:
     """Accept one unambiguous Codex working root, never extra writable roots."""
     workspace: str | None = None
     execution_mode: str | None = None
+    sandbox_declared = False
     first_exec_positional = True
     explicit_prompt_delimiter = False
     index = 1
@@ -3879,6 +3880,9 @@ def _codex_workspace_argument(argv: list[str]) -> str | None:
                 "read-only", "workspace-write",
             }:
                 raise RuntimeError("Codex sandbox must be workspace-confined")
+            if sandbox_declared:
+                raise RuntimeError("Codex sandbox declarations are ambiguous")
+            sandbox_declared = True
             index += 2
             continue
         if token.startswith("--sandbox=") or (
@@ -3891,6 +3895,9 @@ def _codex_workspace_argument(argv: list[str]) -> str | None:
             )
             if mode not in {"read-only", "workspace-write"}:
                 raise RuntimeError("Codex sandbox must be workspace-confined")
+            if sandbox_declared:
+                raise RuntimeError("Codex sandbox declarations are ambiguous")
+            sandbox_declared = True
             index += 1
             continue
         # Workspace leases never authorize administrative commands, direct
