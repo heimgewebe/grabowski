@@ -650,6 +650,10 @@ def _github_pr_diff_too_large(diagnostic: bytes, changed_files: Any) -> bool:
     """Recognize GitHub's separate file and line limits, never generic 406 errors."""
     if type(changed_files) is not int or changed_files < 0:
         return False
+    if b"HTTP 406" not in diagnostic or any(
+        marker in diagnostic for marker in (b"HTTP 401", b"HTTP 403", b"HTTP 429")
+    ):
+        return False
     line_limit = all(marker in diagnostic for marker in (
         b"HTTP 406",
         b"diff exceeded the maximum number of lines",

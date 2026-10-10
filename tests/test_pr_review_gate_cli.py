@@ -222,7 +222,7 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
         completed = mock.Mock(
             returncode=1,
             stdout=b"",
-            stderr=b"GraphQL: PullRequest.diff too_large",
+            stderr=b"HTTP 406: PullRequest.diff too_large",
         )
         with (
             mock.patch.object(pr_review_gate.shutil, "which", return_value="/usr/bin/gh"),
@@ -279,6 +279,17 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
                     Path("/tmp/commonworld"), 226, changed_files=259
                 )
                 self.assertFalse(too_large, diagnostic)
+
+    def test_file_cap_fallback_rejects_non_406_authorization_errors(self) -> None:
+        for diagnostic in (
+            b"GraphQL: PullRequest.diff too_large",
+            b"HTTP 401: PullRequest.diff too_large",
+            b"HTTP 403: diff exceeded the maximum number of files (300)",
+        ):
+            self.assertFalse(pr_review_gate._github_pr_diff_too_large(diagnostic, 301))
+        self.assertTrue(pr_review_gate._github_pr_diff_too_large(
+            b"HTTP 406: diff exceeded the maximum number of files (300)", 301
+        ))
 
     def test_advanced_base_uses_single_merge_base_not_two_endpoint_diff(self) -> None:
         import subprocess

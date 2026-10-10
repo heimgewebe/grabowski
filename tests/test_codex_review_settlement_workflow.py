@@ -75,6 +75,18 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn('git cat-file -e "' + chr(36) + '{BASE_SHA}^{commit}"', fetch)
         self.assertIn('git cat-file -e "' + chr(36) + '{HEAD_SHA}^{commit}"', fetch)
 
+    def test_fetched_pr_objects_are_pinned_to_bound_refs(self) -> None:
+        fetch = self.text.split(
+            "      - name: Fetch exact PR history for local diff fallback\n", 1
+        )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
+        d = chr(36)
+        self.assertIn("refs/heads/" + d + "{BASE_REF}:refs/settlement/base", fetch)
+        self.assertIn("refs/pull/" + d + "{PR_NUMBER}/head:refs/settlement/head", fetch)
+        self.assertIn('git rev-parse "refs/settlement/base^{commit}"', fetch)
+        self.assertIn('git rev-parse "refs/settlement/head^{commit}"', fetch)
+        self.assertIn('" = "' + d + 'BASE_SHA"', fetch)
+        self.assertIn('" = "' + d + 'HEAD_SHA"', fetch)
+
     def test_permissions_are_observer_only_except_status_publication(self) -> None:
         self.assertIn("  contents: read\n", self.text)
         self.assertIn("  issues: read\n", self.text)

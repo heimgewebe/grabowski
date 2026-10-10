@@ -230,6 +230,22 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             )
         )
 
+    def test_file_cap_301_unauthorized_status_cannot_use_local_fallback(self) -> None:
+        for diagnostic in (
+            "GraphQL: PullRequest.diff too_large",
+            "HTTP 401: PullRequest.diff too_large",
+            "HTTP 403: diff exceeded the maximum number of files (300)",
+        ):
+            self.assertFalse(merge_guard._merge_guard_github_diff_too_large(
+                {"returncode": 1, "stdout": "", "stderr": diagnostic},
+                changed_files=301,
+            ))
+        self.assertTrue(merge_guard._merge_guard_github_diff_too_large(
+            {"returncode": 1, "stdout": "",
+             "stderr": "HTTP 406: diff exceeded the maximum number of files (300)"},
+            changed_files=301,
+        ))
+
     def test_ambiguous_merge_base_rejected_before_local_diff(self) -> None:
         with mock.patch.object(
             merge_guard, "_merge_guard_local_git_bytes",

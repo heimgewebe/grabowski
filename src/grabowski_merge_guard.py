@@ -1679,6 +1679,10 @@ def _merge_guard_github_diff_too_large(
     if type(changed_files) is not int or changed_files < 0 or info.get("returncode") == 0:
         return False
     message = f"{info.get('stderr', '')}\n{info.get('stdout', '')}"
+    if "HTTP 406" not in message or any(
+        marker in message for marker in ("HTTP 401", "HTTP 403", "HTTP 429")
+    ):
+        return False
     line_limit = all(marker in message for marker in (
         "HTTP 406",
         "diff exceeded the maximum number of lines",
