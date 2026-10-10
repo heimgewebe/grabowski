@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import errno
 import fcntl
@@ -1715,9 +1716,12 @@ def _validate_work_lane_binding(
             checkouts._resolve_repo(repository), writer_worktree
         )
         checkouts._require_linked(checkout)
-        live_lifecycle = checkouts._lifecycle_bindings(
-            [str(lifecycle["checkout_key"])]
-        ).get(str(lifecycle["checkout_key"]))
+        # Status is READ_ONLY even when a checkout WAL exists: mode=ro
+        # alone can create or update SQLite -shm, so fail closed instead.
+        with (checkouts._strict_inventory_readonly_scope() if read_only else nullcontext()):
+            live_lifecycle = checkouts._lifecycle_bindings(
+                [str(lifecycle["checkout_key"])]
+            ).get(str(lifecycle["checkout_key"]))
     except Exception as exc:
         raise AgentWorkspaceError(f"work lane checkout is not safely observable: {_error_summary(exc)}") from exc
     if (
@@ -4471,7 +4475,15 @@ def _revision_collection_evidence(
         role_task = _task_public(task_id, read_only=read_only)
         if not role_task.get("terminal"):
             raise AgentWorkspaceError("candidate revision verifier task is not terminal")
-    _require_live_lane_binding(manifest, _run)
+    if read_only:
+        # A candidate eligibility projection must never request writer authority.
+        lane_status = _lane_binding_status(manifest, _run, read_only=True)
+        if lane_status.get("valid") is not True:
+            raise AgentWorkspaceError(
+                f"work lane binding is not live and exact: {lane_status.get('error')}"
+            )
+    else:
+        _require_live_lane_binding(manifest, _run)
     result_sha256 = collection.get("result_sha256")
     preimage_sha256 = collection.get("diff_sha256")
     if (

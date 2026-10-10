@@ -1527,7 +1527,19 @@ class AgentWorkspaceTests(unittest.TestCase):
         ):
             plan = self.normalize_lane(lane)
 
+        # This verifies the retained runtime horizon, not WAL availability.
+        # Use a checkpointed copy so strict READ_ONLY checkout observation
+        # does not depend on the lifetime of setup-time writer connections.
+        checkout_snapshot = self.root / "horizon-checkout-snapshot.sqlite3"
+        source = sqlite3.connect(workspace.checkouts.CHECKOUT_DB)
+        target = sqlite3.connect(checkout_snapshot)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
         with (
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot),
             mock.patch.object(workspace, "_now", return_value=observed_at + 300),
             mock.patch.object(
                 workspace.resources,
@@ -1550,14 +1562,44 @@ class AgentWorkspaceTests(unittest.TestCase):
         }
         (self.state / plan["workspace_id"]).mkdir(mode=0o700)
         workspace._write_manifest(stored_manifest)
-        self.assertEqual(
-            workspace._existing_lane_runtime_deadline(
-                lane_id=lane["lane_id"],
-                binding_id="thread-1",
-                repository=str(self.git.repo),
-            ),
-            deadline,
-        )
+        with mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot):
+            self.assertEqual(
+                workspace._existing_lane_runtime_deadline(
+                    lane_id=lane["lane_id"],
+                    binding_id="thread-1",
+                    repository=str(self.git.repo),
+                ),
+                deadline,
+            )
+
+    def test_lane_backed_status_rejects_checkout_wal_without_sidecar_writes(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-strict-checkout-wal")
+        plan = self.normalize_lane(lane)
+        database = workspace.checkouts.CHECKOUT_DB
+        keeper = workspace.checkouts._database()
+        try:
+            keeper.execute("BEGIN IMMEDIATE")
+            keeper.execute("UPDATE metadata SET value=value WHERE key='schema_version'")
+            keeper.commit()
+            wal = Path(str(database) + "-wal")
+            shm = Path(str(database) + "-shm")
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+            before = {path: path.read_bytes() for path in (database, wal, shm)}
+            with mock.patch.object(
+                workspace.operator,
+                "_require_operator_mutation",
+                side_effect=AssertionError("READ_ONLY workspace status requested mutation"),
+            ) as gate:
+                observed = workspace._lane_binding_status(plan)
+            self.assertFalse(observed["valid"])
+            self.assertIn("Strict read-only snapshot unavailable", observed["error"])
+            gate.assert_not_called()
+            self.assertEqual(
+                before, {path: path.read_bytes() for path in (database, wal, shm)}
+            )
+        finally:
+            keeper.close()
 
     def test_lane_backed_writer_validation_survives_live_resource_wal(self) -> None:
         lane = self.lane_receipt(idempotency_key="lane-writer-live-resource-wal")
@@ -1582,8 +1624,10 @@ class AgentWorkspaceTests(unittest.TestCase):
         # Strict public READ_ONLY must reject any remaining WAL/SHM sidecars.
         wal = Path(str(workspace.resources.RESOURCE_DB) + "-wal")
         shm = Path(str(workspace.resources.RESOURCE_DB) + "-shm")
+        checkout_wal = Path(str(workspace.checkouts.CHECKOUT_DB) + "-wal")
+        checkout_shm = Path(str(workspace.checkouts.CHECKOUT_DB) + "-shm")
         observed = workspace._lane_binding_status(plan)
-        if wal.exists() or shm.exists():
+        if any(path.exists() for path in (wal, shm, checkout_wal, checkout_shm)):
             self.assertFalse(observed["valid"])
             self.assertIn("Strict read-only snapshot unavailable", observed["error"])
         else:
@@ -1600,7 +1644,20 @@ class AgentWorkspaceTests(unittest.TestCase):
             source.close()
         self.assertFalse(Path(str(snapshot) + "-wal").exists())
         self.assertFalse(Path(str(snapshot) + "-shm").exists())
-        with mock.patch.object(workspace.resources, "RESOURCE_DB", snapshot):
+        checkout_snapshot = self.root / "quiescent-checkout-snapshot.sqlite3"
+        checkout_source = sqlite3.connect(workspace.checkouts.CHECKOUT_DB)
+        checkout_target = sqlite3.connect(checkout_snapshot)
+        try:
+            checkout_source.backup(checkout_target)
+        finally:
+            checkout_target.close()
+            checkout_source.close()
+        self.assertFalse(Path(str(checkout_snapshot) + "-wal").exists())
+        self.assertFalse(Path(str(checkout_snapshot) + "-shm").exists())
+        with (
+            mock.patch.object(workspace.resources, "RESOURCE_DB", snapshot),
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot),
+        ):
             self.assertTrue(workspace._lane_binding_status(plan)["valid"])
 
     def test_lane_backed_writer_denial_precedes_resource_store_inspection(self) -> None:
@@ -1782,7 +1839,30 @@ class AgentWorkspaceTests(unittest.TestCase):
             manifest["checkout_lifecycle"]["checkout_key"],
             lane["worktree_receipt"]["lifecycle"]["checkout_key"],
         )
-        self.assertTrue(workspace._lane_binding_status(manifest)["valid"])
+        # Creation may leave resource and checkout WAL sidecars from setup
+        # writers. READ_ONLY must fail closed there; test a quiescent backup
+        # of *both* stores rather than relaxing the runtime security gate.
+        checkout_snapshot = self.root / "reuse-checkout-snapshot.sqlite3"
+        resource_snapshot = self.root / "reuse-resource-snapshot.sqlite3"
+        for original, snapshot in (
+            (workspace.checkouts.CHECKOUT_DB, checkout_snapshot),
+            (workspace.resources.RESOURCE_DB, resource_snapshot),
+        ):
+            source = sqlite3.connect(original)
+            target = sqlite3.connect(snapshot)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+            self.assertFalse(Path(str(snapshot) + "-wal").exists())
+            self.assertFalse(Path(str(snapshot) + "-shm").exists())
+        with (
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot),
+            mock.patch.object(workspace.resources, "RESOURCE_DB", resource_snapshot),
+        ):
+            status = workspace._lane_binding_status(manifest)
+            self.assertTrue(status["valid"], status)
         for key in lane["inputs"]["resource_keys"]:
             lease = workspace.resources.inspect_resource(key)
             self.assertEqual(lease["owner_id"], f"lane:{lane['lane_id']}")
@@ -11515,17 +11595,20 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(
                 workspace,
                 "_require_live_lane_binding",
-                return_value={
-                    "valid": True,
-                    "lane_id": lane["lane_id"],
-                    "receipt_sha256": lane["receipt_sha256"],
-                },
-            ),
+                side_effect=AssertionError("READ_ONLY candidate requested writer lane"),
+            ) as writer_lane,
+            mock.patch.object(
+                workspace.operator,
+                "_require_operator_mutation",
+                side_effect=AssertionError("READ_ONLY candidate requested mutation"),
+            ) as mutation_gate,
         ):
             status = workspace.grabowski_agent_workspace_status(
                 manifest["workspace_id"]
             )
 
+        writer_lane.assert_not_called()
+        mutation_gate.assert_not_called()
         self.assertTrue(status["candidate_revision"]["eligible"])
         self.assertEqual(
             status["candidate_revision"]["candidate_id"], candidate["candidate_id"]
