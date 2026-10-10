@@ -1332,7 +1332,6 @@ def _validate_pair(baseline: Mapping[str, Any], treatment: Mapping[str, Any]) ->
         "taskset_id",
         "taskset_sha256",
         "prompt",
-        "setup",
         "budgets",
         "runner",
         "repository",
@@ -1340,6 +1339,10 @@ def _validate_pair(baseline: Mapping[str, Any], treatment: Mapping[str, Any]) ->
     for field in same_fields:
         if baseline.get(field) != treatment.get(field):
             raise PreflightError(f"paired requests disagree on {field}")
+    # An omitted setup is the historical spelling of explicitly clean.
+    # Compare validated scenario semantics; G2 still requires exact frozen dirty identity.
+    if runner.validated_setup(baseline) != runner.validated_setup(treatment):
+        raise PreflightError("paired requests disagree on setup")
     if baseline.get("condition") != "baseline" or treatment.get("condition") != "treatment":
         raise PreflightError("pair conditions are invalid")
     if baseline.get("session_id") == treatment.get("session_id"):

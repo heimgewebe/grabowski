@@ -140,6 +140,40 @@ RepoBriefAgentBenchmarkPreflightTests = (
 )
 
 
+class SemanticPairSetupCompatibilityTests(unittest.TestCase):
+    """The optional clean setup has one semantic identity for both conditions."""
+
+    @staticmethod
+    def _pair() -> tuple[dict, dict]:
+        kwargs = {
+            "commit": "a" * 40,
+            "manifest": Path("/nonexistent/frozen-mcp-manifest.json"),
+            "manifest_sha256": "b" * 64,
+            "mcp_command": ["python3"],
+        }
+        return (
+            support.request(condition="baseline", **kwargs),
+            support.request(condition="treatment", **kwargs),
+        )
+
+    def test_omitted_and_explicit_clean_setup_are_pair_equivalent(self) -> None:
+        baseline, treatment = self._pair()
+        treatment["setup"] = {"working_tree": "clean"}
+        support.preflight._validate_pair(baseline, treatment)
+        baseline["setup"] = {"working_tree": "clean"}
+        treatment.pop("setup")
+        support.preflight._validate_pair(baseline, treatment)
+        treatment["setup"] = {"working_tree": "clean"}
+        support.preflight._validate_pair(baseline, treatment)
+
+    def test_forged_dirty_setup_is_not_treated_as_clean(self) -> None:
+        baseline, treatment = self._pair()
+        treatment["setup"] = {"working_tree": "dirty", "fixture": "dirty-checkout"}
+        with self.assertRaisesRegex(support.runner.RunnerError, "dirty setup is not bound"):
+            support.preflight._validate_pair(baseline, treatment)
+
+
+
 def _preflight_kwargs(root: Path, environment: dict) -> dict:
     return {
         "pair_id": support.PAIR_ID,
