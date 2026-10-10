@@ -1641,6 +1641,119 @@ def _merge_guard_local_diff_bytes(
     return stdout, info, []
 
 
+def _merge_guard_legacy_local_review_diff_identity(
+    repo_path: Path,
+    *,
+    base_sha: str,
+    head_sha: str,
+    expected_sha256: str,
+    provider_diff: bytes,
+    changed_paths: list[str],
+) -> tuple[bool, dict[str, Any]]:
+    """Prove that a legacy raw committed Git review diff equals live GitHub hunks.
+
+    Legacy reviewers hash the exact binary no-external-diff committed diff,
+    not GitHub's canonical representation. Accept only identical canonical
+    hunks and changed paths at the exact bound Git commit pair.
+    """
+    evidence: dict[str, Any] = {
+        "source": "exact-local-committed-review-diff",
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "status": "not_proven",
+    }
+    if (
+        not isinstance(provider_diff, bytes)
+        or not provider_diff
+        or len(provider_diff) > _MERGE_GUARD_MAX_DIFF_BYTES
+        or not isinstance(base_sha, str)
+        or not isinstance(head_sha, str)
+        or not isinstance(expected_sha256, str)
+        or _SHA40_RE.fullmatch(base_sha) is None
+        or _SHA40_RE.fullmatch(head_sha) is None
+        or _SHA256_RE.fullmatch(expected_sha256) is None
+        or not changed_paths
+        or len(changed_paths) > _MERGE_GUARD_MAX_CHANGED_PATHS
+        or _merge_guard_diff_contains_binary_metadata(provider_diff)
+    ):
+        evidence["reason"] = "invalid_or_unsupported_input"
+        return False, evidence
+
+    for label, sha in (("base", base_sha), ("head", head_sha)):
+        available, probe = _merge_guard_commit_probe(repo_path, sha)
+        evidence[f"{label}_object"] = probe
+        if not available:
+            evidence["reason"] = f"{label}_commit_object_missing"
+            return False, evidence
+
+    try:
+        merge_base_result = _merge_guard_local_git_bytes(
+            repo_path, ["merge-base", "--all", base_sha, head_sha]
+        )
+        merge_bases = merge_base_result["stdout_bytes"].splitlines()
+        # The review runner uses BASE...HEAD. Do not require BASE itself
+        # to be an ancestor: GitHub PR heads normally diverge from main.
+        # Multiple merge bases are ambiguous; fail closed rather than
+        # guessing which tree to compare with the exact reviewed patch.
+        if merge_base_result["returncode"] != 0 or len(merge_bases) != 1:
+            evidence["reason"] = "unique_merge_base_unavailable"
+            return False, evidence
+        try:
+            common_ancestor = merge_bases[0].decode("ascii")
+        except UnicodeDecodeError:
+            evidence["reason"] = "unique_merge_base_invalid"
+            return False, evidence
+        if _SHA40_RE.fullmatch(common_ancestor) is None:
+            evidence["reason"] = "unique_merge_base_invalid"
+            return False, evidence
+        evidence["common_ancestor_sha"] = common_ancestor
+        evidence["base_is_ancestor"] = common_ancestor == base_sha
+
+        local_paths, path_receipt, path_errors = _merge_guard_local_changed_paths(
+            repo_path, base_sha=common_ancestor, head_sha=head_sha
+        )
+        evidence["local_paths"] = path_receipt
+        evidence["changed_paths_match"] = not path_errors and local_paths == changed_paths
+        if not evidence["changed_paths_match"]:
+            evidence["reason"] = "changed_paths_mismatch"
+            return False, evidence
+
+        local_result = _merge_guard_local_git_bytes(
+            repo_path,
+            ["diff", "--binary", "--no-ext-diff", "--no-textconv", f"{base_sha}...{head_sha}"],
+            timeout=60,
+        )
+        local_diff = local_result["stdout_bytes"]
+        if (
+            local_result["returncode"] != 0
+            or not local_diff
+            or len(local_diff) > _MERGE_GUARD_MAX_DIFF_BYTES
+            or _merge_guard_diff_contains_binary_metadata(local_diff)
+        ):
+            evidence["reason"] = "local_diff_unavailable_or_unsupported"
+            return False, evidence
+
+        local_digest = hashlib.sha256(local_diff).hexdigest()
+        local_canonical_digest = github_pr_diff_identity_sha256(local_diff)
+        provider_canonical_digest = github_pr_diff_identity_sha256(provider_diff)
+        evidence.update({
+            "local_raw_sha256": local_digest,
+            "local_canonical_sha256": local_canonical_digest,
+            "provider_canonical_sha256": provider_canonical_digest,
+            "local_diff_bytes": len(local_diff),
+            "raw_digest_matches_review": local_digest == expected_sha256,
+            "canonical_hunks_match": local_canonical_digest == provider_canonical_digest,
+        })
+        if local_digest != expected_sha256 or local_canonical_digest != provider_canonical_digest:
+            evidence["reason"] = "review_digest_or_canonical_hunks_mismatch"
+            return False, evidence
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+        evidence["reason"] = f"local_evidence_unavailable:{type(exc).__name__}"
+        return False, evidence
+    evidence["status"] = "proven"
+    return True, evidence
+
+
 def _merge_guard_github_diff_too_large(
     info: dict[str, Any], *, changed_files: int
 ) -> bool:
@@ -5183,6 +5296,21 @@ class CaptainMergeGuardRunner:
                     "error": f"{type(exc).__name__}",
                     "proven_equivalent": False,
                 }
+        # Legacy immutable reviewers may bind raw local Git diff bytes, not
+        # GitHub's rendering. Admit them only after exact local/remote proof.
+        if diff_identity_mode == "unmatched" and provider_raw_identity_available:
+            local_equivalent, local_evidence = _merge_guard_legacy_local_review_diff_identity(
+                self.repo_path,
+                base_sha=base_sha,
+                head_sha=expected_head,
+                expected_sha256=expected_diff,
+                provider_diff=raw_live_diff_bytes,
+                changed_paths=changed_paths,
+            )
+            self.receipt["local_review_diff_equivalence"] = local_evidence
+            if local_equivalent:
+                binding_diff_sha256 = expected_diff
+                diff_identity_mode = "local-review-diff-proven-equivalent"
         diff_canonicalization = diff_source
         if live_diff_bytes != raw_live_diff_bytes:
             diff_canonicalization += "+" + GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION
