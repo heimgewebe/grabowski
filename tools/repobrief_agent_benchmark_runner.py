@@ -1303,7 +1303,8 @@ def _decoded_repoground_payload(result: Mapping[str, Any]) -> Mapping[str, Any] 
                 nested = result_value.get("structured_content")
             if isinstance(nested, Mapping):
                 return nested
-        if value.get("kind") in {
+        kind = value.get("kind")
+        if isinstance(kind, str) and kind in {
             "repobrief.mcp.read_only_frontdoor",
             "repobrief.live_freshness",
         }:
@@ -1891,7 +1892,8 @@ def _snapshot_ref_matches_manifest(
         return observed_sha == manifest_sha256
     if require_sha:
         return False
-    return snapshot_ref.get("manifest_path") in manifest_paths
+    manifest_path = snapshot_ref.get("manifest_path")
+    return isinstance(manifest_path, str) and manifest_path in manifest_paths
 
 
 def _snapshot_ref_commit(
@@ -1915,10 +1917,12 @@ def _live_snapshot_commit(
     if (
         payload.get("kind") != "repobrief.live_freshness"
         or payload.get("version") != "v1"
-        or payload.get("status") not in _REPOGROUND_LIVE_FRESHNESS
+        or not isinstance(payload.get("status"), str)
+        or payload["status"] not in _REPOGROUND_LIVE_FRESHNESS
         or not isinstance(payload.get("reason"), str)
         or not payload.get("reason")
-        or payload.get("bundle_manifest") not in manifest_paths
+        or not isinstance(payload.get("bundle_manifest"), str)
+        or payload["bundle_manifest"] not in manifest_paths
         or "repo_root" not in payload
         or (
             payload.get("repo_root") is not None
@@ -2042,7 +2046,8 @@ def _repoground_evidence_from_payload(
         if (
             not isinstance(freshness, Mapping)
             or not isinstance(snapshot_ref, Mapping)
-            or freshness.get("status") not in _REPOGROUND_FRESHNESS
+            or not isinstance(freshness.get("status"), str)
+            or freshness["status"] not in _REPOGROUND_FRESHNESS
             or snapshot_ref.get("freshness_status") != freshness.get("status")
             or not _snapshot_ref_matches_manifest(
                 snapshot_ref,
@@ -2120,13 +2125,16 @@ def _repoground_evidence_from_payload(
             not isinstance(verdict, Mapping)
             or verdict.get("kind") != "repobrief.answer_grounding_verdict"
             or verdict.get("version") != "1.0"
-            or verdict.get("status") not in _REPOGROUND_GROUNDING
+            or not isinstance(verdict.get("status"), str)
+            or verdict["status"] not in _REPOGROUND_GROUNDING
             or payload.get("status") != verdict.get("status")
             or not isinstance(live_freshness, Mapping)
             or live_freshness.get("kind") != "repobrief.live_freshness"
             or live_freshness.get("version") != "v1"
-            or live_freshness.get("status") not in _REPOGROUND_LIVE_FRESHNESS
-            or live_freshness.get("bundle_manifest") not in manifest_paths
+            or not isinstance(live_freshness.get("status"), str)
+            or live_freshness["status"] not in _REPOGROUND_LIVE_FRESHNESS
+            or not isinstance(live_freshness.get("bundle_manifest"), str)
+            or live_freshness["bundle_manifest"] not in manifest_paths
             or live_commit is None
         ):
             return None
@@ -2150,7 +2158,8 @@ def _repoground_evidence_from_payload(
         live_status = live_freshness.get("status")
         raw_freshness = snapshot_ref.get("freshness_status")
         if raw_freshness is not None and (
-            raw_freshness not in _REPOGROUND_FRESHNESS
+            not isinstance(raw_freshness, str)
+            or raw_freshness not in _REPOGROUND_FRESHNESS
             or raw_freshness != live_status
         ):
             return None
@@ -2287,12 +2296,15 @@ def normalize_repoground_evidence(
                 if manifest_binding is None:
                     return None
             live_freshness, content_bytes = prepared_resource
-            normalized = _repoground_resource_read_evidence(
-                manifest_binding=manifest_binding,
-                sequence=sequence,
-                live_freshness=live_freshness,
-                content_bytes=content_bytes,
-            )
+            try:
+                normalized = _repoground_resource_read_evidence(
+                    manifest_binding=manifest_binding,
+                    sequence=sequence,
+                    live_freshness=live_freshness,
+                    content_bytes=content_bytes,
+                )
+            except (RunnerError, TypeError, ValueError):
+                continue
         else:
             payload = _decoded_repoground_payload(result)
             if payload is None:
@@ -2307,12 +2319,15 @@ def normalize_repoground_evidence(
                 manifest_paths=manifest_binding[3],
             ):
                 continue
-            normalized = _repoground_evidence_from_payload(
-                manifest_binding=manifest_binding,
-                tool_name=str(abstract),
-                sequence=sequence,
-                payload=payload,
-            )
+            try:
+                normalized = _repoground_evidence_from_payload(
+                    manifest_binding=manifest_binding,
+                    tool_name=str(abstract),
+                    sequence=sequence,
+                    payload=payload,
+                )
+            except (RunnerError, TypeError, ValueError):
+                continue
         if normalized is None:
             continue
         commit, evidence_call = normalized

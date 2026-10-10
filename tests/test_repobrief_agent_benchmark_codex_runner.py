@@ -4180,6 +4180,41 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         external_manifest=external_manifest,
                     )
 
+        staged_ask = json.loads(json.dumps(cases["ask_context"]))
+        staged_ask["context_pack"]["snapshot_ref"]["manifest_path"] = str(manifest)
+        rebound_ask = runner._validated_treatment_tool_result(
+            {
+                "content": [{"type": "text", "text": "ok"}],
+                "structuredContent": staged_ask,
+                "isError": False,
+            },
+            tool_name="ask_context",
+            expected_manifest=manifest,
+            external_manifest=external_manifest,
+        )
+        self.assertEqual(
+            rebound_ask["structuredContent"]["context_pack"]["snapshot_ref"]["manifest_path"],
+            str(external_manifest),
+        )
+        for unexpected_path in ("/foreign/context.json", str(external_manifest)):
+            with self.subTest(ask_context_non_staged=unexpected_path):
+                invalid_ask = json.loads(json.dumps(staged_ask))
+                invalid_ask["context_pack"]["snapshot_ref"]["manifest_path"] = unexpected_path
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "ask_context snapshot manifest does not match staged manifest",
+                ):
+                    runner._validated_treatment_tool_result(
+                        {
+                            "content": [{"type": "text", "text": "ok"}],
+                            "structuredContent": invalid_ask,
+                            "isError": False,
+                        },
+                        tool_name="ask_context",
+                        expected_manifest=manifest,
+                        external_manifest=external_manifest,
+                    )
+
         nested_drifts = {
             "ask_context": "context_pack",
             "grounding_verify": "verdict",
@@ -4322,6 +4357,77 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "output_bytes": 1,
             }]
             return runner._repoground_evidence_from_codex_events(value, events, calls)
+
+    def test_codex_unhashable_optional_freshness_is_nonfatal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory), repo_root="/tmp/repo")
+            original = {
+                "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+                "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+                "tool": "grounding_verify",
+                "status": "pass",
+                "verdict": {
+                    "kind": "repobrief.answer_grounding_verdict",
+                    "version": "1.0",
+                    "status": "pass",
+                    "snapshot_ref": {
+                        "manifest_path": str(manifest),
+                        "git_commit": COMMIT,
+                        "freshness_status": "fresh",
+                    },
+                },
+                "live_freshness": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v1",
+                    "status": "fresh",
+                    "reason": "git_head_matches_snapshot",
+                    "bundle_manifest": str(manifest),
+                    "repo_root": "/tmp/repo",
+                    "read_only_git_probe": True,
+                    "implicit_refresh": False,
+                    "snapshot_provenance": {"git_commit": COMMIT},
+                },
+            }
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "grounding_verify",
+                    "arguments": {},
+                    "result": {"structured_content": original},
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{"sequence": 1, "name": "grounding_verify", "status": "success"}]
+            with patch.object(
+                runner, "_validated_treatment_structured_payload",
+                return_value=original,
+            ):
+                self.assertIsNotNone(runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                ))
+            for path in (
+                ("verdict", "snapshot_ref", "freshness_status"),
+                ("live_freshness", "status"),
+                ("live_freshness", "bundle_manifest"),
+            ):
+                for bad in ([], {}):
+                    with self.subTest(path=path, bad_type=type(bad).__name__):
+                        payload = copy.deepcopy(original)
+                        field = payload
+                        for name in path[:-1]:
+                            field = field[name]
+                        field[path[-1]] = bad
+                        with patch.object(
+                            runner, "_validated_treatment_structured_payload",
+                            return_value=payload,
+                        ):
+                            self.assertIsNone(runner._repoground_evidence_from_codex_events(
+                                value, events, calls
+                            ))
 
     def test_codex_fresh_evidence_requires_proven_read_only_probe(self) -> None:
         valid = self._codex_live_freshness_evidence(root="/tmp/repo")

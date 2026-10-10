@@ -770,6 +770,95 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
         )
         self.assertEqual(receipt["tool_calls"][0]["name"], "ask_context")
 
+    def test_malformed_optional_snapshot_values_never_raise(self) -> None:
+        manifest_path = "/tmp/repoground-pinned-manifest.json"
+        manifest_paths = frozenset({manifest_path})
+        binding = ("a" * 64, COMMIT, "/tmp/repo", manifest_paths)
+        valid = {
+            "kind": "repobrief.live_freshness",
+            "version": "v1",
+            "status": "fresh",
+            "reason": "git_head_matches_snapshot",
+            "bundle_manifest": manifest_path,
+            "repo_root": "/tmp/repo",
+            "read_only_git_probe": True,
+            "implicit_refresh": False,
+            "snapshot_provenance": {"git_commit": COMMIT},
+        }
+        for invalid in ([], {"untrusted": True}):
+            with self.subTest(field="snapshot_ref.manifest_path", invalid=invalid):
+                self.assertFalse(runner._snapshot_ref_matches_manifest(
+                    {"manifest_path": invalid},
+                    manifest_paths=manifest_paths,
+                    manifest_sha256=binding[0],
+                    require_sha=False,
+                ))
+            for field in ("status", "bundle_manifest"):
+                with self.subTest(field=field, invalid=invalid):
+                    corrupted = {**valid, field: invalid}
+                    self.assertIsNone(runner._live_snapshot_commit(
+                        corrupted,
+                        manifest_paths=manifest_paths,
+                        manifest_commit=COMMIT,
+                        manifest_repo_root="/tmp/repo",
+                    ))
+                    self.assertIsNone(runner._repoground_resource_read_evidence(
+                        manifest_binding=binding,
+                        sequence=1,
+                        live_freshness=corrupted,
+                        content_bytes=7,
+                    ))
+
+    def test_malformed_grounding_status_types_omit_optional_evidence(self) -> None:
+        path = "/tmp/pinned-grounding-manifest.json"
+        binding = ("a" * 64, COMMIT, "/tmp/repo", frozenset({path}))
+        fresh = {
+            "kind": "repobrief.live_freshness",
+            "version": "v1",
+            "status": "fresh",
+            "reason": "git_head_matches_snapshot",
+            "bundle_manifest": path,
+            "repo_root": "/tmp/repo",
+            "read_only_git_probe": True,
+            "implicit_refresh": False,
+            "snapshot_provenance": {"git_commit": COMMIT},
+        }
+        payload = {
+            "kind": "repobrief.mcp.read_only_frontdoor",
+            "version": "v1",
+            "tool": "grounding_verify",
+            "status": "degraded",
+            "verdict": {
+                "kind": "repobrief.answer_grounding_verdict",
+                "version": "1.0",
+                "status": "degraded",
+                "snapshot_ref": {"manifest_path": path},
+            },
+            "live_freshness": fresh,
+        }
+        def projection(value):
+            return runner._repoground_evidence_from_payload(
+                manifest_binding=binding,
+                tool_name="grounding_verify",
+                sequence=1,
+                payload=value,
+            )
+        self.assertEqual(projection(payload)[0], COMMIT)
+        for invalid in ([], {"invalid": True}):
+            for section, field in (
+                ("verdict", "status"),
+                ("verdict.snapshot_ref", "freshness_status"),
+                ("live_freshness", "status"),
+                ("live_freshness", "bundle_manifest"),
+            ):
+                with self.subTest(section=section, field=field, invalid=invalid):
+                    changed = copy.deepcopy(payload)
+                    target = changed
+                    for name in section.split("."):
+                        target = target[name]
+                    target[field] = invalid
+                    self.assertIsNone(projection(changed))
+
     def test_legacy_manifest_version_rejects_explicit_null(self) -> None:
         legacy = {"kind": runner._REPOGROUND_LEGACY_MANIFEST_KIND}
         runner._require_repoground_manifest_envelope(legacy)
@@ -2447,6 +2536,153 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 self.assertIsNone(
                     self._evidence_for_payload(tool, payload, fill=False)
                 )
+
+    def test_invalid_tool_kind_does_not_fail_completed_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            bind_manifest(value, Path(directory))
+            for invalid_kind in ([], {}):
+                with self.subTest(kind=type(invalid_kind).__name__):
+                    messages = runner.parse_jsonl(
+                        stream(value, tool_name="mcp__repobrief__live_freshness")
+                    )
+                    tool_result = next(
+                        block
+                        for message in messages
+                        for block in runner._list(
+                            runner._mapping(message.get("message")).get("content")
+                        )
+                        if runner._mapping(block).get("type") == "tool_result"
+                    )
+                    tool_result["content"] = json.dumps({"kind": invalid_kind})
+                    raw = b"".join(
+                        runner._canonical_json(message).encode("utf-8") + b"\n"
+                        for message in messages
+                    )
+                    started = datetime.now(timezone.utc)
+                    receipt = runner.build_receipt(
+                        value,
+                        raw,
+                        transcript_artifact="transcript.jsonl",
+                        returncode=0,
+                        started_at=started,
+                        ended_at=started,
+                    )
+                    self.assertEqual(receipt["kind"], runner.RECEIPT_KIND)
+                    self.assertIsNone(receipt.get("repoground_evidence"))
+
+    def test_unhashable_optional_repoground_fields_do_not_break_receipt(self) -> None:
+        for bad in ([], {}):
+            with self.subTest(field="decoded_kind", bad_type=type(bad).__name__):
+                self.assertIsNone(runner._decoded_repoground_payload({
+                    "content": [{"type": "text", "text": json.dumps({"kind": bad})}]
+                }))
+
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            bound = runner._optional_repoground_manifest_binding(value)
+            self.assertIsNotNone(bound)
+            live = self._freshness(str(manifest))
+            original = {
+                "kind": "repobrief.mcp.read_only_frontdoor",
+                "version": "v1",
+                "tool": "grounding_verify",
+                "status": "pass",
+                "verdict": {
+                    "kind": "repobrief.answer_grounding_verdict",
+                    "version": "1.0",
+                    "status": "pass",
+                    "snapshot_ref": {
+                        "manifest_path": str(manifest),
+                        "git_commit": COMMIT,
+                        "freshness_status": "fresh",
+                    },
+                },
+                "live_freshness": live,
+            }
+            self.assertIsNotNone(runner._repoground_evidence_from_payload(
+                manifest_binding=bound,
+                tool_name="grounding_verify",
+                sequence=1,
+                payload=original,
+            ))
+            for path in (
+                ("verdict", "status"),
+                ("verdict", "snapshot_ref", "manifest_path"),
+                ("verdict", "snapshot_ref", "freshness_status"),
+                ("live_freshness", "status"),
+                ("live_freshness", "bundle_manifest"),
+            ):
+                for bad in ([], {}):
+                    with self.subTest(path=path, bad_type=type(bad).__name__):
+                        payload = copy.deepcopy(original)
+                        field = payload
+                        for name in path[:-1]:
+                            field = field[name]
+                        field[path[-1]] = bad
+                        self.assertIsNone(runner._repoground_evidence_from_payload(
+                            manifest_binding=bound,
+                            tool_name="grounding_verify",
+                            sequence=1,
+                            payload=payload,
+                        ))
+            for bad in ([], {}):
+                with self.subTest(field="ask_context.freshness_status", bad_type=type(bad).__name__):
+                    payload = {
+                        "kind": "repobrief.mcp.read_only_frontdoor",
+                        "version": "v1",
+                        "tool": "ask_context",
+                        "status": "ok",
+                        "live_freshness": copy.deepcopy(live),
+                        "context_pack": {
+                            "kind": "repobrief.ask_context_pack",
+                            "version": "1.0",
+                            "freshness": {"status": bad},
+                            "snapshot_ref": {
+                                "manifest_sha256": value["repobrief"]["manifest_sha256"],
+                                "freshness_status": bad,
+                            },
+                        },
+                    }
+                    self.assertIsNone(runner._repoground_evidence_from_payload(
+                        manifest_binding=bound,
+                        tool_name="ask_context",
+                        sequence=1,
+                        payload=payload,
+                    ))
+
+    def test_snapshot_and_live_membership_reject_unhashable_json_values(self) -> None:
+        paths = frozenset({"/logical/manifest.json"})
+        original = {
+            "kind": "repobrief.live_freshness",
+            "version": "v1",
+            "status": "fresh",
+            "reason": "git_head_matches_snapshot",
+            "bundle_manifest": "/logical/manifest.json",
+            "repo_root": "/tmp/repo",
+            "read_only_git_probe": True,
+            "implicit_refresh": False,
+            "snapshot_provenance": {"git_commit": COMMIT},
+        }
+        for bad in ([], {}):
+            with self.subTest(field="snapshot_ref.manifest_path", kind=type(bad).__name__):
+                self.assertFalse(runner._snapshot_ref_matches_manifest(
+                    {"manifest_path": bad},
+                    manifest_paths=paths,
+                    manifest_sha256="0" * 64,
+                    require_sha=False,
+                ))
+            for field in ("status", "bundle_manifest"):
+                with self.subTest(field="live_freshness." + field, kind=type(bad).__name__):
+                    payload = copy.deepcopy(original)
+                    payload[field] = bad
+                    self.assertIsNone(runner._live_snapshot_commit(
+                        payload,
+                        manifest_paths=paths,
+                        manifest_commit=COMMIT,
+                        manifest_repo_root="/tmp/repo",
+                    ))
 
     def test_treatment_projects_strict_unknown_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

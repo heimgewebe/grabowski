@@ -1202,15 +1202,19 @@ def _validated_treatment_tool_result(
         if not isinstance(freshness, dict):
             raise RunnerError("RepoGround treatment tool freshness binding is missing")
         freshness["bundle_manifest"] = str(external_manifest)
-        if tool_name == "grounding_verify":
-            verdict = structured.get("verdict")
+        if tool_name in {"grounding_verify", "ask_context"}:
+            parent = (
+                structured.get("verdict")
+                if tool_name == "grounding_verify"
+                else structured.get("context_pack")
+            )
             snapshot_ref = (
-                verdict.get("snapshot_ref") if isinstance(verdict, dict) else None
+                parent.get("snapshot_ref") if isinstance(parent, dict) else None
             )
             if isinstance(snapshot_ref, dict) and "manifest_path" in snapshot_ref:
                 if snapshot_ref["manifest_path"] != str(expected_manifest):
                     raise RunnerError(
-                        "RepoGround grounding snapshot manifest does not match staged manifest"
+                        f"RepoGround {tool_name.replace('_verify', '')} snapshot manifest does not match staged manifest"
                     )
                 snapshot_ref["manifest_path"] = str(external_manifest)
     return {
@@ -5447,18 +5451,21 @@ def _repoground_evidence_from_codex_events(
                     expected_manifest=manifest,
                     is_error=False,
                 )
-            except RunnerError:
+            except (RunnerError, TypeError, ValueError):
                 continue
             if manifest_binding is None:
                 manifest_binding = base._optional_repoground_manifest_binding(request)
                 if manifest_binding is None:
                     return None
-            normalized = base._repoground_evidence_from_payload(
-                manifest_binding=manifest_binding,
-                tool_name=str(tool_name),
-                sequence=sequence,
-                payload=payload,
-            )
+            try:
+                normalized = base._repoground_evidence_from_payload(
+                    manifest_binding=manifest_binding,
+                    tool_name=str(tool_name),
+                    sequence=sequence,
+                    payload=payload,
+                )
+            except (RunnerError, TypeError, ValueError):
+                continue
         if normalized is None:
             continue
         commit, call_evidence = normalized
