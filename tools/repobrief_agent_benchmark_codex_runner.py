@@ -451,6 +451,28 @@ def _frozen_g1_mcp_profile(request: Mapping[str, Any]) -> str:
     return MCP_PROFILE_FROZEN_G1
 
 
+
+def _frozen_g1_baseline_pair(request: Mapping[str, Any]) -> bool:
+    """Gate the exact frozen G1 baseline too; a bad treatment must not burn it."""
+    frozen = FROZEN_G1_LEGACY_IDENTITY
+    if (
+        request.get("taskset_id") != frozen["taskset_id"]
+        or request.get("case_id") != frozen["case_id"]
+        or request.get("condition") != "baseline"
+    ):
+        return False
+    prompt = request.get("prompt")
+    if (
+        request.get("taskset_sha256") != frozen["taskset_sha256"]
+        or request.get("repository") != frozen["repository"]
+        or not isinstance(prompt, str)
+        or sha_bytes(prompt.encode("utf-8")) != frozen["prompt_sha256"]
+        or base.validated_setup(request) != "clean"
+    ):
+        raise RunnerError("frozen historical G1 baseline identity is not authorized")
+    return True
+
+
 MCP_CLIENT_METHODS = {"initialize", "notifications/initialized", "ping", "tools/list", "tools/call"}
 MAX_FROZEN_RESOURCES = 512
 
@@ -6446,6 +6468,17 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 )
                 if dispatch_authorization is None:
                     raise RunnerError("live dispatch authorization is unavailable before provider intent")
+                # Historical G1 dependencies must remain pinned immediately before
+                # consuming the one-shot authorization. The MCP proxy's private
+                # runtime staging independently rechecks them after dispatch.
+                if (
+                    _frozen_g1_baseline_pair(request)
+                    or (
+                        request["condition"] == "treatment"
+                        and _frozen_g1_mcp_profile(request) == MCP_PROFILE_FROZEN_G1
+                    )
+                ):
+                    _frozen_g1_vendor_snapshot()
                 _record_preflight_dispatch_intent(
                     request,
                     state_path,

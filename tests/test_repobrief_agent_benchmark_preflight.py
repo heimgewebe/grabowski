@@ -1765,6 +1765,82 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             self.assertEqual(events[-1]["payload"]["provider_process_intents"], 0)
 
 
+    def test_frozen_g1_vendor_failure_refuses_preflight_publication(self) -> None:
+        for vendor_failure in (
+            "historical G1 vendor source is unavailable or linked",
+            "historical G1 vendor source digest is not frozen",
+        ):
+            with self.subTest(vendor_failure=vendor_failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = support.fixture_environment(root)
+                pair_id, _baseline, _treatment = self._codex_pair(environment)
+                state_root = root / "state"
+                codex = root / "codex"
+                codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                codex.chmod(0o755)
+                codex_sha256 = hashlib.sha256(codex.read_bytes()).hexdigest()
+                core = codex_preflight.core
+                loaded_codex = core._codex_runner_module()
+                with (
+                    mock.patch.object(
+                        codex_preflight.codex_runner,
+                        "validate_executable",
+                        return_value=str(codex.resolve()),
+                    ),
+                    mock.patch.object(
+                        codex_preflight.codex_runner, "validate_toolchain"
+                    ),
+                    mock.patch.object(
+                        codex_preflight.codex_runner,
+                        "validate_chatgpt_subscription",
+                        return_value=b'{"tokens":{}}',
+                    ),
+                    mock.patch.object(
+                        loaded_codex, "_frozen_g1_mcp_profile",
+                        return_value=loaded_codex.MCP_PROFILE_FROZEN_G1,
+                    ),
+                    mock.patch.object(
+                        core, "_historical_g1_preflight_stage",
+                        side_effect=core.PreflightError(vendor_failure),
+                    ) as staging,
+                    mock.patch.object(core.subprocess, "Popen", wraps=subprocess.Popen) as process,
+                    self.assertRaisesRegex(core.PreflightError, "historical G1 vendor"),
+                ):
+                    codex_preflight.authorize_pair(
+                        pair_id=pair_id,
+                        request_root=environment["request_root"],
+                        repository_map=environment["repository_map"],
+                        state_root=state_root,
+                        transcript_root=root / "transcripts",
+                        evidence_root=root / "evidence",
+                        report_out=root / "preflight-report.json",
+                        codex_command=str(codex.resolve()),
+                        codex_command_sha256=codex_sha256,
+                        max_cost_usd=support.Decimal("1.00"),
+                        validator_command=core._command_array(
+                            environment["validator_command"]
+                        ),
+                    )
+                staging.assert_called_once()
+                self.assertFalse(
+                    any(
+                        "mcp-stdio.py" in str(call.args)
+                        for call in process.call_args_list
+                    ),
+                    "historical G1 MCP started despite rejected vendor",
+                )
+                pair_root = next(
+                    (state_root / "preflight-dispatch-ledger").iterdir()
+                )
+                self.assertFalse(
+                    (pair_root / "authorization.json").exists()
+                )
+                events = support.ledger_events(state_root)
+                self.assertEqual(events[-1]["event"], "preflight-failed")
+                self.assertEqual(
+                    events[-1]["payload"]["provider_process_intents"], 0
+                )
+
     def test_codex_producer_ledger_is_consumable_by_exact_runner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

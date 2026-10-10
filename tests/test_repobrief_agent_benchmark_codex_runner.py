@@ -6051,9 +6051,249 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(runner.RunnerError, "path is unsafe"):
                     runner._frozen_g1_vendor_snapshot()
                 forged.unlink()
+                moved_package = site / "unavailable-vendor"
+                package.rename(moved_package)
+                try:
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "source is unavailable or linked"
+                    ):
+                        runner._frozen_g1_vendor_snapshot()
+                finally:
+                    moved_package.rename(package)
                 with patch.object(runner, "MAX_FROZEN_G1_VENDOR_FILES", 1):
                     with self.assertRaisesRegex(runner.RunnerError, "exceeds bounds"):
                         runner._frozen_g1_vendor_snapshot()
+
+
+class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
+    """Frozen G1 dependency corruption must not consume a paid one-shot."""
+
+    def test_vendor_failure_before_one_shot_intent_prevents_provider_start(self) -> None:
+        for failure in (
+            "historical G1 vendor source is unavailable or linked",
+            "historical G1 vendor source digest is not frozen",
+            "historical G1 vendor path is unsafe",
+            "historical G1 vendor metadata is unsafe",
+        ):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                value = request(condition="treatment")
+                manifest = root / "manifest.json"
+                manifest.write_bytes(b"{}\n")
+                value["repobrief"]["manifest"] = str(manifest)
+                value["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                    manifest.read_bytes()
+                ).hexdigest()
+                planned_request_root(root, value)
+                checkout = root / "checkout"
+                checkout.mkdir()
+                codex_home = root / "codex-home"
+                codex_home.mkdir()
+                args = Namespace(
+                    request_root=root / "requests",
+                    repository_map=root / "repositories.json",
+                    state_root=root / "state",
+                    transcript_root=root / "transcripts",
+                    provider_evidence_root=root / "provider-evidence",
+                    codex_command="/opt/codex",
+                    codex_command_sha256="1" * 64,
+                    allow_live_provider=True,
+                    stream_fixture=None,
+                    stderr_fixture=None,
+                    fixture_returncode=0,
+                )
+                dispatch = {
+                    "authorization": {"contract": "test"},
+                    "provider_codex": {},
+                    "provider_authentication": {},
+                    "repository_map_bytes": b"{}",
+                    "binding": {},
+                    "mcp_files": [],
+                    "proxy_code": {},
+                    "proxy_base_code": {},
+                    "manifest": {},
+                }
+                with ExitStack() as stack:
+                    for name, value_to_return in (
+                        ("validate_executable", "/opt/codex"),
+                        ("validate_toolchain", None),
+                        ("validate_chatgpt_subscription", b"opaque-auth"),
+                        ("_repository_root_from_authorized_map_bytes", root),
+                        ("prepare_provider_evidence", {"plan": True}),
+                        ("create_checkout", checkout),
+                        ("stage_codex_home", codex_home),
+                        ("stage_mcp_proxy", {"path": str(root / "proxy.py")}),
+                        ("stage_repoground_manifest", {"path": str(manifest)}),
+                        ("_rebind_staged_manifest_authorization", []),
+                        ("build_command", ["codex"]),
+                        ("provider_env", {}),
+                        ("cleanup_codex_home", None),
+                        ("cleanup_staged_mcp_proxy", None),
+                        ("cleanup_staged_repoground_manifest", None),
+                    ):
+                        stack.enter_context(
+                            patch.object(runner, name, return_value=value_to_return)
+                        )
+                    for name in (
+                        "_assert_authorized_codex_executable",
+                        "_assert_authorized_chatgpt_auth",
+                        "_assert_authorized_runtime_binding",
+                        "close_provider_evidence_plan",
+                        "write_schema",
+                    ):
+                        stack.enter_context(patch.object(runner, name))
+                    stack.enter_context(
+                        patch.object(
+                            runner, "_load_preflight_dispatch_authorization",
+                            return_value=dispatch,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            runner, "_frozen_g1_mcp_profile",
+                            return_value=runner.MCP_PROFILE_FROZEN_G1,
+                        )
+                    )
+                    frozen_vendor = stack.enter_context(
+                        patch.object(
+                            runner, "_frozen_g1_vendor_snapshot",
+                            side_effect=runner.RunnerError(failure),
+                        )
+                    )
+                    intent = stack.enter_context(
+                        patch.object(runner, "_record_preflight_dispatch_intent")
+                    )
+                    provider = stack.enter_context(
+                        patch.object(runner, "run_bounded")
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            runner.base, "attest_checkout_setup",
+                            return_value={"working_tree": "clean"},
+                        )
+                    )
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "historical G1 vendor"
+                    ):
+                        runner.execute(value, args)
+                frozen_vendor.assert_called_once_with()
+                intent.assert_not_called()
+                provider.assert_not_called()
+
+
+
+    def test_frozen_g1_baseline_pair_has_exact_identity(self) -> None:
+        value = request(condition="baseline")
+        identity = dict(runner.FROZEN_G1_LEGACY_IDENTITY)
+        identity.update({
+            "taskset_id": value["taskset_id"],
+            "taskset_sha256": value["taskset_sha256"],
+            "case_id": value["case_id"],
+            "repository": value["repository"],
+            "prompt_sha256": hashlib.sha256(value["prompt"].encode()).hexdigest(),
+        })
+        with patch.object(runner, "FROZEN_G1_LEGACY_IDENTITY", identity):
+            self.assertTrue(runner._frozen_g1_baseline_pair(value))
+            for key, other in (
+                ("taskset_sha256", "0" * 64),
+                ("repository", {"id": "other"}),
+                ("prompt", "altered task prompt"),
+            ):
+                modified = json.loads(json.dumps(value))
+                modified[key] = other
+                with self.subTest(key=key), self.assertRaisesRegex(
+                    runner.RunnerError, "baseline identity is not authorized"
+                ):
+                    runner._frozen_g1_baseline_pair(modified)
+            unrelated = json.loads(json.dumps(value))
+            unrelated["case_id"] = "ordinary-modern-case"
+            self.assertFalse(runner._frozen_g1_baseline_pair(unrelated))
+
+    def test_frozen_g1_baseline_vendor_failure_blocks_first_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request(condition="baseline")
+            planned_request_root(root, value)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            codex_home = root / "codex-home"
+            codex_home.mkdir()
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "repositories.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "provider-evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            dispatch = {
+                "authorization": {"contract": "test"},
+                "provider_codex": {},
+                "provider_authentication": {},
+                "repository_map_bytes": b"{}",
+                "binding": {},
+                "mcp_files": [],
+                "proxy_code": None,
+                "proxy_base_code": None,
+                "manifest": None,
+            }
+            with ExitStack() as stack:
+                for name, result in (
+                    ("validate_executable", "/opt/codex"),
+                    ("validate_toolchain", None),
+                    ("validate_chatgpt_subscription", b"opaque-auth"),
+                    ("_repository_root_from_authorized_map_bytes", root),
+                    ("prepare_provider_evidence", {"plan": True}),
+                    ("create_checkout", checkout),
+                    ("stage_codex_home", codex_home),
+                    ("build_command", ["codex"]),
+                    ("provider_env", {}),
+                    ("cleanup_codex_home", None),
+                ):
+                    stack.enter_context(patch.object(runner, name, return_value=result))
+                for name in (
+                    "_assert_authorized_codex_executable",
+                    "_assert_authorized_chatgpt_auth",
+                    "_assert_authorized_runtime_binding",
+                    "close_provider_evidence_plan",
+                    "write_schema",
+                ):
+                    stack.enter_context(patch.object(runner, name))
+                stack.enter_context(
+                    patch.object(
+                        runner, "_load_preflight_dispatch_authorization",
+                        return_value=dispatch,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(runner, "_frozen_g1_baseline_pair", return_value=True)
+                )
+                vendor = stack.enter_context(
+                    patch.object(
+                        runner, "_frozen_g1_vendor_snapshot",
+                        side_effect=runner.RunnerError("historical G1 vendor missing"),
+                    )
+                )
+                intent = stack.enter_context(
+                    patch.object(runner, "_record_preflight_dispatch_intent")
+                )
+                provider = stack.enter_context(patch.object(runner, "run_bounded"))
+                stack.enter_context(
+                    patch.object(
+                        runner.base, "attest_checkout_setup",
+                        return_value={"working_tree": "clean"},
+                    )
+                )
+                with self.assertRaisesRegex(runner.RunnerError, "vendor missing"):
+                    runner.execute(value, args)
+            vendor.assert_called_once_with()
+            intent.assert_not_called()
+            provider.assert_not_called()
 
 
 if __name__ == "__main__":
