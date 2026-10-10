@@ -12271,8 +12271,11 @@ def _task_reconcile_check_after_guard(
     limit: int,
     cursor: str | None,
 ) -> dict[str, Any]:
+    # This in-process RLock has no filesystem effect. Check mutation authority
+    # under serialization, immediately before legacy SQLite/broker effects.
+    operator._require_operator_capability("durable_job")
     with TASK_RECONCILE_LOCK:
-        operator._require_operator_capability("durable_job")
+        operator._require_operator_mutation("durable_job")
         return reconcile_tasks_check(task_id=task_id, limit=limit, cursor=cursor)
 
 
@@ -12281,18 +12284,18 @@ def grabowski_task_reconcile_check(
     limit: int = DEFAULT_TASK_RECONCILE_CHECK_LIMIT,
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    """Read one bounded, resumable reconcile preview for persistent tasks."""
+    """Preview tasks through the mutation gate (legacy stores may be upgraded)."""
     operator._require_operator_capability("durable_job")
     return _task_reconcile_check_after_guard(task_id, limit, cursor)
 
 
-@mcp.tool(name="grabowski_task_reconcile_check", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_task_reconcile_check", annotations=MUTATING)
 async def _grabowski_task_reconcile_check_tool(
     task_id: str = "",
     limit: int = DEFAULT_TASK_RECONCILE_CHECK_LIMIT,
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    """Read one bounded, resumable reconcile preview for persistent tasks."""
+    """Preview tasks through the mutation gate (legacy stores may be upgraded)."""
     operator._require_operator_capability("durable_job")
     return await asyncio.to_thread(
         _task_reconcile_check_after_guard,

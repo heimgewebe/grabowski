@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "8f0cadc240dd7c9f1dcd865910c87437d57ea91e9973484610a57ce36bfdddd6",
+  "capability_source_sha256": "0ebd9b07c4fa485b9ce82c1a67642ec9a66eda3f8666ea724d48d51f862da647",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "2681d2593edcdc23e200aa0fa3e6eec2cbda1b9c1794b1d9faf87fc81801c567",
   "integrity": {
@@ -1546,11 +1546,14 @@
     },
     {
       "category": "task",
-      "description": "Read one bounded, resumable reconcile preview for persistent tasks.",
-      "effects": [],
+      "description": "Preview tasks through the mutation gate (legacy stores may be upgraded).",
+      "effects": [
+        "schema-migration",
+        "temporary-file-create"
+      ],
       "id": "grabowski_task_reconcile_check",
-      "purpose": "Preview reconcile effects for persistent task records without mutating state.",
-      "read_only": true,
+      "purpose": "Preview persistent task reconciliation through the mutation gate; legacy SQLite stores may be initialized or migrated and privileged observations may create temporary reference files.",
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_reconcile_check"

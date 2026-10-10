@@ -178,13 +178,13 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         amendments = self.contract["accepted_semantic_corrections"]
         self.assertEqual(
             set(amendments),
-            {"grabowski_task_status", "grabowski_task_list", "grabowski_resource_list"},
+            {"grabowski_task_status", "grabowski_task_list", "grabowski_task_reconcile_check", "grabowski_resource_list"},
         )
         self.assertEqual(
             self.contract["baseline"]["tool_semantics_sha256"],
             budget.BASELINE_TOOL_SEMANTICS_SHA256,
         )
-        self.assertEqual(budget.validate_repository()["accepted_semantic_correction_count"], 3)
+        self.assertEqual(budget.validate_repository()["accepted_semantic_correction_count"], 4)
         self.assertTrue(self._validate(copy.deepcopy(self.contract))["valid"])
 
     def test_semantic_correction_never_allows_unreviewed_or_weaker_contract(self) -> None:

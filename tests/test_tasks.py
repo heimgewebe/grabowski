@@ -5406,6 +5406,39 @@ class TaskTests(unittest.TestCase):
             result["blocked"][0]["resume_policy"], "verify-then-retry"
         )
 
+    def test_reconcile_check_public_guard_denies_inside_lock_before_store(self) -> None:
+        self.assertFalse(self.database.exists())
+        self.assertFalse(self.resource_database.exists())
+        gate_after_lock = []
+
+        def deny_after_lock(capability):
+            gate_after_lock.append((capability, lock.__enter__.called))
+            raise PermissionError("mutation gate denied")
+
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=deny_after_lock,
+            ) as gate,
+            patch.object(tasks, "_task_read_snapshot") as reader,
+            patch.object(tasks, "TASK_RECONCILE_LOCK") as lock,
+        ):
+            with self.assertRaisesRegex(PermissionError, "mutation gate denied"):
+                tasks.grabowski_task_reconcile_check(limit=1)
+            lock.__enter__.assert_called_once()
+        gate.assert_called_once_with("durable_job")
+        self.assertEqual([("durable_job", True)], gate_after_lock)
+        reader.assert_not_called()
+        self.assertFalse(self.database.exists())
+        self.assertFalse(self.resource_database.exists())
+
+    def test_reconcile_check_public_allowed_guard_keeps_preview_working(self) -> None:
+        with patch.object(tasks.operator, "_require_operator_mutation") as gate:
+            result = tasks.grabowski_task_reconcile_check(limit=1)
+        gate.assert_called_once_with("durable_job")
+        self.assertEqual("check", result["mode"])
+        self.assertEqual(0, result["scanned"])
+
     def test_reconcile_check_is_read_only_preview(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_dispatch", return_value=_launcher()

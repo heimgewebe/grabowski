@@ -3701,6 +3701,28 @@
         "src/grabowski_tasks.py:7113-7172"
       ]
     },
+    "grabowski_task_reconcile_check": {
+      "original_semantics_sha256": "1f79a531f65d5d03c2e44e0af56fa2aa288bcaa8e5166448fca660ce49a3c5cb",
+      "tool_contract": {
+        "tool": "grabowski_task_reconcile_check",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "low",
+        "read_only": false,
+        "effects": [
+          "schema-migration",
+          "temporary-file-create"
+        ],
+        "reversibility": "not-applicable"
+      },
+      "rationale": "The published reconciliation check was mislabeled READ_ONLY: legacy task/resource readers can initialize or migrate SQLite stores and privileged rootbroker observations can create temporary reference files. Classify this existing tool as MUTATING and require the operator mutation gate under the serialized lock, preserving the immutable historical baseline.",
+      "evidence_refs": [
+        "https://github.com/heimgewebe/grabowski/issues/1407#issuecomment-6094244124",
+        "src/grabowski_resources.py:3949-3990",
+        "src/grabowski_tasks.py:12269-12307",
+        "tests/test_tasks.py:5409-5456"
+      ]
+    },
     "grabowski_task_status": {
       "original_semantics_sha256": "ba95d919769c0e626cd698adf624e06a854e62408ce4f521f9acd1abb8580f01",
       "tool_contract": {

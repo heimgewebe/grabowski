@@ -160,7 +160,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_chronik_outbox_import` | coding-memory | no | medium | Import one redacted Grabowski outbox JSONL into optional local Chronik. |
 | `grabowski_chronik_history` | coding-memory | yes | low | Read bounded historical coding events without asserting current truth. |
 | `grabowski_operator_historical_recall` | operator-recall | yes | low | Read evidence-bound operator recall derived from validated Chronik history. |
-| `grabowski_task_reconcile_check` | task | yes | low | Preview reconcile effects for persistent task records without mutating state. |
+| `grabowski_task_reconcile_check` | task | no | low | Preview persistent task reconciliation through the mutation gate; legacy SQLite stores may be initialized or migrated and privileged observations may create temporary reference files. |
 | `grabowski_task_reconcile_refresh` | task | no | medium | Refresh persistent task records and release terminal leases without resuming processes. |
 | `grabowski_task_reconcile_resume` | task | no | high | Resume bounded retry-safe tasks after reconcile verification. |
 | `grabowski_recovery_provenance_assess` | recovery | yes | low | Assess the fail-closed lane for repairing invalid deployment provenance. |

@@ -1606,11 +1606,14 @@
     },
     {
       "category": "task",
-      "description": "Read one bounded, resumable reconcile preview for persistent tasks.",
-      "effects": [],
+      "description": "Preview tasks through the mutation gate (legacy stores may be upgraded).",
+      "effects": [
+        "schema-migration",
+        "temporary-file-create"
+      ],
       "id": "grabowski_task_reconcile_check",
-      "purpose": "Preview reconcile effects for persistent task records without mutating state.",
-      "read_only": true,
+      "purpose": "Preview persistent task reconciliation through the mutation gate; legacy SQLite stores may be initialized or migrated and privileged observations may create temporary reference files.",
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_reconcile_check"
@@ -3677,7 +3680,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "8f0cadc240dd7c9f1dcd865910c87437d57ea91e9973484610a57ce36bfdddd6"
+      "sha256": "0ebd9b07c4fa485b9ce82c1a67642ec9a66eda3f8666ea724d48d51f862da647"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3807,7 +3810,7 @@
       "src/grabowski_systemkatalog.py": "e3ec4884b3dd367b8970b3143432cab0fea5fe55963292806001f5df535c83f9",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "c19fdc6b80efa10b7988ce7d3645bb840587f9c6ae0411402160d8fa3338ef13",
+      "src/grabowski_tasks.py": "d822ef6e676a9ad5dd79cebb7d9b27fbb965915340273c030f5737473d50ee9a",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",

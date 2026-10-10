@@ -942,9 +942,9 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_task_reconcile_check": {
         "category": "task",
-        "purpose": "Preview reconcile effects for persistent task records without mutating state.",
+        "purpose": "Preview persistent task reconciliation through the mutation gate; legacy SQLite stores may be initialized or migrated and privileged observations may create temporary reference files.",
         "risk_class": "low",
-        "effects": [],
+        "effects": ["schema-migration", "temporary-file-create"],
         "reversibility": "not-applicable",
     },
     "grabowski_task_reconcile_refresh": {
