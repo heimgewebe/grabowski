@@ -7852,7 +7852,7 @@ def renew_resources(
     now = _now()
     requested_expires = now + ttl
     updates: list[tuple[int, int, str, str]] = []
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             _check_bureau_semantic_conflicts(

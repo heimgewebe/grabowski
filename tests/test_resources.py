@@ -89,6 +89,21 @@ class ResourceTests(unittest.TestCase):
                     connection.execute("SELECT 1")
             opened.clear()
 
+            resources.renew_resources(owner, [key], ttl_seconds=2400)
+            self.assertTrue(opened)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+            opened.clear()
+
+            with self.assertRaises(PermissionError):
+                resources.renew_resources("operator:other-owner", [key])
+            self.assertTrue(opened)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+            opened.clear()
+
             resources.release_resources(owner, [key])
             self.assertTrue(opened)
             for connection in opened:
