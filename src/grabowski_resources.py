@@ -3950,7 +3950,7 @@ def task_terminalization_record(
     task_id: str, *, include_projection: bool = False
 ) -> dict[str, Any] | None:
     identifier = _task_identifier(task_id)
-    with _database() as connection:
+    with closing(_database()) as connection:
         row = connection.execute(
             "SELECT * FROM task_terminalizations WHERE task_id=?",
             (identifier,),
@@ -3976,7 +3976,7 @@ def task_terminalization_records(
     if not identifiers:
         return {}
     placeholders = ",".join("?" for _ in identifiers)
-    with _database() as connection:
+    with closing(_database()) as connection:
         rows = connection.execute(
             f"SELECT * FROM task_terminalizations WHERE task_id IN ({placeholders})",
             identifiers,

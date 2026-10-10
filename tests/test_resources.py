@@ -140,6 +140,31 @@ class ResourceTests(unittest.TestCase):
         for suffix in ("-wal", "-shm"):
             self.assertFalse(Path(str(self.database) + suffix).exists())
 
+    def test_task_terminalization_inspection_closes_held_sqlite_connections(self) -> None:
+        # The Task start path consults this resource store while setting
+        # a running state. A retained open handle leaves WAL/SHM sidecars.
+        task_id = "0" * 24
+        initialized = resources._database()
+        initialized.close()
+        original_database = resources._database
+        opened: list[sqlite3.Connection] = []
+
+        def record_connection() -> sqlite3.Connection:
+            connection = original_database()
+            opened.append(connection)
+            return connection
+
+        with patch.object(resources, "_database", side_effect=record_connection):
+            self.assertIsNone(resources.task_terminalization_record(task_id))
+            self.assertEqual({}, resources.task_terminalization_records([task_id]))
+
+        self.assertEqual(2, len(opened))
+        for connection in opened:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+        for sidecar in ("-wal", "-shm"):
+            self.assertFalse(Path(str(self.database) + sidecar).exists())
+
     def scope_manifest(
         self, repository: Path, *, name: str, path: Path, effects: list[str] | None = None
     ) -> dict[str, object]:
