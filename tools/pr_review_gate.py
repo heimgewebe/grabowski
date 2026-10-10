@@ -27,6 +27,8 @@ from grabowski_pr_diff import (  # noqa: E402
     canonicalize_github_pr_diff_identity_v1,
     github_pr_diff_identity_sha256,
     github_pr_diff_identity_sha256_v1,
+    bound_local_pr_git_diff,
+    local_pr_git_environment,
 )
 
 try:
@@ -385,7 +387,7 @@ def _run_text(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> st
     return completed.stdout
 
 
-def _run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> bytes:
+def _run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False, env_override: dict[str, str] | None = None) -> bytes:
     if argv and argv[0] == "gh" and shutil.which("gh") is None:
         raise GateInputError("gh CLI is not available in PATH")
     try:
@@ -397,7 +399,7 @@ def _run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> b
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=False,
-            env=_env(),
+            env=_env() if env_override is None else env_override,
             timeout=90,
         )
     except subprocess.TimeoutExpired as exc:
@@ -646,6 +648,25 @@ GITHUB_PR_DIFF_TOO_LARGE_MARKERS = (
 )
 
 
+def _github_pr_diff_too_large(diagnostic: bytes, changed_files: Any) -> bool:
+    """Recognize GitHub's separate file and line limits, never generic 406 errors."""
+    if type(changed_files) is not int or changed_files < 0:
+        return False
+    if b"HTTP 406" not in diagnostic or any(
+        marker in diagnostic for marker in (b"HTTP 401", b"HTTP 403", b"HTTP 429")
+    ):
+        return False
+    line_limit = all(marker in diagnostic for marker in (
+        b"HTTP 406",
+        b"diff exceeded the maximum number of lines",
+        b"PullRequest.diff too_large",
+    ))
+    file_limit = changed_files > GITHUB_PR_DIFF_MAX_FILES and any(
+        marker in diagnostic for marker in GITHUB_PR_DIFF_TOO_LARGE_MARKERS
+    )
+    return line_limit or file_limit
+
+
 def _complete_pr_diff_paths(view: Any) -> list[str] | None:
     if not isinstance(view, dict) or view.get("pullFilesEvidenceComplete") is not True:
         return None
@@ -732,12 +753,7 @@ def _current_pr_diff_bytes(
     if completed.returncode == 0:
         return completed.stdout, None, False
     diagnostic = completed.stderr + b"\n" + completed.stdout
-    too_large = (
-        isinstance(changed_files, int)
-        and not isinstance(changed_files, bool)
-        and changed_files > GITHUB_PR_DIFF_MAX_FILES
-        and any(marker in diagnostic for marker in GITHUB_PR_DIFF_TOO_LARGE_MARKERS)
-    )
+    too_large = _github_pr_diff_too_large(diagnostic, changed_files)
     return None, f"command failed: {_command_label(argv)}", too_large
 
 
@@ -756,6 +772,27 @@ def _local_bound_pr_diff_bytes(repo: Path, view: Any) -> bytes:
     expected_paths = _complete_pr_diff_paths(view)
     if expected_paths is None:
         raise RuntimeError("local PR diff fallback requires complete GitHub file evidence")
+    # GitHub PR files/diffs use the merge base, not the advanced base tip.
+    # Reject missing or ambiguous merge bases instead of silently choosing one.
+    local_env = local_pr_git_environment()
+    # A shallow boundary can hide or misidentify the unique PR merge base.
+    # This fallback cannot safely deepen; refuse incomplete ancestry.
+    shallow_state = _run_bytes(
+        repo, _local_diff_git_argv("rev-parse", "--is-shallow-repository"),
+        env_override=local_env,
+    ).strip()
+    if shallow_state != b"false":
+        raise RuntimeError("local PR diff requires complete history")
+    merge_bases = _run_bytes(
+        repo, _local_diff_git_argv("merge-base", "--all", base, head),
+        env_override=local_env,
+    ).splitlines()
+    if (
+        len(merge_bases) != 1
+        or re.fullmatch(rb"[0-9a-f]{40}", merge_bases[0]) is None
+    ):
+        raise RuntimeError("local PR diff requires exactly one valid merge base")
+    merge_base = merge_bases[0].decode("ascii")
     raw_paths = _run_bytes(
         repo,
         _local_diff_git_argv(
@@ -766,10 +803,11 @@ def _local_bound_pr_diff_bytes(repo: Path, view: Any) -> bytes:
             "--no-textconv",
             "--no-renames",
             "--no-color",
-            base,
+            merge_base,
             head,
             "--",
         ),
+        env_override=local_env,
     )
     try:
         local_paths = sorted(
@@ -779,18 +817,8 @@ def _local_bound_pr_diff_bytes(repo: Path, view: Any) -> bytes:
         raise RuntimeError("local PR diff paths are not valid UTF-8") from exc
     if len(local_paths) != len(set(local_paths)) or local_paths != expected_paths:
         raise RuntimeError("local PR diff changed paths do not match GitHub file evidence")
-    raw_diff = _run_bytes(
-        repo,
-        _local_diff_git_argv(
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--no-color",
-            base,
-            head,
-            "--",
-        ),
+    raw_diff = bound_local_pr_git_diff(
+        repo, merge_base=merge_base, head=head,
     )
     if not raw_diff:
         raise RuntimeError("local PR diff fallback produced an empty diff")

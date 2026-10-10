@@ -22,6 +22,8 @@ from grabowski_pr_diff import (
     canonicalize_github_pr_diff_identity,
     github_pr_diff_identity_sha256,
     github_pr_diff_identity_sha256_v1,
+    bound_local_pr_git_diff,
+    BoundLocalDiffError,
 )
 
 
@@ -1359,8 +1361,10 @@ def _merge_guard_git_environment() -> dict[str, str]:
         "HOME": str(Path.home()),
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": "/dev/null",
         "GIT_TERMINAL_PROMPT": "0",
         "LC_ALL": "C",
     }
@@ -1421,6 +1425,22 @@ def _merge_guard_commit_probe(
     return result["returncode"] == 0, info
 
 
+def _merge_guard_shallow_state(repo_path: Path) -> tuple[bool | None, list[str]]:
+    """Probe full-history availability using the same isolated Git environment."""
+    try:
+        result = _merge_guard_local_git_bytes(
+            repo_path, ["rev-parse", "--is-shallow-repository"]
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, [f"merge_guard_shallow_probe_exception:{type(exc).__name__}"]
+    if result["returncode"] != 0:
+        return None, ["merge_guard_shallow_probe_failed"]
+    value = result["stdout_bytes"].strip()
+    if value not in {b"true", b"false"}:
+        return None, ["merge_guard_shallow_probe_invalid"]
+    return value == b"true", []
+
+
 def _merge_guard_ensure_pr_objects(
     repo_path: Path,
     *,
@@ -1452,7 +1472,13 @@ def _merge_guard_ensure_pr_objects(
     base_present, base_probe = _merge_guard_commit_probe(repo_path, base_sha)
     head_present, head_probe = _merge_guard_commit_probe(repo_path, head_sha)
     receipt["before"] = {"base": base_probe, "head": head_probe}
-    if base_present and head_present:
+    shallow_before, shallow_errors = _merge_guard_shallow_state(repo_path)
+    if shallow_errors:
+        return receipt, shallow_errors
+    receipt["shallow_before"] = shallow_before
+    receipt["unshallow_attempted"] = bool(shallow_before)
+    if base_present and head_present and not shallow_before:
+        receipt["shallow_after"] = False
         receipt["available"] = True
         return receipt, []
 
@@ -1466,6 +1492,7 @@ def _merge_guard_ensure_pr_objects(
         "-c",
         "protocol.file.allow=never",
         "fetch",
+        *(["--unshallow"] if shallow_before else []),
         "--no-tags",
         "--no-write-fetch-head",
         "--no-recurse-submodules",
@@ -1491,6 +1518,13 @@ def _merge_guard_ensure_pr_objects(
     if fetched["returncode"] != 0:
         return receipt, ["merge_guard_pr_object_fetch_failed"]
 
+    shallow_after, shallow_errors = _merge_guard_shallow_state(repo_path)
+    receipt["shallow_after"] = shallow_after
+    if shallow_errors:
+        return receipt, shallow_errors
+    if shallow_after:
+        return receipt, ["merge_guard_pr_history_still_shallow_after_fetch"]
+
     base_present, base_probe = _merge_guard_commit_probe(repo_path, base_sha)
     head_present, head_probe = _merge_guard_commit_probe(repo_path, head_sha)
     receipt["after"] = {"base": base_probe, "head": head_probe}
@@ -1505,6 +1539,26 @@ def _merge_guard_ensure_pr_objects(
 
 def _merge_guard_diff_contains_binary_metadata(diff_bytes: bytes) -> bool:
     return _MERGE_GUARD_BINARY_DIFF_RE.search(diff_bytes) is not None
+
+
+def _merge_guard_unique_merge_base(
+    repo_path: Path, *, base_sha: str, head_sha: str
+) -> tuple[str | None, list[str]]:
+    """Bind the local PR diff to its unique GitHub-compatible merge base."""
+    try:
+        result = _merge_guard_local_git_bytes(
+            repo_path, ["merge-base", "--all", base_sha, head_sha]
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, [f"merge_guard_local_merge_base_exception:{type(exc).__name__}"]
+    if result["returncode"] != 0:
+        return None, ["merge_guard_local_merge_base_failed"]
+    values = result["stdout_bytes"].splitlines()
+    if len(values) != 1 or _SHA40_RE.fullmatch(
+        values[0].decode("ascii", errors="replace")
+    ) is None:
+        return None, ["merge_guard_local_merge_base_missing_or_ambiguous"]
+    return values[0].decode("ascii"), []
 
 
 def _merge_guard_local_changed_paths(
@@ -1522,6 +1576,12 @@ def _merge_guard_local_changed_paths(
         or _SHA40_RE.fullmatch(head_sha) is None
     ):
         return [], info, ["merge_guard_local_changed_paths_revision_invalid"]
+    merge_base, merge_base_errors = _merge_guard_unique_merge_base(
+        repo_path, base_sha=base_sha, head_sha=head_sha
+    )
+    if merge_base_errors or merge_base is None:
+        return [], info, merge_base_errors
+    info["merge_base_sha"] = merge_base
     try:
         result = _merge_guard_local_git_bytes(
             repo_path,
@@ -1532,7 +1592,7 @@ def _merge_guard_local_changed_paths(
                 "--no-ext-diff",
                 "--no-textconv",
                 "--no-renames",
-                base_sha,
+                merge_base,
                 head_sha,
                 "--",
             ],
@@ -1594,24 +1654,21 @@ def _merge_guard_local_diff_bytes(
         or _SHA40_RE.fullmatch(head_sha) is None
     ):
         return b"", info, ["merge_guard_local_diff_revision_invalid"]
+    merge_base, merge_base_errors = _merge_guard_unique_merge_base(
+        repo_path, base_sha=base_sha, head_sha=head_sha
+    )
+    if merge_base_errors or merge_base is None:
+        return b"", info, merge_base_errors
+    info["merge_base_sha"] = merge_base
     try:
-        result = _merge_guard_local_git_bytes(
-            repo_path,
-            [
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-renames",
-                "--no-color",
-                base_sha,
-                head_sha,
-                "--",
-            ],
-            timeout=60,
+        bounded = bound_local_pr_git_diff(
+            repo_path, merge_base=merge_base, head=head_sha,
+            timeout=60, max_diff_bytes=_MERGE_GUARD_MAX_DIFF_BYTES,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, BoundLocalDiffError) as exc:
         info["error_class"] = type(exc).__name__
         return b"", info, [f"merge_guard_local_diff_exception:{type(exc).__name__}"]
+    result = {"returncode": 0, "stdout_bytes": bounded, "stderr_bytes": b""}
     stdout = result["stdout_bytes"]
     stderr = result["stderr_bytes"]
     info.update(
@@ -1644,13 +1701,23 @@ def _merge_guard_local_diff_bytes(
 def _merge_guard_github_diff_too_large(
     info: dict[str, Any], *, changed_files: int
 ) -> bool:
-    if changed_files <= _MERGE_GUARD_GITHUB_DIFF_MAX_FILES or info.get("returncode") == 0:
+    if type(changed_files) is not int or changed_files < 0 or info.get("returncode") == 0:
         return False
     message = f"{info.get('stderr', '')}\n{info.get('stdout', '')}"
-    return (
+    if "HTTP 406" not in message or any(
+        marker in message for marker in ("HTTP 401", "HTTP 403", "HTTP 429")
+    ):
+        return False
+    line_limit = all(marker in message for marker in (
+        "HTTP 406",
+        "diff exceeded the maximum number of lines",
+        "PullRequest.diff too_large",
+    ))
+    file_limit = changed_files > _MERGE_GUARD_GITHUB_DIFF_MAX_FILES and (
         "PullRequest.diff too_large" in message
         or "diff exceeded the maximum number of files" in message
     )
+    return line_limit or file_limit
 
 
 def _merge_guard_github_file_records(

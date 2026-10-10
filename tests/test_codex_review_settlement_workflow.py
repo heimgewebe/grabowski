@@ -35,6 +35,114 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertNotIn("actions/checkout@v", self.text)
         self.assertNotIn("github.event.pull_request.head", self.text)
 
+    def test_oversized_pr_diff_has_full_history_and_exact_head_objects(self) -> None:
+        checkout = self.text.split(
+            "      - name: Checkout trusted evaluator\n", 1
+        )[1].split("      - name: Fetch exact PR history for local diff fallback\n", 1)[0]
+        self.assertIn("ref: " + chr(36) + "{{ github.event.repository.default_branch }}", checkout)
+        self.assertIn("persist-credentials: false", checkout)
+        self.assertIn("fetch-depth: 0", checkout)
+        fetch = self.text.split(
+            "      - name: Fetch exact PR history for local diff fallback\n", 1
+        )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
+        self.assertIn("GH_TOKEN: " + chr(36) + "{{ github.token }}", fetch)
+        self.assertIn("PR_NUMBER: " + chr(36) + "{{ steps.pr.outputs.number }}", fetch)
+        self.assertIn("HEAD_SHA: " + chr(36) + "{{ steps.pr.outputs.head_sha }}", fetch)
+        self.assertIn("refs/pull/" + chr(36) + "{PR_NUMBER}/head", fetch)
+        self.assertIn("GIT_TERMINAL_PROMPT=0", fetch)
+        self.assertIn("gh auth git-credential", fetch)
+        self.assertIn('git cat-file -e "' + chr(36) + '{HEAD_SHA}^{commit}"', fetch)
+        self.assertNotIn("git checkout", fetch)
+        self.assertNotIn("git reset", fetch)
+        self.assertNotIn("tools/codex_review_settlement.py", fetch)
+
+    def test_nondefault_pr_target_resolves_and_fetches_exact_base_commit(self) -> None:
+        resolve = self.text.split(
+            "      - name: Resolve pull request\n", 1
+        )[1].split("      - name: Mark current head pending\n", 1)[0]
+        self.assertIn("--json headRefOid,baseRefOid,baseRefName,isDraft,state", resolve)
+        self.assertIn('base_sha="$(jq -r', resolve)
+        self.assertIn('base_ref="$(jq -r', resolve)
+        self.assertIn('echo "base_sha=$base_sha"', resolve)
+        self.assertIn('echo "base_ref=$base_ref"', resolve)
+        fetch = self.text.split(
+            "      - name: Fetch exact PR history for local diff fallback\n", 1
+        )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
+        self.assertIn("BASE_SHA: " + chr(36) + "{{ steps.pr.outputs.base_sha }}", fetch)
+        self.assertIn("BASE_REF: " + chr(36) + "{{ steps.pr.outputs.base_ref }}", fetch)
+        self.assertIn('git check-ref-format "refs/heads/' + chr(36) + '{BASE_REF}"', fetch)
+        self.assertIn("refs/heads/" + chr(36) + "{BASE_REF}", fetch)
+        self.assertIn('git cat-file -e "' + chr(36) + '{BASE_SHA}^{commit}"', fetch)
+        self.assertIn('git cat-file -e "' + chr(36) + '{HEAD_SHA}^{commit}"', fetch)
+
+    def test_fetched_pr_objects_are_pinned_to_bound_refs(self) -> None:
+        fetch = self.text.split(
+            "      - name: Fetch exact PR history for local diff fallback\n", 1
+        )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
+        d = chr(36)
+        self.assertIn("refs/heads/" + d + "{BASE_REF}:refs/settlement/base-tip", fetch)
+        self.assertIn("refs/pull/" + d + "{PR_NUMBER}/head:refs/settlement/head", fetch)
+        self.assertIn('git merge-base --is-ancestor "' + d + 'BASE_SHA" "refs/settlement/base-tip"', fetch)
+        self.assertIn('git update-ref refs/settlement/base "' + d + 'BASE_SHA"', fetch)
+        self.assertIn('git rev-parse "refs/settlement/base^{commit}"', fetch)
+        self.assertIn('git rev-parse "refs/settlement/head^{commit}"', fetch)
+        self.assertIn('" = "' + d + 'BASE_SHA"', fetch)
+        self.assertIn('" = "' + d + 'HEAD_SHA"', fetch)
+
+    def test_advanced_main_tip_can_still_pin_historical_pr_base_sha(self) -> None:
+        fetch = self.text.split(
+            "      - name: Fetch exact PR history for local diff fallback\n", 1
+        )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
+        d = chr(36)
+        self.assertIn(
+            "refs/heads/" + d + "{BASE_REF}:refs/settlement/base-tip", fetch
+        )
+        self.assertIn(
+            'git merge-base --is-ancestor "' + d + 'BASE_SHA" "refs/settlement/base-tip"',
+            fetch,
+        )
+        self.assertIn('git update-ref refs/settlement/base "' + d + 'BASE_SHA"', fetch)
+        self.assertNotIn(
+            "refs/heads/" + d + "{BASE_REF}:refs/settlement/base" + '"', fetch
+        )
+        self.assertLess(
+            fetch.index("git merge-base --is-ancestor"),
+            fetch.index("git update-ref refs/settlement/base"),
+        )
+
+    def test_object_pin_failure_publishes_terminal_failure(self) -> None:
+        pending = self.text.split(
+            "      - name: Mark current head pending\n", 1
+        )[1].split("      - name: Checkout trusted evaluator\n", 1)[0]
+        checkout = self.text.split(
+            "      - name: Checkout trusted evaluator\n", 1
+        )[1].split("      - name: Fetch exact PR history for local diff fallback\n", 1)[0]
+        fetch = self.text.split(
+            "      - name: Fetch exact PR history for local diff fallback\n", 1
+        )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
+        evaluate = self.text.split(
+            "      - name: Evaluate current-head settlement\n", 1
+        )[1].split("      - name: Publish settlement status\n", 1)[0]
+        publish = self.text.split(
+            "      - name: Publish settlement status\n", 1
+        )[1].split("      - name: Fail blocked settlement\n", 1)[0]
+        fail = self.text.split("      - name: Fail blocked settlement\n", 1)[1]
+        self.assertIn("id: pending", pending)
+        self.assertIn("id: trusted_checkout", checkout)
+        self.assertIn("continue-on-error: true", checkout)
+        self.assertIn("id: fetched_objects", fetch)
+        self.assertIn("continue-on-error: true", fetch)
+        self.assertIn("steps.trusted_checkout.outcome == 'success'", fetch)
+        self.assertIn("if: always()", evaluate)
+        self.assertIn('"$CHECKOUT_OUTCOME" != "success"', evaluate)
+        self.assertIn('"$FETCH_OUTCOME" != "success"', evaluate)
+        self.assertIn("trusted_pr_object_pinning_failed", evaluate)
+        self.assertIn('github_state:"failure"', evaluate)
+        self.assertIn("if: always()", publish)
+        self.assertIn("|| 'failure'", publish)
+        self.assertIn("if: always()", fail)
+        self.assertIn("steps.fetched_objects.outcome != 'success'", fail)
+
     def test_permissions_are_observer_only_except_status_publication(self) -> None:
         self.assertIn("  contents: read\n", self.text)
         self.assertIn("  issues: read\n", self.text)

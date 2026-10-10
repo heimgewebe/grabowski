@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -201,6 +203,64 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
                 changed_files=301,
             )
         )
+
+    def test_github_line_limit_with_259_files_is_not_a_generic_http_406_bypass(self) -> None:
+        info = {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000) (PullRequest.diff too_large)",
+        }
+        self.assertTrue(
+            merge_guard._merge_guard_github_diff_too_large(info, changed_files=259)
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_github_diff_too_large(
+                {**info, "stderr": "HTTP 401: Sorry, the diff exceeded the maximum number of lines (20000) (PullRequest.diff too_large)"},
+                changed_files=259,
+            )
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_github_diff_too_large(
+                {**info, "stderr": "HTTP 406: pull request unavailable"},
+                changed_files=259,
+            )
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_github_diff_too_large(
+                {**info, "stderr": "HTTP 406: PullRequest.diff too_large"},
+                changed_files=259,
+            )
+        )
+
+    def test_file_cap_301_unauthorized_status_cannot_use_local_fallback(self) -> None:
+        for diagnostic in (
+            "GraphQL: PullRequest.diff too_large",
+            "HTTP 401: PullRequest.diff too_large",
+            "HTTP 403: diff exceeded the maximum number of files (300)",
+        ):
+            self.assertFalse(merge_guard._merge_guard_github_diff_too_large(
+                {"returncode": 1, "stdout": "", "stderr": diagnostic},
+                changed_files=301,
+            ))
+        self.assertTrue(merge_guard._merge_guard_github_diff_too_large(
+            {"returncode": 1, "stdout": "",
+             "stderr": "HTTP 406: diff exceeded the maximum number of files (300)"},
+            changed_files=301,
+        ))
+
+    def test_ambiguous_merge_base_rejected_before_local_diff(self) -> None:
+        with mock.patch.object(
+            merge_guard, "_merge_guard_local_git_bytes",
+            return_value={
+                "returncode": 0,
+                "stdout_bytes": b"a" * 40 + bytes([10]) + b"b" * 40 + bytes([10]),
+            },
+        ):
+            sha, errors = merge_guard._merge_guard_unique_merge_base(
+                Path("/tmp"), base_sha="a" * 40, head_sha="b" * 40
+            )
+        self.assertIsNone(sha)
+        self.assertEqual(errors, ["merge_guard_local_merge_base_missing_or_ambiguous"])
 
     def test_paged_file_projection_maps_only_supported_metadata(self) -> None:
         gh = _PagedFilesGh(
@@ -445,15 +505,144 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
                     any(call[:2] == ("pr", "merge") for call in gh.calls)
                 )
 
+    def test_merge_guard_git_environment_disables_system_attributes(self) -> None:
+        self.assertEqual(
+            merge_guard._merge_guard_git_environment().get("GIT_ATTR_NOSYSTEM"), "1"
+        )
+
+    def test_shallow_tips_require_complete_ancestry_before_local_fallback(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="captain-shallow-history-") as directory:
+            root = Path(directory)
+            origin = root / "origin.git"
+            writer = root / "writer"
+            checkout = root / "shallow"
+            _git(root, "init", "-q", "-b", "main", str(writer))
+            _git(writer, "config", "gc.auto", "0")
+            _git(writer, "config", "maintenance.auto", "false")
+            _git(writer, "config", "user.email", "captain-test@example.invalid")
+            _git(writer, "config", "user.name", "Captain Test")
+            (writer / "seed.txt").write_text("common\\n", encoding="utf-8")
+            _git(writer, "add", ".")
+            _git(writer, "commit", "-q", "-m", "common")
+            ancestor = _git(writer, "rev-parse", "HEAD")
+            (writer / "base.txt").write_text("base\\n", encoding="utf-8")
+            _git(writer, "add", ".")
+            _git(writer, "commit", "-q", "-m", "base advanced")
+            base_sha = _git(writer, "rev-parse", "HEAD")
+            _git(writer, "checkout", "-q", "-b", "feature", ancestor)
+            (writer / "feature.txt").write_text("feature\\n", encoding="utf-8")
+            _git(writer, "add", ".")
+            _git(writer, "commit", "-q", "-m", "feature")
+            head_sha = _git(writer, "rev-parse", "HEAD")
+            _git(root, "clone", "-q", "--bare", str(writer), str(origin))
+            _git(origin, "update-ref", "refs/pull/212/head", head_sha)
+            # Exercise the real guarded fetch using an allowed transport. A
+            # file:// origin cannot pass protocol.file.allow=never by design.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            daemon = subprocess.Popen(
+                [
+                    "git", "daemon", "--export-all", f"--base-path={root}",
+                    "--listen=127.0.0.1", f"--port={port}", str(origin),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.addCleanup(daemon.wait, timeout=5)
+            self.addCleanup(daemon.terminate)
+            for _ in range(100):
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                        break
+                except OSError:
+                    if daemon.poll() is not None:
+                        self.fail("local git daemon exited before startup")
+                    time.sleep(0.02)
+            else:
+                self.fail("local git daemon startup timed out")
+            git_url = f"git://127.0.0.1:{port}/{origin.name}"
+            _git(root, "clone", "-q", "--depth", "1", "--branch", "main",
+                 git_url, str(checkout))
+            _git(checkout, "fetch", "-q", "--depth", "1", "--no-tags",
+                 "--no-write-fetch-head", "origin", "refs/pull/212/head")
+            self.assertEqual(_git(checkout, "rev-parse", "--is-shallow-repository"), "true")
+            _git(checkout, "cat-file", "-e", f"{base_sha}^{{commit}}")
+            _git(checkout, "cat-file", "-e", f"{head_sha}^{{commit}}")
+            self.assertNotEqual(subprocess.run(
+                ["git", "merge-base", "--all", base_sha, head_sha],
+                cwd=checkout, capture_output=True, check=False,
+            ).returncode, 0)
+            before_head = _git(checkout, "rev-parse", "HEAD")
+            before_status = _git(checkout, "status", "--porcelain")
+            receipt, errors = merge_guard._merge_guard_ensure_pr_objects(
+                checkout, base_branch="main", pr_number=212,
+                base_sha=base_sha, head_sha=head_sha,
+            )
+            self.assertEqual(errors, [])
+            self.assertTrue(receipt["unshallow_attempted"])
+            self.assertTrue(receipt["shallow_before"])
+            self.assertFalse(receipt["shallow_after"])
+            self.assertTrue(receipt["available"])
+            self.assertEqual(_git(checkout, "rev-parse", "--is-shallow-repository"), "false")
+            self.assertEqual(_git(checkout, "merge-base", "--all", base_sha, head_sha),
+                             ancestor)
+            self.assertEqual(_git(checkout, "rev-parse", "HEAD"), before_head)
+            self.assertEqual(_git(checkout, "status", "--porcelain"), before_status)
+
+    def test_shallow_ancestry_fetch_failure_stays_closed(self) -> None:
+        base_sha, head_sha = "a" * 40, "b" * 40
+        present = {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""}
+        with mock.patch.object(
+            merge_guard, "_merge_guard_local_git_bytes",
+            side_effect=[
+                present, present,
+                {"returncode": 0, "stdout_bytes": b"true", "stderr_bytes": b""},
+                {"returncode": 1, "stdout_bytes": b"", "stderr_bytes": b"network failed"},
+            ],
+        ) as git:
+            receipt, errors = merge_guard._merge_guard_ensure_pr_objects(
+                Path("/repo"), base_branch="main", pr_number=212,
+                base_sha=base_sha, head_sha=head_sha,
+            )
+        self.assertEqual(errors, ["merge_guard_pr_object_fetch_failed"])
+        self.assertTrue(receipt["unshallow_attempted"])
+        self.assertIn("--unshallow", git.call_args_list[3].args[1])
+
+    def test_shallow_fetch_does_not_accept_still_incomplete_history(self) -> None:
+        base_sha, head_sha = "a" * 40, "b" * 40
+        present = {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""}
+        with mock.patch.object(
+            merge_guard, "_merge_guard_local_git_bytes",
+            side_effect=[
+                present, present,
+                {"returncode": 0, "stdout_bytes": b"true", "stderr_bytes": b""},
+                present,
+                {"returncode": 0, "stdout_bytes": b"true", "stderr_bytes": b""},
+            ],
+        ):
+            receipt, errors = merge_guard._merge_guard_ensure_pr_objects(
+                Path("/repo"), base_branch="main", pr_number=212,
+                base_sha=base_sha, head_sha=head_sha,
+            )
+        self.assertEqual(errors, ["merge_guard_pr_history_still_shallow_after_fetch"])
+        self.assertTrue(receipt["shallow_after"])
+        self.assertTrue(receipt["unshallow_attempted"])
+        self.assertNotIn("available", receipt)
+
     def test_missing_pr_object_fetches_bounded_refs_and_reprobes_exact_shas(self) -> None:
         base_sha = "a" * 40
         head_sha = "b" * 40
+        present = {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""}
+        full_history = {"returncode": 0, "stdout_bytes": b"false", "stderr_bytes": b""}
         results = [
-            {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""},
+            present,
             {"returncode": 1, "stdout_bytes": b"", "stderr_bytes": b"missing"},
-            {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""},
-            {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""},
-            {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""},
+            full_history,
+            present,
+            full_history,
+            present,
+            present,
         ]
         with mock.patch.object(
             merge_guard, "_merge_guard_local_git_bytes", side_effect=results
@@ -469,10 +658,13 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertTrue(receipt["fetch_attempted"])
         self.assertTrue(receipt["available"])
+        self.assertFalse(receipt["shallow_before"])
+        self.assertFalse(receipt["shallow_after"])
+        self.assertFalse(receipt["unshallow_attempted"])
         self.assertEqual(
             receipt["fetch_refs"], ["refs/heads/main", "refs/pull/212/head"]
         )
-        fetch_args = local_git.call_args_list[2].args[1]
+        fetch_args = local_git.call_args_list[3].args[1]
         self.assertEqual(
             fetch_args,
             [
@@ -493,11 +685,19 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            local_git.call_args_list[3].args[1],
-            ["cat-file", "-e", f"{base_sha}^{{commit}}"],
+            local_git.call_args_list[2].args[1],
+            ["rev-parse", "--is-shallow-repository"],
         )
         self.assertEqual(
             local_git.call_args_list[4].args[1],
+            ["rev-parse", "--is-shallow-repository"],
+        )
+        self.assertEqual(
+            local_git.call_args_list[5].args[1],
+            ["cat-file", "-e", f"{base_sha}^{{commit}}"],
+        )
+        self.assertEqual(
+            local_git.call_args_list[6].args[1],
             ["cat-file", "-e", f"{head_sha}^{{commit}}"],
         )
 
@@ -579,6 +779,85 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
         self.assertEqual(
             runner.receipt["live_files"]["record_count"], len(expected_paths)
         )
+
+    def test_live_bindings_falls_back_at_259_files_when_line_limit_is_hit(self) -> None:
+        temporary, repo, base_sha, head_sha, expected_paths = _large_git_repo(259)
+        self.addCleanup(temporary.cleanup)
+        diff, info, failures = merge_guard._merge_guard_local_diff_bytes(
+            repo, base_sha=base_sha, head_sha=head_sha
+        )
+        self.assertEqual(failures, [])
+        class LineLimitGh(_LargePrGh):
+            def __call__(self, target: Path, argv: list[str]) -> dict[str, object]:
+                outcome = super().__call__(target, argv)
+                if argv[:2] == ["pr", "diff"]:
+                    outcome["stderr"] = (
+                        "HTTP 406: Sorry, the diff exceeded the maximum number of lines "
+                        "(20000) (PullRequest.diff too_large)"
+                    )
+                return outcome
+
+        gh = LineLimitGh(base_sha=base_sha, head_sha=head_sha, paths=expected_paths)
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.action = {"target": {"repo": "heimgewebe/commonworld", "pr": 212, "base": "main"}}
+        runner.parameters = {
+            "expected_head": head_sha,
+            "expected_base_sha": base_sha,
+            "diff_sha256": info["sha256"],
+        }
+        runner.static_errors = []
+        runner.repo_path = repo
+        runner.github_runner = gh
+        runner.receipt = {}
+        runner.execution_intent_sha256 = "1" * 64
+        runner._revalidate_codex_review = lambda _bindings, phase: []
+        bindings, errors = runner._live_bindings()
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(bindings)
+        assert bindings is not None
+        self.assertEqual(bindings["changed_paths"], expected_paths)
+        self.assertEqual(bindings["diff_sha256"], info["sha256"])
+        self.assertEqual(
+            runner.receipt["live_diff"]["source"],
+            "local-bound-git-diff-after-github-too-large",
+        )
+
+    def test_advanced_base_uses_merge_base_for_captain_paths_and_diff(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="captain-mergebase-diverge-") as d:
+            repo=Path(d)
+            def run(*args: str) -> str:
+                return subprocess.run(["git",*args],cwd=repo,check=True,text=True,
+                    capture_output=True).stdout.strip()
+            run("init","-q")
+            run("config","user.email","captain@example.invalid")
+            run("config","user.name","Captain Test")
+            run("config","gc.auto","0")
+            (repo/"seed.txt").write_text("seed\n")
+            run("add","seed.txt")
+            run("commit","-q","-m","seed")
+            seed=run("rev-parse","HEAD")
+            run("checkout","-q","-b","feature")
+            (repo/"feature.txt").write_text("feature\n")
+            run("add","feature.txt")
+            run("commit","-q","-m","feature")
+            head=run("rev-parse","HEAD")
+            run("checkout","-q","-B","main",seed)
+            (repo/"base-only.txt").write_text("base only\n")
+            run("add","base-only.txt")
+            run("commit","-q","-m","main-advanced")
+            base=run("rev-parse","HEAD")
+            paths,path_info,path_err=merge_guard._merge_guard_local_changed_paths(
+                repo,base_sha=base,head_sha=head)
+            diff,diff_info,diff_err=merge_guard._merge_guard_local_diff_bytes(
+                repo,base_sha=base,head_sha=head)
+            self.assertEqual(path_err,[])
+            self.assertEqual(diff_err,[])
+            self.assertEqual(paths,["feature.txt"])
+            self.assertNotIn(b"base-only.txt",diff)
+            expected=subprocess.run(["git","diff",seed,head],cwd=repo,check=True,
+                capture_output=True).stdout
+            self.assertEqual(merge_guard.github_pr_diff_identity_sha256(diff),
+                merge_guard.github_pr_diff_identity_sha256(expected))
 
     def test_resource_normalization_supports_bounded_generated_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

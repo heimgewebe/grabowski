@@ -61,16 +61,25 @@ jobs:
             echo "Cannot resolve pull request number" >&2
             exit 1
           fi
-          payload="$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json headRefOid,isDraft,state)"
+          payload="$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json headRefOid,baseRefOid,baseRefName,isDraft,state)"
           head_sha="$(jq -r '.headRefOid // empty' <<<"$payload")"
+          base_sha="$(jq -r '.baseRefOid // empty' <<<"$payload")"
+          base_ref="$(jq -r '.baseRefName // empty' <<<"$payload")"
           if [ -z "$head_sha" ]; then
             echo "Cannot resolve pull request head SHA" >&2
             exit 1
           fi
+          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]] || ! git check-ref-format "refs/heads/$base_ref"; then
+            echo "Invalid pull request base SHA or ref" >&2
+            exit 1
+          fi
           echo "number=$pr" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
 
       - name: Mark current head pending
+        id: pending
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -82,19 +91,70 @@ jobs:
             -f description="Checking current-head Codex review settlement"
 
       - name: Checkout trusted evaluator
+        id: trusted_checkout
+        continue-on-error: true
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Evaluate current-head settlement
-        id: evaluate
+      - name: Fetch exact PR history for local diff fallback
+        id: fetched_objects
+        if: steps.trusted_checkout.outcome == 'success'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || ! git check-ref-format "refs/heads/${BASE_REF}"; then
+            echo "Invalid bound pull request or head SHA" >&2
+            exit 1
+          fi
+          # Never check out PR code. A one-command credential helper uses the
+          # step-local token without persisting credentials in the Git config.
+          GIT_TERMINAL_PROMPT=0 git \
+            -c 'credential.helper=!gh auth git-credential' \
+            -c 'protocol.file.allow=never' \
+            fetch --no-tags --no-write-fetch-head --no-recurse-submodules \
+            -- origin "refs/heads/${BASE_REF}:refs/settlement/base-tip" "refs/pull/${PR_NUMBER}/head:refs/settlement/head"
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          # baseRefOid is a PR snapshot. A later fast-forward of the target
+          # branch must not invalidate it; force-push/non-ancestral drift does.
+          git merge-base --is-ancestor "$BASE_SHA" "refs/settlement/base-tip"
+          git update-ref refs/settlement/base "$BASE_SHA"
+          test "$(git rev-parse "refs/settlement/base^{commit}")" = "$BASE_SHA"
+          test "$(git rev-parse "refs/settlement/head^{commit}")" = "$HEAD_SHA"
+
+      - name: Evaluate current-head settlement
+        id: evaluate
+        if: always() && steps.pr.outcome == 'success' && steps.pending.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          CHECKOUT_OUTCOME: ${{ steps.trusted_checkout.outcome }}
+          FETCH_OUTCOME: ${{ steps.fetched_objects.outcome }}
         run: |
           set +e
-          if [ ! -f tools/codex_review_settlement.py ]; then
+          if [ "$CHECKOUT_OUTCOME" != "success" ] || [ "$FETCH_OUTCOME" != "success" ]; then
+            jq -nc \
+              --arg error "trusted Git checkout/fetch/pinning failed: checkout=$CHECKOUT_OUTCOME fetch=$FETCH_OUTCOME" \
+              '{
+                status:"block",
+                status_code:"trusted_pr_object_pinning_failed",
+                exit_code:2,
+                github_state:"failure",
+                description:"Trusted PR object pinning failed",
+                settled:false,
+                errors:[$error]
+              }' > codex-review-settlement.json
+            rc=2
+          elif [ ! -f tools/codex_review_settlement.py ]; then
             jq -nc \
               --arg error trusted_evaluator_missing_on_default_branch \
               '{
@@ -175,11 +235,12 @@ jobs:
           echo "description=$description" >> "$GITHUB_OUTPUT"
 
       - name: Publish settlement status
+        if: always() && steps.pr.outcome == 'success' && steps.pending.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          STATE: ${{ steps.evaluate.outputs.github_state }}
-          DESCRIPTION: ${{ steps.evaluate.outputs.description }}
+          STATE: ${{ steps.evaluate.outputs.github_state || 'failure' }}
+          DESCRIPTION: ${{ steps.evaluate.outputs.description || 'Trusted Codex settlement interrupted' }}
         run: |
           set -euo pipefail
           gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
@@ -189,5 +250,5 @@ jobs:
             -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
       - name: Fail blocked settlement
-        if: steps.evaluate.outputs.github_state == 'failure'
+        if: always() && steps.pending.outcome == 'success' && (steps.evaluate.outcome == 'failure' || steps.evaluate.outputs.github_state == 'failure' || steps.trusted_checkout.outcome != 'success' || steps.fetched_objects.outcome != 'success')
         run: exit 1
