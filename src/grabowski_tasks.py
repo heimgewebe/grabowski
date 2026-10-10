@@ -3975,6 +3975,22 @@ def _codex_workspace_argument(argv: list[str]) -> str | None:
     return workspace
 
 
+def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
+    """Reject direct Codex while no task-launch OS filesystem boundary is attested.
+
+    Workspace and repository leases serialize writers; they cannot constrain
+    the inherited home directory, user configuration, or host filesystem.
+    The existing grabowski_agent_writer executes agents in a bounded bwrap
+    filesystem sandbox with explicit writable paths. Do not silently replace
+    that separate, scoped execution contract with a direct Codex task.
+    """
+    if argv and Path(argv[0]).name.lower() == "codex":
+        raise RuntimeError(
+            "Codex direct task has no attested filesystem sandbox; "
+            "use the scoped grabowski_agent_writer route"
+        )
+
+
 def _mutating_agent_workspace(
     host: str,
     argv: list[str],
@@ -8930,6 +8946,8 @@ def grabowski_task_start(
         command,
         cwd=working_directory,
     )
+    # Fail before operation reuse, lease acquisition, task INSERT or dispatch.
+    _require_direct_codex_filesystem_sandbox(command)
     task_effect_classification = _classify_task_effect(
         transport=str(target["transport"]),
         argv=command,
@@ -10185,6 +10203,8 @@ def grabowski_task_resume(
         raise PermissionError("Task resume policy does not permit automatic retry")
     command = json.loads(record["argv_json"])
     task_effect_classification = _verified_task_effect_start(record, command=command)
+    # Legacy tasks receive no implicit exemption from the filesystem boundary.
+    _require_direct_codex_filesystem_sandbox(command)
     recovery_gate = _require_recovery_gate(command)
     observation = _observe(record)
     if observation["state"] == "running":

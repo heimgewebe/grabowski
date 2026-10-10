@@ -115,6 +115,86 @@ class CodexTaskCommandSecurityTests(unittest.TestCase):
                         cwd=str(self.root),
                     )
 
+    def test_direct_codex_without_attested_filesystem_sandbox_is_denied(self) -> None:
+        # A workspace lease coordinates a writer but does not sandbox the process.
+        # systemd-run's current ProtectSystem=off/ProtectHome=no is not proof
+        # that the effective Codex permissions are confined to that workspace.
+        command = ["/opt/codex", "-C", str(self.root), "exec", "--sandbox", "workspace-write", "prompt"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=fixture.LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=command),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+            patch.object(tasks, "_dispatch", return_value=fixture._launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                tasks.grabowski_task_start(
+                    "local", command, cwd=str(self.root), runtime_seconds=60
+                )
+        dispatch.assert_not_called()
+        self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
+        if self.database_exists():
+            with sqlite3.connect(self.fixture.database) as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM tasks").fetchone()[0], 0)
+
+    def test_preexisting_codex_task_cannot_resume_without_os_sandbox(self) -> None:
+        command = ["/opt/codex", "-C", str(self.root), "exec", "prompt"]
+        admitted = {
+            "schema_version": 1, "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True, "admitted": True, "reason_code": "admitted",
+            "argv_sha256": "1" * 64, "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+        # Only synthesize a historical pre-fix record in the private fixture DB.
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=fixture.LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=command),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 130}),
+            patch.object(tasks, "_require_direct_codex_filesystem_sandbox"),
+            patch.object(fixture.coding_agent_router, "coding_agent_pre_dispatch_admission", return_value=admitted),
+            patch.object(tasks, "_dispatch", return_value=fixture._launcher()),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            created = tasks.grabowski_task_start(
+                "local", command, cwd=str(self.root),
+                runtime_seconds=60, resume_policy="verify-then-retry",
+            )
+        task_id = created["task"]["task_id"]
+        attempt_before = tasks._row_raw(task_id)["attempt"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=fixture.LOCAL_HOST),
+            patch.object(tasks, "_dispatch") as dispatch,
+            patch.object(tasks, "_launch") as launch,
+            patch.object(tasks.resources, "renew_resources") as renew,
+            patch.object(tasks.resources, "acquire_resources") as acquire,
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                tasks.grabowski_task_resume(task_id)
+        dispatch.assert_not_called()
+        launch.assert_not_called()
+        renew.assert_not_called()
+        acquire.assert_not_called()
+        self.assertEqual(tasks._row_raw(task_id)["attempt"], attempt_before)
+
+    def test_existing_scoped_writer_wrapper_is_still_admissible(self) -> None:
+        command = [
+            "/usr/bin/python3", "-m", "grabowski_agent_writer",
+            "--repository", str(self.root),
+        ]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=fixture.LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=command),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 125}),
+            patch.object(tasks, "_dispatch", return_value=fixture._launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            accepted = tasks.grabowski_task_start(
+                "local", command, cwd=str(self.root), runtime_seconds=60
+            )
+        self.assertEqual(accepted["task"]["resource_keys"], [])
+        dispatch.assert_called()
+
     def test_known_execution_and_explicit_payload_remain_accepted(self) -> None:
         permitted = (
             ["/opt/codex", "exec", "--sandbox", "workspace-write", "prompt"],
