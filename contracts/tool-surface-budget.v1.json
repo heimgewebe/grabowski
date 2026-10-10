@@ -485,22 +485,25 @@
     },
     "grabowski_checkout_binding_identity_rebind_preview": {
       "evidence_refs": [
+        "https://github.com/heimgewebe/grabowski/issues/1407#issuecomment-6095283858",
         "github:heimgewebe/grabowski#852",
         "tests:tests/test_checkouts.py",
         "tests:tests/test_grips.py"
       ],
       "exception_detail": {
-        "claim": "The tool owns only read-only proof for one existing active managed checkout whose current named branch differs from the stored lifecycle identity.",
-        "evidence": "The checkout key resolves the target server-side; clean state, unchanged owner, branch-only drift, recorded-head ancestry, exact remote security, live retention and zero coordination blockers are snapshot-bound before any mutation authority exists."
+        "claim": "The tool owns only mutation-gated proof for one existing active managed checkout whose current named branch differs from the stored lifecycle identity.",
+        "evidence": "The checkout key resolves the target server-side; clean state, unchanged owner, branch-only drift, recorded-head ancestry, exact remote security, live retention and zero coordination blockers are snapshot-bound without granting identity-apply, Git, archive or cleanup authority."
       },
       "justification_kind": "distinct_authority_boundary",
       "operation_alternative_considered": "Reusing missing-checkout terminal preview was rejected because terminal reconciliation proves absence and source terminality, while identity rebind proves a live existing checkout and a branch-name identity correction.",
-      "rationale": "Branch identity reconciliation has different evidence, postconditions and mutation authority from checkout terminalization, so it requires an independently inspectable preview surface.",
+      "rationale": "Branch identity reconciliation has different evidence, postconditions and mutation authority from checkout terminalization, so it requires an independently inspectable, resource-mutation-gated preview surface.",
       "tool_contract": {
-        "authority_class": "read",
+        "authority_class": "mutation",
         "category": "checkout-lifecycle",
-        "effects": [],
-        "read_only": true,
+        "effects": [
+          "sqlite-wal-shm-sidecar-write"
+        ],
+        "read_only": false,
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "grabowski_checkout_binding_identity_rebind_preview"
@@ -559,22 +562,25 @@
     },
     "grabowski_checkout_binding_terminal_preview": {
       "evidence_refs": [
+        "https://github.com/heimgewebe/grabowski/issues/1407#issuecomment-6095283858",
         "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T140",
         "docs:checkout-lifecycle.md",
         "tests:test_checkout_terminal_reconciliation.py"
       ],
       "exception_detail": {
-        "claim": "The tool owns only the read-only, time-bounded evidence shape required before one absent-checkout terminal reconciliation or one clean present terminal Work Lane retention transition.",
+        "claim": "The tool owns only the resource-mutation-gated, time-bounded evidence shape required before one absent-checkout terminal reconciliation or one clean present terminal Work Lane retention transition.",
         "evidence": "Exact checkout, repository, common-dir, path, owner, branch, head, source identity, source-terminal receipt, Work Lane terminal head when available, clean/remote recovery evidence for present mode, archive absence and live lease/task/process blockers are hash-bound with explicit nonclaims."
       },
       "justification_kind": "material_call_shape",
       "operation_alternative_considered": "Extending generic checkout inventory or binding reconciliation was rejected because neither call shape binds a fresh source-terminal receipt and exact apply preimage with an expiry contract.",
-      "rationale": "A dedicated preview keeps source-specific terminal evidence and the exact compare-and-swap preimage inspectable without granting mutation, archive or cleanup authority.",
+      "rationale": "A dedicated preview keeps source-specific terminal evidence and the exact compare-and-swap preimage inspectable without granting lifecycle-apply, archive or cleanup authority.",
       "tool_contract": {
-        "authority_class": "read",
+        "authority_class": "mutation",
         "category": "checkout-lifecycle",
-        "effects": [],
-        "read_only": true,
+        "effects": [
+          "sqlite-wal-shm-sidecar-write"
+        ],
+        "read_only": false,
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "grabowski_checkout_binding_terminal_preview"

@@ -1578,7 +1578,30 @@ class AgentWorkspaceTests(unittest.TestCase):
             mutation_gate.assert_called_once_with("resource_lease")
         finally:
             keeper.close()
-        self.assertTrue(workspace._lane_binding_status(plan)["valid"])
+        # SQLite fixture connections may survive keeper.close() on Python 3.12.
+        # Strict public READ_ONLY must reject any remaining WAL/SHM sidecars.
+        wal = Path(str(workspace.resources.RESOURCE_DB) + "-wal")
+        shm = Path(str(workspace.resources.RESOURCE_DB) + "-shm")
+        observed = workspace._lane_binding_status(plan)
+        if wal.exists() or shm.exists():
+            self.assertFalse(observed["valid"])
+            self.assertIn("Strict read-only snapshot unavailable", observed["error"])
+        else:
+            self.assertTrue(observed["valid"])
+        # The exact lease must remain readable from a genuinely quiescent
+        # SQLite backup, independent of other fixture writers' lifetimes.
+        snapshot = self.root / "quiescent-resource-snapshot.sqlite3"
+        source = sqlite3.connect(workspace.resources.RESOURCE_DB)
+        target = sqlite3.connect(snapshot)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        self.assertFalse(Path(str(snapshot) + "-wal").exists())
+        self.assertFalse(Path(str(snapshot) + "-shm").exists())
+        with mock.patch.object(workspace.resources, "RESOURCE_DB", snapshot):
+            self.assertTrue(workspace._lane_binding_status(plan)["valid"])
 
     def test_lane_backed_writer_denial_precedes_resource_store_inspection(self) -> None:
         lane = self.lane_receipt(idempotency_key="lane-writer-denied-before-sqlite")

@@ -5821,7 +5821,9 @@ class TaskTests(unittest.TestCase):
         # Build both existing stores without launching a process.
         with tasks._database_connection():
             pass
-        with tasks.resources._database():
+        # sqlite3.Connection.__exit__ commits but does not close the writer;
+        # keep the strictly read-only resource snapshot quiescent on Python 3.12.
+        with closing(tasks.resources._database()):
             pass
         with tasks._task_readonly_snapshot() as connection:
             self.assertEqual(
@@ -5909,7 +5911,7 @@ class TaskTests(unittest.TestCase):
                     tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
                 )
         # A directly changed resource revision invalidates existing evidence.
-        with tasks.resources._database() as connection:
+        with closing(tasks.resources._database()) as connection, connection:
             connection.execute(
                 "UPDATE metadata SET value=lower(hex(randomblob(32))) WHERE key=?",
                 (tasks.resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),

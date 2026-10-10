@@ -679,13 +679,13 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_git_branch": ("git_cli",),
     "grabowski_checkout_inventory": ("git_cli",),
     "grabowski_checkout_binding_reconciliation": (),
-    "grabowski_checkout_binding_terminal_preview": ("git_cli", "github_cli"),
+    "grabowski_checkout_binding_terminal_preview": ("git_cli", "github_cli", "resource_lease"),
     "grabowski_checkout_binding_terminal_apply": (
         "git_cli",
         "github_cli",
         "resource_lease",
     ),
-    "grabowski_checkout_binding_identity_rebind_preview": ("git_cli", "github_cli"),
+    "grabowski_checkout_binding_identity_rebind_preview": ("git_cli", "github_cli", "resource_lease"),
     "grabowski_checkout_binding_identity_rebind_apply": (
         "git_cli",
         "github_cli",

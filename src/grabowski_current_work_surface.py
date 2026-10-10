@@ -192,17 +192,21 @@ def _checkout_payloads(
     payloads: list[dict[str, Any]] = []
     for repository in repositories:
         try:
-            payload = checkouts.checkout_inventory(
-                repository,
-                include_processes=False,
-                include_tasks=False,
-                include_resources=True,
-                git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
-                observation_budget_seconds=(
-                    CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS
-                ),
-                max_worktrees=CURRENT_WORK_CHECKOUT_MAX_WORKTREES,
-            )
+            # Public Current Work is READ_ONLY.  Direct internal inventory
+            # uses WAL-aware SQLite readers that may create a missing SHM file;
+            # enforce the same strict non-writing scope as checkout_inventory.
+            with checkouts._strict_inventory_readonly_scope():
+                payload = checkouts.checkout_inventory(
+                    repository,
+                    include_processes=False,
+                    include_tasks=False,
+                    include_resources=True,
+                    git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
+                    observation_budget_seconds=(
+                        CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS
+                    ),
+                    max_worktrees=CURRENT_WORK_CHECKOUT_MAX_WORKTREES,
+                )
             payloads.append(payload)
             if payload.get("truncated") is True and errors is not None:
                 errors.append(

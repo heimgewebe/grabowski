@@ -350,7 +350,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "checkout-lifecycle",
         "purpose": "Preview one exact evidence-bound terminal reconciliation for an absent managed checkout, a clean terminal Work Lane, or a present terminal thread_focus checkout whose only admitted local state is hash-bound .review-audits evidence and whose head is exactly retention-bound.",
         "risk_class": "low",
-        "effects": [],
+        "effects": ["sqlite-wal-shm-sidecar-write"],
         "reversibility": "not-applicable",
     },
     "grabowski_checkout_binding_terminal_apply": {
@@ -364,7 +364,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "checkout-lifecycle",
         "purpose": "Preview one clean, coordination-free and remote-secured existing checkout for a supported identity repair: branch rename, repo-path canonicalization, or lifecycle catch-up when retention already matches current Git identity.",
         "risk_class": "low",
-        "effects": [],
+        "effects": ["sqlite-wal-shm-sidecar-write"],
         "reversibility": "not-applicable",
     },
     "grabowski_checkout_binding_identity_rebind_apply": {

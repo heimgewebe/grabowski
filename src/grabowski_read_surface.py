@@ -2025,14 +2025,17 @@ def grabowski_checkout_summary(
     )
     repository = context.get("repository")
     try:
-        active_capacity = (
-            checkouts.active_capacity_projection(Path(repository))
-            if isinstance(repository, str) and repository
-            else {
+        if isinstance(repository, str) and repository:
+            # The public LOCAL_READ summary must not create SQLite SHM while
+            # projecting active capacity.  Keep authoritatively unavailable
+            # rather than treating a live WAL snapshot as empty.
+            with checkouts._strict_inventory_readonly_scope():
+                active_capacity = checkouts.active_capacity_projection(Path(repository))
+        else:
+            active_capacity = {
                 "available": False,
                 "does_not_establish": ["absence_of_active_bindings"],
             }
-        )
     except Exception as exc:  # pragma: no cover - defensive read boundary
         active_capacity = {
             "available": False,

@@ -6267,9 +6267,10 @@ def _verify_recovery_refs(repo: Path, recovery_refs: list[dict[str, str]]) -> li
     return verified
 
 
-@mcp.tool(name="grabowski_checkout_binding_terminal_preview", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_checkout_binding_terminal_preview", annotations=MUTATING)
 def grabowski_checkout_binding_terminal_preview(checkout_key: str) -> dict[str, Any]:
-    """Preview an evidence-only terminal transition for one missing or safely retained managed checkout."""
+    """Preview an evidence-bound terminal transition; SQLite WAL observation needs mutation admission."""
+    operator._require_operator_mutation("resource_lease")
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
     from grabowski_checkout_terminal_reconciliation import preview
@@ -6597,11 +6598,12 @@ def _binding_identity_rebind_state_for_key(
     )
 
 
-@mcp.tool(name="grabowski_checkout_binding_identity_rebind_preview", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_checkout_binding_identity_rebind_preview", annotations=MUTATING)
 def grabowski_checkout_binding_identity_rebind_preview(
     checkout_key: str,
 ) -> dict[str, Any]:
-    """Preview one fail-closed identity repair for branch, path, or retention-converged lifecycle drift."""
+    """Preview identity repair through mutation admission before SQLite WAL observation."""
+    operator._require_operator_mutation("resource_lease")
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
     return _binding_identity_rebind_state_for_key(
@@ -7038,6 +7040,7 @@ def checkout_owner_handoff_preview(
     expected_head: str,
     expected_branch: str | None = None,
 ) -> dict[str, Any]:
+    operator._require_operator_mutation("resource_lease")
     operator._require_operator_capability("git_cli")
     return _owner_handoff_state(
         repo=repo,

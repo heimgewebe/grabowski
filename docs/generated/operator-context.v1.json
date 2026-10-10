@@ -870,11 +870,13 @@
     },
     {
       "category": "checkout-lifecycle",
-      "description": "Preview an evidence-only terminal transition for one missing or safely retained managed checkout.",
-      "effects": [],
+      "description": "Preview an evidence-bound terminal transition; SQLite WAL observation needs mutation admission.",
+      "effects": [
+        "sqlite-wal-shm-sidecar-write"
+      ],
       "id": "grabowski_checkout_binding_terminal_preview",
       "purpose": "Preview one exact evidence-bound terminal reconciliation for an absent managed checkout, a clean terminal Work Lane, or a present terminal thread_focus checkout whose only admitted local state is hash-bound .review-audits evidence and whose head is exactly retention-bound.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_checkout_binding_terminal_preview"
@@ -897,11 +899,13 @@
     },
     {
       "category": "checkout-lifecycle",
-      "description": "Preview one fail-closed identity repair for branch, path, or retention-converged lifecycle drift.",
-      "effects": [],
+      "description": "Preview identity repair through mutation admission before SQLite WAL observation.",
+      "effects": [
+        "sqlite-wal-shm-sidecar-write"
+      ],
       "id": "grabowski_checkout_binding_identity_rebind_preview",
       "purpose": "Preview one clean, coordination-free and remote-secured existing checkout for a supported identity repair: branch rename, repo-path canonicalization, or lifecycle catch-up when retention already matches current Git identity.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_checkout_binding_identity_rebind_preview"
@@ -3680,7 +3684,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "0ebd9b07c4fa485b9ce82c1a67642ec9a66eda3f8666ea724d48d51f862da647"
+      "sha256": "a5469c45befc5e65fa71e13c3a69d050d0c23db8f261434095b5cbab7055d780"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3721,7 +3725,7 @@
       "src/grabowski_checkout_identity.py": "377ca0a5396df74023cff263a7ae16da94d1c31a887772c3abb877961f4e5fd5",
       "src/grabowski_checkout_terminal_reconciliation.py": "fbe3f0a0778c006a76ab5d44734c6d06988fd0a0cda2e931b39a5e0a0f4a41b2",
       "src/grabowski_checkout_terminal_sources.py": "56e65c901e7b5ba5a6b9d764617b709cff14dc1d3d852244beff5ac5cadce32b",
-      "src/grabowski_checkouts.py": "1ea1796a071baf59e7a47d5b3851f2fb1746de6108fed9005f4e5b5993cd26c7",
+      "src/grabowski_checkouts.py": "b765e63544a072a0b0ab24d1f7a06670173642f44c45356783492cbdbf52a4f8",
       "src/grabowski_chronik.py": "68785720fc9dac258b493011f99d5568ef1ca5543e21eee853e6d8e6c1616c17",
       "src/grabowski_client_snapshot.py": "777d9aa6d4bd964e7fdbb923d82586d186f9e0340e51b8e4b1140cae1e863eec",
       "src/grabowski_coding_agent_catalog_data.py": "2e9b3163bf93f58f5c2848813e51d1cf0f13c59dc071eb678a11657c4bb645a2",
