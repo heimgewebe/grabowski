@@ -1265,6 +1265,19 @@ def _extract_claude_review_document(
         or subagent_stats["spawned"] != 0
     ):
         return None, "Claude review subagent evidence is missing or nonzero", metadata
+    # Claude CLI 2.1.285 distinguishes spawned agents from attempted/refused
+    # agent tool calls. Zero spawned alone does not establish no tool attempts.
+    for field, required_counters in (
+        ("requested", {"background", "foreground", "unset"}),
+        ("refused", {"depth_limit", "concurrency_limit", "budget"}),
+    ):
+        counters = subagent_stats.get(field)
+        if (
+            not isinstance(counters, dict)
+            or not required_counters.issubset(counters)
+            or any(type(value) is not int or value != 0 for value in counters.values())
+        ):
+            return None, "Claude review subagent attempt evidence is missing or nonzero", metadata
     result = envelope.get("structured_output")
     if not isinstance(result, dict) or set(result) != {"verdict", "findings"}:
         return None, "Claude review structured_output has an invalid shape", metadata

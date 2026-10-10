@@ -920,7 +920,13 @@ class GrokReviewRoleTests(unittest.TestCase):
                 "web_search_requests": 0, "web_fetch_requests": 0,
             }},
             "modelUsage": {"claude-opus-5-5": {"webSearchRequests": 0}},
-            "subagent_stats": {"spawned": 0},
+            "subagent_stats": {
+                "spawned": 0,
+                "requested": {"background": 0, "foreground": 0, "unset": 0},
+                "refused": {
+                    "depth_limit": 0, "concurrency_limit": 0, "budget": 0,
+                },
+            },
             "structured_output": {"verdict": "PASS", "findings": []},
         }
 
@@ -1002,6 +1008,86 @@ class GrokReviewRoleTests(unittest.TestCase):
                 )
                 self.assertIsNone(document)
                 self.assertIsNotNone(error)
+
+    def test_claude_result_rejects_attempted_or_refused_subagents(self) -> None:
+        """CLI 2.1.285: spawned=0 excludes neither requested nor refused attempts."""
+        clean = self._clean_claude_success_envelope()
+        stats = clean["subagent_stats"]
+        accepted, error, _ = role._extract_claude_review_document(
+            json.dumps(clean).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(clean["structured_output"], json.loads(accepted))
+
+        # Unknown future activity counters are admitted only as typed zeros.
+        for category in ("requested", "refused"):
+            future_zero = {
+                **clean,
+                "subagent_stats": {
+                    **stats,
+                    category: {**stats[category], "future_counter": 0},
+                },
+            }
+            document, rejected, _ = role._extract_claude_review_document(
+                json.dumps(future_zero).encode()
+            )
+            self.assertIsNone(rejected)
+            self.assertEqual(clean["structured_output"], json.loads(document))
+
+        for category in ("requested", "refused"):
+            required = stats[category]
+            for key in (*required, "future_counter"):
+                for invalid_value in (1, -1, True, "0"):
+                    with self.subTest(category=category, key=key, value=invalid_value):
+                        modified = {
+                            **clean,
+                            "subagent_stats": {
+                                **stats,
+                                category: {**required, key: invalid_value},
+                            },
+                        }
+                        document, rejected, _ = role._extract_claude_review_document(
+                            json.dumps(modified).encode()
+                        )
+                        self.assertIsNone(document)
+                        self.assertIsNotNone(rejected)
+
+            for missing_key in required:
+                with self.subTest(category=category, missing_key=missing_key):
+                    modified = {
+                        **clean,
+                        "subagent_stats": {
+                            **stats,
+                            category: {
+                                key: value for key, value in required.items()
+                                if key != missing_key
+                            },
+                        },
+                    }
+                    document, rejected, _ = role._extract_claude_review_document(
+                        json.dumps(modified).encode()
+                    )
+                    self.assertIsNone(document)
+                    self.assertIsNotNone(rejected)
+
+            for invalid in (None, False, 0, "0", [], {}):
+                with self.subTest(category=category, malformed=invalid):
+                    modified = {
+                        **clean,
+                        "subagent_stats": {**stats, category: invalid},
+                    }
+                    document, rejected, _ = role._extract_claude_review_document(
+                        json.dumps(modified).encode()
+                    )
+                    self.assertIsNone(document)
+                    self.assertIsNotNone(rejected)
+
+            missing = {key: value for key, value in stats.items() if key != category}
+            document, rejected, _ = role._extract_claude_review_document(
+                json.dumps({**clean, "subagent_stats": missing}).encode()
+            )
+            self.assertIsNone(document)
+            self.assertIsNotNone(rejected)
 
     def test_claude_result_requires_explicit_zero_activity_proof(self) -> None:
         """Missing fields must not be promoted to tool-free execution."""
