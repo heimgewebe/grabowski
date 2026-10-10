@@ -3808,10 +3808,14 @@ def _workspace_has_git_marker(workspace: str) -> bool:
 def _codex_workspace_argument(argv: list[str]) -> str | None:
     """Accept one unambiguous Codex working root, never extra writable roots."""
     workspace: str | None = None
+    execution_mode: str | None = None
+    first_exec_positional = True
+    explicit_prompt_delimiter = False
     index = 1
     while index < len(argv):
         token = argv[index]
         if token == "--":
+            explicit_prompt_delimiter = True
             break
         if (
             token == "--worktree"
@@ -3887,6 +3891,32 @@ def _codex_workspace_argument(argv: list[str]) -> str | None:
                 raise RuntimeError("Codex sandbox must be workspace-confined")
             index += 1
             continue
+        # Workspace leases never authorize administrative commands, direct
+        # approval bypasses, or feature-driven changes to the CLI write surface.
+        if token in {
+            "--enable", "--disable", "--approve-for-me",
+            "-a", "--ask-for-approval", "--oss", "--local-provider",
+        } or token.startswith((
+            "--enable=", "--disable=", "--ask-for-approval=",
+            "--local-provider=",
+        )):
+            raise RuntimeError(
+                "Codex command cannot be authorized with unverified write controls"
+            )
+        if token in {
+            "-m", "--model", "-i", "--image", "--color",
+            "--output-schema", "--thread-source",
+        }:
+            if index + 1 >= len(argv) or not argv[index + 1] or argv[index + 1].startswith("-"):
+                raise RuntimeError("Codex option is missing its value")
+            index += 2
+            continue
+        if token.startswith((
+            "--model=", "--image=", "--color=",
+            "--output-schema=", "--thread-source=",
+        )) or (token.startswith(("-m", "-i")) and not token.startswith("--")):
+            index += 1
+            continue
         if token in {"-C", "--cd"}:
             if index + 1 >= len(argv):
                 raise RuntimeError("Codex working directory option is missing its path")
@@ -3901,6 +3931,24 @@ def _codex_workspace_argument(argv: list[str]) -> str | None:
                 candidate = candidate[1:]
             index += 1
         else:
+            # Before the payload, allow only the two coding-agent execution
+            # entrypoints. Administrative and historical-session subcommands
+            # can write outside the leased checkout, regardless of -C.
+            if token.startswith("-"):
+                index += 1
+                continue
+            if execution_mode is None:
+                if token not in {"exec", "review"}:
+                    raise RuntimeError(
+                        "Codex command is outside verified workspace execution modes"
+                    )
+                execution_mode = token
+            elif execution_mode == "exec" and first_exec_positional:
+                if token in {"resume", "fork"}:
+                    raise RuntimeError(
+                        "Codex resumed or forked sessions lack verified workspace identity"
+                    )
+                first_exec_positional = False
             index += 1
             continue
         if not candidate or candidate.startswith("-"):
@@ -3908,6 +3956,8 @@ def _codex_workspace_argument(argv: list[str]) -> str | None:
         if workspace is not None:
             raise RuntimeError("Codex working directory has ambiguous declarations")
         workspace = candidate
+    if execution_mode is None and not explicit_prompt_delimiter:
+        raise RuntimeError("Codex command lacks a verified execution mode")
     return workspace
 
 
