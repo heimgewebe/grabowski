@@ -1223,44 +1223,48 @@ def _extract_claude_review_document(
         or envelope.get("is_error") is not False
     ):
         return None, "Claude review result envelope does not prove success", metadata
-    # A provider may still return a successful structured output after
-    # attempting a denied Bash, Web or MCP call. That is not a toolless review.
-    denials = envelope.get("permission_denials", [])
+    # Review evidence must prove zero external activity, not merely omit data.
+    # This bounded CLI contract is intentionally fail-closed for other variants.
+    denials = envelope.get("permission_denials")
     if not isinstance(denials, list) or denials:
-        return None, "Claude review attempted a forbidden tool", metadata
-    # Claude can report server-side tool effects that are not guarded by the
-    # local filesystem sandbox or represented in permission_denials. Only
-    # absent optional counters or exact integer zero prove no such activity.
-    zero_activity_counters: list[tuple[dict[str, Any], tuple[str, ...]]] = []
-    if "usage" in envelope:
-        usage = envelope["usage"]
-        if not isinstance(usage, dict):
-            return None, "Claude review usage evidence is invalid", metadata
-        if "server_tool_use" in usage:
-            server_tools = usage["server_tool_use"]
-            if not isinstance(server_tools, dict):
-                return None, "Claude review server tool evidence is invalid", metadata
-            zero_activity_counters.append((
-                server_tools, ("web_search_requests", "web_fetch_requests"),
-            ))
-    if "modelUsage" in envelope:
-        model_usage = envelope["modelUsage"]
-        if not isinstance(model_usage, dict):
-            return None, "Claude review model usage evidence is invalid", metadata
-        for model_stats in model_usage.values():
-            if not isinstance(model_stats, dict):
-                return None, "Claude review model usage evidence is invalid", metadata
-            zero_activity_counters.append((model_stats, ("webSearchRequests", "webFetchRequests")))
-    if "subagent_stats" in envelope:
-        subagent_stats = envelope["subagent_stats"]
-        if not isinstance(subagent_stats, dict):
-            return None, "Claude review subagent evidence is invalid", metadata
-        zero_activity_counters.append((subagent_stats, ("spawned",)))
-    if any(
-        key in counters and (type(counters[key]) is not int or counters[key] != 0)
-        for counters, names in zero_activity_counters for key in names
+        return None, "Claude review attempted a forbidden tool or lacks denial evidence", metadata
+    usage = envelope.get("usage")
+    if not isinstance(usage, dict):
+        return None, "Claude review usage evidence is missing or invalid", metadata
+    server_tools = usage.get("server_tool_use")
+    if not isinstance(server_tools, dict) or not {
+        "web_search_requests", "web_fetch_requests",
+    }.issubset(server_tools):
+        return None, "Claude review server tool evidence is missing or invalid", metadata
+    # Every current and future server-side tool counter must be integer zero.
+    if any(type(value) is not int or value != 0 for value in server_tools.values()):
+        return None, "Claude review reports forbidden server tool activity", metadata
+
+    model_usage = envelope.get("modelUsage")
+    if not isinstance(model_usage, dict) or not model_usage:
+        return None, "Claude review model usage evidence is missing or invalid", metadata
+    for model_stats in model_usage.values():
+        if (
+            not isinstance(model_stats, dict)
+            or type(model_stats.get("webSearchRequests")) is not int
+            or model_stats["webSearchRequests"] != 0
+            or (
+                "webFetchRequests" in model_stats
+                and (
+                    type(model_stats["webFetchRequests"]) is not int
+                    or model_stats["webFetchRequests"] != 0
+                )
+            )
+        ):
+            return None, "Claude review reports forbidden model web activity", metadata
+
+    subagent_stats = envelope.get("subagent_stats")
+    if (
+        not isinstance(subagent_stats, dict)
+        or type(subagent_stats.get("spawned")) is not int
+        or subagent_stats["spawned"] != 0
     ):
-        return None, "Claude review reports forbidden server tool or subagent activity", metadata
+        return None, "Claude review subagent evidence is missing or nonzero", metadata
     result = envelope.get("structured_output")
     if not isinstance(result, dict) or set(result) != {"verdict", "findings"}:
         return None, "Claude review structured_output has an invalid shape", metadata
