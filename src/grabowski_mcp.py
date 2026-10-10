@@ -6560,6 +6560,10 @@ def _operator_system_overview(
         next_action = "resolve unknown task states before relying on projections"
     elif not tasks.get("snapshot_complete"):
         next_action = "restore complete task state counts before relying on readiness"
+    elif (tasks.get("projection_counts") or {}).get("active", 0) > 0:
+        # An authorized reconciliation cannot certify quiescence while
+        # tasks remain active. Do not recommend an impossible retry loop.
+        next_action = "wait for active tasks to terminalize, then run authorized reconciliation"
     elif reconciliation_evidence.get("status") != "verified":
         next_action = "reconcile live task outcomes through an authorized mutation-capable path"
     elif obligations.get("integrity_error_count"):
