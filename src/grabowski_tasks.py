@@ -3804,6 +3804,48 @@ def _workspace_has_git_marker(workspace: str) -> bool:
     return not marker.is_symlink() and (marker.is_file() or marker.is_dir())
 
 
+
+def _codex_workspace_argument(argv: list[str]) -> str | None:
+    """Accept one unambiguous Codex working root, never extra writable roots."""
+    workspace: str | None = None
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            break
+        if (
+            token == "--worktree"
+            or token.startswith("--worktree=")
+            or token == "--add-dir"
+            or token.startswith("--add-dir=")
+        ):
+            raise RuntimeError(
+                "Codex working directory cannot be authorized with extra writable roots"
+            )
+        if token in {"-C", "--cd"}:
+            if index + 1 >= len(argv):
+                raise RuntimeError("Codex working directory option is missing its path")
+            candidate = argv[index + 1]
+            index += 2
+        elif token.startswith("--cd="):
+            candidate = token[len("--cd="):]
+            index += 1
+        elif token.startswith("-C") and token != "-C":
+            candidate = token[2:]
+            if candidate.startswith("="):
+                candidate = candidate[1:]
+            index += 1
+        else:
+            index += 1
+            continue
+        if not candidate or candidate.startswith("-"):
+            raise RuntimeError("Codex working directory option has an invalid path")
+        if workspace is not None:
+            raise RuntimeError("Codex working directory has ambiguous declarations")
+        workspace = candidate
+    return workspace
+
+
 def _mutating_agent_workspace(
     host: str,
     argv: list[str],
@@ -3814,7 +3856,7 @@ def _mutating_agent_workspace(
         return None
     executable = Path(argv[0]).name.lower()
     if executable == "codex":
-        return _local_workspace_path(_argument_value(argv, "-C", "--cd"), cwd=cwd)
+        return _local_workspace_path(_codex_workspace_argument(argv), cwd=cwd)
     if executable in MUTATING_AGENT_EXECUTABLES - {"codex"}:
         return _local_workspace_path(None, cwd=cwd)
     # Framework-managed writers already hold a workspace-level lease owned by
@@ -3957,6 +3999,105 @@ def _record_task_effect_classification(
         return None
     value = launcher.get("task_effect_classification")
     return dict(value) if isinstance(value, dict) else None
+
+
+
+TASK_EFFECT_START_KEY_PREFIX = "task_effect_start:"
+
+
+def _store_task_effect_start(
+    connection: sqlite3.Connection,
+    record: dict[str, Any],
+    *,
+    classification: dict[str, Any],
+    transport: str,
+) -> None:
+    """Create-only, atomically with the initial task row, before dispatch."""
+    original = {
+        "schema_version": 1,
+        "task_id": record["task_id"],
+        "argv_sha256": record["argv_sha256"],
+        "agent_executable": classification["agent_executable"],
+        "host": record["host"],
+        "transport": transport,
+        "cwd": record["cwd"],
+        "classification": dict(classification),
+    }
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?)",
+        (
+            f"{TASK_EFFECT_START_KEY_PREFIX}{record['task_id']}",
+            _canonical_json(original),
+        ),
+    )
+
+
+def _verified_task_effect_start(
+    record: dict[str, Any], *, command: list[str] | None = None
+) -> dict[str, Any] | None:
+    """Fail closed for coding agents if their create-only start decision drifts."""
+    if command is None:
+        try:
+            command = json.loads(str(record["argv_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("persisted agent identity is invalid") from exc
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(item, str) for item in command)
+    ):
+        raise RuntimeError("persisted agent identity is invalid")
+    executable = Path(command[0]).name.lower()
+    launcher_classification = _record_task_effect_classification(record)
+    agent_known = (
+        executable in MUTATING_AGENT_EXECUTABLES
+        or (
+            launcher_classification is not None
+            and launcher_classification.get("agent_executable")
+            in MUTATING_AGENT_EXECUTABLES
+        )
+    )
+    if not agent_known:
+        return launcher_classification
+    if command_identity.argv_sha256(command) != str(record["argv_sha256"]):
+        raise RuntimeError("persisted agent identity disagrees with original argv")
+    with _database_connection() as connection:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (f"{TASK_EFFECT_START_KEY_PREFIX}{record['task_id']}",),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError("unverified agent effect: original start decision is missing")
+    try:
+        original = json.loads(str(row["value"]))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("unverified agent effect: original start decision is invalid") from exc
+    if (
+        not isinstance(original, dict)
+        or set(original) != {
+            "schema_version", "task_id", "argv_sha256", "agent_executable",
+            "host", "transport", "cwd", "classification",
+        }
+        or type(original["schema_version"]) is not int
+        or original["schema_version"] != 1
+        or original["task_id"] != record["task_id"]
+        or original["argv_sha256"] != record["argv_sha256"]
+        or original["host"] != record["host"]
+        or original["cwd"] != record["cwd"]
+        or not isinstance(original["classification"], dict)
+    ):
+        raise RuntimeError("unverified agent effect: original start decision is invalid")
+    if original["agent_executable"] != executable:
+        raise RuntimeError("persisted agent identity mismatches original start decision")
+    if original["transport"] != fleet.fleet_host(str(record["host"]))["transport"]:
+        raise RuntimeError("original agent effect transport no longer matches host")
+    if launcher_classification is None:
+        raise RuntimeError("unverified agent effect: launcher classification is missing")
+    if launcher_classification.get("agent_executable") != executable:
+        raise RuntimeError("persisted agent identity mismatches original executable")
+    if launcher_classification != original["classification"]:
+        raise RuntimeError("persisted agent effect profile disagrees with original start decision")
+    return dict(original["classification"])
 
 
 def _server_verified_task_read_route(
@@ -8749,7 +8890,7 @@ def grabowski_task_start(
     reused_record = operation_resolution["reuse"]
     if reused_record is not None:
         reused_classification = _project_task_effect_classification(
-            _record_task_effect_classification(reused_record),
+            _verified_task_effect_start(reused_record),
             fallback=task_effect_classification,
         )
         reuse_audit = {
@@ -8975,7 +9116,7 @@ def grabowski_task_start(
         if execution_reuse_reason is None:
             raise RuntimeError("execution reuse reason is missing")
         reused_classification = _project_task_effect_classification(
-            _record_task_effect_classification(execution_reuse),
+            _verified_task_effect_start(execution_reuse),
             fallback=task_effect_classification,
         )
         reuse_audit = {
@@ -9364,6 +9505,11 @@ def grabowski_task_start(
             )
             """,
                 record,
+            )
+            _store_task_effect_start(
+                connection, record,
+                classification=task_effect_classification,
+                transport=str(target["transport"]),
             )
             _register_task_reconcile_sequence(connection, task_id)
             connection.commit()
@@ -9891,6 +10037,7 @@ def grabowski_task_resume(
     if record["resume_policy"] == "manual" and _interrupted_recovery_context is None:
         raise PermissionError("Task resume policy does not permit automatic retry")
     command = json.loads(record["argv_json"])
+    task_effect_classification = _verified_task_effect_start(record, command=command)
     recovery_gate = _require_recovery_gate(command)
     observation = _observe(record)
     if observation["state"] == "running":
@@ -9930,7 +10077,6 @@ def grabowski_task_resume(
         if retained_retry_binding is not None:
             recovery_launcher_bindings["retry_binding"] = retained_retry_binding
     coding_agent_pre_dispatch_admission: dict[str, Any] | None = None
-    task_effect_classification = _record_task_effect_classification(record)
     command_executable = Path(command[0]).name.lower()
     persisted_executable = (
         task_effect_classification.get("agent_executable")
