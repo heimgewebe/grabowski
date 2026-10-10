@@ -1574,6 +1574,7 @@ def _validate_work_lane_binding(
     allowed_paths: list[str],
     runtime_deadline_unix: int,
     runner: CommandRunner,
+    read_only: bool = False,
 ) -> dict[str, Any]:
     receipt = _lane_receipt(lane_id, expected_receipt_sha256)
     inputs = receipt.get("inputs")
@@ -1644,7 +1645,13 @@ def _validate_work_lane_binding(
     observed_at = _now()
     for key in lease_keys:
         try:
-            lease = resources.inspect_resource(key)
+            # READ_ONLY status must never initialize, migrate, or write
+            # SQLite WAL/SHM while checking another writer's lane.
+            lease = (
+                resources.inspect_resource(key, read_only=True)
+                if read_only
+                else resources.inspect_resource(key)
+            )
         except Exception as exc:
             raise AgentWorkspaceError(f"work lane lease is not observable: {key}: {_error_summary(exc)}") from exc
         if (
@@ -1753,7 +1760,14 @@ def _validate_work_lane_binding(
     return binding
 
 
-def _lane_binding_status(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict[str, Any]:
+def _lane_binding_status(
+    manifest: dict[str, Any],
+    runner: CommandRunner = _run,
+    *,
+    read_only: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(read_only, bool):
+        raise ValueError("read_only must be boolean")
     if not _lane_backed(manifest):
         return {"mode": WORKSPACE_OWNERSHIP_LEGACY, "required": False, "valid": True}
     resources_value = manifest.get("resources")
@@ -1777,6 +1791,7 @@ def _lane_binding_status(manifest: dict[str, Any], runner: CommandRunner = _run)
                 else None
             ),
             runner=runner,
+            read_only=read_only,
         )
         if observed != lane_binding:
             raise AgentWorkspaceError("live work lane binding differs from immutable workspace binding")
@@ -1802,7 +1817,11 @@ def _lane_binding_status(manifest: dict[str, Any], runner: CommandRunner = _run)
 
 
 def _require_live_lane_binding(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict[str, Any]:
-    status = _lane_binding_status(manifest, runner)
+    # The writer path may observe an active WAL, but it must pass central
+    # mutation admission before inspect_resource can open or migrate the store.
+    if _lane_backed(manifest):
+        operator._require_operator_mutation("resource_lease")
+    status = _lane_binding_status(manifest, runner, read_only=False)
     if status.get("valid") is not True:
         raise AgentWorkspaceError(f"work lane binding is not live and exact: {status.get('error')}")
     return status

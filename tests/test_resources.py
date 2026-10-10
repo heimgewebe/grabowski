@@ -1580,7 +1580,27 @@ class ResourceTests(unittest.TestCase):
             self.assertEqual(resources.count_resources(), 0)
             self.assertEqual(resources.list_resources(include_expired=True), [lease])
             self.assertEqual(resources.count_resources(include_expired=True), 1)
-            with patch.object(resources.operator, "_require_operator_capability"):
+            # Strict READ_ONLY may legitimately refuse the live writer's
+            # WAL/SHM sidecars. Read a quiescent copy rather than loosening
+            # the production filesystem-write guard just for this assertion.
+            quiescent = self.root / "expired-public-read.sqlite3"
+            source = sqlite3.connect(self.database)
+            replica = sqlite3.connect(quiescent)
+            try:
+                source.backup(replica)
+                self.assertEqual(
+                    replica.execute("PRAGMA journal_mode=DELETE").fetchone()[0],
+                    "delete",
+                )
+            finally:
+                replica.close()
+                source.close()
+            self.assertFalse(Path(str(quiescent) + "-wal").exists())
+            self.assertFalse(Path(str(quiescent) + "-shm").exists())
+            with (
+                patch.object(resources, "RESOURCE_DB", quiescent),
+                patch.object(resources.operator, "_require_operator_capability"),
+            ):
                 public = resources.grabowski_resource_inspect(key)
             self.assertEqual(public, {"resource_key": key, "lease": None})
 

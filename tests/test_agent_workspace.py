@@ -1500,7 +1500,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         inspect_resource = workspace.resources.inspect_resource
         lifecycle_bindings = workspace.checkouts._lifecycle_bindings
 
-        def lease_at_deadline(resource_key: str) -> dict:
+        def lease_at_deadline(resource_key: str, *, read_only: bool = False) -> dict:
             return {
                 **inspect_resource(resource_key),
                 "expires_at_unix": deadline,
@@ -1558,6 +1558,67 @@ class AgentWorkspaceTests(unittest.TestCase):
             ),
             deadline,
         )
+
+    def test_lane_backed_writer_validation_survives_live_resource_wal(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-writer-live-resource-wal")
+        plan = self.normalize_lane(lane)
+        keeper = workspace.resources._database()
+        try:
+            keeper.execute("BEGIN IMMEDIATE")
+            keeper.execute("UPDATE metadata SET value=value WHERE key='schema_version'")
+            keeper.commit()
+            self.assertTrue(Path(str(workspace.resources.RESOURCE_DB) + "-wal").is_file())
+            self.assertTrue(Path(str(workspace.resources.RESOURCE_DB) + "-shm").is_file())
+            self.assertFalse(workspace._lane_binding_status(plan)["valid"])
+            with mock.patch.object(
+                workspace.operator, "_require_operator_mutation"
+            ) as mutation_gate:
+                result = workspace._require_live_lane_binding(plan)
+            self.assertTrue(result["valid"])
+            mutation_gate.assert_called_once_with("resource_lease")
+        finally:
+            keeper.close()
+        self.assertTrue(workspace._lane_binding_status(plan)["valid"])
+
+    def test_lane_backed_writer_denial_precedes_resource_store_inspection(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-writer-denied-before-sqlite")
+        plan = self.normalize_lane(lane)
+        with (
+            mock.patch.object(
+                workspace.operator,
+                "_require_operator_mutation",
+                side_effect=PermissionError("resource mutation denied"),
+            ) as gate,
+            mock.patch.object(workspace.resources, "inspect_resource") as inspect,
+        ):
+            with self.assertRaisesRegex(PermissionError, "resource mutation denied"):
+                workspace._require_live_lane_binding(plan)
+        gate.assert_called_once_with("resource_lease")
+        inspect.assert_not_called()
+
+    def test_legacy_lane_validation_does_not_acquire_new_resource_authority(self) -> None:
+        legacy = self.manifest(with_writer=False)
+        with mock.patch.object(
+            workspace.operator, "_require_operator_mutation",
+            side_effect=AssertionError("legacy workspace must not request a lane resource gate"),
+        ) as gate:
+            result = workspace._require_live_lane_binding(legacy)
+        self.assertTrue(result["valid"])
+        gate.assert_not_called()
+
+    def test_lane_backed_status_fails_closed_when_strict_resource_snapshot_unavailable(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-strict-resource-readonly")
+        plan = self.normalize_lane(lane)
+        with mock.patch.object(
+            workspace.resources,
+            "inspect_resource",
+            side_effect=RuntimeError("strict resource WAL unavailable"),
+        ) as reader:
+            status = workspace._lane_binding_status(plan)
+        self.assertFalse(status["valid"])
+        self.assertIn("lease is not observable", status["error"])
+        reader.assert_called()
+        self.assertIs(reader.call_args.kwargs["read_only"], True)
 
     def test_lane_backed_create_failure_preserves_lane_resources(self) -> None:
         lane = self.lane_receipt()

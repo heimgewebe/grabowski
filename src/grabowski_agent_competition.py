@@ -1111,6 +1111,7 @@ def _start_reconciliation(identifier: str, intent: dict[str, Any]) -> dict[str, 
                 limit=START_RECONCILE_PAGE_LIMIT,
                 view="standard",
                 cursor=cursor,
+                read_only=True,
             )
         except Exception:
             return {"state": "task_registry_unavailable", "matches": [], "task": None}
