@@ -1684,16 +1684,30 @@ def _merge_guard_legacy_local_review_diff_identity(
             return False, evidence
 
     try:
-        ancestry = _merge_guard_local_git_bytes(
-            repo_path, ["merge-base", "--is-ancestor", base_sha, head_sha]
+        merge_base_result = _merge_guard_local_git_bytes(
+            repo_path, ["merge-base", "--all", base_sha, head_sha]
         )
-        evidence["base_is_ancestor"] = ancestry["returncode"] == 0
-        if ancestry["returncode"] != 0:
-            evidence["reason"] = "base_is_not_proven_ancestor"
+        merge_bases = merge_base_result["stdout_bytes"].splitlines()
+        # The review runner uses BASE...HEAD. Do not require BASE itself
+        # to be an ancestor: GitHub PR heads normally diverge from main.
+        # Multiple merge bases are ambiguous; fail closed rather than
+        # guessing which tree to compare with the exact reviewed patch.
+        if merge_base_result["returncode"] != 0 or len(merge_bases) != 1:
+            evidence["reason"] = "unique_merge_base_unavailable"
             return False, evidence
+        try:
+            common_ancestor = merge_bases[0].decode("ascii")
+        except UnicodeDecodeError:
+            evidence["reason"] = "unique_merge_base_invalid"
+            return False, evidence
+        if _SHA40_RE.fullmatch(common_ancestor) is None:
+            evidence["reason"] = "unique_merge_base_invalid"
+            return False, evidence
+        evidence["common_ancestor_sha"] = common_ancestor
+        evidence["base_is_ancestor"] = common_ancestor == base_sha
 
         local_paths, path_receipt, path_errors = _merge_guard_local_changed_paths(
-            repo_path, base_sha=base_sha, head_sha=head_sha
+            repo_path, base_sha=common_ancestor, head_sha=head_sha
         )
         evidence["local_paths"] = path_receipt
         evidence["changed_paths_match"] = not path_errors and local_paths == changed_paths

@@ -462,6 +462,87 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
                 runner.receipt["local_review_diff_equivalence"]["canonical_hunks_match"]
             )
 
+    def test_legacy_review_accepts_diverged_base_with_exact_three_dot_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            _git(repo, "init", "-q")
+            _git(repo, "config", "gc.auto", "0")
+            _git(repo, "config", "user.email", "captain-test@example.invalid")
+            _git(repo, "config", "user.name", "Captain Test")
+            (repo / "app.py").write_text(
+                "def func():\n" + "".join(f"    n_{n} = {n}\n" for n in range(20)),
+                encoding="utf-8",
+            )
+            _git(repo, "add", "app.py")
+            _git(repo, "commit", "-q", "-m", "common ancestor")
+            common = _git(repo, "rev-parse", "HEAD")
+            _git(repo, "checkout", "-q", "-b", "feature")
+            app = repo / "app.py"
+            app.write_text(app.read_text(encoding="utf-8").replace("n_8 = 8", "n_8 = 99"), encoding="utf-8")
+            _git(repo, "add", "app.py")
+            _git(repo, "commit", "-q", "-m", "reviewed change")
+            head = _git(repo, "rev-parse", "HEAD")
+            _git(repo, "checkout", "-q", "-b", "base-advanced", common)
+            (repo / "base-only.txt").write_text("new base-side change\n", encoding="utf-8")
+            _git(repo, "add", "base-only.txt")
+            _git(repo, "commit", "-q", "-m", "divergent base")
+            base = _git(repo, "rev-parse", "HEAD")
+            self.assertNotEqual(base, common)
+            self.assertNotEqual(head, base)
+            self.assertEqual(_git(repo, "merge-base", base, head), common)
+
+            review = subprocess.check_output([
+                "git", "-C", str(repo), "diff", "--binary", "--no-ext-diff",
+                "--no-textconv", f"{base}...{head}",
+            ])
+            github_diff = merge_guard.canonicalize_github_pr_diff_identity(review)
+            review_sha = hashlib.sha256(review).hexdigest()
+            self.assertEqual(
+                _git(repo, "diff", "--name-only", f"{base}..{head}").splitlines(),
+                ["app.py", "base-only.txt"],
+            )
+
+            proven, evidence = merge_guard._merge_guard_legacy_local_review_diff_identity(
+                repo, base_sha=base, head_sha=head, expected_sha256=review_sha,
+                provider_diff=github_diff, changed_paths=["app.py"],
+            )
+            self.assertTrue(proven, evidence)
+            self.assertFalse(evidence["base_is_ancestor"])
+            self.assertEqual(evidence["common_ancestor_sha"], common)
+            self.assertEqual(evidence["local_raw_sha256"], review_sha)
+
+            gh = _RenamePrGh(change_status="modified")
+            gh.base_sha = base
+            gh.head_sha = head
+            gh.new_path = "app.py"
+            gh.diff_text = github_diff.decode("utf-8")
+            runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+            runner.action = {"target": {"repo": "heimgewebe/commonworld", "pr": 212, "base": "main"}}
+            runner.parameters = {
+                "expected_head": head, "expected_base_sha": base, "diff_sha256": review_sha,
+            }
+            runner.static_errors = []
+            runner.repo_path = repo
+            runner.github_runner = gh
+            runner.receipt = {}
+            runner.execution_intent_sha256 = "1" * 64
+            runner._revalidate_codex_review = lambda _bindings, phase: []
+            bindings, errors = runner._live_bindings()
+            self.assertEqual(errors, [])
+            self.assertIsNotNone(bindings)
+            assert bindings is not None
+            self.assertEqual(bindings["diff_identity_mode"], "local-review-diff-proven-equivalent")
+
+            other_tree = _git(repo, "rev-parse", "HEAD^{tree}")
+            unrelated_base = _git(repo, "commit-tree", other_tree, "-m", "no ancestry")
+            denied, unsupported = merge_guard._merge_guard_legacy_local_review_diff_identity(
+                repo, base_sha=unrelated_base, head_sha=head,
+                expected_sha256=review_sha, provider_diff=github_diff,
+                changed_paths=["app.py"],
+            )
+            self.assertFalse(denied, unsupported)
+            self.assertEqual(unsupported["reason"], "unique_merge_base_unavailable")
+
     def test_live_bindings_rejects_unrelated_diff_identity(self) -> None:
         gh = _RenamePrGh()
         gh.diff_text = (
