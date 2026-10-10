@@ -646,6 +646,21 @@ GITHUB_PR_DIFF_TOO_LARGE_MARKERS = (
 )
 
 
+def _github_pr_diff_too_large(diagnostic: bytes, changed_files: Any) -> bool:
+    """Recognize GitHub's separate file and line limits, never generic 406 errors."""
+    if type(changed_files) is not int or changed_files < 0:
+        return False
+    line_limit = all(marker in diagnostic for marker in (
+        b"HTTP 406",
+        b"diff exceeded the maximum number of lines",
+        b"PullRequest.diff too_large",
+    ))
+    file_limit = changed_files > GITHUB_PR_DIFF_MAX_FILES and any(
+        marker in diagnostic for marker in GITHUB_PR_DIFF_TOO_LARGE_MARKERS
+    )
+    return line_limit or file_limit
+
+
 def _complete_pr_diff_paths(view: Any) -> list[str] | None:
     if not isinstance(view, dict) or view.get("pullFilesEvidenceComplete") is not True:
         return None
@@ -732,12 +747,7 @@ def _current_pr_diff_bytes(
     if completed.returncode == 0:
         return completed.stdout, None, False
     diagnostic = completed.stderr + b"\n" + completed.stdout
-    too_large = (
-        isinstance(changed_files, int)
-        and not isinstance(changed_files, bool)
-        and changed_files > GITHUB_PR_DIFF_MAX_FILES
-        and any(marker in diagnostic for marker in GITHUB_PR_DIFF_TOO_LARGE_MARKERS)
-    )
+    too_large = _github_pr_diff_too_large(diagnostic, changed_files)
     return None, f"command failed: {_command_label(argv)}", too_large
 
 

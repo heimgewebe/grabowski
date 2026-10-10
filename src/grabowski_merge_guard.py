@@ -1644,13 +1644,19 @@ def _merge_guard_local_diff_bytes(
 def _merge_guard_github_diff_too_large(
     info: dict[str, Any], *, changed_files: int
 ) -> bool:
-    if changed_files <= _MERGE_GUARD_GITHUB_DIFF_MAX_FILES or info.get("returncode") == 0:
+    if type(changed_files) is not int or changed_files < 0 or info.get("returncode") == 0:
         return False
     message = f"{info.get('stderr', '')}\n{info.get('stdout', '')}"
-    return (
+    line_limit = all(marker in message for marker in (
+        "HTTP 406",
+        "diff exceeded the maximum number of lines",
+        "PullRequest.diff too_large",
+    ))
+    file_limit = changed_files > _MERGE_GUARD_GITHUB_DIFF_MAX_FILES and (
         "PullRequest.diff too_large" in message
         or "diff exceeded the maximum number of files" in message
     )
+    return line_limit or file_limit
 
 
 def _merge_guard_github_file_records(

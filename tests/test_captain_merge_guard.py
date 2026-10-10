@@ -202,6 +202,34 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             )
         )
 
+    def test_github_line_limit_with_259_files_is_not_a_generic_http_406_bypass(self) -> None:
+        info = {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000) (PullRequest.diff too_large)",
+        }
+        self.assertTrue(
+            merge_guard._merge_guard_github_diff_too_large(info, changed_files=259)
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_github_diff_too_large(
+                {**info, "stderr": "HTTP 401: Sorry, the diff exceeded the maximum number of lines (20000) (PullRequest.diff too_large)"},
+                changed_files=259,
+            )
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_github_diff_too_large(
+                {**info, "stderr": "HTTP 406: pull request unavailable"},
+                changed_files=259,
+            )
+        )
+        self.assertFalse(
+            merge_guard._merge_guard_github_diff_too_large(
+                {**info, "stderr": "HTTP 406: PullRequest.diff too_large"},
+                changed_files=259,
+            )
+        )
+
     def test_paged_file_projection_maps_only_supported_metadata(self) -> None:
         gh = _PagedFilesGh(
             "\n".join(
@@ -578,6 +606,48 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
         )
         self.assertEqual(
             runner.receipt["live_files"]["record_count"], len(expected_paths)
+        )
+
+    def test_live_bindings_falls_back_at_259_files_when_line_limit_is_hit(self) -> None:
+        temporary, repo, base_sha, head_sha, expected_paths = _large_git_repo(259)
+        self.addCleanup(temporary.cleanup)
+        diff, info, failures = merge_guard._merge_guard_local_diff_bytes(
+            repo, base_sha=base_sha, head_sha=head_sha
+        )
+        self.assertEqual(failures, [])
+        class LineLimitGh(_LargePrGh):
+            def __call__(self, target: Path, argv: list[str]) -> dict[str, object]:
+                outcome = super().__call__(target, argv)
+                if argv[:2] == ["pr", "diff"]:
+                    outcome["stderr"] = (
+                        "HTTP 406: Sorry, the diff exceeded the maximum number of lines "
+                        "(20000) (PullRequest.diff too_large)"
+                    )
+                return outcome
+
+        gh = LineLimitGh(base_sha=base_sha, head_sha=head_sha, paths=expected_paths)
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.action = {"target": {"repo": "heimgewebe/commonworld", "pr": 212, "base": "main"}}
+        runner.parameters = {
+            "expected_head": head_sha,
+            "expected_base_sha": base_sha,
+            "diff_sha256": info["sha256"],
+        }
+        runner.static_errors = []
+        runner.repo_path = repo
+        runner.github_runner = gh
+        runner.receipt = {}
+        runner.execution_intent_sha256 = "1" * 64
+        runner._revalidate_codex_review = lambda _bindings, phase: []
+        bindings, errors = runner._live_bindings()
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(bindings)
+        assert bindings is not None
+        self.assertEqual(bindings["changed_paths"], expected_paths)
+        self.assertEqual(bindings["diff_sha256"], info["sha256"])
+        self.assertEqual(
+            runner.receipt["live_diff"]["source"],
+            "local-bound-git-diff-after-github-too-large",
         )
 
     def test_resource_normalization_supports_bounded_generated_release(self) -> None:

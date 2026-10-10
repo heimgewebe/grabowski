@@ -241,6 +241,41 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
             merge_guard._MERGE_GUARD_GITHUB_DIFF_MAX_FILES,
         )
 
+    def test_github_line_limit_with_259_files_enables_only_bound_fallback(self) -> None:
+        error = b"HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000) (PullRequest.diff too_large)"
+        with (
+            mock.patch.object(pr_review_gate.shutil, "which", return_value="/usr/bin/gh"),
+            mock.patch.object(pr_review_gate.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout=b"", stderr=error,
+            )),
+        ):
+            for count in (1, 259, 300):
+                with self.subTest(changed_files=count):
+                    _, _, too_large = pr_review_gate._current_pr_diff_bytes(
+                        Path("/tmp/commonworld"), 226, changed_files=count
+                    )
+                    self.assertTrue(too_large)
+            _, _, invalid = pr_review_gate._current_pr_diff_bytes(
+                Path("/tmp/commonworld"), 226, changed_files=False
+            )
+            self.assertFalse(invalid)
+        for diagnostic in (
+            b"HTTP 406: PullRequest.diff too_large",
+            b"HTTP 401: diff exceeded the maximum number of lines (20000) (PullRequest.diff too_large)",
+            b"HTTP 406: request temporarily unavailable",
+            b"HTTP 406: diff exceeded the maximum number of files (300) (PullRequest.diff too_large)",
+        ):
+            with (
+                mock.patch.object(pr_review_gate.shutil, "which", return_value="/usr/bin/gh"),
+                mock.patch.object(pr_review_gate.subprocess, "run", return_value=mock.Mock(
+                    returncode=1, stdout=b"", stderr=diagnostic,
+                )),
+            ):
+                _, _, too_large = pr_review_gate._current_pr_diff_bytes(
+                    Path("/tmp/commonworld"), 226, changed_files=259
+                )
+                self.assertFalse(too_large, diagnostic)
+
     def test_local_diff_fallback_rejects_untrusted_file_metadata(self) -> None:
         invalid_path = {
             "pullFilesEvidenceComplete": True,
