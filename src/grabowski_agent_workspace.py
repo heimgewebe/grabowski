@@ -7292,8 +7292,15 @@ def _existing_workspace_response(
     expected_pane_ids = set(manifest["pane_ids"].values())
     expected_writer_task_id = str(manifest["tasks"]["writer"])
     try:
-        lane_status = _lane_binding_status(manifest, _run)
-        live_leases = resources.list_resources(owner_id=owner_id, include_expired=False, limit=MAX_PATHS + 8, read_only=True)
+        # Workspace create/reuse is MUTATING. Preserve WAL-aware readers,
+        # but admit resource writes before the lane lock or SQLite access.
+        if _lane_backed(manifest):
+            operator._require_operator_mutation("resource_lease")
+        lane_status = _lane_binding_status(manifest, _run, read_only=False)
+        live_leases = resources.list_resources(
+            owner_id=owner_id, include_expired=False, limit=MAX_PATHS + 8,
+            read_only=False,
+        )
         observed_lease_keys = {str(item.get("resource_key")) for item in live_leases}
         tmux_live = _tmux_has_session(str(plan["session_name"]))
         observed_pane_ids = _tmux_pane_ids(str(plan["session_name"])) if tmux_live else set()
@@ -12822,6 +12829,7 @@ def _workspace_lifecycle_classification(
     # WAL-aware inventory here; the published READ_ONLY tool must keep its
     # strict filesystem-write boundary even when a writer has live sidecars.
     operator._require_operator_mutation("resource_lease")
+    operator._require_operator_capability("git_cli")
     checkout_inventory = checkouts.checkout_inventory(
         repo=str(manifest["repository"]),
         include_processes=True,
