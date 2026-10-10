@@ -1572,6 +1572,44 @@ class AgentWorkspaceTests(unittest.TestCase):
                 deadline,
             )
 
+    def test_lane_backed_readonly_reuses_existing_lock_without_mutation(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-existing-readonly-lock")
+        lock = self.lane_state / f"{lane['lane_id']}.lock"
+        self.assertTrue(lock.is_file())
+        original = lock.read_bytes()
+        before = lock.stat()
+        with mock.patch.object(
+            workspace.work_acquire,
+            "_lane_lock",
+            side_effect=AssertionError("READ_ONLY may not create or chmod a lane lock"),
+        ) as mutating_lock:
+            receipt = workspace._lane_receipt(
+                lane["lane_id"], lane["receipt_sha256"], read_only=True
+            )
+        self.assertEqual(receipt["lane_id"], lane["lane_id"])
+        self.assertEqual(lock.read_bytes(), original)
+        self.assertEqual(lock.stat().st_ctime_ns, before.st_ctime_ns)
+        mutating_lock.assert_not_called()
+
+        # An absent lock fails closed rather than being created by a status call.
+        lock.unlink()
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError, "work lane receipt is not safely readable"
+        ):
+            workspace._lane_receipt(
+                lane["lane_id"], lane["receipt_sha256"], read_only=True
+            )
+        self.assertFalse(lock.exists())
+
+    def test_readonly_workspace_root_is_not_created_when_absent(self) -> None:
+        root = self.root / "absent-workspace-state"
+        with mock.patch.object(workspace, "WORKSPACE_ROOT", root):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError, "agent workspace root is unavailable"
+            ):
+                workspace._workspace_dir("gaw-absent-workspace")
+        self.assertFalse(root.exists())
+
     def test_lane_backed_status_rejects_checkout_wal_without_sidecar_writes(self) -> None:
         lane = self.lane_receipt(idempotency_key="lane-strict-checkout-wal")
         plan = self.normalize_lane(lane)

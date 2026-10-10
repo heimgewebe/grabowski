@@ -1513,7 +1513,7 @@ def _lane_backed(manifest: dict[str, Any]) -> bool:
     return _workspace_ownership_mode(manifest) == WORKSPACE_OWNERSHIP_WORK_LANE
 
 
-def _lane_receipt(lane_id: str, expected_receipt_sha256: str) -> dict[str, Any]:
+def _lane_receipt(lane_id: str, expected_receipt_sha256: str, *, read_only: bool = False) -> dict[str, Any]:
     identifier = _required_string(lane_id, "lane_id", max_length=32).lower()
     expected = _required_string(
         expected_receipt_sha256,
@@ -1525,8 +1525,37 @@ def _lane_receipt(lane_id: str, expected_receipt_sha256: str) -> dict[str, Any]:
     if SHA256_RE.fullmatch(expected) is None:
         raise AgentWorkspaceError("expected_lane_receipt_sha256 must be a lowercase SHA-256")
     try:
-        with work_acquire._lane_lock(identifier) as receipt_path:
-            receipt = work_acquire._read_state(receipt_path)
+        if read_only:
+            # The normal lane lock creates or chmods state; READ_ONLY must
+            # reuse an already existing lock without granting write effects.
+            root = work_acquire._state_root()
+            root_info = root.lstat()
+            if (
+                not stat.S_ISDIR(root_info.st_mode)
+                or root_info.st_uid != os.geteuid()
+                or stat.S_IMODE(root_info.st_mode) & 0o077
+            ):
+                raise PermissionError("work lane state root is not private and owner-controlled")
+            descriptor = os.open(
+                root / f"{identifier}.lock",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                lock_info = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(lock_info.st_mode)
+                    or lock_info.st_uid != os.geteuid()
+                    or lock_info.st_nlink != 1
+                    or stat.S_IMODE(lock_info.st_mode) & 0o077
+                ):
+                    raise PermissionError("work lane lock is not a private owner-controlled file")
+                fcntl.flock(descriptor, fcntl.LOCK_SH)
+                receipt = work_acquire._read_state(root / f"{identifier}.json")
+            finally:
+                os.close(descriptor)
+        else:
+            with work_acquire._lane_lock(identifier) as receipt_path:
+                receipt = work_acquire._read_state(receipt_path)
     except Exception as exc:
         raise AgentWorkspaceError(f"work lane receipt is not safely readable: {_error_summary(exc)}") from exc
     if receipt is None or receipt.get("lane_id") != identifier:
@@ -1577,7 +1606,7 @@ def _validate_work_lane_binding(
     runner: CommandRunner,
     read_only: bool = False,
 ) -> dict[str, Any]:
-    receipt = _lane_receipt(lane_id, expected_receipt_sha256)
+    receipt = _lane_receipt(lane_id, expected_receipt_sha256, read_only=read_only)
     inputs = receipt.get("inputs")
     authority = receipt.get("authority")
     if not isinstance(inputs, dict) or receipt.get("inputs_sha256") != work_acquire._sha(inputs):
@@ -1862,19 +1891,25 @@ def _lane_workspace_identity(binding_id: str, repo: Path, lane_id: str) -> tuple
     return workspace_id, workspace_id
 
 
-def _ensure_root() -> Path:
+def _ensure_root(*, create: bool = True) -> Path:
     root = WORKSPACE_ROOT
     if root.is_symlink():
         raise PermissionError(f"agent workspace root may not be a symlink: {root}")
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    root.chmod(0o700)
+    if create:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root.chmod(0o700)
+    elif not root.is_dir():
+        raise AgentWorkspaceError("agent workspace root is unavailable")
+    root_info = root.stat()
+    if root_info.st_uid != os.geteuid() or stat.S_IMODE(root_info.st_mode) & 0o077:
+        raise PermissionError("agent workspace root is not private and owner-controlled")
     return root.resolve(strict=True)
 
 
 def _workspace_dir(workspace_id: str, *, create: bool = False) -> Path:
     if WORKSPACE_ID_RE.fullmatch(workspace_id) is None:
         raise AgentWorkspaceError("invalid workspace_id")
-    root = _ensure_root()
+    root = _ensure_root(create=create)
     path = root / workspace_id
     if path.exists() and path.is_symlink():
         raise PermissionError("workspace directory may not be a symlink")
