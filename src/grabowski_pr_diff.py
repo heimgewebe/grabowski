@@ -159,6 +159,22 @@ def _bounded_git_capture(
         proc.wait()
 
 
+def local_pr_git_environment() -> dict[str, str]:
+    """Use one identical, replacement-free Git object environment for PR identity."""
+    import os
+
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL="/dev/null",
+        GIT_NO_REPLACE_OBJECTS="1",
+        GIT_GRAFT_FILE="/dev/null",
+        GIT_TERMINAL_PROMPT="0",
+        LC_ALL="C",
+    )
+    return env
+
+
 def bound_local_pr_git_diff(
     repo: "Path", *, merge_base: str, head: str,
     timeout: int = 90, max_diff_bytes: int = LOCAL_PR_DIFF_MAX_BYTES,
@@ -169,7 +185,6 @@ def bound_local_pr_git_diff(
     worktree with only HEAD's tracked .gitattributes, an empty temporary
     index, and disabled system/global attributes. No PR code is checked out.
     """
-    import os
     import tempfile
 
     if (
@@ -181,9 +196,7 @@ def bound_local_pr_git_diff(
     ):
         raise BoundLocalDiffError("invalid local PR revision or byte budget")
     repo = Path(repo).resolve()
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
-               GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
+    env = local_pr_git_environment()
 
     def read_git(*args: str, limit: int = 8192, filter_attributes: bool = False) -> bytes:
         return _bounded_git_capture(

@@ -80,12 +80,35 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
             "      - name: Fetch exact PR history for local diff fallback\n", 1
         )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
         d = chr(36)
-        self.assertIn("refs/heads/" + d + "{BASE_REF}:refs/settlement/base", fetch)
+        self.assertIn("refs/heads/" + d + "{BASE_REF}:refs/settlement/base-tip", fetch)
         self.assertIn("refs/pull/" + d + "{PR_NUMBER}/head:refs/settlement/head", fetch)
+        self.assertIn('git merge-base --is-ancestor "' + d + 'BASE_SHA" "refs/settlement/base-tip"', fetch)
+        self.assertIn('git update-ref refs/settlement/base "' + d + 'BASE_SHA"', fetch)
         self.assertIn('git rev-parse "refs/settlement/base^{commit}"', fetch)
         self.assertIn('git rev-parse "refs/settlement/head^{commit}"', fetch)
         self.assertIn('" = "' + d + 'BASE_SHA"', fetch)
         self.assertIn('" = "' + d + 'HEAD_SHA"', fetch)
+
+    def test_advanced_main_tip_can_still_pin_historical_pr_base_sha(self) -> None:
+        fetch = self.text.split(
+            "      - name: Fetch exact PR history for local diff fallback\n", 1
+        )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
+        d = chr(36)
+        self.assertIn(
+            "refs/heads/" + d + "{BASE_REF}:refs/settlement/base-tip", fetch
+        )
+        self.assertIn(
+            'git merge-base --is-ancestor "' + d + 'BASE_SHA" "refs/settlement/base-tip"',
+            fetch,
+        )
+        self.assertIn('git update-ref refs/settlement/base "' + d + 'BASE_SHA"', fetch)
+        self.assertNotIn(
+            "refs/heads/" + d + "{BASE_REF}:refs/settlement/base" + '"', fetch
+        )
+        self.assertLess(
+            fetch.index("git merge-base --is-ancestor"),
+            fetch.index("git update-ref refs/settlement/base"),
+        )
 
     def test_object_pin_failure_publishes_terminal_failure(self) -> None:
         pending = self.text.split(

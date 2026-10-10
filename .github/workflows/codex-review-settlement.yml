@@ -121,9 +121,13 @@ jobs:
             -c 'credential.helper=!gh auth git-credential' \
             -c 'protocol.file.allow=never' \
             fetch --no-tags --no-write-fetch-head --no-recurse-submodules \
-            -- origin "refs/heads/${BASE_REF}:refs/settlement/base" "refs/pull/${PR_NUMBER}/head:refs/settlement/head"
+            -- origin "refs/heads/${BASE_REF}:refs/settlement/base-tip" "refs/pull/${PR_NUMBER}/head:refs/settlement/head"
           git cat-file -e "${BASE_SHA}^{commit}"
           git cat-file -e "${HEAD_SHA}^{commit}"
+          # baseRefOid is a PR snapshot. A later fast-forward of the target
+          # branch must not invalidate it; force-push/non-ancestral drift does.
+          git merge-base --is-ancestor "$BASE_SHA" "refs/settlement/base-tip"
+          git update-ref refs/settlement/base "$BASE_SHA"
           test "$(git rev-parse "refs/settlement/base^{commit}")" = "$BASE_SHA"
           test "$(git rev-parse "refs/settlement/head^{commit}")" = "$HEAD_SHA"
 

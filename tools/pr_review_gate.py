@@ -28,6 +28,7 @@ from grabowski_pr_diff import (  # noqa: E402
     github_pr_diff_identity_sha256,
     github_pr_diff_identity_sha256_v1,
     bound_local_pr_git_diff,
+    local_pr_git_environment,
 )
 
 try:
@@ -386,7 +387,7 @@ def _run_text(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> st
     return completed.stdout
 
 
-def _run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> bytes:
+def _run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False, env_override: dict[str, str] | None = None) -> bytes:
     if argv and argv[0] == "gh" and shutil.which("gh") is None:
         raise GateInputError("gh CLI is not available in PATH")
     try:
@@ -398,7 +399,7 @@ def _run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False) -> b
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=False,
-            env=_env(),
+            env=_env() if env_override is None else env_override,
             timeout=90,
         )
     except subprocess.TimeoutExpired as exc:
@@ -773,8 +774,10 @@ def _local_bound_pr_diff_bytes(repo: Path, view: Any) -> bytes:
         raise RuntimeError("local PR diff fallback requires complete GitHub file evidence")
     # GitHub PR files/diffs use the merge base, not the advanced base tip.
     # Reject missing or ambiguous merge bases instead of silently choosing one.
+    local_env = local_pr_git_environment()
     merge_bases = _run_bytes(
-        repo, _local_diff_git_argv("merge-base", "--all", base, head)
+        repo, _local_diff_git_argv("merge-base", "--all", base, head),
+        env_override=local_env,
     ).splitlines()
     if (
         len(merge_bases) != 1
@@ -796,6 +799,7 @@ def _local_bound_pr_diff_bytes(repo: Path, view: Any) -> bytes:
             head,
             "--",
         ),
+        env_override=local_env,
     )
     try:
         local_paths = sorted(

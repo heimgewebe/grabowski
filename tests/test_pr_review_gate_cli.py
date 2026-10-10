@@ -93,7 +93,7 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
                 return [[{"filename": "assets/a.js", "status": "modified"}]]
             raise AssertionError(argv)
 
-        def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False):
+        def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False, env_override=None):
             del repo, allow_nonzero
             if argv[0] == "git" and "merge-base" in argv:
                 return b"b" * 40 + bytes([10])
@@ -195,7 +195,7 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
                 return [[{"filename": "assets/a.js", "status": "modified"}]]
             raise AssertionError(argv)
 
-        def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False):
+        def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False, env_override=None):
             del repo, allow_nonzero
             if argv[0] == "git" and "merge-base" in argv:
                 return b"b" * 40 + bytes([10])
@@ -291,6 +291,57 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
         self.assertTrue(pr_review_gate._github_pr_diff_too_large(
             b"HTTP 406: diff exceeded the maximum number of files (300)", 301
         ))
+
+    def test_local_pr_diff_ignores_git_replace_refs_and_injected_object_directory(self) -> None:
+        import grabowski_merge_guard as merge_guard
+        import os
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="pr-diff-replacements-") as d:
+            repo = Path(d)
+
+            def git(*args: str) -> str:
+                result = subprocess.run(
+                    ["git", *args], cwd=repo, check=True,
+                    text=True, capture_output=True,
+                )
+                return result.stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.email", "review@example.invalid")
+            git("config", "user.name", "Review")
+            (repo / "base.txt").write_text("base\\n")
+            git("add", ".")
+            git("commit", "-qm", "base")
+            base = git("rev-parse", "HEAD")
+            (repo / "test.txt").write_text("change\\n")
+            git("add", ".")
+            git("commit", "-qm", "head")
+            head = git("rev-parse", "HEAD")
+            view = {
+                "baseRefOid": base,
+                "headRefOid": head,
+                "pullFilesEvidenceComplete": True,
+                "files": [{"path": "test.txt", "status": "added"}],
+            }
+            clean = pr_review_gate._local_bound_pr_diff_bytes(repo, view)
+            git("replace", "--graft", head)
+            # Deprecated local grafts also alter merge-base under
+            # GIT_NO_REPLACE_OBJECTS=1 unless separately neutralized.
+            grafts = repo / ".git" / "info" / "grafts"
+            grafts.parent.mkdir(exist_ok=True)
+            grafts.write_text(head + "\n")
+            with mock.patch.dict(
+                os.environ, {"GIT_OBJECT_DIRECTORY": str(repo / "missing-objects")},
+            ):
+                bounded = pr_review_gate._local_bound_pr_diff_bytes(repo, view)
+            self.assertEqual(clean, bounded)
+            merge_base, errors = merge_guard._merge_guard_unique_merge_base(
+                repo, base_sha=base, head_sha=head
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(merge_base, base)
 
     def test_advanced_base_uses_single_merge_base_not_two_endpoint_diff(self) -> None:
         import subprocess
