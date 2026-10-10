@@ -3465,6 +3465,55 @@ class AgentWorkspaceTests(unittest.TestCase):
                 command=["grok", "--model", "grok-4.6", "review this"],
             )
 
+    def test_dirty_claude_role_argv_binds_verified_frozen_patch(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        snapshot = workspace._git_snapshot(manifest, workspace._run)
+        writer_result = workspace._materialize_writer_patch(manifest, snapshot, workspace._run)
+        manifest["frozen_writer"] = {
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": snapshot["dirty"],
+            "writer_result": writer_result,
+        }
+        routes = (
+            ["claude", "--model", "claude-opus-5-5", "--effort", "high",
+             "--permission-mode", "plan", "Review the frozen change"],
+            ["claude", "-p", "--safe-mode", "--permission-mode", "plan",
+             "--model", "claude-fable-5", "--effort", "high", "Review the frozen change"],
+        )
+        for command in routes:
+            with self.subTest(command=command):
+                argv = workspace._role_task_argv(
+                    manifest, "review", snapshot["writer_head"],
+                    snapshot["diff_sha256"], True, command=command,
+                )
+                self.assertEqual(
+                    argv[argv.index("--review-input-root") + 1],
+                    str(workspace._ensure_root()),
+                )
+                self.assertEqual(
+                    argv[argv.index("--review-input-path") + 1],
+                    writer_result["path"],
+                )
+                self.assertEqual(
+                    argv[argv.index("--review-input-sha256") + 1],
+                    writer_result["sha256"],
+                )
+                clean = workspace._role_task_argv(
+                    manifest, "review", snapshot["writer_head"],
+                    snapshot["diff_sha256"], False, command=command,
+                )
+                self.assertNotIn("--review-input-path", clean)
+        Path(writer_result["path"]).write_text("tampered\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError, "exact verified frozen writer patch"
+        ):
+            workspace._role_task_argv(
+                manifest, "review", snapshot["writer_head"],
+                snapshot["diff_sha256"], True, command=routes[0],
+            )
+
     def test_writer_commit_is_rejected_as_unbound_result(self) -> None:
         manifest = self.manifest()
         self.git.commit_writer()

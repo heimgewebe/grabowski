@@ -19,6 +19,8 @@ EVIDENCE_KIND = "github_codex_review_settlement"
 REQUEST_KIND = "grabowski_codex_review_request"
 STATUS_CONTEXT = "Codex review settled"
 MAX_ITEMS = 100
+MAX_FILE_PAGES = 10
+MAX_FILE_ITEMS = MAX_ITEMS * MAX_FILE_PAGES
 MAX_COMMENT_PAGES = 10
 MAX_COMMENT_ITEMS = MAX_ITEMS * MAX_COMMENT_PAGES
 MAX_REVIEW_PAGES = 10
@@ -191,7 +193,7 @@ query($owner: String!, $name: String!, $number: Int!) {
       deletions
       files(first: 100) {
         nodes { path }
-        pageInfo { hasNextPage }
+        pageInfo { hasNextPage endCursor }
       }
       comments(last: 100) {
         nodes {
@@ -236,6 +238,23 @@ query($owner: String!, $name: String!, $number: Int!) {
             pageInfo { hasNextPage }
           }
         }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""".strip()
+
+
+FILES_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $after: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      baseRefOid
+      changedFiles
+      files(first: 100, after: $after) {
+        nodes { path }
         pageInfo { hasNextPage endCursor }
       }
     }
@@ -532,6 +551,88 @@ def _collect_reviews(
 
 
 
+def _collect_files(
+    repo: Path,
+    owner: str,
+    name: str,
+    pr_number: int,
+    initial: Any,
+    *,
+    changed_files: int,
+    head_sha: str,
+    base_sha: str,
+) -> dict[str, Any]:
+    """Read every changed PR file with a bounded, revision-consistent cursor."""
+    if isinstance(changed_files, bool) or not isinstance(changed_files, int) or changed_files < 0:
+        raise SettlementError("changedFiles count is missing or invalid")
+    if changed_files > MAX_FILE_ITEMS:
+        raise SettlementError(f"files exceed the bounded {MAX_FILE_ITEMS}-item history")
+    if not isinstance(initial, dict):
+        raise SettlementError("files connection is missing")
+    nodes = _list_nodes(initial, label="files")
+    page = initial.get("pageInfo")
+    if not isinstance(page, dict) or type(page.get("hasNextPage")) is not bool:
+        raise SettlementError("files pageInfo is missing or invalid")
+    pages = 1
+    cursors: set[str] = set()
+    paths: set[str] = set()
+
+    def remember(items: list[dict[str, Any]]) -> None:
+        if len(items) > MAX_ITEMS:
+            raise SettlementError("files page exceeds the bounded 100-item window")
+        for item in items:
+            file_path = item.get("path")
+            if not isinstance(file_path, str) or not file_path:
+                raise SettlementError("files path is missing or invalid")
+            if file_path in paths:
+                raise SettlementError("files pagination returned duplicate paths")
+            paths.add(file_path)
+
+    remember(nodes)
+    while page["hasNextPage"]:
+        if pages >= MAX_FILE_PAGES:
+            raise SettlementError(f"files exceed the bounded {MAX_FILE_ITEMS}-item history")
+        after = page.get("endCursor")
+        if not isinstance(after, str) or not after or after in cursors:
+            raise SettlementError("files pagination cursor is missing or repeated")
+        cursors.add(after)
+        payload = _run_json(
+            repo,
+            [
+                "gh", "api", "graphql", "-f", f"query={FILES_QUERY}",
+                "-F", f"owner={owner}", "-F", f"name={name}",
+                "-F", f"number={pr_number}", "-f", f"after={after}",
+            ],
+        )
+        try:
+            pr = payload["data"]["repository"]["pullRequest"]
+        except (KeyError, TypeError) as exc:
+            raise SettlementError("GitHub GraphQL response lacks PR files") from exc
+        if not isinstance(pr, dict):
+            raise SettlementError("pull-request file page is missing")
+        if (pr.get("headRefOid") != head_sha
+                or pr.get("baseRefOid") != base_sha
+                or pr.get("changedFiles") != changed_files):
+            raise SettlementError("PR files pagination revision or count drift")
+        connection = pr.get("files")
+        newer = _list_nodes(connection, label="files")
+        if not newer:
+            raise SettlementError("files pagination returned an empty continuation")
+        remember(newer)
+        nodes.extend(newer)
+        if len(nodes) > MAX_FILE_ITEMS:
+            raise SettlementError(f"files exceed the bounded {MAX_FILE_ITEMS}-item history")
+        page = connection.get("pageInfo")
+        if not isinstance(page, dict) or type(page.get("hasNextPage")) is not bool:
+            raise SettlementError("files pageInfo is missing or invalid")
+        pages += 1
+    if len(nodes) != changed_files:
+        raise SettlementError(
+            f"files pagination incomplete: fetched {len(nodes)} vs changedFiles={changed_files}"
+        )
+    return {"nodes": nodes, "pageInfo": {"hasNextPage": False, "pages_loaded": pages}}
+
+
 def _collect_review_threads(
     repo: Path, owner: str, name: str, pr_number: int, initial: Any
 ) -> dict[str, Any]:
@@ -644,6 +745,12 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
     if not isinstance(pull_request, dict):
         raise SettlementError("pull request does not exist")
     pull_request = dict(pull_request)
+    pull_request["files"] = _collect_files(
+        repo, owner, name, pr_number, pull_request.get("files"),
+        changed_files=pull_request.get("changedFiles"),
+        head_sha=pull_request.get("headRefOid"),
+        base_sha=pull_request.get("baseRefOid"),
+    )
     pull_request["comments"] = _collect_comments(
         repo, owner, name, pr_number, pull_request.get("comments")
     )
