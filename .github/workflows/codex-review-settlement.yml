@@ -85,7 +85,28 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
           persist-credentials: false
+
+      - name: Fetch exact PR history for local diff fallback
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid bound pull request or head SHA" >&2
+            exit 1
+          fi
+          # Never check out PR code. A one-command credential helper uses the
+          # step-local token without persisting credentials in the Git config.
+          GIT_TERMINAL_PROMPT=0 git \
+            -c 'credential.helper=!gh auth git-credential' \
+            -c 'protocol.file.allow=never' \
+            fetch --no-tags --no-write-fetch-head --no-recurse-submodules \
+            -- origin "refs/pull/${PR_NUMBER}/head"
+          git cat-file -e "${HEAD_SHA}^{commit}"
 
       - name: Evaluate current-head settlement
         id: evaluate

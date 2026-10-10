@@ -35,6 +35,27 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertNotIn("actions/checkout@v", self.text)
         self.assertNotIn("github.event.pull_request.head", self.text)
 
+    def test_oversized_pr_diff_has_full_history_and_exact_head_objects(self) -> None:
+        checkout = self.text.split(
+            "      - name: Checkout trusted evaluator\n", 1
+        )[1].split("      - name: Fetch exact PR history for local diff fallback\n", 1)[0]
+        self.assertIn("ref: " + chr(36) + "{{ github.event.repository.default_branch }}", checkout)
+        self.assertIn("persist-credentials: false", checkout)
+        self.assertIn("fetch-depth: 0", checkout)
+        fetch = self.text.split(
+            "      - name: Fetch exact PR history for local diff fallback\n", 1
+        )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
+        self.assertIn("GH_TOKEN: " + chr(36) + "{{ github.token }}", fetch)
+        self.assertIn("PR_NUMBER: " + chr(36) + "{{ steps.pr.outputs.number }}", fetch)
+        self.assertIn("HEAD_SHA: " + chr(36) + "{{ steps.pr.outputs.head_sha }}", fetch)
+        self.assertIn("refs/pull/" + chr(36) + "{PR_NUMBER}/head", fetch)
+        self.assertIn("GIT_TERMINAL_PROMPT=0", fetch)
+        self.assertIn("gh auth git-credential", fetch)
+        self.assertIn('git cat-file -e "' + chr(36) + '{HEAD_SHA}^{commit}"', fetch)
+        self.assertNotIn("git checkout", fetch)
+        self.assertNotIn("git reset", fetch)
+        self.assertNotIn("tools/codex_review_settlement.py", fetch)
+
     def test_permissions_are_observer_only_except_status_publication(self) -> None:
         self.assertIn("  contents: read\n", self.text)
         self.assertIn("  issues: read\n", self.text)
