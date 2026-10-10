@@ -86,6 +86,32 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
     }
 
 
+def frozen_g2_request(*, condition: str = "baseline", commit: str | None = None) -> dict:
+    """Use the frozen task identity, independently of local test Git fixtures."""
+
+    frozen = runner.base.FROZEN_G2_IDENTITY
+    value = request(condition=condition)
+    value["taskset_id"] = frozen["taskset_id"]
+    value["taskset_sha256"] = frozen["taskset_sha256"]
+    value["case_id"] = frozen["case_id"]
+    value["repository"] = dict(frozen["repository"])
+    if commit is not None:
+        value["repository"]["commit"] = commit
+    value["prompt"] = (
+        "Prüfe den Snapshot gegen einen Dirty Working Tree. "
+        "Ein gleicher Commit reicht nicht für fresh."
+    )
+    value["setup"] = dict(runner.base.FROZEN_G2_SETUP)
+    pair_id = f"{value['taskset_id']}:{value['case_id']}:r1"
+    value["pair_id"] = pair_id
+    value["request_id"] = f"{pair_id}:{condition}"
+    value["session_id"] = f"session:{value['request_id']}"
+    value["workspace_id"] = f"workspace:{value['request_id']}"
+    if condition == "treatment":
+        value["repobrief"]["manifest_sha256"] = frozen["manifest_sha256"]
+    return value
+
+
 def file_identity(path: Path) -> dict:
     resolved = path.resolve(strict=True)
     metadata = resolved.lstat()
@@ -421,6 +447,135 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         value["runner"]["sampling"] = {"reasoning_effort": "high"}
         with self.assertRaisesRegex(runner.RunnerError, "Codex runner contract mismatch"):
             runner.validate_request(value)
+
+    def test_frozen_g2_request_setup_requires_exact_revision_and_provider(self) -> None:
+        for condition in ("baseline", "treatment"):
+            candidate = frozen_g2_request(condition=condition)
+            runner.validate_request(candidate)
+            for change in ("missing", "clean", "hash", "commit", "prompt", "provider"):
+                forged = json.loads(json.dumps(candidate))
+                if change == "missing":
+                    forged.pop("setup")
+                elif change == "clean":
+                    forged["setup"] = {"working_tree": "clean"}
+                elif change == "hash":
+                    forged["taskset_sha256"] = "e" * 64
+                elif change == "commit":
+                    forged["repository"]["commit"] = "f" * 40
+                elif change == "prompt":
+                    forged["prompt"] += " unbound"
+                elif change == "provider":
+                    forged["runner"]["model"] = "gpt-unbound"
+                with self.subTest(condition=condition, mutation=change):
+                    with self.assertRaises(runner.RunnerError):
+                        runner.validate_request(forged)
+        value = request()
+        value["setup"] = {"working_tree": "clean", "fixture": "fresh-matching-snapshot"}
+        runner.validate_request(value)
+        value["setup"] = {"working_tree": "head_mismatch", "fixture": "stale-head"}
+        with self.assertRaisesRegex(runner.RunnerError, "unsupported"):
+            runner.validate_request(value)
+
+    def test_frozen_g2_r3_cannot_bypass_dispatch_stale_proof(self) -> None:
+        frozen = runner.base.FROZEN_G2_IDENTITY
+        pair_id = f"{frozen['taskset_id']}:{frozen['case_id']}:r3"
+        binding = {
+            "taskset_id": frozen["taskset_id"],
+            "taskset_sha256": frozen["taskset_sha256"],
+            "pair_id": pair_id,
+        }
+        with self.assertRaisesRegex(runner.RunnerError, "unsupported frozen G2 pair"):
+            runner._require_g2_preflight_evidence({}, binding)
+        for condition in ("baseline", "treatment"):
+            candidate = frozen_g2_request(condition=condition)
+            candidate["pair_id"] = pair_id
+            candidate["request_id"] = f"{pair_id}:{condition}"
+            candidate["session_id"] = f"session:{candidate['request_id']}"
+            candidate["workspace_id"] = f"workspace:{candidate['request_id']}"
+            with self.subTest(condition=condition):
+                with self.assertRaisesRegex(runner.RunnerError, "pair_id does not match"):
+                    runner.validate_request(candidate)
+    def test_private_frozen_g2_checkout_is_reproducibly_dirty_and_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            (root / "state").mkdir(mode=0o700)
+            frozen = runner.base.FROZEN_G2_IDENTITY
+            bound_repo = {**frozen["repository"], "commit": commit}
+            with patch.dict(frozen, {"repository": bound_repo}):
+                value = frozen_g2_request(commit=commit)
+                checkout = runner.create_checkout(value, source, root / "state")
+                self.assertEqual(checkout.name, "source")
+                attestation = runner.base.attest_checkout_setup(value, checkout)
+                self.assertEqual(attestation["working_tree"], "dirty")
+                self.assertEqual(attestation["git_commit"], commit)
+                self.assertEqual(attestation["fixture_sha256"], runner.sha_bytes(
+                    runner.base.DIRTY_FIXTURE_BYTES
+                ))
+                self.assertEqual(git(["status", "--porcelain"], source), "")
+                self.assertEqual(
+                    git(["status", "--porcelain"], checkout),
+                    f"?? {runner.base.DIRTY_FIXTURE_NAME}",
+                )
+                with self.assertRaisesRegex(runner.RunnerError, "already used"):
+                    runner.create_checkout(value, source, root / "state")
+                (checkout / runner.base.DIRTY_FIXTURE_NAME).write_text(
+                    "tampered", encoding="utf-8"
+                )
+                with self.assertRaises(runner.RunnerError):
+                    runner.base.attest_checkout_setup(value, checkout)
+                self.assertEqual(git(["status", "--porcelain"], source), "")
+
+    def test_dirty_treatment_mcp_is_pinned_to_its_own_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            (root / "state").mkdir(mode=0o700)
+            frozen = runner.base.FROZEN_G2_IDENTITY
+            with patch.dict(frozen, {
+                "repository": {**frozen["repository"], "commit": commit}
+            }):
+                value = frozen_g2_request(condition="treatment", commit=commit)
+                value["repobrief"]["mcp_command"] = [
+                    sys.executable, "/fixture/mcp.py", "--bundle-root",
+                    "/snapshot", "--repo-root", str(source),
+                ]
+                checkout = runner.create_checkout(value, source, root / "state")
+                with patch.object(
+                    runner, "_validated_mcp_proxy_python",
+                    return_value=sys.executable,
+                ):
+                    command = runner.build_command(
+                        value, "/opt/codex", checkout,
+                        root / "answer.json", root / "codex-home",
+                        authorized_mcp_files=[],
+                        proxy_path=root / "proxy.py",
+                        manifest_path=root / "staged.bundle.manifest.json",
+                        mcp_runtime_root=root / "state",
+                        source=source,
+                    )
+                    config = next(
+                        item for item in command
+                        if item.startswith("mcp_servers.repobrief.args=")
+                    )
+                    proxy_args = json.loads(config.split("=", 1)[1])
+                    original = json.loads(
+                        proxy_args[proxy_args.index("--codex-mcp-proxy") + 1]
+                    )
+                    self.assertEqual(
+                        original[original.index("--repo-root") + 1], str(checkout)
+                    )
+                    value["repobrief"]["mcp_command"][-1] = str(root / "wrong")
+                    with self.assertRaisesRegex(runner.RunnerError, "source"):
+                        runner.build_command(
+                            value, "/opt/codex", checkout,
+                            root / "answer.json", root / "codex-home",
+                            authorized_mcp_files=[],
+                            proxy_path=root / "proxy.py",
+                            manifest_path=root / "staged.bundle.manifest.json",
+                            mcp_runtime_root=root / "state",
+                            source=source,
+                        )
 
     def test_codex_output_schema_strips_only_unsupported_unique_items(self) -> None:
         canonical = json.loads(json.dumps(runner.base.ANSWER_SCHEMA))
@@ -1590,6 +1745,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 )
                 failed = stack.enter_context(
                     patch.object(runner, "_record_preflight_dispatch_failed")
+                )
+                stack.enter_context(
+                    patch.object(
+                        runner.base, "attest_checkout_setup",
+                        return_value={"working_tree": "clean"},
+                    )
                 )
                 with self.assertRaises(KeyboardInterrupt):
                     runner.execute(value, args)
@@ -5723,6 +5884,435 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     label="test runtime file",
                     max_bytes=1024,
                 )
+
+
+class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
+    """Portable offline tests; no personal historical checkout or model required."""
+
+    def _historical_pack(self, manifest: Path) -> dict:
+        return {
+            "kind": runner.EXPECTED_ASK_CONTEXT_PACK_KIND,
+            "version": runner.EXPECTED_ASK_CONTEXT_PACK_VERSION,
+            "request_id": "0123456789abcdef",
+            "snapshot_ref": {
+                "freshness_policy": "allow_stale_with_caveat",
+                "freshness_status": "not_comparable",
+                "git_commit": None,
+                "manifest_path": str(manifest),
+                "manifest_sha256": runner.FROZEN_G1_LEGACY_IDENTITY["manifest_sha256"],
+                "stem": "lenskit",
+            },
+            "freshness": {"status": "not_comparable", "caveats": [
+                {"kind": "stale_snapshot", "detail": "Freshness is not comparable."}
+            ]},
+            "availability": {"status": "unknown", "caveats": []},
+            "required_reading": {
+                "status": "pass", "task_profile": "basic_repo_question",
+                "required": ["agent_reading_pack"], "recommended": ["citation_map_jsonl"],
+                "missing_required": [], "missing_recommended": [],
+            },
+            "retrieval_hits": [], "resolved_ranges": [],
+            "answer_scaffold": {
+                "citation_obligations": ["Cite evidence."],
+                "caveats_to_surface": [
+                    {"kind": "stale_snapshot", "detail": "State freshness caveats."}
+                ],
+                "non_claims_to_surface": list(
+                    runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+                ),
+            },
+            "budget": {
+                "max_context_tokens": 8000, "max_answer_tokens": 1200,
+                "approx_context_chars_used": 0, "truncated": False,
+                "does_not_establish_quality": True,
+            },
+            "forbidden_operations": list(runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS),
+            "does_not_establish": list(
+                runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+            ),
+        }
+
+    def test_historical_g1_pack_accepted_without_inventing_modern_evidence(self) -> None:
+        manifest = Path("/frozen/lenskit.bundle.manifest.json")
+        pack = self._historical_pack(manifest)
+        self.assertEqual(
+            runner._validated_frozen_g1_context_pack(
+                pack, expected_manifest=manifest
+            ), pack
+        )
+        with self.assertRaises(runner.RunnerError):
+            runner._validated_ask_context_pack(pack)
+
+    def test_historical_g1_pack_refuses_drifted_keys_and_provenance(self) -> None:
+        manifest = Path("/frozen/lenskit.bundle.manifest.json")
+        mutations = {
+            "extra_modern_field": lambda d: d.__setitem__("retrieval", {}),
+            "missing_budget": lambda d: d["budget"].pop("max_answer_tokens"),
+            "invented_budget": lambda d: d["budget"].__setitem__("unit", "bytes"),
+            "bool_budget": lambda d: d["budget"].__setitem__("max_answer_tokens", True),
+            "wrong_manifest": lambda d: d["snapshot_ref"].__setitem__(
+                "manifest_path", "/frozen/forged.bundle.manifest.json"
+            ),
+            "wrong_manifest_sha": lambda d: d["snapshot_ref"].__setitem__(
+                "manifest_sha256", "0" * 64
+            ),
+            "wrong_stem": lambda d: d["snapshot_ref"].__setitem__(
+                "stem", "other-repository"
+            ),
+            "wrong_git_commit": lambda d: d["snapshot_ref"].__setitem__(
+                "git_commit", "0" * 40
+            ),
+            "freshness_disagreement": lambda d: d["freshness"].__setitem__(
+                "status", "fresh"
+            ),
+            "forbidden_read_write": lambda d: d["forbidden_operations"].remove(
+                "git_mutation"
+            ),
+            "nonclaim_missing": lambda d: d["does_not_establish"].pop(),
+            "invalid_caveat": lambda d: d["freshness"]["caveats"].append(
+                {"kind": "invented"}
+            ),
+            "invalid_range": lambda d: d["resolved_ranges"].append("unsafe"),
+        }
+        for label, change in mutations.items():
+            with self.subTest(label=label):
+                pack = self._historical_pack(manifest)
+                change(pack)
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "historical G1 ask_context context pack"
+                ):
+                    runner._validated_frozen_g1_context_pack(
+                        pack, expected_manifest=manifest
+                    )
+
+    def test_historical_g1_profile_is_bound_to_exact_request_not_schema_fallback(self) -> None:
+        frozen = runner.FROZEN_G1_LEGACY_IDENTITY
+        manifest = "/frozen/lenskit.bundle.manifest.json"
+        req = request(condition="treatment")
+        req.update(
+            taskset_id=frozen["taskset_id"],
+            taskset_sha256=frozen["taskset_sha256"],
+            case_id=frozen["case_id"],
+            repository=dict(frozen["repository"]),
+            setup={"working_tree": "clean", "fixture": "fresh-matching-snapshot"},
+        )
+        req["repobrief"] = {
+            "manifest": manifest, "manifest_sha256": frozen["manifest_sha256"],
+            "mcp_command": [
+                frozen["python_path"], frozen["launcher_path"],
+                "--bundle-root", manifest, "--repo-root", frozen["source_root"],
+            ],
+        }
+        with patch.dict(
+            frozen, {"prompt_sha256": hashlib.sha256(req["prompt"].encode()).hexdigest()}
+        ):
+            self.assertEqual(
+                runner._frozen_g1_mcp_profile(req), runner.MCP_PROFILE_FROZEN_G1
+            )
+            modified = json.loads(json.dumps(req))
+            modified["repobrief"]["manifest_sha256"] = "f" * 64
+            with self.assertRaises(runner.RunnerError):
+                runner._frozen_g1_mcp_profile(modified)
+            for index, replacement in (
+                (0, "/tmp/foreign-python"),
+                (1, "/tmp/scripts/repobrief-mcp-stdio.py"),
+                (5, "/tmp/foreign-lenskit"),
+            ):
+                modified = json.loads(json.dumps(req))
+                modified["repobrief"]["mcp_command"][index] = replacement
+                with self.subTest(index=index), self.assertRaises(runner.RunnerError):
+                    runner._frozen_g1_mcp_profile(modified)
+            modified = json.loads(json.dumps(req))
+            modified["taskset_sha256"] = "0" * 64
+            self.assertEqual(
+                runner._frozen_g1_mcp_profile(modified),
+                runner.MCP_PROFILE_MODERN,
+            )
+
+    def test_historical_g1_vendor_freeze_rejects_source_edits_and_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            site = root / "site"
+            package = site / "jsonschema"
+            package.mkdir(parents=True)
+            source = package / "__init__.py"
+            source.write_bytes(b"original pinned bytes\\n")
+            source.chmod(0o600)
+            typing = root / "typing_extensions.py"
+            typing.write_bytes(b"typing helper\\n")
+            typing.chmod(0o600)
+            def manifest_sha() -> str:
+                entries = [
+                    {"p": "jsonschema/__init__.py", "n": source.stat().st_size,
+                     "h": hashlib.sha256(source.read_bytes()).hexdigest()},
+                    {"p": "typing_extensions.py", "n": typing.stat().st_size,
+                     "h": hashlib.sha256(typing.read_bytes()).hexdigest()},
+                ]
+                return runner.sha_bytes(runner.canonical(entries).encode())
+            with (
+                patch.object(runner, "FROZEN_G1_VENDOR_SITE_ROOT", site),
+                patch.object(runner, "FROZEN_G1_VENDOR_TYPING_EXT", typing),
+                patch.object(runner, "FROZEN_G1_VENDOR_PACKAGES", ("jsonschema",)),
+                patch.object(runner, "FROZEN_G1_VENDOR_MANIFEST_SHA256", manifest_sha()),
+            ):
+                entries = runner._frozen_g1_vendor_snapshot()
+                self.assertEqual(len(entries), 2)
+                source.write_bytes(b"changed code\\n")
+                with self.assertRaisesRegex(runner.RunnerError, "digest is not frozen"):
+                    runner._frozen_g1_vendor_snapshot()
+                source.write_bytes(b"original pinned bytes\\n")
+                source.chmod(0o666)
+                with self.assertRaisesRegex(runner.RunnerError, "metadata is unsafe"):
+                    runner._frozen_g1_vendor_snapshot()
+                source.chmod(0o600)
+                forged = package / "forged.py"
+                forged.symlink_to(source)
+                with self.assertRaisesRegex(runner.RunnerError, "path is unsafe"):
+                    runner._frozen_g1_vendor_snapshot()
+                forged.unlink()
+                moved_package = site / "unavailable-vendor"
+                package.rename(moved_package)
+                try:
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "source is unavailable or linked"
+                    ):
+                        runner._frozen_g1_vendor_snapshot()
+                finally:
+                    moved_package.rename(package)
+                with patch.object(runner, "MAX_FROZEN_G1_VENDOR_FILES", 1):
+                    with self.assertRaisesRegex(runner.RunnerError, "exceeds bounds"):
+                        runner._frozen_g1_vendor_snapshot()
+
+
+class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
+    """Frozen G1 dependency corruption must not consume a paid one-shot."""
+
+    def test_vendor_failure_before_one_shot_intent_prevents_provider_start(self) -> None:
+        for failure in (
+            "historical G1 vendor source is unavailable or linked",
+            "historical G1 vendor source digest is not frozen",
+            "historical G1 vendor path is unsafe",
+            "historical G1 vendor metadata is unsafe",
+        ):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                value = request(condition="treatment")
+                manifest = root / "manifest.json"
+                manifest.write_bytes(b"{}\n")
+                value["repobrief"]["manifest"] = str(manifest)
+                value["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                    manifest.read_bytes()
+                ).hexdigest()
+                planned_request_root(root, value)
+                checkout = root / "checkout"
+                checkout.mkdir()
+                codex_home = root / "codex-home"
+                codex_home.mkdir()
+                args = Namespace(
+                    request_root=root / "requests",
+                    repository_map=root / "repositories.json",
+                    state_root=root / "state",
+                    transcript_root=root / "transcripts",
+                    provider_evidence_root=root / "provider-evidence",
+                    codex_command="/opt/codex",
+                    codex_command_sha256="1" * 64,
+                    allow_live_provider=True,
+                    stream_fixture=None,
+                    stderr_fixture=None,
+                    fixture_returncode=0,
+                )
+                dispatch = {
+                    "authorization": {"contract": "test"},
+                    "provider_codex": {},
+                    "provider_authentication": {},
+                    "repository_map_bytes": b"{}",
+                    "binding": {},
+                    "mcp_files": [],
+                    "proxy_code": {},
+                    "proxy_base_code": {},
+                    "manifest": {},
+                }
+                with ExitStack() as stack:
+                    for name, value_to_return in (
+                        ("validate_executable", "/opt/codex"),
+                        ("validate_toolchain", None),
+                        ("validate_chatgpt_subscription", b"opaque-auth"),
+                        ("_repository_root_from_authorized_map_bytes", root),
+                        ("prepare_provider_evidence", {"plan": True}),
+                        ("create_checkout", checkout),
+                        ("stage_codex_home", codex_home),
+                        ("stage_mcp_proxy", {"path": str(root / "proxy.py")}),
+                        ("stage_repoground_manifest", {"path": str(manifest)}),
+                        ("_rebind_staged_manifest_authorization", []),
+                        ("build_command", ["codex"]),
+                        ("provider_env", {}),
+                        ("cleanup_codex_home", None),
+                        ("cleanup_staged_mcp_proxy", None),
+                        ("cleanup_staged_repoground_manifest", None),
+                    ):
+                        stack.enter_context(
+                            patch.object(runner, name, return_value=value_to_return)
+                        )
+                    for name in (
+                        "_assert_authorized_codex_executable",
+                        "_assert_authorized_chatgpt_auth",
+                        "_assert_authorized_runtime_binding",
+                        "close_provider_evidence_plan",
+                        "write_schema",
+                    ):
+                        stack.enter_context(patch.object(runner, name))
+                    stack.enter_context(
+                        patch.object(
+                            runner, "_load_preflight_dispatch_authorization",
+                            return_value=dispatch,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            runner, "_frozen_g1_mcp_profile",
+                            return_value=runner.MCP_PROFILE_FROZEN_G1,
+                        )
+                    )
+                    frozen_vendor = stack.enter_context(
+                        patch.object(
+                            runner, "_frozen_g1_vendor_snapshot",
+                            side_effect=runner.RunnerError(failure),
+                        )
+                    )
+                    intent = stack.enter_context(
+                        patch.object(runner, "_record_preflight_dispatch_intent")
+                    )
+                    provider = stack.enter_context(
+                        patch.object(runner, "run_bounded")
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            runner.base, "attest_checkout_setup",
+                            return_value={"working_tree": "clean"},
+                        )
+                    )
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "historical G1 vendor"
+                    ):
+                        runner.execute(value, args)
+                frozen_vendor.assert_called_once_with()
+                intent.assert_not_called()
+                provider.assert_not_called()
+
+
+
+    def test_frozen_g1_baseline_pair_has_exact_identity(self) -> None:
+        value = request(condition="baseline")
+        identity = dict(runner.FROZEN_G1_LEGACY_IDENTITY)
+        identity.update({
+            "taskset_id": value["taskset_id"],
+            "taskset_sha256": value["taskset_sha256"],
+            "case_id": value["case_id"],
+            "repository": value["repository"],
+            "prompt_sha256": hashlib.sha256(value["prompt"].encode()).hexdigest(),
+        })
+        with patch.object(runner, "FROZEN_G1_LEGACY_IDENTITY", identity):
+            self.assertTrue(runner._frozen_g1_baseline_pair(value))
+            for key, other in (
+                ("taskset_sha256", "0" * 64),
+                ("repository", {"id": "other"}),
+                ("prompt", "altered task prompt"),
+            ):
+                modified = json.loads(json.dumps(value))
+                modified[key] = other
+                with self.subTest(key=key), self.assertRaisesRegex(
+                    runner.RunnerError, "baseline identity is not authorized"
+                ):
+                    runner._frozen_g1_baseline_pair(modified)
+            unrelated = json.loads(json.dumps(value))
+            unrelated["case_id"] = "ordinary-modern-case"
+            self.assertFalse(runner._frozen_g1_baseline_pair(unrelated))
+
+    def test_frozen_g1_baseline_vendor_failure_blocks_first_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request(condition="baseline")
+            planned_request_root(root, value)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            codex_home = root / "codex-home"
+            codex_home.mkdir()
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "repositories.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "provider-evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            dispatch = {
+                "authorization": {"contract": "test"},
+                "provider_codex": {},
+                "provider_authentication": {},
+                "repository_map_bytes": b"{}",
+                "binding": {},
+                "mcp_files": [],
+                "proxy_code": None,
+                "proxy_base_code": None,
+                "manifest": None,
+            }
+            with ExitStack() as stack:
+                for name, result in (
+                    ("validate_executable", "/opt/codex"),
+                    ("validate_toolchain", None),
+                    ("validate_chatgpt_subscription", b"opaque-auth"),
+                    ("_repository_root_from_authorized_map_bytes", root),
+                    ("prepare_provider_evidence", {"plan": True}),
+                    ("create_checkout", checkout),
+                    ("stage_codex_home", codex_home),
+                    ("build_command", ["codex"]),
+                    ("provider_env", {}),
+                    ("cleanup_codex_home", None),
+                ):
+                    stack.enter_context(patch.object(runner, name, return_value=result))
+                for name in (
+                    "_assert_authorized_codex_executable",
+                    "_assert_authorized_chatgpt_auth",
+                    "_assert_authorized_runtime_binding",
+                    "close_provider_evidence_plan",
+                    "write_schema",
+                ):
+                    stack.enter_context(patch.object(runner, name))
+                stack.enter_context(
+                    patch.object(
+                        runner, "_load_preflight_dispatch_authorization",
+                        return_value=dispatch,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(runner, "_frozen_g1_baseline_pair", return_value=True)
+                )
+                vendor = stack.enter_context(
+                    patch.object(
+                        runner, "_frozen_g1_vendor_snapshot",
+                        side_effect=runner.RunnerError("historical G1 vendor missing"),
+                    )
+                )
+                intent = stack.enter_context(
+                    patch.object(runner, "_record_preflight_dispatch_intent")
+                )
+                provider = stack.enter_context(patch.object(runner, "run_bounded"))
+                stack.enter_context(
+                    patch.object(
+                        runner.base, "attest_checkout_setup",
+                        return_value={"working_tree": "clean"},
+                    )
+                )
+                with self.assertRaisesRegex(runner.RunnerError, "vendor missing"):
+                    runner.execute(value, args)
+            vendor.assert_called_once_with()
+            intent.assert_not_called()
+            provider.assert_not_called()
 
 
 if __name__ == "__main__":

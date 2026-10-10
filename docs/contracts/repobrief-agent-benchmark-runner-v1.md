@@ -313,3 +313,56 @@ aufgenommen:
 
 Der vollständige Benchmarkauftrag wird vom Lenskit-Harness über Standard Input
 übergeben.
+
+
+## Gesondertes historisches G1-Codex-Profil (nur Offline-Vorbereitung)
+
+Dieser Abschnitt dokumentiert **nicht** den obigen Claude-Livepfad, sondern den
+separaten, ansonsten strikt modernen
+`tools/repobrief_agent_benchmark_codex_runner.py`. Das Profil
+`frozen-g1-lenskit-legacy` wird ausschließlich für die eingefrorenen zwei
+Treatment-Requests von `grounding-clean-freshness`, das exakt gebundene
+Benchmark-Taskset und seine Prompt-/Repository-/Manifestidentität, den
+Python-Interpreter `/usr/bin/python3` und den originalen Lenskit-Checkout
+aktiviert. Andere Fälle oder MCP-Versionen erhalten keinen Legacy-Fallback.
+
+Der historische Quellcommit `dff582f9c4e8…` und der separate
+Generatorcommit `cc345356056f…` werden beide nachgewiesen. Das unveränderte
+Manifest hat SHA-256
+`11b9983e8a41de41dc042b2dfd25dfd68be68e49d0c0065af9dbaa37e3a98179`.
+Die drei historischen `tools/list`-Beschreibungen sind als vollständige
+kanonische Liste mit SHA-256
+`12ebf1efaa29a583c5948e2d33c5b3a9c725a6c18645ba81b0b6eea7e773aa96`
+gebunden. Abweichende Namen, Reihenfolgen, Titel und Schemas werden abgewiesen.
+Moderne Tool- und Ergebnisvalidierung bleiben unverändert.
+
+Das historische `ask_context_pack` v1.0 wird **ohne erfundene neuere
+Retrieval-, Byte-Budget- oder Accounting-Felder** streng separat validiert.
+Snapshot-Referenz, Manifest, Freshness-Status, erforderliche Lektüre,
+Budget, Nichtaussagen und Nur-Lese-Grenzen müssen konsistent sein. Erst danach
+wird der interne temporäre Manifestpfad durch den ursprünglichen logischen
+Pfad ersetzt.
+
+Für historische Graph-Schema-Prüfung bleibt der Interpreter unter
+`-I -B` isoliert. Nur für das exakte G1-Profil werden **83 vorhandene,
+SHA-gebundene Dateien mit zusammen 2.009.055 Bytes** in die private MCP-Stage
+kopiert; ihre sortierte Dateiliste hat SHA-256
+`8dbc45b4c54ec79a4e84efec8c5b577031896a081a6fd325a9283bf50c2e9f8a`.
+Ein bloßer Paketname stellt keine Autorisierung dar: Pfad, regulärer Dateityp,
+Besitzer, Modus, Dateizahl, Bytebudget und Inhaltsdigest werden geprüft.
+Bei fehlenden, geänderten, verlinkten oder unzulässig beschreibbaren Dateien
+wird abgebrochen. Nur die private gebundene Kopie ist auf dem Python-Suchpfad;
+der originale Vendor-Quellbestand wird vor dem Staging geprüft und die gesamte
+private Kopie nach der Ausführung erneut revalidiert und entfernt. Es erfolgen
+keine globalen Paketinstallationen, keine Übernahme der User-Site-Packages und
+keine Ausnahmen von der Isolation. Ändert sich der Vendorbestand später,
+blockiert die eingefrorene Prüfsumme bis zu einer ausdrücklich überprüften
+Neuregistrierung.
+
+Providerfreie Akzeptanz umfasst echte MCP-Aufrufe beider G1-Wiederholungen
+(`initialize`, `tools/list`, `live_freshness`, `ask_context`,
+`grounding_verify`) über den immutable-bootstrap-gebundenen Proxy,
+`stderr=0` und unveränderte historische Originale. Dies ist **kein** Beleg für
+Codex-Anmeldung, gestartete Modellinferenz, korrekte Agentenantworten,
+Review-/Mergefreigabe oder messbaren Nutzennachweis. Bereits verbrauchte
+Einmal-Dispatches bleiben tabu.
