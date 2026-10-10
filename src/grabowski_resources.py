@@ -8030,7 +8030,7 @@ def inspect_resources(resource_keys: Iterable[str]) -> dict[str, dict[str, Any]]
         return {}
     now = _now()
     placeholders = ",".join("?" for _item in keys)
-    with _database() as connection:
+    with closing(_database()) as connection:
         rows = connection.execute(
             f"SELECT * FROM leases WHERE resource_key IN ({placeholders})",
             keys,
@@ -8079,7 +8079,7 @@ def count_resources(
         raise ValueError("read_only must be boolean")
     if not read_only:
         operator._require_operator_mutation("resource_lease")
-    source = _resource_readonly_snapshot() if read_only else _database()
+    source = _resource_readonly_snapshot() if read_only else closing(_database())
     with source as connection:
         row = connection.execute(
             f"SELECT COUNT(*) AS count FROM leases{where}",
@@ -8112,7 +8112,7 @@ def list_resources(
         raise ValueError("read_only must be boolean")
     if not read_only:
         operator._require_operator_mutation("resource_lease")
-    source = _resource_readonly_snapshot() if read_only else _database()
+    source = _resource_readonly_snapshot() if read_only else closing(_database())
     with source as connection:
         rows = connection.execute(
             f"SELECT * FROM leases{where} ORDER BY resource_key LIMIT ?",

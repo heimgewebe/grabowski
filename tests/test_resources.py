@@ -113,6 +113,33 @@ class ResourceTests(unittest.TestCase):
         self.assertFalse(Path(str(self.database) + "-wal").exists())
         self.assertFalse(Path(str(self.database) + "-shm").exists())
 
+    def test_resource_mutating_inspection_connections_close_with_held_refs(self) -> None:
+        # A sqlite3 connection context commits but does not close. Retain
+        # references so Python 3.10 refcounting cannot hide the WAL leak.
+        key = "component:resource-mutating-inspection-close"
+        owner = "operator:resource-mutating-inspection-close"
+        resources.acquire_resources(owner, [key], purpose="test reader close")
+        original_database = resources._database
+        opened: list[sqlite3.Connection] = []
+
+        def record_connection() -> sqlite3.Connection:
+            connection = original_database()
+            opened.append(connection)
+            return connection
+
+        with patch.object(resources, "_database", side_effect=record_connection):
+            self.assertEqual(1, resources.count_resources(read_only=False))
+            listed = resources.list_resources(owner_id=owner, read_only=False)
+            self.assertEqual([key], [item["resource_key"] for item in listed])
+            self.assertIn(key, resources.inspect_resources([key]))
+
+        self.assertEqual(3, len(opened))
+        for connection in opened:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+        for suffix in ("-wal", "-shm"):
+            self.assertFalse(Path(str(self.database) + suffix).exists())
+
     def scope_manifest(
         self, repository: Path, *, name: str, path: Path, effects: list[str] | None = None
     ) -> dict[str, object]:
