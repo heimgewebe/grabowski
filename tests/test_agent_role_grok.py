@@ -784,14 +784,15 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertIn(b"a" * 40, stdin)
         self.assertIn(b"b" * 40, stdin)
         self.assertIn(hashlib.sha256(raw_diff).hexdigest().encode(), stdin)
-        self.assertIn(b"do not use any tool", stdin.lower())
+        self.assertIn(b"do not use any external tool", stdin.lower())
+        self.assertIn(b"cli-internal structuredoutput", stdin.lower())
         prepare.assert_called_once_with(declared)
         self.assertEqual(declared, sandbox.call_args.kwargs["declared_command"])
         actual = sandbox.call_args.args[1]
         self.assertEqual("/opt/grabowski-external/claude", actual[0])
         self.assertIn("-p", actual)
         self.assertEqual(1, actual.count("-p"))
-        self.assertEqual("1", actual[actual.index("--max-turns") + 1])
+        self.assertEqual("2", actual[actual.index("--max-turns") + 1])
         self.assertIn("exact", actual[-1].lower())
         self.assertIn("stdin", actual[-1].lower())
         self.assertNotEqual(declared[-1], actual[-1])
@@ -803,7 +804,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertEqual(["verdict", "findings"], schema["required"])
         for flag in ("--tools=", "--no-session-persistence", "--safe-mode"):
             self.assertIn(flag, actual)
-        self.assertEqual("*", actual[actual.index("--disallowedTools") + 1])
+        self.assertEqual("mcp__*", actual[actual.index("--disallowedTools") + 1])
         self.assertNotIn("Review exact committed change", actual)
         self.assertNotIn("interesting_but_untrusted", " ".join(actual))
 
@@ -839,10 +840,58 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertEqual("claude-fable-5", actual[actual.index("--model") + 1])
         self.assertEqual("high", actual[actual.index("--effort") + 1])
         self.assertEqual("plan", actual[actual.index("--permission-mode") + 1])
-        self.assertEqual("1", actual[actual.index("--max-turns") + 1])
+        self.assertEqual("2", actual[actual.index("--max-turns") + 1])
         self.assertIn("stdin", actual[-1].lower())
         self.assertNotIn("safe only", " ".join(actual))
-        self.assertEqual("*", actual[actual.index("--disallowedTools") + 1])
+        self.assertEqual("mcp__*", actual[actual.index("--disallowedTools") + 1])
+
+    def test_claude_review_denies_external_tools_but_not_internal_structured_output(self) -> None:
+        """The restricted reviewer must not globally deny its own JSON-schema tool."""
+        routes = (
+            (
+                "/opt/grabowski-external/claude", "--model", "claude-opus-5-5",
+                "--effort", "high", "--permission-mode", "plan", "Review exact diff",
+            ),
+            (
+                "/opt/grabowski-external/claude", "-p", "--safe-mode",
+                "--permission-mode", "plan", "--model", "claude-fable-5",
+                "--effort", "high", "Review exact diff",
+            ),
+        )
+        for declared in routes:
+            with self.subTest(model=declared):
+                actual, stdin = role._claude_json_review_command(
+                    declared, expected_head="a" * 40,
+                    expected_base_head="b" * 40, review_diff=b"diff --git a/a b/a\n",
+                )
+                self.assertEqual("mcp__*", actual[actual.index("--disallowedTools") + 1])
+                self.assertNotIn("*", actual)
+                self.assertIn("--tools=", actual)
+                self.assertIn("--safe-mode", actual)
+                self.assertIn("--no-session-persistence", actual)
+                self.assertEqual("plan", actual[actual.index("--permission-mode") + 1])
+                self.assertEqual("2", actual[actual.index("--max-turns") + 1])
+                self.assertEqual("json", actual[actual.index("--output-format") + 1])
+                schema = json.loads(actual[actual.index("--json-schema") + 1])
+                self.assertEqual(["verdict", "findings"], schema["required"])
+                self.assertIn(b"BEGIN UNTRUSTED REVIEW INPUT", stdin)
+                self.assertNotIn("Review exact diff", " ".join(actual))
+
+    def test_claude_review_preserves_invalid_structured_output_denial(self) -> None:
+        """Permission-denied StructuredOutput cannot masquerade as a PASS."""
+        denied = {
+            "type": "result", "subtype": "error_max_turns", "is_error": True,
+            "structured_output": None,
+            "permission_denials": [{
+                "tool_name": "StructuredOutput",
+                "tool_input": {"verdict": "PASS", "findings": []},
+            }],
+        }
+        result, error, _metadata = role._extract_claude_review_document(
+            json.dumps(denied).encode("utf-8")
+        )
+        self.assertIsNone(result)
+        self.assertIsNotNone(error)
 
     def test_claude_review_bound_input_rejects_unsafe_or_oversized_diff(self) -> None:
         command = (
@@ -873,7 +922,18 @@ class GrokReviewRoleTests(unittest.TestCase):
         self.assertEqual({"verdict": "PASS", "findings": []}, json.loads(review))
         self.assertEqual(role.CLAUDE_REVIEW_JSON_CONTRACT,
                          metadata["review_provider_contract"])
+        valid_empty_denials, valid_error, _ = role._extract_claude_review_document(
+            json.dumps({**clean, "permission_denials": []}).encode()
+        )
+        self.assertIsNone(valid_error)
+        self.assertEqual({"verdict": "PASS", "findings": []},
+                         json.loads(valid_empty_denials))
         for malformed in (
+            json.dumps({**clean, "permission_denials": [
+                {"tool_name": "Bash", "tool_input": {"command": "disallowed"}}
+            ]}).encode(),
+            json.dumps({**clean, "permission_denials": "none"}).encode(),
+            json.dumps({**clean, "permission_denials": {}}).encode(),
             b"not-json",
             b'{"verdict":"PASS","findings":[]}',
             json.dumps({**clean, "is_error": True}).encode(),
@@ -889,6 +949,47 @@ class GrokReviewRoleTests(unittest.TestCase):
                 )
                 self.assertIsNone(document)
                 self.assertIsNotNone(rejected)
+
+    def test_claude_result_rejects_server_web_and_subagent_activity(self) -> None:
+        """A success envelope cannot conceal server-side web or subagent effects."""
+        base = {
+            "type": "result", "subtype": "success", "is_error": False,
+            "permission_denials": [],
+            "structured_output": {"verdict": "PASS", "findings": []},
+        }
+        clean_metadata = {
+            "usage": {"server_tool_use": {
+                "web_search_requests": 0, "web_fetch_requests": 0,
+            }},
+            "modelUsage": {"claude-opus-5-5": {"webSearchRequests": 0}},
+            "subagent_stats": {"spawned": 0},
+        }
+        document, error, _metadata = role._extract_claude_review_document(
+            json.dumps({**base, **clean_metadata}).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(base["structured_output"], json.loads(document))
+
+        forbidden = (
+            {"usage": {"server_tool_use": {"web_search_requests": 1}}},
+            {"usage": {"server_tool_use": {"web_fetch_requests": 1}}},
+            {"modelUsage": {"claude-opus-5-5": {"webSearchRequests": 1}}},
+            {"modelUsage": {"claude-opus-5-5": {"webFetchRequests": 1}}},
+            {"modelUsage": {"claude-opus-5-5": {"webFetchRequests": True}}},
+            {"modelUsage": {"claude-opus-5-5": {"webFetchRequests": "0"}}},
+            {"subagent_stats": {"spawned": 1}},
+            {"usage": {"server_tool_use": {"web_search_requests": True}}},
+            {"usage": {"server_tool_use": {"web_fetch_requests": "0"}}},
+            {"modelUsage": {"claude-opus-5-5": {"webSearchRequests": "0"}}},
+            {"subagent_stats": {"spawned": -1}},
+        )
+        for reported_activity in forbidden:
+            with self.subTest(reported_activity=reported_activity):
+                document, error, _metadata = role._extract_claude_review_document(
+                    json.dumps({**base, **reported_activity}).encode()
+                )
+                self.assertIsNone(document)
+                self.assertIsNotNone(error)
 
     def test_claude_structured_findings_revalidated_locally(self) -> None:
         valid_finding = {
