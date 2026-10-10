@@ -96,6 +96,7 @@ def _bounded_git_capture(
     pending_tree = bytearray()
     selector = selectors.DefaultSelector()
     deadline = time.monotonic() + timeout
+    reaped = False
     try:
         assert proc.stdout is not None and proc.stderr is not None
         selector.register(proc.stdout, selectors.EVENT_READ, out)
@@ -140,6 +141,7 @@ def _bounded_git_capture(
             raise BoundLocalDiffError("local git command timed out")
         try:
             rc = proc.wait(timeout=remaining)
+            reaped = True
         except subprocess.TimeoutExpired as exc:
             raise BoundLocalDiffError("local git command timed out") from exc
         if rc:
@@ -147,12 +149,13 @@ def _bounded_git_capture(
         return bytes(out)
     finally:
         selector.close()
-        # The group may still own inherited pipes even if its leader exited.
-        # Kill the entire session on every exit path, never just a live leader.
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        # Reaping releases the PID/PGID for reuse. Signal only while the
+        # child remains unreaped (overflow, timeout or a failed read).
+        if not reaped:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         for stream in (proc.stdout, proc.stderr):
             if stream is not None:
                 stream.close()
@@ -166,6 +169,7 @@ def local_pr_git_environment() -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update(
         GIT_CONFIG_NOSYSTEM="1",
+        GIT_ATTR_NOSYSTEM="1",
         GIT_CONFIG_GLOBAL="/dev/null",
         GIT_NO_REPLACE_OBJECTS="1",
         GIT_GRAFT_FILE="/dev/null",
@@ -186,6 +190,7 @@ def bound_local_pr_git_diff(
     index, and disabled system/global attributes. No PR code is checked out.
     """
     import tempfile
+    import time
 
     if (
         not isinstance(merge_base, str)
@@ -197,11 +202,18 @@ def bound_local_pr_git_diff(
         raise BoundLocalDiffError("invalid local PR revision or byte budget")
     repo = Path(repo).resolve()
     env = local_pr_git_environment()
+    deadline = time.monotonic() + timeout
+
+    def remaining_timeout() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BoundLocalDiffError("local PR diff aggregate deadline exceeded")
+        return remaining
 
     def read_git(*args: str, limit: int = 8192, filter_attributes: bool = False) -> bytes:
         return _bounded_git_capture(
             ["git", "-C", str(repo), "-c", "core.pager=cat", *args],
-            cwd=str(repo), env=env, timeout=timeout, stdout_limit=limit,
+            cwd=str(repo), env=env, timeout=remaining_timeout(), stdout_limit=limit,
             filter_attributes=filter_attributes,
         )
 
@@ -260,7 +272,7 @@ def bound_local_pr_git_diff(
         snapshot = scratch / "snapshot.git"
         _bounded_git_capture(
             ["git", "init", "-q", "--bare", str(snapshot)],
-            cwd=str(scratch), env=env, timeout=timeout, stdout_limit=8192,
+            cwd=str(scratch), env=env, timeout=remaining_timeout(), stdout_limit=8192,
         )
         object_dir = (common / "objects").resolve(strict=True)
         if not object_dir.is_dir():
@@ -275,9 +287,9 @@ def bound_local_pr_git_diff(
                  "core.attributesFile=/dev/null", "-c", "diff.external=",
                  "-c", "diff.trustExitCode=false"]
         _bounded_git_capture([*flags, "read-tree", "--empty"], cwd=str(root),
-                             env=isolated, timeout=timeout, stdout_limit=8192)
+                             env=isolated, timeout=remaining_timeout(), stdout_limit=8192)
         return _bounded_git_capture(
             [*flags, "diff", "--no-ext-diff", "--no-textconv",
              "--no-renames", "--no-color", merge_base, head, "--"],
-            cwd=str(root), env=isolated, timeout=timeout, stdout_limit=max_diff_bytes,
+            cwd=str(root), env=isolated, timeout=remaining_timeout(), stdout_limit=max_diff_bytes,
         )

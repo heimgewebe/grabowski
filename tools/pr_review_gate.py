@@ -775,6 +775,14 @@ def _local_bound_pr_diff_bytes(repo: Path, view: Any) -> bytes:
     # GitHub PR files/diffs use the merge base, not the advanced base tip.
     # Reject missing or ambiguous merge bases instead of silently choosing one.
     local_env = local_pr_git_environment()
+    # A shallow boundary can hide or misidentify the unique PR merge base.
+    # This fallback cannot safely deepen; refuse incomplete ancestry.
+    shallow_state = _run_bytes(
+        repo, _local_diff_git_argv("rev-parse", "--is-shallow-repository"),
+        env_override=local_env,
+    ).strip()
+    if shallow_state != b"false":
+        raise RuntimeError("local PR diff requires complete history")
     merge_bases = _run_bytes(
         repo, _local_diff_git_argv("merge-base", "--all", base, head),
         env_override=local_env,

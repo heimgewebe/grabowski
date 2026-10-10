@@ -1361,6 +1361,7 @@ def _merge_guard_git_environment() -> dict[str, str]:
         "HOME": str(Path.home()),
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_NO_REPLACE_OBJECTS": "1",
         "GIT_GRAFT_FILE": "/dev/null",

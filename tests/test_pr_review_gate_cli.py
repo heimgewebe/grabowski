@@ -95,6 +95,8 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
 
         def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False, env_override=None):
             del repo, allow_nonzero
+            if argv[0] == "git" and "--is-shallow-repository" in argv:
+                return b"false\n"
             if argv[0] == "git" and "merge-base" in argv:
                 return b"b" * 40 + bytes([10])
             if argv[0] == "git" and "--name-only" in argv:
@@ -197,6 +199,8 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
 
         def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False, env_override=None):
             del repo, allow_nonzero
+            if argv[0] == "git" and "--is-shallow-repository" in argv:
+                return b"false\n"
             if argv[0] == "git" and "merge-base" in argv:
                 return b"b" * 40 + bytes([10])
             if argv[0] == "git" and "--name-only" in argv:
@@ -380,6 +384,23 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
             self.assertIn(b"feature.txt",payload)
             self.assertNotIn(b"base-only.txt",payload)
 
+    def test_local_bound_diff_rejects_shallow_history_before_merge_base(self) -> None:
+        view = {
+            "baseRefOid": "b" * 40,
+            "headRefOid": "a" * 40,
+            "pullFilesEvidenceComplete": True,
+            "files": [{"path": "feature.txt", "status": "added"}],
+        }
+        with (
+            mock.patch.object(pr_review_gate, "_run_bytes", return_value=b"true\n") as git,
+            mock.patch.object(pr_review_gate, "bound_local_pr_git_diff") as local_diff,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "complete history"):
+                pr_review_gate._local_bound_pr_diff_bytes(Path("/tmp"), view)
+        self.assertEqual(git.call_count, 1)
+        self.assertIn("rev-parse", git.call_args.args[1])
+        local_diff.assert_not_called()
+
     def test_local_bound_diff_rejects_ambiguous_merge_base(self) -> None:
         view = {
             "baseRefOid": "b" * 40,
@@ -389,7 +410,10 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
         }
         with mock.patch.object(
             pr_review_gate, "_run_bytes",
-            return_value=b"a" * 40 + bytes([10]) + b"b" * 40 + bytes([10]),
+            side_effect=[
+                b"false\n",
+                b"a" * 40 + bytes([10]) + b"b" * 40 + bytes([10]),
+            ],
         ):
             with self.assertRaisesRegex(RuntimeError, "exactly one valid merge base"):
                 pr_review_gate._local_bound_pr_diff_bytes(Path("/tmp"), view)

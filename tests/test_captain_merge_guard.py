@@ -505,6 +505,11 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
                     any(call[:2] == ("pr", "merge") for call in gh.calls)
                 )
 
+    def test_merge_guard_git_environment_disables_system_attributes(self) -> None:
+        self.assertEqual(
+            merge_guard._merge_guard_git_environment().get("GIT_ATTR_NOSYSTEM"), "1"
+        )
+
     def test_shallow_tips_require_complete_ancestry_before_local_fallback(self) -> None:
         with tempfile.TemporaryDirectory(prefix="captain-shallow-history-") as directory:
             root = Path(directory)

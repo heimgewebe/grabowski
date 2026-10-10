@@ -1,14 +1,18 @@
 """Real Git regressions for revision-bound local PR diff config/tree independence."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from grabowski_pr_diff import bound_local_pr_git_diff
+import grabowski_pr_diff as pr_diff
+from grabowski_pr_diff import bound_local_pr_git_diff, local_pr_git_environment
 
 
 class BoundLocalPrDiffHardeningTests(unittest.TestCase):
@@ -19,6 +23,52 @@ class BoundLocalPrDiffHardeningTests(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
         )
         return result.stdout.decode("ascii").strip()
+
+    def test_host_system_attributes_are_disabled_independently_of_inherited_env(self) -> None:
+        # GIT_CONFIG_NOSYSTEM disables config, not $(prefix)/etc/gitattributes.
+        with mock.patch.dict(os.environ, {"GIT_ATTR_NOSYSTEM": "0"}):
+            env = local_pr_git_environment()
+        self.assertEqual(env["GIT_ATTR_NOSYSTEM"], "1")
+
+    def test_completed_git_command_does_not_kill_reaped_process_group(self) -> None:
+        # Reaped PGIDs can be reused; a clean command must not signal its old group.
+        with mock.patch("os.killpg") as kill_group:
+            result = pr_diff._bounded_git_capture(
+                ["git", "--version"], cwd=str(Path.cwd()),
+                env=local_pr_git_environment(), timeout=5, stdout_limit=2048,
+            )
+        self.assertIn(b"git version", result)
+        kill_group.assert_not_called()
+
+    def test_local_diff_subcommands_share_one_aggregate_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pr-diff-deadline-") as d:
+            repo = Path(d)
+            self.git(repo, "init", "-q")
+            self.git(repo, "config", "user.email", "test@example.invalid")
+            self.git(repo, "config", "user.name", "PR Diff Test")
+            (repo / "a.txt").write_text("before\\n")
+            self.git(repo, "add", ".")
+            self.git(repo, "commit", "-qm", "base")
+            base = self.git(repo, "rev-parse", "HEAD")
+            (repo / "a.txt").write_text("after\\n")
+            self.git(repo, "add", ".")
+            self.git(repo, "commit", "-qm", "head")
+            head = self.git(repo, "rev-parse", "HEAD")
+            original = pr_diff._bounded_git_capture
+            budgets: list[float] = []
+
+            def track(*args: object, **kwargs: object) -> bytes:
+                budgets.append(float(kwargs["timeout"]))
+                time.sleep(0.035)
+                return original(*args, **kwargs)
+
+            with mock.patch.object(pr_diff, "_bounded_git_capture", side_effect=track):
+                result = bound_local_pr_git_diff(
+                    repo, merge_base=base, head=head, timeout=8,
+                )
+            self.assertIn(b"a.txt", result)
+            self.assertGreaterEqual(len(budgets), 5)
+            self.assertGreater(budgets[0] - budgets[-1], 0.10)
 
     def test_checkout_diff_config_cannot_change_canonical_bytes(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pr-diff-config-") as d:
