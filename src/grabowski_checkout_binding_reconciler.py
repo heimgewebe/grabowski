@@ -616,6 +616,10 @@ def collect_lifecycle_bindings_from_db(
             temporary_prefix="grabowski-checkout-binding-snapshot.",
             error_type=CheckoutBindingDatabaseError,
             message="checkout database changed during reconciliation snapshot",
+            # The default schema inventory copies live WAL into a temporary
+            # directory. Checkout reconciliation is published READ_ONLY and
+            # must fail closed rather than create files or update SQLite SHM.
+            allow_wal_copy=False,
         ) as connection:
             _validate_database(connection)
             try:
@@ -696,11 +700,7 @@ def collect_lifecycle_bindings_from_db(
                 "bindings": bindings,
                 "retentions": retention_inventory,
                 "read_only": True,
-                "snapshot_mode": (
-                    "immutable-file"
-                    if not Path(str(path) + "-wal").exists()
-                    else "copied-database-and-wal"
-                ),
+                "snapshot_mode": "immutable-file",
             }
     except CheckoutBindingDatabaseError:
         raise

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -15,12 +16,13 @@ import subprocess
 import time
 import urllib.parse
 import uuid
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 import grabowski_audit_query as audit_query
 import grabowski_mcp as base
 import grabowski_physical_checkout as physical_checkout
 import grabowski_resources as resources
+import grabowski_sqlite_store as sqlite_store
 import grabowski_tasks as tasks
 import grabowski_transport_roundtrip as transport_roundtrip
 try:
@@ -631,11 +633,43 @@ def _database() -> sqlite3.Connection:
     return connection
 
 
+# Only public checkout inventory enters this strict mode.  Lifecycle writers
+# and separately governed internal status readers retain WAL-aware semantics.
+_INVENTORY_READ_ONLY_STACK: ContextVar[ExitStack | None] = ContextVar(
+    "checkout_inventory_read_only_sqlite", default=None
+)
+
+
+@contextmanager
+def _strict_inventory_readonly_scope() -> Iterator[None]:
+    with ExitStack() as stack:
+        token = _INVENTORY_READ_ONLY_STACK.set(stack)
+        try:
+            yield
+        finally:
+            _INVENTORY_READ_ONLY_STACK.reset(token)
+
+
 def _readonly_connection(path: Path) -> sqlite3.Connection | None:
+    stack = _INVENTORY_READ_ONLY_STACK.get()
     if not path.exists():
+        if stack is not None:
+            raise RuntimeError("Strict read-only snapshot unavailable: SQLite database is absent")
         return None
     if path.is_symlink():
         raise PermissionError(f"SQLite database may not be a symlink: {path}")
+    if stack is not None:
+        # Even mode=ro creates SHM for live WAL; the already existing strict
+        # reader fails closed and keeps preimage checks until inventory returns.
+        return stack.enter_context(
+            sqlite_store.inventory_readonly_sqlite(
+                path,
+                temporary_prefix="unused-checkout-inventory-readonly.",
+                error_type=RuntimeError,
+                message="Strict read-only checkout inventory changed",
+                allow_wal_copy=False,
+            )
+        )
     resolved = path.resolve(strict=True)
     uri = "file:" + urllib.parse.quote(str(resolved)) + "?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=5)
@@ -4491,10 +4525,51 @@ def _cleanup_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
 @mcp.tool(name="grabowski_checkout_uncertainty_status", annotations=READ_ONLY)
 def grabowski_checkout_uncertainty_status(fence_id: str = "") -> dict[str, Any]:
     """Read durable unknown-outcome fences for checkout lifecycle effects."""
+    if not isinstance(fence_id, str) or (
+        fence_id and re.fullmatch(r"[0-9a-f]{32}", fence_id) is None
+    ):
+        raise ValueError("fence_id must be a 32-character lowercase hex identifier")
+    if CHECKOUT_DB.is_symlink() or not CHECKOUT_DB.is_file():
+        raise RuntimeError("Checkout uncertainty store is unavailable")
+    # The shared inventory reader rejects live WAL/SHM, reads immutable
+    # quiescent content, and checks file identity before and after the read.
+    with sqlite_store.inventory_readonly_sqlite(
+        CHECKOUT_DB,
+        temporary_prefix="unused-checkout-uncertainty.",
+        error_type=RuntimeError,
+        message="Checkout uncertainty snapshot changed",
+        allow_wal_copy=False,
+    ) as connection:
+        try:
+            version = connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()
+            if version is None or version[0] != "1":
+                raise RuntimeError("Checkout uncertainty schema requires explicit migration")
+            present = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='operation_uncertainty'"
+            ).fetchone()
+            if present is None:
+                raise RuntimeError("Checkout uncertainty schema is not observable")
+            if fence_id:
+                rows = connection.execute(
+                    "SELECT * FROM operation_uncertainty WHERE fence_id=?",
+                    (fence_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM operation_uncertainty "
+                    "WHERE cleared_at_unix IS NULL "
+                    "ORDER BY created_at_unix ASC, fence_id ASC"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise RuntimeError("Checkout uncertainty snapshot is unavailable") from exc
+    fences = [_operation_uncertainty_public(row) for row in rows]
     if fence_id:
-        fence = _load_checkout_operation_uncertainty(fence_id)
-        return {"fences": [fence], "count": 1}
-    fences = _active_checkout_operation_uncertainties()
+        if not fences:
+            raise ValueError(f"Unknown checkout uncertainty fence: {fence_id}")
+        return {"fences": fences, "count": 1}
     return {"fences": fences[:256], "count": len(fences), "truncated": len(fences) > 256}
 
 
@@ -7126,12 +7201,13 @@ def grabowski_checkout_inventory(
 ) -> dict[str, Any]:
     """Return a deterministic inventory of linked Git checkouts and lifecycle state."""
     operator._require_operator_capability("git_cli")
-    return checkout_inventory(
-        repo,
-        include_processes=include_processes,
-        include_tasks=include_tasks,
-        include_resources=include_resources,
-    )
+    with _strict_inventory_readonly_scope():
+        return checkout_inventory(
+            repo,
+            include_processes=include_processes,
+            include_tasks=include_tasks,
+            include_resources=include_resources,
+        )
 
 
 @mcp.tool(name="grabowski_checkout_retain", annotations=MUTATING)

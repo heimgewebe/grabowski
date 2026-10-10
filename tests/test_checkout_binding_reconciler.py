@@ -758,7 +758,7 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
             with self.assertRaises(CheckoutBindingDatabaseError):
                 collect_lifecycle_bindings_from_db(path)
 
-    def test_wal_snapshot_preserves_source_database_and_wal(self) -> None:
+    def test_wal_snapshot_fails_closed_without_temporary_file_effects(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "checkouts.sqlite3"
             create_checkout_db(path)
@@ -786,11 +786,89 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 self.assertTrue(wal_path.is_file())
                 database_before = path.read_bytes()
                 wal_before = wal_path.read_bytes()
-                result = collect_lifecycle_bindings_from_db(path)
-                self.assertEqual(result["snapshot_mode"], "copied-database-and-wal")
-                self.assertEqual(result["bindings"][0]["checkout_key"], "key-wal")
+                directory_before = {
+                    item.name: item.read_bytes() for item in Path(tmp).iterdir()
+                }
+                with mock.patch.object(
+                    sqlite_store.tempfile,
+                    "TemporaryDirectory",
+                    side_effect=AssertionError("no READ_ONLY temporary file writes"),
+                ) as temp_dir:
+                    with self.assertRaisesRegex(
+                        CheckoutBindingDatabaseError,
+                        "Strict read-only snapshot unavailable",
+                    ):
+                        collect_lifecycle_bindings_from_db(path)
+                temp_dir.assert_not_called()
                 self.assertEqual(path.read_bytes(), database_before)
                 self.assertEqual(wal_path.read_bytes(), wal_before)
+                self.assertEqual(
+                    directory_before,
+                    {item.name: item.read_bytes() for item in Path(tmp).iterdir()},
+                )
+            finally:
+                keeper.close()
+
+    def test_strict_checkout_reader_rejects_orphaned_shm_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkouts.sqlite3"
+            create_checkout_db(path)
+            shm_path = Path(str(path) + "-shm")
+            shm_path.write_bytes(b"orphaned-shm-marker")
+            before = {item.name: item.read_bytes() for item in Path(tmp).iterdir()}
+            with mock.patch.object(
+                sqlite_store.tempfile,
+                "TemporaryDirectory",
+                side_effect=AssertionError("no temp writes"),
+            ) as temp_dir:
+                with self.assertRaisesRegex(
+                    CheckoutBindingDatabaseError,
+                    "Strict read-only snapshot unavailable",
+                ):
+                    collect_lifecycle_bindings_from_db(path)
+            temp_dir.assert_not_called()
+            self.assertEqual(
+                before,
+                {item.name: item.read_bytes() for item in Path(tmp).iterdir()},
+            )
+
+    def test_current_work_checkout_reconciliation_rejects_wal_before_any_temp_write(self) -> None:
+        import grabowski_current_work_surface as current_work_surface
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkouts.sqlite3"
+            create_checkout_db(path)
+            keeper = sqlite3.connect(path)
+            try:
+                self.assertEqual(
+                    "wal", keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                )
+                keeper.execute("PRAGMA wal_autocheckpoint=0")
+                keeper.execute("PRAGMA user_version=1")
+                keeper.commit()
+                self.assertTrue(Path(str(path) + "-wal").is_file())
+                before = {item.name: item.read_bytes() for item in Path(tmp).iterdir()}
+                with (
+                    mock.patch(
+                        "grabowski_checkout_binding_reconciler._database_path",
+                        return_value=path,
+                    ),
+                    mock.patch.object(
+                        sqlite_store.tempfile,
+                        "TemporaryDirectory",
+                        side_effect=AssertionError("no temporary snapshot allowed"),
+                    ) as temp_dir,
+                ):
+                    with self.assertRaisesRegex(
+                        CheckoutBindingDatabaseError,
+                        "Strict read-only snapshot unavailable",
+                    ):
+                        current_work_surface._reconciliation_payload([REPO])
+                temp_dir.assert_not_called()
+                self.assertEqual(
+                    before,
+                    {item.name: item.read_bytes() for item in Path(tmp).iterdir()},
+                )
             finally:
                 keeper.close()
 

@@ -12771,7 +12771,11 @@ def _workspace_lifecycle_classification(
         "tasks": live_task_states,
         "close_integrity": close_integrity,
     }
-    checkout_inventory = checkouts.grabowski_checkout_inventory(
+    # Workspace cleanup is already mutation-gated.  Use the internal
+    # WAL-aware inventory here; the published READ_ONLY tool must keep its
+    # strict filesystem-write boundary even when a writer has live sidecars.
+    operator._require_operator_mutation("resource_lease")
+    checkout_inventory = checkouts.checkout_inventory(
         repo=str(manifest["repository"]),
         include_processes=True,
         include_tasks=True,
