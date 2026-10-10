@@ -5293,6 +5293,20 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 },
             )
 
+            bad_surrogate_resource = json.loads(json.dumps(resource))
+            bad_surrogate_resource["contents"][0]["text"] = "\ud800"
+            events[0]["item"]["result"] = {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(bad_surrogate_resource, sort_keys=True),
+                }],
+            }
+            self.assertIsNone(
+                runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                )
+            )
+
             unknown = json.loads(json.dumps(resource))
             unknown_freshness = unknown["_meta"]["repoground"]["liveFreshness"]
             unknown_freshness.update({

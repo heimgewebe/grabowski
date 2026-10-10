@@ -1458,6 +1458,15 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                 },
             )
 
+            bad_surrogate_resource = copy.deepcopy(resource)
+            bad_surrogate_resource["contents"][0]["text"] = "\ud800"
+            tool_result["content"] = json.dumps(bad_surrogate_resource, sort_keys=True)
+            self.assertIsNone(
+                runner.normalize_repoground_evidence(
+                    value, messages, runner.normalize_tool_calls(value, messages)
+                )
+            )
+
             unknown_resource = copy.deepcopy(resource)
             unknown_freshness = unknown_resource["_meta"]["repoground"]["liveFreshness"]
             unknown_freshness.update({

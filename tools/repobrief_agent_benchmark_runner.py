@@ -2214,7 +2214,11 @@ def _repoground_resource_read_payload(
     live_freshness = repoground.get("liveFreshness")
     if not isinstance(live_freshness, Mapping):
         return None
-    content_bytes = len(text_value.encode("utf-8"))
+    try:
+        content_bytes = len(text_value.encode("utf-8"))
+    except UnicodeEncodeError:
+        # Optional untrusted evidence must not abort the benchmark receipt.
+        return None
     if content_bytes <= 0:
         return None
     return live_freshness, content_bytes
