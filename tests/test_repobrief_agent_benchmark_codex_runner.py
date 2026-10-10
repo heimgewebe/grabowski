@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
+import copy
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
@@ -85,6 +86,31 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
         "does_not_establish": list(runner.base.DOES_NOT_ESTABLISH),
     }
 
+
+
+def bind_manifest(
+    value: dict,
+    root: Path,
+    *,
+    commit: str = COMMIT,
+    repo_root: str | None = None,
+) -> Path:
+    repository = {"git_commit": commit}
+    if repo_root is not None:
+        repository["repo_root"] = repo_root
+    manifest = {
+        "kind": "repoground.bundle.manifest",
+        "version": "2.0",
+        "snapshotProvenance": {"repositories": [repository]},
+    }
+    raw = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    path = root / "repo.bundle.manifest.json"
+    path.write_bytes(raw)
+    value["repobrief"]["manifest"] = str(path)
+    value["repobrief"]["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+    return path
 
 def file_identity(path: Path) -> dict:
     resolved = path.resolve(strict=True)
@@ -2388,6 +2414,106 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             self.assertEqual(count_path.read_text(), "1")
 
+    def test_mcp_proxy_rebinds_resource_read_live_freshness_to_logical_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            observed_manifest = root / "observed-manifest-path.txt"
+            upstream = root / "mcp.py"
+            upstream.write_text(
+                "import json, pathlib, sys\n"
+                f"TOOLS = {treatment_tools()!r}\n"
+                f"OBSERVED = pathlib.Path({str(observed_manifest)!r})\n"
+                "manifest = sys.argv[sys.argv.index('--bundle-root') + 1]\n"
+                "OBSERVED.write_text(manifest)\n"
+                "for line in sys.stdin:\n"
+                "    m=json.loads(line); method=m.get('method'); ident=m.get('id')\n"
+                "    if method=='tools/list':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'tools':TOOLS}}),flush=True)\n"
+                "    elif method=='resources/list':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':{'resources':[{'uri':'repobrief://frozen/a'}]}}),flush=True)\n"
+                "    elif method=='resources/read':\n"
+                "        fresh={'kind':'repobrief.live_freshness','version':'v1','status':'fresh','reason':'git_head_matches_snapshot','bundle_manifest':manifest,'repo_root':'/tmp/repo','read_only_git_probe':True,'implicit_refresh':False,'snapshot_provenance':{'git_commit':'c'*40}}\n"
+                "        meta={'repoground':{'status':'available','implicitRefresh':False,'snapshotContext':{},'identity':{},'liveFreshness':fresh}}\n"
+                "        result={'contents':[{'uri':'repobrief://frozen/a','mimeType':'text/plain','text':'bound context'}],'_meta':meta}\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':ident,'result':result}),flush=True)\n",
+                encoding="utf-8",
+            )
+            process = subprocess.Popen(
+                proxy_command(upstream, root),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertIsNotNone(process.stdin)
+            self.assertIsNotNone(process.stdout)
+            self.assertIsNotNone(process.stderr)
+
+            def roundtrip(message: dict) -> dict:
+                assert process.stdin is not None and process.stdout is not None
+                process.stdin.write(json.dumps(message).encode() + b"\n")
+                process.stdin.flush()
+                return json.loads(process.stdout.readline())
+
+            tools = roundtrip(
+                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+            )
+            self.assertIn("result", tools)
+            listed = roundtrip(
+                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                    "name":"repobrief_resource_read",
+                    "arguments":{"action":"list"},
+                }}
+            )
+            self.assertFalse(listed["result"]["isError"])
+            read = roundtrip(
+                {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                    "name":"repobrief_resource_read",
+                    "arguments":{"action":"read","uri":"repobrief://frozen/a"},
+                }}
+            )
+            self.assertFalse(read["result"]["isError"])
+            assert process.stdin is not None
+            assert process.stdout is not None
+            assert process.stderr is not None
+            process.stdin.close()
+            returncode = process.wait(timeout=5)
+            stderr = process.stderr.read().decode()
+            process.stdout.close()
+            process.stderr.close()
+            self.assertEqual(returncode, 0, stderr)
+
+            logical_manifest = root / "bound.bundle.manifest.json"
+            staged_manifest = Path(observed_manifest.read_text())
+            self.assertNotEqual(staged_manifest, logical_manifest)
+            read_result = json.loads(read["result"]["content"][0]["text"])
+            self.assertEqual(
+                read_result["_meta"]["repoground"]["liveFreshness"]["bundle_manifest"],
+                str(logical_manifest),
+            )
+
+    def test_rebind_resource_read_manifest_rejects_non_staged_freshness_path(self) -> None:
+        staged_manifest = Path("/private/staged.bundle.manifest.json")
+        logical_manifest = Path("/logical/repo.bundle.manifest.json")
+        value = {
+            "_meta": {
+                "repoground": {
+                    "liveFreshness": {
+                        "bundle_manifest": str(logical_manifest),
+                    }
+                }
+            }
+        }
+
+        with self.assertRaisesRegex(
+            runner.RunnerError,
+            "resource live freshness manifest does not match staged manifest",
+        ):
+            runner._rebind_resource_read_manifest(
+                value,
+                staged_manifest=staged_manifest,
+                external_manifest=logical_manifest,
+            )
+
     def test_mcp_proxy_rejects_malformed_resource_read_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -3951,7 +4077,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "version": runner.EXPECTED_GROUNDING_VERDICT_VERSION,
             "status": "degraded",
             "checked_declaration": {},
-            "snapshot_ref": {},
+            "snapshot_ref": {"manifest_path": str(manifest)},
             "citation_checks": [],
             "range_checks": [],
             "required_reading_checks": [],
@@ -4014,6 +4140,80 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     validated["content"],
                     [{"type": "text", "text": runner.canonical(payload)}],
                 )
+
+        external_manifest = Path("/logical/repo.bundle.manifest.json")
+        grounding_result = {
+            "content": [{"type": "text", "text": "ok"}],
+            "structuredContent": cases["grounding_verify"],
+            "isError": False,
+        }
+        rebound = runner._validated_treatment_tool_result(
+            grounding_result,
+            tool_name="grounding_verify",
+            expected_manifest=manifest,
+            external_manifest=external_manifest,
+        )
+        self.assertEqual(
+            rebound["structuredContent"]["live_freshness"]["bundle_manifest"],
+            str(external_manifest),
+        )
+        self.assertEqual(
+            rebound["structuredContent"]["verdict"]["snapshot_ref"]["manifest_path"],
+            str(external_manifest),
+        )
+        foreign = json.loads(json.dumps(cases["grounding_verify"]))
+        foreign["verdict"]["snapshot_ref"]["manifest_path"] = "/foreign/manifest.json"
+        for unexpected_path in ("/foreign/manifest.json", str(external_manifest)):
+            with self.subTest(non_staged_manifest=unexpected_path):
+                foreign["verdict"]["snapshot_ref"]["manifest_path"] = unexpected_path
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "grounding snapshot manifest does not match staged manifest"
+                ):
+                    runner._validated_treatment_tool_result(
+                        {
+                            "content": [{"type": "text", "text": "ok"}],
+                            "structuredContent": foreign,
+                            "isError": False,
+                        },
+                        tool_name="grounding_verify",
+                        expected_manifest=manifest,
+                        external_manifest=external_manifest,
+                    )
+
+        staged_ask = json.loads(json.dumps(cases["ask_context"]))
+        staged_ask["context_pack"]["snapshot_ref"]["manifest_path"] = str(manifest)
+        rebound_ask = runner._validated_treatment_tool_result(
+            {
+                "content": [{"type": "text", "text": "ok"}],
+                "structuredContent": staged_ask,
+                "isError": False,
+            },
+            tool_name="ask_context",
+            expected_manifest=manifest,
+            external_manifest=external_manifest,
+        )
+        self.assertEqual(
+            rebound_ask["structuredContent"]["context_pack"]["snapshot_ref"]["manifest_path"],
+            str(external_manifest),
+        )
+        for unexpected_path in ("/foreign/context.json", str(external_manifest)):
+            with self.subTest(ask_context_non_staged=unexpected_path):
+                invalid_ask = json.loads(json.dumps(staged_ask))
+                invalid_ask["context_pack"]["snapshot_ref"]["manifest_path"] = unexpected_path
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "ask_context snapshot manifest does not match staged manifest",
+                ):
+                    runner._validated_treatment_tool_result(
+                        {
+                            "content": [{"type": "text", "text": "ok"}],
+                            "structuredContent": invalid_ask,
+                            "isError": False,
+                        },
+                        tool_name="ask_context",
+                        expected_manifest=manifest,
+                        external_manifest=external_manifest,
+                    )
 
         nested_drifts = {
             "ask_context": "context_pack",
@@ -4112,6 +4312,1161 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             self.assertIsNone(arguments["repo"])
             self.assertIsNone(arguments["stem"])
+
+    def _codex_live_freshness_evidence(self, *, root: str | None, **overrides):
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(
+                value, Path(directory), repo_root=root
+            )
+            payload = {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "fresh",
+                "reason": "git_head_matches_snapshot",
+                "bundle_manifest": str(manifest),
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+                "does_not_establish": list(
+                    runner.EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH
+                ),
+                "freshness_values": list(runner.EXPECTED_REPOGROUND_FRESHNESS_VALUES),
+                "snapshot_provenance": {"git_commit": COMMIT},
+                "current_provenance": None,
+            }
+            payload.update(overrides)
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "live_freshness",
+                    "arguments": {},
+                    "result": {"structured_content": payload},
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{
+                "sequence": 1,
+                "name": "live_freshness",
+                "status": "success",
+                "duration_ms": 0,
+                "input_bytes": 1,
+                "output_bytes": 1,
+            }]
+            return runner._repoground_evidence_from_codex_events(value, events, calls)
+
+    def test_codex_unhashable_optional_freshness_is_nonfatal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory), repo_root="/tmp/repo")
+            original = {
+                "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+                "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+                "tool": "grounding_verify",
+                "status": "pass",
+                "verdict": {
+                    "kind": "repobrief.answer_grounding_verdict",
+                    "version": "1.0",
+                    "status": "pass",
+                    "snapshot_ref": {
+                        "manifest_path": str(manifest),
+                        "git_commit": COMMIT,
+                        "freshness_status": "fresh",
+                    },
+                },
+                "live_freshness": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v1",
+                    "status": "fresh",
+                    "reason": "git_head_matches_snapshot",
+                    "bundle_manifest": str(manifest),
+                    "repo_root": "/tmp/repo",
+                    "read_only_git_probe": True,
+                    "implicit_refresh": False,
+                    "snapshot_provenance": {"git_commit": COMMIT},
+                },
+            }
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "grounding_verify",
+                    "arguments": {},
+                    "result": {"structured_content": original},
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{"sequence": 1, "name": "grounding_verify", "status": "success"}]
+            with patch.object(
+                runner, "_validated_treatment_structured_payload",
+                return_value=original,
+            ):
+                self.assertIsNotNone(runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                ))
+            for path in (
+                ("verdict", "snapshot_ref", "freshness_status"),
+                ("live_freshness", "status"),
+                ("live_freshness", "bundle_manifest"),
+            ):
+                for bad in ([], {}):
+                    with self.subTest(path=path, bad_type=type(bad).__name__):
+                        payload = copy.deepcopy(original)
+                        field = payload
+                        for name in path[:-1]:
+                            field = field[name]
+                        field[path[-1]] = bad
+                        with patch.object(
+                            runner, "_validated_treatment_structured_payload",
+                            return_value=payload,
+                        ):
+                            self.assertIsNone(runner._repoground_evidence_from_codex_events(
+                                value, events, calls
+                            ))
+
+    def test_codex_fresh_evidence_requires_proven_read_only_probe(self) -> None:
+        valid = self._codex_live_freshness_evidence(root="/tmp/repo")
+        self.assertEqual(valid["calls"][0]["freshness_status"], "fresh")
+        for case, root, overrides in (
+            ("probe_false", "/tmp/repo", {"read_only_git_probe": False}),
+            ("root_none", "/tmp/repo", {"repo_root": None}),
+            ("root_mismatch", "/tmp/repo", {"repo_root": "/tmp/other"}),
+            ("manifest_without_root", None, {}),
+            ("stale_probe_false", "/tmp/repo", {"status": "stale", "read_only_git_probe": False}),
+        ):
+            with self.subTest(case=case):
+                self.assertIsNone(
+                    self._codex_live_freshness_evidence(root=root, **overrides)
+                )
+
+    def test_codex_snapshot_binds_every_status_to_proven_probe(self) -> None:
+        reasons = {
+            "fresh": "git_head_matches_snapshot",
+            "stale": "git_head_differs_from_snapshot",
+            "unknown": "snapshot_working_tree_cleanliness_unavailable",
+            "not_comparable": "current_git_provenance_unavailable",
+        }
+        for status, reason in reasons.items():
+            with self.subTest(status=status, case="valid"):
+                evidence = self._codex_live_freshness_evidence(
+                    root="/tmp/repo", status=status, reason=reason
+                )
+                self.assertEqual(evidence["calls"][0]["freshness_status"], status)
+            for case, overrides in (
+                ("probe_false", {"read_only_git_probe": False}),
+                ("root_none", {"repo_root": None}),
+                ("root_mismatch", {"repo_root": "/tmp/other"}),
+                ("implicit_refresh", {"implicit_refresh": True}),
+            ):
+                with self.subTest(status=status, case=case):
+                    self.assertIsNone(
+                        self._codex_live_freshness_evidence(
+                            root="/tmp/repo", status=status, reason=reason, **overrides
+                        )
+                    )
+        with self.subTest(case="malformed_not_comparable"):
+            self.assertIsNone(
+                self._codex_live_freshness_evidence(
+                    root="/tmp/repo",
+                    status="not_comparable",
+                    reason="random_reason",
+                    read_only_git_probe=False,
+                )
+            )
+
+    def test_codex_preserves_unknown_and_not_comparable_fallbacks(self) -> None:
+        unknown = self._codex_live_freshness_evidence(
+            root="/tmp/repo",
+            status="unknown",
+            reason="git_probe_failed",
+            snapshot_provenance=None,
+        )
+        self.assertEqual(unknown["calls"][0]["freshness_status"], "unknown")
+        fallback = self._codex_live_freshness_evidence(
+            root=None,
+            status="not_comparable",
+            reason="repo_root_not_configured",
+            repo_root=None,
+            read_only_git_probe=False,
+            snapshot_provenance=None,
+        )
+        self.assertEqual(fallback["calls"][0]["freshness_status"], "not_comparable")
+
+    def test_codex_rejects_non_empty_mutation_boundary_writes(self) -> None:
+        with self.assertRaises(runner.RunnerError):
+            runner._validated_treatment_structured_payload(
+                {
+                    "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+                    "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+                    "tool": "ask_context",
+                    "mutation_boundary": {"writes": ["/tmp/x"]},
+                },
+                tool_name="ask_context",
+                expected_manifest=Path("/tmp/m.json"),
+                is_error=False,
+            )
+
+    def test_codex_projects_bound_repoground_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(
+                value, Path(directory), commit=COMMIT.upper(), repo_root="/tmp/repo"
+            )
+            payload = {
+                "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+                "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+                "tool": "ask_context",
+                "status": "ok",
+                "context_pack": {
+                    "kind": "repobrief.ask_context_pack",
+                    "version": "1.0",
+                    "snapshot_ref": {
+                        "manifest_path": str(manifest),
+                        "manifest_sha256": value["repobrief"]["manifest_sha256"],
+                        "git_commit": COMMIT.upper(),
+                        "freshness_status": "fresh",
+                    },
+                    "freshness": {"status": "fresh"},
+                    "resolved_ranges": [
+                        {
+                            "path": "src/example.py",
+                            "status": "resolved",
+                            "text_excerpt": "def example(): ...",
+                            "range_ref": {"ref": "example"},
+                        }
+                    ],
+                    "budget": {"context_bytes_used": 654, "max_context_bytes": 654, "token_derived_byte_ceiling": 654},
+                },
+                "live_freshness": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v1",
+                    "status": "fresh",
+                    "reason": "git_head_matches_snapshot",
+                    "bundle_manifest": str(manifest),
+                    "repo_root": "/tmp/repo",
+                    "read_only_git_probe": True,
+                    "implicit_refresh": False,
+                    "snapshot_provenance": {"git_commit": COMMIT.upper()},
+                },
+            }
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "ask_context",
+                    "arguments": {"query": "example"},
+                    "result": {"structured_content": payload},
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{
+                "sequence": 1,
+                "name": "ask_context",
+                "status": "success",
+                "duration_ms": 0,
+                "input_bytes": 1,
+                "output_bytes": 1,
+            }]
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                evidence = runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                )
+            self.assertEqual(
+                evidence,
+                {
+                    "target_commit": COMMIT,
+                    "bundle_commit": COMMIT,
+                    "calls": [{
+                        "sequence": 1,
+                        "tool": "ask_context",
+                        "freshness_status": "fresh",
+                        "resolved_range_count": 1,
+                        "context_bytes_used": 654,
+                        "grounding_status": None,
+                    }],
+                },
+            )
+
+            events_twice = [events[0], json.loads(json.dumps(events[0]))]
+            calls_twice = [calls[0], {**calls[0], "sequence": 2}]
+            with (
+                patch.object(
+                    runner.base,
+                    "_bound_repoground_manifest",
+                    wraps=runner.base._bound_repoground_manifest,
+                ) as bound_manifest,
+                patch.object(
+                    runner,
+                    "_validated_treatment_structured_payload",
+                    return_value=payload,
+                ),
+            ):
+                repeated = runner._repoground_evidence_from_codex_events(
+                    value, events_twice, calls_twice
+                )
+            self.assertEqual(bound_manifest.call_count, 1)
+            self.assertEqual(len(repeated["calls"]), 2)
+
+    def test_codex_malformed_forbidden_operations_omit_optional_evidence(self) -> None:
+        base_boundary = {
+            "ref": "repobrief.mutation_boundary.read_only_frontdoor.v1",
+            "writes": [],
+            "read_only": True,
+            "forbidden_operations": ["secret_read", "snapshot_create_side_effect"],
+        }
+        for label, forbidden, valid in (
+            ("valid", ["secret_read", "snapshot_create_side_effect"], True),
+            ("nested_object", ["secret_read", "snapshot_create_side_effect", {"x": 1}], False),
+            ("nested_list", ["secret_read", "snapshot_create_side_effect", ["x"]], False),
+            ("number", ["secret_read", "snapshot_create_side_effect", 1], False),
+        ):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                value = request(condition="treatment")
+                manifest = bind_manifest(
+                    value, Path(directory), commit=COMMIT, repo_root="/tmp/repo"
+                )
+                payload = {
+                    "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+                    "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+                    "tool": "ask_context",
+                    "status": "ok",
+                    "request_semantics": "repobrief.ask_request.v1",
+                    "context_pack_semantics": "repobrief.ask_context_pack.v1",
+                    "mutation_boundary": {**base_boundary, "forbidden_operations": forbidden},
+                    "does_not_establish": {
+                        "ref": "repobrief.does_not_establish.default.v1",
+                        "items": list(runner.EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH),
+                    },
+                    "context_pack": {
+                        "kind": "repobrief.ask_context_pack",
+                        "version": "1.0",
+                        "snapshot_ref": {
+                            "manifest_path": str(manifest),
+                            "manifest_sha256": value["repobrief"]["manifest_sha256"],
+                            "git_commit": COMMIT,
+                            "freshness_status": "fresh",
+                        },
+                        "freshness": {"status": "fresh"},
+                        "resolved_ranges": [],
+                        "budget": {"context_bytes_used": 1, "max_context_bytes": 1, "token_derived_byte_ceiling": 1},
+                    },
+                    "live_freshness": {
+                        "kind": "repobrief.live_freshness",
+                        "version": "v1",
+                        "status": "fresh",
+                        "reason": "git_head_matches_snapshot",
+                        "bundle_manifest": str(manifest),
+                        "repo_root": "/tmp/repo",
+                        "read_only_git_probe": True,
+                        "implicit_refresh": False,
+                        "snapshot_provenance": {"git_commit": COMMIT},
+                    },
+                }
+                events = [{
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "ask_context",
+                        "arguments": {"query": "example"},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }]
+                calls = [{
+                    "sequence": 1, "name": "ask_context", "status": "success",
+                    "duration_ms": 0, "input_bytes": 1, "output_bytes": 1,
+                }]
+                with (
+                    patch.object(runner.base, "_validated_ask_context_pack", return_value=None),
+                    patch.object(
+                        runner.base, "_validated_live_freshness_payload",
+                        return_value=payload["live_freshness"],
+                    ),
+                ):
+                    if not valid:
+                        with self.assertRaises(runner.RunnerError):
+                            runner.base._validated_read_only_frontdoor_projection(payload)
+                    evidence = runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                if valid:
+                    self.assertEqual(evidence["calls"][0]["tool"], "ask_context")
+                else:
+                    self.assertIsNone(evidence)
+
+    def test_codex_structured_language_ranges_projection(self) -> None:
+        lang = {
+            "artifact_role": "language_structure_json",
+            "status": "resolved",
+            "range_ref": {
+                "ref": "rust:fn:main", "path": "src/main.rs",
+                "range": {"start_line": 3, "end_line": 9},
+            },
+            "source_path": "src/main.rs",
+            "source_line_range": {"start_line": 3, "end_line": 9},
+        }
+        canonical = {
+            "artifact_role": "canonical_md", "status": "resolved",
+            "range_ref": {"ref": "c1"}, "text_excerpt": "def example(): ...",
+        }
+        broken = copy.deepcopy(lang)
+        broken["range_ref"]["range"]["start_line"] = True
+        cases = [
+            ([lang, canonical], 2),
+            ([lang], 1),
+            ([{"status": "resolved"}], None),
+            ([{"status": "resolved", "range_ref": {"junk": "x"}, "text_excerpt": "fake"}], None),
+            ([{"artifact_role": "language_structure_json", "status": "resolved"}], None),
+            ([broken], None),
+            ([canonical, {**lang, "source_path": ""}], None),
+        ]
+        for ranges, expected in cases:
+            with self.subTest(ranges=ranges), tempfile.TemporaryDirectory() as directory:
+                value = request(condition="treatment")
+                manifest = bind_manifest(
+                    value, Path(directory), commit=COMMIT.upper(), repo_root="/tmp/repo"
+                )
+                payload = {
+                    "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+                    "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+                    "tool": "ask_context",
+                    "status": "ok",
+                    "context_pack": {
+                        "kind": "repobrief.ask_context_pack",
+                        "version": "1.0",
+                        "snapshot_ref": {
+                            "manifest_path": str(manifest),
+                            "manifest_sha256": value["repobrief"]["manifest_sha256"],
+                            "git_commit": COMMIT.upper(),
+                            "freshness_status": "fresh",
+                        },
+                        "freshness": {"status": "fresh"},
+                        "resolved_ranges": ranges,
+                        "budget": {"context_bytes_used": 10, "max_context_bytes": 10, "token_derived_byte_ceiling": 10},
+                    },
+                    "live_freshness": {
+                        "kind": "repobrief.live_freshness",
+                        "version": "v1",
+                        "status": "fresh",
+                        "reason": "git_head_matches_snapshot",
+                        "bundle_manifest": str(manifest),
+                        "repo_root": "/tmp/repo",
+                        "read_only_git_probe": True,
+                        "implicit_refresh": False,
+                        "snapshot_provenance": {"git_commit": COMMIT.upper()},
+                    },
+                }
+                events = [{
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "ask_context",
+                        "arguments": {"query": "example"},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }]
+                calls = [{
+                    "sequence": 1, "name": "ask_context", "status": "success",
+                    "duration_ms": 0, "input_bytes": 1, "output_bytes": 1,
+                }]
+                with patch.object(
+                    runner,
+                    "_validated_treatment_structured_payload",
+                    return_value=payload,
+                ):
+                    evidence = runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                if expected is None:
+                    self.assertIsNone(evidence)
+                else:
+                    self.assertEqual(
+                        evidence["calls"][0]["resolved_range_count"], expected
+                    )
+
+    def test_codex_shared_validator_enforces_hard_context_byte_ceilings(self) -> None:
+        def pack(used: int, limit: int, ceiling: int) -> dict:
+            return {
+                "kind": runner.EXPECTED_ASK_CONTEXT_PACK_KIND,
+                "version": runner.EXPECTED_ASK_CONTEXT_PACK_VERSION,
+                "request_id": "0123456789abcdef",
+                "snapshot_ref": {},
+                "freshness": {"status": "fresh"},
+                "availability": {"status": "available"},
+                "required_reading": {"status": "available"},
+                "retrieval": {},
+                "retrieval_infrastructure": {"status": "available"},
+                "retrieval_hits": [],
+                "resolved_ranges": [],
+                "answer_scaffold": {
+                    "citation_obligations": [],
+                    "caveats_to_surface": [],
+                    "non_claims_to_surface": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+                },
+                "budget": {
+                    "max_context_tokens": 4,
+                    "token_derived_byte_ceiling": ceiling,
+                    "max_context_bytes": limit,
+                    "max_answer_tokens": 1,
+                    "context_bytes_used": used,
+                    "context_unicode_characters_used": 1000,
+                    "approx_context_chars_used": 1000,
+                    "byte_budget_is_hard": True,
+                    "unit": "utf8_bytes",
+                    "accounting": "pinned test contract",
+                    "omissions": [],
+                    "truncated": False,
+                    "does_not_establish_quality": True,
+                },
+                "forbidden_operations": list(runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS),
+                "does_not_establish": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+            }
+
+        cases = (
+            ("used_zero", 0, 8, 16, True),
+            ("used_equals_both_limits", 16, 16, 16, True),
+            ("used_equals_lower_requested_limit", 8, 8, 16, True),
+            ("used_over_requested_limit", 2, 1, 16, False),
+            ("used_over_token_ceiling", 2, 1, 1, False),
+            ("requested_limit_over_ceiling", 1, 32, 16, False),
+        )
+        for name, used, limit, ceiling, accepted in cases:
+            with self.subTest(case=name):
+                value = pack(used, limit, ceiling)
+                if accepted:
+                    self.assertEqual(
+                        runner._validated_ask_context_pack(value)["budget"][
+                            "context_bytes_used"
+                        ],
+                        used,
+                    )
+                else:
+                    with self.assertRaises(runner.RunnerError):
+                        runner._validated_ask_context_pack(value)
+
+    def test_codex_direct_projection_rejects_over_ceiling_context_bytes(self) -> None:
+        for name, used, limit, ceiling, expected in (
+            ("used_zero", 0, 4, 4, 0),
+            ("used_equals_limits", 4, 4, 4, 4),
+            ("over_requested_limit", 2, 1, 4, None),
+            ("over_token_ceiling", 2, 1, 1, None),
+        ):
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                value = request(condition="treatment")
+                manifest = bind_manifest(
+                    value, Path(directory), commit=COMMIT.upper(), repo_root="/tmp/repo"
+                )
+                snapshot_ref = {
+                    "manifest_path": str(manifest),
+                    "manifest_sha256": value["repobrief"]["manifest_sha256"],
+                    "git_commit": COMMIT.upper(),
+                    "freshness_status": "fresh",
+                }
+                payload = {
+                    "kind": "repobrief.mcp.read_only_frontdoor",
+                    "version": "v1",
+                    "tool": "ask_context",
+                    "status": "ok",
+                    "context_pack": {
+                        "kind": "repobrief.ask_context_pack",
+                        "version": "1.0",
+                        "snapshot_ref": snapshot_ref,
+                        "freshness": {"status": "fresh"},
+                        "resolved_ranges": [],
+                        "budget": {
+                            "context_bytes_used": used,
+                            "max_context_bytes": limit,
+                            "token_derived_byte_ceiling": ceiling,
+                        },
+                    },
+                    "live_freshness": {
+                        "kind": "repobrief.live_freshness",
+                        "version": "v1",
+                        "status": "fresh",
+                        "reason": "git_head_matches_snapshot",
+                        "bundle_manifest": str(manifest),
+                        "repo_root": "/tmp/repo",
+                        "read_only_git_probe": True,
+                        "implicit_refresh": False,
+                        "snapshot_provenance": {"git_commit": COMMIT.upper()},
+                    },
+                }
+                events = [{
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "ask_context",
+                        "arguments": {"query": "example"},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }]
+                calls = [{
+                    "sequence": 1, "name": "ask_context", "status": "success",
+                    "duration_ms": 0, "input_bytes": 1, "output_bytes": 1,
+                }]
+                with patch.object(
+                    runner,
+                    "_validated_treatment_structured_payload",
+                    return_value=payload,
+                ):
+                    evidence = runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                if expected is None:
+                    self.assertIsNone(evidence)
+                else:
+                    self.assertEqual(
+                        evidence["calls"][0]["context_bytes_used"], expected
+                    )
+
+    def test_codex_foreign_manifest_kind_omits_optional_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            raw = json.dumps(
+                {
+                    "kind": "something.else",
+                    "version": "2.0",
+                    "snapshotProvenance": {"repositories": [{"git_commit": COMMIT}]},
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            manifest.write_bytes(raw)
+            value["repobrief"]["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+            with self.assertRaisesRegex(runner.base.RunnerError, "kind is invalid"):
+                runner.base._bound_repoground_manifest(value)
+            self.assertIsNone(runner.base._optional_repoground_manifest_binding(value))
+
+    def test_codex_manifest_bind_failure_omits_optional_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            malformed = {
+                "kind": "repoground.bundle.manifest",
+                "version": "2.0",
+                "snapshotProvenance": {"repositories": []},
+            }
+            raw = json.dumps(
+                malformed, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            manifest.write_bytes(raw)
+            value["repobrief"]["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+            payload = {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "fresh",
+                "reason": "git_head_matches_snapshot",
+                "bundle_manifest": str(manifest),
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+                "snapshot_provenance": {"git_commit": COMMIT},
+            }
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "live_freshness",
+                    "arguments": {},
+                    "result": {"structured_content": payload},
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{
+                "sequence": 1,
+                "name": "live_freshness",
+                "status": "success",
+                "duration_ms": 0,
+                "input_bytes": 1,
+                "output_bytes": 1,
+            }]
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                self.assertIsNone(
+                    runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                )
+
+    def test_codex_rejects_conflicting_grounding_freshness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory), commit=COMMIT)
+            payload = {
+                "kind": runner.EXPECTED_REPOGROUND_READ_ONLY_KIND,
+                "version": runner.EXPECTED_REPOGROUND_READ_ONLY_VERSION,
+                "tool": "grounding_verify",
+                "status": "pass",
+                "verdict": {
+                    "kind": "repobrief.answer_grounding_verdict",
+                    "version": "1.0",
+                    "status": "pass",
+                    "snapshot_ref": {
+                        "manifest_path": str(manifest),
+                        "git_commit": COMMIT,
+                        "freshness_status": "fresh",
+                    },
+                },
+                "live_freshness": {
+                    "kind": "repobrief.live_freshness",
+                    "version": "v1",
+                    "status": "stale",
+                    "reason": "git_head_differs_from_snapshot",
+                    "bundle_manifest": str(manifest),
+                    "repo_root": "/tmp/repo",
+                    "read_only_git_probe": True,
+                    "implicit_refresh": False,
+                    "snapshot_provenance": {"git_commit": COMMIT},
+                },
+            }
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "grounding_verify",
+                    "arguments": {},
+                    "result": {"structured_content": payload},
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{
+                "sequence": 1,
+                "name": "grounding_verify",
+                "status": "success",
+                "duration_ms": 0,
+                "input_bytes": 1,
+                "output_bytes": 1,
+            }]
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                self.assertIsNone(
+                    runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                )
+
+    def test_codex_projects_bound_not_comparable_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(value, Path(directory))
+            payload = {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "not_comparable",
+                "reason": "repo_root_not_configured",
+                "bundle_manifest": str(Path(directory) / "other.bundle.manifest.json"),
+                "repo_root": None,
+                "read_only_git_probe": False,
+                "implicit_refresh": False,
+            }
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "live_freshness",
+                    "arguments": {},
+                    "result": {"structured_content": payload},
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{
+                "sequence": 1,
+                "name": "live_freshness",
+                "status": "success",
+                "duration_ms": 0,
+                "input_bytes": 1,
+                "output_bytes": 1,
+            }]
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                evidence = runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                )
+            self.assertIsNone(evidence)
+
+            payload["bundle_manifest"] = str(manifest)
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                evidence = runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                )
+            self.assertEqual(
+                evidence,
+                {
+                    "target_commit": COMMIT,
+                    "bundle_commit": COMMIT,
+                    "calls": [{
+                        "sequence": 1,
+                        "tool": "live_freshness",
+                        "freshness_status": "not_comparable",
+                        "resolved_range_count": None,
+                        "context_bytes_used": None,
+                        "grounding_status": None,
+                    }],
+                },
+            )
+
+    def test_codex_projects_strict_unknown_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(
+                value, Path(directory), repo_root="/tmp/repo"
+            )
+            payload = {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "unknown",
+                "reason": "git_probe_failed",
+                "bundle_manifest": str(manifest),
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+            }
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "live_freshness",
+                    "arguments": {},
+                    "result": {"structured_content": payload},
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{
+                "sequence": 1,
+                "name": "live_freshness",
+                "status": "success",
+                "duration_ms": 0,
+                "input_bytes": 1,
+                "output_bytes": 1,
+            }]
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                evidence = runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                )
+            self.assertEqual(evidence["calls"][0]["freshness_status"], "unknown")
+
+            payload["repo_root"] = "/tmp/other-repo"
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                self.assertIsNone(
+                    runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                )
+
+            payload["repo_root"] = "/tmp/repo"
+            payload["implicit_refresh"] = True
+            with patch.object(
+                runner,
+                "_validated_treatment_structured_payload",
+                return_value=payload,
+            ):
+                self.assertIsNone(
+                    runner._repoground_evidence_from_codex_events(
+                        value, events, calls
+                    )
+                )
+
+    def test_malformed_completed_event_metadata_fails_closed(self) -> None:
+        value = request(condition="treatment")
+        for field, malformed in (("type", {}), ("tool", [])):
+            with self.subTest(field=field):
+                events = [json.loads(line) for line in stream(value).splitlines()]
+                completed = next(
+                    event for event in events
+                    if event.get("type") == "item.completed"
+                    and event["item"].get("type") == "command_execution"
+                )
+                if field == "type":
+                    completed["item"]["type"] = malformed
+                else:
+                    completed["item"] = {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": malformed,
+                        "arguments": {},
+                        "result": {},
+                        "error": None,
+                        "status": "completed",
+                    }
+                raw = b"".join(
+                    json.dumps(event, sort_keys=True).encode("utf-8") + b"\n"
+                    for event in events
+                )
+                now = datetime.now(timezone.utc)
+                error = (
+                    "Codex completed item type must be a string"
+                    if field == "type"
+                    else "unapproved Codex MCP tool call"
+                )
+                with self.assertRaisesRegex(runner.RunnerError, error):
+                    runner.receipt(value, raw, "transcript.jsonl", 0, now, now)
+                self.assertIsNone(
+                    runner._repoground_evidence_from_codex_events(
+                        value,
+                        events,
+                        [{
+                            "sequence": 1,
+                            "name": "repobrief_resource_read",
+                            "status": "success",
+                        }],
+                    )
+                )
+
+    def test_surrogate_resource_read_does_not_abort_completed_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            bind_manifest(value, Path(directory), repo_root="/tmp/repo")
+            uri = "repoground://snapshot/demo/canonical"
+            resource = {
+                "contents": [{"uri": uri, "text": "\ud800", "mimeType": "text/plain"}],
+                "_meta": {"repoground": {
+                    "status": "available",
+                    "implicitRefresh": False,
+                    "snapshotContext": {},
+                    "identity": {},
+                    "liveFreshness": {},
+                }},
+            }
+            events = [
+                json.loads(line)
+                for line in stream(value).splitlines()
+            ]
+            tool_event = next(
+                event for event in events
+                if event.get("type") == "item.completed"
+                and event["item"].get("type") == "command_execution"
+            )
+            tool_event["item"] = {
+                "type": "mcp_tool_call",
+                "server": "repobrief",
+                "tool": "repobrief_resource_read",
+                "arguments": {"action": "read", "uri": uri},
+                "result": {"content": [{
+                    "type": "text",
+                    "text": json.dumps(resource, sort_keys=True),
+                }]},
+                "error": None,
+                "status": "completed",
+            }
+            transcript = b"".join(
+                json.dumps(event, sort_keys=True).encode("utf-8") + b"\n"
+                for event in events
+            )
+            now = datetime.now(timezone.utc)
+            receipt = runner.receipt(
+                value, transcript, "transcript.jsonl", 0, now, now
+            )
+            self.assertEqual(receipt["status"], "success")
+            self.assertEqual(receipt["tool_calls"][0]["status"], "success")
+            self.assertNotIn("repoground_evidence", receipt)
+
+    def test_codex_projects_revision_bound_resource_read_not_list(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            manifest = bind_manifest(
+                value, Path(directory), repo_root="/tmp/repo"
+            )
+            uri = "repoground://snapshot/demo/canonical"
+            live_freshness = {
+                "kind": "repobrief.live_freshness",
+                "version": "v1",
+                "status": "fresh",
+                "reason": "git_head_matches_snapshot",
+                "bundle_manifest": str(manifest),
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+                "snapshot_provenance": {"git_commit": COMMIT},
+            }
+            resource = {
+                "contents": [{
+                    "uri": uri,
+                    "text": "# Demo\n",
+                    "mimeType": "text/markdown",
+                }],
+                "_meta": {
+                    "repoground": {
+                        "status": "available",
+                        "implicitRefresh": False,
+                        "snapshotContext": {},
+                        "identity": {},
+                        "liveFreshness": live_freshness,
+                    }
+                },
+            }
+            result = {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(resource, sort_keys=True),
+                }]
+            }
+            events = [{
+                "type": "item.completed",
+                "item": {
+                    "type": "mcp_tool_call",
+                    "server": "repobrief",
+                    "tool": "repobrief_resource_read",
+                    "arguments": {"action": "read", "uri": uri},
+                    "result": result,
+                    "error": None,
+                    "status": "completed",
+                },
+            }]
+            calls = [{
+                "sequence": 1,
+                "name": "repobrief_resource_read",
+                "status": "success",
+                "duration_ms": 0,
+                "input_bytes": 1,
+                "output_bytes": 1000,
+            }]
+            self.assertEqual(
+                runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                ),
+                {
+                    "target_commit": COMMIT,
+                    "bundle_commit": COMMIT,
+                    "calls": [{
+                        "sequence": 1,
+                        "tool": "repobrief_resource_read",
+                        "freshness_status": "fresh",
+                        "resolved_range_count": None,
+                        "context_bytes_used": len("# Demo\n".encode("utf-8")),
+                        "grounding_status": None,
+                    }],
+                },
+            )
+
+            bad_surrogate_resource = json.loads(json.dumps(resource))
+            bad_surrogate_resource["contents"][0]["text"] = "\ud800"
+            events[0]["item"]["result"] = {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(bad_surrogate_resource, sort_keys=True),
+                }],
+            }
+            self.assertIsNone(
+                runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                )
+            )
+
+            unknown = json.loads(json.dumps(resource))
+            unknown_freshness = unknown["_meta"]["repoground"]["liveFreshness"]
+            unknown_freshness.update({
+                "status": "unknown",
+                "reason": "git_probe_failed",
+                "repo_root": "/tmp/repo",
+                "read_only_git_probe": True,
+                "implicit_refresh": False,
+            })
+            unknown_freshness.pop("snapshot_provenance")
+            events[0]["item"]["result"] = {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(unknown, sort_keys=True),
+                }]
+            }
+            unknown_evidence = runner._repoground_evidence_from_codex_events(
+                value, events, calls
+            )
+            self.assertEqual(
+                unknown_evidence["calls"][0]["freshness_status"], "unknown"
+            )
+
+            unknown_freshness["repo_root"] = "/tmp/other-repo"
+            events[0]["item"]["result"] = {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps(unknown, sort_keys=True),
+                }]
+            }
+            self.assertIsNone(
+                runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                )
+            )
+
+            events[0]["item"]["result"] = result
+            for name, updates, removals in [
+                ("implicit_refresh_true", {"implicit_refresh": True}, ()),
+                ("missing_implicit_refresh", {}, ("implicit_refresh",)),
+            ]:
+                with self.subTest(name=name):
+                    invalid = json.loads(json.dumps(resource))
+                    freshness = invalid["_meta"]["repoground"]["liveFreshness"]
+                    freshness.update(updates)
+                    for field in removals:
+                        freshness.pop(field)
+                    events[0]["item"]["result"] = {
+                        "content": [{
+                            "type": "text",
+                            "text": json.dumps(invalid, sort_keys=True),
+                        }]
+                    }
+                    self.assertIsNone(
+                        runner._repoground_evidence_from_codex_events(
+                            value, events, calls
+                        )
+                    )
+
+            events[0]["item"]["result"] = result
+            events[0]["item"]["arguments"] = {"action": "list"}
+            self.assertIsNone(
+                runner._repoground_evidence_from_codex_events(
+                    value, events, calls
+                )
+            )
 
     def test_normalize_rejects_boolean_token_counts(self) -> None:
         for field, value in (('input_tokens', True), ('output_tokens', False)):
