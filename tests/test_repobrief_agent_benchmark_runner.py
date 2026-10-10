@@ -2546,6 +2546,57 @@ class RepoBriefAgentBenchmarkRunnerTests(unittest.TestCase):
                     self._evidence_for_payload(tool, payload, fill=False)
                 )
 
+    def test_surrogate_resource_read_does_not_abort_completed_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            bind_manifest(value, Path(directory))
+            uri = "repoground://snapshot/demo/canonical"
+            messages = runner.parse_jsonl(
+                stream(value, tool_name="ReadMcpResource")
+            )
+            use = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_use"
+            )
+            use["input"] = {"uri": uri}
+            result = next(
+                block
+                for message in messages
+                for block in runner._list(
+                    runner._mapping(message.get("message")).get("content")
+                )
+                if runner._mapping(block).get("type") == "tool_result"
+            )
+            result["content"] = json.dumps({
+                "contents": [{"uri": uri, "text": "\ud800", "mimeType": "text/plain"}],
+                "_meta": {"repoground": {
+                    "status": "available",
+                    "implicitRefresh": False,
+                    "snapshotContext": {},
+                    "identity": {},
+                    "liveFreshness": {},
+                }},
+            })
+            transcript = b"".join(
+                runner._canonical_json(message).encode("utf-8") + b"\n"
+                for message in messages
+            )
+            now = datetime.now(timezone.utc)
+            receipt = runner.build_receipt(
+                value, transcript,
+                transcript_artifact="transcript.jsonl",
+                returncode=0,
+                started_at=now,
+                ended_at=now,
+            )
+            self.assertEqual(receipt["status"], "success")
+            self.assertEqual(receipt["tool_calls"][0]["status"], "success")
+            self.assertNotIn("repoground_evidence", receipt)
+
     def test_invalid_tool_kind_does_not_fail_completed_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")

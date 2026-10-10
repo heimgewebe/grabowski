@@ -5215,6 +5215,54 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     )
                 )
 
+    def test_surrogate_resource_read_does_not_abort_completed_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            value = request(condition="treatment")
+            bind_manifest(value, Path(directory), repo_root="/tmp/repo")
+            uri = "repoground://snapshot/demo/canonical"
+            resource = {
+                "contents": [{"uri": uri, "text": "\ud800", "mimeType": "text/plain"}],
+                "_meta": {"repoground": {
+                    "status": "available",
+                    "implicitRefresh": False,
+                    "snapshotContext": {},
+                    "identity": {},
+                    "liveFreshness": {},
+                }},
+            }
+            events = [
+                json.loads(line)
+                for line in stream(value).splitlines()
+            ]
+            tool_event = next(
+                event for event in events
+                if event.get("type") == "item.completed"
+                and event["item"].get("type") == "command_execution"
+            )
+            tool_event["item"] = {
+                "type": "mcp_tool_call",
+                "server": "repobrief",
+                "tool": "repobrief_resource_read",
+                "arguments": {"action": "read", "uri": uri},
+                "result": {"content": [{
+                    "type": "text",
+                    "text": json.dumps(resource, sort_keys=True),
+                }]},
+                "error": None,
+                "status": "completed",
+            }
+            transcript = b"".join(
+                json.dumps(event, sort_keys=True).encode("utf-8") + b"\n"
+                for event in events
+            )
+            now = datetime.now(timezone.utc)
+            receipt = runner.receipt(
+                value, transcript, "transcript.jsonl", 0, now, now
+            )
+            self.assertEqual(receipt["status"], "success")
+            self.assertEqual(receipt["tool_calls"][0]["status"], "success")
+            self.assertNotIn("repoground_evidence", receipt)
+
     def test_codex_projects_revision_bound_resource_read_not_list(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
