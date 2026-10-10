@@ -910,11 +910,28 @@ class GrokReviewRoleTests(unittest.TestCase):
                         expected_base_head="b" * 40, review_diff=content,
                     )
 
-    def test_claude_result_requires_successful_typed_envelope(self) -> None:
-        clean = {
+    @staticmethod
+    def _clean_claude_success_envelope() -> dict:
+        """Document the observed successful-review metadata contract."""
+        return {
             "type": "result", "subtype": "success", "is_error": False,
+            "permission_denials": [],
+            "usage": {"server_tool_use": {
+                "web_search_requests": 0, "web_fetch_requests": 0,
+            }},
+            "modelUsage": {"claude-opus-5-5": {"webSearchRequests": 0}},
+            "subagent_stats": {
+                "spawned": 0,
+                "requested": {"background": 0, "foreground": 0, "unset": 0},
+                "refused": {
+                    "depth_limit": 0, "concurrency_limit": 0, "budget": 0,
+                },
+            },
             "structured_output": {"verdict": "PASS", "findings": []},
         }
+
+    def test_claude_result_requires_successful_typed_envelope(self) -> None:
+        clean = self._clean_claude_success_envelope()
         review, error, metadata = role._extract_claude_review_document(
             json.dumps(clean).encode()
         )
@@ -952,26 +969,27 @@ class GrokReviewRoleTests(unittest.TestCase):
 
     def test_claude_result_rejects_server_web_and_subagent_activity(self) -> None:
         """A success envelope cannot conceal server-side web or subagent effects."""
-        base = {
-            "type": "result", "subtype": "success", "is_error": False,
-            "permission_denials": [],
-            "structured_output": {"verdict": "PASS", "findings": []},
-        }
-        clean_metadata = {
-            "usage": {"server_tool_use": {
-                "web_search_requests": 0, "web_fetch_requests": 0,
-            }},
-            "modelUsage": {"claude-opus-5-5": {"webSearchRequests": 0}},
-            "subagent_stats": {"spawned": 0},
-        }
+        base = self._clean_claude_success_envelope()
         document, error, _metadata = role._extract_claude_review_document(
-            json.dumps({**base, **clean_metadata}).encode()
+            json.dumps(base).encode()
         )
         self.assertIsNone(error)
         self.assertEqual(base["structured_output"], json.loads(document))
 
         forbidden = (
             {"usage": {"server_tool_use": {"web_search_requests": 1}}},
+            {"usage": {"server_tool_use": {
+                "web_search_requests": 0, "web_fetch_requests": 0,
+                "code_execution_requests": 1,
+            }}},
+            {"usage": {"server_tool_use": {
+                "web_search_requests": 0, "web_fetch_requests": 0,
+                "code_execution_requests": True,
+            }}},
+            {"usage": {"server_tool_use": {
+                "web_search_requests": 0, "web_fetch_requests": 0,
+                "code_execution_requests": "0",
+            }}},
             {"usage": {"server_tool_use": {"web_fetch_requests": 1}}},
             {"modelUsage": {"claude-opus-5-5": {"webSearchRequests": 1}}},
             {"modelUsage": {"claude-opus-5-5": {"webFetchRequests": 1}}},
@@ -991,6 +1009,132 @@ class GrokReviewRoleTests(unittest.TestCase):
                 self.assertIsNone(document)
                 self.assertIsNotNone(error)
 
+    def test_claude_result_rejects_attempted_or_refused_subagents(self) -> None:
+        """CLI 2.1.285: spawned=0 excludes neither requested nor refused attempts."""
+        clean = self._clean_claude_success_envelope()
+        stats = clean["subagent_stats"]
+        accepted, error, _ = role._extract_claude_review_document(
+            json.dumps(clean).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(clean["structured_output"], json.loads(accepted))
+
+        # Unknown future activity counters are admitted only as typed zeros.
+        for category in ("requested", "refused"):
+            future_zero = {
+                **clean,
+                "subagent_stats": {
+                    **stats,
+                    category: {**stats[category], "future_counter": 0},
+                },
+            }
+            document, rejected, _ = role._extract_claude_review_document(
+                json.dumps(future_zero).encode()
+            )
+            self.assertIsNone(rejected)
+            self.assertEqual(clean["structured_output"], json.loads(document))
+
+        for category in ("requested", "refused"):
+            required = stats[category]
+            for key in (*required, "future_counter"):
+                for invalid_value in (1, -1, True, "0"):
+                    with self.subTest(category=category, key=key, value=invalid_value):
+                        modified = {
+                            **clean,
+                            "subagent_stats": {
+                                **stats,
+                                category: {**required, key: invalid_value},
+                            },
+                        }
+                        document, rejected, _ = role._extract_claude_review_document(
+                            json.dumps(modified).encode()
+                        )
+                        self.assertIsNone(document)
+                        self.assertIsNotNone(rejected)
+
+            for missing_key in required:
+                with self.subTest(category=category, missing_key=missing_key):
+                    modified = {
+                        **clean,
+                        "subagent_stats": {
+                            **stats,
+                            category: {
+                                key: value for key, value in required.items()
+                                if key != missing_key
+                            },
+                        },
+                    }
+                    document, rejected, _ = role._extract_claude_review_document(
+                        json.dumps(modified).encode()
+                    )
+                    self.assertIsNone(document)
+                    self.assertIsNotNone(rejected)
+
+            for invalid in (None, False, 0, "0", [], {}):
+                with self.subTest(category=category, malformed=invalid):
+                    modified = {
+                        **clean,
+                        "subagent_stats": {**stats, category: invalid},
+                    }
+                    document, rejected, _ = role._extract_claude_review_document(
+                        json.dumps(modified).encode()
+                    )
+                    self.assertIsNone(document)
+                    self.assertIsNotNone(rejected)
+
+            missing = {key: value for key, value in stats.items() if key != category}
+            document, rejected, _ = role._extract_claude_review_document(
+                json.dumps({**clean, "subagent_stats": missing}).encode()
+            )
+            self.assertIsNone(document)
+            self.assertIsNotNone(rejected)
+
+    def test_claude_result_requires_explicit_zero_activity_proof(self) -> None:
+        """Missing fields must not be promoted to tool-free execution."""
+        complete = self._clean_claude_success_envelope()
+        for missing in (
+            "permission_denials", "usage", "modelUsage", "subagent_stats",
+        ):
+            with self.subTest(missing=missing):
+                incomplete = {
+                    key: value for key, value in complete.items()
+                    if key != missing
+                }
+                document, error, _ = role._extract_claude_review_document(
+                    json.dumps(incomplete).encode()
+                )
+                self.assertIsNone(document)
+                self.assertIsNotNone(error)
+        for incomplete in (
+            {**complete, "usage": {"server_tool_use": {}}},
+            {**complete, "usage": {"server_tool_use": {
+                "web_search_requests": 0,
+            }}},
+            {**complete, "modelUsage": {
+                "claude-opus-5-5": {},
+            }},
+            {**complete, "subagent_stats": {}},
+        ):
+            with self.subTest(incomplete=incomplete):
+                document, error, _ = role._extract_claude_review_document(
+                    json.dumps(incomplete).encode()
+                )
+                self.assertIsNone(document)
+                self.assertIsNotNone(error)
+
+        # Newly introduced activity counters may be present but must be zero.
+        future_zero = {
+            **complete, "usage": {"server_tool_use": {
+                **complete["usage"]["server_tool_use"],
+                "code_execution_requests": 0,
+            }},
+        }
+        document, error, _ = role._extract_claude_review_document(
+            json.dumps(future_zero).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(complete["structured_output"], json.loads(document))
+
     def test_claude_structured_findings_revalidated_locally(self) -> None:
         valid_finding = {
             "severity": "P2", "path": "src/role.py", "line": 12,
@@ -999,7 +1143,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             "minimal_fix": "Validate the exact finding fields before signing",
         }
         envelope = {
-            "type": "result", "subtype": "success", "is_error": False,
+            **self._clean_claude_success_envelope(),
             "structured_output": {
                 "verdict": "NEEDS_CHANGE", "findings": [valid_finding],
             },
@@ -1065,10 +1209,7 @@ class GrokReviewRoleTests(unittest.TestCase):
     def test_dirty_claude_main_uses_same_verified_patch_as_grok(self) -> None:
         head, base, binding = "a" * 40, "b" * 40, "c" * 64
         patch = b"diff --git a/app.py b/app.py\n+frozen writer change\n"
-        envelope = json.dumps({
-            "type": "result", "subtype": "success", "is_error": False,
-            "structured_output": {"verdict": "PASS", "findings": []},
-        }).encode()
+        envelope = json.dumps(self._clean_claude_success_envelope()).encode()
         completed = SimpleNamespace(
             returncode=0, stdout_sha256=hashlib.sha256(envelope).hexdigest(),
             stderr_sha256=hashlib.sha256(b"").hexdigest(),
@@ -1211,10 +1352,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             head, base, workspace = "a" * 40, "b" * 40, "c" * 64
             frozen_diff = b"diff --git a/source b/source\\n+only reviewed bytes\\n"
             prompt = b"exact immutable review input"
-            envelope = json.dumps({
-                "type": "result", "subtype": "success", "is_error": False,
-                "structured_output": {"verdict": "PASS", "findings": []},
-            }).encode()
+            envelope = json.dumps(self._clean_claude_success_envelope()).encode()
             completed = SimpleNamespace(
                 returncode=0,
                 stdout_sha256=hashlib.sha256(envelope).hexdigest(),
