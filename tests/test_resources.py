@@ -59,6 +59,45 @@ class ResourceTests(unittest.TestCase):
         self.patch.stop()
         self.temporary.cleanup()
 
+    def test_resource_writer_connections_are_closed_across_lease_lifecycle(self) -> None:
+        # SQLite's connection context manager commits but does not close.
+        # Hold references to every connection so garbage collection cannot
+        # accidentally conceal a leaked WAL writer on either Python version.
+        key = "component:resource-writer-close-regression"
+        owner = "operator:resource-writer-close-regression"
+        original_database = resources._database
+        opened: list[sqlite3.Connection] = []
+
+        def record_connection() -> sqlite3.Connection:
+            connection = original_database()
+            opened.append(connection)
+            return connection
+
+        with patch.object(resources, "_database", side_effect=record_connection):
+            resources.acquire_resources(owner, [key], purpose="test connection close")
+            self.assertTrue(opened)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+            opened.clear()
+
+            lease = resources.inspect_resource(key)
+            self.assertIsNotNone(lease)
+            self.assertTrue(opened)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+            opened.clear()
+
+            resources.release_resources(owner, [key])
+            self.assertTrue(opened)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+
+        self.assertFalse(Path(str(self.database) + "-wal").exists())
+        self.assertFalse(Path(str(self.database) + "-shm").exists())
+
     def scope_manifest(
         self, repository: Path, *, name: str, path: Path, effects: list[str] | None = None
     ) -> dict[str, object]:

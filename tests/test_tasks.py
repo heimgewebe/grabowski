@@ -5817,10 +5817,7 @@ class TaskTests(unittest.TestCase):
             )
         )
 
-    # A readiness-proof test must not run the separately tested archived-output
-    # cleanup writer, which can keep SQLite WAL sidecars live on Python 3.12.
-    @patch.object(tasks, "_attach_task_output_cleanup", side_effect=lambda result: result)
-    def test_reconcile_ready_proof_requires_authorized_quiescent_refresh_and_current_revisions(self, _cleanup) -> None:
+    def test_reconcile_ready_proof_requires_authorized_quiescent_refresh_and_current_revisions(self) -> None:
         # Build both existing stores without launching a process.
         with tasks._database_connection():
             pass

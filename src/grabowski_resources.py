@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime
 import hashlib
 import json
@@ -6257,7 +6257,8 @@ def acquire_resources(
     expires = now + ttl
     reclaimed: list[dict[str, Any]] = []
     preserved: list[str] = []
-    with _database() as connection:
+    # Releasing the SQLite connection is distinct from committing its transaction.
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             if task_owner_match is not None:
@@ -7948,7 +7949,7 @@ def release_resources(
         )
         expected_by_key = {item["resource_key"]: item for item in snapshots}
     released: list[dict[str, Any]] = []
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             placeholders = ",".join("?" for _ in keys)
@@ -8006,7 +8007,7 @@ def inspect_resource(
     now = _now()
     # The public READ_ONLY inspector may never initialize, migrate or copy
     # a WAL store, including on a deny/kill-switch/audit failure.
-    source = _resource_readonly_snapshot() if read_only else _database()
+    source = _resource_readonly_snapshot() if read_only else closing(_database())
     with source as connection:
         row = connection.execute(
             "SELECT * FROM leases WHERE resource_key=?", (key,)
