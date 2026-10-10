@@ -1228,6 +1228,39 @@ def _extract_claude_review_document(
     denials = envelope.get("permission_denials", [])
     if not isinstance(denials, list) or denials:
         return None, "Claude review attempted a forbidden tool", metadata
+    # Claude can report server-side tool effects that are not guarded by the
+    # local filesystem sandbox or represented in permission_denials. Only
+    # absent optional counters or exact integer zero prove no such activity.
+    zero_activity_counters: list[tuple[dict[str, Any], tuple[str, ...]]] = []
+    if "usage" in envelope:
+        usage = envelope["usage"]
+        if not isinstance(usage, dict):
+            return None, "Claude review usage evidence is invalid", metadata
+        if "server_tool_use" in usage:
+            server_tools = usage["server_tool_use"]
+            if not isinstance(server_tools, dict):
+                return None, "Claude review server tool evidence is invalid", metadata
+            zero_activity_counters.append((
+                server_tools, ("web_search_requests", "web_fetch_requests"),
+            ))
+    if "modelUsage" in envelope:
+        model_usage = envelope["modelUsage"]
+        if not isinstance(model_usage, dict):
+            return None, "Claude review model usage evidence is invalid", metadata
+        for model_stats in model_usage.values():
+            if not isinstance(model_stats, dict):
+                return None, "Claude review model usage evidence is invalid", metadata
+            zero_activity_counters.append((model_stats, ("webSearchRequests",)))
+    if "subagent_stats" in envelope:
+        subagent_stats = envelope["subagent_stats"]
+        if not isinstance(subagent_stats, dict):
+            return None, "Claude review subagent evidence is invalid", metadata
+        zero_activity_counters.append((subagent_stats, ("spawned",)))
+    if any(
+        key in counters and (type(counters[key]) is not int or counters[key] != 0)
+        for counters, names in zero_activity_counters for key in names
+    ):
+        return None, "Claude review reports forbidden server tool or subagent activity", metadata
     result = envelope.get("structured_output")
     if not isinstance(result, dict) or set(result) != {"verdict", "findings"}:
         return None, "Claude review structured_output has an invalid shape", metadata

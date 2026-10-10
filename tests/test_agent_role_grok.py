@@ -950,6 +950,44 @@ class GrokReviewRoleTests(unittest.TestCase):
                 self.assertIsNone(document)
                 self.assertIsNotNone(rejected)
 
+    def test_claude_result_rejects_server_web_and_subagent_activity(self) -> None:
+        """A success envelope cannot conceal server-side web or subagent effects."""
+        base = {
+            "type": "result", "subtype": "success", "is_error": False,
+            "permission_denials": [],
+            "structured_output": {"verdict": "PASS", "findings": []},
+        }
+        clean_metadata = {
+            "usage": {"server_tool_use": {
+                "web_search_requests": 0, "web_fetch_requests": 0,
+            }},
+            "modelUsage": {"claude-opus-5-5": {"webSearchRequests": 0}},
+            "subagent_stats": {"spawned": 0},
+        }
+        document, error, _metadata = role._extract_claude_review_document(
+            json.dumps({**base, **clean_metadata}).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(base["structured_output"], json.loads(document))
+
+        forbidden = (
+            {"usage": {"server_tool_use": {"web_search_requests": 1}}},
+            {"usage": {"server_tool_use": {"web_fetch_requests": 1}}},
+            {"modelUsage": {"claude-opus-5-5": {"webSearchRequests": 1}}},
+            {"subagent_stats": {"spawned": 1}},
+            {"usage": {"server_tool_use": {"web_search_requests": True}}},
+            {"usage": {"server_tool_use": {"web_fetch_requests": "0"}}},
+            {"modelUsage": {"claude-opus-5-5": {"webSearchRequests": "0"}}},
+            {"subagent_stats": {"spawned": -1}},
+        )
+        for reported_activity in forbidden:
+            with self.subTest(reported_activity=reported_activity):
+                document, error, _metadata = role._extract_claude_review_document(
+                    json.dumps({**base, **reported_activity}).encode()
+                )
+                self.assertIsNone(document)
+                self.assertIsNotNone(error)
+
     def test_claude_structured_findings_revalidated_locally(self) -> None:
         valid_finding = {
             "severity": "P2", "path": "src/role.py", "line": 12,
