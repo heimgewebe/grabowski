@@ -411,6 +411,77 @@ class PhysicalCheckoutIdentityTests(unittest.TestCase):
                     identity["common_dir"]["path"], worktree
                 )
 
+    def test_unrelated_admin_churn_preserves_target_but_target_churn_blocks(self) -> None:
+        for changed_checkout in ("other", "target"):
+            with (
+                self.subTest(changed_checkout=changed_checkout),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                repo, target, other = root / "repo", root / "target", root / "other"
+                self._init_committed_repo(repo, branch="main")
+                for branch, path in (("target", target), ("other", other)):
+                    self._run(
+                        "git", "worktree", "add", "-q", "-b", branch,
+                        str(path), "HEAD", cwd=repo,
+                    )
+                target_identity = physical_checkout.capture_physical_checkout_identity(target)
+                other_identity = physical_checkout.capture_physical_checkout_identity(other)
+                changed_identity = (
+                    other_identity if changed_checkout == "other" else target_identity
+                )
+                changed_admin = Path(changed_identity["git_dir"]["path"])
+                original_scandir = physical_checkout.os.scandir
+                changed = []
+
+                class ChurnAfterScan:
+                    def __init__(self, iterator):
+                        self.iterator = iterator
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, exc_type, exc, tb):
+                        self.iterator.close()
+                        return False
+
+                    def __iter__(self):
+                        return self
+
+                    def __next__(self):
+                        try:
+                            return next(self.iterator)
+                        except StopIteration:
+                            if not changed:
+                                transient = changed_admin / "transient.lock"
+                                transient.write_bytes(b"lock")
+                                transient.unlink()
+                                changed.append(True)
+                            raise
+
+                with patch.object(
+                    physical_checkout.os, "scandir",
+                    side_effect=lambda fd: ChurnAfterScan(original_scandir(fd)),
+                ):
+                    if changed_checkout == "other":
+                        registered = physical_checkout.capture_registered_linked_worktree_git_dir(
+                            target_identity["common_dir"]["path"], target
+                        )
+                        self.assertEqual(target_identity["git_dir"], registered)
+                    else:
+                        with self.assertRaisesRegex(
+                            physical_checkout.PhysicalCheckoutIdentityError,
+                            "git worktree admin entry changed during registered identity capture",
+                        ):
+                            physical_checkout.capture_registered_linked_worktree_git_dir(
+                                target_identity["common_dir"]["path"], target
+                            )
+                self.assertEqual(changed, [True])
+                self.assertEqual(
+                    target_identity,
+                    physical_checkout.capture_physical_checkout_identity(target),
+                )
+
     def test_nonmatching_backlink_drift_is_detected_before_return(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
