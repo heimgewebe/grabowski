@@ -476,6 +476,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerError, "unsupported"):
             runner.validate_request(value)
 
+    def test_frozen_g2_r3_cannot_bypass_dispatch_stale_proof(self) -> None:
+        frozen = runner.base.FROZEN_G2_IDENTITY
+        pair_id = f"{frozen['taskset_id']}:{frozen['case_id']}:r3"
+        binding = {
+            "taskset_id": frozen["taskset_id"],
+            "taskset_sha256": frozen["taskset_sha256"],
+            "pair_id": pair_id,
+        }
+        with self.assertRaisesRegex(runner.RunnerError, "unsupported frozen G2 pair"):
+            runner._require_g2_preflight_evidence({}, binding)
+        for condition in ("baseline", "treatment"):
+            candidate = frozen_g2_request(condition=condition)
+            candidate["pair_id"] = pair_id
+            candidate["request_id"] = f"{pair_id}:{condition}"
+            candidate["session_id"] = f"session:{candidate['request_id']}"
+            candidate["workspace_id"] = f"workspace:{candidate['request_id']}"
+            with self.subTest(condition=condition):
+                with self.assertRaisesRegex(runner.RunnerError, "pair_id does not match"):
+                    runner.validate_request(candidate)
     def test_private_frozen_g2_checkout_is_reproducibly_dirty_and_read_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

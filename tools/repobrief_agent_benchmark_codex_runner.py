@@ -2228,12 +2228,11 @@ def _require_g2_preflight_evidence(
         binding.get("taskset_id") == frozen["taskset_id"]
         and binding.get("taskset_sha256") == frozen["taskset_sha256"]
         and isinstance(pair_id, str)
-        and re.fullmatch(
-            re.escape(frozen["taskset_id"] + ":" + frozen["case_id"] + ":r")
-            + r"[12]",
-            pair_id,
-        ) is not None
+        and pair_id.startswith(frozen["taskset_id"] + ":" + frozen["case_id"] + ":r")
     ):
+        prefix = frozen["taskset_id"] + ":" + frozen["case_id"] + ":r"
+        if re.fullmatch(re.escape(prefix) + r"[12]", pair_id) is None:
+            raise RunnerError("unsupported frozen G2 pair repetition in preflight proof")
         scenario = report.get("scenario_probe")
         expected = {
             "working_tree": "dirty",
