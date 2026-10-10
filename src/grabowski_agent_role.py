@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ from pathlib import Path, PurePosixPath
 import stat
 import subprocess
 import sys
+import time
 import uuid
 from typing import Any
 
@@ -15,6 +17,8 @@ from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent
 
 SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
 SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
+CREATE_ONLY_RECEIPT_LOCK_TIMEOUT_SECONDS = 6.0
+CREATE_ONLY_RECEIPT_LOCK_POLL_SECONDS = 0.05
 MAX_ROLE_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_REVIEW_JSON_BYTES = 1024 * 1024
 MAX_GROK_REVIEW_STREAM_BYTES = 2 * 1024 * 1024
@@ -312,6 +316,16 @@ def current_binding(repo: Path, base: str) -> tuple[str, str, bool]:
     ), dirty
 
 
+def _require_private_role_receipt_parent(directory_fd: int) -> None:
+    parent = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) & 0o077
+    ):
+        raise PermissionError("role receipt parent must be owner-private")
+
+
 def write_receipt(path: Path, payload: dict[str, Any], *, create_only: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory_fd = os.open(
@@ -320,13 +334,24 @@ def write_receipt(path: Path, payload: dict[str, Any], *, create_only: bool = Fa
     )
     temporary_name = f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     try:
-        parent = os.fstat(directory_fd)
-        if (
-            not stat.S_ISDIR(parent.st_mode)
-            or parent.st_uid != os.getuid()
-            or stat.S_IMODE(parent.st_mode) & 0o077
-        ):
-            raise PermissionError("role receipt parent must be owner-private")
+        _require_private_role_receipt_parent(directory_fd)
+        if create_only:
+            # Coordinate cooperating publishers before target inspection. This
+            # covers the legitimate link-then-unlink interval without relaxing
+            # the hardlink, symlink, owner or mode checks below.
+            deadline = time.monotonic() + CREATE_ONLY_RECEIPT_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError as exc:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("role receipt directory lock timed out") from exc
+                    time.sleep(min(CREATE_ONLY_RECEIPT_LOCK_POLL_SECONDS, remaining))
+            # An owner-private directory can change while the bounded lock waits.
+            # Verify the same opened inode again before touching the target.
+            _require_private_role_receipt_parent(directory_fd)
         try:
             existing = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
