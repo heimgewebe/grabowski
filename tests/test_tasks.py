@@ -5930,9 +5930,13 @@ class TaskTests(unittest.TestCase):
     def test_reconcile_ready_proof_not_published_with_active_task_or_failed_audit(self) -> None:
         with tasks._database_connection():
             pass
-        with tasks.resources._database():
+        # Commit is not close: an open resource connection can retain WAL/SHM
+        # and hide a missing active-task guard behind an unrelated failure.
+        with closing(tasks.resources._database()):
             pass
         started = self._start(resource_keys=["service:reconcile-ready-live.service"])
+        for sidecar in ("-wal", "-shm"):
+            self.assertFalse(Path(str(self.resource_database) + sidecar).exists())
         self.assertEqual("running", started["task"]["state"])
         result = {
             "mode": "refresh", "task_id": "", "scanned": 0,
@@ -5986,6 +5990,26 @@ class TaskTests(unittest.TestCase):
         with tasks._task_readonly_snapshot() as connection:
             self.assertEqual(
                 "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+
+        # Positive control: after the very same task is terminal, an authorized
+        # complete cycle must publish a verified proof. A broken resource
+        # snapshot must not be able to make the negative assertions pass.
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?",
+                (task_id,),
+            )
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "verified",
                 tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
             )
 
