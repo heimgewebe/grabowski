@@ -95,6 +95,8 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
 
         def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False):
             del repo, allow_nonzero
+            if argv[0] == "git" and "merge-base" in argv:
+                return b"b" * 40 + bytes([10])
             if argv[0] == "git" and "--name-only" in argv:
                 return b"assets/a.js\0"
             if argv[0] == "git" and "diff" in argv:
@@ -194,6 +196,8 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
 
         def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False):
             del repo, allow_nonzero
+            if argv[0] == "git" and "merge-base" in argv:
+                return b"b" * 40 + bytes([10])
             if argv[0] == "git" and "--name-only" in argv:
                 return b"assets/other.js\0"
             raise AssertionError(argv)
@@ -275,6 +279,57 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
                     Path("/tmp/commonworld"), 226, changed_files=259
                 )
                 self.assertFalse(too_large, diagnostic)
+
+    def test_advanced_base_uses_single_merge_base_not_two_endpoint_diff(self) -> None:
+        import subprocess
+        with tempfile.TemporaryDirectory(prefix="review-mergebase-diverge-") as d:
+            repo = Path(d)
+            def git(*args: str) -> str:
+                return subprocess.run(["git", *args],cwd=repo,check=True,text=True,
+                    capture_output=True).stdout.strip()
+            git("init","-q")
+            git("config","user.email","review@example.invalid")
+            git("config","user.name","Review")
+            git("config","gc.auto","0")
+            (repo/"seed.txt").write_text("seed\n")
+            git("add","seed.txt")
+            git("commit","-q","-m","seed")
+            seed=git("rev-parse","HEAD")
+            git("checkout","-q","-b","feature")
+            (repo/"feature.txt").write_text("feature\n")
+            git("add","feature.txt")
+            git("commit","-q","-m","feature")
+            head=git("rev-parse","HEAD")
+            git("checkout","-q","-B","main",seed)
+            (repo/"base-only.txt").write_text("base only\n")
+            git("add","base-only.txt")
+            git("commit","-q","-m","main-advanced")
+            base=git("rev-parse","HEAD")
+            expected=pr_review_gate.github_pr_diff_identity_sha256(
+                subprocess.run(["git","diff",seed,head],cwd=repo,check=True,
+                    capture_output=True).stdout
+            )
+            view={"baseRefOid":base,"headRefOid":head,
+                "pullFilesEvidenceComplete":True,
+                "files":[{"path":"feature.txt","status":"added"}]}
+            payload=pr_review_gate._local_bound_pr_diff_bytes(repo,view)
+            self.assertEqual(pr_review_gate.github_pr_diff_identity_sha256(payload),expected)
+            self.assertIn(b"feature.txt",payload)
+            self.assertNotIn(b"base-only.txt",payload)
+
+    def test_local_bound_diff_rejects_ambiguous_merge_base(self) -> None:
+        view = {
+            "baseRefOid": "b" * 40,
+            "headRefOid": "a" * 40,
+            "pullFilesEvidenceComplete": True,
+            "files": [{"path": "feature.txt", "status": "added"}],
+        }
+        with mock.patch.object(
+            pr_review_gate, "_run_bytes",
+            return_value=b"a" * 40 + bytes([10]) + b"b" * 40 + bytes([10]),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exactly one valid merge base"):
+                pr_review_gate._local_bound_pr_diff_bytes(Path("/tmp"), view)
 
     def test_local_diff_fallback_rejects_untrusted_file_metadata(self) -> None:
         invalid_path = {

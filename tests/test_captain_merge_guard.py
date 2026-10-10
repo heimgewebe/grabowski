@@ -230,6 +230,20 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             )
         )
 
+    def test_ambiguous_merge_base_rejected_before_local_diff(self) -> None:
+        with mock.patch.object(
+            merge_guard, "_merge_guard_local_git_bytes",
+            return_value={
+                "returncode": 0,
+                "stdout_bytes": b"a" * 40 + bytes([10]) + b"b" * 40 + bytes([10]),
+            },
+        ):
+            sha, errors = merge_guard._merge_guard_unique_merge_base(
+                Path("/tmp"), base_sha="a" * 40, head_sha="b" * 40
+            )
+        self.assertIsNone(sha)
+        self.assertEqual(errors, ["merge_guard_local_merge_base_missing_or_ambiguous"])
+
     def test_paged_file_projection_maps_only_supported_metadata(self) -> None:
         gh = _PagedFilesGh(
             "\n".join(
@@ -649,6 +663,43 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             runner.receipt["live_diff"]["source"],
             "local-bound-git-diff-after-github-too-large",
         )
+
+    def test_advanced_base_uses_merge_base_for_captain_paths_and_diff(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="captain-mergebase-diverge-") as d:
+            repo=Path(d)
+            def run(*args: str) -> str:
+                return subprocess.run(["git",*args],cwd=repo,check=True,text=True,
+                    capture_output=True).stdout.strip()
+            run("init","-q")
+            run("config","user.email","captain@example.invalid")
+            run("config","user.name","Captain Test")
+            run("config","gc.auto","0")
+            (repo/"seed.txt").write_text("seed\n")
+            run("add","seed.txt")
+            run("commit","-q","-m","seed")
+            seed=run("rev-parse","HEAD")
+            run("checkout","-q","-b","feature")
+            (repo/"feature.txt").write_text("feature\n")
+            run("add","feature.txt")
+            run("commit","-q","-m","feature")
+            head=run("rev-parse","HEAD")
+            run("checkout","-q","-B","main",seed)
+            (repo/"base-only.txt").write_text("base only\n")
+            run("add","base-only.txt")
+            run("commit","-q","-m","main-advanced")
+            base=run("rev-parse","HEAD")
+            paths,path_info,path_err=merge_guard._merge_guard_local_changed_paths(
+                repo,base_sha=base,head_sha=head)
+            diff,diff_info,diff_err=merge_guard._merge_guard_local_diff_bytes(
+                repo,base_sha=base,head_sha=head)
+            self.assertEqual(path_err,[])
+            self.assertEqual(diff_err,[])
+            self.assertEqual(paths,["feature.txt"])
+            self.assertNotIn(b"base-only.txt",diff)
+            expected=subprocess.run(["git","diff",seed,head],cwd=repo,check=True,
+                capture_output=True).stdout
+            self.assertEqual(merge_guard.github_pr_diff_identity_sha256(diff),
+                merge_guard.github_pr_diff_identity_sha256(expected))
 
     def test_resource_normalization_supports_bounded_generated_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

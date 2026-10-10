@@ -766,6 +766,17 @@ def _local_bound_pr_diff_bytes(repo: Path, view: Any) -> bytes:
     expected_paths = _complete_pr_diff_paths(view)
     if expected_paths is None:
         raise RuntimeError("local PR diff fallback requires complete GitHub file evidence")
+    # GitHub PR files/diffs use the merge base, not the advanced base tip.
+    # Reject missing or ambiguous merge bases instead of silently choosing one.
+    merge_bases = _run_bytes(
+        repo, _local_diff_git_argv("merge-base", "--all", base, head)
+    ).splitlines()
+    if (
+        len(merge_bases) != 1
+        or re.fullmatch(rb"[0-9a-f]{40}", merge_bases[0]) is None
+    ):
+        raise RuntimeError("local PR diff requires exactly one valid merge base")
+    merge_base = merge_bases[0].decode("ascii")
     raw_paths = _run_bytes(
         repo,
         _local_diff_git_argv(
@@ -776,7 +787,7 @@ def _local_bound_pr_diff_bytes(repo: Path, view: Any) -> bytes:
             "--no-textconv",
             "--no-renames",
             "--no-color",
-            base,
+            merge_base,
             head,
             "--",
         ),
@@ -797,7 +808,7 @@ def _local_bound_pr_diff_bytes(repo: Path, view: Any) -> bytes:
             "--no-textconv",
             "--no-renames",
             "--no-color",
-            base,
+            merge_base,
             head,
             "--",
         ),

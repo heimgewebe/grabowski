@@ -1507,6 +1507,26 @@ def _merge_guard_diff_contains_binary_metadata(diff_bytes: bytes) -> bool:
     return _MERGE_GUARD_BINARY_DIFF_RE.search(diff_bytes) is not None
 
 
+def _merge_guard_unique_merge_base(
+    repo_path: Path, *, base_sha: str, head_sha: str
+) -> tuple[str | None, list[str]]:
+    """Bind the local PR diff to its unique GitHub-compatible merge base."""
+    try:
+        result = _merge_guard_local_git_bytes(
+            repo_path, ["merge-base", "--all", base_sha, head_sha]
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, [f"merge_guard_local_merge_base_exception:{type(exc).__name__}"]
+    if result["returncode"] != 0:
+        return None, ["merge_guard_local_merge_base_failed"]
+    values = result["stdout_bytes"].splitlines()
+    if len(values) != 1 or _SHA40_RE.fullmatch(
+        values[0].decode("ascii", errors="replace")
+    ) is None:
+        return None, ["merge_guard_local_merge_base_missing_or_ambiguous"]
+    return values[0].decode("ascii"), []
+
+
 def _merge_guard_local_changed_paths(
     repo_path: Path, *, base_sha: str, head_sha: str
 ) -> tuple[list[str], dict[str, Any], list[str]]:
@@ -1522,6 +1542,12 @@ def _merge_guard_local_changed_paths(
         or _SHA40_RE.fullmatch(head_sha) is None
     ):
         return [], info, ["merge_guard_local_changed_paths_revision_invalid"]
+    merge_base, merge_base_errors = _merge_guard_unique_merge_base(
+        repo_path, base_sha=base_sha, head_sha=head_sha
+    )
+    if merge_base_errors or merge_base is None:
+        return [], info, merge_base_errors
+    info["merge_base_sha"] = merge_base
     try:
         result = _merge_guard_local_git_bytes(
             repo_path,
@@ -1532,7 +1558,7 @@ def _merge_guard_local_changed_paths(
                 "--no-ext-diff",
                 "--no-textconv",
                 "--no-renames",
-                base_sha,
+                merge_base,
                 head_sha,
                 "--",
             ],
@@ -1594,6 +1620,12 @@ def _merge_guard_local_diff_bytes(
         or _SHA40_RE.fullmatch(head_sha) is None
     ):
         return b"", info, ["merge_guard_local_diff_revision_invalid"]
+    merge_base, merge_base_errors = _merge_guard_unique_merge_base(
+        repo_path, base_sha=base_sha, head_sha=head_sha
+    )
+    if merge_base_errors or merge_base is None:
+        return b"", info, merge_base_errors
+    info["merge_base_sha"] = merge_base
     try:
         result = _merge_guard_local_git_bytes(
             repo_path,
@@ -1603,7 +1635,7 @@ def _merge_guard_local_diff_bytes(
                 "--no-textconv",
                 "--no-renames",
                 "--no-color",
-                base_sha,
+                merge_base,
                 head_sha,
                 "--",
             ],
