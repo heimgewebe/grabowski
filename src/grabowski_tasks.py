@@ -7915,9 +7915,44 @@ def _task_recommended_next_action(
     return "inspect task status"
 
 
+def _day1_task_output_attestation_diagnostic(
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Report the current lack of independently protected Day-1 provenance.
+
+    This is a conservative operator diagnostic, NOT an attestation verifier.
+    File modes, self-hashes, extra receipt fields and the root-task backend do
+    not authenticate the code or captured stdout to a same-UID adversary.
+    """
+    backend = _execution_backend(record)
+    reason = (
+        "same_uid_capture_and_receipt_storage"
+        if backend == "systemd-user"
+        else "root_task_backend_lacks_protected_source_and_output_attestation"
+    )
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_day1_output_attestation_diagnostic",
+        "status": "unavailable",
+        "authority": "none",
+        "day1_admission_authorized": False,
+        "protected_stdout_capture_verified": False,
+        "executed_source_bytes_verified": False,
+        "reason_code": reason,
+        "does_not_establish": [
+            "captured_stdout_authenticity",
+            "executed_code_bytes_authenticity",
+            "day1_inventory_admission",
+        ],
+    }
+
+
 def _public_for_view(record: dict[str, Any], view: str) -> dict[str, Any]:
     full = _public(record)
     if view == "evidence":
+        full["day1_output_attestation"] = _day1_task_output_attestation_diagnostic(
+            record
+        )
         return full
     minimal = {
         "task_id": full["task_id"],
