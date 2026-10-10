@@ -228,6 +228,7 @@ RISK_PATH_PREFIXES = (
     "src/grabowski_self_deploy.py",
     "src/grabowski_tasks.py",
     "src/grabowski_checkouts.py",
+    "src/grabowski_physical_checkout.py",
     "src/grabowski_operations.py",
     "src/grabowski_artifacts.py",
     "tools/pr_review_gate.py",

@@ -78,6 +78,7 @@ class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
         for path in (
             "src/grabowski_tasks.py",
             "src/grabowski_checkouts.py",
+            "src/grabowski_physical_checkout.py",
             "src/grabowski_operations.py",
             "src/grabowski_artifacts.py",
         ):
@@ -98,6 +99,14 @@ class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
                 self.assertTrue(result["review_sources"]["independent_review_required"])
                 self.assertTrue(result["complexity"]["independent_review_required"])
 
+    def test_unrelated_plain_python_module_keeps_standard_review_floor(self) -> None:
+        state = _state("src/grabowski_plain_helper.py")
+        complexity = pr_review_gate.classify_complexity(
+            state["pr"], None, repo_name=state["repoName"]
+        )
+        self.assertFalse(complexity["high_critical"])
+        self.assertFalse(complexity["independent_review_required"])
+
     def test_documentation_does_not_gain_independent_review_floor(self) -> None:
         state = _state("docs/usage.md")
         state["repoName"] = "heimgewebe/example"
@@ -110,12 +119,12 @@ class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
         self.assertFalse(complexity["external_review_required"])
 
     def test_self_review_audit_transports_independent_review_policy(self) -> None:
-        state = _state("src/grabowski_tasks.py")
+        state = _state("src/grabowski_physical_checkout.py")
         state["pr_diff_sha256"] = "0" * 64
         complexity = pr_review_gate.classify_complexity(
             state["pr"], None, repo_name=state["repoName"]
         )
-        review = _self_review("src/grabowski_tasks.py")
+        review = _self_review("src/grabowski_physical_checkout.py")
         review["review_iterations"] = [
             {"n": index, "summary": "reviewed", "material_findings": 0}
             for index in range(1, complexity["minimum_self_review_iterations"] + 1)
