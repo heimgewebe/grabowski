@@ -372,6 +372,85 @@ EXPECTED_UPSTREAM_MCP_DESCRIPTORS: dict[str, dict[str, Any]] = {
     'grounding_verify': {'name': 'grounding_verify', 'title': 'RepoGround grounding verifier', 'description': 'Verify declared citations and ranges against an existing RepoGround bundle.', 'inputSchema': EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS['grounding_verify'], 'annotations': _REPOGROUND_READ_ANNOTATIONS},
     'live_freshness': {'name': 'live_freshness', 'title': 'RepoGround live freshness', 'description': 'Compare snapshot Git provenance with the configured local checkout without refreshing it.', 'inputSchema': EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS['live_freshness'], 'annotations': _REPOGROUND_READ_ANNOTATIONS},
 }
+MCP_PROFILE_MODERN = "modern"
+MCP_PROFILE_FROZEN_G1 = "frozen-g1-lenskit-legacy"
+FROZEN_G1_LEGACY_IDENTITY = {
+    "taskset_id": "repobrief-agent-benchmark-v1-20260713",
+    "taskset_sha256": "834c4a730fe741b6015a69767db162c87c80311a6688dd8e83eb4a6c6e258184",
+    "case_id": "grounding-clean-freshness",
+    "repository": {
+        "id": "lenskit",
+        "repository": "heimgewebe/repoground",
+        "commit": "dff582f9c4e8b5511d4ce436db81e3e245f725ec",
+    },
+    "prompt_sha256": "010b2b9f986ea57ad6a33ad729f75e695cf8bd244c155f2d7a4239565fc7b0e9",
+    "manifest_sha256": "11b9983e8a41de41dc042b2dfd25dfd68be68e49d0c0065af9dbaa37e3a98179",
+    "python_path": "/usr/bin/python3",
+    "source_root": "/home/alex/.local/state/grabowski/rab-g1-historical-20261009/lenskit",
+    "launcher_path": (
+        "/home/alex/.local/state/grabowski/rab-g1-historical-20261009/"
+        "lenskit/scripts/repobrief-mcp-stdio.py"
+    ),
+    "generator_commit": "cc345356056f2d160bc09f4b70e91cd80b36a033",
+    "launcher_sha256": "0cf2e6ce0a923632f5d659c3de0552ac189142011e7b21dd9dfdfc97a9bb7873",
+    "descriptors_sha256": "12ebf1efaa29a583c5948e2d33c5b3a9c725a6c18645ba81b0b6eea7e773aa96",
+}
+
+
+# The historical Python 3.10 server requires schema validation absent
+# from isolated system site. Freeze exact dependency bytes instead of
+# admitting ambient user imports or installing mutable global packages.
+FROZEN_G1_VENDOR_SITE_ROOT = Path("/home/alex/.local/lib/python3.10/site-packages")
+FROZEN_G1_VENDOR_TYPING_EXT = Path(
+    "/home/alex/repos/grabowski/.venv/lib/python3.12/site-packages/typing_extensions.py"
+)
+FROZEN_G1_VENDOR_PACKAGES = (
+    "attr", "attrs", "jsonschema", "jsonschema_specifications", "referencing", "rpds"
+)
+FROZEN_G1_VENDOR_MANIFEST_SHA256 = (
+    "8dbc45b4c54ec79a4e84efec8c5b577031896a081a6fd325a9283bf50c2e9f8a"
+)
+MAX_FROZEN_G1_VENDOR_FILES = 128
+MAX_FROZEN_G1_VENDOR_BYTES = 8 * 1024 * 1024
+
+
+def _frozen_g1_mcp_profile(request: Mapping[str, Any]) -> str:
+    """Enable one historical read-only MCP profile; never negotiate schemas."""
+    frozen = FROZEN_G1_LEGACY_IDENTITY
+    if (
+        request.get("taskset_id") != frozen["taskset_id"]
+        or request.get("taskset_sha256") != frozen["taskset_sha256"]
+        or request.get("case_id") != frozen["case_id"]
+        or request.get("condition") != "treatment"
+    ):
+        return MCP_PROFILE_MODERN
+    binding = request.get("repobrief")
+    command = binding.get("mcp_command") if isinstance(binding, Mapping) else None
+    if (
+        request.get("repository") != frozen["repository"]
+        or not isinstance(request.get("prompt"), str)
+        or sha_bytes(request["prompt"].encode("utf-8")) != frozen["prompt_sha256"]
+        or base.validated_setup(request) != "clean"
+        or not isinstance(binding, Mapping)
+        or binding.get("manifest_sha256") != frozen["manifest_sha256"]
+        or not isinstance(binding.get("manifest"), str)
+        or not Path(binding["manifest"]).is_absolute()
+        or not isinstance(command, list)
+        or len(command) != 6
+        or not all(isinstance(item, str) and item for item in command)
+        or command[0] != frozen["python_path"]
+        or command[1] != frozen["launcher_path"]
+        or command[5] != frozen["source_root"]
+        or command[2] != "--bundle-root"
+        or command[3] != binding["manifest"]
+        or command[4] != "--repo-root"
+        or not Path(command[5]).is_absolute()
+        or Path(command[1]).parent.parent != Path(command[5])
+    ):
+        raise RunnerError("frozen historical G1 MCP identity is not authorized")
+    return MCP_PROFILE_FROZEN_G1
+
+
 MCP_CLIENT_METHODS = {"initialize", "notifications/initialized", "ping", "tools/list", "tools/call"}
 MAX_FROZEN_RESOURCES = 512
 
@@ -1343,6 +1422,126 @@ def _validated_ask_context_pack(value: Any) -> dict[str, Any]:
     return json.loads(json.dumps(value))
 
 
+def _validated_frozen_g1_context_pack(value: Any, *, expected_manifest: Path) -> dict[str, Any]:
+    """Validate the actual 2026 G1 contract; never synthesize modern evidence."""
+    fields = {
+        "kind", "version", "request_id", "snapshot_ref", "freshness",
+        "availability", "required_reading", "retrieval_hits", "resolved_ranges",
+        "answer_scaffold", "budget", "forbidden_operations", "does_not_establish",
+    }
+    def bad() -> None:
+        raise RunnerError("historical G1 ask_context context pack is malformed")
+    if not isinstance(value, dict) or set(value) != fields:
+        bad()
+    if (
+        value.get("kind") != EXPECTED_ASK_CONTEXT_PACK_KIND
+        or value.get("version") != EXPECTED_ASK_CONTEXT_PACK_VERSION
+        or not isinstance(value.get("request_id"), str)
+        or re.fullmatch(r"[0-9a-f]{16}", value["request_id"]) is None
+        or value.get("forbidden_operations") != list(EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS)
+        or value.get("does_not_establish") != list(EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH)
+    ):
+        bad()
+    snapshot = value.get("snapshot_ref")
+    if (
+        not isinstance(snapshot, dict)
+        or set(snapshot) != {
+            "freshness_policy", "freshness_status", "git_commit", "manifest_path",
+            "manifest_sha256", "stem",
+        }
+        or snapshot.get("freshness_policy") != "allow_stale_with_caveat"
+        or snapshot.get("freshness_status") not in EXPECTED_REPOGROUND_FRESHNESS_VALUES
+        or snapshot.get("git_commit") not in (
+            None, FROZEN_G1_LEGACY_IDENTITY["repository"]["commit"]
+        )
+        or snapshot.get("manifest_path") != str(expected_manifest)
+        or snapshot.get("manifest_sha256") != FROZEN_G1_LEGACY_IDENTITY["manifest_sha256"]
+        or snapshot.get("stem") != expected_manifest.name.removesuffix(
+            ".bundle.manifest.json"
+        )
+    ):
+        bad()
+    for key, statuses in (
+        ("freshness", {"fresh", "stale", "unknown", "not_comparable", "not_applicable"}),
+        ("availability", {"available", "partial", "missing", "unknown"}),
+    ):
+        item = value.get(key)
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"status", "caveats"}
+            or item.get("status") not in statuses
+            or not isinstance(item.get("caveats"), list)
+            or any(
+                not isinstance(c, dict)
+                or set(c) != {"kind", "detail"}
+                or not all(isinstance(c.get(n), str) and c[n] for n in ("kind", "detail"))
+                for c in item["caveats"]
+            )
+        ):
+            bad()
+    if snapshot["freshness_status"] != value["freshness"]["status"]:
+        bad()
+    reading = value.get("required_reading")
+    if (
+        not isinstance(reading, dict)
+        or set(reading) != {
+            "status", "task_profile", "required", "recommended",
+            "missing_required", "missing_recommended",
+        }
+        or reading.get("status") not in {"pass", "partial", "fail", "unknown"}
+        or not isinstance(reading.get("task_profile"), str)
+        or not reading["task_profile"]
+        or any(
+            not isinstance(reading.get(k), list)
+            or any(not isinstance(item, str) or not item for item in reading[k])
+            for k in ("required", "recommended", "missing_required", "missing_recommended")
+        )
+    ):
+        bad()
+    if any(
+        not isinstance(value.get(k), list)
+        or any(not isinstance(item, dict) for item in value[k])
+        for k in ("retrieval_hits", "resolved_ranges")
+    ):
+        bad()
+    scaffold = value.get("answer_scaffold")
+    if (
+        not isinstance(scaffold, dict)
+        or set(scaffold) != {
+            "citation_obligations", "caveats_to_surface", "non_claims_to_surface"
+        }
+        or not isinstance(scaffold.get("citation_obligations"), list)
+        or any(not isinstance(i, str) or not i for i in scaffold["citation_obligations"])
+        or not isinstance(scaffold.get("caveats_to_surface"), list)
+        or any(
+            not isinstance(c, dict)
+            or set(c) != {"kind", "detail"}
+            for c in scaffold["caveats_to_surface"]
+        )
+        or scaffold.get("non_claims_to_surface")
+        != list(EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH)
+    ):
+        bad()
+    budget = value.get("budget")
+    if (
+        not isinstance(budget, dict)
+        or set(budget) != {
+            "max_context_tokens", "max_answer_tokens", "approx_context_chars_used",
+            "truncated", "does_not_establish_quality",
+        }
+        or any(
+            type(budget.get(k)) is not int or budget[k] < 0
+            for k in ("max_context_tokens", "max_answer_tokens", "approx_context_chars_used")
+        )
+        or budget["max_context_tokens"] < 1
+        or budget["max_answer_tokens"] < 1
+        or type(budget.get("truncated")) is not bool
+        or budget.get("does_not_establish_quality") is not True
+    ):
+        bad()
+    return json.loads(json.dumps(value))
+
+
 def _validated_grounding_verdict(value: Any) -> dict[str, Any]:
     expected_keys = {
         "kind", "version", "status", "checked_declaration", "snapshot_ref",
@@ -1377,7 +1576,8 @@ def _validated_grounding_verdict(value: Any) -> dict[str, Any]:
 
 
 def _validated_treatment_structured_payload(
-    value: Any, *, tool_name: str, expected_manifest: Path, is_error: bool
+    value: Any, *, tool_name: str, expected_manifest: Path, is_error: bool,
+    profile: str = MCP_PROFILE_MODERN,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RunnerError("RepoGround treatment tool structured payload is malformed")
@@ -1428,7 +1628,12 @@ def _validated_treatment_structured_payload(
         raise RunnerError("RepoGround treatment tool structured payload is malformed")
     _validated_read_only_frontdoor_projection(value)
     if tool_name == "ask_context":
-        _validated_ask_context_pack(value.get("context_pack"))
+        if profile == MCP_PROFILE_FROZEN_G1:
+            _validated_frozen_g1_context_pack(
+                value.get("context_pack"), expected_manifest=expected_manifest
+            )
+        else:
+            _validated_ask_context_pack(value.get("context_pack"))
     _validated_live_freshness_payload(
         value.get("live_freshness"), expected_manifest=expected_manifest
     )
@@ -1441,6 +1646,7 @@ def _validated_treatment_tool_result(
     tool_name: str,
     expected_manifest: Path,
     external_manifest: Path | None = None,
+    profile: str = MCP_PROFILE_MODERN,
 ) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {"content", "structuredContent", "isError"}:
         raise RunnerError("RepoGround treatment tool result is malformed")
@@ -1464,6 +1670,7 @@ def _validated_treatment_tool_result(
         tool_name=tool_name,
         expected_manifest=expected_manifest,
         is_error=is_error,
+        profile=profile,
     )
     if not is_error and external_manifest is not None:
         freshness = (
@@ -1474,6 +1681,11 @@ def _validated_treatment_tool_result(
         if not isinstance(freshness, dict):
             raise RunnerError("RepoGround treatment tool freshness binding is missing")
         freshness["bundle_manifest"] = str(external_manifest)
+        if profile == MCP_PROFILE_FROZEN_G1 and tool_name == "ask_context":
+            # Never expose the ephemeral private-stage path as public evidence.
+            structured["context_pack"]["snapshot_ref"]["manifest_path"] = (
+                str(external_manifest)
+            )
     return {
         "content": [{"type": "text", "text": canonical(structured)}],
         "structuredContent": structured,
@@ -1485,32 +1697,50 @@ def _proxy_error(identifier: Any, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": identifier, "error": {"code": -32601, "message": message}}
 
 
-def _filtered_treatment_tools(value: Any) -> list[dict[str, Any]]:
+def _filtered_treatment_tools(
+    value: Any, *, profile: str = MCP_PROFILE_MODERN
+) -> list[dict[str, Any]]:
     if not isinstance(value, dict) or not isinstance(value.get("tools"), list):
         raise RunnerError("RepoGround tools/list result is missing a tools array")
-    counts = {name: 0 for name in UPSTREAM_MCP}
-    filtered: list[dict[str, Any]] = []
-    for item in value["tools"]:
-        if not isinstance(item, dict):
-            continue
-        name = item.get("name")
-        if name in counts:
-            expected_schema = EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[str(name)]
-            if canonical(item.get("inputSchema")) != canonical(expected_schema):
-                raise RunnerError(
-                    f"RepoGround treatment tool inputSchema drifted for {name}"
-                )
-            expected_descriptor = EXPECTED_UPSTREAM_MCP_DESCRIPTORS[str(name)]
-            if canonical(item) != canonical(expected_descriptor):
-                raise RunnerError(f'RepoGround treatment tool descriptor drifted for {name}')
-            counts[str(name)] += 1
-            filtered.append(json.loads(json.dumps(expected_descriptor)))
-    invalid = [f"{name}={counts[name]}" for name in sorted(counts) if counts[name] != 1]
-    if invalid:
-        raise RunnerError(
-            "RepoGround tools/list must expose every required treatment tool exactly once: "
-            + ", ".join(invalid)
-        )
+    if profile == MCP_PROFILE_FROZEN_G1:
+        tools = value["tools"]
+        if (
+            len(tools) != 3
+            or [item.get("name") if isinstance(item, dict) else None for item in tools]
+            != ["ask_context", "grounding_verify", "live_freshness"]
+            or not hmac.compare_digest(
+                sha_bytes(canonical(tools).encode("utf-8")),
+                FROZEN_G1_LEGACY_IDENTITY["descriptors_sha256"],
+            )
+        ):
+            raise RunnerError("historical G1 MCP tools/list descriptor drifted")
+        filtered = json.loads(json.dumps(tools))
+    elif profile == MCP_PROFILE_MODERN:
+        counts = {name: 0 for name in UPSTREAM_MCP}
+        filtered: list[dict[str, Any]] = []
+        for item in value["tools"]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            if name in counts:
+                expected_schema = EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[str(name)]
+                if canonical(item.get("inputSchema")) != canonical(expected_schema):
+                    raise RunnerError(
+                        f"RepoGround treatment tool inputSchema drifted for {name}"
+                    )
+                expected_descriptor = EXPECTED_UPSTREAM_MCP_DESCRIPTORS[str(name)]
+                if canonical(item) != canonical(expected_descriptor):
+                    raise RunnerError(f'RepoGround treatment tool descriptor drifted for {name}')
+                counts[str(name)] += 1
+                filtered.append(json.loads(json.dumps(expected_descriptor)))
+        invalid = [f"{name}={counts[name]}" for name in sorted(counts) if counts[name] != 1]
+        if invalid:
+            raise RunnerError(
+                "RepoGround tools/list must expose every required treatment tool exactly once: "
+                + ", ".join(invalid)
+            )
+    else:
+        raise RunnerError("unrecognized RepoGround MCP tool profile")
     filtered.append(
         {
             "name": "repobrief_resource_read",
@@ -3471,10 +3701,70 @@ def _git_index_differs_from_commit(
     raise RunnerError("RepoGround MCP source index cannot be verified")
 
 
+def _frozen_g1_vendor_snapshot() -> list[dict[str, Any]]:
+    """Attest every byte of the historical-only isolated dependency tree."""
+    entries: list[dict[str, Any]] = []
+    roots = [
+        (FROZEN_G1_VENDOR_SITE_ROOT / package, FROZEN_G1_VENDOR_SITE_ROOT)
+        for package in FROZEN_G1_VENDOR_PACKAGES
+    ]
+    roots.append((FROZEN_G1_VENDOR_TYPING_EXT, FROZEN_G1_VENDOR_TYPING_EXT.parent))
+    total_bytes = 0
+    for source, base in roots:
+        if source.is_symlink() or not source.exists():
+            raise RunnerError("historical G1 vendor source is unavailable or linked")
+        candidates = sorted(source.rglob("*")) if source.is_dir() else [source]
+        for candidate in candidates:
+            if candidate.suffix not in {".py", ".json", ".so"}:
+                continue
+            relative = candidate.relative_to(base)
+            if (
+                any(part in {"", ".", ".."} for part in relative.parts)
+                or candidate.is_symlink()
+            ):
+                raise RunnerError("historical G1 vendor path is unsafe")
+            try:
+                metadata = candidate.lstat()
+            except OSError as exc:
+                raise RunnerError("historical G1 vendor file is unavailable") from exc
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o7022
+                or metadata.st_size <= 0 and candidate.suffix != ".py"
+            ):
+                raise RunnerError("historical G1 vendor metadata is unsafe")
+            remaining = MAX_FROZEN_G1_VENDOR_BYTES - total_bytes
+            if len(entries) >= MAX_FROZEN_G1_VENDOR_FILES or metadata.st_size > remaining:
+                raise RunnerError("historical G1 vendor source exceeds bounds")
+            raw = _read_bound_regular_file(
+                candidate, label="historical G1 frozen dependency",
+                max_bytes=remaining,
+            )
+            total_bytes += len(raw)
+            entries.append({
+                "relative": relative, "raw": raw, "sha256": sha_bytes(raw),
+            })
+    entries.sort(key=lambda entry: str(entry["relative"]))
+    paths = [str(entry["relative"]) for entry in entries]
+    if len(paths) != len(set(paths)):
+        raise RunnerError("historical G1 vendor source has duplicate paths")
+    digest = sha_bytes(canonical([
+        {"p": str(entry["relative"]), "n": len(entry["raw"]), "h": entry["sha256"]}
+        for entry in entries
+    ]).encode("utf-8"))
+    if not hmac.compare_digest(digest, FROZEN_G1_VENDOR_MANIFEST_SHA256):
+        raise RunnerError("historical G1 vendor source digest is not frozen")
+    return entries
+
+
 def _repoground_source_tree_snapshot(
-    script: Path, manifest_raw: bytes
+    script: Path, manifest_raw: bytes, *, legacy_g1: bool = False
 ) -> dict[str, Any] | None:
-    if script.name != "repoground-mcp-stdio.py":
+    if legacy_g1:
+        if script.name != "repobrief-mcp-stdio.py":
+            raise RunnerError("historical G1 MCP launcher name is invalid")
+    elif script.name != "repoground-mcp-stdio.py":
         return None
     document = base._load_object_bytes(manifest_raw, label="RepoGround manifest")
     generator = document.get("generator")
@@ -3486,6 +3776,17 @@ def _repoground_source_tree_snapshot(
         or runtime.get("git_dirty") is not False
     ):
         raise RunnerError("RepoGround manifest generator commit is invalid")
+    if legacy_g1:
+        frozen = FROZEN_G1_LEGACY_IDENTITY
+        if (
+            not hmac.compare_digest(sha_bytes(manifest_raw), frozen["manifest_sha256"])
+            or commit != frozen["generator_commit"]
+            or runtime.get("module") != "merger.lenskit.core.merge"
+        ):
+            raise RunnerError("historical G1 bundle generator identity is invalid")
+        # The historical snapshot's source commit and generator commit differ
+        # intentionally. Verify both rather than substituting a newer server.
+        commit = frozen["repository"]["commit"]
     try:
         source_root = script.resolve(strict=True).parent.parent
     except OSError as exc:
@@ -3504,7 +3805,10 @@ def _repoground_source_tree_snapshot(
             "RepoGround manifest generator commit does not match source object format"
         )
 
-    launcher_relative = Path("scripts/repoground-mcp-stdio.py")
+    launcher_relative = Path(
+        "scripts/repobrief-mcp-stdio.py"
+        if legacy_g1 else "scripts/repoground-mcp-stdio.py"
+    )
 
     def verify_source() -> None:
         try:
@@ -3576,7 +3880,10 @@ def _repoground_source_tree_snapshot(
         for relative in tracked_relatives
         if relative.parts and relative.parts[0] == "merger"
     ]
-    required = Path("merger/repoground/cli/mcp_stdio.py")
+    required = Path(
+        "merger/lenskit/cli/repobrief_mcp_stdio.py"
+        if legacy_g1 else "merger/repoground/cli/mcp_stdio.py"
+    )
     if (
         not relatives
         or len(relatives) > MAX_MCP_SOURCE_TREE_FILES
@@ -3693,6 +4000,10 @@ def _repoground_source_tree_snapshot(
         raise RunnerError(
             "RepoGround MCP launcher does not match generator commit"
         )
+    if legacy_g1 and not hmac.compare_digest(
+        sha_bytes(launcher_raw), FROZEN_G1_LEGACY_IDENTITY["launcher_sha256"]
+    ):
+        raise RunnerError("historical G1 MCP launcher bytes differ from frozen source")
 
     verify_source()
     return {
@@ -3787,6 +4098,8 @@ def stage_mcp_upstream(
     upstream: Sequence[str],
     manifest: Path,
     authorized_files: Sequence[Mapping[str, Any]],
+    *,
+    legacy_g1: bool = False,
 ) -> dict[str, Any]:
     bound_argv, source_bindings, manifest_authorization = _bind_mcp_upstream(
         upstream, manifest, authorized_files
@@ -3804,11 +4117,12 @@ def stage_mcp_upstream(
     manifest_artifacts = _manifest_artifact_paths(manifest, manifest_raw)
     source_tree = (
         _repoground_source_tree_snapshot(
-            Path(source_bindings[1]["path"]), manifest_raw
+            Path(source_bindings[1]["path"]), manifest_raw, legacy_g1=legacy_g1
         )
         if len(source_bindings) > 1
         else None
     )
+    vendor_entries = _frozen_g1_vendor_snapshot() if legacy_g1 else []
     stage_root: Path | None = None
     stage_fd: int | None = None
     try:
@@ -3964,7 +4278,38 @@ def stage_mcp_upstream(
                     raise RunnerError("staged RepoGround MCP source binding mismatch")
                 source_tree_bindings.append(staged)
             if Path(staged_argv[0]).name.startswith("python"):
-                staged_argv[1:1] = ["-I", "-B"]
+                if legacy_g1:
+                    for entry in vendor_entries:
+                        relative = Path("vendor") / entry["relative"]
+                        _write_private_relative_file(
+                            stage_fd, relative, entry["raw"], mode=0o600
+                        )
+                        staged = _bind_mcp_file(
+                            stage_root / relative,
+                            label=f"staged historical G1 dependency {relative}",
+                            executable=False,
+                        )
+                        if staged["sha256"] != entry["sha256"]:
+                            raise RunnerError("historical G1 staged dependency digest changed")
+                        source_tree_bindings.append(staged)
+                    # -I continues excluding all ambient user site packages.
+                    # Only this hash-bound private snapshot enters sys.path.
+                    if len(staged_argv) != 6 or not vendor_entries:
+                        raise RunnerError("historical G1 isolated launcher is invalid")
+                    staged_script = staged_argv[1]
+                    entry_code = (
+                        "import sys,runpy;"
+                        "vendor=sys.argv.pop(1);"
+                        "script=sys.argv.pop(1);"
+                        "sys.path.insert(0,vendor);"
+                        "runpy.run_path(script,run_name='__main__')"
+                    )
+                    staged_argv[1:2] = [
+                        "-I", "-B", "-c", entry_code,
+                        str(stage_root / "vendor"), staged_script,
+                    ]
+                else:
+                    staged_argv[1:1] = ["-I", "-B"]
 
         _directory_fd_matches(stage_root, stage_fd)
         return {
@@ -4086,7 +4431,10 @@ def cleanup_staged_mcp_upstream(binding: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _pin_treatment_arguments(message: dict[str, Any], manifest: Path) -> None:
+def _pin_treatment_arguments(
+    message: dict[str, Any], manifest: Path, *,
+    legacy_g1: bool = False, external_manifest: Path | None = None,
+) -> None:
     params = message.get("params")
     if not isinstance(params, dict):
         raise RunnerError("MCP tools/call params must be an object")
@@ -4096,6 +4444,51 @@ def _pin_treatment_arguments(message: dict[str, Any], manifest: Path) -> None:
         params["arguments"] = arguments
     expected = str(manifest)
     supplied = arguments.get("bundle_manifest")
+    if legacy_g1:
+        allowed = {
+            "ask_context": {
+                "bundle_manifest", "query", "task_profile",
+                "max_context_tokens", "max_answer_tokens", "k",
+            },
+            "grounding_verify": {
+                "bundle_manifest", "declaration", "citation_map", "task_profile",
+            },
+            "live_freshness": {"bundle_manifest"},
+        }
+        name = params.get("name")
+        if (
+            name not in allowed
+            or not set(arguments).issubset(allowed[name])
+            or supplied not in (
+                None, expected,
+                str(external_manifest) if external_manifest is not None else None,
+            )
+        ):
+            raise RunnerError("historical G1 MCP tool selectors are not authorized")
+        if name == "ask_context":
+            if not isinstance(arguments.get("query"), str):
+                raise RunnerError("historical G1 ask_context requires a query")
+            task_profile = arguments.get("task_profile")
+            if task_profile is not None and not isinstance(task_profile, str):
+                raise RunnerError("historical G1 ask_context task_profile is invalid")
+            for integer_field in ("max_context_tokens", "max_answer_tokens", "k"):
+                value = arguments.get(integer_field)
+                if value is not None and (
+                    type(value) is not int
+                    or value < 1
+                    or (integer_field == "k" and value > 100)
+                ):
+                    raise RunnerError("historical G1 ask_context budget is invalid")
+        elif name == "grounding_verify":
+            if not isinstance(arguments.get("declaration"), dict):
+                raise RunnerError("historical G1 grounding_verify declaration is invalid")
+            for field in ("citation_map", "task_profile"):
+                value = arguments.get(field)
+                if value is not None and not isinstance(value, str):
+                    raise RunnerError("historical G1 grounding_verify selector is invalid")
+        arguments["bundle_manifest"] = expected
+        return
+
     if supplied not in (None, expected):
         raise RunnerError("MCP bundle_manifest conflicts with the bound manifest")
     for selector in ("repo", "stem"):
@@ -4113,6 +4506,8 @@ def run_mcp_proxy(
     manifest_sha256: str,
     authorized_files: Sequence[Mapping[str, Any]],
     runtime_root_text: str,
+    *,
+    profile: str = MCP_PROFILE_MODERN,
 ) -> int:
     if not upstream or any(not isinstance(item, str) or not item for item in upstream):
         raise RunnerError("invalid MCP upstream argv")
@@ -4128,14 +4523,35 @@ def run_mcp_proxy(
     )
     if sha_bytes(manifest_data) != manifest_sha256:
         raise RunnerError("RepoGround manifest SHA mismatch")
+    if profile == MCP_PROFILE_FROZEN_G1:
+        if (
+            manifest_sha256 != FROZEN_G1_LEGACY_IDENTITY["manifest_sha256"]
+            or len(upstream) != 6
+            or upstream[0] != FROZEN_G1_LEGACY_IDENTITY["python_path"]
+            or upstream[1] != FROZEN_G1_LEGACY_IDENTITY["launcher_path"]
+            or upstream[5] != FROZEN_G1_LEGACY_IDENTITY["source_root"]
+            or upstream[2] != "--bundle-root"
+            or upstream[3] != str(manifest)
+            or upstream[4] != "--repo-root"
+            or Path(upstream[1]).parent.parent != Path(upstream[5])
+        ):
+            raise RunnerError("historical G1 MCP proxy origin is not authorized")
+    elif profile != MCP_PROFILE_MODERN:
+        raise RunnerError("unknown MCP proxy tool profile")
     manifest_metadata = manifest.lstat()
     manifest_identity = (
         manifest_metadata.st_dev, manifest_metadata.st_ino,
         manifest_metadata.st_size, manifest_metadata.st_mode,
     )
-    upstream_stage = stage_mcp_upstream(
-        Path(runtime_root_text), upstream, manifest, authorized_files
-    )
+    if profile == MCP_PROFILE_FROZEN_G1:
+        upstream_stage = stage_mcp_upstream(
+            Path(runtime_root_text), upstream, manifest, authorized_files,
+            legacy_g1=True,
+        )
+    else:
+        upstream_stage = stage_mcp_upstream(
+            Path(runtime_root_text), upstream, manifest, authorized_files
+        )
     bound_upstream = [str(item) for item in upstream_stage["argv"]]
     staged_manifest = Path(upstream_stage["manifest_binding"]["path"])
     process: subprocess.Popen[bytes] | None = None
@@ -4322,7 +4738,13 @@ def run_mcp_proxy(
                             if identifier is not None:
                                 _proxy_write(_proxy_error(identifier, "benchmark MCP tool is not authorized"), output_lock)
                             continue
-                        _pin_treatment_arguments(message, staged_manifest)
+                        if profile == MCP_PROFILE_FROZEN_G1:
+                            _pin_treatment_arguments(
+                                message, staged_manifest, legacy_g1=True,
+                                external_manifest=external_manifest,
+                            )
+                        else:
+                            _pin_treatment_arguments(message, staged_manifest)
                         pending_kind = "tools/call"
                         pending_treatment_tool = str(name)
                     elif identifier is not None:
@@ -4467,6 +4889,7 @@ def run_mcp_proxy(
                         tool_name=treatment_tool,
                         expected_manifest=staged_manifest,
                         external_manifest=external_manifest,
+                        profile=profile,
                     )
                 pending_requests.pop(identifier, None)
                 pending_treatment_tools.pop(identifier, None)
@@ -4485,7 +4908,9 @@ def run_mcp_proxy(
             elif is_tools_list:
                 if "error" in message or "result" not in message:
                     raise RunnerError("MCP tools/list response must contain a successful result")
-                tools = _filtered_treatment_tools(message.get("result"))
+                tools = _filtered_treatment_tools(
+                    message.get("result"), profile=profile
+                )
                 tools_inventory_validated = True
                 message = {"jsonrpc":"2.0","id":identifier,"result":{"tools":tools}}
             elif resource_call is not None:
@@ -4738,6 +5163,9 @@ def build_command(
             canonical(list(authorized_mcp_files)),
             str(mcp_runtime_root),
         ]
+        mcp_profile = _frozen_g1_mcp_profile(request)
+        if mcp_profile == MCP_PROFILE_FROZEN_G1:
+            proxy_args.append(mcp_profile)
         command[2:2] = [
             "-c", f"mcp_servers.repobrief.command={_toml_string(proxy_python)}",
             "-c", "mcp_servers.repobrief.args=" + canonical(proxy_args),
@@ -6241,9 +6669,9 @@ def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "--codex-mcp-proxy":
         try:
-            if len(raw) != 7:
+            if len(raw) not in (7, 8):
                 raise RunnerError(
-                    "codex MCP proxy requires upstream argv, private manifest, logical manifest, SHA, authorized files, and runtime root"
+                    "codex MCP proxy requires exactly the authorized upstream, manifest, file identities, runtime root and optional frozen G1 profile"
                 )
             upstream = json.loads(raw[1])
             authorized_files = json.loads(raw[5])
@@ -6251,6 +6679,13 @@ def main(argv: list[str] | None = None) -> int:
                 raise RunnerError("codex MCP proxy upstream argv must be a list")
             if not isinstance(authorized_files, list):
                 raise RunnerError("codex MCP proxy authorized files must be a list")
+            if len(raw) == 8:
+                if raw[7] != MCP_PROFILE_FROZEN_G1:
+                    raise RunnerError("unrecognized historical G1 MCP profile")
+                return run_mcp_proxy(
+                    upstream, raw[2], raw[3], raw[4], authorized_files, raw[6],
+                    profile=raw[7],
+                )
             return run_mcp_proxy(
                 upstream, raw[2], raw[3], raw[4], authorized_files, raw[6]
             )

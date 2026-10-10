@@ -5867,5 +5867,194 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 )
 
 
+class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
+    """Portable offline tests; no personal historical checkout or model required."""
+
+    def _historical_pack(self, manifest: Path) -> dict:
+        return {
+            "kind": runner.EXPECTED_ASK_CONTEXT_PACK_KIND,
+            "version": runner.EXPECTED_ASK_CONTEXT_PACK_VERSION,
+            "request_id": "0123456789abcdef",
+            "snapshot_ref": {
+                "freshness_policy": "allow_stale_with_caveat",
+                "freshness_status": "not_comparable",
+                "git_commit": None,
+                "manifest_path": str(manifest),
+                "manifest_sha256": runner.FROZEN_G1_LEGACY_IDENTITY["manifest_sha256"],
+                "stem": "lenskit",
+            },
+            "freshness": {"status": "not_comparable", "caveats": [
+                {"kind": "stale_snapshot", "detail": "Freshness is not comparable."}
+            ]},
+            "availability": {"status": "unknown", "caveats": []},
+            "required_reading": {
+                "status": "pass", "task_profile": "basic_repo_question",
+                "required": ["agent_reading_pack"], "recommended": ["citation_map_jsonl"],
+                "missing_required": [], "missing_recommended": [],
+            },
+            "retrieval_hits": [], "resolved_ranges": [],
+            "answer_scaffold": {
+                "citation_obligations": ["Cite evidence."],
+                "caveats_to_surface": [
+                    {"kind": "stale_snapshot", "detail": "State freshness caveats."}
+                ],
+                "non_claims_to_surface": list(
+                    runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+                ),
+            },
+            "budget": {
+                "max_context_tokens": 8000, "max_answer_tokens": 1200,
+                "approx_context_chars_used": 0, "truncated": False,
+                "does_not_establish_quality": True,
+            },
+            "forbidden_operations": list(runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS),
+            "does_not_establish": list(
+                runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+            ),
+        }
+
+    def test_historical_g1_pack_accepted_without_inventing_modern_evidence(self) -> None:
+        manifest = Path("/frozen/lenskit.bundle.manifest.json")
+        pack = self._historical_pack(manifest)
+        self.assertEqual(
+            runner._validated_frozen_g1_context_pack(
+                pack, expected_manifest=manifest
+            ), pack
+        )
+        with self.assertRaises(runner.RunnerError):
+            runner._validated_ask_context_pack(pack)
+
+    def test_historical_g1_pack_refuses_drifted_keys_and_provenance(self) -> None:
+        manifest = Path("/frozen/lenskit.bundle.manifest.json")
+        mutations = {
+            "extra_modern_field": lambda d: d.__setitem__("retrieval", {}),
+            "missing_budget": lambda d: d["budget"].pop("max_answer_tokens"),
+            "invented_budget": lambda d: d["budget"].__setitem__("unit", "bytes"),
+            "bool_budget": lambda d: d["budget"].__setitem__("max_answer_tokens", True),
+            "wrong_manifest": lambda d: d["snapshot_ref"].__setitem__(
+                "manifest_path", "/frozen/forged.bundle.manifest.json"
+            ),
+            "wrong_manifest_sha": lambda d: d["snapshot_ref"].__setitem__(
+                "manifest_sha256", "0" * 64
+            ),
+            "wrong_stem": lambda d: d["snapshot_ref"].__setitem__(
+                "stem", "other-repository"
+            ),
+            "wrong_git_commit": lambda d: d["snapshot_ref"].__setitem__(
+                "git_commit", "0" * 40
+            ),
+            "freshness_disagreement": lambda d: d["freshness"].__setitem__(
+                "status", "fresh"
+            ),
+            "forbidden_read_write": lambda d: d["forbidden_operations"].remove(
+                "git_mutation"
+            ),
+            "nonclaim_missing": lambda d: d["does_not_establish"].pop(),
+            "invalid_caveat": lambda d: d["freshness"]["caveats"].append(
+                {"kind": "invented"}
+            ),
+            "invalid_range": lambda d: d["resolved_ranges"].append("unsafe"),
+        }
+        for label, change in mutations.items():
+            with self.subTest(label=label):
+                pack = self._historical_pack(manifest)
+                change(pack)
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "historical G1 ask_context context pack"
+                ):
+                    runner._validated_frozen_g1_context_pack(
+                        pack, expected_manifest=manifest
+                    )
+
+    def test_historical_g1_profile_is_bound_to_exact_request_not_schema_fallback(self) -> None:
+        frozen = runner.FROZEN_G1_LEGACY_IDENTITY
+        manifest = "/frozen/lenskit.bundle.manifest.json"
+        req = request(condition="treatment")
+        req.update(
+            taskset_id=frozen["taskset_id"],
+            taskset_sha256=frozen["taskset_sha256"],
+            case_id=frozen["case_id"],
+            repository=dict(frozen["repository"]),
+            setup={"working_tree": "clean", "fixture": "fresh-matching-snapshot"},
+        )
+        req["repobrief"] = {
+            "manifest": manifest, "manifest_sha256": frozen["manifest_sha256"],
+            "mcp_command": [
+                frozen["python_path"], frozen["launcher_path"],
+                "--bundle-root", manifest, "--repo-root", frozen["source_root"],
+            ],
+        }
+        with patch.dict(
+            frozen, {"prompt_sha256": hashlib.sha256(req["prompt"].encode()).hexdigest()}
+        ):
+            self.assertEqual(
+                runner._frozen_g1_mcp_profile(req), runner.MCP_PROFILE_FROZEN_G1
+            )
+            modified = json.loads(json.dumps(req))
+            modified["repobrief"]["manifest_sha256"] = "f" * 64
+            with self.assertRaises(runner.RunnerError):
+                runner._frozen_g1_mcp_profile(modified)
+            for index, replacement in (
+                (0, "/tmp/foreign-python"),
+                (1, "/tmp/scripts/repobrief-mcp-stdio.py"),
+                (5, "/tmp/foreign-lenskit"),
+            ):
+                modified = json.loads(json.dumps(req))
+                modified["repobrief"]["mcp_command"][index] = replacement
+                with self.subTest(index=index), self.assertRaises(runner.RunnerError):
+                    runner._frozen_g1_mcp_profile(modified)
+            modified = json.loads(json.dumps(req))
+            modified["taskset_sha256"] = "0" * 64
+            self.assertEqual(
+                runner._frozen_g1_mcp_profile(modified),
+                runner.MCP_PROFILE_MODERN,
+            )
+
+    def test_historical_g1_vendor_freeze_rejects_source_edits_and_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            site = root / "site"
+            package = site / "jsonschema"
+            package.mkdir(parents=True)
+            source = package / "__init__.py"
+            source.write_bytes(b"original pinned bytes\\n")
+            source.chmod(0o600)
+            typing = root / "typing_extensions.py"
+            typing.write_bytes(b"typing helper\\n")
+            typing.chmod(0o600)
+            def manifest_sha() -> str:
+                entries = [
+                    {"p": "jsonschema/__init__.py", "n": source.stat().st_size,
+                     "h": hashlib.sha256(source.read_bytes()).hexdigest()},
+                    {"p": "typing_extensions.py", "n": typing.stat().st_size,
+                     "h": hashlib.sha256(typing.read_bytes()).hexdigest()},
+                ]
+                return runner.sha_bytes(runner.canonical(entries).encode())
+            with (
+                patch.object(runner, "FROZEN_G1_VENDOR_SITE_ROOT", site),
+                patch.object(runner, "FROZEN_G1_VENDOR_TYPING_EXT", typing),
+                patch.object(runner, "FROZEN_G1_VENDOR_PACKAGES", ("jsonschema",)),
+                patch.object(runner, "FROZEN_G1_VENDOR_MANIFEST_SHA256", manifest_sha()),
+            ):
+                entries = runner._frozen_g1_vendor_snapshot()
+                self.assertEqual(len(entries), 2)
+                source.write_bytes(b"changed code\\n")
+                with self.assertRaisesRegex(runner.RunnerError, "digest is not frozen"):
+                    runner._frozen_g1_vendor_snapshot()
+                source.write_bytes(b"original pinned bytes\\n")
+                source.chmod(0o666)
+                with self.assertRaisesRegex(runner.RunnerError, "metadata is unsafe"):
+                    runner._frozen_g1_vendor_snapshot()
+                source.chmod(0o600)
+                forged = package / "forged.py"
+                forged.symlink_to(source)
+                with self.assertRaisesRegex(runner.RunnerError, "path is unsafe"):
+                    runner._frozen_g1_vendor_snapshot()
+                forged.unlink()
+                with patch.object(runner, "MAX_FROZEN_G1_VENDOR_FILES", 1):
+                    with self.assertRaisesRegex(runner.RunnerError, "exceeds bounds"):
+                        runner._frozen_g1_vendor_snapshot()
+
+
 if __name__ == "__main__":
     unittest.main()

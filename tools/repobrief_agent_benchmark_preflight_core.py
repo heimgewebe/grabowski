@@ -1506,6 +1506,26 @@ def probe_freshness(
     ):
         raise PreflightError("treatment MCP command is invalid")
     command = list(command)
+    provider = treatment.get("runner")
+    mcp_profile = "modern"
+    if (
+        isinstance(provider, Mapping)
+        and provider.get("provider") == "openai-codex-cli"
+    ):
+        codex_module = _codex_runner_module()
+        try:
+            mcp_profile = codex_module._frozen_g1_mcp_profile(treatment)
+            if mcp_profile == codex_module.MCP_PROFILE_FROZEN_G1:
+                manifest = Path(str(binding.get("manifest")))
+                raw_manifest = codex_module._read_bound_regular_file(
+                    manifest, label="historical G1 manifest",
+                    max_bytes=codex_module.MAX_MANIFEST_BYTES,
+                )
+                codex_module._repoground_source_tree_snapshot(
+                    Path(command[1]), raw_manifest, legacy_g1=True
+                )
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise PreflightError("historical G1 MCP provenance is not authorized") from exc
     if repo_root is not None:
         if command.count("--repo-root") != 1 or clean_source is None:
             raise PreflightError("dirty MCP probe lacks a unique bound source root")
@@ -1558,7 +1578,6 @@ def probe_freshness(
             },
             timeout_seconds=30,
         )
-        provider = treatment.get("runner")
         if (
             isinstance(provider, Mapping)
             and provider.get("provider") == "openai-codex-cli"
@@ -1574,7 +1593,12 @@ def probe_freshness(
                 timeout_seconds=20,
             )
             try:
-                _codex_runner_module()._filtered_treatment_tools(inventory)
+                if mcp_profile == codex_module.MCP_PROFILE_FROZEN_G1:
+                    codex_module._filtered_treatment_tools(
+                        inventory, profile=mcp_profile
+                    )
+                else:
+                    codex_module._filtered_treatment_tools(inventory)
             except ValueError as exc:
                 raise PreflightError(
                     "Codex treatment MCP tools/list violates the pinned tool contract"
@@ -1602,6 +1626,34 @@ def probe_freshness(
     if result.get("isError") is not False or not isinstance(structured, dict):
         raise PreflightError("RepoBrief MCP freshness call failed")
     status = structured.get("status")
+    if mcp_profile == "frozen-g1-lenskit-legacy":
+        frozen = codex_module.FROZEN_G1_LEGACY_IDENTITY
+        source_root = str(Path(command[-1]).expanduser().resolve(strict=True))
+        current = structured.get("current_provenance")
+        snapshot = structured.get("snapshot_provenance")
+        try:
+            codex_module._validated_live_freshness_payload(
+                structured, expected_manifest=Path(str(binding["manifest"]))
+            )
+        except ValueError as exc:
+            raise PreflightError("historical G1 MCP freshness projection is invalid") from exc
+        if (
+            status != "fresh"
+            or structured.get("reason") != "git_head_matches_and_working_tree_is_clean"
+            or structured.get("repo_root") != source_root
+            or structured.get("read_only_git_probe") is not True
+            or structured.get("implicit_refresh") is not False
+            or not isinstance(current, dict)
+            or current.get("repo_root") != source_root
+            or current.get("git_commit") != frozen["repository"]["commit"]
+            or current.get("git_dirty") is not False
+            or current.get("provenance_status") != "present"
+            or not isinstance(snapshot, dict)
+            or snapshot.get("git_commit") != frozen["repository"]["commit"]
+            or snapshot.get("git_dirty") is not False
+            or snapshot.get("name") != "lenskit"
+        ):
+            raise PreflightError("historical G1 MCP freshness provenance is inconsistent")
     if repo_root is not None:
         expected_root = str(repo_root.resolve())
         current = structured.get("current_provenance")
