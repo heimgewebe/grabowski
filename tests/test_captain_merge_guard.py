@@ -543,6 +543,41 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             self.assertFalse(denied, unsupported)
             self.assertEqual(unsupported["reason"], "unique_merge_base_unavailable")
 
+    def test_live_bindings_handles_untrusted_nonstring_base_oid_fail_closed(self) -> None:
+        for invalid_base_oid in (None, 7, [], {}):
+            with self.subTest(base_oid=invalid_base_oid):
+                gh = _RenamePrGh(change_status="modified")
+                gh.base_sha = invalid_base_oid
+                runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+                runner.action = {
+                    "target": {
+                        "repo": "heimgewebe/commonworld", "pr": 212, "base": "main"
+                    }
+                }
+                runner.parameters = {
+                    "expected_head": gh.head_sha,
+                    "expected_base_sha": "a" * 40,
+                    "diff_sha256": "f" * 64,
+                }
+                runner.static_errors = []
+                runner.repo_path = Path.cwd()
+                runner.github_runner = gh
+                runner.receipt = {}
+                runner.execution_intent_sha256 = "1" * 64
+                runner._revalidate_codex_review = lambda _bindings, phase: []
+
+                bindings, errors = runner._live_bindings()
+                self.assertIsNotNone(bindings)
+                self.assertIn("merge_guard_base_sha_missing_or_invalid", errors)
+                self.assertIn("merge_guard_diff_drift", errors)
+                self.assertEqual(
+                    runner.receipt["local_review_diff_equivalence"]["reason"],
+                    "invalid_or_unsupported_input",
+                )
+                self.assertEqual(
+                    bindings["diff_identity_mode"], "unmatched"
+                )
+
     def test_live_bindings_rejects_unrelated_diff_identity(self) -> None:
         gh = _RenamePrGh()
         gh.diff_text = (

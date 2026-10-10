@@ -1666,6 +1666,9 @@ def _merge_guard_legacy_local_review_diff_identity(
         not isinstance(provider_diff, bytes)
         or not provider_diff
         or len(provider_diff) > _MERGE_GUARD_MAX_DIFF_BYTES
+        or not isinstance(base_sha, str)
+        or not isinstance(head_sha, str)
+        or not isinstance(expected_sha256, str)
         or _SHA40_RE.fullmatch(base_sha) is None
         or _SHA40_RE.fullmatch(head_sha) is None
         or _SHA256_RE.fullmatch(expected_sha256) is None
