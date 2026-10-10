@@ -1906,6 +1906,59 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual(lease["owner_id"], f"lane:{lane['lane_id']}")
         self.assertTrue(self.git.writer.exists())
 
+        # The same already-admitted create/reuse path must work when both
+        # resource and checkout stores have live WAL/SHM from active writers.
+        keepers = (workspace.resources._database(), workspace.checkouts._database())
+        try:
+            for keeper in keepers:
+                keeper.execute("BEGIN IMMEDIATE")
+                keeper.execute("UPDATE metadata SET value=value WHERE key='schema_version'")
+                keeper.commit()
+            for database in (workspace.resources.RESOURCE_DB, workspace.checkouts.CHECKOUT_DB):
+                self.assertTrue(Path(str(database) + "-wal").is_file())
+                self.assertTrue(Path(str(database) + "-shm").is_file())
+            with (
+                mock.patch.object(workspace.operator, "_require_operator_mutation") as mutation_gate,
+                mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+                mock.patch.object(
+                    workspace, "_task_public",
+                    return_value={"task_id": manifest["tasks"]["writer"], "state": "running"},
+                ),
+                mock.patch.object(
+                    workspace, "_writer_create_identity",
+                    return_value={"writer_head": manifest["expected_base_head"], "writer_branch_matches": True},
+                ),
+            ):
+                reuse = workspace._existing_workspace_response(
+                    directory=self.state / manifest["workspace_id"],
+                    plan=workspace._plan_from_manifest(manifest),
+                    plan_sha256=manifest["plan_sha256"],
+                )
+            self.assertEqual(reuse["state"], "creation_runtime_incomplete", reuse)
+            self.assertTrue(reuse["lane_binding_status"]["valid"], reuse)
+            self.assertNotIn("work_lane_binding_invalid", reuse["runtime_errors"])
+            mutation_gate.assert_any_call("resource_lease")
+        finally:
+            for keeper in keepers:
+                keeper.close()
+
+    def test_workspace_lifecycle_classification_rechecks_git_capability_before_inventory(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.operator, "_require_operator_capability",
+                side_effect=PermissionError("git_cli denied"),
+            ) as git_gate,
+            mock.patch.object(workspace.checkouts, "checkout_inventory") as inventory,
+        ):
+            with self.assertRaisesRegex(PermissionError, "git_cli denied"):
+                workspace._workspace_lifecycle_classification(
+                    manifest, {}, observed_at_unix=workspace._now()
+                )
+        git_gate.assert_called_once_with("git_cli")
+        inventory.assert_not_called()
+
     def test_lane_backed_close_preserves_lane_ownership_and_satisfies_close(self) -> None:
         lane = self.lane_receipt()
         manifest = self.lane_manifest(lane)
