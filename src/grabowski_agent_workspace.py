@@ -3233,7 +3233,7 @@ def _role_task_argv(
         role == "review"
         and dirty
         and selected_command
-        and Path(selected_command[0]).name == "grok"
+        and Path(selected_command[0]).name in {"grok", "claude"}
     ):
         frozen = manifest.get("frozen_writer")
         writer_result = frozen.get("writer_result") if isinstance(frozen, dict) else None
@@ -3245,7 +3245,7 @@ def _role_task_argv(
             )
         ):
             raise AgentWorkspaceError(
-                "dirty Grok review requires the exact verified frozen writer patch"
+                "dirty Grok or Claude review requires the exact verified frozen writer patch"
             )
         review_input_arguments = [
             "--review-input-root",
