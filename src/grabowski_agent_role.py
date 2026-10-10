@@ -1250,7 +1250,7 @@ def _extract_claude_review_document(
         for model_stats in model_usage.values():
             if not isinstance(model_stats, dict):
                 return None, "Claude review model usage evidence is invalid", metadata
-            zero_activity_counters.append((model_stats, ("webSearchRequests",)))
+            zero_activity_counters.append((model_stats, ("webSearchRequests", "webFetchRequests")))
     if "subagent_stats" in envelope:
         subagent_stats = envelope["subagent_stats"]
         if not isinstance(subagent_stats, dict):
