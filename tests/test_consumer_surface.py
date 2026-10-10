@@ -654,6 +654,45 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertEqual("bind snapshot", result["recommended_next_action"])
         self.assertNotIn("system_overview", result)
 
+    def test_overview_uses_only_readonly_task_and_resource_sources(self) -> None:
+        def tasks_snapshot(**kwargs):
+            self.assertIs(kwargs.get("read_only"), True)
+            raise RuntimeError("Task store requires an explicit schema migration")
+
+        def resource_snapshot(**kwargs):
+            self.assertIs(kwargs.get("read_only"), True)
+            raise RuntimeError("Resource store requires an explicit schema migration")
+
+        fake_tasks = SimpleNamespace(grabowski_task_list=tasks_snapshot)
+        fake_resources = SimpleNamespace(count_resources=resource_snapshot)
+        fake_obligations = SimpleNamespace(
+            list_obligations=lambda _params: {
+                "record_count": 0, "integrity_errors": [], "scan_truncated": False,
+            }
+        )
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "grabowski_tasks": fake_tasks,
+                "grabowski_resources": fake_resources,
+                "grabowski_operator_obligation": fake_obligations,
+            },
+        ):
+            overview = grabowski_mcp._operator_system_overview(
+                runtime_healthy=True,
+                normal_mutation_path_ready=True,
+                coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                client_snapshot={
+                    "observable": True, "fresh": True, "matched": True,
+                    "server_loopback_schema_contract_matches": True,
+                    "platform_publication_state": "platform_converged",
+                    "platform_publication_pending": False,
+                },
+            )
+        self.assertFalse(overview["tasks"]["available"])
+        self.assertFalse(overview["leases"]["available"])
+        self.assertFalse(overview["operator_ready"])
+
     def test_operator_system_overview_prioritizes_connector_and_compacts_components(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
@@ -724,14 +763,71 @@ class ConsumerSurfaceTests(unittest.TestCase):
         )
 
 
+    def test_operator_overview_fails_closed_on_unreconciled_task_snapshot(self) -> None:
+        # A running task cannot acquire quiescent proof even after another
+        # authorized reconcile. Keep readiness blocked without retry advice
+        # that can never succeed until the task terminalizes.
+        for evidence_status in ("active_tasks", "verified"):
+            with self.subTest(evidence_status=evidence_status):
+                fake_tasks = SimpleNamespace(
+                    grabowski_task_list=lambda **kwargs: {
+                        "state_counts": {"running": 1},
+                        "projection_counts": {"active": 1},
+                        "projection_counts_overlap": False,
+                        "unknown_state_count": 0,
+                        "state_counts_complete": True,
+                        "reconciliation_performed": False,
+                        "reconciliation_evidence": {"status": evidence_status},
+                    }
+                )
+                fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 1)
+                fake_obligations = SimpleNamespace(
+                    list_obligations=lambda _parameters: {
+                        "record_count": 0,
+                        "integrity_errors": [],
+                        "scan_truncated": False,
+                    }
+                )
+                with mock.patch.dict(
+                    "sys.modules",
+                    {
+                        "grabowski_tasks": fake_tasks,
+                        "grabowski_resources": fake_resources,
+                        "grabowski_operator_obligation": fake_obligations,
+                    },
+                ):
+                    overview = grabowski_mcp._operator_system_overview(
+                        runtime_healthy=True,
+                        normal_mutation_path_ready=True,
+                        coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                        client_snapshot={
+                            "observable": True,
+                            "fresh": True,
+                            "matched": True,
+                            "server_loopback_schema_contract_matches": True,
+                            "platform_publication_state": "platform_converged",
+                            "platform_publication_pending": False,
+                        },
+                    )
+                self.assertTrue(overview["tasks"]["snapshot_complete"])
+                self.assertIs(overview["tasks"]["reconciliation_performed"], False)
+                self.assertFalse(overview["readiness"]["truth_model_ready"])
+                self.assertFalse(overview["operator_ready"])
+                self.assertEqual(
+                    "wait for active tasks to terminalize, then run authorized reconciliation",
+                    overview["recommended_next_action"],
+                )
+
     def test_operator_system_overview_keeps_execution_ready_when_publication_is_pending(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
                 "state_counts": {},
-                "projection_counts": {},
+                "projection_counts": {"active": 0},
                 "projection_counts_overlap": False,
                 "unknown_state_count": 0,
                 "state_counts_complete": True,
+                "reconciliation_performed": False,
+                "reconciliation_evidence": {"status": "verified"},
             }
         )
         fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)
@@ -809,10 +905,12 @@ class ConsumerSurfaceTests(unittest.TestCase):
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
                 "state_counts": {},
-                "projection_counts": {},
+                "projection_counts": {"active": 0},
                 "projection_counts_overlap": False,
                 "unknown_state_count": 0,
                 "state_counts_complete": True,
+                "reconciliation_performed": False,
+                "reconciliation_evidence": {"status": "verified"},
             }
         )
         fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)

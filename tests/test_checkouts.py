@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -6661,6 +6662,308 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 "database is locked",
             ):
                 checkouts._archive_uncertainty_readback(fence)
+
+    def test_public_checkout_summary_wal_and_orphaned_shm_are_unavailable_without_writes(self) -> None:
+        import grabowski_read_surface as read_surface
+
+        context = {
+            "repository": str(self.repo),
+            "exists": True,
+            "canonical_checkout": str(self.repo),
+            "canonical_matches_runtime": True,
+            "worktrees": [],
+            "runtime_matching_worktrees": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / "source.sqlite3"
+            keeper = sqlite3.connect(source)
+            try:
+                self.assertEqual(
+                    "wal", keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                )
+                keeper.execute("PRAGMA wal_autocheckpoint=0")
+                keeper.execute("CREATE TABLE proof(value INTEGER)")
+                keeper.execute("INSERT INTO proof VALUES (42)")
+                keeper.commit()
+                wal = Path(str(source) + "-wal")
+                self.assertGreater(wal.stat().st_size, 32)
+                target = directory / "target.sqlite3"
+                shutil.copyfile(source, target)
+                shutil.copyfile(wal, Path(str(target) + "-wal"))
+                for scenario in ("wal_without_shm", "orphaned_shm"):
+                    with self.subTest(scenario=scenario):
+                        if scenario == "orphaned_shm":
+                            Path(str(target) + "-wal").unlink()
+                            Path(str(target) + "-shm").write_bytes(b"orphaned-shm-marker")
+                        before = {
+                            item.name: item.read_bytes()
+                            for item in directory.iterdir()
+                            if item.name.startswith("target.sqlite3")
+                        }
+                        with (
+                            patch.object(checkouts, "CHECKOUT_DB", target),
+                            patch.object(
+                                read_surface.base,
+                                "_deployment_metadata",
+                                return_value={"repo_head": self.head},
+                            ),
+                            patch.object(
+                                read_surface.runtime_extensions,
+                                "_worktree_context",
+                                return_value=context,
+                            ),
+                        ):
+                            observed = read_surface.grabowski_checkout_summary(
+                                view="minimal", limit=5
+                            )
+                        self.assertIs(observed["active_capacity"]["available"], False)
+                        self.assertEqual(
+                            observed["active_capacity"]["error_type"], "RuntimeError"
+                        )
+                        after = {
+                            item.name: item.read_bytes()
+                            for item in directory.iterdir()
+                            if item.name.startswith("target.sqlite3")
+                        }
+                        self.assertEqual(before, after)
+            finally:
+                keeper.close()
+
+    def test_public_checkout_summary_quiescent_store_still_reports_capacity(self) -> None:
+        import grabowski_read_surface as read_surface
+
+        connection = checkouts._database()
+        connection.close()
+        self.assertFalse(Path(str(self.checkout_db) + "-wal").exists())
+        context = {
+            "repository": str(self.repo),
+            "exists": True,
+            "canonical_checkout": str(self.repo),
+            "canonical_matches_runtime": True,
+            "worktrees": [],
+            "runtime_matching_worktrees": [],
+        }
+        with (
+            patch.object(
+                read_surface.base, "_deployment_metadata",
+                return_value={"repo_head": self.head},
+            ),
+            patch.object(
+                read_surface.runtime_extensions, "_worktree_context",
+                return_value=context,
+            ),
+        ):
+            observed = read_surface.grabowski_checkout_summary(view="minimal", limit=5)
+        self.assertIs(observed["active_capacity"]["available"], True)
+        self.assertEqual(observed["active_capacity"]["used"], 0)
+
+    def test_checkout_previews_require_mutation_gate_before_sqlite_observation(self) -> None:
+        # Even a denied preview must not open SQLite: mode=ro can create SHM.
+        with (
+            patch.object(
+                checkouts.operator, "_require_operator_mutation",
+                side_effect=PermissionError("resource mutation denied"),
+            ) as gate,
+            patch.object(
+                checkouts, "_readonly_connection",
+                side_effect=AssertionError("SQLite observation must not occur"),
+            ) as reader,
+        ):
+            with self.assertRaisesRegex(PermissionError, "resource mutation denied"):
+                checkouts.grabowski_checkout_binding_terminal_preview("a" * 64)
+            with self.assertRaisesRegex(PermissionError, "resource mutation denied"):
+                checkouts.grabowski_checkout_binding_identity_rebind_preview("a" * 64)
+            with self.assertRaisesRegex(PermissionError, "resource mutation denied"):
+                checkouts.checkout_owner_handoff_preview(
+                    str(self.repo), str(self.checkout),
+                    "owner-a", "owner-b", "owner-b", self.head, "topic",
+                )
+        self.assertEqual(gate.call_count, 3)
+        for call in gate.call_args_list:
+            self.assertEqual(call.args, ("resource_lease",))
+        reader.assert_not_called()
+
+    def test_public_checkout_inventory_refuses_live_wal_without_shm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / "source.sqlite3"
+            target = directory / "target.sqlite3"
+            keeper = sqlite3.connect(source)
+            try:
+                self.assertEqual(
+                    "wal", keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                )
+                keeper.execute("PRAGMA wal_autocheckpoint=0")
+                keeper.execute("CREATE TABLE proof(value INTEGER)")
+                keeper.execute("INSERT INTO proof VALUES (42)")
+                keeper.commit()
+                source_wal = Path(str(source) + "-wal")
+                self.assertGreater(source_wal.stat().st_size, 32)
+                shutil.copyfile(source, target)
+                shutil.copyfile(source_wal, Path(str(target) + "-wal"))
+                before = {
+                    item.name: item.read_bytes()
+                    for item in directory.iterdir() if item.name.startswith("target")
+                }
+                self.assertNotIn("target.sqlite3-shm", before)
+                with patch.object(checkouts, "CHECKOUT_DB", target):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "Strict read-only snapshot unavailable"
+                    ):
+                        checkouts.grabowski_checkout_inventory(
+                            str(self.repo),
+                            include_processes=False,
+                            include_tasks=False,
+                            include_resources=False,
+                        )
+                after = {
+                    item.name: item.read_bytes()
+                    for item in directory.iterdir() if item.name.startswith("target")
+                }
+                self.assertEqual(before, after)
+            finally:
+                keeper.close()
+
+    def test_public_checkout_inventory_refuses_orphaned_shm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            database = directory / "checkout.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE proof(value INTEGER)")
+            Path(str(database) + "-shm").write_bytes(b"orphaned-shm-marker")
+            before = {p.name: p.read_bytes() for p in directory.iterdir()}
+            with patch.object(checkouts, "CHECKOUT_DB", database):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Strict read-only snapshot unavailable"
+                ):
+                    checkouts.grabowski_checkout_inventory(
+                        str(self.repo),
+                        include_processes=False,
+                        include_tasks=False,
+                        include_resources=False,
+                    )
+            self.assertEqual(before, {p.name: p.read_bytes() for p in directory.iterdir()})
+
+    def test_public_checkout_inventory_missing_store_is_unavailable(self) -> None:
+        missing = self.root / "never-created-inventory.sqlite3"
+        with patch.object(checkouts, "CHECKOUT_DB", missing):
+            with self.assertRaisesRegex(
+                RuntimeError, "Strict read-only snapshot unavailable"
+            ):
+                checkouts.grabowski_checkout_inventory(
+                    str(self.repo),
+                    include_processes=False,
+                    include_tasks=False,
+                    include_resources=False,
+                )
+        self.assertFalse(missing.exists())
+
+    def test_readonly_uncertainty_status_does_not_create_shm_on_live_wal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / "source.sqlite3"
+            target = directory / "target.sqlite3"
+            keeper = sqlite3.connect(source)
+            try:
+                self.assertEqual(
+                    "wal", keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                )
+                keeper.execute("PRAGMA wal_autocheckpoint=0")
+                keeper.execute("CREATE TABLE operation_uncertainty(fence_id TEXT)")
+                keeper.execute("INSERT INTO operation_uncertainty VALUES('x')")
+                keeper.commit()
+                wal = Path(str(source) + "-wal")
+                self.assertTrue(wal.is_file())
+                shutil.copyfile(source, target)
+                shutil.copyfile(wal, Path(str(target) + "-wal"))
+                before = {
+                    item.name: item.read_bytes()
+                    for item in directory.iterdir() if item.name.startswith("target")
+                }
+                self.assertNotIn("target.sqlite3-shm", before)
+                with patch.object(checkouts, "CHECKOUT_DB", target):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "Strict read-only snapshot unavailable"
+                    ):
+                        checkouts.grabowski_checkout_uncertainty_status()
+                after = {
+                    item.name: item.read_bytes()
+                    for item in directory.iterdir() if item.name.startswith("target")
+                }
+                self.assertEqual(before, after)
+            finally:
+                keeper.close()
+
+    def test_readonly_uncertainty_status_absent_store_is_not_empty_success(self) -> None:
+        missing = self.root / "never-created.sqlite3"
+        with patch.object(checkouts, "CHECKOUT_DB", missing):
+            with self.assertRaisesRegex(RuntimeError, "store is unavailable"):
+                checkouts.grabowski_checkout_uncertainty_status()
+        self.assertFalse(missing.exists())
+
+    def test_internal_lifecycle_sqlite_reader_keeps_authorized_wal_support(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "live.sqlite3"
+            keeper = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    "wal", keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                )
+                keeper.execute("CREATE TABLE proof(value INTEGER)")
+                keeper.execute("INSERT INTO proof VALUES (42)")
+                keeper.commit()
+                reader = checkouts._readonly_connection(database)
+                self.assertIsNotNone(reader)
+                try:
+                    self.assertEqual(
+                        42, reader.execute("SELECT value FROM proof").fetchone()[0]
+                    )
+                finally:
+                    reader.close()
+            finally:
+                keeper.close()
+
+
+    def test_readonly_uncertainty_status_rejects_orphaned_shm_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "quiescent.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT)")
+                connection.execute("INSERT INTO metadata VALUES ('schema_version', '1')")
+                connection.execute("CREATE TABLE operation_uncertainty(fence_id TEXT)")
+            shm = Path(str(database) + "-shm")
+            shm.write_bytes(b"orphaned-shm-marker")
+            before = {p.name: p.read_bytes() for p in Path(temporary).iterdir()}
+            with patch.object(checkouts, "CHECKOUT_DB", database):
+                with self.assertRaisesRegex(RuntimeError, "Strict read-only snapshot unavailable"):
+                    checkouts.grabowski_checkout_uncertainty_status()
+            self.assertEqual(before, {p.name: p.read_bytes() for p in Path(temporary).iterdir()})
+
+    def test_readonly_uncertainty_status_rejects_legacy_schema_as_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "legacy.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT)")
+                connection.execute("INSERT INTO metadata VALUES ('schema_version', '1')")
+            with patch.object(checkouts, "CHECKOUT_DB", database):
+                with self.assertRaisesRegex(RuntimeError, "schema is not observable"):
+                    checkouts.grabowski_checkout_uncertainty_status()
+
+    def test_readonly_uncertainty_status_reads_quiescent_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "status.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute("CREATE TABLE metadata(key TEXT PRIMARY KEY, value TEXT)")
+                connection.execute("INSERT INTO metadata VALUES ('schema_version', '1')")
+                connection.execute(
+                    "CREATE TABLE operation_uncertainty("
+                    "fence_id TEXT PRIMARY KEY, cleared_at_unix INTEGER, created_at_unix INTEGER)"
+                )
+            with patch.object(checkouts, "CHECKOUT_DB", database):
+                result = checkouts.grabowski_checkout_uncertainty_status()
+            self.assertEqual({"fences": [], "count": 0, "truncated": False}, result)
+            self.assertEqual(["status.sqlite3"], [p.name for p in Path(temporary).iterdir()])
 
 
 if __name__ == "__main__":

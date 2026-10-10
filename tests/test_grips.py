@@ -2116,6 +2116,12 @@ class GripFoundationTests(unittest.TestCase):
         for item in listed:
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
+        for preview_grip in (
+            "checkout-binding-terminal-preview",
+            "checkout-binding-identity-rebind-preview",
+            "checkout-owner-handoff-preview",
+        ):
+            self.assertEqual("mutating", specs[preview_grip]["effect"])
         self.assertEqual("read_only", specs["repo-orient"]["effect"])
         self.assertEqual("read_only", specs["browser-semantic-observe"]["effect"])
         self.assertEqual("mutating", specs["browser-semantic-act"]["effect"])
@@ -2153,6 +2159,9 @@ class GripFoundationTests(unittest.TestCase):
             "checkout-binding-terminal-apply",
             "checkout-binding-identity-rebind-apply",
             "checkout-owner-handoff-apply",
+            "checkout-binding-terminal-preview",
+            "checkout-binding-identity-rebind-preview",
+            "checkout-owner-handoff-preview",
         ):
             self.assertEqual("worktree_admin", specs[name]["operation_effect_class"])
             self.assertEqual("worktree-admin", specs[name]["operation_class"])
@@ -2367,7 +2376,7 @@ class GripFoundationTests(unittest.TestCase):
             navigation_target="https://example.invalid/",
         )
 
-    def test_checkout_binding_terminal_preview_grip_is_read_only_and_delegates(self) -> None:
+    def test_checkout_binding_terminal_preview_grip_requires_mutation_and_delegates(self) -> None:
         checkout_key = "a" * 64
         preview = {
             "schema_version": 1,
@@ -2385,15 +2394,22 @@ class GripFoundationTests(unittest.TestCase):
             "grabowski_checkouts.grabowski_checkout_binding_terminal_preview",
             return_value=preview,
         ) as terminal_preview:
+            blocked = grips.grip_run(
+                "checkout-binding-terminal-preview",
+                {"checkout_key": checkout_key},
+            )
+            self.assertEqual("blocked", blocked["status"])
+            terminal_preview.assert_not_called()
             result = grips.grip_run(
                 "checkout-binding-terminal-preview",
                 {"checkout_key": checkout_key},
+                allow_mutation=True,
             )
         self.assertEqual("passed", result["status"])
         self.assertEqual("passed", result["output"]["receipt_status"])
         terminal_preview.assert_called_once_with(checkout_key)
         checks = {item["id"]: item for item in result["receipt"]["checks"]}
-        self.assertEqual("pass", checks["preview-read-only"]["status"])
+        self.assertEqual("pass", checks["preview-effect-gated"]["status"])
         self.assertEqual("pass", checks["preview-digest-bound"]["status"])
 
     def test_checkout_binding_terminal_preview_blocks_missing_repository(self) -> None:
@@ -2405,6 +2421,7 @@ class GripFoundationTests(unittest.TestCase):
             result = grips.grip_run(
                 "checkout-binding-terminal-preview",
                 {"checkout_key": checkout_key},
+                allow_mutation=True,
             )
         self.assertEqual("blocked", result["status"])
         self.assertIn("repository missing", result["output"]["error"])
@@ -3034,9 +3051,16 @@ class GripFoundationTests(unittest.TestCase):
         ) as rebind_preview, patch(
             "grabowski_checkouts.grabowski_checkout_binding_terminal_preview"
         ) as terminal_preview:
+            blocked = grips.grip_run(
+                "checkout-binding-identity-rebind-preview",
+                {"checkout_key": checkout_key},
+            )
+            self.assertEqual("blocked", blocked["status"])
+            rebind_preview.assert_not_called()
             result = grips.grip_run(
                 "checkout-binding-identity-rebind-preview",
                 {"checkout_key": checkout_key},
+                allow_mutation=True,
             )
         self.assertEqual("passed", result["status"])
         self.assertEqual("passed", result["output"]["receipt_status"])
@@ -3087,6 +3111,7 @@ class GripFoundationTests(unittest.TestCase):
             result = grips.grip_run(
                 "checkout-binding-identity-rebind-preview",
                 {"checkout_key": checkout_key},
+                allow_mutation=True,
             )
         self.assertEqual("passed", result["status"])
         checks = {item["id"]: item for item in result["receipt"]["checks"]}
@@ -3298,7 +3323,12 @@ class GripFoundationTests(unittest.TestCase):
             "expected_branch": "topic",
         }
         with patch("grabowski_checkouts.checkout_owner_handoff_preview", return_value=preview) as handoff:
-            result = grips.grip_run("checkout-owner-handoff-preview", parameters)
+            denied = grips.grip_run("checkout-owner-handoff-preview", parameters)
+            self.assertEqual("blocked", denied["status"])
+            handoff.assert_not_called()
+            result = grips.grip_run(
+                "checkout-owner-handoff-preview", parameters, allow_mutation=True
+            )
         self.assertEqual("passed", result["status"])
         handoff.assert_called_once()
         self.assertEqual(snapshot, result["output"]["snapshot_sha256"])

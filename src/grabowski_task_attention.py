@@ -3643,6 +3643,7 @@ def reconcile_attention(
     *,
     _bounded_current_projection: bool = False,
     _current_work_task_ids: set[str] | None = None,
+    _mutating_reader: bool = False,
 ) -> dict[str, Any]:
     parameters = _validate_exact_keys(
         dict(parameters or {}),
@@ -3762,7 +3763,12 @@ def reconcile_attention(
     has_more = False
     next_cursor = None
 
-    with tasks._task_read_snapshot() as connection, decision_snapshot_guard() as decision_snapshot:
+    # Only the private legacy/testing path may initialize or migrate stores.
+    # Both public READ_ONLY entry points keep the strict snapshot by default.
+    if _mutating_reader:
+        tasks.operator._require_operator_mutation("durable_job")
+    snapshot = tasks._task_read_snapshot() if _mutating_reader else tasks._task_readonly_snapshot()
+    with snapshot as connection, decision_snapshot_guard() as decision_snapshot:
         raw_total_attention = int(
             connection.execute(
                 f"SELECT COUNT(*) FROM tasks WHERE state IN ({placeholders})",

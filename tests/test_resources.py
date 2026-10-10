@@ -59,6 +59,112 @@ class ResourceTests(unittest.TestCase):
         self.patch.stop()
         self.temporary.cleanup()
 
+    def test_resource_writer_connections_are_closed_across_lease_lifecycle(self) -> None:
+        # SQLite's connection context manager commits but does not close.
+        # Hold references to every connection so garbage collection cannot
+        # accidentally conceal a leaked WAL writer on either Python version.
+        key = "component:resource-writer-close-regression"
+        owner = "operator:resource-writer-close-regression"
+        original_database = resources._database
+        opened: list[sqlite3.Connection] = []
+
+        def record_connection() -> sqlite3.Connection:
+            connection = original_database()
+            opened.append(connection)
+            return connection
+
+        with patch.object(resources, "_database", side_effect=record_connection):
+            resources.acquire_resources(owner, [key], purpose="test connection close")
+            self.assertTrue(opened)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+            opened.clear()
+
+            lease = resources.inspect_resource(key)
+            self.assertIsNotNone(lease)
+            self.assertTrue(opened)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+            opened.clear()
+
+            resources.renew_resources(owner, [key], ttl_seconds=2400)
+            self.assertTrue(opened)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+            opened.clear()
+
+            with self.assertRaises(PermissionError):
+                resources.renew_resources("operator:other-owner", [key])
+            self.assertTrue(opened)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+            opened.clear()
+
+            resources.release_resources(owner, [key])
+            self.assertTrue(opened)
+            for connection in opened:
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    connection.execute("SELECT 1")
+
+        self.assertFalse(Path(str(self.database) + "-wal").exists())
+        self.assertFalse(Path(str(self.database) + "-shm").exists())
+
+    def test_resource_mutating_inspection_connections_close_with_held_refs(self) -> None:
+        # A sqlite3 connection context commits but does not close. Retain
+        # references so Python 3.10 refcounting cannot hide the WAL leak.
+        key = "component:resource-mutating-inspection-close"
+        owner = "operator:resource-mutating-inspection-close"
+        resources.acquire_resources(owner, [key], purpose="test reader close")
+        original_database = resources._database
+        opened: list[sqlite3.Connection] = []
+
+        def record_connection() -> sqlite3.Connection:
+            connection = original_database()
+            opened.append(connection)
+            return connection
+
+        with patch.object(resources, "_database", side_effect=record_connection):
+            self.assertEqual(1, resources.count_resources(read_only=False))
+            listed = resources.list_resources(owner_id=owner, read_only=False)
+            self.assertEqual([key], [item["resource_key"] for item in listed])
+            self.assertIn(key, resources.inspect_resources([key]))
+
+        self.assertEqual(3, len(opened))
+        for connection in opened:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+        for suffix in ("-wal", "-shm"):
+            self.assertFalse(Path(str(self.database) + suffix).exists())
+
+    def test_task_terminalization_inspection_closes_held_sqlite_connections(self) -> None:
+        # The Task start path consults this resource store while setting
+        # a running state. A retained open handle leaves WAL/SHM sidecars.
+        task_id = "0" * 24
+        initialized = resources._database()
+        initialized.close()
+        original_database = resources._database
+        opened: list[sqlite3.Connection] = []
+
+        def record_connection() -> sqlite3.Connection:
+            connection = original_database()
+            opened.append(connection)
+            return connection
+
+        with patch.object(resources, "_database", side_effect=record_connection):
+            self.assertIsNone(resources.task_terminalization_record(task_id))
+            self.assertEqual({}, resources.task_terminalization_records([task_id]))
+
+        self.assertEqual(2, len(opened))
+        for connection in opened:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+        for sidecar in ("-wal", "-shm"):
+            self.assertFalse(Path(str(self.database) + sidecar).exists())
+
     def scope_manifest(
         self, repository: Path, *, name: str, path: Path, effects: list[str] | None = None
     ) -> dict[str, object]:
@@ -713,26 +819,74 @@ class ResourceTests(unittest.TestCase):
         )
         self.assertEqual([], self._resource_migration_backups())
 
+    def test_public_resource_inspect_never_initializes_missing_store(self) -> None:
+        with (
+            patch.object(resources, "_database") as initializing_store,
+            patch.object(
+                resources.operator, "_require_operator_mutation",
+                side_effect=PermissionError("mutation denied"),
+            ) as mutation_guard,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "explicit initialization"):
+                resources.grabowski_resource_inspect("port:9501")
+        initializing_store.assert_not_called()
+        mutation_guard.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_public_resource_inspect_reads_existing_store_without_mutation(self) -> None:
+        writer = resources._database()
+        writer.close()
+        before = self.database.read_bytes()
+        with (
+            patch.object(resources, "_database") as initializing_store,
+            patch.object(
+                resources.operator, "_require_operator_mutation",
+                side_effect=PermissionError("mutation denied"),
+            ) as mutation_guard,
+        ):
+            result = resources.grabowski_resource_inspect("port:9501")
+        self.assertEqual({"resource_key": "port:9501", "lease": None}, result)
+        self.assertEqual(before, self.database.read_bytes())
+        initializing_store.assert_not_called()
+        mutation_guard.assert_not_called()
+
     def test_unknown_resource_schema_still_fails_closed(self) -> None:
-        resources.count_resources()
-        with sqlite3.connect(self.database) as connection:
+        # Store initialization is an explicitly mutating fixture step.
+        initialized = resources._database()
+        initialized.close()
+        connection = sqlite3.connect(self.database)
+        try:
             connection.execute(
                 "UPDATE metadata SET value='4' WHERE key='schema_version'"
             )
             connection.commit()
+        finally:
+            connection.close()
         before = self.database.read_bytes()
         before_stat = self.database.stat()
         before_sidecars = {
             item.name for item in self.database.parent.glob(self.database.name + "-*")
         }
-        with self.assertRaisesRegex(RuntimeError, "Unsupported resource database schema"):
-            resources.count_resources()
+        # Both observed future schemas and active WAL sidecars are explicit
+        # fail-closed read-only outcomes. Neither may initialize or migrate.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "requires an explicit schema migration|Strict read-only snapshot unavailable",
+        ):
+            resources.count_resources(read_only=True)
+        # The READ_ONLY boundary must not touch the source or its sidecars.
+        # The subsequent explicitly mutating _database() preflight has a
+        # different contract and may create WAL/SHM on a quiescent WAL store.
         self.assertEqual(before, self.database.read_bytes())
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual(
             before_sidecars,
             {item.name for item in self.database.parent.glob(self.database.name + "-*")},
         )
+        with self.assertRaisesRegex(RuntimeError, "Unsupported resource database schema"):
+            resources._database()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
         self.assertEqual([], self._resource_migration_backups())
 
     def test_normalizes_typed_resource_keys(self) -> None:
@@ -1532,7 +1686,27 @@ class ResourceTests(unittest.TestCase):
             self.assertEqual(resources.count_resources(), 0)
             self.assertEqual(resources.list_resources(include_expired=True), [lease])
             self.assertEqual(resources.count_resources(include_expired=True), 1)
-            with patch.object(resources.operator, "_require_operator_capability"):
+            # Strict READ_ONLY may legitimately refuse the live writer's
+            # WAL/SHM sidecars. Read a quiescent copy rather than loosening
+            # the production filesystem-write guard just for this assertion.
+            quiescent = self.root / "expired-public-read.sqlite3"
+            source = sqlite3.connect(self.database)
+            replica = sqlite3.connect(quiescent)
+            try:
+                source.backup(replica)
+                self.assertEqual(
+                    replica.execute("PRAGMA journal_mode=DELETE").fetchone()[0],
+                    "delete",
+                )
+            finally:
+                replica.close()
+                source.close()
+            self.assertFalse(Path(str(quiescent) + "-wal").exists())
+            self.assertFalse(Path(str(quiescent) + "-shm").exists())
+            with (
+                patch.object(resources, "RESOURCE_DB", quiescent),
+                patch.object(resources.operator, "_require_operator_capability"),
+            ):
                 public = resources.grabowski_resource_inspect(key)
             self.assertEqual(public, {"resource_key": key, "lease": None})
 
@@ -3727,6 +3901,52 @@ class ResourceTests(unittest.TestCase):
             sorted(item.name for item in self.database.parent.iterdir()),
         )
         self.assertEqual([], self._resource_migration_backups())
+
+    def test_shared_resource_readers_do_not_initialize_missing_store(self) -> None:
+        with patch.object(
+            resources.operator, "_require_operator_mutation",
+            side_effect=AssertionError("unexpected mutation gate"),
+        ) as gate:
+            with self.assertRaisesRegex(RuntimeError, "explicit initialization"):
+                resources.count_resources(read_only=True)
+            with self.assertRaisesRegex(RuntimeError, "explicit initialization"):
+                resources.list_resources(read_only=True)
+        gate.assert_not_called()
+        self.assertFalse(self.database.exists())
+        self.assertFalse(self.database.parent.exists())
+
+    def test_shared_resource_readers_preserve_legacy_store_bytes(self) -> None:
+        self._create_resource_schema_v1()
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        before_files = sorted(p.name for p in self.database.parent.iterdir())
+        with patch.object(
+            resources.operator, "_require_operator_mutation",
+            side_effect=AssertionError("unexpected mutation gate"),
+        ) as gate:
+            with self.assertRaisesRegex(RuntimeError, "explicit schema migration"):
+                resources.count_resources(read_only=True)
+            with self.assertRaisesRegex(RuntimeError, "explicit schema migration"):
+                resources.list_resources(read_only=True)
+        gate.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(before_files, sorted(p.name for p in self.database.parent.iterdir()))
+
+    def test_resource_list_denied_mutation_cannot_open_or_migrate_store(self) -> None:
+        with (
+            patch.object(
+                resources.operator,
+                "_require_operator_mutation",
+                side_effect=PermissionError("test mutation denied"),
+            ) as gate,
+            patch.object(resources, "list_resources") as listing,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test mutation denied"):
+                resources.grabowski_resource_list()
+        gate.assert_called_once_with("resource_lease")
+        listing.assert_not_called()
+        self.assertFalse(self.database.exists())
 
     def test_resource_schema_only_inventory_reports_migration_without_mutation(self) -> None:
         self._create_resource_schema_v1()

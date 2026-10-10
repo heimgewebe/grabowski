@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -70,6 +71,7 @@ def _load_read_surface():
     capabilities = types.ModuleType("grabowski_capabilities")
     capabilities.classify_contract = lambda expected: {}
     checkouts = types.ModuleType("grabowski_checkouts")
+    checkouts._strict_inventory_readonly_scope = nullcontext
     checkouts.active_capacity_projection = lambda repository: {
         "repository": str(repository),
         "available": True,

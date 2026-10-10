@@ -105,9 +105,9 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_git_branch` | version-control | no | medium | Create or switch local branches through a typed, audited branch operation. |
 | `grabowski_checkout_inventory` | checkout-lifecycle | yes | low | Return deterministic linked-checkout inventory with retention, task, process and resource coordination state. |
 | `grabowski_checkout_binding_reconciliation` | checkout-lifecycle | yes | low | Classify durable checkout lifecycle bindings against current canonical Git worktree observations without creating mutation authority. |
-| `grabowski_checkout_binding_terminal_preview` | checkout-lifecycle | yes | low | Preview one exact evidence-bound terminal reconciliation for an absent managed checkout, a clean terminal Work Lane, or a present terminal thread_focus checkout whose only admitted local state is hash-bound .review-audits evidence and whose head is exactly retention-bound. |
+| `grabowski_checkout_binding_terminal_preview` | checkout-lifecycle | no | low | Preview one exact evidence-bound terminal reconciliation for an absent managed checkout, a clean terminal Work Lane, or a present terminal thread_focus checkout whose only admitted local state is hash-bound .review-audits evidence and whose head is exactly retention-bound. |
 | `grabowski_checkout_binding_terminal_apply` | checkout-lifecycle | no | medium | Apply one fresh compare-and-swap terminal reconciliation: absent checkouts to externally_terminal_missing; clean terminal Work Lanes to completed_retained; or bounded present terminal thread_focus checkouts with hash-bound review evidence, including an explicit lifecycle-head catch-up only to the already-retained head while preserving checkout, evidence, retention and cleanup authority boundaries. |
-| `grabowski_checkout_binding_identity_rebind_preview` | checkout-lifecycle | yes | low | Preview one clean, coordination-free and remote-secured existing checkout for a supported identity repair: branch rename, repo-path canonicalization, or lifecycle catch-up when retention already matches current Git identity. |
+| `grabowski_checkout_binding_identity_rebind_preview` | checkout-lifecycle | no | low | Preview one clean, coordination-free and remote-secured existing checkout for a supported identity repair: branch rename, repo-path canonicalization, or lifecycle catch-up when retention already matches current Git identity. |
 | `grabowski_checkout_binding_identity_rebind_apply` | checkout-lifecycle | no | medium | CAS-converge only stale lifecycle/retention repo, head, or branch fields after an exact supported identity-rebind preview and fresh retention/coordination revalidation. |
 | `grabowski_checkout_retain` | checkout-lifecycle | no | medium | Assign explicit retention ownership to one temporary linked Git checkout. |
 | `grabowski_checkout_archive` | checkout-lifecycle | no | medium | Archive one clean temporary linked Git checkout by creating durable recovery refs without deleting branches. |
@@ -152,15 +152,15 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_privileged_broker_status` | privileged-reference | yes | low | Inspect the root-owned privileged broker installation without executing it. |
 | `grabowski_task_start` | task | no | variable | Start a persistent local or fleet task, or return a pre-dispatch typed-read reroute before persistence. |
 | `grabowski_task_routing_shadow_seal` | task | no | medium | Seal one terminal direct-task routing-shadow case with explicit semantic outcome or abstention and evidence-bound execution provenance. |
-| `grabowski_task_status` | task | yes | low | Observe one persistent task and refresh its recorded state. |
+| `grabowski_task_status` | task | no | low | Observe one persistent task and refresh its recorded state. |
 | `grabowski_task_logs` | task | yes | low | Read redacted journal output for one local or fleet task. |
 | `grabowski_task_cancel` | task | no | medium | Stop one task process group while retaining its persistent record. |
 | `grabowski_task_resume` | task | no | variable | Recreate a missing or stopped task unit from its persistent record. |
-| `grabowski_task_list` | task | yes | low | List recent persistent task records with optional state filtering. |
+| `grabowski_task_list` | task | no | low | List recent persistent task records with optional state filtering. |
 | `grabowski_chronik_outbox_import` | coding-memory | no | medium | Import one redacted Grabowski outbox JSONL into optional local Chronik. |
 | `grabowski_chronik_history` | coding-memory | yes | low | Read bounded historical coding events without asserting current truth. |
 | `grabowski_operator_historical_recall` | operator-recall | yes | low | Read evidence-bound operator recall derived from validated Chronik history. |
-| `grabowski_task_reconcile_check` | task | yes | low | Preview reconcile effects for persistent task records without mutating state. |
+| `grabowski_task_reconcile_check` | task | no | low | Preview persistent task reconciliation through the mutation gate; legacy SQLite stores may be initialized or migrated and privileged observations may create temporary reference files. |
 | `grabowski_task_reconcile_refresh` | task | no | medium | Refresh persistent task records and release terminal leases without resuming processes. |
 | `grabowski_task_reconcile_resume` | task | no | high | Resume bounded retry-safe tasks after reconcile verification. |
 | `grabowski_recovery_provenance_assess` | recovery | yes | low | Assess the fail-closed lane for repairing invalid deployment provenance. |
@@ -203,7 +203,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_resource_renew` | resource | no | medium | Renew live resource leases owned by one owner. |
 | `grabowski_resource_release` | resource | no | high | Release owner-bound resource leases with an explicit force override. |
 | `grabowski_resource_inspect` | resource | yes | low | Inspect one typed resource lease without returning private metadata. |
-| `grabowski_resource_list` | resource | yes | low | List bounded typed resource leases with optional owner filtering. |
+| `grabowski_resource_list` | resource | no | low | List bounded typed resource leases with optional owner filtering. |
 | `grabowski_artifact_stat` | artifact | yes | low | Read regular-file size and SHA-256 on one registered fleet host. |
 | `grabowski_artifact_push` | artifact | no | high | Push one hash-bound regular file to a registered SSH fleet host. |
 | `grabowski_artifact_pull` | artifact | no | high | Pull one hash-bound regular file from a registered SSH fleet host. |

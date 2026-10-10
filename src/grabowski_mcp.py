@@ -679,13 +679,13 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_git_branch": ("git_cli",),
     "grabowski_checkout_inventory": ("git_cli",),
     "grabowski_checkout_binding_reconciliation": (),
-    "grabowski_checkout_binding_terminal_preview": ("git_cli", "github_cli"),
+    "grabowski_checkout_binding_terminal_preview": ("git_cli", "github_cli", "resource_lease"),
     "grabowski_checkout_binding_terminal_apply": (
         "git_cli",
         "github_cli",
         "resource_lease",
     ),
-    "grabowski_checkout_binding_identity_rebind_preview": ("git_cli", "github_cli"),
+    "grabowski_checkout_binding_identity_rebind_preview": ("git_cli", "github_cli", "resource_lease"),
     "grabowski_checkout_binding_identity_rebind_apply": (
         "git_cli",
         "github_cli",
@@ -6382,6 +6382,7 @@ def _operator_system_overview(
         task_payload = grabowski_tasks.grabowski_task_list(
             limit=1,
             view="minimal",
+            read_only=True,
         )
         tasks = {
             "available": True,
@@ -6390,6 +6391,14 @@ def _operator_system_overview(
             "projection_counts_overlap": task_payload.get("projection_counts_overlap"),
             "unknown_state_count": task_payload.get("unknown_state_count"),
             "snapshot_complete": task_payload.get("state_counts_complete"),
+            "reconciliation_performed": task_payload.get("reconciliation_performed"),
+            "reconciliation_evidence": (
+                grabowski_tasks.task_reconcile_ready_evidence_readonly()
+                if callable(
+                    getattr(grabowski_tasks, "task_reconcile_ready_evidence_readonly", None)
+                )
+                else task_payload.get("reconciliation_evidence", {"status": "missing"})
+            ),
         }
     except Exception as exc:  # pragma: no cover - defensive status boundary
         errors.append({"component": "tasks", "error": type(exc).__name__})
@@ -6398,6 +6407,7 @@ def _operator_system_overview(
 
         active_count = grabowski_resources.count_resources(
             include_expired=False,
+            read_only=True,
         )
         leases = {
             "available": True,
@@ -6492,7 +6502,16 @@ def _operator_system_overview(
     )
     coding_agent_catalog_ready = coding_agent_catalog.get("ready") is True
     unknown_state_count = tasks.get("unknown_state_count")
-    truth_model_ready = tasks.get("available") is True and unknown_state_count == 0
+    # Read-only status never performs recovery. Only fresh, revision-bound
+    # evidence of an authorized quiescent reconciliation can prove readiness.
+    reconciliation_evidence = tasks.get("reconciliation_evidence") or {}
+    truth_model_ready = (
+        tasks.get("available") is True
+        and tasks.get("snapshot_complete") is True
+        and reconciliation_evidence.get("status") == "verified"
+        and unknown_state_count == 0
+        and (tasks.get("projection_counts") or {}).get("active") == 0
+    )
     components_observable = (
         not errors
         and leases.get("available") is True
@@ -6539,6 +6558,14 @@ def _operator_system_overview(
         next_action = "narrow or extend bounded component projections before relying on the overview"
     elif unknown_state_count:
         next_action = "resolve unknown task states before relying on projections"
+    elif not tasks.get("snapshot_complete"):
+        next_action = "restore complete task state counts before relying on readiness"
+    elif (tasks.get("projection_counts") or {}).get("active", 0) > 0:
+        # An authorized reconciliation cannot certify quiescence while
+        # tasks remain active. Do not recommend an impossible retry loop.
+        next_action = "wait for active tasks to terminalize, then run authorized reconciliation"
+    elif reconciliation_evidence.get("status") != "verified":
+        next_action = "reconcile live task outcomes through an authorized mutation-capable path"
     elif obligations.get("integrity_error_count"):
         next_action = "inspect operator obligation integrity errors"
     elif obligations.get("attention_count"):
@@ -6565,7 +6592,7 @@ def _operator_system_overview(
             "observation_state": (
                 "observed" if tasks.get("available") else "unavailable"
             ),
-            "freshness": "single bounded read snapshot",
+            "freshness": "read-only persistent snapshot without terminalization recovery",
         },
         "resource_leases": {
             "authority": "Grabowski resource lease database",

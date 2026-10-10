@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import errno
 import fcntl
@@ -1512,7 +1513,7 @@ def _lane_backed(manifest: dict[str, Any]) -> bool:
     return _workspace_ownership_mode(manifest) == WORKSPACE_OWNERSHIP_WORK_LANE
 
 
-def _lane_receipt(lane_id: str, expected_receipt_sha256: str) -> dict[str, Any]:
+def _lane_receipt(lane_id: str, expected_receipt_sha256: str, *, read_only: bool = False) -> dict[str, Any]:
     identifier = _required_string(lane_id, "lane_id", max_length=32).lower()
     expected = _required_string(
         expected_receipt_sha256,
@@ -1524,8 +1525,37 @@ def _lane_receipt(lane_id: str, expected_receipt_sha256: str) -> dict[str, Any]:
     if SHA256_RE.fullmatch(expected) is None:
         raise AgentWorkspaceError("expected_lane_receipt_sha256 must be a lowercase SHA-256")
     try:
-        with work_acquire._lane_lock(identifier) as receipt_path:
-            receipt = work_acquire._read_state(receipt_path)
+        if read_only:
+            # The normal lane lock creates or chmods state; READ_ONLY must
+            # reuse an already existing lock without granting write effects.
+            root = work_acquire._state_root()
+            root_info = root.lstat()
+            if (
+                not stat.S_ISDIR(root_info.st_mode)
+                or root_info.st_uid != os.geteuid()
+                or stat.S_IMODE(root_info.st_mode) & 0o077
+            ):
+                raise PermissionError("work lane state root is not private and owner-controlled")
+            descriptor = os.open(
+                root / f"{identifier}.lock",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                lock_info = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(lock_info.st_mode)
+                    or lock_info.st_uid != os.geteuid()
+                    or lock_info.st_nlink != 1
+                    or stat.S_IMODE(lock_info.st_mode) & 0o077
+                ):
+                    raise PermissionError("work lane lock is not a private owner-controlled file")
+                fcntl.flock(descriptor, fcntl.LOCK_SH)
+                receipt = work_acquire._read_state(root / f"{identifier}.json")
+            finally:
+                os.close(descriptor)
+        else:
+            with work_acquire._lane_lock(identifier) as receipt_path:
+                receipt = work_acquire._read_state(receipt_path)
     except Exception as exc:
         raise AgentWorkspaceError(f"work lane receipt is not safely readable: {_error_summary(exc)}") from exc
     if receipt is None or receipt.get("lane_id") != identifier:
@@ -1574,8 +1604,9 @@ def _validate_work_lane_binding(
     allowed_paths: list[str],
     runtime_deadline_unix: int,
     runner: CommandRunner,
+    read_only: bool = False,
 ) -> dict[str, Any]:
-    receipt = _lane_receipt(lane_id, expected_receipt_sha256)
+    receipt = _lane_receipt(lane_id, expected_receipt_sha256, read_only=read_only)
     inputs = receipt.get("inputs")
     authority = receipt.get("authority")
     if not isinstance(inputs, dict) or receipt.get("inputs_sha256") != work_acquire._sha(inputs):
@@ -1644,7 +1675,13 @@ def _validate_work_lane_binding(
     observed_at = _now()
     for key in lease_keys:
         try:
-            lease = resources.inspect_resource(key)
+            # READ_ONLY status must never initialize, migrate, or write
+            # SQLite WAL/SHM while checking another writer's lane.
+            lease = (
+                resources.inspect_resource(key, read_only=True)
+                if read_only
+                else resources.inspect_resource(key)
+            )
         except Exception as exc:
             raise AgentWorkspaceError(f"work lane lease is not observable: {key}: {_error_summary(exc)}") from exc
         if (
@@ -1708,9 +1745,12 @@ def _validate_work_lane_binding(
             checkouts._resolve_repo(repository), writer_worktree
         )
         checkouts._require_linked(checkout)
-        live_lifecycle = checkouts._lifecycle_bindings(
-            [str(lifecycle["checkout_key"])]
-        ).get(str(lifecycle["checkout_key"]))
+        # Status is READ_ONLY even when a checkout WAL exists: mode=ro
+        # alone can create or update SQLite -shm, so fail closed instead.
+        with (checkouts._strict_inventory_readonly_scope() if read_only else nullcontext()):
+            live_lifecycle = checkouts._lifecycle_bindings(
+                [str(lifecycle["checkout_key"])]
+            ).get(str(lifecycle["checkout_key"]))
     except Exception as exc:
         raise AgentWorkspaceError(f"work lane checkout is not safely observable: {_error_summary(exc)}") from exc
     if (
@@ -1753,7 +1793,14 @@ def _validate_work_lane_binding(
     return binding
 
 
-def _lane_binding_status(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict[str, Any]:
+def _lane_binding_status(
+    manifest: dict[str, Any],
+    runner: CommandRunner = _run,
+    *,
+    read_only: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(read_only, bool):
+        raise ValueError("read_only must be boolean")
     if not _lane_backed(manifest):
         return {"mode": WORKSPACE_OWNERSHIP_LEGACY, "required": False, "valid": True}
     resources_value = manifest.get("resources")
@@ -1777,6 +1824,7 @@ def _lane_binding_status(manifest: dict[str, Any], runner: CommandRunner = _run)
                 else None
             ),
             runner=runner,
+            read_only=read_only,
         )
         if observed != lane_binding:
             raise AgentWorkspaceError("live work lane binding differs from immutable workspace binding")
@@ -1802,7 +1850,11 @@ def _lane_binding_status(manifest: dict[str, Any], runner: CommandRunner = _run)
 
 
 def _require_live_lane_binding(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict[str, Any]:
-    status = _lane_binding_status(manifest, runner)
+    # The writer path may observe an active WAL, but it must pass central
+    # mutation admission before inspect_resource can open or migrate the store.
+    if _lane_backed(manifest):
+        operator._require_operator_mutation("resource_lease")
+    status = _lane_binding_status(manifest, runner, read_only=False)
     if status.get("valid") is not True:
         raise AgentWorkspaceError(f"work lane binding is not live and exact: {status.get('error')}")
     return status
@@ -1839,19 +1891,25 @@ def _lane_workspace_identity(binding_id: str, repo: Path, lane_id: str) -> tuple
     return workspace_id, workspace_id
 
 
-def _ensure_root() -> Path:
+def _ensure_root(*, create: bool = True) -> Path:
     root = WORKSPACE_ROOT
     if root.is_symlink():
         raise PermissionError(f"agent workspace root may not be a symlink: {root}")
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    root.chmod(0o700)
+    if create:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root.chmod(0o700)
+    elif not root.is_dir():
+        raise AgentWorkspaceError("agent workspace root is unavailable")
+    root_info = root.stat()
+    if root_info.st_uid != os.geteuid() or stat.S_IMODE(root_info.st_mode) & 0o077:
+        raise PermissionError("agent workspace root is not private and owner-controlled")
     return root.resolve(strict=True)
 
 
 def _workspace_dir(workspace_id: str, *, create: bool = False) -> Path:
     if WORKSPACE_ID_RE.fullmatch(workspace_id) is None:
         raise AgentWorkspaceError("invalid workspace_id")
-    root = _ensure_root()
+    root = _ensure_root(create=create)
     path = root / workspace_id
     if path.exists() and path.is_symlink():
         raise PermissionError("workspace directory may not be a symlink")
@@ -2205,11 +2263,17 @@ def _tmux_pane_ids(session: str) -> set[str]:
     return pane_ids
 
 
-def _task_public(task_id: str | None) -> dict[str, Any]:
+def _task_public(task_id: str | None, *, read_only: bool = False) -> dict[str, Any]:
     if task_id is None:
         return {"task_id": None, "state": "not_started", "terminal": False}
     try:
-        value = tasks.grabowski_task_status(task_id)
+        # Read-only workspace views never refresh persisted task or lease state;
+        # authorized writer/reconcile workflows retain their original semantics.
+        value = (
+            tasks.grabowski_task_peek(task_id)
+            if read_only
+            else tasks.grabowski_task_status(task_id)
+        )
     except Exception as exc:
         return {
             "task_id": task_id,
@@ -3172,7 +3236,7 @@ def _writer_handoff_eligibility(
         reasons.append("workspace_resources_invalid")
     else:
         try:
-            live = resources.list_resources(owner_id=owner, include_expired=False, limit=MAX_PATHS + 8)
+            live = resources.list_resources(owner_id=owner, include_expired=False, limit=MAX_PATHS + 8, read_only=True)
             observed = {str(item.get("resource_key")) for item in live}
             if not set(str(key) for key in keys).issubset(observed):
                 reasons.append("workspace_lease_missing")
@@ -4320,7 +4384,7 @@ def _persist_collection_round_archive(
 
 
 def _revision_collection_evidence(
-    manifest: dict[str, Any],
+    manifest: dict[str, Any], *, read_only: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     if not _lane_backed(manifest):
         raise AgentWorkspaceError("candidate revision requires a lane-backed workspace")
@@ -4432,7 +4496,7 @@ def _revision_collection_evidence(
     ):
         raise AgentWorkspaceError("live workspace no longer matches round-one Candidate")
     effective = _effective_writer_attempt(manifest)
-    writer = _task_public(str(effective["task_id"]))
+    writer = _task_public(str(effective["task_id"]), read_only=read_only)
     if (
         _writer_final_attempt(manifest) != 1
         or effective.get("actor") != "initial_writer"
@@ -4443,10 +4507,18 @@ def _revision_collection_evidence(
         raise AgentWorkspaceError("round-one writer is not a completed exact attempt")
     for role in READ_ONLY_ROLES:
         task_id = manifest.get("tasks", {}).get(role)
-        role_task = _task_public(task_id)
+        role_task = _task_public(task_id, read_only=read_only)
         if not role_task.get("terminal"):
             raise AgentWorkspaceError("candidate revision verifier task is not terminal")
-    _require_live_lane_binding(manifest, _run)
+    if read_only:
+        # A candidate eligibility projection must never request writer authority.
+        lane_status = _lane_binding_status(manifest, _run, read_only=True)
+        if lane_status.get("valid") is not True:
+            raise AgentWorkspaceError(
+                f"work lane binding is not live and exact: {lane_status.get('error')}"
+            )
+    else:
+        _require_live_lane_binding(manifest, _run)
     result_sha256 = collection.get("result_sha256")
     preimage_sha256 = collection.get("diff_sha256")
     if (
@@ -5328,7 +5400,8 @@ def _cached_role_preflight_block(
 
 
 def _role_retry_classification(
-    manifest: dict[str, Any], role: str, frozen: dict[str, Any]
+    manifest: dict[str, Any], role: str, frozen: dict[str, Any],
+    *, read_only: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Classify whether one read-only role may be retried, and why."""
     start_intent = _role_start_intent_classification(manifest, role)
@@ -5348,7 +5421,7 @@ def _role_retry_classification(
                 }
             return "preflight_probe_error", {"prior_preflight": latest}
         return "not_attempted", {}
-    task_public = _task_public(task_id)
+    task_public = _task_public(task_id, read_only=read_only)
     if not task_public["terminal"]:
         return "role_running", {"task": task_public}
     if task_public["state"] in {"observation_error", "outcome_unknown", "interrupted"}:
@@ -5484,14 +5557,16 @@ def _role_retry_state(
     return {**raw, "count": count, "attempts": list(attempts)}, None
 
 
-def _status_role_retry(manifest: dict[str, Any]) -> dict[str, Any]:
+def _status_role_retry(manifest: dict[str, Any], *, read_only: bool = False) -> dict[str, Any]:
     frozen = manifest.get("frozen_writer")
     result: dict[str, Any] = {}
     for role_name in READ_ONLY_ROLES:
         if not isinstance(frozen, dict):
             result[role_name] = {"classification": "not_collected", "eligible": False}
             continue
-        classification, detail = _role_retry_classification(manifest, role_name, frozen)
+        classification, detail = _role_retry_classification(
+            manifest, role_name, frozen, read_only=read_only
+        )
         role_retry_state, retry_state_error = _role_retry_state(manifest, role_name)
         if retry_state_error is not None or role_retry_state is None:
             result[role_name] = {
@@ -5532,7 +5607,7 @@ def _prospective_closure_outcome(manifest: dict[str, Any], collection: Any) -> s
     return "would_abandon_failed_roles" if _collection_failed_roles(collection) else "would_be_successful"
 
 
-def _candidate_revision_status(manifest: dict[str, Any]) -> dict[str, Any]:
+def _candidate_revision_status(manifest: dict[str, Any], *, read_only: bool = False) -> dict[str, Any]:
     collection = manifest.get("collection")
     if not isinstance(collection, dict) or collection.get("state") != "complete":
         return {
@@ -5543,7 +5618,7 @@ def _candidate_revision_status(manifest: dict[str, Any]) -> dict[str, Any]:
         }
     try:
         observed, candidate, _receipts, summary, snapshot = (
-            _revision_collection_evidence(manifest)
+            _revision_collection_evidence(manifest, read_only=read_only)
         )
     except Exception as exc:
         return {
@@ -6464,9 +6539,9 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         writer_attempt_error = _error_summary(exc)
         writer_task_id = manifest.get("tasks", {}).get("writer")
     task_state = {
-        "writer": _task_public(writer_task_id),
-        "tests": _task_public(manifest.get("tasks", {}).get("tests")),
-        "review": _task_public(manifest.get("tasks", {}).get("review")),
+        "writer": _task_public(writer_task_id, read_only=True),
+        "tests": _task_public(manifest.get("tasks", {}).get("tests"), read_only=True),
+        "review": _task_public(manifest.get("tasks", {}).get("review"), read_only=True),
     }
     try:
         tmux_live = _tmux_has_session(str(manifest["session_name"]))
@@ -6547,10 +6622,10 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         writer_handoff = _writer_handoff_eligibility(manifest, task_state["writer"], snapshot)
     except Exception as exc:
         writer_handoff = {"eligible": False, "reasons": ["writer_attempt_history_invalid"], "error": _error_summary(exc), "max": MAX_WRITER_HANDOFFS, "used": None}
-    candidate_revision = _candidate_revision_status(manifest)
+    candidate_revision = _candidate_revision_status(manifest, read_only=True)
     if writer_terminal_failure and "writer" not in failed_roles:
         failed_roles = ["writer", *failed_roles]
-    role_retry = _status_role_retry(manifest)
+    role_retry = _status_role_retry(manifest, read_only=True)
     closure_outcome = _prospective_closure_outcome(manifest, collection)
     recommended_next_action = _recommended_next_action(
         creation_ready=creation_ready,
@@ -6586,7 +6661,7 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         "writer": snapshot,
         "roles": manifest["roles"],
         "tasks": task_state,
-        "original_writer_task": _task_public(manifest.get("tasks", {}).get("writer")),
+        "original_writer_task": _task_public(manifest.get("tasks", {}).get("writer"), read_only=True),
         "writer_attempts": _writer_attempt_refs(manifest) if writer_attempt_error is None else [],
         "writer_final_attempt": writer_final_attempt,
         "writer_attempt_error": writer_attempt_error,
@@ -7217,8 +7292,15 @@ def _existing_workspace_response(
     expected_pane_ids = set(manifest["pane_ids"].values())
     expected_writer_task_id = str(manifest["tasks"]["writer"])
     try:
-        lane_status = _lane_binding_status(manifest, _run)
-        live_leases = resources.list_resources(owner_id=owner_id, include_expired=False, limit=MAX_PATHS + 8)
+        # Workspace create/reuse is MUTATING. Preserve WAL-aware readers,
+        # but admit resource writes before the lane lock or SQLite access.
+        if _lane_backed(manifest):
+            operator._require_operator_mutation("resource_lease")
+        lane_status = _lane_binding_status(manifest, _run, read_only=False)
+        live_leases = resources.list_resources(
+            owner_id=owner_id, include_expired=False, limit=MAX_PATHS + 8,
+            read_only=False,
+        )
         observed_lease_keys = {str(item.get("resource_key")) for item in live_leases}
         tmux_live = _tmux_has_session(str(plan["session_name"]))
         observed_pane_ids = _tmux_pane_ids(str(plan["session_name"])) if tmux_live else set()
@@ -12743,7 +12825,12 @@ def _workspace_lifecycle_classification(
         "tasks": live_task_states,
         "close_integrity": close_integrity,
     }
-    checkout_inventory = checkouts.grabowski_checkout_inventory(
+    # Workspace cleanup is already mutation-gated.  Use the internal
+    # WAL-aware inventory here; the published READ_ONLY tool must keep its
+    # strict filesystem-write boundary even when a writer has live sidecars.
+    operator._require_operator_mutation("resource_lease")
+    operator._require_operator_capability("git_cli")
+    checkout_inventory = checkouts.checkout_inventory(
         repo=str(manifest["repository"]),
         include_processes=True,
         include_tasks=True,

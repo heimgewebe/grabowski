@@ -485,22 +485,25 @@
     },
     "grabowski_checkout_binding_identity_rebind_preview": {
       "evidence_refs": [
+        "https://github.com/heimgewebe/grabowski/issues/1407#issuecomment-6095283858",
         "github:heimgewebe/grabowski#852",
         "tests:tests/test_checkouts.py",
         "tests:tests/test_grips.py"
       ],
       "exception_detail": {
-        "claim": "The tool owns only read-only proof for one existing active managed checkout whose current named branch differs from the stored lifecycle identity.",
-        "evidence": "The checkout key resolves the target server-side; clean state, unchanged owner, branch-only drift, recorded-head ancestry, exact remote security, live retention and zero coordination blockers are snapshot-bound before any mutation authority exists."
+        "claim": "The tool owns only mutation-gated proof for one existing active managed checkout whose current named branch differs from the stored lifecycle identity.",
+        "evidence": "The checkout key resolves the target server-side; clean state, unchanged owner, branch-only drift, recorded-head ancestry, exact remote security, live retention and zero coordination blockers are snapshot-bound without granting identity-apply, Git, archive or cleanup authority."
       },
       "justification_kind": "distinct_authority_boundary",
       "operation_alternative_considered": "Reusing missing-checkout terminal preview was rejected because terminal reconciliation proves absence and source terminality, while identity rebind proves a live existing checkout and a branch-name identity correction.",
-      "rationale": "Branch identity reconciliation has different evidence, postconditions and mutation authority from checkout terminalization, so it requires an independently inspectable preview surface.",
+      "rationale": "Branch identity reconciliation has different evidence, postconditions and mutation authority from checkout terminalization, so it requires an independently inspectable, resource-mutation-gated preview surface.",
       "tool_contract": {
-        "authority_class": "read",
+        "authority_class": "mutation",
         "category": "checkout-lifecycle",
-        "effects": [],
-        "read_only": true,
+        "effects": [
+          "sqlite-wal-shm-sidecar-write"
+        ],
+        "read_only": false,
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "grabowski_checkout_binding_identity_rebind_preview"
@@ -559,22 +562,25 @@
     },
     "grabowski_checkout_binding_terminal_preview": {
       "evidence_refs": [
+        "https://github.com/heimgewebe/grabowski/issues/1407#issuecomment-6095283858",
         "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T140",
         "docs:checkout-lifecycle.md",
         "tests:test_checkout_terminal_reconciliation.py"
       ],
       "exception_detail": {
-        "claim": "The tool owns only the read-only, time-bounded evidence shape required before one absent-checkout terminal reconciliation or one clean present terminal Work Lane retention transition.",
+        "claim": "The tool owns only the resource-mutation-gated, time-bounded evidence shape required before one absent-checkout terminal reconciliation or one clean present terminal Work Lane retention transition.",
         "evidence": "Exact checkout, repository, common-dir, path, owner, branch, head, source identity, source-terminal receipt, Work Lane terminal head when available, clean/remote recovery evidence for present mode, archive absence and live lease/task/process blockers are hash-bound with explicit nonclaims."
       },
       "justification_kind": "material_call_shape",
       "operation_alternative_considered": "Extending generic checkout inventory or binding reconciliation was rejected because neither call shape binds a fresh source-terminal receipt and exact apply preimage with an expiry contract.",
-      "rationale": "A dedicated preview keeps source-specific terminal evidence and the exact compare-and-swap preimage inspectable without granting mutation, archive or cleanup authority.",
+      "rationale": "A dedicated preview keeps source-specific terminal evidence and the exact compare-and-swap preimage inspectable without granting lifecycle-apply, archive or cleanup authority.",
       "tool_contract": {
-        "authority_class": "read",
+        "authority_class": "mutation",
         "category": "checkout-lifecycle",
-        "effects": [],
-        "read_only": true,
+        "effects": [
+          "sqlite-wal-shm-sidecar-write"
+        ],
+        "read_only": false,
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "grabowski_checkout_binding_terminal_preview"
@@ -3658,5 +3664,92 @@
     "operation_catalog": "config/operations.example.json",
     "operation_metadata": "contracts/operation-catalog.v1.json",
     "runtime_entrypoint": "config/runtime-entrypoint.json"
+  },
+  "accepted_semantic_corrections": {
+    "grabowski_resource_list": {
+      "original_semantics_sha256": "d3e817e32df87eef13246c7e1b974969c2c724745fc53dac66848f947b8eab82",
+      "tool_contract": {
+        "tool": "grabowski_resource_list",
+        "category": "resource",
+        "authority_class": "mutation",
+        "risk_class": "low",
+        "read_only": false,
+        "effects": [
+          "schema-migration"
+        ],
+        "reversibility": "not-applicable"
+      },
+      "rationale": "Document the observed hidden state changes and require an explicit operator mutation gate instead of a misleading READ_ONLY annotation; historical baseline remains unchanged.",
+      "evidence_refs": [
+        "https://github.com/heimgewebe/grabowski/issues/1407",
+        "src/grabowski_resources.py:1238-1314",
+        "src/grabowski_resources.py:8467-8492"
+      ]
+    },
+    "grabowski_task_list": {
+      "original_semantics_sha256": "14021cf8ae4016e51b2a3c35aa473cf8894e28996435568006d59f869240b915",
+      "tool_contract": {
+        "tool": "grabowski_task_list",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "low",
+        "read_only": false,
+        "effects": [
+          "schema-migration",
+          "terminalization-recovery"
+        ],
+        "reversibility": "not-applicable"
+      },
+      "rationale": "Document the observed hidden state changes and require an explicit operator mutation gate instead of a misleading READ_ONLY annotation; historical baseline remains unchanged.",
+      "evidence_refs": [
+        "https://github.com/heimgewebe/grabowski/issues/1407",
+        "src/grabowski_tasks.py:12215-12249",
+        "src/grabowski_tasks.py:7113-7172"
+      ]
+    },
+    "grabowski_task_reconcile_check": {
+      "original_semantics_sha256": "1f79a531f65d5d03c2e44e0af56fa2aa288bcaa8e5166448fca660ce49a3c5cb",
+      "tool_contract": {
+        "tool": "grabowski_task_reconcile_check",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "low",
+        "read_only": false,
+        "effects": [
+          "schema-migration",
+          "temporary-file-create"
+        ],
+        "reversibility": "not-applicable"
+      },
+      "rationale": "The published reconciliation check was mislabeled READ_ONLY: legacy task/resource readers can initialize or migrate SQLite stores and privileged rootbroker observations can create temporary reference files. Classify this existing tool as MUTATING and require the operator mutation gate under the serialized lock, preserving the immutable historical baseline.",
+      "evidence_refs": [
+        "https://github.com/heimgewebe/grabowski/issues/1407#issuecomment-6094244124",
+        "src/grabowski_resources.py:3949-3990",
+        "src/grabowski_tasks.py:12269-12307",
+        "tests/test_tasks.py:5409-5456"
+      ]
+    },
+    "grabowski_task_status": {
+      "original_semantics_sha256": "ba95d919769c0e626cd698adf624e06a854e62408ce4f521f9acd1abb8580f01",
+      "tool_contract": {
+        "tool": "grabowski_task_status",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "low",
+        "read_only": false,
+        "effects": [
+          "lease-reacquire",
+          "lease-renew",
+          "state-refresh"
+        ],
+        "reversibility": "not-applicable"
+      },
+      "rationale": "Document the observed hidden state changes and require an explicit operator mutation gate instead of a misleading READ_ONLY annotation; historical baseline remains unchanged.",
+      "evidence_refs": [
+        "https://github.com/heimgewebe/grabowski/issues/1407",
+        "src/grabowski_tasks.py:5734-5794",
+        "src/grabowski_tasks.py:9688-9705"
+      ]
+    }
   }
 }

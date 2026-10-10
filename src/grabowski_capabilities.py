@@ -350,7 +350,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "checkout-lifecycle",
         "purpose": "Preview one exact evidence-bound terminal reconciliation for an absent managed checkout, a clean terminal Work Lane, or a present terminal thread_focus checkout whose only admitted local state is hash-bound .review-audits evidence and whose head is exactly retention-bound.",
         "risk_class": "low",
-        "effects": [],
+        "effects": ["sqlite-wal-shm-sidecar-write"],
         "reversibility": "not-applicable",
     },
     "grabowski_checkout_binding_terminal_apply": {
@@ -364,7 +364,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "checkout-lifecycle",
         "purpose": "Preview one clean, coordination-free and remote-secured existing checkout for a supported identity repair: branch rename, repo-path canonicalization, or lifecycle catch-up when retention already matches current Git identity.",
         "risk_class": "low",
-        "effects": [],
+        "effects": ["sqlite-wal-shm-sidecar-write"],
         "reversibility": "not-applicable",
     },
     "grabowski_checkout_binding_identity_rebind_apply": {
@@ -874,7 +874,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "task",
         "purpose": "Observe one persistent task and refresh its recorded state.",
         "risk_class": "low",
-        "effects": ["state-refresh"],
+        "effects": ["lease-reacquire", "lease-renew", "state-refresh"],
         "reversibility": "not-applicable",
     },
     "grabowski_task_logs": {
@@ -902,7 +902,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "task",
         "purpose": "List recent persistent task records with optional state filtering.",
         "risk_class": "low",
-        "effects": [],
+        "effects": ["schema-migration", "terminalization-recovery"],
         "reversibility": "not-applicable",
     },
     "grabowski_chronik_outbox_import": {
@@ -942,9 +942,9 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_task_reconcile_check": {
         "category": "task",
-        "purpose": "Preview reconcile effects for persistent task records without mutating state.",
+        "purpose": "Preview persistent task reconciliation through the mutation gate; legacy SQLite stores may be initialized or migrated and privileged observations may create temporary reference files.",
         "risk_class": "low",
-        "effects": [],
+        "effects": ["schema-migration", "temporary-file-create"],
         "reversibility": "not-applicable",
     },
     "grabowski_task_reconcile_refresh": {
@@ -1014,7 +1014,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "resource",
         "purpose": "List bounded typed resource leases with optional owner filtering.",
         "risk_class": "low",
-        "effects": [],
+        "effects": ["schema-migration"],
         "reversibility": "not-applicable",
     },
     "grabowski_artifact_stat": {

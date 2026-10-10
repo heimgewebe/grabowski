@@ -174,6 +174,39 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
             report["growth"], len(self.contract["accepted_additions"]) + 1
         )
 
+    def test_semantic_corrections_preserve_historical_baseline_and_are_explicit(self) -> None:
+        amendments = self.contract["accepted_semantic_corrections"]
+        self.assertEqual(
+            set(amendments),
+            {"grabowski_task_status", "grabowski_task_list", "grabowski_task_reconcile_check", "grabowski_resource_list"},
+        )
+        self.assertEqual(
+            self.contract["baseline"]["tool_semantics_sha256"],
+            budget.BASELINE_TOOL_SEMANTICS_SHA256,
+        )
+        self.assertEqual(budget.validate_repository()["accepted_semantic_correction_count"], 4)
+        self.assertTrue(self._validate(copy.deepcopy(self.contract))["valid"])
+
+    def test_semantic_correction_never_allows_unreviewed_or_weaker_contract(self) -> None:
+        name = "grabowski_resource_list"
+        original = copy.deepcopy(self.contract)
+        missing = copy.deepcopy(original)
+        del missing["accepted_semantic_corrections"][name]
+        self.assertIn("tool capability semantics drift", self._validate(missing)["errors"][0])
+        wrong_history = copy.deepcopy(original)
+        wrong_history["accepted_semantic_corrections"][name]["original_semantics_sha256"] = "0" * 64
+        self.assertIn("history mismatch", self._validate(wrong_history)["errors"][0])
+        weaker = copy.deepcopy(original)
+        weaker["accepted_semantic_corrections"][name]["tool_contract"]["read_only"] = True
+        self.assertIn("current projection drift", self._validate(weaker)["errors"][0])
+        missing_proof = copy.deepcopy(original)
+        missing_proof["accepted_semantic_corrections"][name]["evidence_refs"] = []
+        self.assertIn("missing evidence", self._validate(missing_proof)["errors"][0])
+        altered_category = copy.deepcopy(original)
+        altered_category["accepted_semantic_corrections"][name]["tool_contract"]["category"] = "secret"
+        self.assertIn("current projection drift", self._validate(altered_category)["errors"][0])
+
+
     def test_semantic_drift_of_existing_tool_is_rejected(self) -> None:
         capabilities = copy.deepcopy(self.capabilities)
         status = next(

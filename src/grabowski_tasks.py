@@ -1356,11 +1356,14 @@ class TaskSchemaInventoryChanged(RuntimeError):
 
 
 @contextmanager
-def _inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
+def _inventory_readonly_sqlite(
+    path: Path, *, allow_wal_copy: bool = True
+) -> Iterator[sqlite3.Connection]:
     with sqlite_store.inventory_readonly_sqlite(
         path,
         temporary_prefix="grabowski-task-schema-inventory-",
         error_type=TaskSchemaInventoryChanged,
+        allow_wal_copy=allow_wal_copy,
     ) as connection:
         yield connection
 
@@ -7363,6 +7366,60 @@ def _task_read_snapshot() -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
+@contextmanager
+def _task_readonly_snapshot() -> Iterator[sqlite3.Connection]:
+    """Read without filesystem writes; refuse active WAL sidecars fail-closed."""
+    if TASK_DB.is_symlink() or not TASK_DB.is_file() or TASK_DB.stat().st_size == 0:
+        raise RuntimeError("Task store cannot be observed without explicit initialization")
+    with _inventory_readonly_sqlite(TASK_DB, allow_wal_copy=False) as connection:
+        if _task_schema_version(connection) != TASK_CURRENT_SCHEMA_VERSION:
+            raise RuntimeError("Task store requires an explicit schema migration")
+        _validate_task_schema_current(connection)
+        _task_reconcile_revision_contract(connection)
+        connection.execute("BEGIN DEFERRED")
+        try:
+            yield connection
+        finally:
+            if connection.in_transaction:
+                connection.rollback()
+
+
+def grabowski_task_peek(task_id: str) -> dict[str, Any]:
+    """Observe a task without persisting state, reconciling or touching any leases."""
+    operator._require_operator_capability("durable_job")
+    identifier = _validate_task_id(task_id)
+    with _task_readonly_snapshot() as connection:
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (identifier,)
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"Unknown task: {identifier}")
+    record = dict(row)
+    result = _public(record)
+    result["persisted_state"] = result["state"]
+    if _is_root_systemd_backend(record):
+        # The rootbroker's nominally observational show operation creates a
+        # reference file and invokes a privileged client.  READ_ONLY callers
+        # must not execute that effect or present persisted active as live truth.
+        terminal = _is_terminal_state(str(record["state"]))
+        result["state"] = record["state"] if terminal else "outcome_unknown"
+        result["last_observation"] = None
+        result["observation_mode"] = "persisted_only_rootbroker_not_probed"
+        result["observation_unavailable_reason"] = "privileged_broker_requires_mutation_gate"
+        result["systemd_unit_health"] = {
+            "status": "unknown",
+            "reason": "rootbroker_live_observation_requires_mutation_gate",
+        }
+        result["reconcile_required"] = not terminal
+        return result
+    observation = _observe(record)
+    result["state"] = _effective_observed_state(record, observation["state"])
+    result["last_observation"] = observation
+    result["observation_mode"] = "unpersisted_readonly_probe"
+    result["reconcile_required"] = result["state"] != record["state"]
+    return result
+
+
 def _task_filter_states(state: str | None) -> tuple[str, ...] | None:
     if state is None:
         return None
@@ -9685,10 +9742,14 @@ def grabowski_task_start(
     }
 
 
-@_serialize_task_mutation
 def grabowski_task_status(task_id: str) -> dict[str, Any]:
-    """Observe one persistent task and refresh its recorded state."""
-    operator._require_operator_capability("durable_job")
+    """Refresh one task only after the real shared mutation gate succeeds."""
+    operator._require_operator_mutation("durable_job", task_id=task_id)
+    return _task_status_after_mutation_guard(task_id)
+
+
+@_serialize_task_mutation
+def _task_status_after_mutation_guard(task_id: str) -> dict[str, Any]:
     record = _row(task_id)
     observation = _observe(record)
     effective_state = _effective_observed_state(record, observation["state"])
@@ -11295,6 +11356,143 @@ def _reconcile_check_revision_snapshot(
     return {**material, "snapshot_sha256": _sha256_json(material)}
 
 
+
+# Only an explicitly authorized reconciliation may record this quiescent,
+# revision-bound readiness proof in the existing task metadata table.
+TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY = "task_reconcile_ready_evidence_v1"
+TASK_RECONCILE_READY_MAX_AGE_SECONDS = 300
+
+
+def _clear_task_reconcile_ready_evidence() -> None:
+    with _database_connection() as connection:
+        connection.execute(
+            "DELETE FROM metadata WHERE key=?",
+            (TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+        )
+
+
+def _publish_task_reconcile_ready_evidence(result: dict[str, Any]) -> None:
+    batch = result.get("batch")
+    if (
+        result.get("task_id")
+        or result.get("blocked")
+        or not isinstance(batch, dict)
+        or batch.get("cycle_completed") is not True
+        or "cursor_before" not in batch
+        or batch["cursor_before"] is not None
+        or not isinstance(batch.get("active_refresh"), dict)
+        or batch["active_refresh"].get("cycle_completed") is not True
+        or "cursor_before" not in batch["active_refresh"]
+        or batch["active_refresh"]["cursor_before"] is not None
+        or not isinstance(batch.get("terminalization_recovery"), dict)
+        or batch["terminalization_recovery"].get("cycle_completed") is not True
+        or "cursor_before" not in batch["terminalization_recovery"]
+        or batch["terminalization_recovery"]["cursor_before"] is not None
+        or batch["terminalization_recovery"].get("failed")
+    ):
+        # Final pages cannot attest errors on earlier pages. Certify only a
+        # single complete cycle beginning at all three initial cursors.
+        return
+    with _database_connection() as connection:
+        # Live process termination does not bump an SQLite revision. Therefore
+        # a persisted active task cannot be certified from a status snapshot.
+        if connection.execute(
+            "SELECT 1 FROM tasks WHERE state IN "
+            "('launching','running','outcome_unknown','interrupted') LIMIT 1"
+        ).fetchone() is not None:
+            return
+        task_revision = _task_reconcile_revision_contract(connection)
+        with resources._resource_readonly_snapshot() as resource_connection:
+            if resource_connection.execute(
+                "SELECT 1 FROM task_terminalizations "
+                "WHERE phase='leases_revoked' LIMIT 1"
+            ).fetchone() is not None:
+                return
+            resource_revision = resources._resource_reconcile_revision_contract(
+                resource_connection
+            )
+        if resource_revision is None:
+            return
+        material = {
+            "schema_version": 1,
+            "task_revision": task_revision["revision"],
+            "resource_revision": resource_revision["revision"],
+            "reconciled_at_unix": _now(),
+            "scope": "quiescent-active-tasks-and-terminalizations",
+        }
+        proof = {**material, "evidence_sha256": _sha256_json(material)}
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY, _canonical_json(proof)),
+        )
+
+
+def _task_reconcile_ready_evidence_snapshot(
+    task_connection: sqlite3.Connection,
+) -> dict[str, Any]:
+    """Verify prior authorized reconciliation without filesystem writes."""
+    try:
+        rows = task_connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+        ).fetchall()
+        if not rows:
+            return {"status": "missing"}
+        if len(rows) != 1 or not isinstance(rows[0][0], str):
+            return {"status": "invalid"}
+        proof = json.loads(rows[0][0])
+        expected_fields = {
+            "schema_version", "task_revision", "resource_revision",
+            "reconciled_at_unix", "scope", "evidence_sha256",
+        }
+        if not isinstance(proof, dict) or set(proof) != expected_fields:
+            return {"status": "invalid"}
+        material = {key: value for key, value in proof.items() if key != "evidence_sha256"}
+        timestamp = proof["reconciled_at_unix"]
+        now = _now()
+        if (
+            type(proof["schema_version"]) is not int
+            or proof["schema_version"] != 1
+            or proof["scope"] != "quiescent-active-tasks-and-terminalizations"
+            or type(timestamp) is not int
+            or not 0 <= now - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS
+            or proof["evidence_sha256"] != _sha256_json(material)
+        ):
+            return {"status": "invalid_or_stale"}
+        if task_connection.execute(
+            "SELECT 1 FROM tasks WHERE state IN "
+            "('launching','running','outcome_unknown','interrupted') LIMIT 1"
+        ).fetchone() is not None:
+            return {"status": "active_tasks"}
+        task_revision = _task_reconcile_revision_contract(task_connection)
+        with resources._resource_readonly_snapshot() as resource_connection:
+            resource_revision = resources._resource_reconcile_revision_contract(
+                resource_connection
+            )
+            pending = resource_connection.execute(
+                "SELECT 1 FROM task_terminalizations "
+                "WHERE phase='leases_revoked' LIMIT 1"
+            ).fetchone()
+        if (
+            resource_revision is None or pending is not None
+            or task_revision["revision"] != proof["task_revision"]
+            or resource_revision["revision"] != proof["resource_revision"]
+        ):
+            return {"status": "stale"}
+        return {"status": "verified", "reconciled_at_unix": timestamp}
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, sqlite3.Error) as exc:
+        return {"status": "unavailable", "error_type": type(exc).__name__}
+
+
+def task_reconcile_ready_evidence_readonly() -> dict[str, Any]:
+    """A bounded strict read for aggregate operator readiness only."""
+    operator._require_operator_capability("durable_job")
+    with _task_readonly_snapshot() as connection:
+        connection.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
+        return _task_reconcile_ready_evidence_snapshot(connection)
+
+
 def _reconcile_check_store_snapshots_for_legacy_cursor(
     task_connection: sqlite3.Connection,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -12073,8 +12271,11 @@ def _task_reconcile_check_after_guard(
     limit: int,
     cursor: str | None,
 ) -> dict[str, Any]:
+    # This in-process RLock has no filesystem effect. Check mutation authority
+    # under serialization, immediately before legacy SQLite/broker effects.
+    operator._require_operator_capability("durable_job")
     with TASK_RECONCILE_LOCK:
-        operator._require_operator_capability("durable_job")
+        operator._require_operator_mutation("durable_job")
         return reconcile_tasks_check(task_id=task_id, limit=limit, cursor=cursor)
 
 
@@ -12083,18 +12284,18 @@ def grabowski_task_reconcile_check(
     limit: int = DEFAULT_TASK_RECONCILE_CHECK_LIMIT,
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    """Read one bounded, resumable reconcile preview for persistent tasks."""
+    """Preview tasks through the mutation gate (legacy stores may be upgraded)."""
     operator._require_operator_capability("durable_job")
     return _task_reconcile_check_after_guard(task_id, limit, cursor)
 
 
-@mcp.tool(name="grabowski_task_reconcile_check", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_task_reconcile_check", annotations=MUTATING)
 async def _grabowski_task_reconcile_check_tool(
     task_id: str = "",
     limit: int = DEFAULT_TASK_RECONCILE_CHECK_LIMIT,
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    """Read one bounded, resumable reconcile preview for persistent tasks."""
+    """Preview tasks through the mutation gate (legacy stores may be upgraded)."""
     operator._require_operator_capability("durable_job")
     return await asyncio.to_thread(
         _task_reconcile_check_after_guard,
@@ -12107,6 +12308,7 @@ async def _grabowski_task_reconcile_check_tool(
 def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
+        _clear_task_reconcile_ready_evidence()
         result = _reconcile_tasks_refresh_locked(task_id=task_id)
         base._append_audit(
             {
@@ -12117,6 +12319,12 @@ def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
                 "released_count": len(result["released"]),
             }
         )
+        try:
+            _publish_task_reconcile_ready_evidence(result)
+        except Exception:
+            # A successful authorized refresh remains valid if supplementary
+            # readiness publication is unavailable. Readiness stays unproven.
+            pass
     return _attach_task_output_cleanup(result)
 
 
@@ -12189,6 +12397,7 @@ async def _grabowski_task_reconcile_resume_tool(
 def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
+        _clear_task_reconcile_ready_evidence()
         result, refresh = _reconcile_tasks_locked(auto_resume=auto_resume)
         base._append_audit(
             {
@@ -12200,6 +12409,11 @@ def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
                 "blocked_count": len(result["blocked"]),
             }
         )
+        if not auto_resume:
+            try:
+                _publish_task_reconcile_ready_evidence(refresh)
+            except Exception:
+                pass
     cleanup = _attach_task_output_cleanup(refresh)
     if "task_output_cleanup" in cleanup:
         result["task_output_cleanup"] = cleanup["task_output_cleanup"]
@@ -12219,9 +12433,13 @@ def grabowski_task_list(
     cursor: str | None = None,
     fields: list[str] | None = None,
     schema_only: bool = False,
+    *,
+    read_only: bool = False,
 ) -> dict[str, Any]:
-    """List persistent tasks or inspect store-schema compatibility read-only."""
+    """List tasks; read_only=True never opens, migrates or reconciles a writable store."""
     operator._require_operator_capability("durable_job")
+    if not isinstance(read_only, bool):
+        raise ValueError("read_only must be boolean")
     if not isinstance(schema_only, bool):
         raise ValueError("schema_only must be boolean")
     if schema_only:
@@ -12236,7 +12454,12 @@ def grabowski_task_list(
                 "schema_only cannot be combined with task-list filters or projections"
             )
         return _task_schema_inventory()
+    # Ordinary task-list may recover terminalizations and migrate task storage.
+    if not read_only:
+        operator._require_operator_mutation("durable_job")
     if view == "managed_cargo_evidence":
+        if read_only:
+            raise ValueError("managed_cargo_evidence requires explicit mutation authority")
         if state is not None or cursor is not None or fields is not None:
             raise ValueError(
                 "managed_cargo_evidence view cannot be combined with state, cursor or fields"
@@ -12246,7 +12469,8 @@ def grabowski_task_list(
         _recover_pending_task_terminalizations()
         return _managed_cargo_evidence_from_task_store(limit)
     selected_view = consumer_surface.normalize_view(view)
-    _recover_pending_task_terminalizations()
+    if not read_only:
+        _recover_pending_task_terminalizations()
     current_projection = _task_current_projection()
     projection_sha256 = current_projection.get("projection_sha256")
     archived_task_bindings = current_projection.get("archived_task_bindings")
@@ -12270,7 +12494,8 @@ def grabowski_task_list(
         placeholders = ",".join("?" for _ in filter_states)
         where.append(f"state IN ({placeholders})")
         parameters.extend(filter_states)
-    with _task_read_snapshot() as connection:
+    snapshot = _task_readonly_snapshot() if read_only else _task_read_snapshot()
+    with snapshot as connection:
         # BEGIN DEFERRED does not pin a SQLite snapshot until the first read.
         # Pin it before helper calls so row pages, counts and attention decisions
         # are all derived against one task-store view even if a concurrent writer
@@ -12289,7 +12514,7 @@ def grabowski_task_list(
         )
         import grabowski_task_attention as task_attention
 
-        evaluate_attention_projection = state in {None, "attention"}
+        evaluate_attention_projection = not read_only and state in {None, "attention"}
         decision_guard = (
             task_attention.decision_snapshot_guard()
             if evaluate_attention_projection
@@ -12398,6 +12623,11 @@ def grabowski_task_list(
         "outcome_unknown",
     }
     warnings: list[dict[str, Any]] = []
+    if read_only:
+        warnings.append({
+            "code": "terminalization_recovery_not_run",
+            "detail": "Persistent state is a read-only snapshot, not reconciled execution truth",
+        })
     if unknown_state_count:
         warnings.append({
             "code": "unknown_task_states",
@@ -12438,6 +12668,8 @@ def grabowski_task_list(
         "count": len(tasks),
         "total_matching": total_matching,
         "state_filter": state,
+        "read_only_snapshot": read_only,
+        "reconciliation_performed": not read_only,
         "state_filter_kind": (
             "all" if state is None else "projection" if state in TASK_STATE_PROJECTIONS else "exact"
         ),
@@ -12592,10 +12824,10 @@ async def _grabowski_task_start_tool(
     )
 
 
-@mcp.tool(name="grabowski_task_status", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_task_status", annotations=MUTATING)
 async def _grabowski_task_status_tool(task_id: str) -> dict[str, Any]:
-    """Observe one persistent task and refresh its recorded state."""
-    operator._require_operator_capability("durable_job")
+    """Observe and persist one task state; lease maintenance may mutate resources."""
+    operator._require_operator_mutation("durable_job", task_id=task_id)
     return await asyncio.to_thread(grabowski_task_status, task_id)
 
 
@@ -12643,7 +12875,7 @@ async def _grabowski_task_resume_tool(task_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(grabowski_task_resume, task_id)
 
 
-@mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_task_list", annotations=MUTATING)
 async def _grabowski_task_list_tool(
     limit: int = DEFAULT_TASK_LIST_LIMIT,
     state: str | None = None,

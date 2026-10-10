@@ -1500,7 +1500,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         inspect_resource = workspace.resources.inspect_resource
         lifecycle_bindings = workspace.checkouts._lifecycle_bindings
 
-        def lease_at_deadline(resource_key: str) -> dict:
+        def lease_at_deadline(resource_key: str, *, read_only: bool = False) -> dict:
             return {
                 **inspect_resource(resource_key),
                 "expires_at_unix": deadline,
@@ -1527,7 +1527,19 @@ class AgentWorkspaceTests(unittest.TestCase):
         ):
             plan = self.normalize_lane(lane)
 
+        # This verifies the retained runtime horizon, not WAL availability.
+        # Use a checkpointed copy so strict READ_ONLY checkout observation
+        # does not depend on the lifetime of setup-time writer connections.
+        checkout_snapshot = self.root / "horizon-checkout-snapshot.sqlite3"
+        source = sqlite3.connect(workspace.checkouts.CHECKOUT_DB)
+        target = sqlite3.connect(checkout_snapshot)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
         with (
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot),
             mock.patch.object(workspace, "_now", return_value=observed_at + 300),
             mock.patch.object(
                 workspace.resources,
@@ -1550,14 +1562,181 @@ class AgentWorkspaceTests(unittest.TestCase):
         }
         (self.state / plan["workspace_id"]).mkdir(mode=0o700)
         workspace._write_manifest(stored_manifest)
-        self.assertEqual(
-            workspace._existing_lane_runtime_deadline(
-                lane_id=lane["lane_id"],
-                binding_id="thread-1",
-                repository=str(self.git.repo),
-            ),
-            deadline,
-        )
+        with mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot):
+            self.assertEqual(
+                workspace._existing_lane_runtime_deadline(
+                    lane_id=lane["lane_id"],
+                    binding_id="thread-1",
+                    repository=str(self.git.repo),
+                ),
+                deadline,
+            )
+
+    def test_lane_backed_readonly_reuses_existing_lock_without_mutation(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-existing-readonly-lock")
+        lock = self.lane_state / f"{lane['lane_id']}.lock"
+        self.assertTrue(lock.is_file())
+        original = lock.read_bytes()
+        before = lock.stat()
+        with mock.patch.object(
+            workspace.work_acquire,
+            "_lane_lock",
+            side_effect=AssertionError("READ_ONLY may not create or chmod a lane lock"),
+        ) as mutating_lock:
+            receipt = workspace._lane_receipt(
+                lane["lane_id"], lane["receipt_sha256"], read_only=True
+            )
+        self.assertEqual(receipt["lane_id"], lane["lane_id"])
+        self.assertEqual(lock.read_bytes(), original)
+        self.assertEqual(lock.stat().st_ctime_ns, before.st_ctime_ns)
+        mutating_lock.assert_not_called()
+
+        # An absent lock fails closed rather than being created by a status call.
+        lock.unlink()
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError, "work lane receipt is not safely readable"
+        ):
+            workspace._lane_receipt(
+                lane["lane_id"], lane["receipt_sha256"], read_only=True
+            )
+        self.assertFalse(lock.exists())
+
+    def test_readonly_workspace_root_is_not_created_when_absent(self) -> None:
+        root = self.root / "absent-workspace-state"
+        with mock.patch.object(workspace, "WORKSPACE_ROOT", root):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError, "agent workspace root is unavailable"
+            ):
+                workspace._workspace_dir("gaw-absent-workspace")
+        self.assertFalse(root.exists())
+
+    def test_lane_backed_status_rejects_checkout_wal_without_sidecar_writes(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-strict-checkout-wal")
+        plan = self.normalize_lane(lane)
+        database = workspace.checkouts.CHECKOUT_DB
+        keeper = workspace.checkouts._database()
+        try:
+            keeper.execute("BEGIN IMMEDIATE")
+            keeper.execute("UPDATE metadata SET value=value WHERE key='schema_version'")
+            keeper.commit()
+            wal = Path(str(database) + "-wal")
+            shm = Path(str(database) + "-shm")
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+            before = {path: path.read_bytes() for path in (database, wal, shm)}
+            with mock.patch.object(
+                workspace.operator,
+                "_require_operator_mutation",
+                side_effect=AssertionError("READ_ONLY workspace status requested mutation"),
+            ) as gate:
+                observed = workspace._lane_binding_status(plan)
+            self.assertFalse(observed["valid"])
+            self.assertIn("Strict read-only snapshot unavailable", observed["error"])
+            gate.assert_not_called()
+            self.assertEqual(
+                before, {path: path.read_bytes() for path in (database, wal, shm)}
+            )
+        finally:
+            keeper.close()
+
+    def test_lane_backed_writer_validation_survives_live_resource_wal(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-writer-live-resource-wal")
+        plan = self.normalize_lane(lane)
+        keeper = workspace.resources._database()
+        try:
+            keeper.execute("BEGIN IMMEDIATE")
+            keeper.execute("UPDATE metadata SET value=value WHERE key='schema_version'")
+            keeper.commit()
+            self.assertTrue(Path(str(workspace.resources.RESOURCE_DB) + "-wal").is_file())
+            self.assertTrue(Path(str(workspace.resources.RESOURCE_DB) + "-shm").is_file())
+            self.assertFalse(workspace._lane_binding_status(plan)["valid"])
+            with mock.patch.object(
+                workspace.operator, "_require_operator_mutation"
+            ) as mutation_gate:
+                result = workspace._require_live_lane_binding(plan)
+            self.assertTrue(result["valid"])
+            mutation_gate.assert_called_once_with("resource_lease")
+        finally:
+            keeper.close()
+        # SQLite fixture connections may survive keeper.close() on Python 3.12.
+        # Strict public READ_ONLY must reject any remaining WAL/SHM sidecars.
+        wal = Path(str(workspace.resources.RESOURCE_DB) + "-wal")
+        shm = Path(str(workspace.resources.RESOURCE_DB) + "-shm")
+        checkout_wal = Path(str(workspace.checkouts.CHECKOUT_DB) + "-wal")
+        checkout_shm = Path(str(workspace.checkouts.CHECKOUT_DB) + "-shm")
+        observed = workspace._lane_binding_status(plan)
+        if any(path.exists() for path in (wal, shm, checkout_wal, checkout_shm)):
+            self.assertFalse(observed["valid"])
+            self.assertIn("Strict read-only snapshot unavailable", observed["error"])
+        else:
+            self.assertTrue(observed["valid"])
+        # The exact lease must remain readable from a genuinely quiescent
+        # SQLite backup, independent of other fixture writers' lifetimes.
+        snapshot = self.root / "quiescent-resource-snapshot.sqlite3"
+        source = sqlite3.connect(workspace.resources.RESOURCE_DB)
+        target = sqlite3.connect(snapshot)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        self.assertFalse(Path(str(snapshot) + "-wal").exists())
+        self.assertFalse(Path(str(snapshot) + "-shm").exists())
+        checkout_snapshot = self.root / "quiescent-checkout-snapshot.sqlite3"
+        checkout_source = sqlite3.connect(workspace.checkouts.CHECKOUT_DB)
+        checkout_target = sqlite3.connect(checkout_snapshot)
+        try:
+            checkout_source.backup(checkout_target)
+        finally:
+            checkout_target.close()
+            checkout_source.close()
+        self.assertFalse(Path(str(checkout_snapshot) + "-wal").exists())
+        self.assertFalse(Path(str(checkout_snapshot) + "-shm").exists())
+        with (
+            mock.patch.object(workspace.resources, "RESOURCE_DB", snapshot),
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot),
+        ):
+            self.assertTrue(workspace._lane_binding_status(plan)["valid"])
+
+    def test_lane_backed_writer_denial_precedes_resource_store_inspection(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-writer-denied-before-sqlite")
+        plan = self.normalize_lane(lane)
+        with (
+            mock.patch.object(
+                workspace.operator,
+                "_require_operator_mutation",
+                side_effect=PermissionError("resource mutation denied"),
+            ) as gate,
+            mock.patch.object(workspace.resources, "inspect_resource") as inspect,
+        ):
+            with self.assertRaisesRegex(PermissionError, "resource mutation denied"):
+                workspace._require_live_lane_binding(plan)
+        gate.assert_called_once_with("resource_lease")
+        inspect.assert_not_called()
+
+    def test_legacy_lane_validation_does_not_acquire_new_resource_authority(self) -> None:
+        legacy = self.manifest(with_writer=False)
+        with mock.patch.object(
+            workspace.operator, "_require_operator_mutation",
+            side_effect=AssertionError("legacy workspace must not request a lane resource gate"),
+        ) as gate:
+            result = workspace._require_live_lane_binding(legacy)
+        self.assertTrue(result["valid"])
+        gate.assert_not_called()
+
+    def test_lane_backed_status_fails_closed_when_strict_resource_snapshot_unavailable(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-strict-resource-readonly")
+        plan = self.normalize_lane(lane)
+        with mock.patch.object(
+            workspace.resources,
+            "inspect_resource",
+            side_effect=RuntimeError("strict resource WAL unavailable"),
+        ) as reader:
+            status = workspace._lane_binding_status(plan)
+        self.assertFalse(status["valid"])
+        self.assertIn("lease is not observable", status["error"])
+        reader.assert_called()
+        self.assertIs(reader.call_args.kwargs["read_only"], True)
 
     def test_lane_backed_create_failure_preserves_lane_resources(self) -> None:
         lane = self.lane_receipt()
@@ -1698,11 +1877,87 @@ class AgentWorkspaceTests(unittest.TestCase):
             manifest["checkout_lifecycle"]["checkout_key"],
             lane["worktree_receipt"]["lifecycle"]["checkout_key"],
         )
-        self.assertTrue(workspace._lane_binding_status(manifest)["valid"])
+        # Creation may leave resource and checkout WAL sidecars from setup
+        # writers. READ_ONLY must fail closed there; test a quiescent backup
+        # of *both* stores rather than relaxing the runtime security gate.
+        checkout_snapshot = self.root / "reuse-checkout-snapshot.sqlite3"
+        resource_snapshot = self.root / "reuse-resource-snapshot.sqlite3"
+        for original, snapshot in (
+            (workspace.checkouts.CHECKOUT_DB, checkout_snapshot),
+            (workspace.resources.RESOURCE_DB, resource_snapshot),
+        ):
+            source = sqlite3.connect(original)
+            target = sqlite3.connect(snapshot)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+            self.assertFalse(Path(str(snapshot) + "-wal").exists())
+            self.assertFalse(Path(str(snapshot) + "-shm").exists())
+        with (
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot),
+            mock.patch.object(workspace.resources, "RESOURCE_DB", resource_snapshot),
+        ):
+            status = workspace._lane_binding_status(manifest)
+            self.assertTrue(status["valid"], status)
         for key in lane["inputs"]["resource_keys"]:
             lease = workspace.resources.inspect_resource(key)
             self.assertEqual(lease["owner_id"], f"lane:{lane['lane_id']}")
         self.assertTrue(self.git.writer.exists())
+
+        # The same already-admitted create/reuse path must work when both
+        # resource and checkout stores have live WAL/SHM from active writers.
+        keepers = (workspace.resources._database(), workspace.checkouts._database())
+        try:
+            for keeper in keepers:
+                keeper.execute("BEGIN IMMEDIATE")
+                keeper.execute("UPDATE metadata SET value=value WHERE key='schema_version'")
+                keeper.commit()
+            for database in (workspace.resources.RESOURCE_DB, workspace.checkouts.CHECKOUT_DB):
+                self.assertTrue(Path(str(database) + "-wal").is_file())
+                self.assertTrue(Path(str(database) + "-shm").is_file())
+            with (
+                mock.patch.object(workspace.operator, "_require_operator_mutation") as mutation_gate,
+                mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+                mock.patch.object(
+                    workspace, "_task_public",
+                    return_value={"task_id": manifest["tasks"]["writer"], "state": "running"},
+                ),
+                mock.patch.object(
+                    workspace, "_writer_create_identity",
+                    return_value={"writer_head": manifest["expected_base_head"], "writer_branch_matches": True},
+                ),
+            ):
+                reuse = workspace._existing_workspace_response(
+                    directory=self.state / manifest["workspace_id"],
+                    plan=workspace._plan_from_manifest(manifest),
+                    plan_sha256=manifest["plan_sha256"],
+                )
+            self.assertEqual(reuse["state"], "creation_runtime_incomplete", reuse)
+            self.assertTrue(reuse["lane_binding_status"]["valid"], reuse)
+            self.assertNotIn("work_lane_binding_invalid", reuse["runtime_errors"])
+            mutation_gate.assert_any_call("resource_lease")
+        finally:
+            for keeper in keepers:
+                keeper.close()
+
+    def test_workspace_lifecycle_classification_rechecks_git_capability_before_inventory(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.operator, "_require_operator_capability",
+                side_effect=PermissionError("git_cli denied"),
+            ) as git_gate,
+            mock.patch.object(workspace.checkouts, "checkout_inventory") as inventory,
+        ):
+            with self.assertRaisesRegex(PermissionError, "git_cli denied"):
+                workspace._workspace_lifecycle_classification(
+                    manifest, {}, observed_at_unix=workspace._now()
+                )
+        git_gate.assert_called_once_with("git_cli")
+        inventory.assert_not_called()
 
     def test_lane_backed_close_preserves_lane_ownership_and_satisfies_close(self) -> None:
         lane = self.lane_receipt()
@@ -3355,7 +3610,8 @@ class AgentWorkspaceTests(unittest.TestCase):
             "review": {"status": "passed", "verdict": "PASS", "findings": []},
         })
 
-        def task_state(task_id):
+        def task_state(task_id, *, read_only=False):
+            self.assertTrue(read_only)
             state = "failed" if task_id == "writer-task" else "completed"
             return {"task_id": task_id, "state": state, "terminal": True}
 
@@ -6034,7 +6290,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 workspace._role_receipt_path(manifest, role_name),
                 signed_role_receipt(role_name, manifest, snapshot),
             )
-        def completed(task_id):
+        def completed(task_id, *, read_only=False):
             return {"task_id": task_id, "state": "completed", "terminal": True}
         with (
             mock.patch.object(workspace, "_task_public", side_effect=completed),
@@ -11464,7 +11720,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         with (
             mock.patch.object(workspace.operator, "_require_operator_capability"),
             mock.patch.object(
-                workspace.tasks, "grabowski_task_status", side_effect=task_status
+                workspace.tasks, "grabowski_task_peek", side_effect=task_status
             ),
             mock.patch.object(workspace, "_tmux_has_session", return_value=False),
             mock.patch.object(
@@ -11479,17 +11735,20 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(
                 workspace,
                 "_require_live_lane_binding",
-                return_value={
-                    "valid": True,
-                    "lane_id": lane["lane_id"],
-                    "receipt_sha256": lane["receipt_sha256"],
-                },
-            ),
+                side_effect=AssertionError("READ_ONLY candidate requested writer lane"),
+            ) as writer_lane,
+            mock.patch.object(
+                workspace.operator,
+                "_require_operator_mutation",
+                side_effect=AssertionError("READ_ONLY candidate requested mutation"),
+            ) as mutation_gate,
         ):
             status = workspace.grabowski_agent_workspace_status(
                 manifest["workspace_id"]
             )
 
+        writer_lane.assert_not_called()
+        mutation_gate.assert_not_called()
         self.assertTrue(status["candidate_revision"]["eligible"])
         self.assertEqual(
             status["candidate_revision"]["candidate_id"], candidate["candidate_id"]
@@ -12427,7 +12686,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         with (
             mock.patch.object(
                 workspace.tasks,
-                "grabowski_task_status",
+                "grabowski_task_peek",
                 return_value=self._handoff_writer_task(manifest),
             ),
             mock.patch.object(workspace.resources, "list_resources", return_value=leases),

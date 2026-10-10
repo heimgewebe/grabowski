@@ -5406,6 +5406,39 @@ class TaskTests(unittest.TestCase):
             result["blocked"][0]["resume_policy"], "verify-then-retry"
         )
 
+    def test_reconcile_check_public_guard_denies_inside_lock_before_store(self) -> None:
+        self.assertFalse(self.database.exists())
+        self.assertFalse(self.resource_database.exists())
+        gate_after_lock = []
+
+        def deny_after_lock(capability):
+            gate_after_lock.append((capability, lock.__enter__.called))
+            raise PermissionError("mutation gate denied")
+
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=deny_after_lock,
+            ) as gate,
+            patch.object(tasks, "_task_read_snapshot") as reader,
+            patch.object(tasks, "TASK_RECONCILE_LOCK") as lock,
+        ):
+            with self.assertRaisesRegex(PermissionError, "mutation gate denied"):
+                tasks.grabowski_task_reconcile_check(limit=1)
+            lock.__enter__.assert_called_once()
+        gate.assert_called_once_with("durable_job")
+        self.assertEqual([("durable_job", True)], gate_after_lock)
+        reader.assert_not_called()
+        self.assertFalse(self.database.exists())
+        self.assertFalse(self.resource_database.exists())
+
+    def test_reconcile_check_public_allowed_guard_keeps_preview_working(self) -> None:
+        with patch.object(tasks.operator, "_require_operator_mutation") as gate:
+            result = tasks.grabowski_task_reconcile_check(limit=1)
+        gate.assert_called_once_with("durable_job")
+        self.assertEqual("check", result["mode"])
+        self.assertEqual(0, result["scanned"])
+
     def test_reconcile_check_is_read_only_preview(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_dispatch", return_value=_launcher()
@@ -5783,6 +5816,202 @@ class TaskTests(unittest.TestCase):
                 tasks.TASK_RECONCILE_CHECK_CURSOR_CURRENT_SCOPE + ":"
             )
         )
+
+    def test_reconcile_ready_proof_requires_authorized_quiescent_refresh_and_current_revisions(self) -> None:
+        # Build both existing stores without launching a process.
+        with tasks._database_connection():
+            pass
+        # sqlite3.Connection.__exit__ commits but does not close the writer;
+        # keep the strictly read-only resource snapshot quiescent on Python 3.12.
+        with closing(tasks.resources._database()):
+            pass
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+
+        incomplete = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": False,
+                "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=incomplete),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+
+        result = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True,
+                "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            proof = tasks._task_reconcile_ready_evidence_snapshot(connection)
+        self.assertEqual("verified", proof["status"])
+
+        # Finishing a later page does not prove earlier pages were successful.
+        later_page = {**result, "batch": {
+            **result["batch"], "cursor_before": (123, "earlier-task"),
+        }}
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=later_page),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+        # A later valid one-shot complete reconciliation can certify readiness.
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        # Expire the latest proof, not the one from the earlier refresh:
+        # the two reconciliations may cross a clock-second boundary.
+        with tasks._task_readonly_snapshot() as connection:
+            latest_proof = tasks._task_reconcile_ready_evidence_snapshot(connection)
+        self.assertEqual("verified", latest_proof["status"])
+        self.assertIsInstance(latest_proof["reconciled_at_unix"], int)
+
+        with patch.object(
+            tasks, "_now",
+            return_value=latest_proof["reconciled_at_unix"] + tasks.TASK_RECONCILE_READY_MAX_AGE_SECONDS + 1,
+        ):
+            with tasks._task_readonly_snapshot() as connection:
+                self.assertEqual(
+                    "invalid_or_stale",
+                    tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+                )
+        # A directly changed resource revision invalidates existing evidence.
+        with closing(tasks.resources._database()) as connection, connection:
+            connection.execute(
+                "UPDATE metadata SET value=lower(hex(randomblob(32))) WHERE key=?",
+                (tasks.resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+            )
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "stale",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+
+    def test_reconcile_ready_proof_not_published_with_active_task_or_failed_audit(self) -> None:
+        with tasks._database_connection():
+            pass
+        # Commit is not close: an open resource connection can retain WAL/SHM
+        # and hide a missing active-task guard behind an unrelated failure.
+        with closing(tasks.resources._database()):
+            pass
+        started = self._start(resource_keys=["service:reconcile-ready-live.service"])
+        for sidecar in ("-wal", "-shm"):
+            self.assertFalse(Path(str(self.resource_database) + sidecar).exists())
+        self.assertEqual("running", started["task"]["state"])
+        result = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True,
+                "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit", side_effect=RuntimeError("audit unavailable")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "audit unavailable"):
+                tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+        # An unresolved terminal outcome is not an active process, but it is
+        # still unknown execution truth and cannot produce a ready proof.
+        task_id = str(started["task"]["task_id"])
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE tasks SET state='outcome_unknown' WHERE task_id=?",
+                (task_id,),
+            )
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "missing",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
+
+        # Positive control: after the very same task is terminal, an authorized
+        # complete cycle must publish a verified proof. A broken resource
+        # snapshot must not be able to make the negative assertions pass.
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?",
+                (task_id,),
+            )
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as connection:
+            self.assertEqual(
+                "verified",
+                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+            )
 
     def test_task_reconcile_revision_token_changes_only_for_candidate_rows(self) -> None:
         started = self._start(
@@ -9012,6 +9241,130 @@ class TaskTests(unittest.TestCase):
                             )
                     finally:
                         self.database = previous
+
+    def test_shared_task_status_denies_before_lock_or_any_store_access(self) -> None:
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=PermissionError("test mutation denied"),
+            ) as gate,
+            patch.object(tasks, "_task_mutation_lock") as lock,
+            patch.object(tasks, "_row") as row,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test mutation denied"):
+                tasks.grabowski_task_status("0" * 24)
+        gate.assert_called_once_with("durable_job", task_id="0" * 24)
+        lock.assert_not_called()
+        row.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_task_peek_cannot_initialize_missing_store(self) -> None:
+        with (
+            patch.object(tasks, "_database") as database,
+            patch.object(tasks, "_recover_pending_task_terminalizations") as recover,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "explicit initialization"):
+                tasks.grabowski_task_peek("0" * 24)
+        database.assert_not_called()
+        recover.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_task_peek_reads_current_store_without_state_or_lease_write(self) -> None:
+        created = self._start()["task"]
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        observation = {
+            "state": "completed", "properties": {}, "observed_at_unix": tasks._now()
+        }
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=AssertionError("task peek must not mutate"),
+            ) as gate,
+            patch.object(tasks, "_database") as database,
+            patch.object(tasks, "_maintain_record_resources") as maintenance,
+            patch.object(tasks, "_observe", return_value=observation) as observer,
+        ):
+            result = tasks.grabowski_task_peek(created["task_id"])
+        gate.assert_not_called()
+        database.assert_not_called()
+        maintenance.assert_not_called()
+        observer.assert_called_once()
+        self.assertEqual("unpersisted_readonly_probe", result["observation_mode"])
+        self.assertEqual("completed", result["state"])
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+
+    def test_root_broker_peek_is_persisted_only_without_privileged_probe(self) -> None:
+        created = self._start()["task"]
+        writer = tasks._database()
+        try:
+            writer.execute(
+                "UPDATE tasks SET execution_backend=?, systemd_scope=? WHERE task_id=?",
+                ("systemd-root-broker", "system", created["task_id"]),
+            )
+            writer.commit()
+        finally:
+            writer.close()
+        with (
+            patch.object(
+                tasks.privileged, "root_task_systemd_request",
+                side_effect=AssertionError("rootbroker effect forbidden for READ_ONLY"),
+            ) as broker,
+            patch.object(
+                tasks, "_observe",
+                side_effect=AssertionError("rootbroker probe forbidden for READ_ONLY"),
+            ) as probe,
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=PermissionError("mutation stopped"),
+            ) as gate,
+            patch.object(tasks, "_database") as database,
+        ):
+            result = tasks.grabowski_task_peek(created["task_id"])
+        broker.assert_not_called()
+        probe.assert_not_called()
+        gate.assert_not_called()
+        database.assert_not_called()
+        self.assertEqual("outcome_unknown", result["state"])
+        self.assertEqual("persisted_only_rootbroker_not_probed", result["observation_mode"])
+        self.assertEqual("unknown", result["systemd_unit_health"]["status"])
+        self.assertEqual(
+            "rootbroker_live_observation_requires_mutation_gate",
+            result["systemd_unit_health"]["reason"],
+        )
+        self.assertTrue(result["reconcile_required"])
+        self.assertIsNone(result["last_observation"])
+
+    def test_task_list_denied_mutation_cannot_recover_or_open_store(self) -> None:
+        with (
+            patch.object(
+                tasks.operator,
+                "_require_operator_mutation",
+                side_effect=PermissionError("test mutation denied"),
+            ) as gate,
+            patch.object(tasks, "_recover_pending_task_terminalizations") as recover,
+            patch.object(tasks, "_database") as database,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test mutation denied"):
+                tasks.grabowski_task_list(state="active")
+        gate.assert_called_once_with("durable_job")
+        recover.assert_not_called()
+        database.assert_not_called()
+
+    def test_task_status_mcp_denies_before_task_lock_and_lease_work(self) -> None:
+        with (
+            patch.object(
+                tasks.operator,
+                "_require_operator_mutation",
+                side_effect=PermissionError("test mutation denied"),
+            ) as gate,
+            patch.object(tasks, "grabowski_task_status") as status,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test mutation denied"):
+                asyncio.run(tasks._grabowski_task_status_tool("0" * 24))
+        gate.assert_called_once_with("durable_job", task_id="0" * 24)
+        status.assert_not_called()
 
     def test_task_schema_only_inventory_reports_migration_without_mutation(self) -> None:
         self._create_task_schema_version("2")

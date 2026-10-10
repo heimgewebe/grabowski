@@ -870,11 +870,13 @@
     },
     {
       "category": "checkout-lifecycle",
-      "description": "Preview an evidence-only terminal transition for one missing or safely retained managed checkout.",
-      "effects": [],
+      "description": "Preview an evidence-bound terminal transition; SQLite WAL observation needs mutation admission.",
+      "effects": [
+        "sqlite-wal-shm-sidecar-write"
+      ],
       "id": "grabowski_checkout_binding_terminal_preview",
       "purpose": "Preview one exact evidence-bound terminal reconciliation for an absent managed checkout, a clean terminal Work Lane, or a present terminal thread_focus checkout whose only admitted local state is hash-bound .review-audits evidence and whose head is exactly retention-bound.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_checkout_binding_terminal_preview"
@@ -897,11 +899,13 @@
     },
     {
       "category": "checkout-lifecycle",
-      "description": "Preview one fail-closed identity repair for branch, path, or retention-converged lifecycle drift.",
-      "effects": [],
+      "description": "Preview identity repair through mutation admission before SQLite WAL observation.",
+      "effects": [
+        "sqlite-wal-shm-sidecar-write"
+      ],
       "id": "grabowski_checkout_binding_identity_rebind_preview",
       "purpose": "Preview one clean, coordination-free and remote-secured existing checkout for a supported identity repair: branch rename, repo-path canonicalization, or lifecycle catch-up when retention already matches current Git identity.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_checkout_binding_identity_rebind_preview"
@@ -1501,13 +1505,15 @@
     },
     {
       "category": "task",
-      "description": "Observe one persistent task and refresh its recorded state.",
+      "description": "Observe and persist one task state; lease maintenance may mutate resources.",
       "effects": [
+        "lease-reacquire",
+        "lease-renew",
         "state-refresh"
       ],
       "id": "grabowski_task_status",
       "purpose": "Observe one persistent task and refresh its recorded state.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_status"
@@ -1555,10 +1561,13 @@
     {
       "category": "task",
       "description": "List persistent tasks or inspect store-schema compatibility read-only.",
-      "effects": [],
+      "effects": [
+        "schema-migration",
+        "terminalization-recovery"
+      ],
       "id": "grabowski_task_list",
       "purpose": "List recent persistent task records with optional state filtering.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_list"
@@ -1601,11 +1610,14 @@
     },
     {
       "category": "task",
-      "description": "Read one bounded, resumable reconcile preview for persistent tasks.",
-      "effects": [],
+      "description": "Preview tasks through the mutation gate (legacy stores may be upgraded).",
+      "effects": [
+        "schema-migration",
+        "temporary-file-create"
+      ],
       "id": "grabowski_task_reconcile_check",
-      "purpose": "Preview reconcile effects for persistent task records without mutating state.",
-      "read_only": true,
+      "purpose": "Preview persistent task reconciliation through the mutation gate; legacy SQLite stores may be initialized or migrated and privileged observations may create temporary reference files.",
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_reconcile_check"
@@ -2149,10 +2161,12 @@
     {
       "category": "resource",
       "description": "List bounded leases or inspect store-schema compatibility read-only.",
-      "effects": [],
+      "effects": [
+        "schema-migration"
+      ],
       "id": "grabowski_resource_list",
       "purpose": "List bounded typed resource leases with optional owner filtering.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_resource_list"
@@ -3670,7 +3684,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "2e158ca751ea852a8191e978d4689b4fc39fb351120f08423dbf126faf934a3c"
+      "sha256": "a5469c45befc5e65fa71e13c3a69d050d0c23db8f261434095b5cbab7055d780"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3711,7 +3725,7 @@
       "src/grabowski_checkout_identity.py": "377ca0a5396df74023cff263a7ae16da94d1c31a887772c3abb877961f4e5fd5",
       "src/grabowski_checkout_terminal_reconciliation.py": "fbe3f0a0778c006a76ab5d44734c6d06988fd0a0cda2e931b39a5e0a0f4a41b2",
       "src/grabowski_checkout_terminal_sources.py": "56e65c901e7b5ba5a6b9d764617b709cff14dc1d3d852244beff5ac5cadce32b",
-      "src/grabowski_checkouts.py": "7018fca6677b4d32d78cbd2eca09827cfbf473e27d787f651de6f88eb34c4e9f",
+      "src/grabowski_checkouts.py": "b765e63544a072a0b0ab24d1f7a06670173642f44c45356783492cbdbf52a4f8",
       "src/grabowski_chronik.py": "68785720fc9dac258b493011f99d5568ef1ca5543e21eee853e6d8e6c1616c17",
       "src/grabowski_client_snapshot.py": "777d9aa6d4bd964e7fdbb923d82586d186f9e0340e51b8e4b1140cae1e863eec",
       "src/grabowski_coding_agent_catalog_data.py": "2e9b3163bf93f58f5c2848813e51d1cf0f13c59dc071eb678a11657c4bb645a2",
@@ -3789,7 +3803,7 @@
       "src/grabowski_repobrief.py": "1e842a9f310c967012914afbaf2dbbc4af3a29c222734f14f902421773713ded",
       "src/grabowski_repoground_catalog.py": "b8ea8d611a37bb287ae8836790c6aa7abf29c08dcccf252492fb355c9f9ba58f",
       "src/grabowski_repoground_post_merge.py": "6907ea6de2a66209975d3b835fe4bf70683a35bffdcbe479182e9ae010954a5a",
-      "src/grabowski_resources.py": "4c6fa4fff67425607702a23bbdf33fb2deeb6da43430b844a6bb12d1e54fac57",
+      "src/grabowski_resources.py": "28fee9a0fe8f04c0d99e218ee64ef536f30db9a525d6efe5859cd0184fe81a43",
       "src/grabowski_runtime.py": "783a6ed8635da45733a80ed9872a5afcd33aedf638f567fea464e4ab623ff182",
       "src/grabowski_runtime_contract.py": "4528ec08c1019a2b773a7e05250f4842ca2403d1c9171b19ef98a63c6e588054",
       "src/grabowski_runtime_extensions.py": "4bbaabe4120acc6879297e85d3664c69193fe0a9850e48522d1839b7844b2297",
@@ -3800,7 +3814,7 @@
       "src/grabowski_systemkatalog.py": "e3ec4884b3dd367b8970b3143432cab0fea5fe55963292806001f5df535c83f9",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "b616d105e72f21a3230b0f045cb97596f5c0cf9440eab3d2ae947e4fffaa160a",
+      "src/grabowski_tasks.py": "d822ef6e676a9ad5dd79cebb7d9b27fbb965915340273c030f5737473d50ee9a",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",

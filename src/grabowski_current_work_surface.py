@@ -96,7 +96,7 @@ def _task_payload(
     tasks = _module("grabowski_tasks")
     projection = tasks._task_current_projection()
     required_task_ids = list(required_task_ids or [])
-    with tasks._task_read_snapshot() as connection:
+    with tasks._task_readonly_snapshot() as connection:
         if view == "current":
             placeholders = ",".join("?" for _ in CURRENT_TASK_STATES)
             current_rows = tasks._task_list_current_rows(
@@ -174,8 +174,9 @@ def _resources_payload() -> dict[str, Any]:
     leases = resources.list_resources(
         include_expired=False,
         limit=MAX_SOURCE_LEASES,
+        read_only=True,
     )
-    total = resources.count_resources(include_expired=False)
+    total = resources.count_resources(include_expired=False, read_only=True)
     return {
         "leases": leases,
         "count": total,
@@ -191,17 +192,21 @@ def _checkout_payloads(
     payloads: list[dict[str, Any]] = []
     for repository in repositories:
         try:
-            payload = checkouts.checkout_inventory(
-                repository,
-                include_processes=False,
-                include_tasks=False,
-                include_resources=True,
-                git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
-                observation_budget_seconds=(
-                    CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS
-                ),
-                max_worktrees=CURRENT_WORK_CHECKOUT_MAX_WORKTREES,
-            )
+            # Public Current Work is READ_ONLY.  Direct internal inventory
+            # uses WAL-aware SQLite readers that may create a missing SHM file;
+            # enforce the same strict non-writing scope as checkout_inventory.
+            with checkouts._strict_inventory_readonly_scope():
+                payload = checkouts.checkout_inventory(
+                    repository,
+                    include_processes=False,
+                    include_tasks=False,
+                    include_resources=True,
+                    git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
+                    observation_budget_seconds=(
+                        CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS
+                    ),
+                    max_worktrees=CURRENT_WORK_CHECKOUT_MAX_WORKTREES,
+                )
             payloads.append(payload)
             if payload.get("truncated") is True and errors is not None:
                 errors.append(

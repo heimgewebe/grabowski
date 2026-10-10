@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime
 import hashlib
 import json
@@ -384,11 +384,14 @@ class ResourceLeaseExpired(RuntimeError):
 
 
 @contextmanager
-def _resource_inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
+def _resource_inventory_readonly_sqlite(
+    path: Path, *, allow_wal_copy: bool = True
+) -> Iterator[sqlite3.Connection]:
     with sqlite_store.inventory_readonly_sqlite(
         path,
         temporary_prefix="grabowski-resource-schema-inventory-",
         error_type=ResourceSchemaInventoryChanged,
+        allow_wal_copy=allow_wal_copy,
     ) as connection:
         yield connection
 
@@ -3947,7 +3950,7 @@ def task_terminalization_record(
     task_id: str, *, include_projection: bool = False
 ) -> dict[str, Any] | None:
     identifier = _task_identifier(task_id)
-    with _database() as connection:
+    with closing(_database()) as connection:
         row = connection.execute(
             "SELECT * FROM task_terminalizations WHERE task_id=?",
             (identifier,),
@@ -3973,7 +3976,7 @@ def task_terminalization_records(
     if not identifiers:
         return {}
     placeholders = ",".join("?" for _ in identifiers)
-    with _database() as connection:
+    with closing(_database()) as connection:
         rows = connection.execute(
             f"SELECT * FROM task_terminalizations WHERE task_id IN ({placeholders})",
             identifiers,
@@ -6254,7 +6257,8 @@ def acquire_resources(
     expires = now + ttl
     reclaimed: list[dict[str, Any]] = []
     preserved: list[str] = []
-    with _database() as connection:
+    # Releasing the SQLite connection is distinct from committing its transaction.
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             if task_owner_match is not None:
@@ -7848,7 +7852,7 @@ def renew_resources(
     now = _now()
     requested_expires = now + ttl
     updates: list[tuple[int, int, str, str]] = []
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             _check_bureau_semantic_conflicts(
@@ -7945,7 +7949,7 @@ def release_resources(
         )
         expected_by_key = {item["resource_key"]: item for item in snapshots}
     released: list[dict[str, Any]] = []
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             placeholders = ",".join("?" for _ in keys)
@@ -7996,10 +8000,15 @@ def release_resources(
     }
 
 
-def inspect_resource(resource_key: str) -> dict[str, Any] | None:
+def inspect_resource(
+    resource_key: str, *, read_only: bool = False
+) -> dict[str, Any] | None:
     key = normalize_resource_key(resource_key)
     now = _now()
-    with _database() as connection:
+    # The public READ_ONLY inspector may never initialize, migrate or copy
+    # a WAL store, including on a deny/kill-switch/audit failure.
+    source = _resource_readonly_snapshot() if read_only else closing(_database())
+    with source as connection:
         row = connection.execute(
             "SELECT * FROM leases WHERE resource_key=?", (key,)
         ).fetchone()
@@ -8021,7 +8030,7 @@ def inspect_resources(resource_keys: Iterable[str]) -> dict[str, dict[str, Any]]
         return {}
     now = _now()
     placeholders = ",".join("?" for _item in keys)
-    with _database() as connection:
+    with closing(_database()) as connection:
         rows = connection.execute(
             f"SELECT * FROM leases WHERE resource_key IN ({placeholders})",
             keys,
@@ -8035,10 +8044,26 @@ def inspect_resources(resource_keys: Iterable[str]) -> dict[str, dict[str, Any]]
     }
 
 
+@contextmanager
+def _resource_readonly_snapshot() -> Iterator[sqlite3.Connection]:
+    """Observe a stable store without writes; active WAL sidecars fail closed."""
+    if RESOURCE_DB.is_symlink() or not RESOURCE_DB.is_file() or RESOURCE_DB.stat().st_size == 0:
+        raise RuntimeError("Resource store cannot be observed without explicit initialization")
+    with _resource_inventory_readonly_sqlite(
+        RESOURCE_DB, allow_wal_copy=False
+    ) as connection:
+        if _resource_schema_version(connection) != RESOURCE_CURRENT_SCHEMA_VERSION:
+            raise RuntimeError("Resource store requires an explicit schema migration")
+        _validate_resource_schema_current(connection)
+        _resource_reconcile_revision_contract(connection)
+        yield connection
+
+
 def count_resources(
     *,
     owner_id: str | None = None,
     include_expired: bool = False,
+    read_only: bool = False,
 ) -> int:
     parameters: list[Any] = []
     clauses: list[str] = []
@@ -8050,7 +8075,12 @@ def count_resources(
         clauses.append("typeof(expires_at_unix)='integer' AND expires_at_unix>?")
         parameters.append(now)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    with _database() as connection:
+    if not isinstance(read_only, bool):
+        raise ValueError("read_only must be boolean")
+    if not read_only:
+        operator._require_operator_mutation("resource_lease")
+    source = _resource_readonly_snapshot() if read_only else closing(_database())
+    with source as connection:
         row = connection.execute(
             f"SELECT COUNT(*) AS count FROM leases{where}",
             parameters,
@@ -8063,6 +8093,7 @@ def list_resources(
     owner_id: str | None = None,
     include_expired: bool = False,
     limit: int = 200,
+    read_only: bool = False,
 ) -> list[dict[str, Any]]:
     if not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError("limit must be between 1 and 1000")
@@ -8077,7 +8108,12 @@ def list_resources(
         parameters.append(now)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     parameters.append(limit)
-    with _database() as connection:
+    if not isinstance(read_only, bool):
+        raise ValueError("read_only must be boolean")
+    if not read_only:
+        operator._require_operator_mutation("resource_lease")
+    source = _resource_readonly_snapshot() if read_only else closing(_database())
+    with source as connection:
         rows = connection.execute(
             f"SELECT * FROM leases{where} ORDER BY resource_key LIMIT ?",
             parameters,
@@ -8459,11 +8495,11 @@ def grabowski_resource_release(
 def grabowski_resource_inspect(resource_key: str) -> dict[str, Any]:
     """Inspect one typed resource lease without returning private metadata."""
     operator._require_operator_capability("resource_lease")
-    lease = inspect_resource(resource_key)
+    lease = inspect_resource(resource_key, read_only=True)
     return {"resource_key": normalize_resource_key(resource_key), "lease": lease}
 
 
-@mcp.tool(name="grabowski_resource_list", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_resource_list", annotations=MUTATING)
 def grabowski_resource_list(
     owner_id: str | None = None,
     include_expired: bool = False,
@@ -8484,9 +8520,12 @@ def grabowski_resource_list(
                 "schema_only cannot be combined with resource-list filters"
             )
         return _resource_schema_inventory()
+    # Ordinary listings can initialize or migrate the resource store.
+    operator._require_operator_mutation("resource_lease")
     leases = list_resources(
         owner_id=owner_id,
         include_expired=include_expired,
         limit=limit,
+        read_only=False,
     )
     return {"database": str(RESOURCE_DB), "count": len(leases), "leases": leases}
