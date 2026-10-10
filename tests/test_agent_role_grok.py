@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 import threading
 import json
 import os
@@ -11,6 +12,7 @@ import tempfile
 from types import SimpleNamespace
 import sys
 import unittest
+from typing import Any
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +26,25 @@ from grabowski_agent_sandbox import PreparedSandboxCommand
 
 def stream_bytes(events: list[dict]) -> bytes:
     return ("\n".join(json.dumps(event, separators=(",", ":")) for event in events) + "\n").encode()
+
+
+
+def _create_only_process_writer(
+    path: str, attempt: int, ready: Any, start: Any, results: Any,
+) -> None:
+    """Spawn-safe writer: exercise the real directory lock between OS processes."""
+    ready.set()
+    if not start.wait(10):
+        results.put("start-timeout")
+        return
+    try:
+        role.write_receipt(Path(path), {"attempt": attempt}, create_only=True)
+    except FileExistsError:
+        results.put("exists")
+    except Exception as exc:
+        results.put(type(exc).__name__)
+    else:
+        results.put("created")
 
 
 class GrokReviewRoleTests(unittest.TestCase):
@@ -132,6 +153,169 @@ class GrokReviewRoleTests(unittest.TestCase):
                 self.assertEqual(sorted([a.result(), b.result()]), ["created", "exists"])
             self.assertIn(json.loads(path.read_text())["attempt"], (1, 2))
             self.assertFalse(any(p.name.endswith(".tmp") for p in path.parent.iterdir()))
+
+
+    def test_create_only_receipt_link_unlink_window_is_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "review.json"
+            linked = threading.Event()
+            release_link = threading.Event()
+            contender_attempted_lock = threading.Event()
+            thread_state = threading.local()
+            real_link = os.link
+            real_flock = role.fcntl.flock
+
+            def pause_after_link(*args: Any, **kwargs: Any) -> None:
+                real_link(*args, **kwargs)
+                linked.set()
+                if not release_link.wait(5):
+                    raise TimeoutError("synthetic link window was not released")
+
+            def observe_lock(fd: int, mode: int) -> None:
+                if getattr(thread_state, "contender", False):
+                    contender_attempted_lock.set()
+                real_flock(fd, mode)
+
+            def contend() -> str:
+                thread_state.contender = True
+                try:
+                    role.write_receipt(path, {"attempt": 2}, create_only=True)
+                except FileExistsError:
+                    return "exists"
+                return "unexpected-create"
+
+            with (
+                mock.patch.object(role.os, "link", side_effect=pause_after_link),
+                mock.patch.object(role.fcntl, "flock", side_effect=observe_lock),
+                ThreadPoolExecutor(max_workers=2) as pool,
+            ):
+                first = pool.submit(role.write_receipt, path, {"attempt": 1}, create_only=True)
+                try:
+                    self.assertTrue(linked.wait(3), "first writer never published its link")
+                    self.assertEqual(os.stat(path).st_nlink, 2)
+                    second = pool.submit(contend)
+                    self.assertTrue(
+                        contender_attempted_lock.wait(3),
+                        "contender never attempted its directory lock",
+                    )
+                    self.assertFalse(second.done(), "contender must wait for unlink")
+                finally:
+                    release_link.set()
+                first.result(timeout=4)
+                self.assertEqual(second.result(timeout=4), "exists")
+            self.assertEqual(json.loads(path.read_text()), {"attempt": 1})
+            self.assertEqual(os.stat(path).st_nlink, 1)
+            self.assertFalse(any(item.name.endswith(".tmp") for item in path.parent.iterdir()))
+
+    def test_create_only_receipt_two_processes_have_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "review.json"
+            context = multiprocessing.get_context("spawn")
+            start = context.Event()
+            ready = [context.Event(), context.Event()]
+            results = context.Queue()
+            processes = [
+                context.Process(
+                    target=_create_only_process_writer,
+                    args=(str(path), attempt, ready[attempt - 1], start, results),
+                )
+                for attempt in (1, 2)
+            ]
+            try:
+                for process in processes:
+                    process.start()
+                for event in ready:
+                    self.assertTrue(event.wait(10), "writer did not reach start gate")
+                start.set()
+                for process in processes:
+                    process.join(timeout=10)
+                self.assertTrue(all(not process.is_alive() for process in processes))
+                self.assertEqual([process.exitcode for process in processes], [0, 0])
+                outcomes = sorted(results.get(timeout=3) for _ in processes)
+                self.assertEqual(outcomes, ["created", "exists"])
+            finally:
+                start.set()
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                    if process.pid is not None:
+                        process.join(timeout=3)
+                results.close()
+                results.join_thread()
+            self.assertIn(json.loads(path.read_text())["attempt"], (1, 2))
+            self.assertEqual(os.stat(path).st_nlink, 1)
+
+    def test_create_only_receipt_directory_lock_timeout_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "review.json"
+            directory_fd = os.open(
+                temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            try:
+                role.fcntl.flock(directory_fd, role.fcntl.LOCK_EX)
+                with (
+                    mock.patch.object(role, "CREATE_ONLY_RECEIPT_LOCK_TIMEOUT_SECONDS", 0.02),
+                    mock.patch.object(role, "CREATE_ONLY_RECEIPT_LOCK_POLL_SECONDS", 0.005),
+                    self.assertRaisesRegex(TimeoutError, "role receipt directory lock timed out"),
+                ):
+                    role.write_receipt(path, {"attempt": 2}, create_only=True)
+                self.assertFalse(path.exists())
+                self.assertFalse(any(item.name.endswith(".tmp") for item in path.parent.iterdir()))
+            finally:
+                role.fcntl.flock(directory_fd, role.fcntl.LOCK_UN)
+                os.close(directory_fd)
+
+    def test_create_only_receipt_parent_mode_change_during_wait_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "review.json"
+            fd = os.open(
+                temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            real_flock = role.fcntl.flock
+            attempted = threading.Event()
+
+            def observe_lock(descriptor: int, flags: int) -> None:
+                if flags & role.fcntl.LOCK_NB:
+                    attempted.set()
+                real_flock(descriptor, flags)
+
+            try:
+                real_flock(fd, role.fcntl.LOCK_EX)
+                with (
+                    mock.patch.object(role.fcntl, "flock", side_effect=observe_lock),
+                    ThreadPoolExecutor(max_workers=1) as pool,
+                ):
+                    pending = pool.submit(
+                        role.write_receipt, path, {"attempt": 2}, create_only=True,
+                    )
+                    try:
+                        self.assertTrue(attempted.wait(3), "writer never reached the lock")
+                        os.chmod(temporary, 0o755)
+                    finally:
+                        real_flock(fd, role.fcntl.LOCK_UN)
+                    with self.assertRaisesRegex(PermissionError, "parent must be owner-private"):
+                        pending.result(timeout=4)
+                self.assertFalse(path.exists())
+            finally:
+                os.chmod(temporary, 0o700)
+                os.close(fd)
+
+    def test_create_only_receipt_crash_after_link_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "receipts"
+            parent.mkdir(mode=0o700)
+            target = parent / "attempt.json"
+            interrupted = parent / ".attempt.interrupted.tmp"
+            interrupted.write_text('{"attempt": 1}\n', encoding="utf-8")
+            interrupted.chmod(0o600)
+            os.link(interrupted, target)
+            self.assertEqual(target.stat().st_nlink, 2)
+            original = target.read_bytes()
+            with self.assertRaisesRegex(PermissionError, "one owner-controlled regular file"):
+                role.write_receipt(target, {"attempt": 2}, create_only=True)
+            self.assertEqual(target.read_bytes(), original)
+            self.assertEqual(interrupted.read_bytes(), original)
+            self.assertEqual(target.stat().st_nlink, 2)
 
 
     def test_role_main_binds_review_receipt_to_job_unit_and_origin(self) -> None:
