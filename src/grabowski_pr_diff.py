@@ -77,7 +77,7 @@ class BoundLocalDiffError(RuntimeError):
 
 def _bounded_git_capture(
     args: list[str], *, cwd: str, env: dict[str, str],
-    stdout_limit: int, timeout: int,
+    stdout_limit: int, timeout: int, filter_attributes: bool = False,
 ) -> bytes:
     """Collect both pipes below hard byte caps, killing the group on overflow."""
     import os
@@ -93,6 +93,7 @@ def _bounded_git_capture(
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
     )
     out, err = bytearray(), bytearray()
+    pending_tree = bytearray()
     selector = selectors.DefaultSelector()
     deadline = time.monotonic() + timeout
     try:
@@ -105,11 +106,31 @@ def _bounded_git_capture(
                 raise BoundLocalDiffError("local git command timed out")
             for key, _ in selector.select(timeout=min(0.2, remaining)):
                 chunk = os.read(key.fileobj.fileno(), 65536)
+                target = key.data
                 if not chunk:
+                    if filter_attributes and target is out and pending_tree:
+                        raise BoundLocalDiffError("HEAD tree listing ends mid-entry")
                     selector.unregister(key.fileobj)
                     key.fileobj.close()
                     continue
-                target = key.data
+                if filter_attributes and target is out:
+                    # Never materialize the whole monorepo tree: select only
+                    # NUL-delimited attribute records while bytes are produced.
+                    pending_tree.extend(chunk)
+                    records = pending_tree.split(b"\0")
+                    pending_tree = bytearray(records[-1])
+                    if len(pending_tree) > 65536:
+                        raise BoundLocalDiffError("HEAD tree path exceeds parser budget")
+                    for record in records[:-1]:
+                        _, separator, name = record.partition(b"\t")
+                        if not separator:
+                            raise BoundLocalDiffError("malformed HEAD tree entry")
+                        if name == b".gitattributes" or name.endswith(b"/.gitattributes"):
+                            if len(out) + len(record) + 1 > stdout_limit:
+                                raise BoundLocalDiffError("HEAD attributes listing exceeds byte budget")
+                            out.extend(record)
+                            out.append(0)
+                    continue
                 limit = stdout_limit if target is out else _LOCAL_DIFF_STDERR_LIMIT
                 if len(target) + len(chunk) > limit:
                     raise BoundLocalDiffError("local git output exceeds byte budget")
@@ -164,10 +185,11 @@ def bound_local_pr_git_diff(
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null",
                GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
 
-    def read_git(*args: str, limit: int = 8192) -> bytes:
+    def read_git(*args: str, limit: int = 8192, filter_attributes: bool = False) -> bytes:
         return _bounded_git_capture(
             ["git", "-C", str(repo), "-c", "core.pager=cat", *args],
             cwd=str(repo), env=env, timeout=timeout, stdout_limit=limit,
+            filter_attributes=filter_attributes,
         )
 
     gitdir = Path(read_git("rev-parse", "--absolute-git-dir").decode().strip())
@@ -179,7 +201,10 @@ def bound_local_pr_git_diff(
         info_attrs = root / "info" / "attributes"
         if info_attrs.exists() or info_attrs.is_symlink():
             raise BoundLocalDiffError("non-revision-bound info/attributes is present")
-    tree = read_git("ls-tree", "-r", "-z", "--full-tree", head, limit=8 * 1024 * 1024)
+    tree = read_git(
+        "ls-tree", "-r", "-z", "--full-tree", head,
+        limit=2 * 1024 * 1024, filter_attributes=True,
+    )
     blobs: list[tuple[str, str]] = []
     for entry in tree.split(b"\0"):
         if not entry:
@@ -217,8 +242,21 @@ def bound_local_pr_git_diff(
             dest = root.joinpath(*relative.split("/"))
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(blob)
+        # An ephemeral bare Git directory loads objects via alternates, but
+        # never inherits the checkout's .git/config diff-formatting settings.
+        snapshot = scratch / "snapshot.git"
+        _bounded_git_capture(
+            ["git", "init", "-q", "--bare", str(snapshot)],
+            cwd=str(scratch), env=env, timeout=timeout, stdout_limit=8192,
+        )
+        object_dir = (common / "objects").resolve(strict=True)
+        if not object_dir.is_dir():
+            raise BoundLocalDiffError("missing common Git object directory")
+        (snapshot / "objects" / "info" / "alternates").write_text(
+            str(object_dir) + "\n", encoding="utf-8"
+        )
         isolated = dict(env)
-        isolated.update(GIT_DIR=str(gitdir), GIT_WORK_TREE=str(root),
+        isolated.update(GIT_DIR=str(snapshot), GIT_WORK_TREE=str(root),
                         GIT_INDEX_FILE=str(scratch / "empty-index"))
         flags = ["git", "-c", "core.pager=cat", "-c",
                  "core.attributesFile=/dev/null", "-c", "diff.external=",
