@@ -84,6 +84,18 @@ REMOTE_HOST = {
 }
 
 
+def _legacy_direct_codex_lease_fixture(test):
+    """Test downstream lease/recovery behavior without authorizing direct Codex.
+
+    The real filesystem guard is tested in test_codex_task_command_security.py.
+    This patch belongs only to explicit, historical lease-contract tests.
+    """
+    return patch.object(
+        tasks, "_require_direct_codex_filesystem_sandbox",
+        new=lambda _argv: None,
+    )(test)
+
+
 def _launcher(returncode: int = 0) -> dict[str, object]:
     return {
         "returncode": returncode,
@@ -2537,6 +2549,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(status["state"], "completed")
         self.assertEqual(status["last_observation"]["properties"]["Result"], "success")
 
+    @_legacy_direct_codex_lease_fixture
     def test_coding_agent_resume_denial_precedes_attempt_lease_and_launch(self) -> None:
         argv = [
             "/opt/codex",
@@ -3913,6 +3926,7 @@ class TaskTests(unittest.TestCase):
         self.assertIsNotNone(lease)
         self.assertEqual(lease["owner_id"], started["task"]["lease_owner_id"])
 
+    @_legacy_direct_codex_lease_fixture
     def test_coding_agent_pre_dispatch_denial_has_no_launch_persistence_or_resource_lease(self) -> None:
         argv = [
             "/opt/codex",
@@ -3988,6 +4002,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(count, 0)
         self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
+    @_legacy_direct_codex_lease_fixture
     def test_mutating_codex_task_implicitly_leases_workspace(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
@@ -4039,15 +4054,24 @@ class TaskTests(unittest.TestCase):
         self.assertEqual("remote_write", remote["effect_profile"])
 
     def test_read_only_classification_rejects_payload_flags_conflicts_and_overrides(self) -> None:
+        # Unverified Codex permissions must be rejected, not treated as a lease.
+        invalid_codex = [
+            ["/opt/codex", "exec", "--sandbox", "read-only", "--sandbox", "workspace-write"],
+            ["/opt/codex", "exec", "--sandbox", "read-only", "--dangerously-bypass-approvals-and-sandbox"],
+            ["/opt/codex", "exec", "--sandbox", "workspace-write", "--read-only"],
+        ]
+        for argv in invalid_codex:
+            with self.subTest(argv=argv), patch.object(
+                tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Codex"):
+                    tasks._mutating_agent_workspace("local", argv, cwd=str(self.root))
         write_commands = [
             ["/opt/codex", "exec", "--sandbox", "read-only"],
             ["/opt/codex", "exec", "-s", "read-only"],
             ["/opt/codex", "exec", "--sandbox=read-only", "prompt"],
             ["/opt/codex", "exec", "--sandbox", "workspace-write", "--", "--read-only"],
             ["/opt/codex", "exec", "--", "--sandbox", "read-only"],
-            ["/opt/codex", "exec", "--sandbox", "read-only", "--sandbox", "workspace-write"],
-            ["/opt/codex", "exec", "--sandbox", "read-only", "--dangerously-bypass-approvals-and-sandbox"],
-            ["/opt/codex", "exec", "--sandbox", "workspace-write", "--read-only"],
             ["/opt/grok", "--model", "grok-4.6", "--permission-mode", "plan", "--always-approve"],
             ["/opt/grok", "--permission-mode", "plan"],
             ["/opt/grok-cli", "--permission-mode=plan", "--always-approve"],
@@ -4104,6 +4128,7 @@ class TaskTests(unittest.TestCase):
         dispatch.assert_not_called()
         self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
+    @_legacy_direct_codex_lease_fixture
     def test_codex_unverified_read_only_flag_does_not_bypass_opaque_pool(self) -> None:
         # Managed Codex requirements may override -s read-only with write-capable
         # default permissions (openai/codex#47464); argv is not proof.
@@ -4138,6 +4163,7 @@ class TaskTests(unittest.TestCase):
         dispatch.assert_not_called()
         self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
+    @_legacy_direct_codex_lease_fixture
     def test_payload_read_only_token_does_not_bypass_writer_admission(self) -> None:
         argv = [
             "/opt/codex", "exec", "--sandbox", "workspace-write",
@@ -4184,6 +4210,7 @@ class TaskTests(unittest.TestCase):
         self.assertNotIn("reposkop_policy", projected)
         self.assertNotIn("reposkop_cohort", projected)
 
+    @_legacy_direct_codex_lease_fixture
     def test_mutating_codex_task_records_native_effect_classification(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(tasks, "_validate_command", return_value=argv), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks.base, "_append_audit"), patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 151}):
@@ -4197,6 +4224,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(classification, launcher["task_effect_classification"])
         self.assertFalse(any(key.startswith("reposkop_") for key in launcher))
 
+    @_legacy_direct_codex_lease_fixture
     def test_unrelated_path_resource_does_not_replace_workspace_lease(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         unrelated = self.root.parent / f"{self.root.name}-other"
@@ -4223,6 +4251,7 @@ class TaskTests(unittest.TestCase):
         )
         self.assertIsNotNone(tasks.resources.inspect_resource(workspace_key))
 
+    @_legacy_direct_codex_lease_fixture
     def test_exact_path_resource_covers_workspace_without_implicit_repo_lease(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         path_key = f"path:{self.root}"
@@ -4244,6 +4273,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["task"]["resource_keys"], [path_key])
         self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
 
+    @_legacy_direct_codex_lease_fixture
     def test_unrelated_repository_resource_fails_before_acquisition(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         unrelated = self.root.parent / f"{self.root.name}-repo"
@@ -4275,6 +4305,7 @@ class TaskTests(unittest.TestCase):
 
 
 
+    @_legacy_direct_codex_lease_fixture
     def test_unversioned_workspace_write_ignores_invalid_ancestor_git_marker(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         with tempfile.TemporaryDirectory(dir=self.root.parent) as ambient_name:
@@ -4843,6 +4874,7 @@ class TaskTests(unittest.TestCase):
         )
 
 
+    @_legacy_direct_codex_lease_fixture
     def test_expired_implicit_repository_lease_reacquires_complete_scope(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         running = _launcher()
@@ -4896,6 +4928,7 @@ class TaskTests(unittest.TestCase):
             ).fetchone()[0])
         self.assertEqual(stored, metadata["scope_manifest"])
 
+    @_legacy_direct_codex_lease_fixture
     def test_schema4_task_recovers_manifest_from_expired_lease_metadata(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         running = _launcher()
@@ -4940,6 +4973,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(metadata["scope_manifest"]["branch"], "main")
         self.assertEqual(identity.call_count, 1)
 
+    @_legacy_direct_codex_lease_fixture
     def test_legacy_task_without_scope_evidence_fails_closed_on_reacquire(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         running = _launcher()
@@ -5067,6 +5101,7 @@ class TaskTests(unittest.TestCase):
         self.assertIsNone(result["audit"]["repository_scope_manifest_sha256"])
         self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
 
+    @_legacy_direct_codex_lease_fixture
     def test_mutating_agents_cannot_share_one_implicit_workspace(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         active_observation = {
@@ -5101,6 +5136,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(dispatch.call_count, 1)
         self.assertEqual(tasks.grabowski_task_list()["count"], 1)
 
+    @_legacy_direct_codex_lease_fixture
     def test_completed_mutating_agent_retry_refreshes_before_workspace_reacquire(
         self,
     ) -> None:
@@ -5160,6 +5196,7 @@ class TaskTests(unittest.TestCase):
             self.assertIsNone(tasks.resources.inspect_resource(key))
         self.assertEqual(1, tasks.grabowski_task_list()["count"])
 
+    @_legacy_direct_codex_lease_fixture
     def test_explicit_file_scopes_do_not_replace_workspace_guard(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         left = f"path:{self.root / 'left.py'}"
@@ -5185,6 +5222,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(first["audit"]["implicit_workspace_resource_key"], workspace)
         self.assertEqual(dispatch.call_count, 1)
 
+    @_legacy_direct_codex_lease_fixture
     def test_exact_disjoint_workspace_paths_allow_parallel_agent_tasks(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         left_workspace = self.root / "left"
@@ -5215,6 +5253,7 @@ class TaskTests(unittest.TestCase):
         self.assertIsNone(first["audit"]["implicit_workspace_resource_key"])
         self.assertIsNone(second["audit"]["implicit_workspace_resource_key"])
 
+    @_legacy_direct_codex_lease_fixture
     def test_nested_agent_working_directories_share_git_root_guard(self) -> None:
         repository = self.root / "repository"
         subprocess.run(
@@ -5241,6 +5280,7 @@ class TaskTests(unittest.TestCase):
             f"repo:{repository}",
         )
 
+    @_legacy_direct_codex_lease_fixture
     def test_codex_explicit_working_directory_is_the_guarded_workspace(self) -> None:
         repository = self.root / "explicit-repository"
         subprocess.run(
@@ -5288,6 +5328,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["task"]["resource_keys"], [])
         self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
 
+    @_legacy_direct_codex_lease_fixture
     def test_non_path_resource_does_not_disable_workspace_guard(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
@@ -5306,6 +5347,7 @@ class TaskTests(unittest.TestCase):
             ["port:4567", f"repo:{self.root}"],
         )
 
+    @_legacy_direct_codex_lease_fixture
     def test_unverified_codex_read_only_flag_keeps_workspace_lease(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "read-only"]
         admitted = {
@@ -5339,6 +5381,7 @@ class TaskTests(unittest.TestCase):
         self.assertNotIn("read_routing_advisory", result)
         self.assertNotIn("read_routing_advisory", result["audit"])
 
+    @_legacy_direct_codex_lease_fixture
     def test_launch_failure_releases_implicit_workspace_lease(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
