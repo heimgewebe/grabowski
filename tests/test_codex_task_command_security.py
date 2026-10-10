@@ -80,6 +80,25 @@ class CodexTaskCommandSecurityTests(unittest.TestCase):
     def database_exists(self) -> bool:
         return self.fixture.database.exists()
 
+    def test_unrecognized_options_and_unbound_prompt_delimiter_fail_closed(self) -> None:
+        # Unknown current/future flags must not silently change CLI semantics.
+        # A payload delimiter alone does not establish an execution subcommand.
+        invalid = (
+            ("--",),
+            ("--future-write-control", "exec", "prompt"),
+            ("exec", "--future-write-control", "prompt"),
+            ("exec", "--future-write-control=some-value", "prompt"),
+            ("exec", "-x", "prompt"),
+            ("exec", "--config", "sandbox_workspace_write.writable_roots=['/tmp']", "prompt"),
+        )
+        with patch.object(tasks.fleet, "fleet_host", return_value=fixture.LOCAL_HOST):
+            for tail in invalid:
+                with self.subTest(tail=tail), self.assertRaisesRegex(RuntimeError, "Codex"):
+                    tasks._mutating_agent_workspace(
+                        "local", ["/opt/codex", "-C", str(self.root), *tail],
+                        cwd=str(self.root),
+                    )
+
     def test_known_execution_and_explicit_payload_remain_accepted(self) -> None:
         permitted = (
             ["/opt/codex", "exec", "--sandbox", "workspace-write", "prompt"],

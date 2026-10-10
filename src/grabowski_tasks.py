@@ -3815,6 +3815,8 @@ def _codex_workspace_argument(argv: list[str]) -> str | None:
     while index < len(argv):
         token = argv[index]
         if token == "--":
+            if execution_mode is None and index + 1 >= len(argv):
+                raise RuntimeError("Codex command lacks a verified execution mode")
             explicit_prompt_delimiter = True
             break
         if (
@@ -3935,6 +3937,11 @@ def _codex_workspace_argument(argv: list[str]) -> str | None:
             # entrypoints. Administrative and historical-session subcommands
             # can write outside the leased checkout, regardless of -C.
             if token.startswith("-"):
+                if token not in {
+                    "--strict-config", "--json", "--ephemeral",
+                    "--ignore-user-config", "--no-daemon", "--no-alt-screen",
+                }:
+                    raise RuntimeError("Codex command has an unverified CLI option")
                 index += 1
                 continue
             if execution_mode is None:
