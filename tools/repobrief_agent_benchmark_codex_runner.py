@@ -5393,6 +5393,8 @@ def _repoground_evidence_from_codex_events(
             continue
         item = event.get("item") if isinstance(event.get("item"), dict) else {}
         item_type = item.get("type")
+        if not isinstance(item_type, str):
+            continue
         if item_type in {"agent_message", "reasoning", "todo_list"}:
             continue
         if item_type not in {"command_execution", "mcp_tool_call"}:
@@ -5401,6 +5403,8 @@ def _repoground_evidence_from_codex_events(
         if item_type != "mcp_tool_call":
             continue
         tool_name = item.get("tool")
+        if not isinstance(tool_name, str):
+            continue
         if tool_name not in {
             "ask_context",
             "grounding_verify",
@@ -5524,6 +5528,8 @@ def normalize(
             continue
         item = event.get("item") if isinstance(event.get("item"), dict) else {}
         item_type = item.get("type")
+        if not isinstance(item_type, str):
+            raise RunnerError("Codex completed item type must be a string")
         if item_type == "agent_message":
             if isinstance(item.get("text"), str):
                 answers.append(item["text"])
@@ -5540,13 +5546,15 @@ def normalize(
                 else "failed"
             )
         elif item_type == "mcp_tool_call":
+            tool_name = item.get("tool")
             if (
                 request["condition"] != "treatment"
                 or item.get("server") != "repobrief"
-                or item.get("tool") not in ALLOWED_MCP
+                or not isinstance(tool_name, str)
+                or tool_name not in ALLOWED_MCP
             ):
                 raise RunnerError("unapproved Codex MCP tool call")
-            name = str(item["tool"])
+            name = tool_name
             input_bytes = len(canonical(item.get("arguments")).encode("utf-8"))
             result_value = item.get("result")
             output_value = result_value if result_value is not None else item.get("error")

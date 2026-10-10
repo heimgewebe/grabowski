@@ -5215,6 +5215,52 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     )
                 )
 
+    def test_malformed_completed_event_metadata_fails_closed(self) -> None:
+        value = request(condition="treatment")
+        for field, malformed in (("type", {}), ("tool", [])):
+            with self.subTest(field=field):
+                events = [json.loads(line) for line in stream(value).splitlines()]
+                completed = next(
+                    event for event in events
+                    if event.get("type") == "item.completed"
+                    and event["item"].get("type") == "command_execution"
+                )
+                if field == "type":
+                    completed["item"]["type"] = malformed
+                else:
+                    completed["item"] = {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": malformed,
+                        "arguments": {},
+                        "result": {},
+                        "error": None,
+                        "status": "completed",
+                    }
+                raw = b"".join(
+                    json.dumps(event, sort_keys=True).encode("utf-8") + b"\n"
+                    for event in events
+                )
+                now = datetime.now(timezone.utc)
+                error = (
+                    "Codex completed item type must be a string"
+                    if field == "type"
+                    else "unapproved Codex MCP tool call"
+                )
+                with self.assertRaisesRegex(runner.RunnerError, error):
+                    runner.receipt(value, raw, "transcript.jsonl", 0, now, now)
+                self.assertIsNone(
+                    runner._repoground_evidence_from_codex_events(
+                        value,
+                        events,
+                        [{
+                            "sequence": 1,
+                            "name": "repobrief_resource_read",
+                            "status": "success",
+                        }],
+                    )
+                )
+
     def test_surrogate_resource_read_does_not_abort_completed_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
