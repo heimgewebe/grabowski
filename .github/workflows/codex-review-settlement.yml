@@ -61,14 +61,22 @@ jobs:
             echo "Cannot resolve pull request number" >&2
             exit 1
           fi
-          payload="$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json headRefOid,isDraft,state)"
+          payload="$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json headRefOid,baseRefOid,baseRefName,isDraft,state)"
           head_sha="$(jq -r '.headRefOid // empty' <<<"$payload")"
+          base_sha="$(jq -r '.baseRefOid // empty' <<<"$payload")"
+          base_ref="$(jq -r '.baseRefName // empty' <<<"$payload")"
           if [ -z "$head_sha" ]; then
             echo "Cannot resolve pull request head SHA" >&2
             exit 1
           fi
+          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]] || ! git check-ref-format "refs/heads/$base_ref"; then
+            echo "Invalid pull request base SHA or ref" >&2
+            exit 1
+          fi
           echo "number=$pr" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "base_ref=$base_ref" >> "$GITHUB_OUTPUT"
 
       - name: Mark current head pending
         env:
@@ -93,9 +101,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          BASE_REF: ${{ steps.pr.outputs.base_ref }}
         run: |
           set -euo pipefail
-          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || ! git check-ref-format "refs/heads/${BASE_REF}"; then
             echo "Invalid bound pull request or head SHA" >&2
             exit 1
           fi
@@ -105,7 +115,8 @@ jobs:
             -c 'credential.helper=!gh auth git-credential' \
             -c 'protocol.file.allow=never' \
             fetch --no-tags --no-write-fetch-head --no-recurse-submodules \
-            -- origin "refs/pull/${PR_NUMBER}/head"
+            -- origin "refs/heads/${BASE_REF}" "refs/pull/${PR_NUMBER}/head"
+          git cat-file -e "${BASE_SHA}^{commit}"
           git cat-file -e "${HEAD_SHA}^{commit}"
 
       - name: Evaluate current-head settlement

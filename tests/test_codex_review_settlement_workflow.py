@@ -56,6 +56,25 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertNotIn("git reset", fetch)
         self.assertNotIn("tools/codex_review_settlement.py", fetch)
 
+    def test_nondefault_pr_target_resolves_and_fetches_exact_base_commit(self) -> None:
+        resolve = self.text.split(
+            "      - name: Resolve pull request\n", 1
+        )[1].split("      - name: Mark current head pending\n", 1)[0]
+        self.assertIn("--json headRefOid,baseRefOid,baseRefName,isDraft,state", resolve)
+        self.assertIn('base_sha="$(jq -r', resolve)
+        self.assertIn('base_ref="$(jq -r', resolve)
+        self.assertIn('echo "base_sha=$base_sha"', resolve)
+        self.assertIn('echo "base_ref=$base_ref"', resolve)
+        fetch = self.text.split(
+            "      - name: Fetch exact PR history for local diff fallback\n", 1
+        )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
+        self.assertIn("BASE_SHA: " + chr(36) + "{{ steps.pr.outputs.base_sha }}", fetch)
+        self.assertIn("BASE_REF: " + chr(36) + "{{ steps.pr.outputs.base_ref }}", fetch)
+        self.assertIn('git check-ref-format "refs/heads/' + chr(36) + '{BASE_REF}"', fetch)
+        self.assertIn("refs/heads/" + chr(36) + "{BASE_REF}", fetch)
+        self.assertIn('git cat-file -e "' + chr(36) + '{BASE_SHA}^{commit}"', fetch)
+        self.assertIn('git cat-file -e "' + chr(36) + '{HEAD_SHA}^{commit}"', fetch)
+
     def test_permissions_are_observer_only_except_status_publication(self) -> None:
         self.assertIn("  contents: read\n", self.text)
         self.assertIn("  issues: read\n", self.text)
