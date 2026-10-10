@@ -597,6 +597,11 @@ def capture_registered_linked_worktree_git_dir(
                 "git worktrees directory changed during registered identity capture"
             )
 
+        # Metadata churn in an unrelated checkout's admin directory is not
+        # a change to its registration. Its inode, mode and gitdir backlink
+        # are still verified; the selected target remains snapshot-strict.
+        matched_admin_names = {Path(item["path"]).name for item, _ in matches}
+
         for name, admin_snapshot, backlink_snapshot in observed_entries:
             try:
                 current_admin = os.stat(
@@ -611,7 +616,11 @@ def capture_registered_linked_worktree_git_dir(
             if (
                 not stat.S_ISDIR(current_admin.st_mode)
                 or stat.S_ISLNK(current_admin.st_mode)
-                or not _same_file_snapshot(admin_snapshot, current_admin)
+                or not (
+                    _same_file_snapshot(admin_snapshot, current_admin)
+                    if name in matched_admin_names
+                    else _same_node(admin_snapshot, current_admin)
+                )
             ):
                 raise PhysicalCheckoutIdentityError(
                     "git worktree admin entry changed during registered identity capture"
@@ -695,7 +704,11 @@ def capture_registered_linked_worktree_git_dir(
             if (
                 not stat.S_ISDIR(current_admin.st_mode)
                 or stat.S_ISLNK(current_admin.st_mode)
-                or not _same_file_snapshot(admin_snapshot, current_admin)
+                or not (
+                    _same_file_snapshot(admin_snapshot, current_admin)
+                    if name in matched_admin_names
+                    else _same_node(admin_snapshot, current_admin)
+                )
             ):
                 raise PhysicalCheckoutIdentityError(
                     "git worktree admin entry changed during registered identity capture"
@@ -706,7 +719,11 @@ def capture_registered_linked_worktree_git_dir(
                 label="git worktree admin directory",
             )
             try:
-                if not _same_file_snapshot(admin_snapshot, opened_admin):
+                if not (
+                    _same_file_snapshot(admin_snapshot, opened_admin)
+                    if name in matched_admin_names
+                    else _same_node(admin_snapshot, opened_admin)
+                ):
                     raise PhysicalCheckoutIdentityError(
                         "git worktree admin entry changed during registered identity capture"
                     )
