@@ -1424,6 +1424,22 @@ def _merge_guard_commit_probe(
     return result["returncode"] == 0, info
 
 
+def _merge_guard_shallow_state(repo_path: Path) -> tuple[bool | None, list[str]]:
+    """Probe full-history availability using the same isolated Git environment."""
+    try:
+        result = _merge_guard_local_git_bytes(
+            repo_path, ["rev-parse", "--is-shallow-repository"]
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, [f"merge_guard_shallow_probe_exception:{type(exc).__name__}"]
+    if result["returncode"] != 0:
+        return None, ["merge_guard_shallow_probe_failed"]
+    value = result["stdout_bytes"].strip()
+    if value not in {b"true", b"false"}:
+        return None, ["merge_guard_shallow_probe_invalid"]
+    return value == b"true", []
+
+
 def _merge_guard_ensure_pr_objects(
     repo_path: Path,
     *,
@@ -1455,7 +1471,13 @@ def _merge_guard_ensure_pr_objects(
     base_present, base_probe = _merge_guard_commit_probe(repo_path, base_sha)
     head_present, head_probe = _merge_guard_commit_probe(repo_path, head_sha)
     receipt["before"] = {"base": base_probe, "head": head_probe}
-    if base_present and head_present:
+    shallow_before, shallow_errors = _merge_guard_shallow_state(repo_path)
+    if shallow_errors:
+        return receipt, shallow_errors
+    receipt["shallow_before"] = shallow_before
+    receipt["unshallow_attempted"] = bool(shallow_before)
+    if base_present and head_present and not shallow_before:
+        receipt["shallow_after"] = False
         receipt["available"] = True
         return receipt, []
 
@@ -1469,6 +1491,7 @@ def _merge_guard_ensure_pr_objects(
         "-c",
         "protocol.file.allow=never",
         "fetch",
+        *(["--unshallow"] if shallow_before else []),
         "--no-tags",
         "--no-write-fetch-head",
         "--no-recurse-submodules",
@@ -1493,6 +1516,13 @@ def _merge_guard_ensure_pr_objects(
     }
     if fetched["returncode"] != 0:
         return receipt, ["merge_guard_pr_object_fetch_failed"]
+
+    shallow_after, shallow_errors = _merge_guard_shallow_state(repo_path)
+    receipt["shallow_after"] = shallow_after
+    if shallow_errors:
+        return receipt, shallow_errors
+    if shallow_after:
+        return receipt, ["merge_guard_pr_history_still_shallow_after_fetch"]
 
     base_present, base_probe = _merge_guard_commit_probe(repo_path, base_sha)
     head_present, head_probe = _merge_guard_commit_probe(repo_path, head_sha)

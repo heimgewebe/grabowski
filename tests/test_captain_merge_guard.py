@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -503,15 +505,139 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
                     any(call[:2] == ("pr", "merge") for call in gh.calls)
                 )
 
+    def test_shallow_tips_require_complete_ancestry_before_local_fallback(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="captain-shallow-history-") as directory:
+            root = Path(directory)
+            origin = root / "origin.git"
+            writer = root / "writer"
+            checkout = root / "shallow"
+            _git(root, "init", "-q", "-b", "main", str(writer))
+            _git(writer, "config", "gc.auto", "0")
+            _git(writer, "config", "maintenance.auto", "false")
+            _git(writer, "config", "user.email", "captain-test@example.invalid")
+            _git(writer, "config", "user.name", "Captain Test")
+            (writer / "seed.txt").write_text("common\\n", encoding="utf-8")
+            _git(writer, "add", ".")
+            _git(writer, "commit", "-q", "-m", "common")
+            ancestor = _git(writer, "rev-parse", "HEAD")
+            (writer / "base.txt").write_text("base\\n", encoding="utf-8")
+            _git(writer, "add", ".")
+            _git(writer, "commit", "-q", "-m", "base advanced")
+            base_sha = _git(writer, "rev-parse", "HEAD")
+            _git(writer, "checkout", "-q", "-b", "feature", ancestor)
+            (writer / "feature.txt").write_text("feature\\n", encoding="utf-8")
+            _git(writer, "add", ".")
+            _git(writer, "commit", "-q", "-m", "feature")
+            head_sha = _git(writer, "rev-parse", "HEAD")
+            _git(root, "clone", "-q", "--bare", str(writer), str(origin))
+            _git(origin, "update-ref", "refs/pull/212/head", head_sha)
+            # Exercise the real guarded fetch using an allowed transport. A
+            # file:// origin cannot pass protocol.file.allow=never by design.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            daemon = subprocess.Popen(
+                [
+                    "git", "daemon", "--export-all", f"--base-path={root}",
+                    "--listen=127.0.0.1", f"--port={port}", str(origin),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self.addCleanup(daemon.wait, timeout=5)
+            self.addCleanup(daemon.terminate)
+            for _ in range(100):
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                        break
+                except OSError:
+                    if daemon.poll() is not None:
+                        self.fail("local git daemon exited before startup")
+                    time.sleep(0.02)
+            else:
+                self.fail("local git daemon startup timed out")
+            git_url = f"git://127.0.0.1:{port}/{origin.name}"
+            _git(root, "clone", "-q", "--depth", "1", "--branch", "main",
+                 git_url, str(checkout))
+            _git(checkout, "fetch", "-q", "--depth", "1", "--no-tags",
+                 "--no-write-fetch-head", "origin", "refs/pull/212/head")
+            self.assertEqual(_git(checkout, "rev-parse", "--is-shallow-repository"), "true")
+            _git(checkout, "cat-file", "-e", f"{base_sha}^{{commit}}")
+            _git(checkout, "cat-file", "-e", f"{head_sha}^{{commit}}")
+            self.assertNotEqual(subprocess.run(
+                ["git", "merge-base", "--all", base_sha, head_sha],
+                cwd=checkout, capture_output=True, check=False,
+            ).returncode, 0)
+            before_head = _git(checkout, "rev-parse", "HEAD")
+            before_status = _git(checkout, "status", "--porcelain")
+            receipt, errors = merge_guard._merge_guard_ensure_pr_objects(
+                checkout, base_branch="main", pr_number=212,
+                base_sha=base_sha, head_sha=head_sha,
+            )
+            self.assertEqual(errors, [])
+            self.assertTrue(receipt["unshallow_attempted"])
+            self.assertTrue(receipt["shallow_before"])
+            self.assertFalse(receipt["shallow_after"])
+            self.assertTrue(receipt["available"])
+            self.assertEqual(_git(checkout, "rev-parse", "--is-shallow-repository"), "false")
+            self.assertEqual(_git(checkout, "merge-base", "--all", base_sha, head_sha),
+                             ancestor)
+            self.assertEqual(_git(checkout, "rev-parse", "HEAD"), before_head)
+            self.assertEqual(_git(checkout, "status", "--porcelain"), before_status)
+
+    def test_shallow_ancestry_fetch_failure_stays_closed(self) -> None:
+        base_sha, head_sha = "a" * 40, "b" * 40
+        present = {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""}
+        with mock.patch.object(
+            merge_guard, "_merge_guard_local_git_bytes",
+            side_effect=[
+                present, present,
+                {"returncode": 0, "stdout_bytes": b"true", "stderr_bytes": b""},
+                {"returncode": 1, "stdout_bytes": b"", "stderr_bytes": b"network failed"},
+            ],
+        ) as git:
+            receipt, errors = merge_guard._merge_guard_ensure_pr_objects(
+                Path("/repo"), base_branch="main", pr_number=212,
+                base_sha=base_sha, head_sha=head_sha,
+            )
+        self.assertEqual(errors, ["merge_guard_pr_object_fetch_failed"])
+        self.assertTrue(receipt["unshallow_attempted"])
+        self.assertIn("--unshallow", git.call_args_list[3].args[1])
+
+    def test_shallow_fetch_does_not_accept_still_incomplete_history(self) -> None:
+        base_sha, head_sha = "a" * 40, "b" * 40
+        present = {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""}
+        with mock.patch.object(
+            merge_guard, "_merge_guard_local_git_bytes",
+            side_effect=[
+                present, present,
+                {"returncode": 0, "stdout_bytes": b"true", "stderr_bytes": b""},
+                present,
+                {"returncode": 0, "stdout_bytes": b"true", "stderr_bytes": b""},
+            ],
+        ):
+            receipt, errors = merge_guard._merge_guard_ensure_pr_objects(
+                Path("/repo"), base_branch="main", pr_number=212,
+                base_sha=base_sha, head_sha=head_sha,
+            )
+        self.assertEqual(errors, ["merge_guard_pr_history_still_shallow_after_fetch"])
+        self.assertTrue(receipt["shallow_after"])
+        self.assertTrue(receipt["unshallow_attempted"])
+        self.assertNotIn("available", receipt)
+
     def test_missing_pr_object_fetches_bounded_refs_and_reprobes_exact_shas(self) -> None:
         base_sha = "a" * 40
         head_sha = "b" * 40
+        present = {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""}
+        full_history = {"returncode": 0, "stdout_bytes": b"false", "stderr_bytes": b""}
         results = [
-            {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""},
+            present,
             {"returncode": 1, "stdout_bytes": b"", "stderr_bytes": b"missing"},
-            {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""},
-            {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""},
-            {"returncode": 0, "stdout_bytes": b"", "stderr_bytes": b""},
+            full_history,
+            present,
+            full_history,
+            present,
+            present,
         ]
         with mock.patch.object(
             merge_guard, "_merge_guard_local_git_bytes", side_effect=results
@@ -527,10 +653,13 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertTrue(receipt["fetch_attempted"])
         self.assertTrue(receipt["available"])
+        self.assertFalse(receipt["shallow_before"])
+        self.assertFalse(receipt["shallow_after"])
+        self.assertFalse(receipt["unshallow_attempted"])
         self.assertEqual(
             receipt["fetch_refs"], ["refs/heads/main", "refs/pull/212/head"]
         )
-        fetch_args = local_git.call_args_list[2].args[1]
+        fetch_args = local_git.call_args_list[3].args[1]
         self.assertEqual(
             fetch_args,
             [
@@ -551,11 +680,19 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            local_git.call_args_list[3].args[1],
-            ["cat-file", "-e", f"{base_sha}^{{commit}}"],
+            local_git.call_args_list[2].args[1],
+            ["rev-parse", "--is-shallow-repository"],
         )
         self.assertEqual(
             local_git.call_args_list[4].args[1],
+            ["rev-parse", "--is-shallow-repository"],
+        )
+        self.assertEqual(
+            local_git.call_args_list[5].args[1],
+            ["cat-file", "-e", f"{base_sha}^{{commit}}"],
+        )
+        self.assertEqual(
+            local_git.call_args_list[6].args[1],
             ["cat-file", "-e", f"{head_sha}^{{commit}}"],
         )
 
