@@ -23,7 +23,7 @@ REVISION_STARTED_STATES = frozenset(
 )
 COLLECT_PROGRESS_STATES = frozenset({"collecting", "complete", "writer_running"})
 COLLECT_UNKNOWN_STATES = frozenset(
-    {"role_start_outcome_unknown", "writer_outcome_unknown"}
+    {"role_start_outcome_unknown", "role_outcome_unknown", "writer_outcome_unknown"}
 )
 
 
