@@ -919,9 +919,14 @@ class GrokReviewRoleTests(unittest.TestCase):
             "usage": {"server_tool_use": {
                 "web_search_requests": 0, "web_fetch_requests": 0,
             }},
-            "modelUsage": {"claude-opus-5-5": {"webSearchRequests": 0}},
+            "modelUsage": {"claude-opus-5-5": {
+                "inputTokens": 120, "outputTokens": 30, "webSearchRequests": 0,
+            }},
             "subagent_stats": {
                 "spawned": 0,
+                "started_in_background": 0, "max_depth": 0,
+                "spawned_by_subagents": 0, "completed": 0, "failed": 0,
+                "killed": {"parent": 0, "user": 0, "system": 0},
                 "requested": {"background": 0, "foreground": 0, "unset": 0},
                 "refused": {
                     "depth_limit": 0, "concurrency_limit": 0, "budget": 0,
@@ -968,50 +973,61 @@ class GrokReviewRoleTests(unittest.TestCase):
                 self.assertIsNotNone(rejected)
 
     def test_claude_result_rejects_server_web_and_subagent_activity(self) -> None:
-        """A success envelope cannot conceal server-side web or subagent effects."""
+        """Change one counter in a complete success envelope; assert the rejection cause."""
         base = self._clean_claude_success_envelope()
-        document, error, _metadata = role._extract_claude_review_document(
+        document, error, _ = role._extract_claude_review_document(
             json.dumps(base).encode()
         )
         self.assertIsNone(error)
         self.assertEqual(base["structured_output"], json.loads(document))
 
+        server_error = "Claude review reports forbidden server tool activity"
+        model_error = "Claude review reports forbidden model web activity"
+        agent_error = "Claude review subagent evidence is missing or nonzero"
         forbidden = (
-            {"usage": {"server_tool_use": {"web_search_requests": 1}}},
-            {"usage": {"server_tool_use": {
-                "web_search_requests": 0, "web_fetch_requests": 0,
-                "code_execution_requests": 1,
-            }}},
-            {"usage": {"server_tool_use": {
-                "web_search_requests": 0, "web_fetch_requests": 0,
-                "code_execution_requests": True,
-            }}},
-            {"usage": {"server_tool_use": {
-                "web_search_requests": 0, "web_fetch_requests": 0,
-                "code_execution_requests": "0",
-            }}},
-            {"usage": {"server_tool_use": {"web_fetch_requests": 1}}},
-            {"modelUsage": {"claude-opus-5-5": {"webSearchRequests": 1}}},
-            {"modelUsage": {"claude-opus-5-5": {"webFetchRequests": 1}}},
-            {"modelUsage": {"claude-opus-5-5": {"webFetchRequests": True}}},
-            {"modelUsage": {"claude-opus-5-5": {"webFetchRequests": "0"}}},
-            {"subagent_stats": {"spawned": 1}},
-            {"usage": {"server_tool_use": {"web_search_requests": True}}},
-            {"usage": {"server_tool_use": {"web_fetch_requests": "0"}}},
-            {"modelUsage": {"claude-opus-5-5": {"webSearchRequests": "0"}}},
-            {"subagent_stats": {"spawned": -1}},
+            (("usage", "server_tool_use", "web_search_requests"), 1, server_error),
+            (("usage", "server_tool_use", "web_fetch_requests"), 1, server_error),
+            (("usage", "server_tool_use", "code_execution_requests"), 1, server_error),
+            (("usage", "server_tool_use", "code_execution_requests"), True, server_error),
+            (("usage", "server_tool_use", "code_execution_requests"), "0", server_error),
+            (("usage", "server_tool_use", "web_search_requests"), True, server_error),
+            (("usage", "server_tool_use", "web_fetch_requests"), "0", server_error),
+            (("modelUsage", "claude-opus-5-5", "webSearchRequests"), 1, model_error),
+            (("modelUsage", "claude-opus-5-5", "webFetchRequests"), 1, model_error),
+            (("modelUsage", "claude-opus-5-5", "webFetchRequests"), True, model_error),
+            (("modelUsage", "claude-opus-5-5", "webFetchRequests"), "0", model_error),
+            (("modelUsage", "claude-opus-5-5", "webSearchRequests"), "0", model_error),
+            (("modelUsage", "claude-opus-5-5", "codeExecutionRequests"), 1, model_error),
+            (("modelUsage", "claude-opus-5-5", "codeExecutionRequests"), True, model_error),
+            (("modelUsage", "claude-opus-5-5", "codeExecutionRequests"), "0", model_error),
+            (("subagent_stats", "spawned"), 1, agent_error),
+            (("subagent_stats", "spawned"), -1, agent_error),
         )
-        for reported_activity in forbidden:
-            with self.subTest(reported_activity=reported_activity):
-                document, error, _metadata = role._extract_claude_review_document(
-                    json.dumps({**base, **reported_activity}).encode()
+        for keys, invalid_value, expected_error in forbidden:
+            with self.subTest(keys=keys, invalid_value=invalid_value):
+                modified = json.loads(json.dumps(base))
+                target = modified
+                for key in keys[:-1]:
+                    target = target[key]
+                target[keys[-1]] = invalid_value
+                self.assertTrue(
+                    {"web_search_requests", "web_fetch_requests"}.issubset(
+                        modified["usage"]["server_tool_use"]
+                    )
+                )
+                self.assertEqual(
+                    120, modified["modelUsage"]["claude-opus-5-5"]["inputTokens"]
+                )
+                document, rejected, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
                 )
                 self.assertIsNone(document)
-                self.assertIsNotNone(error)
+                self.assertEqual(expected_error, rejected)
 
     def test_claude_result_rejects_attempted_or_refused_subagents(self) -> None:
         """CLI 2.1.285: spawned=0 excludes neither requested nor refused attempts."""
         clean = self._clean_claude_success_envelope()
+        attempt_error = "Claude review subagent attempt evidence is missing or nonzero"
         stats = clean["subagent_stats"]
         accepted, error, _ = role._extract_claude_review_document(
             json.dumps(clean).encode()
@@ -1050,7 +1066,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                             json.dumps(modified).encode()
                         )
                         self.assertIsNone(document)
-                        self.assertIsNotNone(rejected)
+                        self.assertEqual(attempt_error, rejected)
 
             for missing_key in required:
                 with self.subTest(category=category, missing_key=missing_key):
@@ -1068,7 +1084,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                         json.dumps(modified).encode()
                     )
                     self.assertIsNone(document)
-                    self.assertIsNotNone(rejected)
+                    self.assertEqual(attempt_error, rejected)
 
             for invalid in (None, False, 0, "0", [], {}):
                 with self.subTest(category=category, malformed=invalid):
@@ -1080,14 +1096,119 @@ class GrokReviewRoleTests(unittest.TestCase):
                         json.dumps(modified).encode()
                     )
                     self.assertIsNone(document)
-                    self.assertIsNotNone(rejected)
+                    self.assertEqual(attempt_error, rejected)
 
             missing = {key: value for key, value in stats.items() if key != category}
             document, rejected, _ = role._extract_claude_review_document(
                 json.dumps({**clean, "subagent_stats": missing}).encode()
             )
             self.assertIsNone(document)
-            self.assertIsNotNone(rejected)
+            self.assertEqual(attempt_error, rejected)
+
+    def test_claude_result_rejects_all_subagent_activity_counters(self) -> None:
+        """CLI 2.1.285 reports activity beyond spawned, requested and refused."""
+        base = self._clean_claude_success_envelope()
+        complete, error, _ = role._extract_claude_review_document(
+            json.dumps(base).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(base["structured_output"], json.loads(complete))
+        expected_error = "Claude review subagent evidence is missing or nonzero"
+        scalars = (
+            "started_in_background", "max_depth", "spawned_by_subagents",
+            "completed", "failed",
+        )
+        for key in scalars:
+            for invalid in (1, -1, True, "0"):
+                with self.subTest(scalar=key, invalid=invalid):
+                    modified = json.loads(json.dumps(base))
+                    modified["subagent_stats"][key] = invalid
+                    document, rejected, _ = role._extract_claude_review_document(
+                        json.dumps(modified).encode()
+                    )
+                    self.assertIsNone(document)
+                    self.assertEqual(expected_error, rejected)
+            with self.subTest(missing_scalar=key):
+                modified = json.loads(json.dumps(base))
+                del modified["subagent_stats"][key]
+                document, rejected, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(document)
+                self.assertEqual(expected_error, rejected)
+
+        for key in ("parent", "user", "system", "future_counter"):
+            for invalid in (1, -1, True, "0"):
+                with self.subTest(killed=key, invalid=invalid):
+                    modified = json.loads(json.dumps(base))
+                    modified["subagent_stats"]["killed"][key] = invalid
+                    document, rejected, _ = role._extract_claude_review_document(
+                        json.dumps(modified).encode()
+                    )
+                    self.assertIsNone(document)
+                    self.assertEqual(expected_error, rejected)
+
+        for key in ("parent", "user", "system"):
+            with self.subTest(missing_killed=key):
+                modified = json.loads(json.dumps(base))
+                del modified["subagent_stats"]["killed"][key]
+                document, rejected, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(document)
+                self.assertEqual(expected_error, rejected)
+        for invalid in (None, True, 0, "0", [], {}):
+            with self.subTest(killed_shape=invalid):
+                modified = json.loads(json.dumps(base))
+                modified["subagent_stats"]["killed"] = invalid
+                document, rejected, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(document)
+                self.assertEqual(expected_error, rejected)
+
+        # by_type is optional for zero spawns in the original CLI initializer.
+        for invalid in (
+            {"Explore": 1}, {"Explore": -1}, {"Explore": True},
+            {"Explore": "0"}, None, False, 1, [],
+        ):
+            with self.subTest(by_type=invalid):
+                modified = json.loads(json.dumps(base))
+                modified["subagent_stats"]["by_type"] = invalid
+                document, rejected, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(document)
+                self.assertEqual(expected_error, rejected)
+
+        # Unknown top-level counters must not silently create a false PASS.
+        for invalid in (1, -1, True, "0", {"nested_counter": 0}):
+            with self.subTest(unknown_counter=invalid):
+                modified = json.loads(json.dumps(base))
+                modified["subagent_stats"]["future_activity_counter"] = invalid
+                document, rejected, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(document)
+                self.assertEqual(expected_error, rejected)
+
+        # Current and future typed-zero fields remain compatible.
+        for valid_extra in (
+            {"by_type": {}},
+            {"by_type": {"Explore": 0}},
+            {"future_activity_counter": 0},
+            {"killed": {
+                **base["subagent_stats"]["killed"], "future_counter": 0,
+            }},
+        ):
+            with self.subTest(valid_extra=valid_extra):
+                modified = json.loads(json.dumps(base))
+                modified["subagent_stats"].update(valid_extra)
+                document, accepted_error, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(accepted_error)
+                self.assertEqual(base["structured_output"], json.loads(document))
 
     def test_claude_result_requires_explicit_zero_activity_proof(self) -> None:
         """Missing fields must not be promoted to tool-free execution."""

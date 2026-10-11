@@ -1203,6 +1203,11 @@ def _extract_grok_stream_review_document(
     return canonical(review).encode("utf-8"), None, metadata
 
 
+def _is_strictly_zero(value: Any) -> bool:
+    """Exclude JSON booleans when proving an explicit integer zero."""
+    return type(value) is int and value == 0
+
+
 def _extract_claude_review_document(
     raw: bytes,
 ) -> tuple[bytes | None, str | None, dict[str, Any]]:
@@ -1237,7 +1242,7 @@ def _extract_claude_review_document(
     }.issubset(server_tools):
         return None, "Claude review server tool evidence is missing or invalid", metadata
     # Every current and future server-side tool counter must be integer zero.
-    if any(type(value) is not int or value != 0 for value in server_tools.values()):
+    if any(not _is_strictly_zero(value) for value in server_tools.values()):
         return None, "Claude review reports forbidden server tool activity", metadata
 
     model_usage = envelope.get("modelUsage")
@@ -1246,38 +1251,59 @@ def _extract_claude_review_document(
     for model_stats in model_usage.values():
         if (
             not isinstance(model_stats, dict)
-            or type(model_stats.get("webSearchRequests")) is not int
-            or model_stats["webSearchRequests"] != 0
-            or (
-                "webFetchRequests" in model_stats
-                and (
-                    type(model_stats["webFetchRequests"]) is not int
-                    or model_stats["webFetchRequests"] != 0
-                )
+            or not _is_strictly_zero(model_stats.get("webSearchRequests"))
+            or any(
+                key.endswith("Requests") and not _is_strictly_zero(value)
+                for key, value in model_stats.items()
             )
         ):
             return None, "Claude review reports forbidden model web activity", metadata
 
     subagent_stats = envelope.get("subagent_stats")
+    # Claude CLI 2.1.285 distinguishes started agents, attempted/refused
+    # invocations, failures and completed/stopped agents. All are activity.
+    scalar_counters = (
+        "spawned", "started_in_background", "max_depth",
+        "spawned_by_subagents", "completed", "failed",
+    )
     if (
         not isinstance(subagent_stats, dict)
-        or type(subagent_stats.get("spawned")) is not int
-        or subagent_stats["spawned"] != 0
+        or any(
+            not _is_strictly_zero(subagent_stats.get(field))
+            for field in scalar_counters
+        )
     ):
         return None, "Claude review subagent evidence is missing or nonzero", metadata
-    # Claude CLI 2.1.285 distinguishes spawned agents from attempted/refused
-    # agent tool calls. Zero spawned alone does not establish no tool attempts.
     for field, required_counters in (
         ("requested", {"background", "foreground", "unset"}),
         ("refused", {"depth_limit", "concurrency_limit", "budget"}),
+        ("killed", {"parent", "user", "system"}),
     ):
         counters = subagent_stats.get(field)
         if (
             not isinstance(counters, dict)
             or not required_counters.issubset(counters)
-            or any(type(value) is not int or value != 0 for value in counters.values())
+            or any(not _is_strictly_zero(value) for value in counters.values())
         ):
-            return None, "Claude review subagent attempt evidence is missing or nonzero", metadata
+            if field in {"requested", "refused"}:
+                return None, "Claude review subagent attempt evidence is missing or nonzero", metadata
+            return None, "Claude review subagent evidence is missing or nonzero", metadata
+    if "by_type" in subagent_stats:
+        by_type = subagent_stats["by_type"]
+        if (
+            not isinstance(by_type, dict)
+            or any(not _is_strictly_zero(value) for value in by_type.values())
+        ):
+            return None, "Claude review subagent evidence is missing or nonzero", metadata
+    known_fields = set(scalar_counters) | {
+        "requested", "refused", "killed", "by_type",
+    }
+    if any(
+        not _is_strictly_zero(value)
+        for field, value in subagent_stats.items()
+        if field not in known_fields
+    ):
+        return None, "Claude review subagent evidence is missing or nonzero", metadata
     result = envelope.get("structured_output")
     if not isinstance(result, dict) or set(result) != {"verdict", "findings"}:
         return None, "Claude review structured_output has an invalid shape", metadata
