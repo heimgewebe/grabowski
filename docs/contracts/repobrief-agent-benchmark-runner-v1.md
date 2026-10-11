@@ -221,6 +221,25 @@ Der Receipt enthält:
 - Provider- und exakte Modellkennung;
 - Provider-gemeldete Input- und Output-Tokens;
 - normalisierte Toolaufrufe in Reihenfolge;
+- bei auswertbarer Treatment-Nutzung optional repoground_evidence mit
+  Zielcommit, beobachtetem Bundle-Commit und pro RepoGround-Aufruf nur den
+  für die Exposure-Messung nötigen Feldern (Freshness, semantisch aufgelöste
+  Range-Anzahl, Kontextbytes bzw. Grounding-Status); `ask_context` bindet
+  dabei die same-call `live_freshness`-Hülle, revisionsgebundene
+  Resource-Reads zählen ihre tatsächlich gelesenen Inhaltsbytes, reines
+  Resource-Listing bleibt Nicht-Evidence;
+  `ask_context`-Kontextbytes müssen `context_bytes_used <= max_context_bytes <=
+  token_derived_byte_ceiling` erfüllen, sonst wird die Evidence verworfen;
+  `fresh` und `stale` werden nur projiziert, wenn die `live_freshness`-Hülle
+  `read_only_git_probe: true`, ein nichtleeres `repo_root` exakt gleich dem
+  Manifest-`repo_root`, `implicit_refresh: false` und eine an den
+  Manifest-Commit gebundene `snapshot_provenance` belegt; gültige
+  `unknown`- und `not_comparable`-Fallbacks bleiben erhalten. Strukturierte
+  Payloads von `ask_context`, `grounding_verify` und `live_freshness`
+  durchlaufen im Claude- wie im Codex-Pfad denselben strengen Vertrag
+  (`_validated_treatment_structured_payload`, `mutation_boundary.writes == []`,
+  Pflichtfelder, Nichtaussagen); eine verletzende Payload erzeugt keine
+  Evidence und lässt die Receipt-Konstruktion nicht scheitern;
 - strukturierte Antwort, Pfade, Symbole, Belege und Claim-Labels;
 - Start, Ende, Gesamtdauer und Exitstatus;
 - hashgebundenes Transcript-Artefakt;
@@ -248,6 +267,25 @@ Dieser Modus belegt:
 - Fail-closed-Grenzen;
 - Checkout-Isolierung;
 - Transcript- und Receipt-Bindung.
+
+repoground_evidence ist bewusst keine Runner-Entscheidung über Nutzen:
+Der Runner projiziert nur validierte, revisionsgebundene Beobachtungen. Ob diese
+für Navigation, Struktur oder Grounding als tatsächliches Treatment-Exposure
+zählen, entscheidet der RepoGround-Evaluator. Die Projektion bleibt an das
+digestgebundene Manifest gekoppelt; dessen Hülle muss vor der Provenienz
+`kind: repoground.bundle.manifest` mit `version: "2.0"` (oder legacy
+`repolens.bundle.manifest` mit `version: "1.0"` bzw. fehlender Version) sein,
+sonst entsteht keine Evidenz. Für `ask_context` müssen Pack-Commit und
+same-call Live-Commit übereinstimmen; der projizierte Freshness-Status stammt aus
+dieser Live-Hülle, und nur Ranges mit `status=resolved` werden gezählt. Resolved Textranges brauchen nichtleeren `text_excerpt` plus Identität (`source_path`/`path` oder `range_ref.ref`/`range_ref.path`); resolved `language_structure_json`-Ranges tragen keinen Excerpt und brauchen stattdessen konsistente Strukturprovenienz (`range_ref.ref`, `range_ref.path` = `source_path`, ganzzahlige `start_line<=end_line` gleich in `range_ref.range` und `source_line_range`).
+Produktives `not_comparable` ohne Snapshot-Provenienz darf nur im
+`repo_root_not_configured`-Fall mit `implicit_refresh=false` auf den
+Manifest-Commit zurückfallen; `unknown` darf denselben Fallback nur nach einer
+tatsächlich versuchten read-only Git-Probe mit gebundenem Repo-Pfad nutzen.
+Resource-Reads erzeugen Evidence ausschließlich für genau einen nichtleeren,
+URI-gebundenen Inhalt mit verfügbarer RepoGround-Metadatenhülle und gebundener
+`liveFreshness`; Resource-Listing erzeugt keine Evidence. Nicht auswertbare
+oder nicht an dieses Manifest gebundene Toolresultate erzeugen kein Exposure-Feld.
 
 Er belegt ausdrücklich nicht:
 
