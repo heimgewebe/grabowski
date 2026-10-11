@@ -465,6 +465,26 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                         ["/bin/bash", "-c", source]
                     )
 
+    def test_reviewer_p1_shell_command_substitution_is_not_argv_data(self) -> None:
+        for source in (
+            'printf "$(codex exec prompt)"',
+            "echo " + chr(96) + "codex exec prompt" + chr(96),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/bin/bash", "-c", source]
+                    )
+
+        for source in (
+            'printf "$(printf codex)"',
+            "printf 'codex exec prompt'",
+        ):
+            with self.subTest(source=source):
+                tasks._require_direct_codex_filesystem_sandbox(
+                    ["/bin/bash", "-c", source]
+                )
+
     def test_reviewer_p1_env_optional_signal_flags_cannot_hide_codex(self) -> None:
         for argv in (
             ["/usr/bin/env", "--block-signal", "SIGTERM", "codex", "exec", "prompt"],
