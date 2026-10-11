@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from contextlib import contextmanager, nullcontext
 from decimal import Decimal
 import hashlib
 import importlib.util
@@ -21,6 +22,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -1337,6 +1339,10 @@ def _validate_pair(baseline: Mapping[str, Any], treatment: Mapping[str, Any]) ->
     for field in same_fields:
         if baseline.get(field) != treatment.get(field):
             raise PreflightError(f"paired requests disagree on {field}")
+    # An omitted setup is the historical spelling of explicitly clean.
+    # Compare validated scenario semantics; G2 still requires exact frozen dirty identity.
+    if runner.validated_setup(baseline) != runner.validated_setup(treatment):
+        raise PreflightError("paired requests disagree on setup")
     if baseline.get("condition") != "baseline" or treatment.get("condition") != "treatment":
         raise PreflightError("pair conditions are invalid")
     if baseline.get("session_id") == treatment.get("session_id"):
@@ -1407,6 +1413,8 @@ def _assert_source_matches_requested_commit(
         raise PreflightError(
             "source checkout HEAD does not match requested repository commit"
         )
+    if observed.get("clean") is not True:
+        raise PreflightError("historical benchmark source checkout must be clean")
 
 
 def prepare_snapshot(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
@@ -1488,7 +1496,48 @@ def _mcp_environment() -> dict[str, str]:
     return _unprivileged_environment()
 
 
-def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
+@contextmanager
+def _historical_g1_preflight_stage(
+    command: Sequence[str], manifest: Path,
+):
+    """Use the exact historical-only private MCP staging contract before dispatch."""
+    codex = _codex_runner_module()
+    authorized = [
+        codex._mcp_authorization_identity(
+            codex._bind_mcp_file(
+                Path(command[0]).resolve(strict=True),
+                label="MCP executable", executable=True,
+            )
+        ),
+        codex._mcp_authorization_identity(
+            codex._bind_mcp_file(
+                Path(command[1]), label="MCP script", executable=False,
+            )
+        ),
+        codex._mcp_authorization_identity(
+            codex._bind_mcp_file(
+                manifest, label="historical G1 manifest", executable=False,
+            )
+        ),
+    ]
+    with tempfile.TemporaryDirectory(prefix="rab-g1-mcp-preflight-") as temporary:
+        stage_root = Path(temporary)
+        (stage_root / "repoground-mcp-upstream-runtime").mkdir(mode=0o700)
+        stage = codex.stage_mcp_upstream(
+            stage_root, command, manifest, authorized, legacy_g1=True
+        )
+        try:
+            yield stage
+        finally:
+            if codex.cleanup_staged_mcp_upstream(stage) is not None:
+                raise PreflightError("historical G1 MCP preflight stage changed")
+
+
+def probe_freshness(
+    treatment: Mapping[str, Any], *,
+    repo_root: Path | None = None,
+    clean_source: Path | None = None,
+) -> tuple[dict[str, Any], int]:
     binding = treatment.get("repobrief")
     if not isinstance(binding, Mapping):
         raise PreflightError("treatment request has no RepoBrief binding")
@@ -1497,77 +1546,232 @@ def probe_freshness(treatment: Mapping[str, Any]) -> tuple[dict[str, Any], int]:
         isinstance(item, str) and item for item in command
     ):
         raise PreflightError("treatment MCP command is invalid")
-    environment = _mcp_environment()
-    started = time.monotonic()
-    try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            env=environment,
+    command = list(command)
+    provider = treatment.get("runner")
+    mcp_profile = "modern"
+    if (
+        isinstance(provider, Mapping)
+        and provider.get("provider") == "openai-codex-cli"
+    ):
+        codex_module = _codex_runner_module()
+        try:
+            mcp_profile = codex_module._frozen_g1_mcp_profile(treatment)
+        except (ValueError, RuntimeError, OSError) as exc:
+            raise PreflightError("historical G1 MCP provenance is not authorized") from exc
+    if repo_root is not None:
+        if command.count("--repo-root") != 1 or clean_source is None:
+            raise PreflightError("dirty MCP probe lacks a unique bound source root")
+        index = command.index("--repo-root")
+        if (
+            index + 1 >= len(command)
+            or Path(command[index + 1]).expanduser().resolve()
+            != clean_source.resolve()
+        ):
+            raise PreflightError("dirty MCP probe clean source root mismatch")
+        command[index + 1] = str(repo_root.resolve())
+    if mcp_profile == "frozen-g1-lenskit-legacy":
+        stage_context = _historical_g1_preflight_stage(
+            command, Path(str(binding["manifest"]))
         )
-    except OSError as exc:
-        raise PreflightError("RepoBrief MCP could not be started") from exc
-    try:
-        _rpc(
-            process,
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "repobrief-live-preflight", "version": VERSION},
+    else:
+        stage_context = nullcontext(None)
+    with stage_context as stage:
+        probe_manifest = (
+            Path(stage["manifest_binding"]["path"])
+            if stage is not None else Path(str(binding.get("manifest")))
+        )
+        if stage is not None:
+            command = [str(arg) for arg in stage["argv"]]
+        environment = _mcp_environment()
+        started = time.monotonic()
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                env=environment,
+            )
+        except OSError as exc:
+            raise PreflightError("RepoBrief MCP could not be started") from exc
+        try:
+            _rpc(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "repobrief-live-preflight", "version": VERSION},
+                    },
                 },
-            },
-            timeout_seconds=20,
-        )
-        result = _rpc(
-            process,
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "live_freshness",
-                    "arguments": {"bundle_manifest": str(binding.get("manifest"))},
+                timeout_seconds=20,
+            )
+            result = _rpc(
+                process,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "live_freshness",
+                        "arguments": {"bundle_manifest": str(probe_manifest)},
+                    },
                 },
-            },
-            timeout_seconds=30,
-        )
-    finally:
-        if process.stdin is not None:
-            process.stdin.close()
-        if process.poll() is None:
-            process.terminate()
+                timeout_seconds=30,
+            )
+            if (
+                isinstance(provider, Mapping)
+                and provider.get("provider") == "openai-codex-cli"
+            ):
+                inventory = _rpc(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/list",
+                        "params": {},
+                    },
+                    timeout_seconds=20,
+                )
+                try:
+                    if mcp_profile == codex_module.MCP_PROFILE_FROZEN_G1:
+                        codex_module._filtered_treatment_tools(
+                            inventory, profile=mcp_profile
+                        )
+                    else:
+                        codex_module._filtered_treatment_tools(inventory)
+                except ValueError as exc:
+                    raise PreflightError(
+                        "Codex treatment MCP tools/list violates the pinned tool contract"
+                    ) from exc
+        finally:
+            if process.stdin is not None:
+                process.stdin.close()
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            stderr = b"" if process.stderr is None else process.stderr.read(runner.MAX_STDERR_BYTES + 1)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+        if stderr:
+            raise PreflightError(
+                f"RepoBrief MCP stderr is non-empty: {_sha256_bytes(stderr)} ({len(stderr)} bytes)"
+            )
+        structured = result.get("structuredContent")
+        if result.get("isError") is not False or not isinstance(structured, dict):
+            raise PreflightError("RepoBrief MCP freshness call failed")
+        status = structured.get("status")
+        if mcp_profile == "frozen-g1-lenskit-legacy":
+            frozen = codex_module.FROZEN_G1_LEGACY_IDENTITY
+            source_root = str(Path(command[-1]).expanduser().resolve(strict=True))
+            current = structured.get("current_provenance")
+            snapshot = structured.get("snapshot_provenance")
             try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-        stderr = b"" if process.stderr is None else process.stderr.read(runner.MAX_STDERR_BYTES + 1)
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.stderr is not None:
-            process.stderr.close()
-    if stderr:
-        raise PreflightError(
-            f"RepoBrief MCP stderr is non-empty: {_sha256_bytes(stderr)} ({len(stderr)} bytes)"
+                codex_module._validated_live_freshness_payload(
+                    structured, expected_manifest=probe_manifest
+                )
+            except ValueError as exc:
+                raise PreflightError("historical G1 MCP freshness projection is invalid") from exc
+            if (
+                status != "fresh"
+                or structured.get("reason") != "git_head_matches_and_working_tree_is_clean"
+                or structured.get("repo_root") != source_root
+                or structured.get("read_only_git_probe") is not True
+                or structured.get("implicit_refresh") is not False
+                or not isinstance(current, dict)
+                or current.get("repo_root") != source_root
+                or current.get("git_commit") != frozen["repository"]["commit"]
+                or current.get("git_dirty") is not False
+                or current.get("provenance_status") != "present"
+                or not isinstance(snapshot, dict)
+                or snapshot.get("git_commit") != frozen["repository"]["commit"]
+                or snapshot.get("git_dirty") is not False
+                or snapshot.get("name") != "lenskit"
+            ):
+                raise PreflightError("historical G1 MCP freshness provenance is inconsistent")
+        if repo_root is not None:
+            expected_root = str(repo_root.resolve())
+            current = structured.get("current_provenance")
+            snapshot = structured.get("snapshot_provenance")
+            expected_commit = (
+                treatment.get("repository", {}).get("commit")
+                if isinstance(treatment.get("repository"), Mapping)
+                else None
+            )
+            if (
+                structured.get("kind") != "repobrief.live_freshness"
+                or structured.get("version") != "v1"
+                or structured.get("repo_root") != expected_root
+                or structured.get("bundle_manifest") != str(binding.get("manifest"))
+                or structured.get("read_only_git_probe") is not True
+                or structured.get("implicit_refresh") is not False
+                or not isinstance(current, dict)
+                or current.get("repo_root") != expected_root
+                or current.get("git_commit") != expected_commit
+                or current.get("git_dirty") is not True
+                or current.get("provenance_status") != "present"
+                or not isinstance(snapshot, dict)
+                or snapshot.get("git_commit") != expected_commit
+            ):
+                raise PreflightError("dirty MCP provenance does not match isolated checkout")
+        elapsed = max(int((time.monotonic() - started) * 1000), 0)
+        return {
+            "status": status,
+            "reason": structured.get("reason"),
+            "result_sha256": _sha256_json(structured),
+            "stale_blocked": status != "fresh",
+        }, elapsed
+
+
+def probe_bound_negative_scenario(
+    treatment: Mapping[str, Any], *, source: Path, state_root: Path
+) -> dict[str, Any] | None:
+    """Provider-free G2 stale proof using a new private clone of a clean source."""
+
+    if runner.validated_setup(treatment) != "dirty":
+        return None
+    with tempfile.TemporaryDirectory(
+        prefix="rab-g2-preflight-", dir=state_root
+    ) as temporary:
+        checkout = runner.create_isolated_checkout(
+            treatment, source, Path(temporary)
         )
-    structured = result.get("structuredContent")
-    if result.get("isError") is not False or not isinstance(structured, dict):
-        raise PreflightError("RepoBrief MCP freshness call failed")
-    status = structured.get("status")
-    elapsed = max(int((time.monotonic() - started) * 1000), 0)
-    return {
-        "status": status,
-        "reason": structured.get("reason"),
-        "result_sha256": _sha256_json(structured),
-        "stale_blocked": status != "fresh",
-    }, elapsed
+        before = runner.attest_checkout_setup(treatment, checkout)
+        freshness, elapsed = probe_freshness(
+            treatment, repo_root=checkout, clean_source=source
+        )
+        after = runner.attest_checkout_setup(treatment, checkout)
+        if (
+            before != after
+            or freshness.get("status") != "stale"
+            or freshness.get("reason") != "current_working_tree_is_dirty"
+            or before.get("working_tree") != "dirty"
+        ):
+            raise PreflightError("bound G2 negative scenario did not prove stale")
+        return {
+            "working_tree": "dirty",
+            "fixture": "dirty-checkout",
+            "expected_status": "stale",
+            "observed_status": freshness["status"],
+            "observed_reason": freshness["reason"],
+            "git_commit": before["git_commit"],
+            "fixture_sha256": before["fixture_sha256"],
+            "status_sha256": before["status_sha256"],
+            "mcp_result_sha256": freshness["result_sha256"],
+            "probe_ms": elapsed,
+            "source_unchanged_required": True,
+            "provider_started": False,
+        }
 
 
 def _transcript_result(receipt: Mapping[str, Any], transcript_root: Path) -> Mapping[str, Any]:
@@ -1821,6 +2025,9 @@ def authorize_dispatch(
             raise PreflightError(
                 f"treatment snapshot is not fresh: {freshness['status']}"
             )
+        scenario_probe = probe_bound_negative_scenario(
+            treatment, source=source, state_root=state_root
+        )
         after = source_state(source)
         _assert_source_unchanged(before, after)
         _assert_dispatch_binding_unchanged(
@@ -1852,6 +2059,7 @@ def authorize_dispatch(
                 "treatment": _sha256_json(treatment),
             },
             "snapshot": {**snapshot, **freshness},
+            **({"scenario_probe": scenario_probe} if scenario_probe is not None else {}),
             "source_before": before,
             "source_after": after,
             "timings": {
@@ -1955,6 +2163,9 @@ def execute_preflight(
             raise PreflightError(
                 f"treatment snapshot is not fresh: {freshness['status']}"
             )
+        scenario_probe = probe_bound_negative_scenario(
+            treatment, source=source, state_root=state_root
+        )
         claude_identity = (
             {
                 "command": claude,
@@ -2148,6 +2359,7 @@ def execute_preflight(
                 "total_time_to_answer_ms": total_time_to_answer_ms,
             },
             "snapshot": {**snapshot, **freshness},
+            **({"scenario_probe": scenario_probe} if scenario_probe is not None else {}),
             "source_before": before,
             "source_after": after,
             "runs": {
