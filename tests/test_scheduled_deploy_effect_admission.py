@@ -48,6 +48,40 @@ class DelayedRuntimeEffectAdmissionTests(unittest.TestCase):
                     expected_head=TARGET, source_identity_sha256=SOURCE_ID
                 )
 
+
+    def test_sha256_git_object_ids_preserve_fail_closed_release_policy(self):
+        serving_sha256 = "a" * 64
+        target_sha256 = "b" * 64
+        with patch.object(
+            worker.deploy_dual, "observe_authoritative_routing",
+            return_value=active(serving_sha256),
+        ):
+            result = worker.require_effect_time_release_admission(
+                expected_head=serving_sha256, source_identity_sha256=SOURCE_ID
+            )
+            self.assertEqual("already-serving-exact-source", result["status"])
+            self.assertEqual(serving_sha256, result["serving_repo_head"])
+            with self.assertRaisesRegex(RuntimeError, "protected Captain"):
+                worker.require_effect_time_release_admission(
+                    expected_head=target_sha256, source_identity_sha256=SOURCE_ID
+                )
+
+    def test_nonstandard_git_object_id_lengths_rejected(self):
+        for length in (39, 41, 63, 65):
+            with self.subTest(target_length=length):
+                with self.assertRaisesRegex(RuntimeError, "invalid exact target"):
+                    worker.require_effect_time_release_admission(
+                        expected_head="b" * length, source_identity_sha256=SOURCE_ID
+                    )
+            with self.subTest(serving_length=length), patch.object(
+                worker.deploy_dual, "observe_authoritative_routing",
+                return_value=active("a" * length),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "serving identity"):
+                    worker.require_effect_time_release_admission(
+                        expected_head=SERVING, source_identity_sha256=SOURCE_ID
+                    )
+
     def test_unauthenticated_or_unobservable_serving_blocks(self):
         for record in (
             None, {}, {"authoritative": False},

@@ -1707,7 +1707,7 @@ def require_effect_time_release_admission(
     interpret their mere presence, a review PR number, or a self-hashed JSON
     object as a permit to perform a productive cutover.
     """
-    if not isinstance(expected_head, str) or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
+    if not isinstance(expected_head, str) or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None:
         raise RecoveryClassificationBlocked(
             "release admission blocked: invalid exact target source head"
         )
@@ -1733,7 +1733,7 @@ def require_effect_time_release_admission(
     serving_release_id = ingress.get("release_id")
     if (
         not isinstance(serving_head, str)
-        or re.fullmatch(r"[0-9a-f]{40}", serving_head) is None
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", serving_head) is None
         or not isinstance(serving_release_id, str)
         or not serving_release_id.strip()
         or len(serving_release_id.encode("utf-8")) > 512
