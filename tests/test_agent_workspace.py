@@ -8659,6 +8659,186 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual("reconcile_role_task_outcome", selected)
 
+    def test_collect_existing_uncertain_role_blocks_missing_sibling(self) -> None:
+        cases = (
+            ("tests", "outcome_unknown", False),
+            ("tests", "observation_error", False),
+            ("tests", "interrupted", False),
+            ("tests", "running", True),
+            ("review", "outcome_unknown", False),
+            ("review", "observation_error", False),
+            ("review", "interrupted", False),
+            ("review", "running", True),
+        )
+        for existing, state, reconciliation in cases:
+            with self.subTest(existing=existing, state=state, reconciliation=reconciliation):
+                manifest = self.manifest()
+                (self.git.writer / "src" / "app.py").write_text(
+                    "dirty = True\n", encoding="utf-8"
+                )
+                task_id = f"{existing}-task"
+                missing = "review" if existing == "tests" else "tests"
+                manifest["tasks"][existing] = task_id
+                workspace._write_manifest(manifest)
+                readonly_calls = []
+
+                def task_state(current: str, *, read_only: bool = False) -> dict:
+                    if current == "writer-task":
+                        return {"task_id": current, "state": "completed", "terminal": True}
+                    if current == task_id:
+                        readonly_calls.append(read_only)
+                        return {"task_id": current, "state": state, "terminal": False,
+                                "reconcile_required": reconciliation}
+                    return {"task_id": current, "state": "running", "terminal": False}
+
+                with (
+                    mock.patch.object(workspace, "_task_public", side_effect=task_state),
+                    mock.patch.object(
+                        workspace, "_start_role_task",
+                        return_value={"task_id": f"{missing}-task"},
+                    ) as start,
+                    mock.patch.object(workspace.operator, "_require_operator_mutation"),
+                    mock.patch.object(
+                        workspace, "_role_toolchain_preflight",
+                        side_effect=passing_toolchain_preflight,
+                    ) as preflight,
+                    mock.patch.object(
+                        workspace.resources, "acquire_resources",
+                        side_effect=AssertionError("unexpected lease acquisition"),
+                    ) as acquire,
+                ):
+                    result = workspace.grabowski_agent_workspace_collect(
+                        manifest["workspace_id"]
+                    )
+                self.assertEqual("role_outcome_unknown", result["state"])
+                self.assertEqual("blocked", result["receipt_status"])
+                self.assertTrue(result["reconcile_required"])
+                self.assertEqual([existing], result["reconcile_roles"])
+                self.assertEqual(task_id, result["tasks"][existing]["task_id"])
+                self.assertTrue(readonly_calls)
+                self.assertTrue(all(readonly_calls))
+                start.assert_not_called()
+                preflight.assert_not_called()
+                acquire.assert_not_called()
+                persisted = workspace._manifest(manifest["workspace_id"])
+                self.assertIsNone(persisted["tasks"][missing])
+                self.assertEqual({}, persisted["task_start_intents"])
+
+    def test_collect_rechecks_newly_started_role_before_sibling(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        starts = []
+        read_only_calls = []
+
+        def role_start(_manifest: dict, role: str, _snapshot: dict) -> dict:
+            starts.append(role)
+            return {"task_id": f"{role}-task"}
+
+        def task_state(task_id: str, *, read_only: bool = False) -> dict:
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            if task_id == "tests-task":
+                read_only_calls.append(read_only)
+                return {"task_id": task_id, "state": "outcome_unknown",
+                        "terminal": False, "reconcile_required": True}
+            return {"task_id": task_id, "state": "running", "terminal": False}
+
+        with (
+            mock.patch.object(workspace, "_task_public", side_effect=task_state),
+            mock.patch.object(workspace, "_start_role_task", side_effect=role_start),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("role_outcome_unknown", result["state"])
+        self.assertEqual(["tests"], result["reconcile_roles"])
+        self.assertEqual(["tests"], starts)
+        self.assertTrue(read_only_calls)
+        self.assertTrue(all(read_only_calls))
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual("tests-task", persisted["tasks"]["tests"])
+        self.assertIsNone(persisted["tasks"]["review"])
+        self.assertEqual({}, persisted["task_start_intents"])
+
+    def test_collect_reconciles_role_that_becomes_unknown_during_preflight(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        manifest["tasks"]["tests"] = "tests-task"
+        workspace._write_manifest(manifest)
+        outcome_changed = False
+        observations = []
+
+        def role_status(task_id: str, *, read_only: bool = False) -> dict:
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            if task_id == "tests-task":
+                observations.append(read_only)
+                return {
+                    "task_id": task_id,
+                    "state": "outcome_unknown" if outcome_changed else "running",
+                    "terminal": False,
+                    "reconcile_required": outcome_changed,
+                }
+            raise AssertionError("unexpected task read")
+
+        def preflight_after_transition(value: dict, role: str, command: list[str]) -> dict:
+            nonlocal outcome_changed
+            self.assertEqual("review", role)
+            outcome_changed = True
+            return passing_toolchain_preflight(value, role, command)
+
+        with (
+            mock.patch.object(workspace, "_task_public", side_effect=role_status),
+            mock.patch.object(
+                workspace, "_role_toolchain_preflight",
+                side_effect=preflight_after_transition,
+            ) as preflight,
+            mock.patch.object(workspace, "_start_role_task") as start,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("role_outcome_unknown", result["state"])
+        self.assertEqual(["tests"], result["reconcile_roles"])
+        self.assertTrue(result["reconcile_required"])
+        self.assertTrue(outcome_changed)
+        preflight.assert_called_once()
+        self.assertGreaterEqual(len(observations), 2)
+        self.assertTrue(all(observations))
+        start.assert_not_called()
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual("tests-task", persisted["tasks"]["tests"])
+        self.assertIsNone(persisted["tasks"]["review"])
+        self.assertEqual({}, persisted["task_start_intents"])
+
+    def test_collect_starts_both_roles_when_no_uncertain_outcome(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        started = []
+
+        def role_start(_manifest: dict, role: str, _snapshot: dict) -> dict:
+            started.append(role)
+            return {"task_id": f"{role}-task"}
+
+        def task_state(task_id: str, *, read_only: bool = False) -> dict:
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            return {"task_id": task_id, "state": "running", "terminal": False}
+
+        with (
+            mock.patch.object(workspace, "_task_public", side_effect=task_state),
+            mock.patch.object(workspace, "_start_role_task", side_effect=role_start),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("collecting", result["state"])
+        self.assertEqual(["tests", "review"], started)
+        self.assertEqual(["tests", "review"], result["started_roles"])
+
     def test_collect_unknown_role_outcome_blocks_instead_of_polling(self) -> None:
         manifest = self.manifest()
         (self.git.writer / "src" / "app.py").write_text("dirty = True\\n", encoding="utf-8")
