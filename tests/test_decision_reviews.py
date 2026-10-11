@@ -469,6 +469,18 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
             ("quota_result_control", {
                 "result": "You've hit your weekly limit\tmore text",
             }, {}),
+            ("quota_result_unicode_nel", {
+                "result": "You've hit your weekly limit\u0085extra line",
+            }, {}),
+            ("quota_result_unicode_ls", {
+                "result": "You've hit your weekly limit\u2028extra line",
+            }, {}),
+            ("quota_result_unicode_ps", {
+                "result": "You've hit your weekly limit\u2029extra line",
+            }, {}),
+            ("quota_result_zero_width", {
+                "result": "You've hit your weekly limit\u200bextra text",
+            }, {}),
             ("provider_api_work", {"duration_api_ms": 1}, {}),
             ("provider_api_work_false", {"duration_api_ms": False}, {}),
             ("provider_api_work_missing", {"duration_api_ms": None}, {}),

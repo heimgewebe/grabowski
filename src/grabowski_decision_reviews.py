@@ -1137,7 +1137,7 @@ def _proven_claude_quota_failure_before_review(
         and isinstance(envelope.get("result"), str)
         and envelope["result"].startswith("You've hit your weekly limit")
         and len(envelope["result"]) <= 256
-        and all(32 <= ord(character) != 127 for character in envelope["result"])
+        and envelope["result"].isprintable()
         and isinstance(usage, dict) and usage.get("iterations") == []
         and envelope.get("permission_denials") == []
         and type(envelope.get("total_cost_usd")) in {int, float}
