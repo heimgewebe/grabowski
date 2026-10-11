@@ -4033,6 +4033,21 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
         }
         return re.fullmatch(patterns[language], source.strip()) is not None
 
+    # These variables can execute attacker-controlled code before a nominally
+    # harmless command body runs. argv inspection cannot attest that code.
+    preload_hook_variables = frozenset({
+        "BASH_ENV", "ENV", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
+        "NODE_OPTIONS", "NODE_PATH", "RUBYOPT", "RUBYLIB", "PERL5OPT",
+        "PERL5LIB", "LD_PRELOAD", "LD_AUDIT",
+    })
+
+    def reject_unverified_preload_assignment(token: str) -> None:
+        key, separator, _ = token.partition("=")
+        if separator and key in preload_hook_variables:
+            raise RuntimeError(
+                "Codex filesystem sandbox cannot verify executable environment preload"
+            )
+
     def shell_embedded_sources(source: str) -> list[str]:
         """Inspect executable substitutions, including inside double quotes."""
         embedded: list[str] = []
@@ -4172,6 +4187,8 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
             if item == "--" or (
                 "=" in item and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item.split("=", 1)[0])
             ):
+                if item != "--":
+                    reject_unverified_preload_assignment(item)
                 index += 1
                 continue
             if item.startswith("-"):
@@ -4292,6 +4309,7 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
             while start < len(argv) and re.fullmatch(
                 r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[start]
             ):
+                reject_unverified_preload_assignment(argv[start])
                 start += 1
         if start < len(argv):
             _require_direct_codex_filesystem_sandbox(argv[start:])
@@ -4340,6 +4358,7 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                     while offset < len(segment) and re.fullmatch(
                         r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[offset]
                     ):
+                        reject_unverified_preload_assignment(segment[offset])
                         offset += 1
                     # Builtins change the command position. Parse their
                     # literal options instead of mistaking -a/-p for programs.
@@ -4351,6 +4370,15 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                         }:
                             offset += 1
                             continue
+                        if prefix in {"export", "declare", "typeset", "readonly", "local"}:
+                            # Builtins can install hooks for later commands.
+                            for assignment in segment[offset + 1:]:
+                                if assignment.split("=", 1)[0] in preload_hook_variables:
+                                    raise RuntimeError(
+                                        "Codex filesystem sandbox cannot verify executable environment preload"
+                                    )
+                            offset = len(segment)
+                            break
                         if prefix == "function":
                             offset += 2
                             if offset < len(segment) and segment[offset] == "()":

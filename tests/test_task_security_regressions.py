@@ -700,5 +700,30 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 tasks._require_direct_codex_filesystem_sandbox(argv)
 
 
+    def test_nested_preload_environment_bypasses_are_rejected(self) -> None:
+        # Test *admission* only; no shell, sudo or interpreter is executed.
+        dangerous = (
+            ["env", "-S", "NODE_OPTIONS=--require=/tmp/preload.js node -e 'console.log(1)'"],
+            ["env", "--", "PYTHONPATH=/tmp/preload", "python3", "-c", "print('safe')"],
+            ["env", "LD_PRELOAD=/tmp/preload.so", "cargo", "test"],
+            ["sudo", "-n", "BASH_ENV=/tmp/preload.sh", "bash", "-c", "printf safe"],
+            ["doas", "RUBYOPT=-r/tmp/preload.rb", "ruby", "-e", "puts 'safe'"],
+            ["bash", "-c", "BASH_ENV=/tmp/preload.sh bash -c 'printf safe'"],
+            ["bash", "-c", "export BASH_ENV=/tmp/preload.sh; bash -c 'printf safe'"],
+            ["bash", "-c", "declare -x NODE_OPTIONS=--require=/tmp/preload.js; node -e 'console.log(1)'"],
+        )
+        for argv in dangerous:
+            with self.subTest(dangerous=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        for argv in (
+            ["sudo", "-n", "FOO=bar", "bash", "-c", "printf safe"],
+            ["bash", "-c", "export FOO=bar; printf safe"],
+        ):
+            with self.subTest(allowed=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
 if __name__ == "__main__":
     unittest.main()
