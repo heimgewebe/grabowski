@@ -8304,8 +8304,36 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 "reconcile_required": True,
                 "receipt_status": "blocked",
             }
+        def _existing_role_reconciliation_block() -> dict[str, Any] | None:
+            existing_tasks = {
+                existing_role: _task_public(tasks_map[existing_role], read_only=True)
+                for existing_role in READ_ONLY_ROLES
+                if tasks_map.get(existing_role) is not None
+            }
+            reconcile_roles = sorted(
+                existing_role
+                for existing_role, value in existing_tasks.items()
+                if value.get("state") in {"observation_error", "outcome_unknown", "interrupted"}
+                or value.get("reconcile_required") is True
+            )
+            if not reconcile_roles:
+                return None
+            return {
+                "workspace_id": identifier,
+                "state": "role_outcome_unknown",
+                "tasks": existing_tasks,
+                "reconcile_roles": reconcile_roles,
+                "snapshot": snapshot,
+                "reconcile_required": True,
+                "receipt_status": "blocked",
+            }
+
         for role in READ_ONLY_ROLES:
             if tasks_map.get(role) is None:
+                # Do not preflight a sibling if reconciliation is already required.
+                reconciliation_block = _existing_role_reconciliation_block()
+                if reconciliation_block is not None:
+                    return reconciliation_block
                 cached_preflight = _cached_role_preflight_block(
                     manifest, role, manifest["commands"][role]
                 )
@@ -8339,6 +8367,10 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                         "preflight": preflight,
                         "receipt_status": "blocked",
                     }
+                # A sibling can become uncertain during a long toolchain preflight.
+                reconciliation_block = _existing_role_reconciliation_block()
+                if reconciliation_block is not None:
+                    return reconciliation_block
                 intents = dict(manifest.get("task_start_intents", {}))
                 role_task_argv = _role_task_argv(
                     manifest,
