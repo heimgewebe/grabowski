@@ -8617,6 +8617,91 @@ class AgentWorkspaceTests(unittest.TestCase):
         if isinstance(head, str) and head and isinstance(branch, str) and branch:
             self.git.publish_remote_head(head, branch)
 
+    def test_unknown_role_outcome_requires_reconcile_before_retry(self) -> None:
+        manifest = self.manifest()
+        manifest["tasks"]["tests"] = "tests-task"
+        frozen = {"writer_head": self.git.base, "diff_sha256": "a" * 64, "dirty": False}
+        for unknown_state in ("outcome_unknown", "observation_error", "interrupted"):
+            with self.subTest(state=unknown_state):
+                with mock.patch.object(
+                    workspace,
+                    "_task_public",
+                    return_value={
+                        "task_id": "tests-task",
+                        "state": unknown_state,
+                        "terminal": False,
+                        "reconcile_required": True,
+                    },
+                ) as task_status:
+                    classification, detail = workspace._role_retry_classification(
+                        manifest, "tests", frozen, read_only=True
+                    )
+                self.assertEqual("unknown_prior_outcome", classification)
+                self.assertTrue(detail["reconcile_required"])
+                task_status.assert_called_once_with("tests-task", read_only=True)
+
+    def test_unknown_role_outcome_has_reconcile_next_action(self) -> None:
+        selected = workspace._recommended_next_action(
+            creation_ready=True,
+            closed=False,
+            route_gate_passed=True,
+            closeable=False,
+            success_ready=False,
+            role_retry={
+                "tests": {
+                    "classification": "unknown_prior_outcome",
+                    "eligible": False,
+                    "reconcile_required": True,
+                }
+            },
+            failed_roles=[],
+            incomplete_roles=[],
+        )
+        self.assertEqual("reconcile_role_task_outcome", selected)
+
+    def test_collect_unknown_role_outcome_blocks_instead_of_polling(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\\n", encoding="utf-8")
+        role_ids = iter([{"task_id": "tests-task"}, {"task_id": "review-task"}])
+        with (
+            mock.patch.object(
+                workspace,
+                "_task_public",
+                return_value={"task_id": "writer-task", "state": "completed", "terminal": True},
+            ),
+            mock.patch.object(
+                workspace, "_start_role_task", side_effect=lambda *_: next(role_ids)
+            ),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            first = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("collecting", first["state"])
+
+        def task_state(task_id: str) -> dict:
+            if task_id == "tests-task":
+                return {
+                    "task_id": task_id,
+                    "state": "outcome_unknown",
+                    "terminal": False,
+                    "reconcile_required": True,
+                }
+            return {
+                "task_id": task_id,
+                "state": "completed" if task_id == "writer-task" else "running",
+                "terminal": task_id == "writer-task",
+            }
+
+        with (
+            mock.patch.object(workspace, "_task_public", side_effect=task_state),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            second = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("role_outcome_unknown", second["state"])
+        self.assertEqual("blocked", second["receipt_status"])
+        self.assertTrue(second["reconcile_required"])
+        self.assertEqual(["tests"], second["reconcile_roles"])
+        self.assertFalse(second["tasks"]["tests"]["terminal"])
+
     def test_unobserved_rootbroker_task_remains_nonterminal_in_workspace(self) -> None:
         task_id = "root-task"
         peek = {

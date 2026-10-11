@@ -5440,10 +5440,10 @@ def _role_retry_classification(
             return "preflight_probe_error", {"prior_preflight": latest}
         return "not_attempted", {}
     task_public = _task_public(task_id, read_only=read_only)
+    if task_public["state"] in {"observation_error", "outcome_unknown", "interrupted"} or task_public.get("reconcile_required") is True:
+        return "unknown_prior_outcome", {"task": task_public, "reconcile_required": True}
     if not task_public["terminal"]:
         return "role_running", {"task": task_public}
-    if task_public["state"] in {"observation_error", "outcome_unknown", "interrupted"}:
-        return "unknown_prior_outcome", {"task": task_public}
     receipt = _role_receipt(manifest, role)
     if receipt is None:
         return "unknown_prior_outcome", {"task": task_public}
@@ -5687,6 +5687,13 @@ def _recommended_next_action(
         if isinstance(value, dict)
     ):
         return "reconcile_role_start_outcome"
+    if any(
+        value.get("classification") == "unknown_prior_outcome"
+        and value.get("reconcile_required") is True
+        for value in role_retry.values()
+        if isinstance(value, dict)
+    ):
+        return "reconcile_role_task_outcome"
     for role_name in sorted(role_retry):
         if role_retry[role_name].get("eligible"):
             return f"retry_role:{role_name}"
@@ -8372,16 +8379,31 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 manifest["task_start_intents"] = intents
                 _write_manifest(manifest)
                 started_roles.append(role)
+        role_tasks = {role: _task_public(tasks_map[role]) for role in READ_ONLY_ROLES}
+        reconcile_roles = sorted(
+            role for role, value in role_tasks.items()
+            if value.get("state") in {"observation_error", "outcome_unknown", "interrupted"}
+            or value.get("reconcile_required") is True
+        )
+        if reconcile_roles:
+            return {
+                "workspace_id": identifier,
+                "state": "role_outcome_unknown",
+                "tasks": role_tasks,
+                "reconcile_roles": reconcile_roles,
+                "snapshot": snapshot,
+                "reconcile_required": True,
+                "receipt_status": "blocked",
+            }
         if started_roles:
             return {
                 "workspace_id": identifier,
                 "state": "collecting",
                 "started_roles": started_roles,
-                "tasks": {role: _task_public(tasks_map[role]) for role in READ_ONLY_ROLES},
+                "tasks": role_tasks,
                 "snapshot": snapshot,
                 "receipt_status": "passed",
             }
-        role_tasks = {role: _task_public(tasks_map[role]) for role in READ_ONLY_ROLES}
         if not all(value["terminal"] for value in role_tasks.values()):
             return {
                 "workspace_id": identifier,
