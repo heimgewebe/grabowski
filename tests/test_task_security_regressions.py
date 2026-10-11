@@ -725,5 +725,30 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 tasks._require_direct_codex_filesystem_sandbox(argv)
 
 
+    def test_interpreter_preload_flags_cannot_run_unverified_code(self) -> None:
+        # Preload modules run *before* a harmless inline body. Inspect only;
+        # never run or create the named payload files in this fixture.
+        dangerous = (
+            ["node", "--require", "/tmp/unsafe.js", "-e", "console.log('safe')"],
+            ["node", "--require=/tmp/unsafe.js", "-e", "console.log('safe')"],
+            ["node", "--import", "/tmp/unsafe.mjs", "-e", "console.log('safe')"],
+            ["node", "--loader=/tmp/unsafe.mjs", "-e", "console.log('safe')"],
+            ["ruby", "-r", "/tmp/unsafe.rb", "-e", "puts 'safe'"],
+            ["perl", "-r", "/tmp/unsafe.pl", "-e", "print 'safe'"],
+        )
+        for argv in dangerous:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        for argv in (
+            ["node", "-e", "console.log('safe')"],
+            ["ruby", "-e", "puts 'safe'"],
+            ["perl", "-e", "print 'safe'"],
+        ):
+            with self.subTest(allowed=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
 if __name__ == "__main__":
     unittest.main()

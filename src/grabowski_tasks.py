@@ -4502,20 +4502,14 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                 )
                 inline_code_index = len(payload_tokens) - 1
                 break
-            if item in {"-r", "--require", "--import", "--loader"}:
-                if index + 1 >= len(argv):
-                    raise RuntimeError(
-                        "Codex filesystem sandbox cannot verify interpreter preload"
-                    )
-                if codex_entrypoint(argv[index + 1]):
-                    payload_tokens.append(argv[index + 1])
-                index += 2
-                continue
-            if item.startswith(("--require=", "--import=", "--loader=")):
-                if codex_entrypoint(item.split("=", 1)[1]):
-                    payload_tokens.append(item.split("=", 1)[1])
-                index += 1
-                continue
+            # Every explicit preload can execute code before a harmless
+            # inline body. A non-Codex module name is not sandbox evidence.
+            if item in {"-r", "--require", "--import", "--loader"} or item.startswith(
+                ("--require=", "--import=", "--loader=")
+            ):
+                raise RuntimeError(
+                    "Codex filesystem sandbox cannot verify interpreter preload"
+                )
             if item in {"-I", "--no-warnings", "--no-deprecation",
                         "--experimental-modules", "--disable-gems", "-w", "-W"}:
                 index += 1
