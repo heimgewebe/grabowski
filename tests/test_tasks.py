@@ -9258,6 +9258,43 @@ class TaskTests(unittest.TestCase):
         row.assert_not_called()
         self.assertFalse(self.database.exists())
 
+    def test_shared_task_status_rechecks_mutation_authority_under_lock(self) -> None:
+        # The policy may change while waiting for the shared process lock.
+        task_id = "0" * 24
+        guard_positions: list[str] = []
+        inside_lock = False
+
+        @contextmanager
+        def held_lock():
+            nonlocal inside_lock
+            inside_lock = True
+            try:
+                yield
+            finally:
+                inside_lock = False
+
+        def authorize(capability: str, **kwargs) -> None:
+            self.assertEqual("durable_job", capability)
+            self.assertEqual({"task_id": task_id}, kwargs)
+            guard_positions.append("inside" if inside_lock else "before")
+            if inside_lock:
+                raise PermissionError("policy revoked while waiting for task lock")
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation", side_effect=authorize),
+            patch.object(tasks, "_task_mutation_lock", side_effect=held_lock),
+            patch.object(tasks, "_row", side_effect=AssertionError("store accessed after revocation")) as row,
+            patch.object(tasks, "_maintain_record_resources") as maintain,
+            patch.object(tasks, "_set_state") as persist,
+        ):
+            with self.assertRaisesRegex(PermissionError, "policy revoked"):
+                tasks.grabowski_task_status(task_id)
+        self.assertEqual(["before", "inside"], guard_positions)
+        row.assert_not_called()
+        maintain.assert_not_called()
+        persist.assert_not_called()
+        self.assertFalse(self.database.exists())
+
     def test_task_peek_cannot_initialize_missing_store(self) -> None:
         with (
             patch.object(tasks, "_database") as database,
@@ -9326,7 +9363,10 @@ class TaskTests(unittest.TestCase):
         probe.assert_not_called()
         gate.assert_not_called()
         database.assert_not_called()
-        self.assertEqual("outcome_unknown", result["state"])
+        self.assertEqual("observation_error", result["state"])
+        self.assertEqual(created["state"], result["persisted_state"])
+        self.assertNotEqual(result["state"], result["persisted_state"])
+        self.assertFalse(tasks._is_terminal_state(result["state"]))
         self.assertEqual("persisted_only_rootbroker_not_probed", result["observation_mode"])
         self.assertEqual("unknown", result["systemd_unit_health"]["status"])
         self.assertEqual(

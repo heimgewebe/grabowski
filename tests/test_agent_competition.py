@@ -2187,12 +2187,17 @@ class AgentCompetitionTests(unittest.TestCase):
 
     def test_unobserved_rootbroker_task_is_not_provider_terminal(self) -> None:
         started = self._start()
-        for persisted_state in ("running", "outcome_unknown"):
-            with self.subTest(persisted_state=persisted_state):
+        for persisted_state, observed_state in (
+            ("running", "outcome_unknown"),
+            ("running", "observation_error"),
+            ("outcome_unknown", "outcome_unknown"),
+            ("outcome_unknown", "observation_error"),
+        ):
+            with self.subTest(persisted_state=persisted_state, observed_state=observed_state):
                 projection = {
                     "task_id": started["task_id"],
                     "unit": "root-unit",
-                    "state": "outcome_unknown",
+                    "state": observed_state,
                     "persisted_state": persisted_state,
                     "observation_mode": "persisted_only_rootbroker_not_probed",
                     "reconcile_required": True,
