@@ -135,13 +135,30 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn("steps.trusted_checkout.outcome == 'success'", fetch)
         self.assertIn("if: always()", evaluate)
         self.assertIn('"$CHECKOUT_OUTCOME" != "success"', evaluate)
-        self.assertIn('"$FETCH_OUTCOME" != "success"', evaluate)
+        self.assertIn(
+            'elif [ "$FETCH_OUTCOME" != "success" ] && ! gh pr diff',
+            evaluate,
+        )
+        self.assertIn('gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"', evaluate)
         self.assertIn("trusted_pr_object_pinning_failed", evaluate)
         self.assertIn('github_state:"failure"', evaluate)
         self.assertIn("if: always()", publish)
         self.assertIn("|| 'failure'", publish)
         self.assertIn("if: always()", fail)
-        self.assertIn("steps.fetched_objects.outcome != 'success'", fail)
+        self.assertNotIn("steps.fetched_objects.outcome != 'success'", fail)
+
+    def test_failed_prefetch_does_not_block_normal_provider_diff(self) -> None:
+        evaluate = self.text.split(
+            "      - name: Evaluate current-head settlement\n", 1
+        )[1].split("      - name: Publish settlement status\n", 1)[0]
+        fail = self.text.split("      - name: Fail blocked settlement\n", 1)[1]
+        self.assertIn('if [ "$CHECKOUT_OUTCOME" != "success" ]; then', evaluate)
+        self.assertNotIn('|| [ "$FETCH_OUTCOME" != "success" ]', evaluate)
+        self.assertIn("python3 tools/codex_review_settlement.py", evaluate)
+        self.assertIn('--arg head "$HEAD_SHA"', evaluate)
+        self.assertIn('--arg base "$BASE_SHA"', evaluate)
+        self.assertIn('.head_sha == $head and .evidence.base_sha == $base', evaluate)
+        self.assertNotIn("steps.fetched_objects.outcome != 'success'", fail)
 
     def test_permissions_are_observer_only_except_status_publication(self) -> None:
         self.assertIn("  contents: read\n", self.text)
@@ -194,7 +211,7 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         evaluate_section = self.text.split(
             "      - name: Evaluate current-head settlement\n", 1
         )[1].split("      - name: Publish settlement status\n", 1)[0]
-        self.assertIn("if ! jq -e '", evaluate_section)
+        self.assertIn('if ! jq -e --arg head "$HEAD_SHA" --arg base "$BASE_SHA"', evaluate_section)
         self.assertIn("trusted_evaluator_output_invalid", evaluate_section)
         self.assertIn("codex-review-settlement.invalid.json", evaluate_section)
         self.assertIn("status_code", evaluate_section)
