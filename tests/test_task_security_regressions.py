@@ -505,14 +505,28 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 )
 
     def test_reviewer_p1_env_optional_signal_flags_cannot_hide_codex(self) -> None:
-        for argv in (
-            ["/usr/bin/env", "--block-signal", "SIGTERM", "codex", "exec", "prompt"],
+        # GNU env --block-signal takes an OPTIONAL attached argument.
+        # The separated form "--block-signal SIGTERM codex" attempts to exec
+        # SIGTERM (exit 127), not codex, so is not an executable bypass.
+        executable = (
             ["/usr/bin/env", "--block-signal=SIGTERM", "codex", "exec", "prompt"],
-            ["/usr/bin/env", "-iS", "--block-signal KILL codex exec"],
-        ):
+            ["/usr/bin/env", "--default-signal=TERM", "codex", "exec", "prompt"],
+            ["/usr/bin/env", "--ignore-signal=PIPE", "codex", "exec", "prompt"],
+            ["/usr/bin/env", "-S",
+             "--block-signal=TERM codex exec prompt"],
+        )
+        for argv in executable:
             with self.subTest(argv=argv):
                 with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
                     tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        # Signal option values do not by themselves make cargo a Codex launch.
+        for argv in (
+            ["/usr/bin/env", "--block-signal=TERM", "cargo", "build"],
+            ["/usr/bin/env", "--default-signal=TERM", "cargo", "test"],
+        ):
+            with self.subTest(non_agent=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
 
     def test_reviewer_p1_busybox_shell_applets_cannot_hide_codex(self) -> None:
         for shell in ("ash", "hush"):
