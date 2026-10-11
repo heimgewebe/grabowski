@@ -285,6 +285,33 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
                 )
                 self.assertFalse(too_large, diagnostic)
 
+    def test_rest_only_http_406_line_limit_without_graphql_marker(self) -> None:
+        # Reported by gh CLI: this REST endpoint error contains no
+        # PullRequest.diff too_large GraphQL marker.
+        diagnostic = (
+            b"HTTP 406: Sorry, the diff exceeded the maximum number of lines "
+            b"(20000) (https://api.github.com/repos/heimgewebe/schauwerk/pulls/203)"
+        )
+        with (
+            mock.patch.object(pr_review_gate.shutil, "which", return_value="/usr/bin/gh"),
+            mock.patch.object(pr_review_gate.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout=b"", stderr=diagnostic,
+            )),
+        ):
+            _, _, too_large = pr_review_gate._current_pr_diff_bytes(
+                Path("/tmp/commonworld"), 203, changed_files=259
+            )
+        self.assertTrue(too_large)
+        for invalid in (
+            b"HTTP 406: request temporarily unavailable",
+            b"HTTP 401: Sorry, the diff exceeded the maximum number of lines (20000)",
+            b"HTTP 403: Sorry, the diff exceeded the maximum number of lines (20000)",
+            b"HTTP 406: Sorry, the diff exceeded the maximum number of lines",
+            b"HTTP 406: PullRequest.diff too_large",
+        ):
+            with self.subTest(diagnostic=invalid):
+                self.assertFalse(pr_review_gate._github_pr_diff_too_large(invalid, 259))
+
     def test_file_cap_fallback_rejects_non_406_authorization_errors(self) -> None:
         for diagnostic in (
             b"GraphQL: PullRequest.diff too_large",

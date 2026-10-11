@@ -658,11 +658,12 @@ def _github_pr_diff_too_large(diagnostic: bytes, changed_files: Any) -> bool:
         marker in diagnostic for marker in (b"HTTP 401", b"HTTP 403", b"HTTP 429")
     ):
         return False
-    line_limit = all(marker in diagnostic for marker in (
-        b"HTTP 406",
-        b"diff exceeded the maximum number of lines",
-        b"PullRequest.diff too_large",
-    ))
+    # REST gh CLI 20k-line errors omit GraphQL's PullRequest.diff marker.
+    # Accept only the exact HTTP 406 line-limit diagnostic, not generic 406s.
+    line_limit = re.search(
+        rb"HTTP 406: (?:Sorry, )?the diff exceeded the maximum number of lines \(20000\)",
+        diagnostic,
+    ) is not None
     file_limit = changed_files > GITHUB_PR_DIFF_MAX_FILES and any(
         marker in diagnostic for marker in GITHUB_PR_DIFF_TOO_LARGE_MARKERS
     )

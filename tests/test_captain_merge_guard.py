@@ -232,6 +232,35 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             )
         )
 
+    def test_rest_only_http_406_line_limit_without_graphql_marker(self) -> None:
+        # gh CLI emits the REST 20,000-line error without GraphQL's marker.
+        info = {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": (
+                "HTTP 406: Sorry, the diff exceeded the maximum number "
+                "of lines (20000) (https://api.github.com/repos/"
+                "heimgewebe/schauwerk/pulls/203)"
+            ),
+        }
+        self.assertTrue(
+            merge_guard._merge_guard_github_diff_too_large(info, changed_files=259)
+        )
+        for invalid in (
+            "HTTP 406: request temporarily unavailable",
+            "HTTP 401: Sorry, the diff exceeded the maximum number of lines (20000)",
+            "HTTP 403: Sorry, the diff exceeded the maximum number of lines (20000)",
+            "HTTP 406: Sorry, the diff exceeded the maximum number of lines",
+            "HTTP 406: PullRequest.diff too_large",
+        ):
+            with self.subTest(diagnostic=invalid):
+                self.assertFalse(merge_guard._merge_guard_github_diff_too_large(
+                    {**info, "stderr": invalid}, changed_files=259
+                ))
+        self.assertFalse(merge_guard._merge_guard_github_diff_too_large(
+            {**info, "returncode": 0}, changed_files=259
+        ))
+
     def test_file_cap_301_unauthorized_status_cannot_use_local_fallback(self) -> None:
         for diagnostic in (
             "GraphQL: PullRequest.diff too_large",

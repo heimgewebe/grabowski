@@ -1830,11 +1830,12 @@ def _merge_guard_github_diff_too_large(
         marker in message for marker in ("HTTP 401", "HTTP 403", "HTTP 429")
     ):
         return False
-    line_limit = all(marker in message for marker in (
-        "HTTP 406",
-        "diff exceeded the maximum number of lines",
-        "PullRequest.diff too_large",
-    ))
+    # REST gh CLI 20k-line errors omit GraphQL's PullRequest.diff marker.
+    # Accept only the exact HTTP 406 line-limit diagnostic, not generic 406s.
+    line_limit = re.search(
+        r"HTTP 406: (?:Sorry, )?the diff exceeded the maximum number of lines \(20000\)",
+        message,
+    ) is not None
     file_limit = changed_files > _MERGE_GUARD_GITHUB_DIFF_MAX_FILES and (
         "PullRequest.diff too_large" in message
         or "diff exceeded the maximum number of files" in message
