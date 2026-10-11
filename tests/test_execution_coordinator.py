@@ -346,6 +346,43 @@ class ExecutionCoordinatorTests(unittest.TestCase):
         self.assertEqual(collect.call_count, 1)
         self.assertEqual(result["status"], readback)
 
+    def test_collect_role_outcome_unknown_requires_reconciliation(self) -> None:
+        initial = self.status()
+        with (
+            mock.patch.object(
+                coordinator.workspace,
+                "grabowski_agent_workspace_status",
+                return_value=initial,
+            ) as status,
+            mock.patch.object(
+                coordinator.workspace,
+                "grabowski_agent_workspace_collect",
+                return_value={
+                    "state": "role_outcome_unknown",
+                    "reconcile_required": True,
+                    "receipt_status": "blocked",
+                    "reconcile_roles": ["tests"],
+                },
+            ) as collect,
+            mock.patch.object(
+                coordinator.workspace, "grabowski_agent_workspace_close"
+            ) as close,
+        ):
+            result = coordinator.run_workspace_candidate_coordinator(
+                "gaw-role-outcome-unknown", max_polls=3, poll_seconds=0
+            )
+
+        self.assertEqual(result["state"], "reconcile_required")
+        self.assertEqual(result["reason"], "collection_outcome_requires_reconciliation")
+        self.assertEqual(result["status"], initial)
+        self.assertEqual(
+            result["actions"],
+            [{"action": "collect", "state": "role_outcome_unknown"}],
+        )
+        status.assert_called_once_with("gaw-role-outcome-unknown")
+        collect.assert_called_once_with("gaw-role-outcome-unknown")
+        close.assert_not_called()
+
     def test_invalid_close_binding_refuses_close(self) -> None:
         collection = self.complete_collection()
         collection["writer_head"] = "not-a-head"
