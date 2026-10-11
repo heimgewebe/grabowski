@@ -7400,9 +7400,11 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
     if _is_root_systemd_backend(record):
         # The rootbroker's nominally observational show operation creates a
         # reference file and invokes a privileged client.  READ_ONLY callers
-        # must not execute that effect or recast stored active as terminal.
+        # must not execute that effect or present stored active as live truth.
+        # Unobserved active tasks have an explicitly nonterminal diagnostic
+        # state; their actual persisted state remains separate and available.
         terminal = _is_terminal_state(str(record["state"]))
-        result["state"] = record["state"]
+        result["state"] = record["state"] if terminal else "observation_error"
         result["last_observation"] = None
         result["observation_mode"] = "persisted_only_rootbroker_not_probed"
         result["observation_unavailable_reason"] = "privileged_broker_requires_mutation_gate"
