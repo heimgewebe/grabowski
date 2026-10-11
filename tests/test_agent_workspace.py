@@ -12452,22 +12452,29 @@ class AgentWorkspaceTests(unittest.TestCase):
 
 
     def _use_quiescent_handoff_checkout_snapshot(self, label: str) -> None:
-        # A positive READ_ONLY status requires a quiescent source snapshot.
-        # Explicit backup removes dependency on Python-version GC of setup
-        # connections while preserving strict WAL/SHM denial tests elsewhere.
-        snapshot = self.root / f"handoff-{label}-checkout.sqlite3"
-        source = sqlite3.connect(workspace.checkouts.CHECKOUT_DB)
-        target = sqlite3.connect(snapshot)
-        try:
-            source.backup(target)
-        finally:
-            target.close()
-            source.close()
-        for suffix in ("-wal", "-shm"):
-            self.assertFalse(Path(str(snapshot) + suffix).exists())
-        scope = mock.patch.object(workspace.checkouts, "CHECKOUT_DB", snapshot)
-        scope.start()
-        self.addCleanup(scope.stop)
+        # Positive READ_ONLY status checks both stores through immutable
+        # snapshots. Setup-time writer connections can retain WAL/SHM under
+        # Python 3.12; keep live-WAL rejection covered by separate tests.
+        for module, stem in (
+            (workspace.checkouts, "checkout"),
+            (workspace.resources, "resource"),
+        ):
+            original = module.CHECKOUT_DB if stem == "checkout" else module.RESOURCE_DB
+            snapshot = self.root / f"handoff-{label}-{stem}.sqlite3"
+            source = sqlite3.connect(original)
+            target = sqlite3.connect(snapshot)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+            for suffix in ("-wal", "-shm"):
+                self.assertFalse(Path(str(snapshot) + suffix).exists())
+            scope = mock.patch.object(
+                module, "CHECKOUT_DB" if stem == "checkout" else "RESOURCE_DB", snapshot
+            )
+            scope.start()
+            self.addCleanup(scope.stop)
 
     def test_writer_handoff_eligibility_reports_each_authority_blocker(self) -> None:
         manifest, leases = self._handoff_ready_manifest()
