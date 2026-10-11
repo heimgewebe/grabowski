@@ -258,60 +258,18 @@ CODEX_CREDENTIAL_COMMITMENT_DOMAIN = "grabowski.codex-credential-commitment.v1"
 ALLOWED_MCP = {"ask_context", "grounding_verify", "live_freshness", "repobrief_resource_read"}
 UPSTREAM_MCP = {"ask_context", "grounding_verify", "live_freshness"}
 REPOGROUND_MCP_SCHEMA_CONTRACT_COMMIT = "9c24c2887b4b5724686a5051e5feb8aa54783019"
-EXPECTED_REPOGROUND_READ_ONLY_KIND = "repobrief.mcp.read_only_frontdoor"
-EXPECTED_REPOGROUND_READ_ONLY_VERSION = "v1"
-EXPECTED_REPOGROUND_FRESHNESS_VALUES = ("fresh", "stale", "unknown", "not_comparable")
-EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH = (
-    "freshness_against_remote",
-    "remote_branch_state",
-    "pull_request_diff_current",
-    "runtime_correctness",
-    "repo_understood",
-    "merge_readiness",
-)
-EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH = (
-    "truth",
-    "correctness",
-    "completeness",
-    "runtime_behavior",
-    "test_sufficiency",
-    "regression_absence",
-    "repo_understood",
-    "claims_true",
-    "forensic_ready",
-    "review_complete",
-    "pr_mergeable",
-    "mcp_server_available",
-)
-EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH = (
-    "actual_reading_proven",
-    "answer_correct",
-    "repo_understood",
-    "all_relevant_context_used",
-    "claims_true",
-    "test_sufficiency",
-    "regression_absence",
-    "runtime_behavior",
-    "forensic_ready",
-    "merge_readiness",
-    "security_correctness",
-)
-EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS = (
-    "implicit_refresh",
-    "git_mutation",
-    "snapshot_creation_on_read",
-    "patch_application",
-    "pull_request_mutation",
-    "shell_execution",
-    "merge_authorization",
-)
-EXPECTED_ASK_CONTEXT_PACK_KIND = "repobrief.ask_context_pack"
-EXPECTED_ASK_CONTEXT_PACK_VERSION = "1.0"
-EXPECTED_GROUNDING_VERDICT_KIND = "repobrief.answer_grounding_verdict"
-EXPECTED_GROUNDING_VERDICT_VERSION = "1.0"
-EXPECTED_GROUNDING_VERDICT_STATUSES = frozenset(
-    {"pass", "fail", "warn", "degraded", "not_applicable"}
-)
+EXPECTED_REPOGROUND_READ_ONLY_KIND = base.EXPECTED_REPOGROUND_READ_ONLY_KIND
+EXPECTED_REPOGROUND_READ_ONLY_VERSION = base.EXPECTED_REPOGROUND_READ_ONLY_VERSION
+EXPECTED_REPOGROUND_FRESHNESS_VALUES = base.EXPECTED_REPOGROUND_FRESHNESS_VALUES
+EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH = base.EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH
+EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH = base.EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH
+EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH = base.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS = base.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS
+EXPECTED_ASK_CONTEXT_PACK_KIND = base.EXPECTED_ASK_CONTEXT_PACK_KIND
+EXPECTED_ASK_CONTEXT_PACK_VERSION = base.EXPECTED_ASK_CONTEXT_PACK_VERSION
+EXPECTED_GROUNDING_VERDICT_KIND = base.EXPECTED_GROUNDING_VERDICT_KIND
+EXPECTED_GROUNDING_VERDICT_VERSION = base.EXPECTED_GROUNDING_VERDICT_VERSION
+EXPECTED_GROUNDING_VERDICT_STATUSES = base.EXPECTED_GROUNDING_VERDICT_STATUSES
 _REPOGROUND_SELECTOR_PROPERTIES: dict[str, Any] = {
     "bundle_manifest": {
         "type": ["string", "null"],
@@ -1178,243 +1136,31 @@ def _validated_resource_read_result(value: Any, *, expected_uri: str) -> dict[st
     return json.loads(json.dumps(value))
 
 
-def _validated_live_freshness_payload(
-    value: Any, *, expected_manifest: Path
+def _rebind_resource_read_manifest(
+    value: Mapping[str, Any],
+    *,
+    staged_manifest: Path,
+    external_manifest: Path,
 ) -> dict[str, Any]:
-    common = {
-        "kind", "version", "status", "reason", "bundle_manifest", "repo_root",
-        "read_only_git_probe", "implicit_refresh", "does_not_establish",
-    }
-    extended = common | {"freshness_values", "snapshot_provenance", "current_provenance"}
-    if not isinstance(value, dict) or frozenset(value) not in {frozenset(common), frozenset(extended)}:
-        raise RunnerError("RepoGround live_freshness payload is malformed")
-    if (
-        value.get("kind") != "repobrief.live_freshness"
-        or value.get("version") != "v1"
-        or value.get("status") not in EXPECTED_REPOGROUND_FRESHNESS_VALUES
-        or not isinstance(value.get("reason"), str)
-        or not value.get("reason")
-        or value.get("bundle_manifest") != str(expected_manifest)
-        or (value.get("repo_root") is not None and not isinstance(value.get("repo_root"), str))
-        or not isinstance(value.get("read_only_git_probe"), bool)
-        or value.get("implicit_refresh") is not False
-        or value.get("does_not_establish") != list(EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH)
-    ):
-        raise RunnerError("RepoGround live_freshness payload is malformed")
-    if set(value) == extended:
-        if (
-            value.get("freshness_values") != list(EXPECTED_REPOGROUND_FRESHNESS_VALUES)
-            or (value.get("snapshot_provenance") is not None and not isinstance(value.get("snapshot_provenance"), dict))
-            or (value.get("current_provenance") is not None and not isinstance(value.get("current_provenance"), dict))
-        ):
-            raise RunnerError("RepoGround live_freshness payload is malformed")
-    return json.loads(json.dumps(value))
-
-
-def _validated_read_only_frontdoor_projection(value: Mapping[str, Any]) -> None:
-    boundary = value.get("mutation_boundary")
-    if not isinstance(boundary, dict) or boundary.get("writes") != []:
-        raise RunnerError("RepoGround treatment tool read-only boundary is malformed")
-    guarded_booleans = {
-        "read_only": True,
-        "read_paths_do_not_refresh": True,
-        "not_reachable_from_snapshot_create": True,
-        "explicit_write_tool": False,
-    }
-    for field, expected in guarded_booleans.items():
-        if field in boundary and boundary.get(field) is not expected:
-            raise RunnerError("RepoGround treatment tool read-only boundary is malformed")
-    forbidden = boundary.get("forbidden_operations")
-    if forbidden is not None and (
-        not isinstance(forbidden, list)
-        or not {"secret_read", "snapshot_create_side_effect"}.issubset(set(forbidden))
-    ):
-        raise RunnerError("RepoGround treatment tool read-only boundary is malformed")
-    dne = value.get("does_not_establish")
-    expected_items = list(EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH)
-    if isinstance(dne, list):
-        valid_dne = dne == expected_items
-    elif isinstance(dne, dict):
-        valid_dne = (
-            set(dne) == {"ref", "items"}
-            and dne.get("ref") == "repobrief.does_not_establish.default.v1"
-            and dne.get("items") == expected_items
+    rebound = json.loads(json.dumps(value))
+    meta = rebound.get("_meta")
+    repoground = meta.get("repoground") if isinstance(meta, dict) else None
+    freshness = repoground.get("liveFreshness") if isinstance(repoground, dict) else None
+    if not isinstance(freshness, dict):
+        return rebound
+    if freshness.get("bundle_manifest") != str(staged_manifest):
+        raise RunnerError(
+            "RepoGround resource live freshness manifest does not match staged manifest"
         )
-    else:
-        valid_dne = False
-    if not valid_dne:
-        raise RunnerError("RepoGround treatment tool non-claim projection is malformed")
+    freshness["bundle_manifest"] = str(external_manifest)
+    return rebound
 
 
-def _validated_ask_context_pack(value: Any) -> dict[str, Any]:
-    base_keys = {
-        "kind", "version", "request_id", "snapshot_ref", "freshness",
-        "availability", "required_reading", "retrieval",
-        "retrieval_infrastructure", "retrieval_hits", "resolved_ranges",
-        "answer_scaffold", "budget", "forbidden_operations",
-        "does_not_establish",
-    }
-    if not isinstance(value, dict) or frozenset(value) not in {
-        frozenset(base_keys), frozenset(base_keys | {"structured_evidence"})
-    }:
-        raise RunnerError("RepoGround ask_context context pack is malformed")
-    request_id = value.get("request_id")
-    if (
-        value.get("kind") != EXPECTED_ASK_CONTEXT_PACK_KIND
-        or value.get("version") != EXPECTED_ASK_CONTEXT_PACK_VERSION
-        or not isinstance(request_id, str)
-        or re.fullmatch(r"[0-9a-f]{16}", request_id) is None
-        or not all(isinstance(value.get(name), dict) for name in (
-            "snapshot_ref", "freshness", "availability", "required_reading",
-            "retrieval", "retrieval_infrastructure", "answer_scaffold", "budget"
-        ))
-        or not isinstance(value.get("retrieval_hits"), list)
-        or not isinstance(value.get("resolved_ranges"), list)
-        or value.get("forbidden_operations") != list(EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS)
-        or value.get("does_not_establish") != list(EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH)
-        or ("structured_evidence" in value and not isinstance(value.get("structured_evidence"), dict))
-    ):
-        raise RunnerError("RepoGround ask_context context pack is malformed")
-    freshness = value["freshness"]
-    availability = value["availability"]
-    infrastructure = value["retrieval_infrastructure"]
-    if (
-        freshness.get("status") not in {"fresh", "stale", "unknown", "not_comparable", "not_applicable"}
-        or availability.get("status") not in {"available", "partial", "missing", "unknown"}
-        or infrastructure.get("status") not in {"available", "missing", "invalid", "unknown"}
-    ):
-        raise RunnerError("RepoGround ask_context context pack is malformed")
-    scaffold = value["answer_scaffold"]
-    if (
-        set(scaffold) != {"citation_obligations", "caveats_to_surface", "non_claims_to_surface"}
-        or not isinstance(scaffold.get("citation_obligations"), list)
-        or not isinstance(scaffold.get("caveats_to_surface"), list)
-        or scaffold.get("non_claims_to_surface") != list(EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH)
-    ):
-        raise RunnerError("RepoGround ask_context context pack is malformed")
-    budget = value["budget"]
-    budget_keys = {
-        "max_context_tokens", "token_derived_byte_ceiling", "max_context_bytes",
-        "max_answer_tokens", "context_bytes_used",
-        "context_unicode_characters_used", "approx_context_chars_used",
-        "byte_budget_is_hard", "unit", "accounting", "omissions",
-        "truncated", "does_not_establish_quality",
-    }
-    integer_fields = (
-        "max_context_tokens", "token_derived_byte_ceiling", "max_context_bytes",
-        "max_answer_tokens", "context_bytes_used",
-        "context_unicode_characters_used", "approx_context_chars_used",
-    )
-    if (
-        set(budget) != budget_keys
-        or any(
-            isinstance(budget.get(name), bool)
-            or not isinstance(budget.get(name), int)
-            or budget.get(name) < 0
-            for name in integer_fields
-        )
-        or budget.get("byte_budget_is_hard") is not True
-        or budget.get("unit") != "utf8_bytes"
-        or not isinstance(budget.get("accounting"), str)
-        or not budget.get("accounting")
-        or not isinstance(budget.get("omissions"), list)
-        or not isinstance(budget.get("truncated"), bool)
-        or budget.get("does_not_establish_quality") is not True
-    ):
-        raise RunnerError("RepoGround ask_context context pack is malformed")
-    return json.loads(json.dumps(value))
-
-
-def _validated_grounding_verdict(value: Any) -> dict[str, Any]:
-    expected_keys = {
-        "kind", "version", "status", "checked_declaration", "snapshot_ref",
-        "citation_checks", "range_checks", "required_reading_checks",
-        "diagnostics", "freshness_caveats", "availability_caveats",
-        "does_not_establish",
-    }
-    if (
-        not isinstance(value, dict)
-        or set(value) != expected_keys
-        or value.get("kind") != EXPECTED_GROUNDING_VERDICT_KIND
-        or value.get("version") != EXPECTED_GROUNDING_VERDICT_VERSION
-        or value.get("status") not in EXPECTED_GROUNDING_VERDICT_STATUSES
-        or not isinstance(value.get("checked_declaration"), dict)
-        or not isinstance(value.get("snapshot_ref"), dict)
-        or any(
-            not isinstance(value.get(name), list)
-            for name in (
-                "citation_checks", "range_checks", "required_reading_checks",
-                "diagnostics", "freshness_caveats", "availability_caveats"
-            )
-        )
-        or any(
-            not isinstance(item, dict)
-            for name in ("citation_checks", "range_checks", "required_reading_checks", "diagnostics")
-            for item in value.get(name, [])
-        )
-        or value.get("does_not_establish") != list(EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH)
-    ):
-        raise RunnerError("RepoGround grounding_verify verdict is malformed")
-    return json.loads(json.dumps(value))
-
-
-def _validated_treatment_structured_payload(
-    value: Any, *, tool_name: str, expected_manifest: Path, is_error: bool
-) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise RunnerError("RepoGround treatment tool structured payload is malformed")
-    if is_error:
-        if (
-            set(value) != {"status", "tool", "error"}
-            or value.get("status") != "error"
-            or value.get("tool") != tool_name
-            or not isinstance(value.get("error"), str)
-            or not value.get("error")
-        ):
-            raise RunnerError("RepoGround treatment tool structured payload is malformed")
-        return json.loads(json.dumps(value))
-    if tool_name == "live_freshness":
-        return _validated_live_freshness_payload(value, expected_manifest=expected_manifest)
-    common = {
-        "kind", "version", "tool", "status", "mutation_boundary",
-        "does_not_establish", "live_freshness",
-    }
-    if tool_name == "ask_context":
-        expected_keys = common | {"context_pack", "request_semantics", "context_pack_semantics"}
-        valid = (
-            set(value) == expected_keys
-            and value.get("kind") == EXPECTED_REPOGROUND_READ_ONLY_KIND
-            and value.get("version") == EXPECTED_REPOGROUND_READ_ONLY_VERSION
-            and value.get("tool") == "ask_context"
-            and value.get("status") == "ok"
-            and value.get("request_semantics") == "repobrief.ask_request.v1"
-            and value.get("context_pack_semantics") == "repobrief.ask_context_pack.v1"
-        )
-    elif tool_name == "grounding_verify":
-        expected_keys = common | {"verdict", "declaration_semantics", "verdict_semantics"}
-        verdict = _validated_grounding_verdict(value.get("verdict"))
-        verdict_status = verdict["status"]
-        valid = (
-            set(value) == expected_keys
-            and value.get("kind") == EXPECTED_REPOGROUND_READ_ONLY_KIND
-            and value.get("version") == EXPECTED_REPOGROUND_READ_ONLY_VERSION
-            and value.get("tool") == "grounding_verify"
-            and isinstance(value.get("status"), str)
-            and value.get("status") == verdict_status
-            and value.get("declaration_semantics") == "repobrief.answer_grounding_declaration.v1"
-            and value.get("verdict_semantics") == "repobrief.answer_grounding_verdict.v1"
-        )
-    else:
-        raise RunnerError("RepoGround treatment tool response is not authorized")
-    if not valid:
-        raise RunnerError("RepoGround treatment tool structured payload is malformed")
-    _validated_read_only_frontdoor_projection(value)
-    if tool_name == "ask_context":
-        _validated_ask_context_pack(value.get("context_pack"))
-    _validated_live_freshness_payload(
-        value.get("live_freshness"), expected_manifest=expected_manifest
-    )
-    return json.loads(json.dumps(value))
+_validated_live_freshness_payload = base._validated_live_freshness_payload
+_validated_read_only_frontdoor_projection = base._validated_read_only_frontdoor_projection
+_validated_ask_context_pack = base._validated_ask_context_pack
+_validated_grounding_verdict = base._validated_grounding_verdict
+_validated_treatment_structured_payload = base._validated_treatment_structured_payload
 
 
 def _validated_treatment_tool_result(
@@ -1456,6 +1202,21 @@ def _validated_treatment_tool_result(
         if not isinstance(freshness, dict):
             raise RunnerError("RepoGround treatment tool freshness binding is missing")
         freshness["bundle_manifest"] = str(external_manifest)
+        if tool_name in {"grounding_verify", "ask_context"}:
+            parent = (
+                structured.get("verdict")
+                if tool_name == "grounding_verify"
+                else structured.get("context_pack")
+            )
+            snapshot_ref = (
+                parent.get("snapshot_ref") if isinstance(parent, dict) else None
+            )
+            if isinstance(snapshot_ref, dict) and "manifest_path" in snapshot_ref:
+                if snapshot_ref["manifest_path"] != str(expected_manifest):
+                    raise RunnerError(
+                        f"RepoGround {tool_name.replace('_verify', '')} snapshot manifest does not match staged manifest"
+                    )
+                snapshot_ref["manifest_path"] = str(external_manifest)
     return {
         "content": [{"type": "text", "text": canonical(structured)}],
         "structuredContent": structured,
@@ -4447,6 +4208,11 @@ def run_mcp_proxy(
                     validated_read = _validated_resource_read_result(
                         message.get("result"), expected_uri=_uri
                     )
+                    validated_read = _rebind_resource_read_manifest(
+                        validated_read,
+                        staged_manifest=staged_manifest,
+                        external_manifest=external_manifest,
+                    )
                     text = canonical(validated_read); is_error = False
                 if action == "list":
                     with state_lock:
@@ -5603,6 +5369,121 @@ def _codex_mcp_result_is_success(
     return False
 
 
+def _repoground_evidence_from_codex_events(
+    request: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]],
+    calls: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    if request.get("condition") != "treatment":
+        return None
+    binding = request.get("repobrief")
+    manifest = (
+        Path(str(binding.get("manifest")))
+        if isinstance(binding, Mapping) and isinstance(binding.get("manifest"), str)
+        else None
+    )
+    if manifest is None:
+        return None
+    sequence = 0
+    evidence_calls: list[dict[str, Any]] = []
+    commits: set[str] = set()
+    manifest_binding: tuple[str, str, str | None, frozenset[str]] | None = None
+    for event in events:
+        if event.get("type") != "item.completed":
+            continue
+        item = event.get("item") if isinstance(event.get("item"), dict) else {}
+        item_type = item.get("type")
+        if not isinstance(item_type, str):
+            continue
+        if item_type in {"agent_message", "reasoning", "todo_list"}:
+            continue
+        if item_type not in {"command_execution", "mcp_tool_call"}:
+            continue
+        sequence += 1
+        if item_type != "mcp_tool_call":
+            continue
+        tool_name = item.get("tool")
+        if not isinstance(tool_name, str):
+            continue
+        if tool_name not in {
+            "ask_context",
+            "grounding_verify",
+            "live_freshness",
+            "repobrief_resource_read",
+        }:
+            continue
+        if sequence > len(calls):
+            continue
+        call = calls[sequence - 1]
+        if call.get("name") != tool_name or call.get("status") != "success":
+            continue
+        result_value = item.get("result")
+        if not isinstance(result_value, Mapping):
+            continue
+        if tool_name == "repobrief_resource_read":
+            arguments = item.get("arguments")
+            if (
+                not isinstance(arguments, Mapping)
+                or arguments.get("action") != "read"
+            ):
+                continue
+            prepared_resource = base._repoground_resource_read_payload(
+                result=result_value,
+                expected_uri=arguments.get("uri"),
+            )
+            if prepared_resource is None:
+                continue
+            if manifest_binding is None:
+                manifest_binding = base._optional_repoground_manifest_binding(request)
+                if manifest_binding is None:
+                    return None
+            live_freshness, content_bytes = prepared_resource
+            normalized = base._repoground_resource_read_evidence(
+                manifest_binding=manifest_binding,
+                sequence=sequence,
+                live_freshness=live_freshness,
+                content_bytes=content_bytes,
+            )
+        else:
+            structured = result_value.get("structured_content")
+            if not isinstance(structured, Mapping):
+                continue
+            try:
+                payload = _validated_treatment_structured_payload(
+                    structured,
+                    tool_name=str(tool_name),
+                    expected_manifest=manifest,
+                    is_error=False,
+                )
+            except (RunnerError, TypeError, ValueError):
+                continue
+            if manifest_binding is None:
+                manifest_binding = base._optional_repoground_manifest_binding(request)
+                if manifest_binding is None:
+                    return None
+            try:
+                normalized = base._repoground_evidence_from_payload(
+                    manifest_binding=manifest_binding,
+                    tool_name=str(tool_name),
+                    sequence=sequence,
+                    payload=payload,
+                )
+            except (RunnerError, TypeError, ValueError):
+                continue
+        if normalized is None:
+            continue
+        commit, call_evidence = normalized
+        commits.add(commit)
+        evidence_calls.append(call_evidence)
+    if not evidence_calls or len(commits) != 1:
+        return None
+    return {
+        "target_commit": str(request["repository"]["commit"]),
+        "bundle_commit": next(iter(commits)),
+        "calls": evidence_calls,
+    }
+
+
 def normalize(
     request: Mapping[str, Any], events: Sequence[Mapping[str, Any]]
 ) -> tuple[int, int, list[dict[str, Any]], dict[str, Any]]:
@@ -5647,6 +5528,8 @@ def normalize(
             continue
         item = event.get("item") if isinstance(event.get("item"), dict) else {}
         item_type = item.get("type")
+        if not isinstance(item_type, str):
+            raise RunnerError("Codex completed item type must be a string")
         if item_type == "agent_message":
             if isinstance(item.get("text"), str):
                 answers.append(item["text"])
@@ -5663,13 +5546,15 @@ def normalize(
                 else "failed"
             )
         elif item_type == "mcp_tool_call":
+            tool_name = item.get("tool")
             if (
                 request["condition"] != "treatment"
                 or item.get("server") != "repobrief"
-                or item.get("tool") not in ALLOWED_MCP
+                or not isinstance(tool_name, str)
+                or tool_name not in ALLOWED_MCP
             ):
                 raise RunnerError("unapproved Codex MCP tool call")
-            name = str(item["tool"])
+            name = tool_name
             input_bytes = len(canonical(item.get("arguments")).encode("utf-8"))
             result_value = item.get("result")
             output_value = result_value if result_value is not None else item.get("error")
@@ -5738,6 +5623,9 @@ def receipt(
         raise RunnerError(f"Codex exited nonzero: {returncode}")
     events = parse_events(raw)
     input_tokens, output_tokens, calls, answer = normalize(request, events)
+    repoground_evidence = _repoground_evidence_from_codex_events(
+        request, events, calls
+    )
     elapsed = max(0, int((ended_at - started_at).total_seconds() * 1000))
     if elapsed > int(request["budgets"]["wall_seconds"]) * 1000:
         raise RunnerError("Codex wall budget exceeded")
@@ -5760,6 +5648,11 @@ def receipt(
         "duration_ms": elapsed,
         "exit_code": 0,
         "tool_calls": calls,
+        **(
+            {"repoground_evidence": repoground_evidence}
+            if repoground_evidence is not None
+            else {}
+        ),
         "answer": answer,
         "transcript": {
             "storage": "artifact",
