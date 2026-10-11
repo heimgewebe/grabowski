@@ -8664,10 +8664,12 @@ class AgentWorkspaceTests(unittest.TestCase):
             ("tests", "outcome_unknown", False),
             ("tests", "observation_error", False),
             ("tests", "interrupted", False),
+            ("tests", "unknown", False),
             ("tests", "running", True),
             ("review", "outcome_unknown", False),
             ("review", "observation_error", False),
             ("review", "interrupted", False),
+            ("review", "unknown", False),
             ("review", "running", True),
         )
         for existing, state, reconciliation in cases:
@@ -8812,6 +8814,53 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual("tests-task", persisted["tasks"]["tests"])
         self.assertIsNone(persisted["tasks"]["review"])
         self.assertEqual({}, persisted["task_start_intents"])
+
+    def test_collect_role_launch_serializes_reconciliation_and_start(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        held = False
+        observations = []
+        starts = []
+
+        @contextmanager
+        def task_mutation_guard():
+            nonlocal held
+            self.assertFalse(held)
+            held = True
+            try:
+                yield
+            finally:
+                held = False
+
+        def task_state(task_id: str, *, read_only: bool = False) -> dict:
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            if read_only:
+                observations.append((task_id, held))
+            return {"task_id": task_id, "state": "running", "terminal": False}
+
+        def role_start(_manifest: dict, role: str, _snapshot: dict) -> dict:
+            starts.append((role, held, list(observations)))
+            return {"task_id": f"{role}-task"}
+
+        with (
+            mock.patch.object(
+                workspace.tasks, "_task_mutation_lock", side_effect=task_mutation_guard
+            ),
+            mock.patch.object(workspace, "_task_public", side_effect=task_state),
+            mock.patch.object(workspace, "_start_role_task", side_effect=role_start),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("collecting", result["state"])
+        self.assertEqual(["tests", "review"], [role for role, _, _ in starts])
+        self.assertTrue(all(under_lock for _, under_lock, _ in starts))
+        self.assertTrue(
+            any(task_id == "tests-task" and under_lock
+                for task_id, under_lock in starts[-1][2])
+        )
 
     def test_collect_starts_both_roles_when_no_uncertain_outcome(self) -> None:
         manifest = self.manifest()
