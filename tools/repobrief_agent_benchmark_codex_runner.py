@@ -5119,6 +5119,8 @@ def parse_events(raw: bytes) -> list[dict[str, Any]]:
             raise RunnerError(f"Codex transcript line {number} invalid JSON") from exc
         if not isinstance(value, dict):
             raise RunnerError(f"Codex transcript line {number} not object")
+        if not isinstance(value.get("type"), str) or not value["type"]:
+            raise RunnerError(f"Codex transcript line {number} event type must be a nonempty string")
         result.append(value)
     if not result:
         raise RunnerError("Codex transcript contains no events")
