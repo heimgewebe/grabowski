@@ -382,6 +382,12 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
             }
             payload = pr_review_gate._local_bound_pr_diff_bytes(repo, view)
             self.assertIn(b"deps/module", payload)
+            import grabowski_merge_guard as merge_guard
+            paths, _info, errors = merge_guard._merge_guard_local_changed_paths(
+                repo, base_sha=base, head_sha=head,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(paths, ["deps/module"])
 
     def test_advanced_base_uses_single_merge_base_not_two_endpoint_diff(self) -> None:
         import subprocess
