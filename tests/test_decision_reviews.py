@@ -325,7 +325,111 @@ def make_job(
     return directory
 
 
+def stamp_claude_quota_429(directory: Path, *, envelope_updates: dict | None = None,
+                           receipt_updates: dict | None = None) -> None:
+    """Synthetic exact transcript and job-owned V2 receipt, no provider call."""
+    receipt_path = directory / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    envelope = {
+        "type": "result", "is_error": True, "terminal_reason": "api_error",
+        "api_error_status": 429, "modelUsage": {},
+        "permission_denials": [], "total_cost_usd": 0,
+        "usage": {
+            "input_tokens": 0, "output_tokens": 0, "iterations": [],
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+        },
+        "subagent_stats": {"spawned": 0},
+        "result": "You've hit your weekly limit",
+    }
+    envelope.update(envelope_updates or {})
+    payload = (json.dumps(envelope, separators=(",", ":")) + "\n").encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    receipt.update({
+        "verdict": "INVALID", "findings": [], "returncode": 126,
+        "failure_classification": "invalid_review_output",
+        "stdout_tail": payload.decode("utf-8"),
+        "stdout_bytes": len(payload), "stdout_sha256": digest,
+        "review_provider_envelope_bytes": len(payload),
+        "review_provider_envelope_sha256": digest,
+        "review_provider_contract": "claude-headless-bound-diff-json-v1",
+        "review_document_bytes": 0, "review_document_sha256": None,
+        "review_findings_normalized": False, "stderr_bytes": 0,
+    })
+    receipt.update(receipt_updates or {})
+    receipt["receipt_sha256"] = reviews._agent_role_receipt_sha256(receipt)
+    write_private(receipt_path, json.dumps(receipt))
+
+
 class DecisionReviewReconciliationTests(unittest.TestCase):
+    def test_v2_claude_429_blocks_until_exact_later_same_slot_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a88888888888", slot="claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            stamp_claude_quota_429(failed)
+            prior = self.reconcile(jobs)
+            self.assertEqual(prior["status"], "blocked")
+            self.assertIn("decision_review_slot_without_pass:claude", prior["errors"])
+            self.assertEqual(prior["attempts"][0]["classification"], "infrastructure_error")
+            make_job(
+                jobs, suffix="b99999999999", slot="claude",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_200,
+            )
+            settled = self.reconcile(jobs)
+        self.assertEqual(settled["status"], "settled")
+        self.assertEqual(settled["errors"], [])
+        self.assertEqual(settled["slots"][0]["independent_pass_count"], 1)
+        self.assertEqual(settled["slots"][0]["infrastructure_error_count"], 1)
+
+    def test_v2_429_near_misses_remain_blocking_even_after_valid_pass(self) -> None:
+        cases = [
+            ("http_401", {"api_error_status": 401}, {}),
+            ("nonzero_output", {"usage": {
+                "input_tokens": 0, "output_tokens": 1,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+            }}, {}),
+            ("material_document", {}, {"review_document_bytes": 14}),
+            ("unbound_envelope", {}, {"review_provider_envelope_sha256": "f" * 64}),
+            ("ambiguous_report", {}, {"review_findings_normalized": True}),
+            ("tool_use", {"usage": {
+                "input_tokens": 0, "output_tokens": 0, "iterations": [],
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 0},
+            }}, {}),
+        ]
+        for label, envelope_delta, receipt_delta in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                jobs = Path(temporary) / "jobs"
+                jobs.mkdir(mode=0o700)
+                failed = make_job(
+                    jobs, suffix="a88888888888", slot="claude",
+                    terminal_status="failed", review_result=None,
+                    review_role=True, attempt_bound=True, attempt_epoch=2,
+                )
+                stamp_claude_quota_429(
+                    failed, envelope_updates=envelope_delta, receipt_updates=receipt_delta,
+                )
+                make_job(
+                    jobs, suffix="b99999999999", slot="claude",
+                    terminal_status="succeeded", review_result=None,
+                    review_role=True, attempt_bound=True, attempt_epoch=2,
+                    created_at_unix=1_787_000_200,
+                )
+                outcome = self.reconcile(jobs)
+                self.assertEqual(outcome["status"], "blocked")
+                self.assertIn(
+                    "decision_review_result_invalid:grabowski-job-a88888888888:InvalidReviewDocument",
+                    outcome["errors"],
+                )
+
     def test_review_role_provenance_uses_agent_role_command_hash_for_unicode_prompt(self) -> None:
         role_command = [
             "claude",

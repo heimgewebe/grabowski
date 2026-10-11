@@ -1006,6 +1006,76 @@ def _normalize_review_role_provenance(
     return value
 
 
+def _proven_claude_quota_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any]
+) -> bool:
+    """Accept only an exact, bound 429 transport envelope with zero model work.
+
+    This never grants a review PASS: a later independent PASS from the same
+    registered provider slot is still mandatory before settlement.
+    """
+    if (
+        provenance.get("schema_version") != 2
+        or provenance.get("review_route", {}).get("provider_family") != "anthropic"
+        or receipt.get("verdict") != "INVALID"
+        or receipt.get("findings") != []
+        or receipt.get("failure_classification") != "invalid_review_output"
+        or receipt.get("returncode") != 126
+        or receipt.get("review_document_bytes") != 0
+        or receipt.get("review_document_sha256") is not None
+        or receipt.get("review_findings_normalized") is not False
+        or receipt.get("stderr_bytes") != 0
+        or receipt.get("review_provider_contract") != "claude-headless-bound-diff-json-v1"
+    ):
+        return False
+    tail = receipt.get("stdout_tail")
+    if not isinstance(tail, str):
+        return False
+    encoded = tail.encode("utf-8")
+    if (
+        not encoded
+        or type(receipt.get("stdout_bytes")) is not int
+        or len(encoded) != receipt["stdout_bytes"]
+        or receipt.get("review_provider_envelope_bytes") != len(encoded)
+        or receipt.get("stdout_sha256") != hashlib.sha256(encoded).hexdigest()
+        or receipt.get("review_provider_envelope_sha256") != receipt["stdout_sha256"]
+    ):
+        return False
+    try:
+        envelope = json.loads(tail)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(envelope, dict):
+        return False
+    usage = envelope.get("usage")
+    subagents = envelope.get("subagent_stats")
+    return (
+        envelope.get("type") == "result"
+        and envelope.get("is_error") is True
+        and envelope.get("terminal_reason") == "api_error"
+        and type(envelope.get("api_error_status")) is int
+        and envelope["api_error_status"] == 429
+        and envelope.get("modelUsage") == {}
+        and isinstance(usage, dict) and usage.get("iterations") == []
+        and envelope.get("permission_denials") == []
+        and type(envelope.get("total_cost_usd")) in {int, float}
+        and envelope["total_cost_usd"] == 0
+        and isinstance(usage, dict)
+        and all(
+            type(usage.get(field)) is int and usage[field] == 0
+            for field in (
+                "input_tokens", "output_tokens",
+                "cache_creation_input_tokens", "cache_read_input_tokens",
+            )
+        )
+        and isinstance(usage.get("server_tool_use"), dict)
+        and usage["server_tool_use"].get("web_search_requests") == 0
+        and usage["server_tool_use"].get("web_fetch_requests") == 0
+        and isinstance(subagents, dict)
+        and subagents.get("spawned") == 0
+    )
+
+
 def _validated_review_role_evidence(
     metadata: dict[str, Any], binding: dict[str, Any], provenance: dict[str, Any] | None
 ) -> dict[str, Any] | None:
@@ -1065,6 +1135,10 @@ def _validated_review_role_evidence(
         "role_receipt_sha256": expected_receipt_sha256,
         "review_route": provenance["review_route"],
         "result": result,
+        "pre_result_quota_failure_verified": (
+            result is None
+            and _proven_claude_quota_failure_before_review(receipt, provenance)
+        ),
     }
 
 
@@ -1359,8 +1433,15 @@ def reconcile(
             # Preserve legacy handling for old immutable attempts, but never
             # supersede the new ambiguous evidence on a later PASS.
             if provenance is not None and provenance.get("schema_version") == 2:
-                attempt["classification"] = "invalid_result"
-                errors.append(f"decision_review_result_invalid:{directory.name}:InvalidReviewDocument")
+                if (
+                    role_evidence is not None
+                    and role_evidence.get("pre_result_quota_failure_verified") is True
+                    and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
+                ):
+                    attempt["classification"] = "infrastructure_error"
+                else:
+                    attempt["classification"] = "invalid_result"
+                    errors.append(f"decision_review_result_invalid:{directory.name}:InvalidReviewDocument")
             else:
                 attempt["classification"] = "infrastructure_error"
             attempts.append(attempt)
