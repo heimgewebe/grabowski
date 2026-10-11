@@ -8305,6 +8305,9 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 "receipt_status": "blocked",
             }
         def _existing_role_reconciliation_block() -> dict[str, Any] | None:
+            # Task peek observes live systemd state without writing it; an
+            # unobserved Rootbroker task instead requires reconciliation.
+            # A persisted state mutation is not needed to block role admission.
             existing_tasks = {
                 existing_role: _task_public(tasks_map[existing_role], read_only=True)
                 for existing_role in READ_ONLY_ROLES

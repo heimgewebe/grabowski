@@ -9332,6 +9332,40 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(before, self.database.read_bytes())
         self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
 
+    def test_task_peek_detects_live_uncertainty_without_refreshing_store(self) -> None:
+        created = self._start()["task"]
+        task_id = created["task_id"]
+        persisted = created["state"]
+        self.assertIn(persisted, {"running", "launching"})
+        before = self.database.read_bytes()
+        for observed_state in ("outcome_unknown", "interrupted", "failed", "completed"):
+            with self.subTest(observed_state=observed_state):
+                probe = {
+                    "state": observed_state,
+                    "properties": {},
+                    "observed_at_unix": tasks._now(),
+                }
+                with (
+                    patch.object(tasks, "_observe", return_value=probe) as observer,
+                    patch.object(
+                        tasks, "_set_state",
+                        side_effect=AssertionError("READ_ONLY peek cannot persist state"),
+                    ) as mutating_writer,
+                    patch.object(
+                        tasks, "_maintain_record_resources",
+                        side_effect=AssertionError("READ_ONLY peek cannot maintain leases"),
+                    ) as lease_writer,
+                ):
+                    public = tasks.grabowski_task_peek(task_id)
+                observer.assert_called_once()
+                mutating_writer.assert_not_called()
+                lease_writer.assert_not_called()
+                self.assertEqual(observed_state, public["state"])
+                self.assertEqual(persisted, public["persisted_state"])
+                self.assertTrue(public["reconcile_required"])
+                self.assertEqual("unpersisted_readonly_probe", public["observation_mode"])
+                self.assertEqual(before, self.database.read_bytes())
+
     def test_root_broker_peek_is_persisted_only_without_privileged_probe(self) -> None:
         created = self._start()["task"]
         writer = tasks._database()

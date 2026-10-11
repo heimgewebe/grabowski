@@ -9,6 +9,7 @@ import sqlite3
 from pathlib import Path, PurePosixPath
 import stat
 import subprocess
+import threading
 import sys
 import tempfile
 import time
@@ -8814,6 +8815,69 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual("tests-task", persisted["tasks"]["tests"])
         self.assertIsNone(persisted["tasks"]["review"])
         self.assertEqual({}, persisted["task_start_intents"])
+
+    def test_collect_admission_excludes_real_concurrent_state_mutation(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        manifest["tasks"]["tests"] = "tests-task"
+        workspace._write_manifest(manifest)
+        worker_attempted = threading.Event()
+        competing_mutation_entered = threading.Event()
+        writer_done = threading.Event()
+        child_threads = []
+
+        completed_mutation_result = []
+
+        def competing_writer():
+            worker_attempted.set()
+            try:
+                # Real @_serialize_task_mutation entry point: it must not reach
+                # even the missing-task validation while the launch holds lock.
+                workspace.tasks._set_state("0" * 24, "outcome_unknown")
+                completed_mutation_result.append("unexpected_success")
+            except ValueError:
+                completed_mutation_result.append("missing_task")
+            finally:
+                competing_mutation_entered.set()
+                writer_done.set()
+
+        def role_task_state(task_id: str, *, read_only: bool = False) -> dict:
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            return {"task_id": task_id, "state": "running", "terminal": False}
+
+        def launch_review(_manifest: dict, role: str, _snapshot: dict) -> dict:
+            self.assertEqual("review", role)
+            # The actual task-start path re-enters the same global lock.
+            with workspace.tasks._task_mutation_lock():
+                self.assertFalse(competing_mutation_entered.is_set())
+            thread = threading.Thread(target=competing_writer, daemon=True)
+            child_threads.append(thread)
+            thread.start()
+            self.assertTrue(worker_attempted.wait(2.0))
+            self.assertFalse(
+                competing_mutation_entered.wait(0.075),
+                "another task-state writer entered between sibling check and launch",
+            )
+            return {"task_id": "review-task"}
+
+        try:
+            with (
+                mock.patch.object(workspace, "_task_public", side_effect=role_task_state),
+                mock.patch.object(workspace, "_start_role_task", side_effect=launch_review),
+                mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            ):
+                result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+            self.assertEqual("collecting", result["state"])
+            self.assertEqual(["review"], result["started_roles"])
+        finally:
+            for thread in child_threads:
+                thread.join(timeout=2.0)
+        self.assertTrue(writer_done.is_set())
+        self.assertTrue(competing_mutation_entered.is_set())
+        self.assertEqual(["missing_task"], completed_mutation_result)
 
     def test_collect_role_launch_serializes_reconciliation_and_start(self) -> None:
         manifest = self.manifest()
