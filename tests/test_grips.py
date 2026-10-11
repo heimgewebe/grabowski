@@ -2087,6 +2087,7 @@ class GripFoundationTests(unittest.TestCase):
                 "saga-plan",
                 "saga-run",
                 "saga-settle",
+                "saga-external-merge-closeout",
                 "operator-obligation-close",
                 "operator-obligation-evidence-assess",
                 "operator-obligation-list",
@@ -23676,3 +23677,172 @@ class CaptainStructuredErrorTests(unittest.TestCase):
         self.assertEqual("fresh_status_projection_unavailable", errors[0]["code"])
         self.assertEqual("gate", errors[0]["phase"])
         self.assertEqual({"gate_id": "status-projection-fresh"}, errors[0]["context"])
+
+
+class SagaExternalMergeCloseoutGripTests(unittest.TestCase):
+    """No GitHub merge mutation and one immutable terminal audit record."""
+
+    def setUp(self) -> None:
+        self.plan = grip_orchestration.build_plan(
+            "pr-settlement", _saga_pr_target(), "external-merge-closeout-1371"
+        )
+        self.run = _saga_run_stub(self.plan)
+        self.run_ref = _saga_run_audit_record(self.plan, run=self.run)[1]
+        self.captain_ref = _saga_audit_records(
+            self.plan, status="blocked"
+        )[4]
+        self.merge_sha = "c" * 40
+        self.current_sha = "e" * 40
+        self.audit = {
+            "status": "blocked",
+            "receipt_sha256": "1" * 64,
+            "intent_record_sha256": "c" * 64,
+            "completion_record_sha256": "d" * 64,
+            "merge_provenance": {
+                "provenance_schema_version": 2,
+                "execution_invoked": False,
+                "dispatch_succeeded": False,
+                "verification_passed": False,
+                "remote_mutation_observed": False,
+                "merge_completion_verified": False,
+                "merge_queued": False,
+                "external_merge_observed": True,
+                "observed_merge_sha": None,
+                "provenance_mode": "unverified",
+            },
+        }
+        self.parameters = {
+            "saga_kind": "pr-settlement",
+            "target": _saga_pr_target(),
+            "idempotency_key": "external-merge-closeout-1371",
+            "expected_plan_sha256": self.plan["plan_sha256"],
+            "run_receipt": self.run_ref,
+            "captain_result": self.captain_ref,
+        }
+        self.calls: list[list[str]] = []
+        self.branch_reads = 0
+        self.bad_compare = False
+        self.stale_branch = False
+
+    def github(self, repo: Path, argv: list[str]) -> dict[str, object]:
+        del repo
+        self.calls.append(argv)
+        value: dict[str, object]
+        if argv[:2] == ["pr", "view"]:
+            value = {
+                "number": 995, "state": "MERGED",
+                "baseRefName": "main", "headRefOid": "a" * 40,
+                "mergeCommit": {"oid": self.merge_sha},
+            }
+        elif argv[0] == "api" and "/branches/main" in argv[1]:
+            self.branch_reads += 1
+            value = {
+                "name": "main", "sha": self.current_sha,
+                "protected": True,
+            }
+            if self.stale_branch and self.branch_reads == 2:
+                value["sha"] = "f" * 40
+        elif argv[0] == "api" and "/compare/" in argv[1]:
+            if argv[1].endswith("..." + self.merge_sha):
+                value = {
+                    "status": "ahead", "ahead_by": 2, "behind_by": 0,
+                    "base": "b" * 40, "merge_base": "b" * 40,
+                }
+            else:
+                value = {
+                    "status": "ahead", "ahead_by": 3, "behind_by": 0,
+                    "base": self.merge_sha, "merge_base": self.merge_sha,
+                }
+                if self.bad_compare:
+                    value["merge_base"] = "f" * 40
+        else:
+            raise AssertionError(f"unexpected GitHub call: {argv!r}")
+        return {"returncode": 0, "stdout": json.dumps(value), "stderr": ""}
+
+    def run_closeout(self, audit_append=None, **updates):
+        params = {**self.parameters, **updates}
+        append = audit_append or Mock(return_value="7" * 64)
+        fake_work_acquire = types.ModuleType("grabowski_work_acquire")
+        fake_work_acquire.operator = types.SimpleNamespace(
+            base=types.SimpleNamespace(_append_audit_with_digest=append)
+        )
+        with patch.dict(sys.modules, {"grabowski_work_acquire": fake_work_acquire}), patch.object(
+            grip_orchestration,
+            "_verified_saga_run_receipt_reference",
+            return_value=self.run,
+        ), patch.object(
+            grip_orchestration,
+            "_verified_captain_audit_reference_identity",
+            return_value=self.audit,
+        ):
+            outcome = grips.run_grip(
+                "saga-external-merge-closeout", params,
+                allow_mutation=True, github_runner=self.github,
+            )
+        return outcome, append
+
+    def test_external_merge_writes_only_authenticated_terminal_audit(self) -> None:
+        result, append = self.run_closeout()
+        self.assertEqual("passed", result["status"])
+        self.assertEqual("externally_merged", result["output"]["state"])
+        self.assertEqual("7" * 64, result["output"]["settlement_audit_record_sha256"])
+        self.assertFalse(result["output"]["captain_dispatch_succeeded"])
+        self.assertTrue(
+            all(args[:2] != ["pr", "merge"] for args in self.calls)
+        )
+        append.assert_called_once()
+        record = append.call_args.args[0]
+        self.assertEqual("saga-external-merge-closeout", record["operation"])
+        self.assertEqual("externally_merged", record["settlement"]["state"])
+        self.assertEqual(
+            record["settlement"]["settlement_sha256"],
+            record["settlement_sha256"],
+        )
+        self.assertEqual(
+            "7" * 64, result["receipt"]["checks"][-2]["detail"]
+        )
+
+    def test_stale_branch_or_wrong_ancestry_cannot_write_audit(self) -> None:
+        for key in ("stale_branch", "bad_compare"):
+            with self.subTest(key=key):
+                self.calls.clear()
+                self.branch_reads = 0
+                setattr(self, key, True)
+                result, append = self.run_closeout()
+                self.assertEqual("blocked", result["status"])
+                append.assert_not_called()
+                self.assertTrue(
+                    all(args[:2] != ["pr", "merge"] for args in self.calls)
+                )
+                setattr(self, key, False)
+
+    def test_missing_external_permission_and_untrusted_inputs_block(self) -> None:
+        runner = Mock(side_effect=AssertionError("GitHub must not be queried"))
+        outcome = grips.run_grip(
+            "saga-external-merge-closeout", self.parameters,
+            allow_mutation=False, github_runner=runner,
+        )
+        self.assertEqual("blocked", outcome["status"])
+        runner.assert_not_called()
+
+        result, append = self.run_closeout(readback={"state": "MERGED"})
+        self.assertEqual("blocked", result["status"])
+        append.assert_not_called()
+
+    def test_failed_audit_append_does_not_claim_terminal_success(self) -> None:
+        result, append = self.run_closeout(
+            audit_append=Mock(side_effect=OSError("audit unavailable"))
+        )
+        self.assertEqual("failed", result["status"])
+        append.assert_called_once()
+        self.assertNotIn("settlement_audit_record_sha256", result["output"])
+
+    def test_surface_keeps_observer_readonly(self) -> None:
+        specs = {
+            x["name"]: x
+            for x in grips.grip_list(profile="observer")["grips"]
+        }
+        self.assertFalse(
+            specs["saga-external-merge-closeout"]["availability"]["available"]
+        )
+        self.assertTrue(specs["saga-settle"]["availability"]["available"])

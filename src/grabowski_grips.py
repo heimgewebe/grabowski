@@ -842,6 +842,27 @@ GRIP_SPECS: dict[str, GripSpec] = {
         runner="saga_settle",
         uses_github=True,
     ),
+    "saga-external-merge-closeout": GripSpec(
+        name="saga-external-merge-closeout",
+        version="1.0",
+        summary="Persist one externally merged PR saga without granting retroactive Captain success.",
+        effect=MUTATING,
+        required_parameters=(
+            "saga_kind", "target", "idempotency_key", "expected_plan_sha256",
+            "run_receipt", "captain_result",
+        ),
+        acceptance_ids=(
+            "plan-run-audit-bound",
+            "Captain-no-dispatch-proven",
+            "protected-merge-ancestry-proven",
+            "terminal-audit-recorded",
+            "Captain-authority-preserved",
+        ),
+        runner="saga_external_merge_closeout",
+        uses_github=True,
+        operation_effect_class="orchestration",
+        operation_class="operator-saga-external-closeout",
+    ),
     "captain-preflight": GripSpec(
         name="captain-preflight",
         version="1.2",
@@ -1119,6 +1140,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "saga-plan",
         "saga-run",
         "saga-settle",
+        "saga-external-merge-closeout",
         "captain-preflight",
         "captain-run",
         "pr-check-readiness",
@@ -1181,6 +1203,7 @@ GRIP_SURFACE_TARGETS = {
     "saga-plan": "one immutable named five-phase operator saga plan",
     "saga-run": "one exact saga prepare phase through mechanic-loop plus Captain handoff",
     "saga-settle": "one exact Saga run/Captain/live-readback settlement",
+    "saga-external-merge-closeout": "one immutable externally merged PR Saga audit-only terminal closeout",
     "captain-preflight": "high-impact Captain action preflight only",
     "captain-run": "action-specific high-impact Captain execution",
     "pr-check-readiness": "pull request readiness evidence",
@@ -1225,6 +1248,10 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
     "saga-settle": (
         "read-only repeat is allowed for runtime readback_pending; for recovery_required, repair named evidence "
         "and obtain authoritative target readback before any new Captain intent"
+    ),
+    "saga-external-merge-closeout": (
+        "read the exact immutable external settlement audit record and current GitHub PR/base ancestry; "
+        "do not replay Captain, change PR state, or promote external merge to Captain compliance"
     ),
     "agent-execution-happy-path": (
         "read back the exact Source-derived Work Lane, Workspace coordinator status, continuation job and any nested "
@@ -12366,6 +12393,140 @@ def _run_saga_settle(
     return {**settlement, "live_readback_source": readback_source}
 
 
+def _run_saga_external_merge_closeout(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    _saga_allowed_parameters(
+        parameters,
+        {
+            "saga_kind", "target", "idempotency_key", "expected_plan_sha256",
+            "run_receipt", "captain_result",
+        },
+    )
+    plan = _saga_plan_from_parameters(parameters)
+    _saga_expected_plan(plan, parameters)
+    if plan["saga_kind"] != "pr-settlement":
+        raise GripPreflightError("external merge closeout requires pr-settlement")
+    try:
+        grabowski_grip_orchestration.validate_saga_run_receipt_ref(
+            parameters.get("run_receipt")
+        )
+        grabowski_grip_orchestration.validate_captain_audit_result_ref(
+            parameters.get("captain_result")
+        )
+    except grabowski_grip_orchestration.SagaError as exc:
+        raise GripPreflightError(str(exc)) from exc
+
+    readback, source = _saga_live_readback(plan, github_runner)
+    expected = plan["expected_identity"]
+    repo_slug = str(expected["repository"])
+    base = str(expected["base"])
+    if (
+        re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo_slug) is None
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", base) is None
+        or ".." in base.split("/")
+    ):
+        raise GripPreflightError("external merge GitHub repository or branch identity is unsafe")
+    if readback.get("state") != "MERGED":
+        raise GripPreflightError("external merge live PR is not merged")
+    merge_record = readback.get("mergeCommit")
+    merge_sha = merge_record.get("oid") if isinstance(merge_record, dict) else None
+    if not isinstance(merge_sha, str) or re.fullmatch(r"[0-9a-f]{40}", merge_sha) is None:
+        raise GripPreflightError("external merge PR lacks a canonical merge SHA")
+    gh_cwd = Path(str(plan["target"]["repository_path"]))
+
+    def github_json(args: list[str], name: str) -> dict[str, Any]:
+        value = _json_stdout(_github(gh_cwd, github_runner, args))
+        if not isinstance(value, dict):
+            raise GripActionError(f"external merge {name} GitHub readback is not an object")
+        return value
+
+    branch_command = [
+        "api", f"repos/{repo_slug}/branches/{quote(base, safe='/')}",
+        "--jq", "{name:.name,sha:.commit.sha,protected:.protected}",
+    ]
+    branch = github_json(branch_command, "base_branch")
+    current_head = branch.get("sha")
+    if not isinstance(current_head, str) or re.fullmatch(r"[0-9a-f]{40}", current_head) is None:
+        raise GripPreflightError("external merge protected base SHA is missing")
+    compare_query = "{status:.status,ahead_by:.ahead_by,behind_by:.behind_by,base:.base_commit.sha,merge_base:.merge_base_commit.sha}"
+    compare_base = github_json(
+        [
+            "api", f"repos/{repo_slug}/compare/{expected['expected_base_sha']}...{merge_sha}",
+            "--jq", compare_query,
+        ],
+        "base_to_merge",
+    )
+    compare_current = github_json(
+        [
+            "api", f"repos/{repo_slug}/compare/{merge_sha}...{current_head}",
+            "--jq", compare_query,
+        ],
+        "merge_to_current",
+    )
+    if github_json(branch_command, "base_branch_recheck") != branch:
+        raise GripPreflightError("external merge protected base branch changed during readback")
+    typed_readback = {
+        "pr": readback,
+        "base_branch": branch,
+        "base_to_merge": compare_base,
+        "merge_to_current": compare_current,
+    }
+    try:
+        settlement = grabowski_grip_orchestration.settle_external_merge(
+            plan_value=plan,
+            run_receipt_value=parameters.get("run_receipt"),
+            captain_result_value=parameters.get("captain_result"),
+            readback_value=typed_readback,
+        )
+    except grabowski_grip_orchestration.SagaError as exc:
+        raise GripPreflightError(str(exc)) from exc
+    _check(receipt, "plan-run-audit-bound", "pass", settlement["run_sha256"])
+    _check(
+        receipt, "Captain-no-dispatch-proven", "pass",
+        settlement["captain_audit_completion_record_sha256"],
+    )
+    _check(receipt, "protected-merge-ancestry-proven", "pass", merge_sha)
+    record = {
+        "operation": "saga-external-merge-closeout",
+        "kind": "grabowski.saga_external_merge_closeout_audit",
+        "schema_version": 1,
+        "saga_kind": "pr-settlement",
+        "plan_sha256": settlement["plan_sha256"],
+        "run_sha256": settlement["run_sha256"],
+        "captain_audit_completion_record_sha256": settlement[
+            "captain_audit_completion_record_sha256"
+        ],
+        "merged_commit_sha": merge_sha,
+        "settlement_sha256": settlement["settlement_sha256"],
+        "settlement": settlement,
+    }
+    try:
+        work_acquire = __import__("grabowski_work_acquire")
+        audit_sha = work_acquire.operator.base._append_audit_with_digest(record)
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        raise GripActionError(
+            f"external merge settlement durability append failed: {type(exc).__name__}"
+        ) from exc
+    if not _is_sha256_hex(audit_sha):
+        raise GripActionError("external merge settlement audit has no valid record SHA-256")
+    _check(receipt, "terminal-audit-recorded", "pass", audit_sha)
+    _check(
+        receipt, "Captain-authority-preserved", "pass",
+        "Captain did not merge; no GitHub mutation was issued",
+    )
+    return {
+        **settlement,
+        "settlement_audit_record_sha256": audit_sha,
+        "live_readback_source": source,
+        "receipt_status": "passed",
+    }
+
 def _captain_wildcardish(value: Any) -> bool:
     if not isinstance(value, str):
         return True
@@ -17636,6 +17797,7 @@ _RUNNERS = {
     "saga_plan": _run_saga_plan,
     "saga_run": _run_saga_run,
     "saga_settle": _run_saga_settle,
+    "saga_external_merge_closeout": _run_saga_external_merge_closeout,
     "captain_preflight": _run_captain_preflight,
     "captain_run": _run_captain_run,
     "branch_publish": _run_branch_publish,
