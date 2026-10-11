@@ -802,6 +802,7 @@ def _local_bound_pr_diff_bytes(repo: Path, view: Any) -> bytes:
             "--no-ext-diff",
             "--no-textconv",
             "--no-renames",
+            "--ignore-submodules=none",
             "--no-color",
             merge_base,
             head,

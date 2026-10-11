@@ -347,6 +347,42 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertEqual(merge_base, base)
 
+    def test_gitlink_diff_path_cannot_be_suppressed_by_checkout_submodule_config(self) -> None:
+        import subprocess
+
+        with tempfile.TemporaryDirectory(prefix="review-gitlink-ignored-") as d:
+            repo = Path(d)
+
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    ["git", *args], cwd=repo, check=True,
+                    text=True, capture_output=True,
+                ).stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.email", "review@example.invalid")
+            git("config", "user.name", "Review")
+            (repo / "seed.txt").write_text("seed\n")
+            git("add", "seed.txt")
+            git("commit", "-qm", "seed")
+            submodule_old = git("rev-parse", "HEAD")
+            git("update-index", "--add", "--cacheinfo", "160000", submodule_old, "deps/module")
+            git("commit", "-qm", "gitlink-base")
+            base = git("rev-parse", "HEAD")
+            git("update-index", "--cacheinfo", "160000", base, "deps/module")
+            git("commit", "-qm", "gitlink-head")
+            head = git("rev-parse", "HEAD")
+            git("config", "diff.ignoreSubmodules", "all")
+            self.assertEqual(git("diff", "--name-only", base, head), "")
+            view = {
+                "baseRefOid": base,
+                "headRefOid": head,
+                "pullFilesEvidenceComplete": True,
+                "files": [{"path": "deps/module", "status": "modified"}],
+            }
+            payload = pr_review_gate._local_bound_pr_diff_bytes(repo, view)
+            self.assertIn(b"deps/module", payload)
+
     def test_advanced_base_uses_single_merge_base_not_two_endpoint_diff(self) -> None:
         import subprocess
         with tempfile.TemporaryDirectory(prefix="review-mergebase-diverge-") as d:
