@@ -133,6 +133,11 @@ MAX_SIDECAR_READBACK_BYTES = 256 * 1024
 _RUNTIME_PROOF_CACHE: ContextVar[dict[tuple[str, str, str], bool] | None] = ContextVar(
     "grabowski_runtime_proof_cache", default=None
 )
+# Only Captain's accepted runtime-deploy action may establish this per-call
+# context. It is never a public scheduler parameter or persisted caller PASS.
+_CAPTAIN_RUNTIME_RELEASE_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar(
+    "grabowski_captain_runtime_release_scope", default=None
+)
 
 
 class BlueGreenCutoverError(RuntimeError):
@@ -5385,12 +5390,43 @@ def _recovered_auto_deploy_source_binding(
 
 
 
-def _require_release_source_admission(expected_head: str) -> dict[str, Any]:
-    """Read-only release admission; never infer an independent R3 from main.
+@contextmanager
+def _captain_release_scope(
+    expected_head: str, release_review_pr: int,
+) -> Iterator[None]:
+    """Ephemeral Captain-only bridge; no direct-scheduler release override."""
+    reviewed = _require_release_source_admission(
+        expected_head,
+        release_review_pr=release_review_pr,
+        captain_preview=True,
+    )
+    if reviewed.get("independent_review_required") is not True:
+        yield
+        return
+    binding = {
+        "target_head": expected_head,
+        "review_pr": release_review_pr,
+        "serving_head": reviewed["serving_head"],
+        "serving_release_id": reviewed["serving_release_id"],
+        "identity_sha256": reviewed["release_review_identity_sha256"],
+    }
+    reset = _CAPTAIN_RUNTIME_RELEASE_SCOPE.set(binding)
+    try:
+        yield
+    finally:
+        _CAPTAIN_RUNTIME_RELEASE_SCOPE.reset(reset)
 
-    Independently authenticated post-merge release authorization is not yet
-    implemented by this seam. Changed runtime and policy sources are blocked
-    before scheduling, Git-ref changes and Rootbroker side effects.
+
+def _require_release_source_admission(
+    expected_head: str, *,
+    release_review_pr: int | None = None,
+    captain_preview: bool = False,
+) -> dict[str, Any]:
+    """Server-observed release proof; Captain preview never grants dispatch.
+
+    The direct scheduler cannot accept caller-provided review identities. Its
+    only critical-release authority is an ephemeral accepted Captain action,
+    whose exact review/CI/serving evidence is re-read before effects.
     """
     if not isinstance(expected_head, str) or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
         raise DeploySchedulePreEffectRefusal("release admission blocked: exact target head is invalid")
@@ -5503,9 +5539,152 @@ def _require_release_source_admission(expected_head: str) -> dict[str, Any]:
         not path.startswith("docs/") or not path.endswith(safe_document_extensions)
         for path in changed_paths
     ):
+        scope = _CAPTAIN_RUNTIME_RELEASE_SCOPE.get()
+        if not captain_preview:
+            if (
+                not isinstance(scope, dict)
+                or scope.get("target_head") != expected_head
+                or type(scope.get("review_pr")) is not int
+                or scope["review_pr"] <= 0
+            ):
+                raise DeploySchedulePreEffectRefusal(
+                    "release review admission missing: critical source deployment "
+                    "requires an accepted Captain release action"
+                )
+            release_review_pr = scope["review_pr"]
+        if type(release_review_pr) is not int or release_review_pr <= 0:
+            raise DeploySchedulePreEffectRefusal(
+                "release review admission missing: exact independent R3 job namespace"
+            )
+
+        def exact_tree(commit: str) -> str:
+            result = _git_result(
+                CANONICAL_REPOSITORY, "rev-parse", f"{commit}^{{tree}}"
+            )
+            if (
+                type(result.get("returncode")) is not int
+                or result["returncode"] != 0
+                or result.get("timed_out") is not False
+                or result.get("stdout_truncated") is not False
+                or result.get("stderr_truncated") is not False
+                or result.get("stderr") != ""
+                or not isinstance(result.get("stdout"), str)
+                or re.fullmatch(r"[0-9a-f]{40}\n?", result["stdout"]) is None
+            ):
+                raise DeploySchedulePreEffectRefusal(
+                    "release admission blocked: exact source tree unavailable"
+                )
+            return result["stdout"].strip()
+
+        raw_diff = _git_result(
+            CANONICAL_REPOSITORY,
+            "diff", "--no-ext-diff", "--no-textconv",
+            "--no-renames", "--ignore-submodules=none",
+            "--raw", "--abbrev=40", "-z",
+            serving_head, expected_head, "--",
+            max_output_bytes=262_144,
+        )
+        if (
+            type(raw_diff.get("returncode")) is not int
+            or raw_diff["returncode"] != 0
+            or raw_diff.get("timed_out") is not False
+            or raw_diff.get("stdout_truncated") is not False
+            or raw_diff.get("stderr_truncated") is not False
+            or raw_diff.get("stderr") != ""
+            or not isinstance(raw_diff.get("stdout"), str)
+            or "\ufffd" in raw_diff["stdout"]
+            or "<REDACTED>" in raw_diff["stdout"]
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: exact complete raw source diff unavailable"
+            )
+        import grabowski_release_admission as release_admission
+
+        try:
+            reviewed = release_admission.validate_release(
+                serving_head=serving_head,
+                target_head=expected_head,
+                serving_release_id=release_id,
+                serving_tree=exact_tree(serving_head),
+                target_tree=exact_tree(expected_head),
+                diff_sha256=hashlib.sha256(
+                    raw_diff["stdout"].encode("utf-8")
+                ).hexdigest(),
+                review_pr=release_review_pr,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise DeploySchedulePreEffectRefusal(
+                "release review admission blocked: " + str(exc)
+            ) from exc
+        if not captain_preview and (
+            reviewed["release_review_identity_sha256"] != scope.get("identity_sha256")
+            or serving_head != scope.get("serving_head")
+            or release_id != scope.get("serving_release_id")
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release review admission blocked: Captain-to-dispatch identity drift"
+            )
+        return reviewed
+    # A docs/ extension is not enough to exempt a symlink, executable,
+    # gitlink, type-change or ambiguous Git entry. Verify exact Git object
+    # modes independently of the filename-only classifier.
+    document_diff = _git_result(
+        CANONICAL_REPOSITORY,
+        "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+        "--ignore-submodules=none", "--raw", "--abbrev=40", "-z",
+        serving_head, expected_head, "--",
+        max_output_bytes=262_144,
+    )
+    if (
+        type(document_diff.get("returncode")) is not int
+        or document_diff["returncode"] != 0
+        or document_diff.get("timed_out") is not False
+        or document_diff.get("stdout_truncated") is not False
+        or document_diff.get("stderr_truncated") is not False
+        or document_diff.get("stderr") != ""
+        or not isinstance(document_diff.get("stdout"), str)
+        or "\ufffd" in document_diff["stdout"]
+        or "<REDACTED>" in document_diff["stdout"]
+    ):
         raise DeploySchedulePreEffectRefusal(
-            "release review admission missing: changed runtime/policy sources "
-            "require independent exact-revision authorization before deployment"
+            "release admission blocked: complete documentation Git modes unavailable"
+        )
+    raw_document = document_diff["stdout"]
+    if raw_document and not raw_document.endswith("\x00"):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: documentation Git mode boundary incomplete"
+        )
+    fields = raw_document[:-1].split("\x00") if raw_document else []
+    if len(fields) != 2 * len(changed_paths):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: documentation Git mode inventory mismatch"
+        )
+    observed_doc_paths: list[str] = []
+    for index in range(0, len(fields), 2):
+        header, path = fields[index : index + 2]
+        match = re.fullmatch(
+            r":([0-7]{6}) ([0-7]{6}) [0-9a-f]{40} [0-9a-f]{40} ([AMD])",
+            header,
+        )
+        if match is None:
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: non-plain documentation change"
+            )
+        old_mode, new_mode, operation = match.groups()
+        if (
+            old_mode not in {"000000", "100644"}
+            or new_mode not in {"000000", "100644"}
+            or (operation == "A" and (old_mode, new_mode) != ("000000", "100644"))
+            or (operation == "D" and (old_mode, new_mode) != ("100644", "000000"))
+            or (operation == "M" and (old_mode, new_mode) != ("100644", "100644"))
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: documentation Git mode is not plain"
+            )
+        observed_doc_paths.append(path)
+    if observed_doc_paths != changed_paths:
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: documentation source paths and Git modes disagree"
         )
     return {
         "status": "non-runtime-documentation",
@@ -5528,6 +5707,9 @@ def _grabowski_runtime_deploy_schedule_impl(
     """Implement one source-identity-bound self-deployment schedule attempt."""
     _require_release_source_admission(expected_head)
     with _deploy_schedule_lock():
+        # Re-read serving identity and authenticated review after taking the
+        # cooperating scheduler lock, never rely on a stale Captain preview.
+        _require_release_source_admission(expected_head)
         public_github_main_before = _fresh_public_github_main(expected_head)
         if public_github_main_before != expected_head:
             raise RuntimeError(
@@ -5937,6 +6119,33 @@ def _grabowski_runtime_deploy_schedule_impl(
         reserved_unit: str | None = None
         pending_index_written = False
         try:
+            # Final pre-effect revalidation: Rootbroker/auto-source handling
+            # may have taken time. No pending index or job is registered yet.
+            # Persist a server-observed admission *identity* alongside the
+            # launch intent. No caller-supplied PASS or reviewer text is
+            # accepted as a scheduling capability or deployment receipt.
+            admitted = _require_release_source_admission(expected_head)
+            if not isinstance(admitted, dict) or not isinstance(
+                admitted.get("status"), str
+            ):
+                raise DeploySchedulePreEffectRefusal(
+                    "release admission blocked: final server evidence malformed"
+                )
+            intent["release_admission"] = {
+                "source": "server-revalidated-at-scheduler-dispatch",
+                "status": admitted["status"],
+                "serving_repo_head": admitted.get(
+                    "serving_head", admitted.get("serving_repo_head")
+                ),
+                "serving_release_id": admitted.get("serving_release_id"),
+                "target_repo_head": expected_head,
+                "review_identity_sha256": admitted.get(
+                    "release_review_identity_sha256"
+                ),
+                "independent_review_required": admitted.get(
+                    "independent_review_required"
+                ),
+            }
             _append_deploy_audit(intent)
             jobs_root = operator._jobs_root()
             index = _deploy_index(jobs_root)

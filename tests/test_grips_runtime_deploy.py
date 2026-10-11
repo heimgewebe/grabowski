@@ -236,7 +236,13 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             patch.object(
                 deploy,
                 "_git_result",
-                side_effect=[self._git_success(""), self._git_success("docs/guide.md\x00")],
+                side_effect=[
+                    self._git_success(""),
+                    self._git_success("docs/guide.md\x00"),
+                    self._git_success(
+                        ":100644 100644 " + "1" * 40 + " " + "2" * 40 + " M\x00docs/guide.md\x00"
+                    ),
+                ],
             ),
         ):
             record = deploy._require_release_source_admission("b" * 40)
@@ -289,7 +295,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             )
         self.assertEqual("blocked", gate["status"])
         self.assertIn("release", str(gate.get("details", gate.get("reason", ""))))
-        admission.assert_called_once_with("b" * 40)
+        admission.assert_called_once_with("b" * 40, release_review_pr=None, captain_preview=True)
 
 
     def test_source_diff_without_explicit_transport_completeness_blocks(self) -> None:

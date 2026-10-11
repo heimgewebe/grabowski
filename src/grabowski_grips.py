@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import Counter
@@ -13492,7 +13493,11 @@ def _captain_independent_review_gate(
         try:
             from grabowski_self_deploy import _require_release_source_admission
 
-            release = _require_release_source_admission(parameters.get("expected_head"))
+            release = _require_release_source_admission(
+                parameters.get("expected_head"),
+                release_review_pr=parameters.get("release_review_pr"),
+                captain_preview=True,
+            )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             return _captain_gate(
                 "independent-review-policy",
@@ -13500,11 +13505,23 @@ def _captain_independent_review_gate(
                 "runtime release review admission was not proven",
                 [f"release_admission_blocked:{type(exc).__name__}: {exc}"],
             )
+        release_review_required = release.get("independent_review_required") is True
         return _captain_gate(
             "independent-review-policy",
             "pass",
-            "unchanged or documentation-only runtime source; R3 not implied",
-            {"required": False, "release_source_status": release.get("status")},
+            (
+                "post-merge whole-release R3 and target CI provenance authenticated; "
+                "Captain authorization still separately required"
+                if release_review_required
+                else "unchanged or documentation-only runtime source; R3 not implied"
+            ),
+            {
+                "required": release_review_required,
+                "release_source_status": release.get("status"),
+                "release_review_identity_sha256": release.get(
+                    "release_review_identity_sha256"
+                ),
+            },
         )
     targets = [
         action.get("target")
@@ -16260,16 +16277,27 @@ def _run_captain_runtime_deploy(
     execution_result["execution_invoked"] = True
     execution_result["execution_attempted"] = True
     try:
-        schedule = (
-            _runtime_deploy_self_schedule(expected_head, delay_seconds)
-            if source_repository is None
-            else _runtime_deploy_self_schedule(
-                expected_head,
-                delay_seconds,
-                source_repository,
-                source_lease_owner_id,
+        # A positive release-review record is not a direct scheduler
+        # capability. Only this Captain-dispatched call may hold the short
+        # in-process scope after all Captain authority gates have passed.
+        review_pr = parameters.get("release_review_pr")
+        if type(review_pr) is int and review_pr > 0:
+            from grabowski_self_deploy import _captain_release_scope
+
+            release_scope = _captain_release_scope(expected_head, review_pr)
+        else:
+            release_scope = nullcontext()
+        with release_scope:
+            schedule = (
+                _runtime_deploy_self_schedule(expected_head, delay_seconds)
+                if source_repository is None
+                else _runtime_deploy_self_schedule(
+                    expected_head,
+                    delay_seconds,
+                    source_repository,
+                    source_lease_owner_id,
+                )
             )
-        )
         execution_result["command_returned"] = True
     except RuntimeDeployPreEffectRefusal as exc:
         local_mutation_evidence = getattr(exc, "local_mutation_evidence", None)
