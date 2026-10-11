@@ -650,5 +650,24 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 tasks._require_direct_codex_filesystem_sandbox(argv)
 
 
+    def test_interpolated_print_strings_cannot_hide_computed_codex(self) -> None:
+        # Ruby and Perl evaluate interpolations inside double-quoted strings.
+        # These payloads are only passed as strings to the admission guard.
+        for argv in (
+            ["ruby", "-e", "puts \"#{system('co' + 'dex', 'exec')}\""],
+            ["perl", "-e", "print \"@{[system('co' . 'dex', 'exec')]}\""],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        for argv in (
+            ["ruby", "-e", "puts 'codex'"],
+            ["perl", "-e", "print 'codex'"],
+        ):
+            with self.subTest(harmless=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4022,11 +4022,14 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                 for node in tree.body
             )
         literal = r"""(?:'[^'\n]{0,1024}'|"[^"\n]{0,1024}")"""
+        # Ruby #{...} and Perl @{[...]} execute inside double-quoted
+        # strings. Only a single-quoted literal proves pure print output.
+        non_interpolated_literal = r"'[^'\n]{0,1024}'"
         patterns = {
             "node": rf"console\.log\(\s*{literal}\s*\)\s*;?",
             "nodejs": rf"console\.log\(\s*{literal}\s*\)\s*;?",
-            "ruby": rf"puts\s+{literal}\s*;?",
-            "perl": rf"print\s+{literal}\s*;?",
+            "ruby": rf"puts\s+{non_interpolated_literal}\s*;?",
+            "perl": rf"print\s+{non_interpolated_literal}\s*;?",
         }
         return re.fullmatch(patterns[language], source.strip()) is not None
 
