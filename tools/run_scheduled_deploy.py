@@ -1694,12 +1694,103 @@ def run_midcutover_resume(*, repo: Path, decision: dict[str, Any]) -> dict[str, 
     return {**result, "summary": summary}
 
 
+
+def require_effect_time_release_admission(
+    *, expected_head: str, source_identity_sha256: str,
+) -> dict[str, Any]:
+    """Fail closed at the *delayed effect* boundary, not only at scheduling.
+
+    This is deliberately a conservative interim guard. A source-changing
+    release needs a separately protected, origin-bound Captain decision and a
+    fresh whole-release R3/CI reconciliation. The current user-owned scheduler
+    intent and arbitrary worker argv do not establish that authority. Never
+    interpret their mere presence, a review PR number, or a self-hashed JSON
+    object as a permit to perform a productive cutover.
+    """
+    if not isinstance(expected_head, str) or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: invalid exact target source head"
+        )
+    if (
+        not isinstance(source_identity_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_identity_sha256) is None
+    ):
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: invalid source identity"
+        )
+    observed = deploy_dual.observe_authoritative_routing()
+    if not isinstance(observed, dict) or observed.get("authoritative") is not True:
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: serving route is not authoritative"
+        )
+    ingress = observed.get("ingress")
+    selector = observed.get("selector")
+    if not isinstance(ingress, dict) or not isinstance(selector, dict):
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: serving provenance is incomplete"
+        )
+    serving_head = ingress.get("repo_head")
+    serving_release_id = ingress.get("release_id")
+    if (
+        not isinstance(serving_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}", serving_head) is None
+        or not isinstance(serving_release_id, str)
+        or not serving_release_id.strip()
+        or len(serving_release_id.encode("utf-8")) > 512
+        or selector.get("selected_slot") != ingress.get("selected_slot")
+        or selector.get("runtime_binding_sha256")
+        != ingress.get("runtime_binding_sha256")
+    ):
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: serving identity is incomplete or contradictory"
+        )
+    # A readback hash is an integrity consistency check, not an authority
+    # signature. The trusted ingress observer above proves route authority.
+    material = {
+        "authoritative": True,
+        "selector": selector,
+        "ingress": ingress,
+    }
+    if observed.get("readback_sha256") != canonical_json_sha256(material):
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: serving readback identity mismatch"
+        )
+    if serving_head != expected_head:
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: source-changing productive cutover "
+            "requires a protected Captain release decision and fresh "
+            "independent R3/CI proof at this effect boundary"
+        )
+    return {
+        "schema_version": 1,
+        "status": "already-serving-exact-source",
+        "serving_repo_head": serving_head,
+        "serving_release_id": serving_release_id,
+        "target_repo_head": expected_head,
+        "source_identity_sha256": source_identity_sha256,
+        "ingress_readback_sha256": observed["readback_sha256"],
+        "does_not_establish": [
+            "Captain deployment authorization",
+            "historical merge review",
+            "authority for a source-changing release",
+        ],
+    }
+
+
+
 def run_productive_blue_green(
     *,
     repo: Path,
     expected_head: str,
     source_identity_sha256: str,
 ) -> dict[str, Any]:
+    # The scheduled job may have waited, validated and been overtaken by a
+    # different serving release. A scheduler-time R3/Captain PASS is not a
+    # durable effect-time capability.
+    require_effect_time_release_admission(
+        expected_head=expected_head,
+        source_identity_sha256=source_identity_sha256,
+    )
     try:
         result = deploy_dual.run_production_blue_green_cutover(
             repo=repo,
