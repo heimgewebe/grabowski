@@ -1720,7 +1720,9 @@ def _merge_guard_legacy_local_review_diff_identity(
 
         local_result = _merge_guard_local_git_bytes(
             repo_path,
-            ["diff", "--binary", "--no-ext-diff", "--no-textconv", f"{base_sha}...{head_sha}"],
+            # Historic review receipts hash the default 3-context Git diff.
+            # Pin it explicitly: repository diff.context must not change the proof.
+            ["diff", "--binary", "--no-ext-diff", "--no-textconv", "--unified=3", f"{base_sha}...{head_sha}"],
             timeout=60,
         )
         local_diff = local_result["stdout_bytes"]

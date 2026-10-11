@@ -399,6 +399,9 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             provider = merge_guard.canonicalize_github_pr_diff_identity(reviewed)
             self.assertNotEqual(provider, reviewed)
             reviewed_sha = hashlib.sha256(reviewed).hexdigest()
+            # The signed review used Git's default three context lines.
+            # Later repository config changes must not invalidate its bytes.
+            _git(repo, "config", "diff.context", "8")
 
             proven, evidence = merge_guard._merge_guard_legacy_local_review_diff_identity(
                 repo, base_sha=base, head_sha=head, expected_sha256=reviewed_sha,
