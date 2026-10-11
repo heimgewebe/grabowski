@@ -2721,7 +2721,7 @@ def grabowski_agent_competition_status(competition_id: str) -> dict[str, Any]:
     elif task_state == "completed":
         lifecycle_state = "candidate_output_missing_or_invalid"
         phase = "candidate_validation"
-    elif task_state == "outcome_unknown":
+    elif task_state in {"outcome_unknown", "observation_error"}:
         # Uncertain execution or unavailable live observation is not terminal.
         lifecycle_state = "provider_outcome_unknown"
         phase = "task_observation"
