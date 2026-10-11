@@ -87,6 +87,23 @@ _PRE_RESULT_INFRASTRUCTURE_STATUSES = frozenset(
     {"failed", "timed_out", "signalled", "terminated_unclear"}
 )
 _VERDICTS = frozenset({"PASS_THIS_REVISION", "REJECT_THIS_REVISION"})
+# Only the observed human-readable no-inference quota response is an
+# infrastructure error. Unknown message shapes are ambiguous, never review PASS.
+_CLAUDE_QUOTA_RESULT_RE = re.compile(
+    r"You've hit your weekly limit"
+    r"(?: · resets (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(?:[1-9]|[12][0-9]|3[01]), "
+    r"(?:[1-9]|1[0-2])(?::[0-5][0-9])?(?:am|pm) \(UTC\))?\Z"
+)
+# New provider fields must be understood before claiming zero semantic output.
+_CLAUDE_QUOTA_ENVELOPE_FIELDS = frozenset({
+    "type", "is_error", "terminal_reason", "api_error_status", "duration_api_ms",
+    "modelUsage", "structured_output", "result", "usage", "subagent_stats",
+    "permission_denials", "total_cost_usd", "duration_ms", "num_turns",
+    "stop_reason", "session_id", "fast_mode_state",
+    "fast_mode_disabled_reason", "subtype", "uuid", "queued_turn_count",
+    "result_index",
+})
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -1120,8 +1137,36 @@ def _proven_claude_quota_failure_before_review(
         envelope = json.loads(tail)
     except json.JSONDecodeError:
         return False
-    if not isinstance(envelope, dict):
+    if not isinstance(envelope, dict) or set(envelope) - _CLAUDE_QUOTA_ENVELOPE_FIELDS:
         return False
+    # The actual 429 result has one CLI wrapper turn, not one model turn.
+    # An unexpected count, tool trace or provider state is not pre-result proof.
+    for zero_key in ("queued_turn_count", "result_index"):
+        if zero_key in envelope and (
+            type(envelope[zero_key]) is not int or envelope[zero_key] != 0
+        ):
+            return False
+    if "num_turns" in envelope and (
+        type(envelope["num_turns"]) is not int or envelope["num_turns"] != 1
+    ):
+        return False
+    if "duration_ms" in envelope and (
+        type(envelope["duration_ms"]) is not int or envelope["duration_ms"] < 0
+    ):
+        return False
+    for key, expected in (
+        ("stop_reason", "stop_sequence"), ("subtype", "success"),
+        ("fast_mode_state", "off"),
+        ("fast_mode_disabled_reason", "sdk_opt_in_required"),
+    ):
+        if key in envelope and envelope[key] != expected:
+            return False
+    for key in ("session_id", "uuid"):
+        if key in envelope and (
+            not isinstance(envelope[key], str)
+            or not (1 <= len(envelope[key]) <= 128)
+        ):
+            return False
     usage = envelope.get("usage")
     subagents = envelope.get("subagent_stats")
     return (
@@ -1135,9 +1180,8 @@ def _proven_claude_quota_failure_before_review(
         and envelope.get("modelUsage") == {}
         and envelope.get("structured_output") is None
         and isinstance(envelope.get("result"), str)
-        and envelope["result"].startswith("You've hit your weekly limit")
         and len(envelope["result"]) <= 256
-        and envelope["result"].isprintable()
+        and _CLAUDE_QUOTA_RESULT_RE.fullmatch(envelope["result"]) is not None
         and isinstance(usage, dict) and usage.get("iterations") == []
         and envelope.get("permission_denials") == []
         and type(envelope.get("total_cost_usd")) in {int, float}
@@ -1515,8 +1559,10 @@ def reconcile(
                     role_evidence is not None
                     and role_evidence.get("pre_result_quota_failure_verified") is True
                     and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
+                    and attempt["terminal_status"] == "failed"
                 ):
                     attempt["classification"] = "infrastructure_error"
+                    attempt["pre_result_quota_failure_verified"] = True
                 else:
                     attempt["classification"] = "invalid_result"
                     errors.append(f"decision_review_result_invalid:{directory.name}:InvalidReviewDocument")
@@ -1557,9 +1603,19 @@ def reconcile(
         ]
         unsuperseded_infrastructure = []
         for infrastructure_attempt in infrastructure:
+            eligible_passes = passes
+            if infrastructure_attempt.get("pre_result_quota_failure_verified") is True:
+                # A legacy generic PASS cannot replace authenticated Claude
+                # quota evidence. The later PASS itself must be independent
+                # and from the same provider family, not merely an old PASS.
+                family = infrastructure_attempt.get("review_provider_family")
+                eligible_passes = [
+                    item for item in independent_passes
+                    if item.get("review_provider_family") == family
+                ]
             if not any(
                 _attempt_started_after(pass_attempt, infrastructure_attempt)
-                for pass_attempt in passes
+                for pass_attempt in eligible_passes
             ):
                 unsuperseded_infrastructure.append(infrastructure_attempt)
         if not passes and not rejects:

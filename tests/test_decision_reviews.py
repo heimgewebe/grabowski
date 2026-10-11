@@ -408,6 +408,70 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(settled["slots"][0]["independent_pass_count"], 1)
         self.assertEqual(settled["slots"][0]["infrastructure_error_count"], 1)
 
+    def test_v2_429_known_reset_suffix_then_independent_pass_settles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a88888888888", slot="claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            stamp_claude_quota_429(
+                failed, envelope_updates={
+                    "result": "You've hit your weekly limit · resets Oct 13, 10am (UTC)"
+                },
+            )
+            make_job(
+                jobs, suffix="b99999999999", slot="claude",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_200,
+            )
+            outcome = self.reconcile(jobs)
+        self.assertEqual(outcome["status"], "settled")
+        self.assertEqual(outcome["errors"], [])
+
+    def test_v2_429_generic_pass_cannot_supersede_independent_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="a11111111111", slot="claude",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_000,
+            )
+            quota = make_job(
+                jobs, suffix="b22222222222", slot="claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_100,
+            )
+            stamp_claude_quota_429(quota)
+            make_job(
+                jobs, suffix="c33333333333", slot="claude",
+                terminal_status="succeeded",
+                review_result=result("claude", "PASS_THIS_REVISION", 0),
+                created_at_unix=1_787_000_200,
+            )
+            blocked = self.reconcile(jobs)
+            self.assertEqual(blocked["status"], "blocked")
+            self.assertIn(
+                "decision_review_infrastructure_not_superseded:"
+                "claude:grabowski-job-b22222222222",
+                blocked["errors"],
+            )
+            make_job(
+                jobs, suffix="d44444444444", slot="claude",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_300,
+            )
+            settled = self.reconcile(jobs)
+        self.assertEqual(settled["status"], "settled")
+        self.assertEqual(settled["errors"], [])
+
     def test_v2_429_near_misses_remain_blocking_even_after_valid_pass(self) -> None:
         cases = [
             ("http_401", {"api_error_status": 401}, {}),
@@ -460,6 +524,19 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 "structured_output": {"verdict": "NEEDS_CHANGE", "findings": [{}]},
             }, {}),
             ("not_known_quota_error", {"result": "unexpected inference text"}, {}),
+            ("same_line_material_reject", {
+                "result": "You've hit your weekly limit. REJECT_THIS_REVISION: material findings present",
+            }, {}),
+            ("quota_reset_with_extra_text", {
+                "result": "You've hit your weekly limit · resets Oct 13, 10am (UTC). REVIEW REJECT",
+            }, {}),
+            ("unknown_top_level_review_result", {
+                "review_result": {"verdict": "REJECT_THIS_REVISION", "findings": [{"priority": "P1"}]},
+            }, {}),
+            ("unknown_provider_tool_history", {
+                "provider_tool_calls": [{"name": "read_file", "result": "review evidence"}],
+            }, {}),
+            ("unexpected_cli_turns", {"num_turns": 100}, {}),
             ("actual_quota_result_newline", {
                 "result": "You've hit your weekly limit\nmodel-produced text",
             }, {}),
