@@ -11805,7 +11805,9 @@ class TaskTests(unittest.TestCase):
         ):
             second = tasks.grabowski_task_start(
                 "local",
-                ["env", "PYTHONPATH=src", "/bin/echo", "syntax-b"],
+                # Executable preload variables are now explicitly fail-closed.
+                # Use an inert env change to test reuse independently.
+                ["env", "FOO=src", "/bin/echo", "syntax-b"],
                 cwd=str(self.root),
                 runtime_seconds=60,
                 operation_identity=operation_identity,
@@ -11819,6 +11821,42 @@ class TaskTests(unittest.TestCase):
             second["deduplicated_reuse"]["reason"],
         )
         self.assertEqual("task-start-deduplicated", audit.call_args.args[0]["operation"])
+
+    def test_operation_identity_preload_rejects_before_completed_reuse(self) -> None:
+        operation_identity = self._operation_identity_fixture()
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(
+                "local", ["/bin/echo", "safe"], cwd=str(self.root),
+                runtime_seconds=60, operation_identity=operation_identity,
+            )
+        tasks._set_state(
+            str(first["task"]["task_id"]), "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch") as dispatch,
+            patch.object(tasks.base, "_append_audit") as audit,
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                tasks.grabowski_task_start(
+                    "local",
+                    ["env", "PYTHONPATH=src", "/bin/echo", "syntax-b"],
+                    cwd=str(self.root), runtime_seconds=60,
+                    operation_identity=operation_identity,
+                )
+        dispatch.assert_not_called()
+        audit.assert_not_called()
 
     def test_operation_identity_stale_active_hit_is_reobserved_once(self) -> None:
         operation_identity = self._operation_identity_fixture()
