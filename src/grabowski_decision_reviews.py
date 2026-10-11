@@ -1027,7 +1027,7 @@ def _normalize_review_role_provenance(
 
 
 def _claude_no_external_activity(usage: Any, subagents: Any) -> bool:
-    """Require all provider tool and subagent counters, including future keys, to be int zero."""
+    """Require known zero-activity counters; reject unknown names even when zero."""
     def strictly_zero(value: Any) -> bool:
         return type(value) is int and value == 0
     if not isinstance(usage, dict):
@@ -1048,7 +1048,7 @@ def _claude_no_external_activity(usage: Any, subagents: Any) -> bool:
         fields = usage.get(section)
         if (
             not isinstance(fields, dict)
-            or not required.issubset(fields)
+            or set(fields) != required
             or any(not strictly_zero(value) for value in fields.values())
         ):
             return False
@@ -1062,7 +1062,7 @@ def _claude_no_external_activity(usage: Any, subagents: Any) -> bool:
     tools = usage.get("server_tool_use")
     if (
         not isinstance(tools, dict)
-        or not {"web_search_requests", "web_fetch_requests"}.issubset(tools)
+        or set(tools) != {"web_search_requests", "web_fetch_requests"}
         or any(not strictly_zero(value) for value in tools.values())
     ):
         return False
@@ -1084,20 +1084,16 @@ def _claude_no_external_activity(usage: Any, subagents: Any) -> bool:
         counters = subagents.get(name)
         if (
             not isinstance(counters, dict)
-            or not required.issubset(counters)
+            or set(counters) != required
             or any(not strictly_zero(value) for value in counters.values())
         ):
             return False
     if "by_type" in subagents:
         types = subagents["by_type"]
-        if (
-            not isinstance(types, dict)
-            or any(not strictly_zero(value) for value in types.values())
-        ):
+        if types != {}:
             return False
-    for name, value in subagents.items():
-        if name not in scalar | set(groups) | {"by_type"} and not strictly_zero(value):
-            return False
+    if set(subagents) - (scalar | set(groups) | {"by_type"}):
+        return False
     return True
 
 
@@ -1136,9 +1132,19 @@ def _proven_claude_quota_failure_before_review(
         or receipt.get("review_provider_envelope_sha256") != receipt["stdout_sha256"]
     ):
         return False
+    # object_pairs_hook rejects duplicates at every depth. json.loads otherwise
+    # silently takes the last value and can hide semantic REJECT material.
+    def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for name, item in pairs:
+            if name in value:
+                raise ValueError("duplicate Claude quota envelope JSON field")
+            value[name] = item
+        return value
+
     try:
-        envelope = json.loads(tail)
-    except json.JSONDecodeError:
+        envelope = json.loads(tail, object_pairs_hook=unique_json_object)
+    except ValueError:
         return False
     if not isinstance(envelope, dict) or set(envelope) - _CLAUDE_QUOTA_ENVELOPE_FIELDS:
         return False
