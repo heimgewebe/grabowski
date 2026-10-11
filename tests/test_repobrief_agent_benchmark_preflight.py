@@ -140,6 +140,40 @@ RepoBriefAgentBenchmarkPreflightTests = (
 )
 
 
+class SemanticPairSetupCompatibilityTests(unittest.TestCase):
+    """The optional clean setup has one semantic identity for both conditions."""
+
+    @staticmethod
+    def _pair() -> tuple[dict, dict]:
+        kwargs = {
+            "commit": "a" * 40,
+            "manifest": Path("/nonexistent/frozen-mcp-manifest.json"),
+            "manifest_sha256": "b" * 64,
+            "mcp_command": ["python3"],
+        }
+        return (
+            support.request(condition="baseline", **kwargs),
+            support.request(condition="treatment", **kwargs),
+        )
+
+    def test_omitted_and_explicit_clean_setup_are_pair_equivalent(self) -> None:
+        baseline, treatment = self._pair()
+        treatment["setup"] = {"working_tree": "clean"}
+        support.preflight._validate_pair(baseline, treatment)
+        baseline["setup"] = {"working_tree": "clean"}
+        treatment.pop("setup")
+        support.preflight._validate_pair(baseline, treatment)
+        treatment["setup"] = {"working_tree": "clean"}
+        support.preflight._validate_pair(baseline, treatment)
+
+    def test_forged_dirty_setup_is_not_treated_as_clean(self) -> None:
+        baseline, treatment = self._pair()
+        treatment["setup"] = {"working_tree": "dirty", "fixture": "dirty-checkout"}
+        with self.assertRaisesRegex(support.runner.RunnerError, "dirty setup is not bound"):
+            support.preflight._validate_pair(baseline, treatment)
+
+
+
 def _preflight_kwargs(root: Path, environment: dict) -> dict:
     return {
         "pair_id": support.PAIR_ID,
@@ -855,7 +889,8 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
     def test_quota_readiness_is_explicitly_unknown_without_provider_probe(self) -> None:
         with mock.patch.object(support.preflight.http.client, "HTTPSConnection") as connection, mock.patch("subprocess.run") as provider_call:
             readiness = support.preflight._claude_quota_readiness()
-        connection.assert_not_called(); provider_call.assert_not_called()
+        connection.assert_not_called()
+        provider_call.assert_not_called()
         self.assertEqual((readiness["status"], readiness["reason"]), ("unknown", "oauth_credential_unavailable"))
         self.assertIsNone(readiness["provider_available"])
         self.assertFalse(readiness["authentication_is_quota_evidence"])
@@ -875,7 +910,8 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
         http.close.assert_called_once_with()
         self.assertEqual((readiness["status"], readiness["remaining_five_hour_quota"], readiness["remaining_weekly_quota"]), ("observed", 75.0, 60.0))
         self.assertTrue(readiness["subscription_quota_not_exhausted"])
-        self.assertNotIn(secret, json.dumps(readiness, sort_keys=True)); self.assertNotIn("extra_usage", json.dumps(readiness, sort_keys=True))
+        self.assertNotIn(secret, json.dumps(readiness, sort_keys=True))
+        self.assertNotIn("extra_usage", json.dumps(readiness, sort_keys=True))
         exhausted, _ = self._quota_call({"five_hour": {"utilization": 100.0, "resets_at": None}, "seven_day": {"utilization": 50.0, "resets_at": None}})
         self.assertFalse(exhausted["subscription_quota_not_exhausted"])
         self.assertEqual((exhausted["remaining_five_hour_quota"], exhausted["remaining_weekly_quota"]), (0.0, 50.0))
@@ -907,7 +943,8 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
         huge = b"9" * 5000
         with mock.patch.object(support.preflight.http.client, "HTTPSConnection") as connection:
             bad_credential = support.preflight._claude_quota_readiness(b'{"ignored":' + huge + b',"claudeAiOauth":{"accessToken":"synthetic-token"}}')
-        connection.assert_not_called(); self.assertEqual(bad_credential["reason"], "credential_json_invalid")
+        connection.assert_not_called()
+        self.assertEqual(bad_credential["reason"], "credential_json_invalid")
         bad_response, _ = self._quota_call(b'{"ignored":' + huge + b',"five_hour":{"utilization":1,"resets_at":null},"seven_day":{"utilization":1,"resets_at":null}}')
         self.assertEqual(bad_response["reason"], "usage_response_invalid")
 
@@ -916,33 +953,48 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
         http = self._quota_http(body)
         with mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=http), mock.patch.object(support.preflight.signal, "getsignal", return_value=signal.SIG_DFL), mock.patch.object(support.preflight.signal, "getitimer", return_value=(0.0, 0.0)), mock.patch.object(support.preflight.signal, "signal") as set_signal, mock.patch.object(support.preflight.signal, "setitimer") as set_timer:
             self.assertEqual(support.preflight._claude_quota_readiness(self._quota_credential())["status"], "observed")
-        set_timer.assert_has_calls([mock.call(signal.ITIMER_REAL, 5.0), mock.call(signal.ITIMER_REAL, 0.0)]); self.assertGreaterEqual(set_signal.call_count, 2)
+        set_timer.assert_has_calls([mock.call(signal.ITIMER_REAL, 5.0), mock.call(signal.ITIMER_REAL, 0.0)])
+        self.assertGreaterEqual(set_signal.call_count, 2)
         with mock.patch.object(support.preflight.signal, "getitimer", return_value=(1.0, 0.0)), mock.patch.object(support.preflight.http.client, "HTTPSConnection") as connection:
             unavailable = support.preflight._claude_quota_readiness(self._quota_credential())
-        connection.assert_not_called(); self.assertEqual(unavailable["reason"], "usage_request_failed")
-        secret = "synthetic-token-never-return-this"; credential = self._quota_credential(secret)
+        connection.assert_not_called()
+        self.assertEqual(unavailable["reason"], "usage_request_failed")
+        secret = "synthetic-token-never-return-this"
+        credential = self._quota_credential(secret)
         unauthorized, _ = self._quota_call(b"", credential=credential, status=401)
-        broken = mock.Mock(); broken.request.side_effect = OSError(f"network failure {secret}")
-        with mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=broken): failed = support.preflight._claude_quota_readiness(credential)
+        broken = mock.Mock()
+        broken.request.side_effect = OSError(f"network failure {secret}")
+        with mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=broken):
+            failed = support.preflight._claude_quota_readiness(credential)
         oversized, _ = self._quota_call(b"x" * (support.preflight.CLAUDE_USAGE_MAX_RESPONSE_BYTES + 1), credential=credential)
         self.assertEqual([unauthorized["reason"], failed["reason"], oversized["reason"]], ["usage_http_status_401", "usage_request_failed", "usage_response_too_large"])
-        for result in (unauthorized, failed, oversized): self.assertNotIn(secret, json.dumps(result, sort_keys=True))
+        for result in (unauthorized, failed, oversized):
+            self.assertNotIn(secret, json.dumps(result, sort_keys=True))
 
     def test_quota_readiness_only_mode_is_isolated_and_structured(self) -> None:
         readiness = {"status": "observed", "provider_available": None, "subscription_quota_not_exhausted": True}
         with mock.patch.object(support.preflight, "_validated_live_credential_binding", return_value=(b"synthetic-credential", mock.Mock(st_mode=0o100600), {"kind": "synthetic-commitment"})), mock.patch.object(support.preflight, "_claude_quota_readiness", return_value=readiness), mock.patch.object(support.preflight._core, "main") as core_main, mock.patch.object(support.preflight.sys, "stdout") as stdout:
-            stdout.write.return_value = None; self.assertEqual(support.preflight.main(self._quota_argv()), 0)
+            stdout.write.return_value = None
+            self.assertEqual(support.preflight.main(self._quota_argv()), 0)
         core_main.assert_not_called()
         stderr = io.StringIO()
         with mock.patch.dict(os.environ, {support.preflight.CLAUDE_AUTH_ROOT_ENV: "relative-auth-root"}, clear=False), redirect_stderr(stderr), mock.patch.object(support.preflight._core, "main") as core_main:
             self.assertEqual(support.preflight.main(self._quota_argv()), 2)
-        core_main.assert_not_called(); self.assertEqual(json.loads(stderr.getvalue())["error"], "canonical Claude auth root is invalid")
+        core_main.assert_not_called()
+        self.assertEqual(json.loads(stderr.getvalue())["error"], "canonical Claude auth root is invalid")
         with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary); credential=root/".credentials.json"; credential_data=b"{}\n"; credential.write_bytes(credential_data); credential.chmod(0o600); nonce="ab"*16
+            root=Path(temporary)
+            credential=root/".credentials.json"
+            credential_data=b"{}\n"
+            credential.write_bytes(credential_data)
+            credential.chmod(0o600)
+            nonce="ab"*16
             stderr=io.StringIO()
             with mock.patch.dict(os.environ, {support.preflight.CLAUDE_AUTH_ROOT_ENV: str(root)}, clear=False), redirect_stderr(stderr), mock.patch.object(support.preflight._core, "main") as core_main, mock.patch.object(support.preflight, "_claude_quota_readiness") as quota_readiness:
                 status=support.preflight.main(self._quota_argv("0001-01-01T00:00:00+23:59", nonce=nonce, digest=support.preflight._commitment_sha256(credential_data, nonce)))
-        self.assertEqual(status, 2); core_main.assert_not_called(); quota_readiness.assert_not_called()
+        self.assertEqual(status, 2)
+        core_main.assert_not_called()
+        quota_readiness.assert_not_called()
         self.assertEqual(json.loads(stderr.getvalue())["error"], "Claude credential commitment timestamp is invalid")
 
     def test_live_call_requires_explicit_provider_bindings(self) -> None:
@@ -1669,6 +1721,22 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
                 "sampling": codex_runner.SAMPLING,
             }
             requests.append(value)
+        # This test fixture must expose the exact pinned Codex tool
+        # descriptors; otherwise the preflight rightly refuses it.
+        mcp_path = Path(requests[1]["repobrief"]["mcp_command"][1])
+        mcp_text = mcp_path.read_text(encoding="utf-8")
+        old = "    else:\n"
+        tools_list = (
+            "    elif request['method'] == 'tools/list':\n"
+            f"        result = {{'tools': {list(codex_runner.EXPECTED_UPSTREAM_MCP_DESCRIPTORS.values())!r}}}\n"
+            "    else:\n"
+        )
+        if mcp_text.count(old) != 1 or "tools/list" in mcp_text:
+            raise AssertionError("test MCP fixture shape drifted")
+        mcp_path.write_text(
+            mcp_text.replace(old, tools_list),
+            encoding="utf-8",
+        )
         request_root = environment["request_root"]
         for path in request_root.glob("*.json"):
             path.unlink()
@@ -1748,6 +1816,82 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             self.assertEqual(events[-1]["event"], "preflight-failed")
             self.assertEqual(events[-1]["payload"]["provider_process_intents"], 0)
 
+
+    def test_frozen_g1_vendor_failure_refuses_preflight_publication(self) -> None:
+        for vendor_failure in (
+            "historical G1 vendor source is unavailable or linked",
+            "historical G1 vendor source digest is not frozen",
+        ):
+            with self.subTest(vendor_failure=vendor_failure), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                environment = support.fixture_environment(root)
+                pair_id, _baseline, _treatment = self._codex_pair(environment)
+                state_root = root / "state"
+                codex = root / "codex"
+                codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                codex.chmod(0o755)
+                codex_sha256 = hashlib.sha256(codex.read_bytes()).hexdigest()
+                core = codex_preflight.core
+                loaded_codex = core._codex_runner_module()
+                with (
+                    mock.patch.object(
+                        codex_preflight.codex_runner,
+                        "validate_executable",
+                        return_value=str(codex.resolve()),
+                    ),
+                    mock.patch.object(
+                        codex_preflight.codex_runner, "validate_toolchain"
+                    ),
+                    mock.patch.object(
+                        codex_preflight.codex_runner,
+                        "validate_chatgpt_subscription",
+                        return_value=b'{"tokens":{}}',
+                    ),
+                    mock.patch.object(
+                        loaded_codex, "_frozen_g1_mcp_profile",
+                        return_value=loaded_codex.MCP_PROFILE_FROZEN_G1,
+                    ),
+                    mock.patch.object(
+                        core, "_historical_g1_preflight_stage",
+                        side_effect=core.PreflightError(vendor_failure),
+                    ) as staging,
+                    mock.patch.object(core.subprocess, "Popen", wraps=subprocess.Popen) as process,
+                    self.assertRaisesRegex(core.PreflightError, "historical G1 vendor"),
+                ):
+                    codex_preflight.authorize_pair(
+                        pair_id=pair_id,
+                        request_root=environment["request_root"],
+                        repository_map=environment["repository_map"],
+                        state_root=state_root,
+                        transcript_root=root / "transcripts",
+                        evidence_root=root / "evidence",
+                        report_out=root / "preflight-report.json",
+                        codex_command=str(codex.resolve()),
+                        codex_command_sha256=codex_sha256,
+                        max_cost_usd=support.Decimal("1.00"),
+                        validator_command=core._command_array(
+                            environment["validator_command"]
+                        ),
+                    )
+                staging.assert_called_once()
+                self.assertFalse(
+                    any(
+                        "mcp-stdio.py" in str(call.args)
+                        for call in process.call_args_list
+                    ),
+                    "historical G1 MCP started despite rejected vendor",
+                )
+                pair_root = next(
+                    (state_root / "preflight-dispatch-ledger").iterdir()
+                )
+                self.assertFalse(
+                    (pair_root / "authorization.json").exists()
+                )
+                events = support.ledger_events(state_root)
+                self.assertEqual(events[-1]["event"], "preflight-failed")
+                self.assertEqual(
+                    events[-1]["payload"]["provider_process_intents"], 0
+                )
 
     def test_codex_producer_ledger_is_consumable_by_exact_runner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2675,6 +2819,199 @@ class McpCommandFileIdentityTests(unittest.TestCase):
                     maximum=1024,
                     label="test repository map",
                 )
+
+
+class FrozenG2PreflightProofTests(unittest.TestCase):
+    def _g2_treatment(self, source: Path, manifest: Path, server: Path) -> dict:
+        frozen = codex_preflight.core.runner.FROZEN_G2_IDENTITY
+        value = support.request(
+            condition="treatment",
+            commit=frozen["repository"]["commit"],
+            manifest=manifest,
+            manifest_sha256=frozen["manifest_sha256"],
+            mcp_command=[
+                sys.executable, str(server), "--bundle-root",
+                str(manifest), "--repo-root", str(source),
+            ],
+        )
+        value["taskset_id"] = frozen["taskset_id"]
+        value["taskset_sha256"] = frozen["taskset_sha256"]
+        value["case_id"] = frozen["case_id"]
+        value["repository"] = dict(frozen["repository"])
+        value["prompt"] = (
+            "Prüfe den Snapshot gegen einen Dirty Working Tree. "
+            "Ein gleicher Commit reicht nicht für fresh."
+        )
+        value["setup"] = dict(codex_preflight.core.runner.FROZEN_G2_SETUP)
+        pair = f'{frozen["taskset_id"]}:{frozen["case_id"]}:r1'
+        value["pair_id"] = pair
+        value["request_id"] = f"{pair}:treatment"
+        value["session_id"] = f'session:{value["request_id"]}'
+        value["workspace_id"] = f'workspace:{value["request_id"]}'
+        value["runner"] = {
+            "execution_contract": "grabowski-codex-cli-live-v1",
+            "provider": "openai-codex-cli",
+            "model": "gpt-6-astra",
+            "sampling": {"reasoning_effort": "medium"},
+        }
+        return value
+
+    def test_real_isolated_g2_probe_fails_closed_on_fresh_or_wrong_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = support.repository(root)
+            state_root = root / "state"
+            state_root.mkdir(mode=0o700)
+            server = root / "fake-mcp.py"
+            server.write_text(
+                "import json, subprocess, sys\n"
+                "repo = sys.argv[sys.argv.index('--repo-root') + 1]\n"
+                "manifest = sys.argv[sys.argv.index('--bundle-root') + 1]\n"
+                "status = subprocess.check_output(['git', '-C', repo, 'status', '--porcelain=v1', '--untracked-files=all'], text=True).strip()\n"
+                "head = subprocess.check_output(['git', '-C', repo, 'rev-parse', 'HEAD'], text=True).strip()\n"
+                f"tools = {list(codex_runner.EXPECTED_UPSTREAM_MCP_DESCRIPTORS.values())!r}\n"
+                "for line in sys.stdin:\n"
+                "    message = json.loads(line)\n"
+                "    result = {}\n"
+                "    if message.get('method') == 'tools/list':\n"
+                "        result = {'tools': ([] if '--wrong-tools' in sys.argv else tools)}\n"
+                "    if message.get('method') == 'tools/call':\n"
+                "        stale = bool(status) and '--force-fresh' not in sys.argv\n"
+                "        current_root = repo + '/wrong' if '--wrong-root' in sys.argv else repo\n"
+                "        current_head = 'f' * 40 if '--wrong-head' in sys.argv else head\n"
+                "        dirty = False if '--mask-dirty' in sys.argv else bool(status)\n"
+                "        result = {'isError': False, 'structuredContent': {\n"
+                "            'kind': 'repobrief.live_freshness',\n"
+                "            'version': 'v1',\n"
+                "            'status': 'stale' if stale else 'fresh',\n"
+                "            'reason': 'current_working_tree_is_dirty' if stale else 'git_head_matches_and_working_tree_is_clean',\n"
+                "            'repo_root': current_root,\n"
+                "            'bundle_manifest': manifest,\n"
+                "            'read_only_git_probe': True,\n"
+                "            'implicit_refresh': False,\n"
+                "            'snapshot_provenance': {'git_commit': head},\n"
+                "            'current_provenance': {'repo_root': current_root, 'git_commit': current_head, 'git_dirty': dirty, 'provenance_status': 'present'},\n"
+                "        }}\n"
+                "    print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}), flush=True)\n",
+                encoding="utf-8",
+            )
+            manifest = root / "snapshot.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            frozen = codex_preflight.core.runner.FROZEN_G2_IDENTITY
+            with mock.patch.dict(
+                frozen, {"repository": {**frozen["repository"], "commit": commit}}
+            ):
+                treatment = self._g2_treatment(source, manifest, server)
+                proof = codex_preflight.core.probe_bound_negative_scenario(
+                    treatment, source=source, state_root=state_root
+                )
+                self.assertEqual(proof["observed_status"], "stale")
+                self.assertEqual(
+                    proof["observed_reason"], "current_working_tree_is_dirty"
+                )
+                self.assertEqual(proof["git_commit"], commit)
+                self.assertEqual(
+                    proof["fixture_sha256"],
+                    codex_preflight.core.runner._sha256_bytes(
+                        codex_preflight.core.runner.DIRTY_FIXTURE_BYTES
+                    ),
+                )
+                self.assertEqual(support.git(["status", "--porcelain"], source), "")
+                self.assertEqual(list(state_root.iterdir()), [])
+
+                treatment["repobrief"]["mcp_command"].append("--force-fresh")
+                with self.assertRaisesRegex(
+                    codex_preflight.core.PreflightError, "did not prove stale"
+                ):
+                    codex_preflight.core.probe_bound_negative_scenario(
+                        treatment, source=source, state_root=state_root
+                    )
+                treatment["repobrief"]["mcp_command"].pop()
+                for manipulation in (
+                    "--wrong-root", "--wrong-head", "--mask-dirty", "--wrong-tools"
+                ):
+                    treatment["repobrief"]["mcp_command"].append(manipulation)
+                    with self.subTest(manipulation=manipulation):
+                        reason = (
+                            "tools/list violates the pinned tool contract"
+                            if manipulation == "--wrong-tools"
+                            else "provenance does not match"
+                        )
+                        with self.assertRaisesRegex(
+                            codex_preflight.core.PreflightError, reason
+                        ):
+                            codex_preflight.core.probe_bound_negative_scenario(
+                                treatment, source=source, state_root=state_root
+                            )
+                    treatment["repobrief"]["mcp_command"].pop()
+                treatment["repobrief"]["mcp_command"][-1] = str(root / "wrong")
+                with self.assertRaisesRegex(
+                    codex_preflight.core.PreflightError, "source root mismatch"
+                ):
+                    codex_preflight.core.probe_bound_negative_scenario(
+                        treatment, source=source, state_root=state_root
+                    )
+                self.assertEqual(support.git(["status", "--porcelain"], source), "")
+
+    def test_g2_preflight_evidence_requires_real_stale_attestation(self) -> None:
+        frozen = codex_runner.base.FROZEN_G2_IDENTITY
+        binding = {
+            "taskset_id": frozen["taskset_id"],
+            "taskset_sha256": frozen["taskset_sha256"],
+            "pair_id": f'{frozen["taskset_id"]}:{frozen["case_id"]}:r1',
+        }
+        source_state = {"clean": True, "head": frozen["repository"]["commit"]}
+        report = {
+            "scenario_probe": {
+                "working_tree": "dirty",
+                "fixture": "dirty-checkout",
+                "expected_status": "stale",
+                "observed_status": "stale",
+                "observed_reason": "current_working_tree_is_dirty",
+                "git_commit": frozen["repository"]["commit"],
+                "fixture_sha256": codex_runner.base._sha256_bytes(
+                    codex_runner.base.DIRTY_FIXTURE_BYTES
+                ),
+                "status_sha256": codex_runner.base._sha256_bytes(
+                    f'?? {codex_runner.base.DIRTY_FIXTURE_NAME}'.encode()
+                ),
+                "mcp_result_sha256": "a" * 64,
+                "probe_ms": 10,
+                "source_unchanged_required": True,
+                "provider_started": False,
+            },
+            "source_before": source_state,
+            "source_after": dict(source_state),
+        }
+        codex_runner._require_g2_preflight_evidence(report, binding)
+        for changed in ("missing", "fresh", "fixture", "unbound", "source"):
+            candidate = json.loads(json.dumps(report))
+            if changed == "missing":
+                candidate.pop("scenario_probe")
+            elif changed == "fresh":
+                candidate["scenario_probe"]["observed_status"] = "fresh"
+            elif changed == "fixture":
+                candidate["scenario_probe"]["fixture_sha256"] = "b" * 64
+            elif changed == "unbound":
+                candidate["scenario_probe"]["mcp_result_sha256"] = "unverified"
+            elif changed == "source":
+                candidate["source_after"]["clean"] = False
+            with self.subTest(tamper=changed):
+                with self.assertRaisesRegex(
+                    codex_runner.RunnerError, "bound G2 stale scenario proof"
+                ):
+                    codex_runner._require_g2_preflight_evidence(
+                        candidate, binding
+                    )
+        # The proof requirement cannot accidentally apply to normal clean pairs.
+        clean_binding = {
+            **binding,
+            "pair_id": binding["pair_id"].replace(
+                frozen["case_id"], "grounding-clean-freshness"
+            ),
+        }
+        codex_runner._require_g2_preflight_evidence({}, clean_binding)
+
 
 
 if __name__ == "__main__":
