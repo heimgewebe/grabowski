@@ -669,5 +669,36 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 tasks._require_direct_codex_filesystem_sandbox(argv)
 
 
+    def test_preload_environment_must_not_bypass_coding_agent_isolation(self) -> None:
+        # All commands here are inert strings inspected only by the admission
+        # guard. None of the preload files exists in the fixture or is run.
+        # Each variable can load executable code before a harmless argv body.
+        commands = (
+            ["env", "BASH_ENV=/tmp/preload.sh",
+             "bash", "-c", "printf safe"],
+            ["env", "PYTHONPATH=/tmp/preload",
+             "python3", "-c", "print('safe')"],
+            ["env", "NODE_OPTIONS=--require=/tmp/preload.js",
+             "node", "-e", "console.log('safe')"],
+            ["env", "RUBYOPT=-r/tmp/preload.rb",
+             "ruby", "-e", "puts 'safe'"],
+            ["env", "PERL5OPT=-MInjected",
+             "perl", "-e", "print 'safe'"],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Codex.*filesystem sandbox"
+                ):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        for argv in (
+            ["env", "CARGO_TARGET_DIR=/tmp/project-codex", "cargo", "test"],
+            ["env", "FOO=bar", "bash", "-c", "printf safe"],
+        ):
+            with self.subTest(allowed=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
 if __name__ == "__main__":
     unittest.main()
