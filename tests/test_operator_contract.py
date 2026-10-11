@@ -3122,9 +3122,10 @@ class OperatorContractTests(unittest.TestCase):
                 operator, "JOBS_DIR", jobs
             ), patch.object(
                 operator.decision_reviews, "LOCKS_ROOT", locks
-            ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
-                operator, "_run", return_value=launcher
-            ) as run_mock:
+            ), patch("grabowski_agent_role.current_binding",
+                     return_value=("a" * 40, "e" * 64, False)), patch.object(
+                operator.uuid, "uuid4", return_value=fake_uuid
+            ), patch.object(operator, "_run", return_value=launcher) as run_mock:
                 job = operator.grabowski_job_start(
                     argv,
                     cwd=str(cwd),
@@ -3216,7 +3217,10 @@ class OperatorContractTests(unittest.TestCase):
                 return types.SimpleNamespace(hex=f"{next(counter):012x}" + ("f" * 20))
             with patch.object(operator, "STATE_DIR", state), patch.object(
                 operator, "JOBS_DIR", jobs
-            ), patch.object(operator.decision_reviews, "LOCKS_ROOT", locks), patch.object(
+            ), patch.object(operator.decision_reviews, "LOCKS_ROOT", locks), patch(
+                "grabowski_agent_role.current_binding",
+                return_value=("a" * 40, "e" * 64, False),
+            ), patch.object(
                 operator.uuid, "uuid4", side_effect=next_uuid
             ), patch.object(operator, "_run", return_value=launched):
                 first = operator.grabowski_job_start(
