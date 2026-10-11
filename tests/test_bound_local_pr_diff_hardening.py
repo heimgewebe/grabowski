@@ -76,6 +76,83 @@ class BoundLocalPrDiffHardeningTests(unittest.TestCase):
             self.assertTrue(seen_init)
             self.assertIn(b"a.txt", result)
 
+    def test_gitlink_identity_diff_pins_submodules_and_commit_oids(self) -> None:
+        # Path lists alone cannot prove that a 160000 submodule pointer was reviewed.
+        # Keep the isolated content diff policy explicit under both host config
+        # and committed .gitmodules, not merely as a side effect of an empty GIT_DIR.
+        for policy in ("checkout-config", "committed-gitmodules"):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory(
+                prefix="pr-diff-gitlink-identity-"
+            ) as directory:
+                repo = Path(directory)
+                self.git(repo, "init", "-q")
+                self.git(repo, "config", "user.email", "review@example.invalid")
+                self.git(repo, "config", "user.name", "Review")
+                (repo / "seed.txt").write_text("seed\n")
+                if policy == "committed-gitmodules":
+                    (repo / ".gitmodules").write_text(
+                        '[submodule "module"]\n'
+                        '    path = deps/module\n'
+                        '    url = https://example.invalid/module\n'
+                        '    ignore = all\n'
+                    )
+                self.git(repo, "add", ".")
+                self.git(repo, "commit", "-qm", "seed")
+                old_pointer = self.git(repo, "rev-parse", "HEAD")
+                self.git(
+                    repo, "update-index", "--add", "--cacheinfo",
+                    "160000", old_pointer, "deps/module",
+                )
+                self.git(repo, "commit", "-qm", "gitlink-base")
+                base = self.git(repo, "rev-parse", "HEAD")
+                self.git(
+                    repo, "update-index", "--cacheinfo",
+                    "160000", base, "deps/module",
+                )
+                self.git(repo, "commit", "-qm", "gitlink-head")
+                head = self.git(repo, "rev-parse", "HEAD")
+                if policy == "checkout-config":
+                    self.git(repo, "config", "diff.ignoreSubmodules", "all")
+                self.assertEqual(
+                    self.git(repo, "diff", "--name-only", base, head), "",
+                )
+                content_commands: list[list[str]] = []
+                original = pr_diff._bounded_git_capture
+
+                def capture_content(args: list[str], **kwargs: object) -> bytes:
+                    if "diff" in args and "--no-ext-diff" in args:
+                        content_commands.append(args)
+                    return original(args, **kwargs)
+
+                with mock.patch.object(
+                    pr_diff, "_bounded_git_capture", side_effect=capture_content,
+                ):
+                    content = bound_local_pr_git_diff(
+                        repo, merge_base=base, head=head,
+                    )
+                self.assertEqual(len(content_commands), 1)
+                self.assertIn("--ignore-submodules=none", content_commands[0])
+                self.assertIn(b"diff --git a/deps/module b/deps/module", content)
+                self.assertIn(
+                    ("-Subproject commit " + old_pointer).encode("ascii"), content,
+                )
+                self.assertIn(
+                    ("+Subproject commit " + base).encode("ascii"), content,
+                )
+                self.git(
+                    repo, "update-index", "--cacheinfo",
+                    "160000", head, "deps/module",
+                )
+                self.git(repo, "commit", "-qm", "retarget-gitlink")
+                retarget = self.git(repo, "rev-parse", "HEAD")
+                retarget_content = bound_local_pr_git_diff(
+                    repo, merge_base=base, head=retarget,
+                )
+                self.assertNotEqual(
+                    pr_diff.github_pr_diff_identity_sha256(content),
+                    pr_diff.github_pr_diff_identity_sha256(retarget_content),
+                )
+
     def test_completed_git_command_does_not_kill_reaped_process_group(self) -> None:
         # Reaped PGIDs can be reused; a clean command must not signal its old group.
         with mock.patch("os.killpg") as kill_group:
