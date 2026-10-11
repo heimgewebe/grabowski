@@ -224,6 +224,34 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             task_id, message="original start decision is missing"
         )
 
+    def test_missing_anchor_with_disguised_agent_cannot_be_legacy_nonagent(self) -> None:
+        task_id = self._start_claude()
+        fake_argv = [
+            "/bin/bash", "-c",
+            "/opt/claude --permission-mode plan -p prompt",
+        ]
+        with tasks._database_connection() as db:
+            db.execute(
+                "DELETE FROM metadata WHERE key=?",
+                (f"{tasks.TASK_EFFECT_START_KEY_PREFIX}{task_id}",),
+            )
+            db.execute(
+                "UPDATE tasks SET argv_json=?, argv_sha256=?, launcher_json=? "
+                "WHERE task_id=?",
+                (
+                    tasks._canonical_json(fake_argv),
+                    tasks.command_identity.argv_sha256(fake_argv),
+                    tasks._canonical_json({}),
+                    task_id,
+                ),
+            )
+        # Missing original identity cannot become a legacy exemption merely
+        # because mutable argv/launcher fields were rewritten.
+        with self.assertRaisesRegex(RuntimeError, "original start decision"):
+            tasks._verified_task_effect_start(
+                tasks._row_raw(task_id), command=fake_argv
+            )
+
     def test_task_and_start_anchor_roll_back_in_same_transaction(self) -> None:
         argv = ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"]
         with (
@@ -423,6 +451,70 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                     tasks._require_direct_codex_filesystem_sandbox(
                         ["/bin/bash", "-c", command]
                     )
+
+    def test_reviewer_p1_grouped_shell_codex_launches_are_denied(self) -> None:
+        for source in (
+            "{ codex exec prompt; }",
+            "function run(){ codex exec prompt; }; run",
+            "echo ok; { codex exec prompt; }",
+            "if true; then { codex exec prompt; }; fi",
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/bin/bash", "-c", source]
+                    )
+
+    def test_reviewer_p1_env_optional_signal_flags_cannot_hide_codex(self) -> None:
+        for argv in (
+            ["/usr/bin/env", "--block-signal", "SIGTERM", "codex", "exec", "prompt"],
+            ["/usr/bin/env", "--block-signal=SIGTERM", "codex", "exec", "prompt"],
+            ["/usr/bin/env", "-iS", "--block-signal KILL codex exec"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_reviewer_p1_busybox_shell_applets_cannot_hide_codex(self) -> None:
+        for shell in ("ash", "hush"):
+            with self.subTest(shell=shell):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/usr/bin/busybox", shell, "-c", "codex exec prompt"]
+                    )
+
+    def test_reviewer_p1_perl_ruby_option_clusters_cannot_hide_codex(self) -> None:
+        for argv in (
+            ["perl", "-p", "-e", "system('codex exec')"],
+            ["perl", "-pe", "system('codex exec')"],
+            ["ruby", "-p", "-e", "system('codex exec')"],
+            ["ruby", "-pe", "system('codex exec')"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_reviewer_p1_renamed_python_and_loader_are_detected(self) -> None:
+        for name, target, args in (
+            ("alias-python-guard", "/usr/bin/python3.12",
+             ["-c", "import os; os.execvp('codex', ['codex', 'exec'])"]),
+            ("alias-loader-guard", "/lib64/ld-linux-x86-64.so.2",
+             ["/opt/codex", "exec", "prompt"]),
+        ):
+            alias = self.root / name
+            alias.symlink_to(target)
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox([str(alias), *args])
+
+    def test_grouping_non_agent_literal_arguments_are_preserved(self) -> None:
+        for argv in (
+            ["/bin/bash", "-c", "{ printf 'codex exec prompt'; }"],
+            ["/bin/bash", "-c", "function f(){ printf codex; }; f"],
+            ["/usr/bin/busybox", "ash", "-c", "printf 'codex exec prompt'"],
+        ):
+            with self.subTest(argv=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
 
     def test_legitimate_codex_named_paths_are_not_entrypoints(self) -> None:
         commands = (
