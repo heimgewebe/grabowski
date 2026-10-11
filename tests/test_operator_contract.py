@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -3052,6 +3053,108 @@ class OperatorContractTests(unittest.TestCase):
                 job["scope"]["started_at_unix_ns"],
             )
 
+    def test_v2_job_start_rejects_invalid_real_git_before_attempt_registration(self) -> None:
+        """The public job launcher must reject bad role bindings before recording an attempt."""
+        import grabowski_agent_role as agent_role
+
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repository"
+            repo.mkdir()
+            state = root / "state"
+            jobs = state / "jobs"
+            locks = state / "decision-review-locks"
+
+            def git(*arguments: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *arguments],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.name", "Review Test")
+            git("config", "user.email", "review-test@example.invalid")
+            (repo / "source.py").write_text("before\n", encoding="utf-8")
+            git("add", "source.py")
+            git("commit", "-qm", "base")
+            base = git("rev-parse", "HEAD")
+            (repo / "source.py").write_text("after\n", encoding="utf-8")
+            git("add", "source.py")
+            git("commit", "-qm", "head")
+            head = git("rev-parse", "HEAD")
+            actual_head, workspace_sha, dirty = agent_role.current_binding(repo, base)
+            raw_sha = hashlib.sha256(agent_role.committed_diff(repo, base, head)).hexdigest()
+            self.assertEqual(actual_head, head)
+            self.assertFalse(dirty)
+            self.assertNotEqual(raw_sha, workspace_sha)
+
+            binding = {
+                "schema_version": 1,
+                "kind": operator.decision_reviews.BINDING_KIND,
+                "repo": "heimgewebe/grabowski",
+                "pr": 1444,
+                "head_sha": head,
+                "base_sha": base,
+                "diff_sha256": "f" * 64,
+                "slot": "independent-gemini",
+            }
+            argv = [
+                operator.decision_reviews.REVIEW_ROLE_PYTHON,
+                "-I", "-m", operator.decision_reviews.REVIEW_ROLE_MODULE,
+                "--role", "review",
+                "--repository", str(repo),
+                "--expected-head", head,
+                "--expected-base-head", base,
+                "--expected-diff-sha256", workspace_sha,
+                "--expected-dirty", "false",
+                "--output", str(root / "unused-output.json"),
+                "--", "agy", "--model", "gemini-3.1-pro-high",
+                "Review the bound immutable committed diff",
+            ]
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(
+                operator.decision_reviews, "LOCKS_ROOT", locks
+            ), patch.object(
+                operator, "_run", side_effect=AssertionError("provider launch forbidden")
+            ) as launch:
+                def rejected(fingerprint: str, *, unavailable: bool = False) -> None:
+                    command = list(argv)
+                    command[command.index("--expected-diff-sha256") + 1] = fingerprint
+                    if unavailable:
+                        with patch(
+                            "grabowski_agent_role.current_binding",
+                            side_effect=RuntimeError("Git readback unavailable"),
+                        ):
+                            with self.assertRaisesRegex(ValueError, "prelaunch.*unavailable"):
+                                operator.grabowski_job_start(
+                                    command, cwd=str(repo), runtime_seconds=60,
+                                    decision_review_binding=binding,
+                                )
+                    else:
+                        with self.assertRaisesRegex(ValueError, "prelaunch.*identity"):
+                            operator.grabowski_job_start(
+                                command, cwd=str(repo), runtime_seconds=60,
+                                decision_review_binding=binding,
+                            )
+                    # The coordination lock is legitimate, but a decision
+                    # attempt must not acquire a job origin/order/role receipt.
+                    self.assertFalse(list(jobs.glob("grabowski-job-*/metadata.json")))
+                    self.assertFalse(list(jobs.glob("grabowski-job-*/review-role-attempt.json")))
+                    self.assertFalse(list((state / "decision-review-order").glob("*.json")))
+                    launch.assert_not_called()
+
+                rejected(raw_sha)  # A raw committed Git diff is not the role fingerprint.
+                (repo / "untracked.txt").write_text("dirty", encoding="utf-8")
+                rejected(workspace_sha)
+                (repo / "untracked.txt").unlink()
+                (repo / "source.py").write_text("newer\n", encoding="utf-8")
+                git("add", "source.py")
+                git("commit", "-qm", "new head")
+                rejected(workspace_sha)
+                rejected(workspace_sha, unavailable=True)
+
     def test_job_start_origin_binds_server_derived_independent_reviewer_provenance(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -3122,9 +3225,10 @@ class OperatorContractTests(unittest.TestCase):
                 operator, "JOBS_DIR", jobs
             ), patch.object(
                 operator.decision_reviews, "LOCKS_ROOT", locks
-            ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
-                operator, "_run", return_value=launcher
-            ) as run_mock:
+            ), patch("grabowski_agent_role.current_binding",
+                     return_value=("a" * 40, "e" * 64, False)), patch.object(
+                operator.uuid, "uuid4", return_value=fake_uuid
+            ), patch.object(operator, "_run", return_value=launcher) as run_mock:
                 job = operator.grabowski_job_start(
                     argv,
                     cwd=str(cwd),
@@ -3216,7 +3320,10 @@ class OperatorContractTests(unittest.TestCase):
                 return types.SimpleNamespace(hex=f"{next(counter):012x}" + ("f" * 20))
             with patch.object(operator, "STATE_DIR", state), patch.object(
                 operator, "JOBS_DIR", jobs
-            ), patch.object(operator.decision_reviews, "LOCKS_ROOT", locks), patch.object(
+            ), patch.object(operator.decision_reviews, "LOCKS_ROOT", locks), patch(
+                "grabowski_agent_role.current_binding",
+                return_value=("a" * 40, "e" * 64, False),
+            ), patch.object(
                 operator.uuid, "uuid4", side_effect=next_uuid
             ), patch.object(operator, "_run", return_value=launched):
                 first = operator.grabowski_job_start(
