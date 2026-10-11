@@ -1722,7 +1722,13 @@ def _merge_guard_legacy_local_review_diff_identity(
             repo_path,
             # Historic review receipts hash the default 3-context Git diff.
             # Pin it explicitly: repository diff.context must not change the proof.
-            ["diff", "--binary", "--no-ext-diff", "--no-textconv", "--unified=3", f"{base_sha}...{head_sha}"],
+            # Keep the original default Git review-byte format despite later
+            # local config changes. Full-index would invalidate signed receipts.
+            [
+                "-c", "diff.noprefix=false", "-c", "core.abbrev=auto",
+                "diff", "--binary", "--no-ext-diff", "--no-textconv",
+                "--unified=3", f"{base_sha}...{head_sha}",
+            ],
             timeout=60,
         )
         local_diff = local_result["stdout_bytes"]

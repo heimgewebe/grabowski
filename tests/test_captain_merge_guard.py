@@ -412,6 +412,25 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             self.assertEqual(evidence["local_raw_sha256"], reviewed_sha)
             self.assertTrue(evidence["canonical_hunks_match"])
 
+            # Local Git formatting config may change after a reviewer signed
+            # the immutable raw bytes; neither knob changes committed hunks.
+            for setting, hostile_value in (
+                ("diff.noprefix", "true"),
+                ("core.abbrev", "12"),
+            ):
+                _git(repo, "config", setting, hostile_value)
+                try:
+                    with self.subTest(git_setting=setting):
+                        accepted, details = merge_guard._merge_guard_legacy_local_review_diff_identity(
+                            repo, base_sha=base, head_sha=head,
+                            expected_sha256=reviewed_sha,
+                            provider_diff=provider, changed_paths=["app.py"],
+                        )
+                        self.assertTrue(accepted, details)
+                        self.assertEqual(details["local_raw_sha256"], reviewed_sha)
+                finally:
+                    _git(repo, "config", "--unset", setting)
+
             altered_provider = provider.replace(b"+    item_11 = 123", b"+    item_11 = 999")
             self.assertNotEqual(provider, altered_provider)
             for label, modifications in (
