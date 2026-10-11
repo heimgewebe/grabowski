@@ -1592,6 +1592,7 @@ def _merge_guard_local_changed_paths(
                 "--no-ext-diff",
                 "--no-textconv",
                 "--no-renames",
+                "--ignore-submodules=none",
                 merge_base,
                 head_sha,
                 "--",
