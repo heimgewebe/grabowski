@@ -3999,6 +3999,84 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
             or "@openai/codex" in value
         )
 
+
+
+    def harmless_inline_source(source: str, language: str) -> bool:
+        """Accept literal output only; never authorize an arbitrary program."""
+        if len(source) > 2048:
+            return False
+        if language == "python":
+            import ast
+
+            try:
+                tree = ast.parse(source, mode="exec")
+            except SyntaxError:
+                return False
+            return bool(tree.body) and all(
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "print"
+                and not node.value.keywords
+                and all(isinstance(arg, ast.Constant) for arg in node.value.args)
+                for node in tree.body
+            )
+        literal = r"""(?:'[^'\n]{0,1024}'|"[^"\n]{0,1024}")"""
+        patterns = {
+            "node": rf"console\.log\(\s*{literal}\s*\)\s*;?",
+            "nodejs": rf"console\.log\(\s*{literal}\s*\)\s*;?",
+            "ruby": rf"puts\s+{literal}\s*;?",
+            "perl": rf"print\s+{literal}\s*;?",
+        }
+        return re.fullmatch(patterns[language], source.strip()) is not None
+
+    def shell_embedded_sources(source: str) -> list[str]:
+        """Inspect executable substitutions, including inside double quotes."""
+        embedded: list[str] = []
+        quote: str | None = None
+        cursor = 0
+        while cursor < len(source):
+            current = source[cursor]
+            if current == "\\":
+                cursor += 2
+                continue
+            if quote == "'":
+                if current == "'":
+                    quote = None
+                cursor += 1
+                continue
+            if current == "'" and quote is None:
+                quote = "'"
+                cursor += 1
+                continue
+            if current == '"':
+                quote = None if quote == '"' else '"'
+                cursor += 1
+                continue
+            if current == chr(96):
+                end = source.find(chr(96), cursor + 1)
+                if end < 0:
+                    raise RuntimeError("Codex filesystem sandbox cannot verify shell substitution")
+                embedded.append(source[cursor + 1:end])
+                cursor = end + 1
+                continue
+            if source.startswith("$(", cursor):
+                depth = 1
+                end = cursor + 2
+                while end < len(source) and depth:
+                    if source[end] == "(":
+                        depth += 1
+                    elif source[end] == ")":
+                        depth -= 1
+                    end += 1
+                if depth:
+                    raise RuntimeError("Codex filesystem sandbox cannot verify shell substitution")
+                embedded.append(source[cursor + 2:end - 1])
+                cursor = end
+                continue
+            cursor += 1
+        return embedded
+
     executable = Path(argv[0]).name.casefold()
     try:
         resolved_executable = str(Path(argv[0]).resolve(strict=False))
@@ -4018,9 +4096,9 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
     resolved_binary = Path(resolved_executable).name.casefold()
     if (
         resolved_binary in wrappers
-        or re.fullmatch(r"python(?:[0-9]+(?:\\.[0-9]+)?)?", resolved_binary)
+        or re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)?)?", resolved_binary)
         or resolved_binary == "ld.so"
-        or re.fullmatch(r"ld-linux[^/]*\\.so(?:\\.[0-9]+)*", resolved_binary)
+        or re.fullmatch(r"ld-linux[^/]*\.so(?:\.[0-9]+)*", resolved_binary)
     ):
         executable = resolved_binary
     python_interpreter = re.fullmatch(
@@ -4077,11 +4155,24 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
             if item in {"-u", "--unset", "-C", "--chdir", "-a", "--argv0"}:
                 index += 2
                 continue
-            if item == "--" or item.startswith("-") or (
+            # GNU env signal actions accept an optional value only when
+            # joined by '='; a following word is the executable, not a value.
+            if item in {"--block-signal", "--default-signal", "--ignore-signal"}:
+                index += 1
+                continue
+            if item.startswith(("--block-signal=", "--default-signal=", "--ignore-signal=")):
+                index += 1
+                continue
+            if item in {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}:
+                index += 1
+                continue
+            if item == "--" or (
                 "=" in item and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item.split("=", 1)[0])
             ):
                 index += 1
                 continue
+            if item.startswith("-"):
+                raise RuntimeError("Codex filesystem sandbox cannot verify env options")
             # Recurse through nested env and known launchers; only a command
             # entrypoint (not an arbitrary environment value) is executable.
             _require_direct_codex_filesystem_sandbox(argv[index:])
@@ -4095,7 +4186,15 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
     if executable == "busybox":
         start = 2 if argv[1:2] == ["--"] else 1
         if start < len(argv) and not argv[start].startswith("-"):
-            _require_direct_codex_filesystem_sandbox(argv[start:])
+            applet = argv[start]
+            # These are shell applets rather than standalone executables.
+            # Their -c payload must pass the same recursive shell guard.
+            if applet in {"ash", "hush"}:
+                _require_direct_codex_filesystem_sandbox(["sh", *argv[start + 1:]])
+            else:
+                _require_direct_codex_filesystem_sandbox(argv[start:])
+        elif start < len(argv) and argv[start] not in {"--help", "--list", "--list-full"}:
+            raise RuntimeError("Codex filesystem sandbox cannot verify busybox options")
         return
     if executable in {"timeout", "nice", "stdbuf", "nohup", "setsid"}:
         # These programs run a child argv after their own option payloads.
@@ -4208,12 +4307,20 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                 shell_code = argv[index + 1]
                 break
         if shell_code is not None:
+            # Substitution executes a child even when the argument is quoted.
+            for embedded in shell_embedded_sources(shell_code):
+                _require_direct_codex_filesystem_sandbox(["sh", "-c", embedded])
+            # Dynamic eval can construct an executable after admission.
+            if re.search(r"\beval\b", shell_code) and (
+                "$" in shell_code or chr(96) in shell_code
+            ):
+                raise RuntimeError("Codex filesystem sandbox cannot verify dynamic shell eval")
             # Only command positions of a literal shell payload are entrypoints.
             # A path or text argument containing "codex" is not a program.
             import shlex
 
             lexer = shlex.shlex(
-                shell_code, posix=True, punctuation_chars=";&|()\n"
+                shell_code, posix=True, punctuation_chars=";&|(){}\n"
             )
             lexer.whitespace = " \t\r"
             lexer.whitespace_split = True
@@ -4225,7 +4332,7 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                 ) from exc
             segment: list[str] = []
             for token in [*shell_tokens, ";"]:
-                if token and all(char in ";&|()\n" for char in token):
+                if token and all(char in ";&|(){}\n" for char in token):
                     offset = 0
                     while offset < len(segment) and re.fullmatch(
                         r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[offset]
@@ -4237,10 +4344,19 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                         prefix = segment[offset]
                         if prefix in {
                             "if", "elif", "while", "until", "then", "do",
-                            "else", "!", "builtin",
+                            "else", "!", "builtin", "{", "}", "coproc",
                         }:
                             offset += 1
                             continue
+                        if prefix == "function":
+                            offset += 2
+                            if offset < len(segment) and segment[offset] == "()":
+                                offset += 1
+                            continue
+                        if prefix.startswith("$"):
+                            raise RuntimeError(
+                                "Codex filesystem sandbox cannot verify dynamic shell command"
+                            )
                         if prefix == "exec":
                             offset += 1
                             while offset < len(segment) and segment[offset].startswith("-"):
@@ -4289,6 +4405,13 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
             module_index += 1
         if (
             len(argv) > module_index + 1
+            and argv[module_index] == "-c"
+        ):
+            if not harmless_inline_source(argv[module_index + 1], "python"):
+                raise RuntimeError("Codex filesystem sandbox cannot verify Python inline code")
+            payload_tokens = []
+        elif (
+            len(argv) > module_index + 1
             and argv[module_index] == "-m"
             and argv[module_index + 1] == "grabowski_agent_writer"
         ):
@@ -4302,26 +4425,51 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
         # an inline code payload or a preloaded executable module can launch
         # Codex directly. Unknown interpreter flags fail closed.
         payload_tokens = []
+        inline_code_index: int | None = None
         index = 1
         while index < len(argv):
             item = argv[index]
             if item == "--":
                 index += 1
                 break
-            if item in {"-e", "--eval", "-p", "--print"}:
+            # Perl/Ruby -p is a per-line loop flag, unlike Node -p which
+            # supplies an expression. Combined -pe contains executable code.
+            if executable in {"perl", "ruby"} and item in {"-p", "-n"}:
+                index += 1
+                continue
+            combined_code = (
+                re.fullmatch(r"-[pnwla]+e(.*)", item)
+                if executable in {"perl", "ruby"} else None
+            )
+            if combined_code is not None:
+                inline = combined_code.group(1)
+                if not inline:
+                    if index + 1 >= len(argv):
+                        raise RuntimeError("Codex filesystem sandbox cannot verify interpreter code")
+                    inline = argv[index + 1]
+                payload_tokens.append(inline)
+                inline_code_index = len(payload_tokens) - 1
+                break
+            if item in {"-e", "--eval"} or (
+                executable in {"node", "nodejs"} and item in {"-p", "--print"}
+            ):
                 if index + 1 >= len(argv):
                     raise RuntimeError(
                         "Codex filesystem sandbox cannot verify interpreter code"
                     )
                 payload_tokens.append(argv[index + 1])
+                inline_code_index = len(payload_tokens) - 1
                 index += 2
                 break
-            if item.startswith(("--eval=", "--print=")) or (
-                item.startswith(("-e", "-p")) and len(item) > 2
+            if item.startswith("--eval=") or (
+                executable in {"node", "nodejs"} and item.startswith("--print=")
+            ) or (item.startswith("-e") and len(item) > 2) or (
+                executable in {"node", "nodejs"} and item.startswith("-p") and len(item) > 2
             ):
                 payload_tokens.append(
                     item.partition("=")[2] if item.startswith("--") else item[2:]
                 )
+                inline_code_index = len(payload_tokens) - 1
                 break
             if item in {"-r", "--require", "--import", "--loader"}:
                 if index + 1 >= len(argv):
@@ -4346,6 +4494,10 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                     "Codex filesystem sandbox cannot verify interpreter options"
                 )
             break
+        if inline_code_index is not None:
+            inline_code = payload_tokens.pop(inline_code_index)
+            if not harmless_inline_source(inline_code, executable):
+                raise RuntimeError("Codex filesystem sandbox cannot verify interpreter inline code")
         if index < len(argv):
             if codex_entrypoint(argv[index]):
                 payload_tokens.append(argv[index])
@@ -4584,10 +4736,9 @@ def _verified_task_effect_start(
             (f"{TASK_EFFECT_START_KEY_PREFIX}{record['task_id']}",),
         ).fetchone()
     if row is None:
-        # Preserve genuine non-agent legacy tasks, but fail closed whenever
-        # an unanchored task currently identifies as a coding agent.
-        if not agent_known:
-            return launcher_classification
+        # Mutable legacy-looking argv/launcher fields cannot prove an
+        # original non-agent effect. Allow observation but never re-execute
+        # an unanchored historical or tampered task.
         raise RuntimeError("unverified agent effect: original start decision is missing")
     try:
         original = json.loads(str(row["value"]))
