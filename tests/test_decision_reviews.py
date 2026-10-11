@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -1882,6 +1883,97 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(attempts["grabowski-job-a66666666666"]["classification"], "invalid_result")
         self.assertEqual(attempts["grabowski-job-b77777777777"]["classification"], "pass")
 
+
+    def test_v2_role_prelaunch_rejects_wrong_workspace_identity_without_job_registration(self) -> None:
+        # Real committed Git bytes are not the composite role workspace identity.
+        # Admission must fail BEFORE the job-owned review attempt is recorded.
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repository"
+            repo.mkdir()
+            def git(*arguments: str) -> str:
+                return subprocess.run(
+                    ["git", *arguments], cwd=repo, check=True,
+                    capture_output=True, text=True,
+                ).stdout.strip()
+            git("init", "-q")
+            git("config", "user.email", "review-test@example.invalid")
+            git("config", "user.name", "Reviewer Test")
+            (repo / "source.py").write_text("before\\n", encoding="utf-8")
+            git("add", "source.py")
+            git("commit", "-qm", "base")
+            base = git("rev-parse", "HEAD")
+            (repo / "source.py").write_text("after\\n", encoding="utf-8")
+            git("add", "source.py")
+            git("commit", "-qm", "head")
+            head = git("rev-parse", "HEAD")
+            actual_head, workspace_sha, dirty = agent_role.current_binding(repo, base)
+            raw_sha = hashlib.sha256(agent_role.committed_diff(repo, base, head)).hexdigest()
+            self.assertEqual(actual_head, head)
+            self.assertFalse(dirty)
+            self.assertNotEqual(raw_sha, workspace_sha)
+
+            target = Path(temporary) / "jobs" / "grabowski-job-a11111111111"
+            normalized = reviews.normalize_binding({
+                **binding("independent-gemini"), "head_sha": head, "base_sha": base,
+                "diff_sha256": "f" * 64,
+            })
+            argv = [
+                reviews.REVIEW_ROLE_PYTHON, "-I", "-m", reviews.REVIEW_ROLE_MODULE,
+                "--role", "review", "--repository", str(repo),
+                "--expected-head", head, "--expected-base-head", base,
+                "--expected-diff-sha256", raw_sha,
+                "--expected-dirty", "false", "--output", "/tmp/preflight-placeholder.json",
+                "--", "agy", "--model", "gemini-3.1-pro-high", "Review exact diff",
+            ]
+            with self.assertRaisesRegex(ValueError, "prelaunch.*identity"):
+                reviews.bind_job_review_role_argv(
+                    argv, normalized, cwd=repo, attempt_directory=target,
+                )
+            self.assertFalse(target.exists())
+            self.assertFalse(target.parent.exists())
+
+            valid = list(argv)
+            valid[valid.index("--expected-diff-sha256") + 1] = workspace_sha
+            accepted = reviews.bind_job_review_role_argv(
+                valid, normalized, cwd=repo, attempt_directory=target,
+            )
+            self.assertEqual(
+                accepted[accepted.index("--output") + 1],
+                str(target / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME),
+            )
+            self.assertFalse(target.exists())
+
+            # A later dirty tree or HEAD drift is independently rejected.
+            (repo / "untracked.txt").write_text("dirty", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "prelaunch.*identity"):
+                reviews.bind_job_review_role_argv(
+                    valid, normalized, cwd=repo, attempt_directory=target,
+                )
+            (repo / "untracked.txt").unlink()
+            (repo / "source.py").write_text("newer\\n", encoding="utf-8")
+            git("add", "source.py")
+            git("commit", "-qm", "new head")
+            with self.assertRaisesRegex(ValueError, "prelaunch.*identity"):
+                reviews.bind_job_review_role_argv(
+                    valid, normalized, cwd=repo, attempt_directory=target,
+                )
+
+    def test_v2_role_prelaunch_unknown_readback_fails_closed(self) -> None:
+        normalized = reviews.normalize_binding(binding("independent-gemini"))
+        argv = [
+            reviews.REVIEW_ROLE_PYTHON, "-I", "-m", reviews.REVIEW_ROLE_MODULE,
+            "--role", "review", "--repository", "/tmp/review",
+            "--expected-head", HEAD, "--expected-base-head", BASE,
+            "--expected-diff-sha256", "e" * 64,
+            "--expected-dirty", "false", "--output", "/tmp/preflight-placeholder.json",
+            "--", "agy", "--model", "gemini-3.1-pro-high", "Review exact diff",
+        ]
+        with mock.patch.object(agent_role, "current_binding", side_effect=RuntimeError("git unavailable")):
+            with self.assertRaisesRegex(ValueError, "prelaunch.*unavailable"):
+                reviews.bind_job_review_role_argv(
+                    argv, normalized, cwd=Path("/tmp/review"),
+                    attempt_directory=Path("/tmp/grabowski-job-a11111111111"),
+                )
 
     def test_noncanonical_release_role_runner_is_rejected_before_start(self) -> None:
         command = [
