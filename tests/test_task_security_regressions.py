@@ -258,5 +258,96 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         self.assertEqual((task_count, anchor_count), (0, 0))
 
 
+    def test_operation_identity_active_bound_lease_requires_fresh_maintenance(self) -> None:
+        # A fresh unit observation does not attest an unchanged resource lease.
+        # A deduplicated task must not be returned when its lease check fails.
+        task_id = "f" * 24
+        stored = {
+            "task_id": task_id,
+            "state": "running",
+            "resume_policy": "verify-then-retry",
+            "resource_keys_json": json.dumps([f"repo:{self.root}"]),
+        }
+        operation_identity = {"operation_identity_sha256": "a" * 64}
+        with (
+            patch.object(
+                tasks, "_latest_task_for_operation_identity", return_value=stored
+            ),
+            patch.object(
+                tasks, "_task_has_fresh_active_observation", return_value=True
+            ),
+            patch.object(
+                tasks, "grabowski_task_status",
+                side_effect=RuntimeError("lease maintenance failed"),
+            ) as status,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "lease maintenance failed"):
+                tasks._resolve_task_operation_identity(
+                    operation_identity,
+                    supersedes_task_id="",
+                    supersedes_receipt_sha256="",
+                    force_new_reason="",
+                )
+        status.assert_called_once_with(task_id)
+
+
+
+    def test_env_split_short_clusters_do_not_bypass_codex_guard(self) -> None:
+        commands = (
+            ["/usr/bin/env", "-iS", "codex exec prompt"],
+            ["/usr/bin/env", "-Scodex", "exec", "prompt"],
+            ["/usr/bin/env", "-vS", "codex exec prompt"],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_codex_indirect_prefixers_do_not_bypass_guard(self) -> None:
+        commands = (
+            ["/usr/bin/time", "-p", "codex", "exec", "prompt"],
+            ["sudo", "-n", "codex", "exec", "prompt"],
+            ["doas", "codex", "exec", "prompt"],
+            ["/usr/bin/busybox", "sh", "-c", "codex exec prompt"],
+            ["/usr/bin/busybox", "env", "codex", "exec", "prompt"],
+            ["/lib64/ld-linux-x86-64.so.2", "/opt/codex", "exec", "prompt"],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_legitimate_codex_named_paths_are_not_entrypoints(self) -> None:
+        commands = (
+            ["/usr/bin/python3", "-m", "grabowski_agent_writer", "--repository",
+             str(self.root / "project-codex")],
+            ["/bin/bash", str(self.root / "project-codex" / "build.sh")],
+            ["/bin/bash", "-c", "printf hello", "--", str(self.root / "project-codex")],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_env_split_codex_fails_before_dispatch_or_persistence(self) -> None:
+        argv = ["/usr/bin/env", "-iS", "codex exec prompt"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(tasks, "_require_recovery_gate",
+                         return_value={"checked_at_unix": 150}),
+            patch.object(tasks, "_dispatch", return_value=fixture._launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                tasks.grabowski_task_start(
+                    "local", argv, cwd=str(self.root), runtime_seconds=60
+                )
+        dispatch.assert_not_called()
+        with tasks._database_connection() as db:
+            count = db.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        self.assertEqual(count, 0)
+
+
+
 if __name__ == "__main__":
     unittest.main()
