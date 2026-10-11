@@ -30,6 +30,52 @@ class BoundLocalPrDiffHardeningTests(unittest.TestCase):
             env = local_pr_git_environment()
         self.assertEqual(env["GIT_ATTR_NOSYSTEM"], "1")
 
+    def test_local_git_environment_does_not_inherit_attacker_path(self) -> None:
+        with mock.patch.dict(os.environ, {
+            "PATH": "/tmp/untrusted-git:/usr/bin",
+            "LD_PRELOAD": "/tmp/untrusted-git.so",
+            "LD_LIBRARY_PATH": "/tmp/untrusted-libraries",
+            "XDG_CONFIG_HOME": "/tmp/untrusted-config",
+        }):
+            env = local_pr_git_environment()
+        self.assertEqual(env["PATH"], "/usr/local/bin:/usr/bin:/bin")
+        for key in ("LD_PRELOAD", "LD_LIBRARY_PATH", "XDG_CONFIG_HOME"):
+            self.assertNotIn(key, env, f"{key} must not influence identity-critical Git")
+
+    def test_isolated_snapshot_uses_a_fresh_empty_git_template(self) -> None:
+        # No host or global Git template may inject info/attributes into the
+        # temporary GIT_DIR used for the revision-bound identity diff.
+        with tempfile.TemporaryDirectory(prefix="pr-diff-template-") as d:
+            repo = Path(d)
+            self.git(repo, "init", "-q")
+            self.git(repo, "config", "user.email", "test@example.invalid")
+            self.git(repo, "config", "user.name", "PR Diff Test")
+            (repo / "a.txt").write_text("before\n")
+            self.git(repo, "add", ".")
+            self.git(repo, "commit", "-qm", "base")
+            base = self.git(repo, "rev-parse", "HEAD")
+            (repo / "a.txt").write_text("after\n")
+            self.git(repo, "add", ".")
+            self.git(repo, "commit", "-qm", "head")
+            head = self.git(repo, "rev-parse", "HEAD")
+            original = pr_diff._bounded_git_capture
+            seen_init = []
+
+            def verify_git_init(args: list[str], **kwargs: object) -> bytes:
+                if args[:4] == ["git", "init", "-q", "--bare"]:
+                    seen_init.append(True)
+                    templates = [x.split("=", 1)[1] for x in args if x.startswith("--template=")]
+                    self.assertEqual(len(templates), 1, "Git init must not use host templates")
+                    empty = Path(templates[0])
+                    self.assertTrue(empty.is_dir())
+                    self.assertEqual(list(empty.iterdir()), [])
+                return original(args, **kwargs)
+
+            with mock.patch.object(pr_diff, "_bounded_git_capture", side_effect=verify_git_init):
+                result = bound_local_pr_git_diff(repo, merge_base=base, head=head)
+            self.assertTrue(seen_init)
+            self.assertIn(b"a.txt", result)
+
     def test_completed_git_command_does_not_kill_reaped_process_group(self) -> None:
         # Reaped PGIDs can be reused; a clean command must not signal its old group.
         with mock.patch("os.killpg") as kill_group:
@@ -46,11 +92,11 @@ class BoundLocalPrDiffHardeningTests(unittest.TestCase):
             self.git(repo, "init", "-q")
             self.git(repo, "config", "user.email", "test@example.invalid")
             self.git(repo, "config", "user.name", "PR Diff Test")
-            (repo / "a.txt").write_text("before\\n")
+            (repo / "a.txt").write_text("before\n")
             self.git(repo, "add", ".")
             self.git(repo, "commit", "-qm", "base")
             base = self.git(repo, "rev-parse", "HEAD")
-            (repo / "a.txt").write_text("after\\n")
+            (repo / "a.txt").write_text("after\n")
             self.git(repo, "add", ".")
             self.git(repo, "commit", "-qm", "head")
             head = self.git(repo, "rev-parse", "HEAD")

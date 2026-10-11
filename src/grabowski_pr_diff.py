@@ -164,9 +164,12 @@ def _bounded_git_capture(
 
 def local_pr_git_environment() -> dict[str, str]:
     """Use one identical, replacement-free Git object environment for PR identity."""
-    import os
-
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    # Identity-critical Git must not inherit executable/library/config injection.
+    # Match merge_guard's fixed minimal environment instead of filtering only GIT_*.
+    env = {
+        "HOME": str(Path.home()),
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+    }
     env.update(
         GIT_CONFIG_NOSYSTEM="1",
         GIT_ATTR_NOSYSTEM="1",
@@ -270,8 +273,10 @@ def bound_local_pr_git_diff(
         # An ephemeral bare Git directory loads objects via alternates, but
         # never inherits the checkout's .git/config diff-formatting settings.
         snapshot = scratch / "snapshot.git"
+        empty_template = scratch / "empty-template"
+        empty_template.mkdir()
         _bounded_git_capture(
-            ["git", "init", "-q", "--bare", str(snapshot)],
+            ["git", "init", "-q", "--bare", f"--template={empty_template}", str(snapshot)],
             cwd=str(scratch), env=env, timeout=remaining_timeout(), stdout_limit=8192,
         )
         object_dir = (common / "objects").resolve(strict=True)
