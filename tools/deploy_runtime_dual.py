@@ -7451,6 +7451,83 @@ def _production_blue_green_preflight_failure_receipt(
     return {**material, "receipt_sha256": _json_sha256(material)}
 
 
+def require_locked_release_source_admission(*, expected_head: str) -> dict[str, Any]:
+    """Fail closed under the central deployment lock before a productive effect.
+
+    User-owned argv, scheduler intent, a review-PR number or a self-hashed job
+    origin never establishes a protected Captain plus independent R3 permit.
+    Until a separately protected durable grant is verified at this boundary,
+    only the identical authoritatively already-serving Git head may proceed.
+    """
+    if (
+        not isinstance(expected_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None
+    ):
+        raise RuntimeError("release admission blocked: exact target HEAD is invalid")
+    observed = observe_authoritative_routing()
+    if not isinstance(observed, dict) or observed.get("authoritative") is not True:
+        raise RuntimeError("release admission blocked: serving route is not authoritative")
+    selector = observed.get("selector")
+    ingress = observed.get("ingress")
+    if not isinstance(selector, dict) or not isinstance(ingress, dict):
+        raise RuntimeError("release admission blocked: serving selector/ingress is incomplete")
+    serving_head = ingress.get("repo_head")
+    release_id = ingress.get("release_id")
+    slot = selector.get("selected_slot")
+    port = transport_ingress.ROUTING_SLOTS.get(slot) if isinstance(slot, str) else None
+    binding_sha256 = selector.get("runtime_binding_sha256")
+    selector_sha256 = selector.get("selector_sha256")
+    generation = selector.get("generation")
+    if (
+        not isinstance(serving_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", serving_head) is None
+        or not isinstance(release_id, str)
+        or not release_id.strip()
+        or len(release_id.encode("utf-8")) > 512
+        or port is None
+        or selector.get("selected_slot") != ingress.get("selected_slot")
+        or type(selector.get("upstream_port")) is not int
+        or selector.get("upstream_port") != port
+        or type(ingress.get("upstream_port")) is not int
+        or ingress.get("upstream_port") != port
+        or type(generation) is not int
+        or generation < 1
+        or ingress.get("selector_generation") != generation
+        or not isinstance(selector_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", selector_sha256) is None
+        or ingress.get("selector_sha256") != selector_sha256
+        or not isinstance(binding_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding_sha256) is None
+        or ingress.get("runtime_binding_sha256") != binding_sha256
+        or selector.get("repo_head") != serving_head
+        or selector.get("release_id") != release_id
+    ):
+        raise RuntimeError(
+            "release admission blocked: serving identity is incomplete or contradictory"
+        )
+    material = {"authoritative": True, "selector": selector, "ingress": ingress}
+    if observed.get("readback_sha256") != _json_sha256(material):
+        raise RuntimeError("release admission blocked: serving readback hash mismatch")
+    if serving_head != expected_head:
+        raise RuntimeError(
+            "release admission blocked: source-changing productive cutover "
+            "requires protected Captain authority and fresh independent "
+            "whole-release R3/CI proof at the locked effect boundary"
+        )
+    return {
+        "schema_version": 1,
+        "status": "already-serving-exact-source",
+        "serving_repo_head": serving_head,
+        "serving_release_id": release_id,
+        "target_repo_head": expected_head,
+        "ingress_readback_sha256": observed["readback_sha256"],
+        "does_not_establish": [
+            "Captain source-changing deployment authorization",
+            "independent whole-release R3 review",
+        ],
+    }
+
+
 def run_production_blue_green_cutover(
     *,
     repo: Path,
@@ -7471,6 +7548,10 @@ def run_production_blue_green_cutover(
     target_runtime = runtime or (core.HOME / ".local/share/grabowski-mcp")
     target_profile = profile_path or core.DEFAULT_PROFILE_PATH
     target_lock = lock_file or core.DEFAULT_LOCK_FILE
+    if target_lock != core.DEFAULT_LOCK_FILE:
+        raise RuntimeError(
+            "release admission blocked: productive cutover requires canonical deployment lock"
+        )
     observations: list[dict[str, Any]] = []
     context: ProductionBlueGreenRuntime | None = None
     phase = "prepare"
@@ -7485,6 +7566,9 @@ def run_production_blue_green_cutover(
     error: dict[str, Any] | None = None
     with core.deployment_lock(target_lock):
         try:
+            # The scheduler's earlier review and readback can become stale.
+            # Recheck the serving source after taking the actual effect lock.
+            require_locked_release_source_admission(expected_head=expected_head)
             context = prepare_production_blue_green_runtime(
                 repo,
                 target_runtime,
@@ -10057,6 +10141,12 @@ def main() -> int:
             raise ValueError(
                 "--bootstrap-recovery requires --apply and --expected-head"
             )
+        if args.apply and expected_head is None:
+            raise ValueError("productive --apply requires an exact --expected-head")
+        if args.apply and lock_file != core.DEFAULT_LOCK_FILE:
+            raise ValueError(
+                "release admission blocked: productive --apply requires canonical deployment lock"
+            )
         if args.check:
             core.check(repo, runtime)
         elif args.preflight:
@@ -10074,6 +10164,10 @@ def main() -> int:
                     expected_head=expected_head,
                 )
             with core.deployment_lock(lock_file):
+                if not bootstrap_recovery:
+                    # This is the direct CLI effect boundary. Bootstrap
+                    # recovery is separately classified and exact-head-bound.
+                    require_locked_release_source_admission(expected_head=expected_head)
                 deploy_url(
                     repo,
                     runtime,

@@ -2220,40 +2220,72 @@ class SafetyObserverUnitTests(unittest.TestCase):
                 dual._observer_unit_relations(target)
 
     def test_main_keeps_installation_inside_locked_deploy_flow(self) -> None:
+        """CLI must admit exact already-serving source *inside* the lock."""
         events: list[str] = []
         args = SimpleNamespace(
             repo=ROOT,
             runtime=RUNTIME,
             profile_path=Path("profile.yaml"),
-            lock_file=Path("deploy.lock"),
+            lock_file=core.DEFAULT_LOCK_FILE,
             timeout=1,
+            expected_head="a" * 40,
+            bootstrap_recovery=False,
             check=False,
             preflight=False,
             apply=True,
         )
+
+        @contextlib.contextmanager
+        def locked(_path):
+            events.append("lock-enter")
+            try:
+                yield
+            finally:
+                events.append("lock-exit")
+
+        def readback():
+            events.append("trusted-readback")
+            selector = {
+                "selector_sha256": "2" * 64,
+                "generation": 2,
+                "selected_slot": "canonical",
+                "upstream_port": 18181,
+                "runtime_binding_sha256": "1" * 64,
+                "repo_head": "a" * 40,
+                "release_id": "synthetic-serving",
+            }
+            ingress = {
+                "selector_sha256": selector["selector_sha256"],
+                "selector_generation": selector["generation"],
+                "selected_slot": selector["selected_slot"],
+                "upstream_port": selector["upstream_port"],
+                "runtime_binding_sha256": selector["runtime_binding_sha256"],
+                "repo_head": selector["repo_head"],
+                "release_id": selector["release_id"],
+            }
+            material = {"authoritative": True, "selector": selector, "ingress": ingress}
+            return {**material, "readback_sha256": dual._json_sha256(material)}
+
         with (
             mock.patch.object(dual, "parse_args", return_value=args),
             mock.patch.object(core, "absolute_no_resolve", side_effect=lambda value: value),
             mock.patch.object(
-                dual,
-                "preflight_url",
+                dual, "preflight_url",
                 side_effect=lambda *args, **kwargs: events.append("preflight"),
             ),
-            mock.patch.object(
-                core,
-                "deployment_lock",
-                return_value=contextlib.nullcontext(),
-            ),
+            mock.patch.object(core, "deployment_lock", side_effect=locked),
+            mock.patch.object(dual, "observe_authoritative_routing", side_effect=readback),
             mock.patch.object(dual, "install_safety_observer_unit") as install,
             mock.patch.object(
-                dual,
-                "deploy_url",
+                dual, "deploy_url",
                 side_effect=lambda *args, **kwargs: events.append("deploy"),
             ),
         ):
             result = dual.main()
         self.assertEqual(result, 0)
-        self.assertEqual(events, ["preflight", "deploy"])
+        self.assertEqual(
+            events, ["preflight", "lock-enter", "trusted-readback", "deploy", "lock-exit"]
+        )
         install.assert_not_called()
 
 
