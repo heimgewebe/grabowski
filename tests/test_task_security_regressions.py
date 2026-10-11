@@ -596,6 +596,44 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             count = db.execute("SELECT count(*) FROM tasks").fetchone()[0]
         self.assertEqual(count, 0)
 
+    def test_computed_shell_agent_entrypoints_require_isolation(self) -> None:
+        # A literal argv scan does not see the actual exec target created
+        # through variables, substitutions, or dynamic Python invocation.
+        for source in (
+            'agent=codex; "$agent" exec prompt',
+            'eval "$(printf co)$(printf dex) exec prompt"',
+            'python -c \'import os; os.execvp("co"+"dex", ["co"+"dex", "exec"])\'',
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/bin/bash", "-c", source]
+                    )
+
+    def test_computed_interpreter_agent_entrypoints_require_isolation(self) -> None:
+        # These are inert source strings. No agent or interpreter is executed.
+        for argv in (
+            ["python3", "-c",
+             "import os; os.execvp('co'+'dex', ['co'+'dex','exec'])"],
+            ["node", "-e",
+             "require('child_process').spawnSync('co'+'dex',['exec'])"],
+            ["ruby", "-e", "system('co'+'dex', 'exec')"],
+            ["perl", "-e", "system('co' . 'dex', 'exec')"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_print_only_interpreter_code_can_mention_codex(self) -> None:
+        # A command name appearing only as printable text is not an exec.
+        for argv in (
+            ["python3", "-c", "print('codex')"],
+            ["node", "-e", "console.log('codex')"],
+            ["ruby", "-e", "puts 'codex'"],
+            ["perl", "-e", "print 'codex'"],
+        ):
+            with self.subTest(argv=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
 
 
 if __name__ == "__main__":
