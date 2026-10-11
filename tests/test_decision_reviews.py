@@ -342,7 +342,7 @@ def stamp_claude_quota_429(directory: Path, *, envelope_updates: dict | None = N
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     envelope = {
         "type": "result", "is_error": True, "terminal_reason": "api_error",
-        "api_error_status": 429, "modelUsage": {},
+        "api_error_status": 429, "duration_api_ms": 0, "modelUsage": {},
         "permission_denials": [], "total_cost_usd": 0,
         "usage": {
             "input_tokens": 0, "output_tokens": 0, "iterations": [],
@@ -460,6 +460,18 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 "structured_output": {"verdict": "NEEDS_CHANGE", "findings": [{}]},
             }, {}),
             ("not_known_quota_error", {"result": "unexpected inference text"}, {}),
+            ("actual_quota_result_newline", {
+                "result": "You've hit your weekly limit\nmodel-produced text",
+            }, {}),
+            ("actual_quota_result_carriage", {
+                "result": "You've hit your weekly limit\rmore text",
+            }, {}),
+            ("quota_result_control", {
+                "result": "You've hit your weekly limit\tmore text",
+            }, {}),
+            ("provider_api_work", {"duration_api_ms": 1}, {}),
+            ("provider_api_work_false", {"duration_api_ms": False}, {}),
+            ("provider_api_work_missing", {"duration_api_ms": None}, {}),
             ("material_document", {}, {"review_document_bytes": 14}),
             ("unbound_envelope", {}, {"review_provider_envelope_sha256": "f" * 64}),
             ("ambiguous_report", {}, {"review_findings_normalized": True}),

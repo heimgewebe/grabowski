@@ -1008,7 +1008,8 @@ def _normalize_review_role_provenance(
 
 def _claude_no_external_activity(usage: Any, subagents: Any) -> bool:
     """Require all provider tool and subagent counters, including future keys, to be int zero."""
-    strictly_zero = lambda value: type(value) is int and value == 0
+    def strictly_zero(value: Any) -> bool:
+        return type(value) is int and value == 0
     if not isinstance(usage, dict):
         return False
     # A newly introduced usage field is ambiguous until its semantics are known.
@@ -1129,12 +1130,14 @@ def _proven_claude_quota_failure_before_review(
         and envelope.get("terminal_reason") == "api_error"
         and type(envelope.get("api_error_status")) is int
         and envelope["api_error_status"] == 429
+        and type(envelope.get("duration_api_ms")) is int
+        and envelope["duration_api_ms"] == 0
         and envelope.get("modelUsage") == {}
         and envelope.get("structured_output") is None
         and isinstance(envelope.get("result"), str)
         and envelope["result"].startswith("You've hit your weekly limit")
         and len(envelope["result"]) <= 256
-        and "\\n" not in envelope["result"]
+        and all(32 <= ord(character) != 127 for character in envelope["result"])
         and isinstance(usage, dict) and usage.get("iterations") == []
         and envelope.get("permission_denials") == []
         and type(envelope.get("total_cost_usd")) in {int, float}
