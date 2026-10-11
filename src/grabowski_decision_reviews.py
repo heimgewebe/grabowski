@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 from typing import Any, Iterator
 
@@ -795,8 +796,27 @@ def bind_job_review_role_argv(
         ):
             raise ValueError("noncanonical decision-bound role launcher is not admitted")
         return argv
-    if review_role_provenance(argv, binding, cwd=cwd) is None:
+    provenance = review_role_provenance(argv, binding, cwd=cwd)
+    if provenance is None:
         raise ValueError("decision-bound role launcher is not a valid read-only reviewer")
+    # The role's --expected-diff-sha256 is a *workspace fingerprint*, not
+    # the separately signed GitHub PR diff. Reject mistaken hashes BEFORE
+    # reserving a decision-bound attempt. This cannot clear old ambiguous jobs
+    # or replace the role's own second check immediately before provider spawn.
+    from grabowski_agent_role import current_binding
+
+    try:
+        observed_head, observed_diff, observed_dirty = current_binding(
+            Path(provenance["repository"]), provenance["base_sha"]
+        )
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        raise ValueError("decision-bound review prelaunch identity unavailable") from exc
+    if (
+        observed_head != provenance["head_sha"]
+        or observed_diff != provenance["workspace_diff_sha256"]
+        or observed_dirty is not False
+    ):
+        raise ValueError("decision-bound review prelaunch identity mismatch")
     separator = argv.index("--")
     output_index = argv.index("--output", 4, separator) + 1
     result = list(argv)
