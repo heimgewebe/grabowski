@@ -1006,6 +1006,80 @@ def _normalize_review_role_provenance(
     return value
 
 
+def _claude_no_external_activity(usage: Any, subagents: Any) -> bool:
+    """Require all provider tool and subagent counters, including future keys, to be int zero."""
+    strictly_zero = lambda value: type(value) is int and value == 0
+    if not isinstance(usage, dict):
+        return False
+    # A newly introduced usage field is ambiguous until its semantics are known.
+    known_usage = {
+        "input_tokens", "output_tokens", "cache_creation_input_tokens",
+        "cache_read_input_tokens", "server_tool_use", "output_tokens_details",
+        "cache_creation", "service_tier", "inference_geo", "iterations",
+        "speed", "fallback_credit",
+    }
+    if set(usage) - known_usage:
+        return False
+    for section, required in (
+        ("output_tokens_details", {"thinking_tokens"}),
+        ("cache_creation", {"ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"}),
+    ):
+        fields = usage.get(section)
+        if (
+            not isinstance(fields, dict)
+            or not required.issubset(fields)
+            or any(not strictly_zero(value) for value in fields.values())
+        ):
+            return False
+    if (
+        not isinstance(usage.get("service_tier"), str)
+        or not isinstance(usage.get("speed"), str)
+        or not isinstance(usage.get("inference_geo"), str)
+        or usage.get("fallback_credit") is not None
+    ):
+        return False
+    tools = usage.get("server_tool_use")
+    if (
+        not isinstance(tools, dict)
+        or not {"web_search_requests", "web_fetch_requests"}.issubset(tools)
+        or any(not strictly_zero(value) for value in tools.values())
+    ):
+        return False
+    scalar = {
+        "spawned", "started_in_background", "max_depth",
+        "spawned_by_subagents", "completed", "failed",
+    }
+    groups = {
+        "requested": {"background", "foreground", "unset"},
+        "refused": {"depth_limit", "concurrency_limit", "budget"},
+        "killed": {"parent", "user", "system"},
+    }
+    if (
+        not isinstance(subagents, dict)
+        or any(not strictly_zero(subagents.get(field)) for field in scalar)
+    ):
+        return False
+    for name, required in groups.items():
+        counters = subagents.get(name)
+        if (
+            not isinstance(counters, dict)
+            or not required.issubset(counters)
+            or any(not strictly_zero(value) for value in counters.values())
+        ):
+            return False
+    if "by_type" in subagents:
+        types = subagents["by_type"]
+        if (
+            not isinstance(types, dict)
+            or any(not strictly_zero(value) for value in types.values())
+        ):
+            return False
+    for name, value in subagents.items():
+        if name not in scalar | set(groups) | {"by_type"} and not strictly_zero(value):
+            return False
+    return True
+
+
 def _proven_claude_quota_failure_before_review(
     receipt: dict[str, Any], provenance: dict[str, Any]
 ) -> bool:
@@ -1056,6 +1130,11 @@ def _proven_claude_quota_failure_before_review(
         and type(envelope.get("api_error_status")) is int
         and envelope["api_error_status"] == 429
         and envelope.get("modelUsage") == {}
+        and envelope.get("structured_output") is None
+        and isinstance(envelope.get("result"), str)
+        and envelope["result"].startswith("You've hit your weekly limit")
+        and len(envelope["result"]) <= 256
+        and "\\n" not in envelope["result"]
         and isinstance(usage, dict) and usage.get("iterations") == []
         and envelope.get("permission_denials") == []
         and type(envelope.get("total_cost_usd")) in {int, float}
@@ -1068,11 +1147,7 @@ def _proven_claude_quota_failure_before_review(
                 "cache_creation_input_tokens", "cache_read_input_tokens",
             )
         )
-        and isinstance(usage.get("server_tool_use"), dict)
-        and usage["server_tool_use"].get("web_search_requests") == 0
-        and usage["server_tool_use"].get("web_fetch_requests") == 0
-        and isinstance(subagents, dict)
-        and subagents.get("spawned") == 0
+        and _claude_no_external_activity(usage, subagents)
     )
 
 

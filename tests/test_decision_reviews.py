@@ -325,6 +325,16 @@ def make_job(
     return directory
 
 
+ZERO_CLAUDE_SUBAGENTS = {
+    "spawned": 0, "started_in_background": 0, "max_depth": 0,
+    "spawned_by_subagents": 0, "completed": 0, "failed": 0,
+    "requested": {"background": 0, "foreground": 0, "unset": 0},
+    "refused": {"depth_limit": 0, "concurrency_limit": 0, "budget": 0},
+    "killed": {"parent": 0, "user": 0, "system": 0},
+    "by_type": {},
+}
+
+
 def stamp_claude_quota_429(directory: Path, *, envelope_updates: dict | None = None,
                            receipt_updates: dict | None = None) -> None:
     """Synthetic exact transcript and job-owned V2 receipt, no provider call."""
@@ -337,12 +347,22 @@ def stamp_claude_quota_429(directory: Path, *, envelope_updates: dict | None = N
         "usage": {
             "input_tokens": 0, "output_tokens": 0, "iterations": [],
             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "output_tokens_details": {"thinking_tokens": 0},
+            "cache_creation": {
+                "ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0,
+            },
+            "service_tier": "standard", "speed": "standard",
+            "inference_geo": "", "fallback_credit": None,
             "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
         },
-        "subagent_stats": {"spawned": 0},
+        "subagent_stats": ZERO_CLAUDE_SUBAGENTS,
         "result": "You've hit your weekly limit",
     }
-    envelope.update(envelope_updates or {})
+    amendments = dict(envelope_updates or {})
+    if "usage" in amendments and isinstance(amendments["usage"], dict):
+        usage_amendments = amendments.pop("usage")
+        envelope["usage"] = {**envelope["usage"], **usage_amendments}
+    envelope.update(amendments)
     payload = (json.dumps(envelope, separators=(",", ":")) + "\n").encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()
     receipt.update({
@@ -396,6 +416,50 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
                 "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
             }}, {}),
+            ("unknown_server_tool", {"usage": {
+                "input_tokens": 0, "output_tokens": 0, "iterations": [],
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                "server_tool_use": {
+                    "web_search_requests": 0, "web_fetch_requests": 0,
+                    "code_execution_requests": 1,
+                },
+            }}, {}),
+            ("server_tool_bool", {"usage": {
+                "input_tokens": 0, "output_tokens": 0, "iterations": [],
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": False, "web_fetch_requests": 0},
+            }}, {}),
+            ("subagent_request", {"subagent_stats": {
+                **ZERO_CLAUDE_SUBAGENTS,
+                "requested": {"background": 0, "foreground": 1, "unset": 0},
+            }}, {}),
+            ("subagent_refused", {"subagent_stats": {
+                **ZERO_CLAUDE_SUBAGENTS,
+                "refused": {"depth_limit": 0, "concurrency_limit": 0, "budget": 1},
+            }}, {}),
+            ("subagent_unknown", {"subagent_stats": {
+                **ZERO_CLAUDE_SUBAGENTS, "queued_work": 1,
+            }}, {}),
+            ("subagent_unknown_non_integer", {"subagent_stats": {
+                **ZERO_CLAUDE_SUBAGENTS, "queued_work": False,
+            }}, {}),
+            ("subagent_by_type", {"subagent_stats": {
+                **ZERO_CLAUDE_SUBAGENTS, "by_type": {"succeeded": 1},
+            }}, {}),
+            ("subagent_missing_evidence", {"subagent_stats": {"spawned": 0}}, {}),
+            ("thinking_activity", {"usage": {
+                "output_tokens_details": {"thinking_tokens": 1},
+            }}, {}),
+            ("cache_activity", {"usage": {
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 1, "ephemeral_5m_input_tokens": 0,
+                },
+            }}, {}),
+            ("unknown_usage_activity", {"usage": {"future_activity": 1}}, {}),
+            ("structured_review_payload", {
+                "structured_output": {"verdict": "NEEDS_CHANGE", "findings": [{}]},
+            }, {}),
+            ("not_known_quota_error", {"result": "unexpected inference text"}, {}),
             ("material_document", {}, {"review_document_bytes": 14}),
             ("unbound_envelope", {}, {"review_provider_envelope_sha256": "f" * 64}),
             ("ambiguous_report", {}, {"review_findings_normalized": True}),
