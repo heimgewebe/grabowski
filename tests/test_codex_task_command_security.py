@@ -137,6 +137,60 @@ class CodexTaskCommandSecurityTests(unittest.TestCase):
             with sqlite3.connect(self.fixture.database) as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM tasks").fetchone()[0], 0)
 
+    def test_indirect_codex_launchers_denied_before_task_effects(self) -> None:
+        # Run neither Codex nor any wrapper. These are admission-only fixtures.
+        commands = (
+            ["/usr/bin/env", "codex", "-C", str(self.root), "exec", "prompt"],
+            ["/usr/bin/env", "-i", "HOME=/tmp", "codex", "exec", "prompt"],
+            ["/usr/bin/env", "-S", "codex exec prompt"],
+            ["/usr/bin/timeout", "30", "codex", "exec", "prompt"],
+            ["/usr/bin/nice", "-n", "8", "codex", "exec", "prompt"],
+            ["/bin/sh", "-c", "codex exec --sandbox workspace-write prompt"],
+            ["/bin/bash", "-lc", "exec codex -C /tmp exec prompt"],
+            ["/usr/bin/node", "/tmp/node_modules/@openai/codex/bin/codex.js", "exec", "prompt"],
+            ["/usr/bin/npx", "@openai/codex", "exec", "prompt"],
+            ["/usr/bin/pnpm", "exec", "codex", "exec", "prompt"],
+            ["/usr/bin/python3", "-c", "import subprocess; subprocess.run(['codex', 'exec'])"],
+            ["/usr/bin/python3.12", "-c", "import subprocess; subprocess.run(['codex', 'exec'])"],
+            ["/opt/codex-x86_64-unknown-linux-musl", "exec", "prompt"],
+        )
+        alias = self.root / "renamed-executable"
+        alias.symlink_to("/opt/codex")
+        commands = (*commands, [str(alias), "exec", "prompt"])
+        alias_named_env = self.root / "env"
+        alias_named_env.symlink_to("/opt/codex")
+        commands = (*commands, [str(alias_named_env), "exec", "prompt"])
+        with patch.object(tasks.fleet, "fleet_host", return_value=fixture.LOCAL_HOST):
+            for command in commands:
+                with (
+                    self.subTest(command=command),
+                    patch.object(tasks, "_validate_command", return_value=command),
+                    patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 142}),
+                    patch.object(tasks, "_dispatch") as dispatch,
+                    patch.object(tasks.base, "_append_audit"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                        tasks.grabowski_task_start(
+                            "local", command, cwd=str(self.root), runtime_seconds=60
+                        )
+                    dispatch.assert_not_called()
+                    self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
+                    if self.database_exists():
+                        with sqlite3.connect(self.fixture.database) as db:
+                            self.assertEqual(db.execute("SELECT count(*) FROM tasks").fetchone()[0], 0)
+
+    def test_non_codex_commands_remain_admissible(self) -> None:
+        allowed = (
+            ["/bin/echo", "codex is documentation text"],
+            ["/bin/sh", "-c", "printf 'hello'"],
+            ["/usr/bin/env", "FOO=bar", "/bin/true"],
+            ["/usr/bin/env", "CARGO_TARGET_DIR=/tmp/pr1386-indirect-codex/target", "/usr/bin/cargo", "test"],
+            ["/usr/bin/node", "/tmp/test.js", "hello"],
+        )
+        for command in allowed:
+            with self.subTest(command=command):
+                tasks._require_direct_codex_filesystem_sandbox(command)
+
     def test_preexisting_codex_task_cannot_resume_without_os_sandbox(self) -> None:
         command = ["/opt/codex", "-C", str(self.root), "exec", "prompt"]
         admitted = {
@@ -175,6 +229,39 @@ class CodexTaskCommandSecurityTests(unittest.TestCase):
         launch.assert_not_called()
         renew.assert_not_called()
         acquire.assert_not_called()
+        self.assertEqual(tasks._row_raw(task_id)["attempt"], attempt_before)
+
+    def test_preexisting_indirect_codex_resume_fails_before_new_attempt(self) -> None:
+        # Reproduce a historical pre-guard wrapper record, without execution.
+        command = ["/usr/bin/env", "codex", "exec", "prompt"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=fixture.LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=command),
+            patch.object(tasks, "_require_direct_codex_filesystem_sandbox"),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 136}),
+            patch.object(tasks, "_dispatch", return_value=fixture._launcher()),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            created = tasks.grabowski_task_start(
+                "local", command, cwd=str(self.root),
+                runtime_seconds=60, resume_policy="verify-then-retry",
+            )
+        task_id = created["task"]["task_id"]
+        attempt_before = tasks._row_raw(task_id)["attempt"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=fixture.LOCAL_HOST),
+            patch.object(tasks, "_dispatch") as dispatch,
+            patch.object(tasks, "_launch") as launch,
+            patch.object(tasks.resources, "acquire_resources") as acquire,
+            patch.object(tasks.resources, "renew_resources") as renew,
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                tasks.grabowski_task_resume(task_id)
+        dispatch.assert_not_called()
+        launch.assert_not_called()
+        acquire.assert_not_called()
+        renew.assert_not_called()
         self.assertEqual(tasks._row_raw(task_id)["attempt"], attempt_before)
 
     def test_existing_scoped_writer_wrapper_is_still_admissible(self) -> None:

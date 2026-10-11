@@ -3806,7 +3806,11 @@ def _workspace_has_git_marker(workspace: str) -> bool:
 
 
 def _codex_workspace_argument(argv: list[str]) -> str | None:
-    """Accept one unambiguous Codex working root, never extra writable roots."""
+    """Parse one CLI-declared root for lease coordination, not OS isolation.
+
+    Codex user config and inherited permissions are not attested here. The
+    independent direct-execution guard must still reject unsandboxed agents.
+    """
     workspace: str | None = None
     execution_mode: str | None = None
     sandbox_declared = False
@@ -3976,15 +3980,84 @@ def _codex_workspace_argument(argv: list[str]) -> str | None:
 
 
 def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
-    """Reject direct Codex while no task-launch OS filesystem boundary is attested.
+    """Deny recognizable Codex entrypoints without an attested OS boundary.
 
-    Workspace and repository leases serialize writers; they cannot constrain
-    the inherited home directory, user configuration, or host filesystem.
-    The existing grabowski_agent_writer executes agents in a bounded bwrap
-    filesystem sandbox with explicit writable paths. Do not silently replace
-    that separate, scoped execution contract with a direct Codex task.
+    Repository leases coordinate writes; they are not filesystem isolation.
+    Also reject known indirect launchers before reuse, task INSERT, or resume.
+    An arbitrary opaque script cannot be proven confined by inspecting argv:
+    this guard does not replace the separately sandboxed agent-writer route.
     """
-    if argv and Path(argv[0]).name.lower() == "codex":
+    if not argv:
+        return
+
+    def codex_entrypoint(token: str) -> bool:
+        value = token.casefold().replace("\\", "/")
+        binary = value.rsplit("/", 1)[-1]
+        return (
+            re.fullmatch(r"codex(?:[._-][a-z0-9][a-z0-9._-]*)?", binary)
+            is not None
+            or "@openai/codex" in value
+        )
+
+    executable = Path(argv[0]).name.casefold()
+    try:
+        resolved_executable = str(Path(argv[0]).resolve(strict=False))
+    except (OSError, RuntimeError):
+        # An unresolvable explicit path cannot prove a non-Codex executable.
+        resolved_executable = argv[0]
+    wrappers = {
+        "env", "timeout", "nice", "nohup", "stdbuf", "ionice",
+        "taskset", "setsid", "chrt", "sh", "bash", "dash", "zsh",
+        "fish", "node", "nodejs", "npx", "npm", "pnpm", "bun",
+        "bunx", "yarn", "corepack", "uv", "uvx", "perl", "ruby",
+    }
+    interpreter = executable in wrappers or re.fullmatch(
+        r"python(?:[0-9]+(?:\.[0-9]+)?)?", executable
+    ) is not None
+    token_pattern = re.compile(
+        r"(?<![a-zA-Z0-9_])(?:@openai/codex|codex(?:[._-][a-zA-Z0-9._-]+)?)"
+        r"(?![a-zA-Z0-9_])",
+        flags=re.IGNORECASE,
+    )
+    # env accepts assignments before the executable. A writable-root variable
+    # can contain the word "codex" merely because the checkout is named that;
+    # scanning it as a command would block unrelated cargo/build tasks.
+    if executable == "env" and not codex_entrypoint(resolved_executable):
+        index = 1
+        while index < len(argv):
+            item = argv[index]
+            if item in {"-S", "--split-string"} or item.startswith((
+                "-S", "--split-string=",
+            )):
+                if any(token_pattern.search(value) for value in argv[index:]):
+                    raise RuntimeError(
+                        "Codex direct task has no attested filesystem sandbox; "
+                        "use the scoped grabowski_agent_writer route"
+                    )
+                return
+            if item in {"-u", "--unset", "-C", "--chdir", "-a", "--argv0"}:
+                index += 2
+                continue
+            if item == "--" or item.startswith("-") or (
+                "=" in item and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item.split("=", 1)[0])
+            ):
+                index += 1
+                continue
+            # Recurse through nested env and known launchers; only a command
+            # entrypoint (not an arbitrary environment value) is executable.
+            _require_direct_codex_filesystem_sandbox(argv[index:])
+            return
+        return
+    if (
+        codex_entrypoint(argv[0])
+        or codex_entrypoint(resolved_executable)
+        or (
+            interpreter and any(
+                codex_entrypoint(item) or token_pattern.search(item) is not None
+                for item in argv[1:]
+            )
+        )
+    ):
         raise RuntimeError(
             "Codex direct task has no attested filesystem sandbox; "
             "use the scoped grabowski_agent_writer route"
