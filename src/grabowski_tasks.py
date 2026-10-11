@@ -4010,10 +4010,28 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
         "taskset", "setsid", "chrt", "sh", "bash", "dash", "zsh",
         "fish", "node", "nodejs", "npx", "npm", "pnpm", "bun",
         "bunx", "yarn", "corepack", "uv", "uvx", "perl", "ruby",
+        "time", "sudo", "doas", "busybox",
     }
-    interpreter = executable in wrappers or re.fullmatch(
+    # A filesystem symlink may rename a known prefix launcher. Recognize
+    # its resolved executable before interpreting argv; argv0 alone is not
+    # authority for selecting a less restrictive command path.
+    resolved_binary = Path(resolved_executable).name.casefold()
+    if (
+        resolved_binary in wrappers
+        or re.fullmatch(r"python(?:[0-9]+(?:\\.[0-9]+)?)?", resolved_binary)
+        or resolved_binary == "ld.so"
+        or re.fullmatch(r"ld-linux[^/]*\\.so(?:\\.[0-9]+)*", resolved_binary)
+    ):
+        executable = resolved_binary
+    python_interpreter = re.fullmatch(
         r"python(?:[0-9]+(?:\.[0-9]+)?)?", executable
     ) is not None
+    interpreter = (
+        executable in wrappers
+        or python_interpreter
+        or executable == "ld.so"
+        or re.fullmatch(r"ld-linux[^/]*\.so(?:\.[0-9]+)*", executable) is not None
+    )
     token_pattern = re.compile(
         r"(?<![a-zA-Z0-9_])(?:@openai/codex|codex(?:[._-][a-zA-Z0-9._-]+)?)"
         r"(?![a-zA-Z0-9_])",
@@ -4026,14 +4044,35 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
         index = 1
         while index < len(argv):
             item = argv[index]
-            if item in {"-S", "--split-string"} or item.startswith((
-                "-S", "--split-string=",
-            )):
-                if any(token_pattern.search(value) for value in argv[index:]):
-                    raise RuntimeError(
-                        "Codex direct task has no attested filesystem sandbox; "
-                        "use the scoped grabowski_agent_writer route"
+            # Parse GNU env split strings into actual argv rather than
+            # treating incidental codex-named argument values as executables.
+            split_short = re.fullmatch(r"-[iv0]*S(.*)", item)
+            if (
+                item == "--split-string"
+                or item.startswith("--split-string=")
+                or split_short is not None
+            ):
+                import shlex
+
+                if item == "--split-string" or (
+                    split_short is not None and not split_short.group(1)
+                ):
+                    if index + 1 >= len(argv):
+                        raise RuntimeError("Codex filesystem sandbox cannot verify env -S without a payload")
+                    split_payload = argv[index + 1]
+                    rest = argv[index + 2:]
+                else:
+                    split_payload = (
+                        item.partition("=")[2]
+                        if item.startswith("--split-string=")
+                        else split_short.group(1)
                     )
+                    rest = argv[index + 1:]
+                try:
+                    tokens = shlex.split(split_payload, posix=True)
+                except ValueError as exc:
+                    raise RuntimeError("Codex filesystem sandbox cannot verify env -S payload") from exc
+                _require_direct_codex_filesystem_sandbox(["env", *tokens, *rest])
                 return
             if item in {"-u", "--unset", "-C", "--chdir", "-a", "--argv0"}:
                 index += 2
@@ -4048,13 +4087,275 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
             _require_direct_codex_filesystem_sandbox(argv[index:])
             return
         return
+    # These launchers execute a child argv. Only the child command position
+    # determines its executable; option values and later arguments are data.
+    loader = executable == "ld.so" or re.fullmatch(
+        r"ld-linux[^/]*\.so(?:\.[0-9]+)*", executable
+    ) is not None
+    if executable == "busybox":
+        start = 2 if argv[1:2] == ["--"] else 1
+        if start < len(argv) and not argv[start].startswith("-"):
+            _require_direct_codex_filesystem_sandbox(argv[start:])
+        return
+    if executable in {"timeout", "nice", "stdbuf", "nohup", "setsid"}:
+        # These programs run a child argv after their own option payloads.
+        # A codex-named build directory is not an executable position.
+        start = 1
+        while start < len(argv):
+            option = argv[start]
+            if option == "--":
+                start += 1
+                break
+            if not option.startswith("-") or option == "-":
+                break
+            if executable == "timeout":
+                flags = {"-f", "--foreground", "-p", "--preserve-status", "-v", "--verbose"}
+                needs_value = {"-s", "--signal", "-k", "--kill-after"}
+                attached = any(option.startswith(v + "=") for v in needs_value if v.startswith("--"))
+                attached = attached or (option.startswith(("-s", "-k")) and len(option) > 2)
+            elif executable == "nice":
+                flags = set()
+                needs_value = {"-n", "--adjustment"}
+                attached = option.startswith("--adjustment=") or (
+                    len(option) > 2 and option.startswith("-n")
+                ) or (len(option) > 1 and option[1:].isdigit())
+            elif executable == "stdbuf":
+                flags = set()
+                needs_value = {"-i", "-o", "-e"}
+                attached = len(option) > 2 and option[:2] in needs_value
+            elif executable == "setsid":
+                flags = {"-c", "-f", "-w", "--ctty", "--fork", "--wait"}
+                needs_value = set()
+                attached = False
+            else:
+                flags = set()
+                needs_value = set()
+                attached = False
+            if option in flags or attached:
+                start += 1
+            elif option in needs_value and start + 1 < len(argv):
+                start += 2
+            else:
+                raise RuntimeError(
+                    "Codex filesystem sandbox cannot verify prefix-launcher options"
+                )
+        if executable == "timeout":
+            # The first non-option word is always the duration.
+            start += 1
+        if start < len(argv):
+            _require_direct_codex_filesystem_sandbox(argv[start:])
+        return
+    if executable in {"time", "sudo", "doas"} or loader:
+        start = 1
+        while start < len(argv):
+            option = argv[start]
+            if option == "--":
+                start += 1
+                break
+            if not option.startswith("-") or option == "-":
+                break
+            if executable == "time":
+                simple = {"-p", "--portability", "-v", "--verbose", "-q",
+                          "--quiet", "-a", "--append"}
+                takes_value = {"-o", "--output", "-f", "--format"}
+                attached = option.startswith(("-o", "-f")) and len(option) > 2
+                attached = attached or option.startswith(("--output=", "--format="))
+            elif loader:
+                simple = {"--list", "--verify", "--inhibit-cache", "--list-diagnostics"}
+                takes_value = {"--library-path", "--preload", "--audit",
+                               "--argv0", "--inhibit-rpath",
+                               "--glibc-hwcaps-prepend", "--glibc-hwcaps-mask"}
+                attached = any(option.startswith(name + "=") for name in takes_value)
+            else:
+                simple = {"-n", "-E", "-H", "-k", "-K", "-S", "-b", "-P",
+                          "--non-interactive", "--preserve-env", "--login",
+                          "--set-home", "--reset-timestamp"}
+                takes_value = {"-u", "-g", "-C", "-p", "-D", "-r", "-t",
+                               "--user", "--group", "--chdir",
+                               "--close-from", "--prompt", "--role", "--type"}
+                attached = any(option.startswith(name + "=") for name in takes_value if name.startswith("--"))
+                attached = attached or (len(option) > 2 and option[:2] in {"-u", "-g", "-C", "-p", "-D", "-r", "-t"})
+            if option in simple or attached:
+                start += 1
+                continue
+            if option in takes_value and start + 1 < len(argv):
+                start += 2
+                continue
+            raise RuntimeError(
+                "Codex filesystem sandbox cannot verify prefix-launcher options"
+            )
+        if executable in {"sudo", "doas"}:
+            # sudo accepts NAME=value assignments before the command.
+            # Neither assignment keys nor values attest the executable.
+            while start < len(argv) and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[start]
+            ):
+                start += 1
+        if start < len(argv):
+            _require_direct_codex_filesystem_sandbox(argv[start:])
+        return
+    # Shell script filenames and the scoped writer's workspace roots are
+    # data, not program names. Keep literal -c payloads under inspection.
+    payload_tokens = argv[1:]
+    if executable in {"sh", "bash", "dash", "zsh", "fish"}:
+        shell_code = None
+        for index, option in enumerate(argv[1:-1], 1):
+            if (
+                option.startswith("-")
+                and not option.startswith("--")
+                and "c" in option[1:]
+            ):
+                shell_code = argv[index + 1]
+                break
+        if shell_code is not None:
+            # Only command positions of a literal shell payload are entrypoints.
+            # A path or text argument containing "codex" is not a program.
+            import shlex
+
+            lexer = shlex.shlex(
+                shell_code, posix=True, punctuation_chars=";&|()\n"
+            )
+            lexer.whitespace = " \t\r"
+            lexer.whitespace_split = True
+            try:
+                shell_tokens = list(lexer)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Codex filesystem sandbox cannot verify shell payload"
+                ) from exc
+            segment: list[str] = []
+            for token in [*shell_tokens, ";"]:
+                if token and all(char in ";&|()\n" for char in token):
+                    offset = 0
+                    while offset < len(segment) and re.fullmatch(
+                        r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[offset]
+                    ):
+                        offset += 1
+                    # Builtins change the command position. Parse their
+                    # literal options instead of mistaking -a/-p for programs.
+                    while offset < len(segment):
+                        prefix = segment[offset]
+                        if prefix in {
+                            "if", "elif", "while", "until", "then", "do",
+                            "else", "!", "builtin",
+                        }:
+                            offset += 1
+                            continue
+                        if prefix == "exec":
+                            offset += 1
+                            while offset < len(segment) and segment[offset].startswith("-"):
+                                option = segment[offset]
+                                if option in {"-c", "-l", "--"}:
+                                    offset += 1
+                                    if option == "--":
+                                        break
+                                elif option == "-a" and offset + 1 < len(segment):
+                                    offset += 2
+                                else:
+                                    raise RuntimeError(
+                                        "Codex filesystem sandbox cannot verify shell exec options"
+                                    )
+                            continue
+                        if prefix == "command":
+                            offset += 1
+                            while offset < len(segment) and segment[offset] == "-p":
+                                offset += 1
+                            if offset < len(segment) and segment[offset] in {"-v", "-V"}:
+                                # The query-only forms of command do not exec.
+                                offset = len(segment)
+                            continue
+                        if prefix == "eval":
+                            _require_direct_codex_filesystem_sandbox(
+                                ["bash", "-c", " ".join(segment[offset + 1:])]
+                            )
+                            offset = len(segment)
+                        break
+                    if offset < len(segment):
+                        _require_direct_codex_filesystem_sandbox(
+                            segment[offset:]
+                        )
+                    segment = []
+                else:
+                    segment.append(token)
+            return
+        payload_tokens = (
+            [argv[1]] if len(argv) > 1 and codex_entrypoint(argv[1]) else []
+        )
+    elif python_interpreter:
+        module_index = 1
+        while module_index < len(argv) and argv[module_index] in {
+            "-I", "-B", "-S", "-E", "-s", "-u",
+        }:
+            module_index += 1
+        if (
+            len(argv) > module_index + 1
+            and argv[module_index] == "-m"
+            and argv[module_index + 1] == "grabowski_agent_writer"
+        ):
+            payload_tokens = []
+        elif len(argv) > 1 and not argv[1].startswith("-"):
+            payload_tokens = (
+                [argv[1]] if codex_entrypoint(argv[1]) else []
+            )
+    elif executable in {"node", "nodejs", "ruby", "perl"}:
+        # Script paths and arguments are data. Only an executable script,
+        # an inline code payload or a preloaded executable module can launch
+        # Codex directly. Unknown interpreter flags fail closed.
+        payload_tokens = []
+        index = 1
+        while index < len(argv):
+            item = argv[index]
+            if item == "--":
+                index += 1
+                break
+            if item in {"-e", "--eval", "-p", "--print"}:
+                if index + 1 >= len(argv):
+                    raise RuntimeError(
+                        "Codex filesystem sandbox cannot verify interpreter code"
+                    )
+                payload_tokens.append(argv[index + 1])
+                index += 2
+                break
+            if item.startswith(("--eval=", "--print=")) or (
+                item.startswith(("-e", "-p")) and len(item) > 2
+            ):
+                payload_tokens.append(
+                    item.partition("=")[2] if item.startswith("--") else item[2:]
+                )
+                break
+            if item in {"-r", "--require", "--import", "--loader"}:
+                if index + 1 >= len(argv):
+                    raise RuntimeError(
+                        "Codex filesystem sandbox cannot verify interpreter preload"
+                    )
+                if codex_entrypoint(argv[index + 1]):
+                    payload_tokens.append(argv[index + 1])
+                index += 2
+                continue
+            if item.startswith(("--require=", "--import=", "--loader=")):
+                if codex_entrypoint(item.split("=", 1)[1]):
+                    payload_tokens.append(item.split("=", 1)[1])
+                index += 1
+                continue
+            if item in {"-I", "--no-warnings", "--no-deprecation",
+                        "--experimental-modules", "--disable-gems", "-w", "-W"}:
+                index += 1
+                continue
+            if item.startswith("-"):
+                raise RuntimeError(
+                    "Codex filesystem sandbox cannot verify interpreter options"
+                )
+            break
+        if index < len(argv):
+            if codex_entrypoint(argv[index]):
+                payload_tokens.append(argv[index])
     if (
         codex_entrypoint(argv[0])
         or codex_entrypoint(resolved_executable)
         or (
             interpreter and any(
                 codex_entrypoint(item) or token_pattern.search(item) is not None
-                for item in argv[1:]
+                for item in payload_tokens
             )
         )
     ):
@@ -8831,9 +9132,11 @@ def _resolve_task_operation_identity(
         return {"reuse": None, "reuse_reason": None, "retry_binding": None}
     now = _now()
     if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
-        if not _task_has_fresh_active_observation(latest, now=now):
-            grabowski_task_status(str(latest["task_id"]))
-            latest = _row_raw(str(latest["task_id"]))
+        # A fresh unit observation does not prove that the repository writer
+        # lease is still owned. Use the existing lease-maintaining reuse check.
+        latest = _refresh_active_execution_reuse_record(
+            latest, allow_active_reuse=True
+        )
         if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
             if any(retry_fields):
                 raise ValueError("active operation identity cannot be superseded")

@@ -317,12 +317,130 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
                     tasks._require_direct_codex_filesystem_sandbox(argv)
 
+    def test_symlinked_prefix_launcher_aliases_must_not_hide_codex(self) -> None:
+        for name, target, args in (
+            ("alias-env", "/usr/bin/env", ["-iS", "codex exec prompt"]),
+            ("alias-time", "/usr/bin/time", ["-p", "codex", "exec", "prompt"]),
+        ):
+            alias = self.root / name
+            alias.symlink_to(target)
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        [str(alias), *args]
+                    )
+        alias = self.root / "alias-env-good"
+        alias.symlink_to("/usr/bin/env")
+        tasks._require_direct_codex_filesystem_sandbox([
+            str(alias), "CARGO_TARGET_DIR=/tmp/project-codex/target",
+            "cargo", "test"
+        ])
+
+    def test_shell_builtin_prefixes_do_not_hide_codex(self) -> None:
+        commands = (
+            "exec -a harmless codex exec prompt",
+            "command -p codex exec prompt",
+            "eval 'codex exec prompt'",
+            "builtin eval 'codex exec prompt'",
+            "bash -c 'exec -a harmless codex exec prompt'",
+        )
+        for source in commands:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/bin/bash", "-c", source]
+                    )
+
+    def test_shell_builtin_cargo_and_printed_text_remain_allowed(self) -> None:
+        for source in (
+            "exec -a label cargo test",
+            "command -p cargo test",
+            "eval 'printf codex'",
+            "printf 'codex exec prompt'",
+        ):
+            with self.subTest(source=source):
+                tasks._require_direct_codex_filesystem_sandbox(
+                    ["/bin/bash", "-c", source]
+                )
+
+    def test_sudo_assignment_prefix_cannot_hide_indirect_codex(self) -> None:
+        # Prefixed environment assignments are not the executable. Both
+        # wrappers must still inspect the child command before any task effect.
+        for argv in (
+            ["sudo", "-n", "HOME=/tmp", "codex", "exec", "prompt"],
+            ["sudo", "-u", "tester", "X=1", "codex", "exec", "prompt"],
+            ["doas", "-n", "HOME=/tmp", "codex", "exec", "prompt"],
+            ["/usr/bin/env", "HOME=/tmp", "sudo", "-n",
+             "X=1", "/usr/bin/env", "-S", "codex exec prompt"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_sudo_assignment_preserves_non_agent_cargo(self) -> None:
+        for wrapper in ("sudo", "doas"):
+            with self.subTest(wrapper=wrapper):
+                tasks._require_direct_codex_filesystem_sandbox([
+                    wrapper, "-n", "HOME=/tmp/project-codex",
+                    "cargo", "build", "--manifest-path",
+                    str(self.root / "project-codex" / "Cargo.toml"),
+                ])
+
+    def test_prefix_launchers_preserve_non_agent_cargo_and_build_paths(self) -> None:
+        commands = (
+            ["timeout", "30", "cargo", "build", "--manifest-path",
+             str(self.root / "project-codex" / "Cargo.toml")],
+            ["nice", "-n", "10", "cargo", "build", "--manifest-path",
+             str(self.root / "project-codex" / "Cargo.toml")],
+            ["stdbuf", "-oL", "cargo", "build", "--manifest-path",
+             str(self.root / "project-codex" / "Cargo.toml")],
+            ["nohup", "/bin/bash", str(self.root / "project-codex" / "build.sh")],
+            ["setsid", "/bin/bash", str(self.root / "project-codex" / "build.sh")],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_prefixed_codex_remains_denied(self) -> None:
+        for argv in (
+            ["timeout", "30", "codex", "exec", "prompt"],
+            ["nice", "-n", "10", "codex", "exec", "prompt"],
+            ["stdbuf", "-oL", "codex", "exec", "prompt"],
+            ["nohup", "codex", "exec", "prompt"],
+            ["setsid", "codex", "exec", "prompt"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_shell_control_flow_still_detects_literal_codex(self) -> None:
+        for command in (
+            "while true; do codex exec prompt; done",
+            "if true; then codex exec prompt; fi",
+        ):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/bin/bash", "-c", command]
+                    )
+
     def test_legitimate_codex_named_paths_are_not_entrypoints(self) -> None:
         commands = (
             ["/usr/bin/python3", "-m", "grabowski_agent_writer", "--repository",
              str(self.root / "project-codex")],
             ["/bin/bash", str(self.root / "project-codex" / "build.sh")],
             ["/bin/bash", "-c", "printf hello", "--", str(self.root / "project-codex")],
+            ["sudo", "-n", "/bin/bash", str(self.root / "project-codex" / "build.sh")],
+            ["/usr/bin/time", "-p", "cargo", "build", "--manifest-path",
+             str(self.root / "project-codex" / "Cargo.toml")],
+            ["/usr/bin/env", "-iS", "python -m grabowski_agent_writer"
+             " --repository /tmp/project-codex"],
+            ["/usr/bin/busybox", "sh", "-c", "printf project-codex"],
+            ["/bin/bash", "-c", "printf codex"],
+            ["/bin/bash", "-c", "echo codex"],
+            ["/usr/bin/node", str(self.root / "project-codex" / "build.js"),
+             "--label", "codex"],
+            ["ruby", str(self.root / "project-codex" / "build.rb")],
         )
         for argv in commands:
             with self.subTest(argv=argv):
