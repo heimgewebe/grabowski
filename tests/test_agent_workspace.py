@@ -1942,6 +1942,77 @@ class AgentWorkspaceTests(unittest.TestCase):
             for keeper in keepers:
                 keeper.close()
 
+    def test_writer_handoff_eligibility_retains_authorized_wal_aware_lane_validation(self) -> None:
+        lane = self.lane_receipt(idempotency_key="writer-handoff-live-wal")
+        manifest = self.lane_manifest(lane)
+        writer = {"state": "failed", "terminal": True}
+        snapshot = {
+            "writer_branch_matches": True,
+            "writer_head": manifest["expected_base_head"],
+            "dirty": False,
+            "scope_passed": True,
+        }
+        keepers = (workspace.resources._database(), workspace.checkouts._database())
+        try:
+            databases = (workspace.resources.RESOURCE_DB, workspace.checkouts.CHECKOUT_DB)
+            for connection in keepers:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("UPDATE metadata SET value=value WHERE key='schema_version'")
+                connection.commit()
+            sidecars = [
+                Path(str(database) + suffix)
+                for database in databases for suffix in ("-wal", "-shm")
+            ]
+            self.assertTrue(all(path.is_file() for path in sidecars))
+            before = {
+                str(path): path.read_bytes()
+                for database in databases
+                for path in (database, Path(str(database) + "-wal"), Path(str(database) + "-shm"))
+            }
+            with (
+                mock.patch.object(workspace, "_writer_attempts", return_value=[{"actor": "initial_writer"}]),
+                mock.patch.object(workspace, "_writer_task_binding_reasons", return_value=[]),
+                mock.patch.object(workspace, "_route_gate", return_value=({}, True, False)),
+            ):
+                with mock.patch.object(
+                    workspace.operator, "_require_operator_mutation"
+                ) as mutation_gate:
+                    result = workspace._writer_handoff_eligibility(
+                        manifest, writer, snapshot, read_only=False
+                    )
+                self.assertNotIn("work_lane_binding_invalid", result["reasons"], result)
+                self.assertNotIn("checkout_lifecycle_unobservable", result["reasons"], result)
+                self.assertNotIn("workspace_lease_unobservable", result["reasons"], result)
+                mutation_gate.assert_any_call("resource_lease")
+
+                with mock.patch.object(
+                    workspace.operator,
+                    "_require_operator_mutation",
+                    side_effect=PermissionError("resource mutation denied"),
+                ):
+                    with self.assertRaisesRegex(PermissionError, "resource mutation denied"):
+                        workspace._writer_handoff_eligibility(
+                            manifest, writer, snapshot, read_only=False
+                        )
+
+                with mock.patch.object(
+                    workspace.operator,
+                    "_require_operator_mutation",
+                    side_effect=AssertionError("READ_ONLY must not enter mutation"),
+                ) as gate:
+                    strict = workspace._writer_handoff_eligibility(
+                        manifest, writer, snapshot, read_only=True
+                    )
+                gate.assert_not_called()
+                self.assertIn("work_lane_binding_invalid", strict["reasons"])
+                self.assertIn("checkout_lifecycle_unobservable", strict["reasons"])
+                self.assertIn("workspace_lease_unobservable", strict["reasons"])
+                for filename, payload in before.items():
+                    self.assertEqual(Path(filename).read_bytes(), payload)
+        finally:
+            for connection in keepers:
+                connection.close()
+
     def test_workspace_lifecycle_classification_rechecks_git_capability_before_inventory(self) -> None:
         manifest = self.manifest(with_writer=False)
         with (
@@ -12380,8 +12451,27 @@ class AgentWorkspaceTests(unittest.TestCase):
 
 
 
+    def _use_quiescent_handoff_checkout_snapshot(self, label: str) -> None:
+        # A positive READ_ONLY status requires a quiescent source snapshot.
+        # Explicit backup removes dependency on Python-version GC of setup
+        # connections while preserving strict WAL/SHM denial tests elsewhere.
+        snapshot = self.root / f"handoff-{label}-checkout.sqlite3"
+        source = sqlite3.connect(workspace.checkouts.CHECKOUT_DB)
+        target = sqlite3.connect(snapshot)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        for suffix in ("-wal", "-shm"):
+            self.assertFalse(Path(str(snapshot) + suffix).exists())
+        scope = mock.patch.object(workspace.checkouts, "CHECKOUT_DB", snapshot)
+        scope.start()
+        self.addCleanup(scope.stop)
+
     def test_writer_handoff_eligibility_reports_each_authority_blocker(self) -> None:
         manifest, leases = self._handoff_ready_manifest()
+        self._use_quiescent_handoff_checkout_snapshot("authority-blockers")
         writer = self._handoff_writer_task(manifest)
         snapshot = workspace._git_snapshot(manifest, workspace._run)
         with mock.patch.object(workspace.resources, "list_resources", return_value=leases):
@@ -12447,6 +12537,7 @@ class AgentWorkspaceTests(unittest.TestCase):
 
     def test_writer_handoff_eligibility_accepts_current_lane_retained_active_projection(self) -> None:
         manifest, leases = self._handoff_ready_manifest()
+        self._use_quiescent_handoff_checkout_snapshot("retained-projection")
         lifecycle = dict(manifest["checkout_lifecycle"])
         lifecycle.pop("phase", None)
         lifecycle["state"] = "retained"
@@ -12683,7 +12774,26 @@ class AgentWorkspaceTests(unittest.TestCase):
 
     def test_status_exposes_eligible_redacted_writer_handoff(self) -> None:
         manifest, leases = self._handoff_ready_manifest()
+        # Positive READ_ONLY status needs quiescent copies of both stores.
+        # Python 3.12 can retain setup-time resource or checkout WAL sidecars.
+        checkout_snapshot = self.root / "handoff-status-snapshot.sqlite3"
+        resource_snapshot = self.root / "handoff-resource-snapshot.sqlite3"
+        for original, snapshot in (
+            (workspace.checkouts.CHECKOUT_DB, checkout_snapshot),
+            (workspace.resources.RESOURCE_DB, resource_snapshot),
+        ):
+            source = sqlite3.connect(original)
+            target = sqlite3.connect(snapshot)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+            for suffix in ("-wal", "-shm"):
+                self.assertFalse(Path(str(snapshot) + suffix).exists())
         with (
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot),
+            mock.patch.object(workspace.resources, "RESOURCE_DB", resource_snapshot),
             mock.patch.object(
                 workspace.tasks,
                 "grabowski_task_peek",
@@ -12699,6 +12809,9 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(status["tasks"]["writer"]["task_id"], "writer-task")
         self.assertEqual(status["original_writer_task"]["task_id"], "writer-task")
         self.assertNotIn("command", status["writer_attempts"][0])
+        for snapshot in (checkout_snapshot, resource_snapshot):
+            for suffix in ("-wal", "-shm"):
+                self.assertFalse(Path(str(snapshot) + suffix).exists())
 
     def test_collect_uses_attempt_two_task_and_receipt(self) -> None:
         manifest = self.manifest()

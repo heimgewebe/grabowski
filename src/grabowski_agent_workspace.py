@@ -3161,11 +3161,19 @@ def _writer_handoff_eligibility(
     manifest: dict[str, Any],
     writer: dict[str, Any],
     snapshot: dict[str, Any],
+    *,
+    read_only: bool = True,
 ) -> dict[str, Any]:
+    if not isinstance(read_only, bool):
+        raise ValueError("read_only must be boolean")
+    # A writer handoff may touch WAL-aware resource/checkout SQLite. Gate
+    # before any such reads; status projections retain strict READ_ONLY.
+    if not read_only:
+        operator._require_operator_mutation("resource_lease")
     attempts = _writer_attempts(manifest)
     reasons = _writer_task_binding_reasons(manifest, attempts[-1], writer)
     if _lane_backed(manifest):
-        lane_status = _lane_binding_status(manifest)
+        lane_status = _lane_binding_status(manifest, read_only=read_only)
         if lane_status.get("valid") is not True:
             reasons.append("work_lane_binding_invalid")
     if len(attempts) - 1 >= MAX_WRITER_HANDOFFS:
@@ -3216,7 +3224,8 @@ def _writer_handoff_eligibility(
     else:
         try:
             key = str(lifecycle["checkout_key"])
-            observed_binding = checkouts._lifecycle_bindings([key]).get(key)
+            with (checkouts._strict_inventory_readonly_scope() if read_only else nullcontext()):
+                observed_binding = checkouts._lifecycle_bindings([key]).get(key)
             if not isinstance(observed_binding, dict):
                 reasons.append("checkout_lifecycle_unbound")
             elif (
@@ -3236,7 +3245,10 @@ def _writer_handoff_eligibility(
         reasons.append("workspace_resources_invalid")
     else:
         try:
-            live = resources.list_resources(owner_id=owner, include_expired=False, limit=MAX_PATHS + 8, read_only=True)
+            live = resources.list_resources(
+                owner_id=owner, include_expired=False, limit=MAX_PATHS + 8,
+                read_only=read_only,
+            )
             observed = {str(item.get("resource_key")) for item in live}
             if not set(str(key) for key in keys).issubset(observed):
                 reasons.append("workspace_lease_missing")
@@ -6619,7 +6631,9 @@ def _status_data(manifest: dict[str, Any], runner: CommandRunner = _run) -> dict
         and not collection_complete
     )
     try:
-        writer_handoff = _writer_handoff_eligibility(manifest, task_state["writer"], snapshot)
+        writer_handoff = _writer_handoff_eligibility(
+            manifest, task_state["writer"], snapshot, read_only=True
+        )
     except Exception as exc:
         writer_handoff = {"eligible": False, "reasons": ["writer_attempt_history_invalid"], "error": _error_summary(exc), "max": MAX_WRITER_HANDOFFS, "used": None}
     candidate_revision = _candidate_revision_status(manifest, read_only=True)
@@ -9658,7 +9672,9 @@ def grabowski_agent_workspace_writer_handoff(workspace_id: str, replacement_argv
             )
         try:
             snapshot = _git_snapshot(manifest, _run)
-            eligibility = _writer_handoff_eligibility(manifest, writer, snapshot)
+            eligibility = _writer_handoff_eligibility(
+                manifest, writer, snapshot, read_only=False
+            )
         except Exception as exc:
             return {"workspace_id": identifier, "state": "writer_handoff_unobservable", "error": _error_summary(exc), "handoff_status": "blocked"}
         if not eligibility["eligible"]:
@@ -9697,7 +9713,7 @@ def grabowski_agent_workspace_writer_handoff(workspace_id: str, replacement_argv
         revalidated_writer = _task_public(str(effective["task_id"]))
         revalidated_snapshot = _git_snapshot(manifest, _run)
         revalidated = _writer_handoff_eligibility(
-            manifest, revalidated_writer, revalidated_snapshot
+            manifest, revalidated_writer, revalidated_snapshot, read_only=False
         )
         if not revalidated["eligible"]:
             _append_workspace_event(
