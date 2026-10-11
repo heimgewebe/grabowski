@@ -13476,6 +13476,36 @@ def _captain_review_evidence_gate(parameters: dict[str, Any], actions: list[dict
 def _captain_independent_review_gate(
     parameters: dict[str, Any], actions: list[dict[str, Any]]
 ) -> dict[str, Any]:
+    # A trusted-owner deployment cannot inherit an independent R3 from a
+    # GitHub merge that never passed the bound reviewer-authority contract.
+    deployments = [
+        action for action in actions if action.get("action") == "runtime-deploy"
+    ]
+    if deployments:
+        if len(deployments) != 1 or len(actions) != 1:
+            return _captain_gate(
+                "independent-review-policy",
+                "blocked",
+                "one runtime release admission can bind exactly one action",
+                ["runtime_deploy_admission_target_count_invalid"],
+            )
+        try:
+            from grabowski_self_deploy import _require_release_source_admission
+
+            release = _require_release_source_admission(parameters.get("expected_head"))
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            return _captain_gate(
+                "independent-review-policy",
+                "blocked",
+                "runtime release review admission was not proven",
+                [f"release_admission_blocked:{type(exc).__name__}: {exc}"],
+            )
+        return _captain_gate(
+            "independent-review-policy",
+            "pass",
+            "unchanged or documentation-only runtime source; R3 not implied",
+            {"required": False, "release_source_status": release.get("status")},
+        )
     targets = [
         action.get("target")
         for action in actions

@@ -5384,6 +5384,138 @@ def _recovered_auto_deploy_source_binding(
     }
 
 
+
+def _require_release_source_admission(expected_head: str) -> dict[str, Any]:
+    """Read-only release admission; never infer an independent R3 from main.
+
+    Independently authenticated post-merge release authorization is not yet
+    implemented by this seam. Changed runtime and policy sources are blocked
+    before scheduling, Git-ref changes and Rootbroker side effects.
+    """
+    if not isinstance(expected_head, str) or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
+        raise DeploySchedulePreEffectRefusal("release admission blocked: exact target head is invalid")
+    deployment = base._deployment_metadata()
+    if (
+        not isinstance(deployment, dict)
+        or deployment.get("completion_status") != "complete"
+        or any(
+            deployment.get(flag) is not True
+            for flag in ("runtime_binding_valid", "artifact_integrity_valid", "provenance_valid")
+        )
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: deployed manifest integrity is invalid"
+        )
+    serving_head = deployment.get("repo_head")
+    release_id = deployment.get("release_id")
+    if (
+        not isinstance(serving_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}", serving_head) is None
+        or not isinstance(release_id, str)
+        or not release_id
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: serving source identity is missing"
+        )
+    process = serving_process.identity(
+        current_release_id=release_id,
+        current_repo_head=serving_head,
+    )
+    if (
+        not isinstance(process, dict)
+        or process.get("matches_deployed_manifest") is not True
+        or process.get("process_release_id") != release_id
+        or process.get("process_repo_head") != serving_head
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: serving process identity mismatch"
+        )
+    if serving_head == expected_head:
+        return {
+            "status": "already-serving-exact-source",
+            "serving_repo_head": serving_head,
+            "target_repo_head": expected_head,
+            "independent_review_required": False,
+        }
+    ancestor = _git_result(
+        CANONICAL_REPOSITORY, "merge-base", "--is-ancestor", serving_head, expected_head
+    )
+    if (
+        type(ancestor.get("returncode")) is not int
+        or ancestor.get("returncode") != 0
+        or ancestor.get("timed_out") is not False
+        or ancestor.get("stdout_truncated") is not False
+        or ancestor.get("stderr_truncated") is not False
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: source ancestry is unproved"
+        )
+    observed = _git_result(
+        CANONICAL_REPOSITORY,
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-renames",
+        "--ignore-submodules=none",
+        "--name-only",
+        "-z",
+        serving_head,
+        expected_head,
+        "--",
+        max_output_bytes=262_144,
+    )
+    if (
+        type(observed.get("returncode")) is not int
+        or observed.get("returncode") != 0
+        or observed.get("timed_out") is not False
+        or observed.get("stdout_truncated") is not False
+        or observed.get("stderr_truncated") is not False
+        or not isinstance(observed.get("stdout"), str)
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: complete source diff is unavailable"
+        )
+    raw_paths = observed["stdout"]
+    if raw_paths and not raw_paths.endswith("\x00"):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: source path boundary is incomplete"
+        )
+    changed_paths = raw_paths[:-1].split("\x00") if raw_paths else []
+    if any(
+        not path
+        or path.startswith("/")
+        or "\ufffd" in path
+        or "<REDACTED>" in path
+        or "\\" in path
+        or any(component in {"", ".", ".."} for component in path.split("/"))
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        for path in changed_paths
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: source paths are ambiguous"
+        )
+    # Only pure documentation delta is exempt; unknown files, test or CI
+    # policy, executables, tools and runtime sources all fail closed.
+    # Even inside docs/, executable or configuration files are not inherently
+    # review-free; the exemption covers only plain documentation formats.
+    safe_document_extensions = (".md", ".markdown", ".rst", ".txt", ".adoc")
+    if any(
+        not path.startswith("docs/") or not path.endswith(safe_document_extensions)
+        for path in changed_paths
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release review admission missing: changed runtime/policy sources "
+            "require independent exact-revision authorization before deployment"
+        )
+    return {
+        "status": "non-runtime-documentation",
+        "serving_repo_head": serving_head,
+        "target_repo_head": expected_head,
+        "changed_path_count": len(changed_paths),
+        "independent_review_required": False,
+    }
+
+
 def _grabowski_runtime_deploy_schedule_impl(
     expected_head: ExpectedHead,
     delay_seconds: DelaySeconds = 8,
@@ -5394,6 +5526,7 @@ def _grabowski_runtime_deploy_schedule_impl(
     local_mutation_tracker: dict[str, Any],
 ) -> dict[str, Any]:
     """Implement one source-identity-bound self-deployment schedule attempt."""
+    _require_release_source_admission(expected_head)
     with _deploy_schedule_lock():
         public_github_main_before = _fresh_public_github_main(expected_head)
         if public_github_main_before != expected_head:

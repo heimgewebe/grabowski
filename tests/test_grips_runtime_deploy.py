@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -36,6 +36,7 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.types"] = fake_types
 
 import grabowski_grips as grips  # noqa: E402
+import grabowski_self_deploy as real_deploy  # noqa: E402
 
 
 class RuntimeDeployScheduleReceiptTests(unittest.TestCase):
@@ -176,6 +177,214 @@ class RuntimeDeployScheduleReceiptTests(unittest.TestCase):
         self.assertEqual(source_repository, bound_preflight["repository"])
         self.assertEqual("detached-worktree", bound_preflight["source_kind"])
         self.assertEqual("d" * 64, bound_preflight["source_identity_sha256"])
+
+
+
+class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
+    @staticmethod
+    def _git_success(output: str) -> dict[str, object]:
+        return {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": output,
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+    @staticmethod
+    def _deployed() -> dict[str, object]:
+        return {
+            "release_id": "existing-protected-release",
+            "repo_head": "a" * 40,
+            "completion_status": "complete",
+            "runtime_binding_valid": True,
+            "artifact_integrity_valid": True,
+            "provenance_valid": True,
+        }
+
+    @staticmethod
+    def _serving() -> dict[str, object]:
+        return {
+            "matches_deployed_manifest": True,
+            "process_release_id": "existing-protected-release",
+            "process_repo_head": "a" * 40,
+        }
+
+    def test_critical_source_change_requires_authentic_release_admission(self) -> None:
+        import grabowski_self_deploy as deploy
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=self._deployed()),
+            patch.object(deploy.serving_process, "identity", return_value=self._serving()),
+            patch.object(
+                deploy,
+                "_git_result",
+                side_effect=[
+                    self._git_success(""),
+                    self._git_success("src/grabowski_agent_role.py\x00tests/test_agent_role_grok.py\x00"),
+                ],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "release.*admission"):
+                deploy._require_release_source_admission("b" * 40)
+
+    def test_docs_only_delta_has_no_release_review_bypass_of_runtime_source(self) -> None:
+        import grabowski_self_deploy as deploy
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=self._deployed()),
+            patch.object(deploy.serving_process, "identity", return_value=self._serving()),
+            patch.object(
+                deploy,
+                "_git_result",
+                side_effect=[self._git_success(""), self._git_success("docs/guide.md\x00")],
+            ),
+        ):
+            record = deploy._require_release_source_admission("b" * 40)
+        self.assertEqual("non-runtime-documentation", record["status"])
+
+    def test_missing_serving_process_provenance_blocks(self) -> None:
+        import grabowski_self_deploy as deploy
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=self._deployed()),
+            patch.object(deploy.serving_process, "identity", return_value={"matches_deployed_manifest": False}),
+            patch.object(deploy, "_git_result") as git_read,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "serving"):
+                deploy._require_release_source_admission("b" * 40)
+        git_read.assert_not_called()
+
+    def test_direct_scheduler_rejects_before_github_or_local_mutation(self) -> None:
+        import grabowski_self_deploy as deploy
+        with (
+            patch.object(deploy, "_require_release_source_admission", side_effect=RuntimeError("release admission missing")),
+            patch.object(deploy, "_fresh_public_github_main") as remote,
+            patch.object(deploy, "inflight_runtime_job_evidence") as inflight,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "release admission missing"):
+                deploy._grabowski_runtime_deploy_schedule_impl(
+                    "b" * 40, local_mutation_tracker={}
+                )
+        remote.assert_not_called()
+        inflight.assert_not_called()
+
+    def test_captain_runtime_deploy_marks_review_gate_blocked(self) -> None:
+        # Exercise the Captain policy seam without import-order effects from
+        # the old scheduler fixture's synthetic modules.
+        fake_deploy = types.ModuleType("grabowski_self_deploy")
+        admission = Mock(side_effect=RuntimeError("release admission missing"))
+        fake_deploy._require_release_source_admission = admission
+        with patch.dict(sys.modules, {"grabowski_self_deploy": fake_deploy}):
+            gate = grips._captain_independent_review_gate(
+                {"expected_head": "b" * 40},
+                [
+                    {
+                        "action": "runtime-deploy",
+                        "target": {
+                            "repo": "heimgewebe/grabowski",
+                            "runtime_target": "heim-pc",
+                            "adapter": "grabowski-self",
+                        },
+                    }
+                ],
+            )
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn("release", str(gate.get("details", gate.get("reason", ""))))
+        admission.assert_called_once_with("b" * 40)
+
+
+    def test_source_diff_without_explicit_transport_completeness_blocks(self) -> None:
+        deploy = real_deploy
+        observed = self._git_success("docs/guide.md\x00")
+        del observed["stdout_truncated"]
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=self._deployed()),
+            patch.object(deploy.serving_process, "identity", return_value=self._serving()),
+            patch.object(deploy, "_git_result", side_effect=[self._git_success(""), observed]),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "complete source diff"):
+                deploy._require_release_source_admission("b" * 40)
+
+    def test_source_ancestor_missing_explicit_zero_exit_blocks(self) -> None:
+        deploy = real_deploy
+        ancestor = self._git_success("")
+        ancestor["returncode"] = False
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=self._deployed()),
+            patch.object(deploy.serving_process, "identity", return_value=self._serving()),
+            patch.object(deploy, "_git_result", side_effect=[ancestor]) as read,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "source ancestry"):
+                deploy._require_release_source_admission("b" * 40)
+        read.assert_called_once()
+
+    def test_source_path_escape_from_docs_prefix_blocks(self) -> None:
+        deploy = real_deploy
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=self._deployed()),
+            patch.object(deploy.serving_process, "identity", return_value=self._serving()),
+            patch.object(
+                deploy,
+                "_git_result",
+                side_effect=[
+                    self._git_success(""),
+                    self._git_success("docs/../src/grabowski_agent_role.py\x00"),
+                ],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "source paths"):
+                deploy._require_release_source_admission("b" * 40)
+
+    def test_truncated_and_unterminated_path_output_blocks(self) -> None:
+        deploy = real_deploy
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=self._deployed()),
+            patch.object(deploy.serving_process, "identity", return_value=self._serving()),
+            patch.object(
+                deploy,
+                "_git_result",
+                side_effect=[
+                    self._git_success(""),
+                    self._git_success("docs/readme.md"),
+                ],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "source path boundary"):
+                deploy._require_release_source_admission("b" * 40)
+
+
+    def test_redacted_documentation_path_cannot_grant_release_admission(self) -> None:
+        deploy = real_deploy
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=self._deployed()),
+            patch.object(deploy.serving_process, "identity", return_value=self._serving()),
+            patch.object(
+                deploy,
+                "_git_result",
+                side_effect=[
+                    self._git_success(""),
+                    self._git_success("docs/<REDACTED>\x00"),
+                ],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "source paths"):
+                deploy._require_release_source_admission("b" * 40)
+
+    def test_executable_script_inside_docs_does_not_get_documentation_exemption(self) -> None:
+        deploy = real_deploy
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=self._deployed()),
+            patch.object(deploy.serving_process, "identity", return_value=self._serving()),
+            patch.object(
+                deploy,
+                "_git_result",
+                side_effect=[
+                    self._git_success(""),
+                    self._git_success("docs/run_deploy.sh\x00"),
+                ],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "release review admission missing"):
+                deploy._require_release_source_admission("b" * 40)
 
 
 
