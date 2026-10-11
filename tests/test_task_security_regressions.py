@@ -750,5 +750,33 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 tasks._require_direct_codex_filesystem_sandbox(argv)
 
 
+    def test_elf_loader_preload_and_library_override_rejected(self) -> None:
+        # Admission-only fixtures: no ELF loader or shared object is executed.
+        # Library search overrides can load arbitrary constructors just like
+        # explicit --preload/--audit, even if the target binary is harmless.
+        dangerous = (
+            ["ld-linux-x86-64.so.2", "--preload", "/tmp/inject.so", "/bin/true"],
+            ["ld-linux-x86-64.so.2", "--preload=/tmp/inject.so", "/bin/true"],
+            ["ld-linux-x86-64.so.2", "--audit", "/tmp/inject.so", "/bin/true"],
+            ["ld-linux-x86-64.so.2", "--audit=/tmp/inject.so", "/bin/true"],
+            ["ld.so", "--library-path", "/tmp/untrusted", "/bin/true"],
+            ["ld.so", "--library-path=/tmp/untrusted", "/bin/true"],
+            ["env", "-i", "ld.so", "--preload", "/tmp/inject.so", "/bin/true"],
+            ["bash", "-c", "ld.so --preload /tmp/inject.so /bin/true"],
+        )
+        for argv in dangerous:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        for argv in (
+            ["ld.so", "--verify", "/bin/true"],
+            ["ld.so", "--list", "/bin/true"],
+            ["env", "FOO=bar", "ld.so", "--verify", "/bin/true"],
+        ):
+            with self.subTest(allowed=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
 if __name__ == "__main__":
     unittest.main()

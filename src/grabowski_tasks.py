@@ -4280,11 +4280,22 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                 attached = option.startswith(("-o", "-f")) and len(option) > 2
                 attached = attached or option.startswith(("--output=", "--format="))
             elif loader:
+                # Search overrides, preloads and auditors can load executable
+                # shared objects before the nominal child binary is reached.
+                unverified_library_options = {
+                    "--library-path", "--preload", "--audit", "--inhibit-rpath",
+                    "--glibc-hwcaps-prepend", "--glibc-hwcaps-mask",
+                }
+                if option in unverified_library_options or any(
+                    option.startswith(name + "=")
+                    for name in unverified_library_options
+                ):
+                    raise RuntimeError(
+                        "Codex filesystem sandbox cannot verify executable ELF loader libraries"
+                    )
                 simple = {"--list", "--verify", "--inhibit-cache", "--list-diagnostics"}
-                takes_value = {"--library-path", "--preload", "--audit",
-                               "--argv0", "--inhibit-rpath",
-                               "--glibc-hwcaps-prepend", "--glibc-hwcaps-mask"}
-                attached = any(option.startswith(name + "=") for name in takes_value)
+                takes_value = {"--argv0"}
+                attached = option.startswith("--argv0=")
             else:
                 simple = {"-n", "-E", "-H", "-k", "-K", "-S", "-b", "-P",
                           "--non-interactive", "--preserve-env", "--login",
