@@ -295,6 +295,6 @@ def bound_local_pr_git_diff(
                              env=isolated, timeout=remaining_timeout(), stdout_limit=8192)
         return _bounded_git_capture(
             [*flags, "diff", "--no-ext-diff", "--no-textconv",
-             "--no-renames", "--no-color", merge_base, head, "--"],
+             "--no-renames", "--ignore-submodules=none", "--no-color", merge_base, head, "--"],
             cwd=str(root), env=isolated, timeout=remaining_timeout(), stdout_limit=max_diff_bytes,
         )
