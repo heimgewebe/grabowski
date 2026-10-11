@@ -18,15 +18,24 @@ SOURCE_ID = "c" * 64
 
 
 def active(head: str = SERVING, release: str = "release-blue") -> dict:
+    """The actual trusted ingress observer uses canonical/green, never blue."""
     selector = {
-        "selected_slot": "blue",
+        "selector_sha256": "2" * 64,
+        "generation": 7,
+        "selected_slot": "canonical",
+        "upstream_port": 18181,
         "runtime_binding_sha256": "1" * 64,
+        "release_id": release,
+        "repo_head": head,
     }
     ingress = {
+        "selector_sha256": "2" * 64,
+        "selector_generation": 7,
+        "selected_slot": "canonical",
+        "upstream_port": 18181,
+        "runtime_binding_sha256": "1" * 64,
         "repo_head": head,
         "release_id": release,
-        "selected_slot": "blue",
-        "runtime_binding_sha256": "1" * 64,
     }
     material = {"authoritative": True, "selector": selector, "ingress": ingress}
     return {**material, "readback_sha256": worker.canonical_json_sha256(material)}
@@ -40,6 +49,80 @@ class DelayedRuntimeEffectAdmissionTests(unittest.TestCase):
             )
         self.assertEqual("already-serving-exact-source", result["status"])
         self.assertEqual(SERVING, result["serving_repo_head"])
+
+    def test_green_slot_with_proven_authoritative_port_is_valid_already_serving(self):
+        observed = active()
+        observed["selector"]["selected_slot"] = "green"
+        observed["ingress"]["selected_slot"] = "green"
+        observed["selector"]["upstream_port"] = 18182
+        observed["ingress"]["upstream_port"] = 18182
+        material = {name: observed[name] for name in ("authoritative", "selector", "ingress")}
+        observed["readback_sha256"] = worker.canonical_json_sha256(material)
+        with patch.object(
+            worker.deploy_dual, "observe_authoritative_routing", return_value=observed,
+        ):
+            result = worker.require_effect_time_release_admission(
+                expected_head=SERVING, source_identity_sha256=SOURCE_ID
+            )
+        self.assertEqual("already-serving-exact-source", result["status"])
+
+    def test_readback_rejects_consistently_missing_or_invalid_route_identities(self):
+        """Even a self-consistent hash cannot license an incomplete selector."""
+        invalid = (
+            ("selected_slot", None),
+            ("selected_slot", "blue"),
+            ("selected_slot", ""),
+            ("upstream_port", None),
+            ("upstream_port", 0),
+            ("upstream_port", 18182),
+            ("upstream_port", True),
+            ("generation", None),
+            ("generation", False),
+            ("generation", 0),
+            ("runtime_binding_sha256", None),
+            ("runtime_binding_sha256", "Z" * 64),
+            ("runtime_binding_sha256", "1" * 63),
+            ("selector_sha256", None),
+            ("selector_sha256", "f" * 63),
+        )
+        for field, value in invalid:
+            with self.subTest(field=field, value=value):
+                observed = active()
+                observed["selector"][field] = value
+                ingress_field = "selector_generation" if field == "generation" else field
+                observed["ingress"][ingress_field] = value
+                material = {name: observed[name] for name in ("authoritative", "selector", "ingress")}
+                observed["readback_sha256"] = worker.canonical_json_sha256(material)
+                with patch.object(
+                    worker.deploy_dual, "observe_authoritative_routing", return_value=observed,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "serving identity"):
+                        worker.require_effect_time_release_admission(
+                            expected_head=SERVING, source_identity_sha256=SOURCE_ID
+                        )
+
+    def test_readback_rejects_contradictory_selector_provenance(self):
+        """The ingress and selector must agree beyond just the slot and binding."""
+        mismatches = (
+            ("selector_sha256", "f" * 64),
+            ("generation", 8),
+            ("upstream_port", 18182),
+            ("repo_head", TARGET),
+            ("release_id", "unrelated-release"),
+        )
+        for field, value in mismatches:
+            with self.subTest(field=field):
+                observed = active()
+                observed["selector"][field] = value
+                material = {name: observed[name] for name in ("authoritative", "selector", "ingress")}
+                observed["readback_sha256"] = worker.canonical_json_sha256(material)
+                with patch.object(
+                    worker.deploy_dual, "observe_authoritative_routing", return_value=observed,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "serving identity"):
+                        worker.require_effect_time_release_admission(
+                            expected_head=SERVING, source_identity_sha256=SOURCE_ID
+                        )
 
     def test_critical_change_requires_separate_protected_captain_authority(self):
         with patch.object(worker.deploy_dual, "observe_authoritative_routing", return_value=active()):

@@ -1731,15 +1731,39 @@ def require_effect_time_release_admission(
         )
     serving_head = ingress.get("repo_head")
     serving_release_id = ingress.get("release_id")
+    selected_slot = selector.get("selected_slot")
+    slot_port = (
+        deploy_dual.transport_ingress.ROUTING_SLOTS.get(selected_slot)
+        if isinstance(selected_slot, str)
+        else None
+    )
+    binding_sha256 = selector.get("runtime_binding_sha256")
+    selector_sha256 = selector.get("selector_sha256")
+    generation = selector.get("generation")
     if (
         not isinstance(serving_head, str)
         or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", serving_head) is None
         or not isinstance(serving_release_id, str)
         or not serving_release_id.strip()
         or len(serving_release_id.encode("utf-8")) > 512
+        # A pair of missing fields is not an identity: None == None must
+        # never constitute positive release admission.
+        or slot_port is None
         or selector.get("selected_slot") != ingress.get("selected_slot")
-        or selector.get("runtime_binding_sha256")
-        != ingress.get("runtime_binding_sha256")
+        or type(selector.get("upstream_port")) is not int
+        or selector.get("upstream_port") != slot_port
+        or ingress.get("upstream_port") != slot_port
+        or type(generation) is not int
+        or generation < 1
+        or ingress.get("selector_generation") != generation
+        or not isinstance(selector_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", selector_sha256) is None
+        or ingress.get("selector_sha256") != selector_sha256
+        or not isinstance(binding_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding_sha256) is None
+        or ingress.get("runtime_binding_sha256") != binding_sha256
+        or selector.get("repo_head") != serving_head
+        or selector.get("release_id") != serving_release_id
     ):
         raise RecoveryClassificationBlocked(
             "release admission blocked: serving identity is incomplete or contradictory"
