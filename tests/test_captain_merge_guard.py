@@ -417,6 +417,7 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
             for setting, hostile_value in (
                 ("diff.noprefix", "true"),
                 ("core.abbrev", "12"),
+                ("color.ui", "always"),
             ):
                 _git(repo, "config", setting, hostile_value)
                 try:

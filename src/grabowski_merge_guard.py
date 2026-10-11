@@ -1727,7 +1727,7 @@ def _merge_guard_legacy_local_review_diff_identity(
             [
                 "-c", "diff.noprefix=false", "-c", "core.abbrev=auto",
                 "diff", "--binary", "--no-ext-diff", "--no-textconv",
-                "--unified=3", f"{base_sha}...{head_sha}",
+                "--no-color", "--unified=3", f"{base_sha}...{head_sha}",
             ],
             timeout=60,
         )
