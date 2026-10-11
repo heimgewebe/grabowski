@@ -3165,7 +3165,7 @@ def deploy(
     profile_path: Path,
     *,
     timeout_seconds: int,
-    expected_head: str | None = None,
+    expected_head: str,
 ) -> None:
     """Low-level deploy primitive; callers must hold the canonical deploy lock.
 
@@ -3173,12 +3173,13 @@ def deploy(
     The extra HEAD check binds this independently refreshed Git snapshot to the
     precise target that was authorized, before any release-building effect.
     """
-    snapshot = snapshot_from_git(repo)
-    if expected_head is not None and (
+    if (
         not isinstance(expected_head, str)
         or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None
-        or snapshot.repo_head != expected_head
     ):
+        fail("Legacy deployment requires valid exact expected_head", phase="expected-head")
+    snapshot = snapshot_from_git(repo)
+    if snapshot.repo_head != expected_head:
         fail(
             "Legacy deployment snapshot differs from exact expected_head",
             phase="expected-head",

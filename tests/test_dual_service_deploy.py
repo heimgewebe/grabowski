@@ -4361,7 +4361,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                 return_value={"process": {"pid": 1}},
             ),
         ):
-            dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+            dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1, expected_head="a" * 40)
         self.assertEqual(
             events,
             [
@@ -4407,6 +4407,11 @@ class DeploymentSequenceTests(unittest.TestCase):
             dual.TUNNEL_SERVICE: inactive.to_dict(),
         }
         with contextlib.ExitStack() as stack:
+            # This is an isolated unit test of the recovery path, not proof of
+            # a real rootbroker-signed origin or permission to deploy.
+            root_origin = stack.enter_context(
+                mock.patch.object(dual, "require_root_broker_bootstrap_origin")
+            )
             stack.enter_context(
                 mock.patch.object(
                     dual,
@@ -4564,6 +4569,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                 expected_head="a" * 40,
                 bootstrap_recovery=True,
             )
+        root_origin.assert_called_once_with(expected_head="a" * 40)
         admission.assert_not_called()
         drain.assert_not_called()
         drain_guard.assert_not_called()
@@ -4604,12 +4610,13 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch.object(dual, "install_watchdog_host_assets") as install_watchdogs,
             mock.patch.object(dual, "install_safety_observer_unit") as install,
         ):
-            dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+            dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1, expected_head="a" * 40)
         deploy.assert_called_once_with(
             ROOT,
             RUNTIME,
             Path("profile.yaml"),
             timeout_seconds=1,
+            expected_head="a" * 40,
         )
         build.assert_not_called()
         install_watchdogs.assert_not_called()
@@ -4646,7 +4653,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch.object(dual, "install_watchdog_host_assets") as install,
         ):
             with self.assertRaisesRegex(core.DeployError, "legacy-stdio"):
-                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1, expected_head="a" * 40)
         deploy.assert_not_called()
         install.assert_not_called()
 
@@ -4706,7 +4713,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch("sys.stderr", stderr),
         ):
             with self.assertRaises(core.DeployError):
-                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1, expected_head="a" * 40)
         activate.assert_not_called()
         self.assertEqual(
             events,
@@ -4773,7 +4780,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch("sys.stderr", stderr),
         ):
             with self.assertRaisesRegex(core.DeployError, "busy"):
-                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1, expected_head="a" * 40)
         stop.assert_not_called()
         rollback.assert_not_called()
         restore_watchdogs.assert_called_once()
@@ -4837,7 +4844,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch("sys.stderr", stderr),
         ):
             with self.assertRaisesRegex(core.DeployError, "new command"):
-                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1, expected_head="a" * 40)
         stop.assert_not_called()
         rollback.assert_not_called()
         restore_watchdogs.assert_called_once()
@@ -4896,7 +4903,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch("sys.stderr", stderr),
         ):
             with self.assertRaises(core.DeployError):
-                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1, expected_head="a" * 40)
 
         stop.assert_not_called()
         self.assertEqual(rollback_calls, ["rollback"])
@@ -4975,7 +4982,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch("sys.stderr", stderr),
         ):
             with self.assertRaises(core.DeployError):
-                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1)
+                dual.deploy_url(ROOT, RUNTIME, Path("profile.yaml"), timeout_seconds=1, expected_head="a" * 40)
 
         error_line = next(
             line
