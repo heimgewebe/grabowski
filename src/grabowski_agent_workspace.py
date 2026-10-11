@@ -68,7 +68,7 @@ SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 BINDING_KINDS = frozenset({"bureau_task", "thread_focus"})
 TERMINAL_TASK_STATES = frozenset(
-    {"completed", "failed", "cancelled", "timed_out", "signalled", "outcome_unknown"}
+    {"completed", "failed", "cancelled", "timed_out", "signalled"}
 )
 READ_ONLY_ROLES = ("tests", "review")
 ALL_ROLES = ("captain", "writer", "tests", "review")
@@ -2283,7 +2283,7 @@ def _task_public(task_id: str | None, *, read_only: bool = False) -> dict[str, A
             "reconcile_required": True,
         }
     state = str(value.get("state", "unknown"))
-    return {
+    public = {
         "task_id": task_id,
         "host": value.get("host"),
         "unit": value.get("unit"),
@@ -2295,6 +2295,12 @@ def _task_public(task_id: str | None, *, read_only: bool = False) -> dict[str, A
         "cwd": value.get("cwd"),
         "outcome_receipt": value.get("outcome_receipt"),
     }
+    if value.get("reconcile_required") or state == "outcome_unknown":
+        public["reconcile_required"] = True
+    for key in ("persisted_state", "observation_mode", "observation_unavailable_reason"):
+        if key in value:
+            public[key] = value[key]
+    return public
 
 
 def _stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -10614,6 +10620,7 @@ def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
         "argv_sha256": value.get("argv_sha256"),
         "cwd": value.get("cwd"),
         "outcome_receipt": None,
+        "reconcile_required": state == "outcome_unknown",
     }
 
 

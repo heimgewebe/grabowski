@@ -8617,6 +8617,83 @@ class AgentWorkspaceTests(unittest.TestCase):
         if isinstance(head, str) and head and isinstance(branch, str) and branch:
             self.git.publish_remote_head(head, branch)
 
+    def test_unobserved_rootbroker_task_remains_nonterminal_in_workspace(self) -> None:
+        task_id = "root-task"
+        peek = {
+            "task_id": task_id,
+            "host": "heim-pc",
+            "unit": "root.service",
+            "state": "outcome_unknown",
+            "persisted_state": "running",
+            "observation_mode": "persisted_only_rootbroker_not_probed",
+            "observation_unavailable_reason": "privileged_broker_requires_mutation_gate",
+            "reconcile_required": True,
+        }
+        with (
+            mock.patch.object(workspace.tasks, "grabowski_task_peek", return_value=peek) as reader,
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                side_effect=AssertionError("read-only status may not refresh a rootbroker task"),
+            ) as mutating_reader,
+        ):
+            public = workspace._task_public(task_id, read_only=True)
+        reader.assert_called_once_with(task_id)
+        mutating_reader.assert_not_called()
+        self.assertEqual("outcome_unknown", public["state"])
+        self.assertFalse(public["terminal"])
+        self.assertEqual("running", public["persisted_state"])
+        self.assertEqual("persisted_only_rootbroker_not_probed", public["observation_mode"])
+        self.assertEqual(
+            "privileged_broker_requires_mutation_gate",
+            public["observation_unavailable_reason"],
+        )
+        self.assertTrue(public["reconcile_required"])
+
+    def test_unknown_mutating_task_result_cannot_finish_role(self) -> None:
+        with mock.patch.object(
+            workspace.tasks,
+            "grabowski_task_status",
+            return_value={"state": "outcome_unknown"},
+        ) as task_status:
+            public = workspace._task_public("unknown-task")
+        task_status.assert_called_once_with("unknown-task")
+        self.assertEqual("outcome_unknown", public["state"])
+        self.assertFalse(public["terminal"])
+        self.assertTrue(public["reconcile_required"])
+
+    def test_cleanup_persisted_unknown_task_is_nonterminal_without_probe(self) -> None:
+        task_id = "root-task"
+        row = {
+            "task_id": task_id,
+            "host": "heim-pc",
+            "unit": "root.service",
+            "state": "outcome_unknown",
+            "attempt": 1,
+            "resume_policy": "never",
+            "argv_sha256": "a" * 64,
+            "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection", return_value=connection
+            ) as reader,
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                side_effect=AssertionError("cleanup must not refresh status"),
+            ) as mutating_reader,
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        reader.assert_called_once_with(workspace.tasks.TASK_DB)
+        mutating_reader.assert_not_called()
+        connection.close.assert_called_once_with()
+        self.assertEqual("outcome_unknown", public["state"])
+        self.assertFalse(public["terminal"])
+        self.assertTrue(public["reconcile_required"])
+
     def test_task_public_reads_persisted_state_without_status_refresh(self) -> None:
         task_db = workspace.tasks.TASK_DB
         task_db.parent.mkdir(parents=True, exist_ok=True)
