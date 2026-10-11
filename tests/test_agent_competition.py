@@ -2184,6 +2184,46 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(status["lifecycle_state"], "provider_running")
         self.assertEqual(status["phase"], "provider_execution")
 
+
+    def test_unobserved_rootbroker_task_is_not_provider_terminal(self) -> None:
+        started = self._start()
+        for persisted_state in ("running", "outcome_unknown"):
+            with self.subTest(persisted_state=persisted_state):
+                projection = {
+                    "task_id": started["task_id"],
+                    "unit": "root-unit",
+                    "state": "outcome_unknown",
+                    "persisted_state": persisted_state,
+                    "observation_mode": "persisted_only_rootbroker_not_probed",
+                    "reconcile_required": True,
+                }
+                with (
+                    mock.patch.object(
+                        competition.tasks, "grabowski_task_peek", return_value=projection
+                    ) as peek,
+                    mock.patch.object(
+                        competition.tasks,
+                        "grabowski_task_status",
+                        side_effect=AssertionError("READ_ONLY may not refresh a task"),
+                    ) as refresh,
+                    mock.patch.object(
+                        competition.operator,
+                        "_require_operator_mutation",
+                        side_effect=AssertionError("READ_ONLY may not mutate"),
+                    ) as mutation,
+                ):
+                    status = competition.grabowski_agent_competition_status(
+                        started["competition_id"]
+                    )
+                self.assertEqual("provider_outcome_unknown", status["lifecycle_state"])
+                self.assertEqual("task_observation", status["phase"])
+                self.assertFalse(status["candidate_ready"])
+                self.assertTrue(status["retry_blocked"])
+                self.assertFalse(status["receipt_present"])
+                peek.assert_called_once_with(started["task_id"])
+                refresh.assert_not_called()
+                mutation.assert_not_called()
+
     def test_high_novelty_security_alone_does_not_force_external_competition(self) -> None:
         result = competition.grabowski_agent_execution_route(
             task_kind="code",
