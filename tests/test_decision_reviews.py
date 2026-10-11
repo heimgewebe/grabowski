@@ -537,6 +537,21 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 "provider_tool_calls": [{"name": "read_file", "result": "review evidence"}],
             }, {}),
             ("unexpected_cli_turns", {"num_turns": 100}, {}),
+            ("semantic_usage_speed", {
+                "usage": {"speed": "standard REJECT_THIS_REVISION P1"},
+            }, {}),
+            ("semantic_usage_tier", {
+                "usage": {"service_tier": "standard REJECT_THIS_REVISION P1"},
+            }, {}),
+            ("semantic_usage_geo", {
+                "usage": {"inference_geo": "REJECT_THIS_REVISION"},
+            }, {}),
+            ("semantic_session_id", {
+                "session_id": "REJECT_THIS_REVISION P1",
+            }, {}),
+            ("semantic_uuid", {
+                "uuid": "REJECT_THIS_REVISION P1",
+            }, {}),
             ("actual_quota_result_newline", {
                 "result": "You've hit your weekly limit\nmodel-produced text",
             }, {}),

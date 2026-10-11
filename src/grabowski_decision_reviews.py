@@ -96,6 +96,9 @@ _CLAUDE_QUOTA_RESULT_RE = re.compile(
     r"(?:[1-9]|1[0-2])(?::[0-5][0-9])?(?:am|pm) \(UTC\))?\Z"
 )
 # New provider fields must be understood before claiming zero semantic output.
+_CLAUDE_QUOTA_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\Z"
+)
 _CLAUDE_QUOTA_ENVELOPE_FIELDS = frozenset({
     "type", "is_error", "terminal_reason", "api_error_status", "duration_api_ms",
     "modelUsage", "structured_output", "result", "usage", "subagent_stats",
@@ -1050,9 +1053,9 @@ def _claude_no_external_activity(usage: Any, subagents: Any) -> bool:
         ):
             return False
     if (
-        not isinstance(usage.get("service_tier"), str)
-        or not isinstance(usage.get("speed"), str)
-        or not isinstance(usage.get("inference_geo"), str)
+        usage.get("service_tier") != "standard"
+        or usage.get("speed") != "standard"
+        or usage.get("inference_geo") != ""
         or usage.get("fallback_credit") is not None
     ):
         return False
@@ -1164,7 +1167,7 @@ def _proven_claude_quota_failure_before_review(
     for key in ("session_id", "uuid"):
         if key in envelope and (
             not isinstance(envelope[key], str)
-            or not (1 <= len(envelope[key]) <= 128)
+            or _CLAUDE_QUOTA_UUID_RE.fullmatch(envelope[key]) is None
         ):
             return False
     usage = envelope.get("usage")
