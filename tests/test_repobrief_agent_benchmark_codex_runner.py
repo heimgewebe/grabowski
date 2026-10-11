@@ -5215,6 +5215,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     )
                 )
 
+    def test_malformed_outer_event_type_fails_closed_before_receipt(self) -> None:
+        value = request()
+        events = [json.loads(line) for line in stream(value).splitlines()]
+        now = datetime.now(timezone.utc)
+        self.assertEqual(
+            "success",
+            runner.receipt(value, stream(value), "transcript.jsonl", 0, now, now)["status"],
+        )
+        for malformed in ([], {}, 123, True, None):
+            with self.subTest(value=repr(malformed)):
+                bad = copy.deepcopy(events)
+                bad.insert(1, {"type": malformed})
+                raw = b"".join(
+                    json.dumps(event, sort_keys=True).encode("utf-8") + b"\n"
+                    for event in bad
+                )
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    r"Codex transcript line \d+ event type",
+                ):
+                    runner.receipt(
+                        value, raw, "transcript.jsonl", 0, now, now
+                    )
+
     def test_malformed_completed_event_metadata_fails_closed(self) -> None:
         value = request(condition="treatment")
         for field, malformed in (("type", {}), ("tool", [])):
