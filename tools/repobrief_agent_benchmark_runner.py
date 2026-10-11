@@ -13,6 +13,7 @@ from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import selectors
 import shutil
@@ -1205,6 +1206,1148 @@ def normalize_tool_calls(
     return calls
 
 
+_REPOGROUND_FRESHNESS = {"fresh", "stale", "unknown", "not_comparable", "not_applicable"}
+_REPOGROUND_LIVE_FRESHNESS = {"fresh", "stale", "unknown", "not_comparable"}
+_REPOGROUND_GROUNDING = {"pass", "fail", "warn", "degraded", "not_applicable"}
+_REPOGROUND_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
+# Mirrors repoground.core.bundle_identity; a legacy manifest may omit version.
+_REPOGROUND_MANIFEST_KIND = "repoground.bundle.manifest"
+_REPOGROUND_MANIFEST_VERSION = "2.0"
+_REPOGROUND_LEGACY_MANIFEST_KIND = "repolens.bundle.manifest"
+_REPOGROUND_LEGACY_MANIFEST_VERSION = "1.0"
+EXPECTED_REPOGROUND_READ_ONLY_KIND = "repobrief.mcp.read_only_frontdoor"
+EXPECTED_REPOGROUND_READ_ONLY_VERSION = "v1"
+EXPECTED_REPOGROUND_FRESHNESS_VALUES = ("fresh", "stale", "unknown", "not_comparable")
+EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH = (
+    "freshness_against_remote",
+    "remote_branch_state",
+    "pull_request_diff_current",
+    "runtime_correctness",
+    "repo_understood",
+    "merge_readiness",
+)
+EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH = (
+    "truth",
+    "correctness",
+    "completeness",
+    "runtime_behavior",
+    "test_sufficiency",
+    "regression_absence",
+    "repo_understood",
+    "claims_true",
+    "forensic_ready",
+    "review_complete",
+    "pr_mergeable",
+    "mcp_server_available",
+)
+EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH = (
+    "actual_reading_proven",
+    "answer_correct",
+    "repo_understood",
+    "all_relevant_context_used",
+    "claims_true",
+    "test_sufficiency",
+    "regression_absence",
+    "runtime_behavior",
+    "forensic_ready",
+    "merge_readiness",
+    "security_correctness",
+)
+EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS = (
+    "implicit_refresh",
+    "git_mutation",
+    "snapshot_creation_on_read",
+    "patch_application",
+    "pull_request_mutation",
+    "shell_execution",
+    "merge_authorization",
+)
+EXPECTED_ASK_CONTEXT_PACK_KIND = "repobrief.ask_context_pack"
+EXPECTED_ASK_CONTEXT_PACK_VERSION = "1.0"
+EXPECTED_GROUNDING_VERDICT_KIND = "repobrief.answer_grounding_verdict"
+EXPECTED_GROUNDING_VERDICT_VERSION = "1.0"
+EXPECTED_GROUNDING_VERDICT_STATUSES = frozenset(
+    {"pass", "fail", "warn", "degraded", "not_applicable"}
+)
+
+
+def _decoded_repoground_payload(result: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    content = result.get("content")
+    candidates: list[Any] = []
+    if isinstance(content, str):
+        candidates.append(content)
+    elif isinstance(content, Mapping):
+        candidates.append(content)
+    elif isinstance(content, list):
+        candidates.extend(content)
+    for candidate in candidates:
+        value: Any = candidate
+        if isinstance(candidate, Mapping) and isinstance(candidate.get("text"), str):
+            value = candidate.get("text")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(value, Mapping):
+            continue
+        nested = value.get("structuredContent")
+        if not isinstance(nested, Mapping):
+            nested = value.get("structured_content")
+        if isinstance(nested, Mapping):
+            return nested
+        result_value = value.get("result")
+        if isinstance(result_value, Mapping):
+            nested = result_value.get("structuredContent")
+            if not isinstance(nested, Mapping):
+                nested = result_value.get("structured_content")
+            if isinstance(nested, Mapping):
+                return nested
+        kind = value.get("kind")
+        if isinstance(kind, str) and kind in {
+            "repobrief.mcp.read_only_frontdoor",
+            "repobrief.live_freshness",
+        }:
+            return value
+    return None
+
+
+def _decoded_resource_read_result(
+    result: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    if "contents" in result and "_meta" in result:
+        return result
+    content = result.get("content")
+    candidates: list[Any] = []
+    if isinstance(content, str):
+        candidates.append(content)
+    elif isinstance(content, Mapping):
+        candidates.append(content)
+    elif isinstance(content, list):
+        candidates.extend(content)
+    for candidate in candidates:
+        value: Any = candidate
+        if isinstance(candidate, Mapping) and isinstance(candidate.get("text"), str):
+            value = candidate.get("text")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(value, Mapping) and "contents" in value and "_meta" in value:
+            return value
+    return None
+
+
+_SOURCE_RECOVERY_SUFFIX_RE = re.compile(
+    r"([0-9a-fA-F]{40}|[0-9a-fA-F]{64})(?:--recovery-[0-9a-f]{12})?\Z"
+)
+
+
+def _is_commit(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) in {40, 64}
+        and all(char in "0123456789abcdefABCDEF" for char in value)
+    )
+
+
+def _provenance_identities(item: Mapping[str, Any]) -> list[str]:
+    return [
+        value.strip().removesuffix(".git")
+        for value in (
+            item.get("repo"),
+            item.get("repository"),
+            item.get("repo_id"),
+            item.get("name"),
+        )
+        if isinstance(value, str) and value.strip()
+    ]
+
+
+def _provenance_match(item: Mapping[str, Any], requested: set[str]) -> str | None:
+    """Return "foreign", "match" or None for a provenance repository entry.
+
+    Normalization mirrors grabowski_repobrief._snapshot_repository_matches:
+    strip, drop ".git", match the repository segment, and accept canonical
+    "<owner>__<segment>__<ref>[--<commit>]" identities.  The request carries
+    no ref, so the ref is the single token after the last "__"; the segment
+    itself may contain "__" and must be the intact suffix of what precedes it.
+    """
+    segments = {name.rsplit("/", 1)[-1] for name in requested}
+    segments.discard("")
+    # Full repository slugs carry the owner identity; plain local IDs do not.
+    owners = {name.rsplit("/", 1)[0] for name in requested if "/" in name and name.rsplit("/", 1)[0]}
+    hits: list[str] = []
+    for identity in _provenance_identities(item):
+        if identity in requested:
+            hits.append("match")
+            continue
+        if any(identity.endswith(f"/{segment}") for segment in segments):
+            hits.append("foreign")
+            continue
+        canonical = identity
+        for separator in reversed([m.start() for m in re.finditer(r"--", identity)]):
+            if _SOURCE_RECOVERY_SUFFIX_RE.fullmatch(identity[separator + 2 :]):
+                canonical = identity[:separator]
+                break
+        prefix, separator_found, ref = canonical.rpartition("__")
+        segment_match = (
+            separator_found
+            and bool(ref)
+            and "/" not in canonical
+            and any(
+                prefix == segment
+                or (prefix.endswith(f"__{segment}") and len(prefix) > len(segment) + 2)
+                for segment in segments
+            )
+        )
+        if segment_match:
+            if prefix in segments or not owners:
+                hits.append("match")
+            elif any(
+                prefix == f"{owner}__{segment}"
+                for owner in owners
+                for segment in segments
+            ):
+                hits.append("match")
+            else:
+                # A canonical identity with an explicit different owner
+                # cannot authorize exposure for this requested repository.
+                hits.append("foreign")
+        elif identity in segments:
+            hits.append("match")
+    # Any explicitly foreign-owner identity disqualifies the entry; callers
+    # must bind only on "match".
+    if "foreign" in hits:
+        return "foreign"
+    return "match" if hits else None
+
+
+def _require_repoground_manifest_envelope(document: Mapping[str, Any]) -> None:
+    kind = document.get("kind")
+    version = document.get("version")
+    if kind == _REPOGROUND_MANIFEST_KIND:
+        valid = version == _REPOGROUND_MANIFEST_VERSION
+    elif kind == _REPOGROUND_LEGACY_MANIFEST_KIND:
+        valid = (
+            "version" not in document
+            or version == _REPOGROUND_LEGACY_MANIFEST_VERSION
+        )
+    else:
+        raise RunnerError(
+            "RepoGround manifest kind is invalid: expected "
+            f"{_REPOGROUND_MANIFEST_KIND!r} or {_REPOGROUND_LEGACY_MANIFEST_KIND!r}"
+        )
+    if not valid:
+        raise RunnerError(
+            f"RepoGround manifest version is invalid for kind {kind!r}"
+        )
+
+
+def _bound_repoground_manifest(
+    request: Mapping[str, Any],
+) -> tuple[Path, str, str, str | None]:
+    binding = _mapping(request.get("repobrief"))
+    raw_path = Path(_require_string(binding.get("manifest"), "repobrief.manifest")).expanduser()
+    if raw_path.is_symlink():
+        raise RunnerError("RepoGround manifest must not be a symlink")
+    try:
+        manifest_path = raw_path.resolve(strict=True)
+        with manifest_path.open("rb") as handle:
+            raw = handle.read(_REPOGROUND_MANIFEST_MAX_BYTES + 1)
+    except OSError as exc:
+        raise RunnerError("RepoGround manifest is unavailable") from exc
+    if len(raw) > _REPOGROUND_MANIFEST_MAX_BYTES:
+        raise RunnerError("RepoGround manifest exceeds configured limit")
+    expected_sha = _require_string(
+        binding.get("manifest_sha256"), "repobrief.manifest_sha256", maximum=64
+    )
+    if _sha256_bytes(raw) != expected_sha:
+        raise RunnerError("RepoGround manifest SHA mismatch")
+    document = _load_object_bytes(raw, label="RepoGround manifest")
+    _require_repoground_manifest_envelope(document)
+    provenance = document.get("snapshotProvenance")
+    if not isinstance(provenance, Mapping):
+        provenance = document.get("snapshot_provenance")
+    repositories = (
+        provenance.get("repositories") if isinstance(provenance, Mapping) else None
+    )
+    if (
+        not isinstance(repositories, list)
+        or not repositories
+        or any(not isinstance(item, Mapping) for item in repositories)
+    ):
+        raise RunnerError("RepoGround manifest provenance is invalid")
+
+    repository = _mapping(request.get("repository"))
+    requested = {
+        value.strip().removesuffix(".git")
+        for value in (repository.get("id"), repository.get("repository"))
+        if isinstance(value, str) and value.strip().removesuffix(".git")
+    }
+    if len(repositories) == 1:
+        selected = repositories[0]
+        # A singleton without any identity field stays an anonymous legacy
+        # fallback; an explicit identity must match the requested repository
+        # (same rule as grabowski_repobrief._snapshot_repository_matches).
+        if (
+            _provenance_identities(selected)
+            and _provenance_match(selected, requested) != "match"
+        ):
+            raise RunnerError(
+                "RepoGround manifest repository binding does not match request"
+            )
+    else:
+        # "foreign" (explicit different owner) is never a binding candidate.
+        matches = [
+            item
+            for item in repositories
+            if _provenance_match(item, requested) == "match"
+        ]
+        if len(matches) != 1:
+            raise RunnerError("RepoGround manifest repository binding is ambiguous")
+        selected = matches[0]
+
+    commit = (
+        selected.get("git_commit") or selected.get("commit") or selected.get("head")
+    )
+    if not _is_commit(commit):
+        raise RunnerError("RepoGround manifest commit is invalid")
+    repo_root = selected.get("repo_root")
+    manifest_repo_root = (
+        repo_root
+        if isinstance(repo_root, str)
+        and bool(repo_root)
+        and Path(repo_root).is_absolute()
+        else None
+    )
+    return manifest_path, expected_sha, str(commit).lower(), manifest_repo_root
+
+
+def _authorized_manifest_paths(
+    request: Mapping[str, Any], *, manifest_path: Path
+) -> frozenset[str]:
+    binding = _mapping(request.get("repobrief"))
+    logical = _require_string(binding.get("manifest"), "repobrief.manifest")
+    expanded = Path(logical).expanduser()
+    # Authorize only representations derived from the exact request-bound
+    # manifest path.  Do not admit arbitrary lexical aliases that happen to
+    # resolve to the same file.
+    paths = {logical, str(expanded), str(manifest_path)}
+    return frozenset(paths)
+
+
+def _repoground_manifest_binding(
+    request: Mapping[str, Any],
+) -> tuple[str, str, str | None, frozenset[str]]:
+    (
+        manifest_path,
+        manifest_sha256,
+        manifest_commit,
+        manifest_repo_root,
+    ) = _bound_repoground_manifest(request)
+    return (
+        manifest_sha256,
+        manifest_commit,
+        manifest_repo_root,
+        _authorized_manifest_paths(request, manifest_path=manifest_path),
+    )
+
+
+def _optional_repoground_manifest_binding(
+    request: Mapping[str, Any],
+) -> tuple[str, str, str | None, frozenset[str]] | None:
+    try:
+        return _repoground_manifest_binding(request)
+    except RunnerError:
+        # RepoGround evidence is an optional receipt projection.  A manifest
+        # that cannot be safely bound must suppress the projection, not turn an
+        # otherwise completed provider run into a receipt-construction failure.
+        return None
+
+
+def _validated_live_freshness_payload(
+    value: Any, *, expected_manifest: Path
+) -> dict[str, Any]:
+    common = {
+        "kind", "version", "status", "reason", "bundle_manifest", "repo_root",
+        "read_only_git_probe", "implicit_refresh", "does_not_establish",
+    }
+    extended = common | {"freshness_values", "snapshot_provenance", "current_provenance"}
+    if not isinstance(value, dict) or frozenset(value) not in {frozenset(common), frozenset(extended)}:
+        raise RunnerError("RepoGround live_freshness payload is malformed")
+    if (
+        value.get("kind") != "repobrief.live_freshness"
+        or value.get("version") != "v1"
+        or value.get("status") not in EXPECTED_REPOGROUND_FRESHNESS_VALUES
+        or not isinstance(value.get("reason"), str)
+        or not value.get("reason")
+        or value.get("bundle_manifest") != str(expected_manifest)
+        or (value.get("repo_root") is not None and not isinstance(value.get("repo_root"), str))
+        or not isinstance(value.get("read_only_git_probe"), bool)
+        or value.get("implicit_refresh") is not False
+        or value.get("does_not_establish") != list(EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH)
+    ):
+        raise RunnerError("RepoGround live_freshness payload is malformed")
+    if set(value) == extended:
+        if (
+            value.get("freshness_values") != list(EXPECTED_REPOGROUND_FRESHNESS_VALUES)
+            or (value.get("snapshot_provenance") is not None and not isinstance(value.get("snapshot_provenance"), dict))
+            or (value.get("current_provenance") is not None and not isinstance(value.get("current_provenance"), dict))
+        ):
+            raise RunnerError("RepoGround live_freshness payload is malformed")
+    return json.loads(json.dumps(value))
+
+
+def _validated_read_only_frontdoor_projection(value: Mapping[str, Any]) -> None:
+    boundary = value.get("mutation_boundary")
+    if not isinstance(boundary, dict) or boundary.get("writes") != []:
+        raise RunnerError("RepoGround treatment tool read-only boundary is malformed")
+    guarded_booleans = {
+        "read_only": True,
+        "read_paths_do_not_refresh": True,
+        "not_reachable_from_snapshot_create": True,
+        "explicit_write_tool": False,
+    }
+    for field, expected in guarded_booleans.items():
+        if field in boundary and boundary.get(field) is not expected:
+            raise RunnerError("RepoGround treatment tool read-only boundary is malformed")
+    forbidden = boundary.get("forbidden_operations")
+    if forbidden is not None and (
+        not isinstance(forbidden, list)
+        or not all(isinstance(item, str) for item in forbidden)
+        or not {"secret_read", "snapshot_create_side_effect"}.issubset(set(forbidden))
+    ):
+        raise RunnerError("RepoGround treatment tool read-only boundary is malformed")
+    dne = value.get("does_not_establish")
+    expected_items = list(EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH)
+    if isinstance(dne, list):
+        valid_dne = dne == expected_items
+    elif isinstance(dne, dict):
+        valid_dne = (
+            set(dne) == {"ref", "items"}
+            and dne.get("ref") == "repobrief.does_not_establish.default.v1"
+            and dne.get("items") == expected_items
+        )
+    else:
+        valid_dne = False
+    if not valid_dne:
+        raise RunnerError("RepoGround treatment tool non-claim projection is malformed")
+
+
+def _nonempty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _line_range_pair(value: Any) -> tuple[int, int] | None:
+    if not isinstance(value, Mapping):
+        return None
+    start, end = value.get("start_line"), value.get("end_line")
+    if any(isinstance(n, bool) or not isinstance(n, int) or n < 0 for n in (start, end)):
+        return None
+    return (start, end) if start <= end else None
+
+
+def _structured_range_valid(item: Mapping[str, Any]) -> bool:
+    """language_structure_json ranges carry structure provenance, no excerpt."""
+    range_ref = item.get("range_ref")
+    if not isinstance(range_ref, Mapping):
+        return False
+    path = range_ref.get("path")
+    coords = _line_range_pair(range_ref.get("range"))
+    if (
+        not _nonempty_str(range_ref.get("ref"))
+        or not _nonempty_str(path)
+        or coords is None
+        or item.get("source_path") != path
+    ):
+        return False
+    return _line_range_pair(item.get("source_line_range")) == coords
+
+
+def _resolved_range_entries_valid(ranges: Any) -> bool:
+    """Frontdoor shape: resolved ranges carry identity plus excerpt or structure."""
+    if not isinstance(ranges, list):
+        return False
+    for item in ranges:
+        if not isinstance(item, Mapping):
+            return False
+        if item.get("status") != "resolved":
+            continue
+        if item.get("artifact_role") == "language_structure_json":
+            if not _structured_range_valid(item):
+                return False
+            continue
+        range_ref = item.get("range_ref")
+        has_identity = _nonempty_str(item.get("source_path")) or _nonempty_str(
+            item.get("path")
+        ) or (
+            isinstance(range_ref, Mapping)
+            and (_nonempty_str(range_ref.get("ref")) or _nonempty_str(range_ref.get("path")))
+        )
+        if not _nonempty_str(item.get("text_excerpt")) or not has_identity:
+            return False
+    return True
+
+
+def _context_byte_budget_valid(budget: Mapping[str, Any]) -> bool:
+    """Hard byte accounting: used <= max_context_bytes <= token-derived ceiling.
+
+    The producer computes max_context_bytes as min(ceiling, requested), so the
+    relation is a production invariant. Unicode character fields are separate
+    and are not compared with byte limits.
+    """
+    values = []
+    for name in ("token_derived_byte_ceiling", "max_context_bytes", "context_bytes_used"):
+        item = budget.get(name)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            return False
+        values.append(item)
+    ceiling, limit, used = values
+    return used <= limit <= ceiling
+
+
+def _validated_ask_context_pack(value: Any) -> dict[str, Any]:
+    base_keys = {
+        "kind", "version", "request_id", "snapshot_ref", "freshness",
+        "availability", "required_reading", "retrieval",
+        "retrieval_infrastructure", "retrieval_hits", "resolved_ranges",
+        "answer_scaffold", "budget", "forbidden_operations",
+        "does_not_establish",
+    }
+    if not isinstance(value, dict) or frozenset(value) not in {
+        frozenset(base_keys), frozenset(base_keys | {"structured_evidence"})
+    }:
+        raise RunnerError("RepoGround ask_context context pack is malformed")
+    request_id = value.get("request_id")
+    if (
+        value.get("kind") != EXPECTED_ASK_CONTEXT_PACK_KIND
+        or value.get("version") != EXPECTED_ASK_CONTEXT_PACK_VERSION
+        or not isinstance(request_id, str)
+        or re.fullmatch(r"[0-9a-f]{16}", request_id) is None
+        or not all(isinstance(value.get(name), dict) for name in (
+            "snapshot_ref", "freshness", "availability", "required_reading",
+            "retrieval", "retrieval_infrastructure", "answer_scaffold", "budget"
+        ))
+        or not isinstance(value.get("retrieval_hits"), list)
+        or not _resolved_range_entries_valid(value.get("resolved_ranges"))
+        or value.get("forbidden_operations") != list(EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS)
+        or value.get("does_not_establish") != list(EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH)
+        or ("structured_evidence" in value and not isinstance(value.get("structured_evidence"), dict))
+    ):
+        raise RunnerError("RepoGround ask_context context pack is malformed")
+    freshness = value["freshness"]
+    availability = value["availability"]
+    infrastructure = value["retrieval_infrastructure"]
+    if (
+        freshness.get("status") not in {"fresh", "stale", "unknown", "not_comparable", "not_applicable"}
+        or availability.get("status") not in {"available", "partial", "missing", "unknown"}
+        or infrastructure.get("status") not in {"available", "missing", "invalid", "unknown"}
+    ):
+        raise RunnerError("RepoGround ask_context context pack is malformed")
+    scaffold = value["answer_scaffold"]
+    if (
+        set(scaffold) != {"citation_obligations", "caveats_to_surface", "non_claims_to_surface"}
+        or not isinstance(scaffold.get("citation_obligations"), list)
+        or not isinstance(scaffold.get("caveats_to_surface"), list)
+        or scaffold.get("non_claims_to_surface") != list(EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH)
+    ):
+        raise RunnerError("RepoGround ask_context context pack is malformed")
+    budget = value["budget"]
+    budget_keys = {
+        "max_context_tokens", "token_derived_byte_ceiling", "max_context_bytes",
+        "max_answer_tokens", "context_bytes_used",
+        "context_unicode_characters_used", "approx_context_chars_used",
+        "byte_budget_is_hard", "unit", "accounting", "omissions",
+        "truncated", "does_not_establish_quality",
+    }
+    integer_fields = (
+        "max_context_tokens", "token_derived_byte_ceiling", "max_context_bytes",
+        "max_answer_tokens", "context_bytes_used",
+        "context_unicode_characters_used", "approx_context_chars_used",
+    )
+    if (
+        set(budget) != budget_keys
+        or any(
+            isinstance(budget.get(name), bool)
+            or not isinstance(budget.get(name), int)
+            or budget.get(name) < 0
+            for name in integer_fields
+        )
+        or not _context_byte_budget_valid(budget)
+        or budget.get("byte_budget_is_hard") is not True
+        or budget.get("unit") != "utf8_bytes"
+        or not isinstance(budget.get("accounting"), str)
+        or not budget.get("accounting")
+        or not isinstance(budget.get("omissions"), list)
+        or not isinstance(budget.get("truncated"), bool)
+        or budget.get("does_not_establish_quality") is not True
+    ):
+        raise RunnerError("RepoGround ask_context context pack is malformed")
+    return json.loads(json.dumps(value))
+
+
+def _validated_grounding_verdict(value: Any) -> dict[str, Any]:
+    expected_keys = {
+        "kind", "version", "status", "checked_declaration", "snapshot_ref",
+        "citation_checks", "range_checks", "required_reading_checks",
+        "diagnostics", "freshness_caveats", "availability_caveats",
+        "does_not_establish",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_keys
+        or value.get("kind") != EXPECTED_GROUNDING_VERDICT_KIND
+        or value.get("version") != EXPECTED_GROUNDING_VERDICT_VERSION
+        or value.get("status") not in EXPECTED_GROUNDING_VERDICT_STATUSES
+        or not isinstance(value.get("checked_declaration"), dict)
+        or not isinstance(value.get("snapshot_ref"), dict)
+        or any(
+            not isinstance(value.get(name), list)
+            for name in (
+                "citation_checks", "range_checks", "required_reading_checks",
+                "diagnostics", "freshness_caveats", "availability_caveats"
+            )
+        )
+        or any(
+            not isinstance(item, dict)
+            for name in ("citation_checks", "range_checks", "required_reading_checks", "diagnostics")
+            for item in value.get(name, [])
+        )
+        or value.get("does_not_establish") != list(EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH)
+    ):
+        raise RunnerError("RepoGround grounding_verify verdict is malformed")
+    return json.loads(json.dumps(value))
+
+
+def _validated_treatment_structured_payload(
+    value: Any, *, tool_name: str, expected_manifest: Path, is_error: bool
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RunnerError("RepoGround treatment tool structured payload is malformed")
+    if is_error:
+        if (
+            set(value) != {"status", "tool", "error"}
+            or value.get("status") != "error"
+            or value.get("tool") != tool_name
+            or not isinstance(value.get("error"), str)
+            or not value.get("error")
+        ):
+            raise RunnerError("RepoGround treatment tool structured payload is malformed")
+        return json.loads(json.dumps(value))
+    if tool_name == "live_freshness":
+        return _validated_live_freshness_payload(value, expected_manifest=expected_manifest)
+    common = {
+        "kind", "version", "tool", "status", "mutation_boundary",
+        "does_not_establish", "live_freshness",
+    }
+    if tool_name == "ask_context":
+        expected_keys = common | {"context_pack", "request_semantics", "context_pack_semantics"}
+        valid = (
+            set(value) == expected_keys
+            and value.get("kind") == EXPECTED_REPOGROUND_READ_ONLY_KIND
+            and value.get("version") == EXPECTED_REPOGROUND_READ_ONLY_VERSION
+            and value.get("tool") == "ask_context"
+            and value.get("status") == "ok"
+            and value.get("request_semantics") == "repobrief.ask_request.v1"
+            and value.get("context_pack_semantics") == "repobrief.ask_context_pack.v1"
+        )
+    elif tool_name == "grounding_verify":
+        expected_keys = common | {"verdict", "declaration_semantics", "verdict_semantics"}
+        verdict = _validated_grounding_verdict(value.get("verdict"))
+        verdict_status = verdict["status"]
+        valid = (
+            set(value) == expected_keys
+            and value.get("kind") == EXPECTED_REPOGROUND_READ_ONLY_KIND
+            and value.get("version") == EXPECTED_REPOGROUND_READ_ONLY_VERSION
+            and value.get("tool") == "grounding_verify"
+            and isinstance(value.get("status"), str)
+            and value.get("status") == verdict_status
+            and value.get("declaration_semantics") == "repobrief.answer_grounding_declaration.v1"
+            and value.get("verdict_semantics") == "repobrief.answer_grounding_verdict.v1"
+        )
+    else:
+        raise RunnerError("RepoGround treatment tool response is not authorized")
+    if not valid:
+        raise RunnerError("RepoGround treatment tool structured payload is malformed")
+    _validated_read_only_frontdoor_projection(value)
+    if tool_name == "ask_context":
+        _validated_ask_context_pack(value.get("context_pack"))
+    _validated_live_freshness_payload(
+        value.get("live_freshness"), expected_manifest=expected_manifest
+    )
+    return json.loads(json.dumps(value))
+
+
+def _snapshot_ref_matches_manifest(
+    snapshot_ref: Mapping[str, Any],
+    *,
+    manifest_paths: frozenset[str],
+    manifest_sha256: str,
+    require_sha: bool,
+) -> bool:
+    observed_sha = snapshot_ref.get("manifest_sha256")
+    if observed_sha is not None:
+        return observed_sha == manifest_sha256
+    if require_sha:
+        return False
+    manifest_path = snapshot_ref.get("manifest_path")
+    return isinstance(manifest_path, str) and manifest_path in manifest_paths
+
+
+def _snapshot_ref_commit(
+    snapshot_ref: Mapping[str, Any], *, manifest_commit: str
+) -> str | None:
+    commit = snapshot_ref.get("git_commit")
+    if _is_commit(commit):
+        return manifest_commit if str(commit).lower() == manifest_commit else None
+    if commit is None:
+        return manifest_commit
+    return None
+
+
+def _live_snapshot_commit(
+    payload: Mapping[str, Any],
+    *,
+    manifest_paths: frozenset[str],
+    manifest_commit: str,
+    manifest_repo_root: str | None,
+) -> str | None:
+    if (
+        payload.get("kind") != "repobrief.live_freshness"
+        or payload.get("version") != "v1"
+        or not isinstance(payload.get("status"), str)
+        or payload["status"] not in _REPOGROUND_LIVE_FRESHNESS
+        or not isinstance(payload.get("reason"), str)
+        or not payload.get("reason")
+        or not isinstance(payload.get("bundle_manifest"), str)
+        or payload["bundle_manifest"] not in manifest_paths
+        or "repo_root" not in payload
+        or (
+            payload.get("repo_root") is not None
+            and not isinstance(payload.get("repo_root"), str)
+        )
+        or not isinstance(payload.get("read_only_git_probe"), bool)
+        or payload.get("implicit_refresh") is not False
+    ):
+        return None
+    snapshot = payload.get("snapshot_provenance")
+    if isinstance(snapshot, Mapping):
+        commit = snapshot.get("git_commit")
+        if not (_is_commit(commit) and str(commit).lower() == manifest_commit):
+            return None
+        if not (
+            # Snapshot-bound evidence of any status requires the permitted
+            # read-only probe of exactly the bound root without implicit refresh.
+            payload.get("read_only_git_probe") is True
+            and isinstance(payload.get("repo_root"), str)
+            and bool(payload.get("repo_root"))
+            and manifest_repo_root is not None
+            and payload.get("repo_root") == manifest_repo_root
+            and payload.get("implicit_refresh") is False
+        ):
+            return None
+        return manifest_commit
+    if (
+        payload.get("status") == "not_comparable"
+        and payload.get("reason") == "repo_root_not_configured"
+        and payload.get("repo_root") is None
+        and payload.get("read_only_git_probe") is False
+        and payload.get("implicit_refresh") is False
+        and snapshot is None
+    ):
+        return manifest_commit
+    if (
+        payload.get("status") == "unknown"
+        and isinstance(payload.get("reason"), str)
+        and bool(payload.get("reason"))
+        and isinstance(payload.get("repo_root"), str)
+        and bool(payload.get("repo_root"))
+        and manifest_repo_root is not None
+        and payload.get("repo_root") == manifest_repo_root
+        and payload.get("read_only_git_probe") is True
+        and payload.get("implicit_refresh") is False
+        and snapshot is None
+    ):
+        return manifest_commit
+    return None
+
+
+def _claude_payload_satisfies_contract(
+    *,
+    tool_name: str,
+    payload: Mapping[str, Any],
+    manifest_paths: frozenset[str],
+) -> bool:
+    """Apply the strict treatment payload contract shared with the Codex runner."""
+    freshness = (
+        payload if tool_name == "live_freshness" else payload.get("live_freshness")
+    )
+    if not isinstance(freshness, Mapping):
+        return False
+    manifest = freshness.get("bundle_manifest")
+    if not isinstance(manifest, str) or manifest not in manifest_paths:
+        return False
+    try:
+        _validated_treatment_structured_payload(
+            payload,
+            tool_name=tool_name,
+            expected_manifest=Path(manifest),
+            is_error=False,
+        )
+    except (RunnerError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _repoground_evidence_from_payload(
+    *,
+    manifest_binding: tuple[str, str, str | None, frozenset[str]],
+    tool_name: str,
+    sequence: int,
+    payload: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]] | None:
+    (
+        manifest_sha256,
+        manifest_commit,
+        manifest_repo_root,
+        manifest_paths,
+    ) = manifest_binding
+    if tool_name == "ask_context":
+        live_freshness = payload.get("live_freshness")
+        live_commit = (
+            _live_snapshot_commit(
+                live_freshness,
+                manifest_paths=manifest_paths,
+                manifest_commit=manifest_commit,
+                manifest_repo_root=manifest_repo_root,
+            )
+            if isinstance(live_freshness, Mapping)
+            else None
+        )
+        if (
+            payload.get("kind") != "repobrief.mcp.read_only_frontdoor"
+            or payload.get("version") != "v1"
+            or payload.get("tool") != "ask_context"
+            or payload.get("status") != "ok"
+            or live_commit is None
+        ):
+            return None
+        pack = payload.get("context_pack")
+        if (
+            not isinstance(pack, Mapping)
+            or pack.get("kind") != "repobrief.ask_context_pack"
+            or pack.get("version") != "1.0"
+        ):
+            return None
+        freshness = pack.get("freshness")
+        snapshot_ref = pack.get("snapshot_ref")
+        if (
+            not isinstance(freshness, Mapping)
+            or not isinstance(snapshot_ref, Mapping)
+            or not isinstance(freshness.get("status"), str)
+            or freshness["status"] not in _REPOGROUND_FRESHNESS
+            or snapshot_ref.get("freshness_status") != freshness.get("status")
+            or not _snapshot_ref_matches_manifest(
+                snapshot_ref,
+                manifest_paths=manifest_paths,
+                manifest_sha256=manifest_sha256,
+                require_sha=True,
+            )
+        ):
+            return None
+        commit = _snapshot_ref_commit(
+            snapshot_ref, manifest_commit=manifest_commit
+        )
+        if commit is None or commit != live_commit:
+            return None
+        ranges = pack.get("resolved_ranges")
+        budget = pack.get("budget")
+        if not _resolved_range_entries_valid(ranges) or not isinstance(
+            budget, Mapping
+        ):
+            return None
+        if not _context_byte_budget_valid(budget):
+            return None
+        context_bytes = budget["context_bytes_used"]
+        resolved_range_count = sum(
+            1
+            for item in ranges
+            if isinstance(item, Mapping) and item.get("status") == "resolved"
+        )
+        return commit, {
+            "sequence": sequence,
+            "tool": "ask_context",
+            "freshness_status": live_freshness.get("status"),
+            "resolved_range_count": resolved_range_count,
+            "context_bytes_used": context_bytes,
+            "grounding_status": None,
+        }
+    if tool_name == "live_freshness":
+        status = payload.get("status")
+        commit = _live_snapshot_commit(
+            payload,
+            manifest_paths=manifest_paths,
+            manifest_commit=manifest_commit,
+            manifest_repo_root=manifest_repo_root,
+        )
+        if commit is None:
+            return None
+        return commit, {
+            "sequence": sequence,
+            "tool": "live_freshness",
+            "freshness_status": status,
+            "resolved_range_count": None,
+            "context_bytes_used": None,
+            "grounding_status": None,
+        }
+    if tool_name == "grounding_verify":
+        if (
+            payload.get("kind") != "repobrief.mcp.read_only_frontdoor"
+            or payload.get("version") != "v1"
+            or payload.get("tool") != "grounding_verify"
+        ):
+            return None
+        verdict = payload.get("verdict")
+        live_freshness = payload.get("live_freshness")
+        live_commit = (
+            _live_snapshot_commit(
+                live_freshness,
+                manifest_paths=manifest_paths,
+                manifest_commit=manifest_commit,
+                manifest_repo_root=manifest_repo_root,
+            )
+            if isinstance(live_freshness, Mapping)
+            else None
+        )
+        if (
+            not isinstance(verdict, Mapping)
+            or verdict.get("kind") != "repobrief.answer_grounding_verdict"
+            or verdict.get("version") != "1.0"
+            or not isinstance(verdict.get("status"), str)
+            or verdict["status"] not in _REPOGROUND_GROUNDING
+            or payload.get("status") != verdict.get("status")
+            or not isinstance(live_freshness, Mapping)
+            or live_freshness.get("kind") != "repobrief.live_freshness"
+            or live_freshness.get("version") != "v1"
+            or not isinstance(live_freshness.get("status"), str)
+            or live_freshness["status"] not in _REPOGROUND_LIVE_FRESHNESS
+            or not isinstance(live_freshness.get("bundle_manifest"), str)
+            or live_freshness["bundle_manifest"] not in manifest_paths
+            or live_commit is None
+        ):
+            return None
+        snapshot_ref = verdict.get("snapshot_ref")
+        if (
+            not isinstance(snapshot_ref, Mapping)
+            or not _snapshot_ref_matches_manifest(
+                snapshot_ref,
+                manifest_paths=manifest_paths,
+                manifest_sha256=manifest_sha256,
+                require_sha=False,
+            )
+        ):
+            return None
+        commit = _snapshot_ref_commit(
+            snapshot_ref, manifest_commit=manifest_commit
+        )
+        if commit is None or commit != live_commit:
+            return None
+        grounding = verdict.get("status")
+        live_status = live_freshness.get("status")
+        raw_freshness = snapshot_ref.get("freshness_status")
+        if raw_freshness is not None and (
+            not isinstance(raw_freshness, str)
+            or raw_freshness not in _REPOGROUND_FRESHNESS
+            or raw_freshness != live_status
+        ):
+            return None
+        freshness_status = str(live_status)
+        return commit, {
+            "sequence": sequence,
+            "tool": "grounding_verify",
+            "freshness_status": freshness_status,
+            "resolved_range_count": None,
+            "context_bytes_used": None,
+            "grounding_status": grounding,
+        }
+    return None
+
+
+def _repoground_resource_read_payload(
+    *,
+    result: Mapping[str, Any],
+    expected_uri: str | None,
+) -> tuple[Mapping[str, Any], int] | None:
+    decoded = _decoded_resource_read_result(result)
+    if decoded is None:
+        return None
+    contents = decoded.get("contents")
+    meta = decoded.get("_meta")
+    if (
+        not isinstance(expected_uri, str)
+        or not expected_uri
+        or not isinstance(contents, list)
+        or len(contents) != 1
+        or not isinstance(contents[0], Mapping)
+        or contents[0].get("uri") != expected_uri
+        or not isinstance(meta, Mapping)
+    ):
+        return None
+    item = contents[0]
+    text_value = item.get("text")
+    mime_type = item.get("mimeType")
+    repoground = meta.get("repoground")
+    if (
+        not isinstance(text_value, str)
+        or not text_value
+        or not isinstance(mime_type, str)
+        or not mime_type
+        or not isinstance(repoground, Mapping)
+        or repoground.get("status") != "available"
+        or repoground.get("implicitRefresh") is not False
+        or not isinstance(repoground.get("snapshotContext"), Mapping)
+        or not isinstance(repoground.get("identity"), Mapping)
+    ):
+        return None
+    live_freshness = repoground.get("liveFreshness")
+    if not isinstance(live_freshness, Mapping):
+        return None
+    try:
+        content_bytes = len(text_value.encode("utf-8"))
+    except UnicodeEncodeError:
+        # Optional untrusted evidence must not abort the benchmark receipt.
+        return None
+    if content_bytes <= 0:
+        return None
+    return live_freshness, content_bytes
+
+
+def _repoground_resource_read_evidence(
+    *,
+    manifest_binding: tuple[str, str, str | None, frozenset[str]],
+    sequence: int,
+    live_freshness: Mapping[str, Any],
+    content_bytes: int,
+) -> tuple[str, dict[str, Any]] | None:
+    (
+        _manifest_sha256,
+        manifest_commit,
+        manifest_repo_root,
+        manifest_paths,
+    ) = manifest_binding
+    commit = _live_snapshot_commit(
+        live_freshness,
+        manifest_paths=manifest_paths,
+        manifest_commit=manifest_commit,
+        manifest_repo_root=manifest_repo_root,
+    )
+    if commit is None:
+        return None
+    return commit, {
+        "sequence": sequence,
+        "tool": "repobrief_resource_read",
+        "freshness_status": live_freshness.get("status"),
+        "resolved_range_count": None,
+        "context_bytes_used": content_bytes,
+        "grounding_status": None,
+    }
+
+
+def normalize_repoground_evidence(
+    request: Mapping[str, Any],
+    messages: Sequence[Mapping[str, Any]],
+    calls: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    if request.get("condition") != "treatment":
+        return None
+    uses, results = _tool_blocks(messages)
+    benchmark_uses = [
+        use for use in uses if use.get("name") != STRUCTURED_OUTPUT_TOOL
+    ]
+    evidence_calls: list[dict[str, Any]] = []
+    commits: set[str] = set()
+    manifest_binding: tuple[str, str, str | None, frozenset[str]] | None = None
+    for sequence, use in enumerate(benchmark_uses, start=1):
+        concrete = str(use.get("name", ""))
+        abstract = ABSTRACT_TOOL_MAP.get(concrete)
+        is_resource_read = concrete in {"ReadMcpResource", "ReadMcpResourceTool"}
+        if (
+            abstract not in {"ask_context", "grounding_verify", "live_freshness"}
+            and not is_resource_read
+        ):
+            continue
+        call = calls[sequence - 1] if sequence <= len(calls) else {}
+        if call.get("name") != abstract or call.get("status") != "success":
+            continue
+        result = results.get(str(use.get("id")))
+        if not isinstance(result, Mapping):
+            continue
+        if is_resource_read:
+            arguments = use.get("input")
+            expected_uri = (
+                arguments.get("uri") if isinstance(arguments, Mapping) else None
+            )
+            prepared_resource = _repoground_resource_read_payload(
+                result=result,
+                expected_uri=expected_uri,
+            )
+            if prepared_resource is None:
+                continue
+            if manifest_binding is None:
+                manifest_binding = _optional_repoground_manifest_binding(request)
+                if manifest_binding is None:
+                    return None
+            live_freshness, content_bytes = prepared_resource
+            try:
+                normalized = _repoground_resource_read_evidence(
+                    manifest_binding=manifest_binding,
+                    sequence=sequence,
+                    live_freshness=live_freshness,
+                    content_bytes=content_bytes,
+                )
+            except (RunnerError, TypeError, ValueError):
+                continue
+        else:
+            payload = _decoded_repoground_payload(result)
+            if payload is None:
+                continue
+            if manifest_binding is None:
+                manifest_binding = _optional_repoground_manifest_binding(request)
+                if manifest_binding is None:
+                    return None
+            if not _claude_payload_satisfies_contract(
+                tool_name=str(abstract),
+                payload=payload,
+                manifest_paths=manifest_binding[3],
+            ):
+                continue
+            try:
+                normalized = _repoground_evidence_from_payload(
+                    manifest_binding=manifest_binding,
+                    tool_name=str(abstract),
+                    sequence=sequence,
+                    payload=payload,
+                )
+            except (RunnerError, TypeError, ValueError):
+                continue
+        if normalized is None:
+            continue
+        commit, evidence_call = normalized
+        commits.add(commit)
+        evidence_calls.append(evidence_call)
+    if not evidence_calls:
+        return None
+    if len(commits) != 1:
+        return None
+    return {
+        "target_commit": str(_mapping(request.get("repository")).get("commit", "")),
+        "bundle_commit": next(iter(commits)),
+        "calls": evidence_calls,
+    }
+
+
 def validate_answer(value: Any) -> dict[str, Any]:
     answer = _mapping(value)
     required = set(ANSWER_SCHEMA["required"])
@@ -1288,6 +2431,7 @@ def build_receipt(
         raise RunnerError("provider did not produce a successful result")
     answer = validate_answer(result.get("structured_output"))
     calls = normalize_tool_calls(request, messages)
+    repoground_evidence = normalize_repoground_evidence(request, messages, calls)
     elapsed = max(int((ended_at - started_at).total_seconds() * 1000), 0)
     wall_limit = int(_mapping(request.get("budgets")).get("wall_seconds", 0)) * 1000
     if elapsed > wall_limit:
@@ -1311,6 +2455,11 @@ def build_receipt(
         "duration_ms": elapsed,
         "exit_code": returncode,
         "tool_calls": calls,
+        **(
+            {"repoground_evidence": repoground_evidence}
+            if repoground_evidence is not None
+            else {}
+        ),
         "answer": answer,
         "transcript": {
             "storage": "artifact",
