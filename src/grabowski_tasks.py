@@ -7400,9 +7400,9 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
     if _is_root_systemd_backend(record):
         # The rootbroker's nominally observational show operation creates a
         # reference file and invokes a privileged client.  READ_ONLY callers
-        # must not execute that effect or present persisted active as live truth.
+        # must not execute that effect or recast stored active as terminal.
         terminal = _is_terminal_state(str(record["state"]))
-        result["state"] = record["state"] if terminal else "outcome_unknown"
+        result["state"] = record["state"]
         result["last_observation"] = None
         result["observation_mode"] = "persisted_only_rootbroker_not_probed"
         result["observation_unavailable_reason"] = "privileged_broker_requires_mutation_gate"
@@ -9750,6 +9750,9 @@ def grabowski_task_status(task_id: str) -> dict[str, Any]:
 
 @_serialize_task_mutation
 def _task_status_after_mutation_guard(task_id: str) -> dict[str, Any]:
+    # Revalidate after the shared task lock: authority may change while waiting.
+    # No read, lease maintenance or state change may happen before this gate.
+    operator._require_operator_mutation("durable_job", task_id=task_id)
     record = _row(task_id)
     observation = _observe(record)
     effective_state = _effective_observed_state(record, observation["state"])
