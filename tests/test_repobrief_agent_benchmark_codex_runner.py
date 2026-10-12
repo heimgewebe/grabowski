@@ -535,6 +535,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         permitted_capabilities: int = 0,
         ambient_capabilities: int = 0,
         protected_hardlink: bool = False,
+        private_output_special: tuple[str, str] | None = None,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -573,6 +574,15 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             }
             for path in leaves.values():
                 path.mkdir(mode=0o700)
+            if private_output_special is not None:
+                leaf, kind = private_output_special
+                target = leaves[leaf] / "unsafe-special-entry"
+                if kind == "fifo":
+                    os.mkfifo(target, mode=0o600)
+                elif kind == "symlink":
+                    target.symlink_to("/dev/null")
+                else:
+                    raise AssertionError("unsupported special entry fixture")
             if protected_bind_origin_in_output:
                 backing = leaves[protected_bind_origin_in_output] / "frozen-source"
                 backing.mkdir()
@@ -998,6 +1008,13 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 runner.RunnerError, "execution identity is unsafe"
             ):
                 self._probe()
+
+    def test_private_output_special_entries_are_rejected(self) -> None:
+        for leaf in ("state", "transcripts", "evidence", "reports"):
+            for kind in ("fifo", "symlink"):
+                with self.subTest(leaf=leaf, kind=kind):
+                    with self.assertRaisesRegex(runner.RunnerError, "special file"):
+                        self._probe(private_output_special=(leaf, kind))
 
     def test_preexisting_protected_hardlink_in_private_output_is_rejected(self) -> None:
         with self.assertRaisesRegex(runner.RunnerError, "hardlinked regular file"):

@@ -948,12 +948,19 @@ def validate_live_immutable_mounts(
                             "live Codex private output scan entry budget exceeded"
                         )
                     metadata = entry.stat(follow_symlinks=False)
-                    if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1:
-                        raise RunnerError(
-                            "live Codex private output contains hardlinked regular file"
-                        )
-                    if stat.S_ISDIR(metadata.st_mode):
+                    if stat.S_ISREG(metadata.st_mode):
+                        if metadata.st_nlink != 1:
+                            raise RunnerError(
+                                "live Codex private output contains hardlinked regular file"
+                            )
+                    elif stat.S_ISDIR(metadata.st_mode):
                         pending.append((Path(entry.path), depth + 1))
+                    else:
+                        # A device, socket, FIFO or symlink in any writable
+                        # output may bypass the read-only mount protection.
+                        raise RunnerError(
+                            "live Codex private output contains special file"
+                        )
         except OSError as exc:
             raise RunnerError("live Codex private output scan unavailable") from exc
 
