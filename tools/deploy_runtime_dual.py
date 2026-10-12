@@ -5547,6 +5547,54 @@ def _root_bootstrap_helper_owned() -> bool:
     return True
 
 
+def _require_rootbroker_systemd_mainpid(
+    *, unit_name: str, parent_pid: int, control_group: str,
+) -> None:
+    """Bind the helper to root systemd's actual transient ExecMainPID.
+
+    A process inside an authentic system.slice cgroup may create a same-UID
+    descendant with plausible argv. Its parent is not systemd's MainPID.
+    The root system manager, not /proc cmdline or caller-controlled context,
+    authoritatively identifies the executable started for this exact unit.
+    """
+    properties = (
+        "Id", "LoadState", "ActiveState", "Transient", "Type",
+        "MainPID", "ControlGroup",
+    )
+    result = core.run(
+        [
+            "/usr/bin/systemctl", "--system", "show", unit_name,
+            "--no-pager", "--property=" + ",".join(properties),
+        ],
+        timeout=core.TIMEOUTS["systemd_query"], capture=True, check=False,
+        # Inherited DBUS_SYSTEM_BUS_ADDRESS or SYSTEMD_BUS_ADDRESS must never
+        # redirect this security boundary to an attacker-chosen system bus.
+        env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+    )
+    if (
+        result.returncode != 0
+        or not isinstance(result.stdout, str)
+        or len(result.stdout) > 4096
+    ):
+        core.fail("bootstrap recovery origin systemd readback is unavailable")
+    observed: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, marker, value = line.partition("=")
+        if (
+            marker != "=" or key not in properties or key in observed
+            or not value or "\r" in value
+        ):
+            core.fail("bootstrap recovery origin systemd response is invalid")
+        observed[key] = value
+    required = {
+        "Id": unit_name, "LoadState": "loaded", "ActiveState": "active",
+        "Transient": "yes", "Type": "exec",
+        "MainPID": str(parent_pid), "ControlGroup": control_group,
+    }
+    if observed != required:
+        core.fail("bootstrap recovery origin systemd MainPID/unit mismatch")
+
+
 def require_root_broker_bootstrap_origin(*, expected_head: str) -> None:
     """Reject arbitrary --bootstrap-recovery callers before a deployment effect.
 
@@ -5599,6 +5647,26 @@ def require_root_broker_bootstrap_origin(*, expected_head: str) -> None:
         )
     ):
         core.fail("bootstrap recovery origin parent argv does not bind exact target")
+    _require_rootbroker_systemd_mainpid(
+        unit_name=(
+            f"grabowski-runtime-bootstrap-{expected_head[:12]}-"
+            f"{unit.group(1)}.service"
+        ),
+        parent_pid=parent_pid,
+        control_group=(
+            f"/system.slice/grabowski-runtime-bootstrap-"
+            f"{expected_head[:12]}-{unit.group(1)}.service"
+        ),
+    )
+    # Recheck procfs after root-manager IPC, rejecting exited/reparented helpers.
+    if (
+        os.getppid() != parent_pid
+        or _bootstrap_recovery_cgroup().strip() != (
+            f"0::/system.slice/grabowski-runtime-bootstrap-"
+            f"{expected_head[:12]}-{unit.group(1)}.service"
+        )
+    ):
+        core.fail("bootstrap recovery origin changed after systemd readback")
 
 
 def preflight_bootstrap_recovery_url(
@@ -5646,7 +5714,13 @@ def deploy_url(
     ):
         core.fail("Direct deployment requires valid exact expected_head", phase="expected-head")
     if bootstrap_recovery:
+        # Unauthorized emergency entry must fail before even querying the lock.
         require_root_broker_bootstrap_origin(expected_head=expected_head)
+    core.require_canonical_deployment_lock_held()
+    if not bootstrap_recovery:
+        # Direct callable callers also need a live authoritative serving check.
+        require_locked_release_source_admission(expected_head=expected_head)
+    if bootstrap_recovery:
         (
             snapshot,
             runtime,
@@ -7144,6 +7218,10 @@ def prepare_production_blue_green_runtime(
     timeout_seconds: int,
     deployment_source_identity_sha256: str | None = None,
 ) -> ProductionBlueGreenRuntime:
+    # The green builder is callable outside run_production_blue_green_cutover.
+    # Preserve both the canonical flock and live source admission here.
+    core.require_canonical_deployment_lock_held()
+    require_locked_release_source_admission(expected_head=expected_head)
     snapshot, runtime, topology = preflight_url(
         repo,
         runtime,

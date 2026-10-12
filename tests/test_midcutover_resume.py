@@ -3024,6 +3024,10 @@ class DeploymentAdmissionAuthorityTests(unittest.TestCase):
             "client_declaration_sha256": None,
         }
         with (
+            # Run this Blue-continuity assertion after synthetic admission:
+            # neither this fixture nor its stubs authorize source changes.
+            mock.patch.object(dual.core, "require_canonical_deployment_lock_held"),
+            mock.patch.object(dual, "require_locked_release_source_admission"),
             mock.patch.object(
                 dual,
                 "preflight_url",

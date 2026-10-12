@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ast
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import fcntl
 import hashlib
@@ -32,6 +33,11 @@ TOOLING_PYYAML_VERSION = "6.0.3"
 DEFAULT_PROFILE_PATH = HOME / ".config/tunnel-client/grabowski.yaml"
 DEFAULT_STATE_ROOT = HOME / ".local/state/grabowski"
 DEFAULT_LOCK_FILE = DEFAULT_STATE_ROOT / "deploy.lock"
+# Tracks only kernel-acquired lock ownership in this execution context;
+# NEVER a substitute for root-issued Captain/R3 release authorization.
+_ACTIVE_DEPLOYMENT_LOCK: ContextVar[tuple[int, int, int, int, str] | None] = (
+    ContextVar("grabowski_deployment_lock", default=None)
+)
 RUNTIME_INPUT_RELATIVE = Path("requirements/runtime.in")
 RUNTIME_LOCK_RELATIVE = Path("requirements/runtime.lock.txt")
 ENTRYPOINT_CONTRACT_RELATIVE = Path("config/runtime-entrypoint.json")
@@ -1035,14 +1041,83 @@ def deployment_lock(
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, payload)
         os.fsync(fd)
+        token = _ACTIVE_DEPLOYMENT_LOCK.set(
+            (os.getpid(), fd, locked.st_dev, locked.st_ino, str(safe_lock))
+        )
         try:
             yield
         finally:
+            _ACTIVE_DEPLOYMENT_LOCK.reset(token)
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         if fd is not None:
             os.close(fd)
         os.close(dir_fd)
+
+
+def require_canonical_deployment_lock_held() -> None:
+    """Verify this execution context holds the real canonical flock FD.
+
+    This proves local serialization, not a protected source-changing release
+    grant. Ordinary callers may acquire the lock, but the independent
+    serving/Captain/R3 admission is still required at each effect boundary.
+    """
+    state = _ACTIVE_DEPLOYMENT_LOCK.get()
+    if (
+        state is None or len(state) != 5
+        or state[0] != os.getpid()
+        or state[4] != str(DEFAULT_LOCK_FILE)
+    ):
+        fail("release admission blocked: canonical deployment lock is not held")
+    _, fd, device, inode, _ = state
+    try:
+        held = os.fstat(fd)
+        linked = os.stat(DEFAULT_LOCK_FILE, follow_symlinks=False)
+    except OSError:
+        fail("release admission blocked: canonical deployment lock is unobservable")
+    if (
+        not statmod.S_ISREG(held.st_mode)
+        or not statmod.S_ISREG(linked.st_mode)
+        or held.st_dev != device
+        or held.st_ino != inode
+        or linked.st_dev != device
+        or linked.st_ino != inode
+        or held.st_uid != os.getuid()
+        or held.st_nlink != 1
+        or statmod.S_IMODE(held.st_mode) != 0o600
+    ):
+        fail("release admission blocked: canonical deployment lock identity drift")
+    # A user-supplied ContextVar tuple and a matching but unlocked FD are not
+    # ownership proof. Linux procfs binds these lock records to the live FD.
+    # Require the kernel to report our PID's exclusive FLOCK on this exact FD.
+    info_fd: int | None = None
+    try:
+        info_fd = os.open(
+            f"/proc/self/fdinfo/{fd}",
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        info = os.read(info_fd, 8193)
+    except OSError:
+        fail("release admission blocked: canonical deployment lock kernel readback unavailable")
+    finally:
+        if info_fd is not None:
+            os.close(info_fd)
+    if not info or len(info) > 8192:
+        fail("release admission blocked: canonical deployment lock kernel readback incomplete")
+    try:
+        info_lines = info.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        fail("release admission blocked: canonical deployment lock kernel readback malformed")
+    locks = [line for line in info_lines if line.startswith("lock:")]
+    if len(locks) != 1:
+        fail("release admission blocked: canonical deployment lock kernel FLOCK not proven")
+    observed = re.fullmatch(
+        r"lock:\s+[0-9]+:\s+FLOCK\s+ADVISORY\s+WRITE\s+([0-9]+)"
+        r"\s+[0-9A-Fa-f]+:[0-9A-Fa-f]+:[0-9]+\s+0\s+EOF",
+        locks[0],
+    )
+    if observed is None or int(observed.group(1)) != os.getpid():
+        fail("release admission blocked: canonical deployment lock kernel owner mismatch")
 
 
 def releases_root_for(runtime: Path) -> Path:
@@ -3178,6 +3253,14 @@ def deploy(
         or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None
     ):
         fail("Legacy deployment requires valid exact expected_head", phase="expected-head")
+    require_canonical_deployment_lock_held()
+    # The public callable is also an effect entrypoint; callers cannot grant
+    # a source-changing release merely by supplying a syntactically valid HEAD.
+    # The normal CLI independently holds the canonical lock; a protected
+    # positive Captain/R3 grant does not yet exist and must remain fail-closed.
+    import deploy_runtime_dual as dual
+
+    dual.require_locked_release_source_admission(expected_head=expected_head)
     snapshot = snapshot_from_git(repo)
     if snapshot.repo_head != expected_head:
         fail(
