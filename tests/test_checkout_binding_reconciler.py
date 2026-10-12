@@ -1222,6 +1222,84 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
                 "RuntimeError",
             )
 
+    def test_internal_single_snapshot_returns_complete_page_without_changing_public_api(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "checkouts.sqlite3"
+            create_checkout_db(database)
+            insert_binding(database, checkout_key="key-a", checkout_path="/tmp/a")
+            insert_binding(database, checkout_key="key-b", checkout_path="/tmp/b")
+            rows = [
+                worktree(checkout_key="key-a", path="/tmp/a"),
+                worktree(checkout_key="key-b", path="/tmp/b"),
+            ]
+            with mock.patch(
+                "grabowski_checkout_binding_reconciler.checkouts.observe_worktree_records",
+                return_value=observed_repo(*rows),
+            ):
+                complete = reconcile_checkout_bindings(
+                    db_path=database, limit=1, _single_complete_snapshot=True,
+                )
+                public_page = reconcile_checkout_bindings(db_path=database, limit=1)
+                with self.assertRaises(CheckoutBindingCursorError):
+                    reconcile_checkout_bindings(
+                        db_path=database, limit=1,
+                        cursor=public_page["pagination"]["next_cursor"],
+                        _single_complete_snapshot=True,
+                    )
+            self.assertEqual(complete["count"], 2)
+            self.assertEqual(complete["total_count"], 2)
+            self.assertEqual(complete["pagination"]["has_more"], False)
+            self.assertEqual(complete["pagination"]["next_cursor"], None)
+            self.assertTrue(complete["pagination"]["snapshot_bound"])
+            self.assertEqual(public_page["count"], 1)
+            self.assertTrue(public_page["pagination"]["has_more"])
+
+    def test_single_admission_snapshot_rejects_over_budget_without_partial_page(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "checkouts.sqlite3"
+            create_checkout_db(database)
+            insert_binding(database, checkout_key="key-a", checkout_path="/tmp/a")
+            over_budget = [
+                {"checkout_key": f"{index:064x}", "blocking": False}
+                for index in range(3201)
+            ]
+            projection = {
+                "bindings": over_budget,
+                "summary": {},
+                "blocking_count": 0,
+                "does_not_establish": [],
+            }
+            git = {
+                "worktrees": [],
+                "observable_repo_paths": [REPO],
+                "observations": [{"repo_path": REPO}],
+                "errors": [],
+                "errors_truncated": False,
+            }
+            with (
+                mock.patch(
+                    "grabowski_checkout_binding_reconciler.collect_git_worktrees_for_repos",
+                    return_value=git,
+                ),
+                mock.patch(
+                    "grabowski_checkout_binding_reconciler.reconcile_bindings",
+                    return_value=projection,
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    CheckoutBindingDatabaseError, "bounded capacity",
+                ):
+                    reconcile_checkout_bindings(
+                        db_path=database, limit=100,
+                        _single_complete_snapshot=True,
+                    )
+
+    def test_single_admission_mode_cannot_be_coerced_from_string(self) -> None:
+        with self.assertRaisesRegex(ValueError, "boolean"):
+            reconcile_checkout_bindings(
+                db_path=Path("/not-read"), _single_complete_snapshot="true",
+            )
+
     def test_pagination_cursor_is_bound_to_full_live_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "checkouts.sqlite3"

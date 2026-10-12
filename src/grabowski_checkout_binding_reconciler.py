@@ -40,6 +40,7 @@ RECONCILER_STATES = frozenset(
 MAX_EVIDENCE = 32
 MAX_PAGE_LIMIT = 100
 MAX_BINDINGS = 10_000
+MAX_SINGLE_ADMISSION_BINDINGS = 3_200
 MAX_REPOSITORY_ERRORS = 100
 LIFECYCLE_PHASES = checkouts.LIFECYCLE_PHASES
 AUTHORITY_BLOCKER_SOURCE_KINDS = frozenset({"automation", "work_lane"})
@@ -835,10 +836,19 @@ def reconcile_checkout_bindings(
         checkouts.DEFAULT_GIT_READ_TIMEOUT_SECONDS
     ),
     _database_snapshot: dict[str, Any] | None = None,
+    _single_complete_snapshot: bool = False,
 ) -> dict[str, Any]:
-    """Compare the pinned durable binding snapshot with current Git observations."""
+    """Compare one pinned database/Git snapshot with worktrees.
+
+    Internal admission callers may request a complete bounded snapshot.
+    Public callers still get cursor-based pages with identical semantics.
+    """
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_PAGE_LIMIT:
         raise ValueError(f"limit must be between 1 and {MAX_PAGE_LIMIT}")
+    if type(_single_complete_snapshot) is not bool:
+        raise ValueError("single snapshot mode must be boolean")
+    if _single_complete_snapshot and cursor is not None:
+        raise CheckoutBindingCursorError("complete snapshot does not accept a cursor")
     filters = _normalize_filters(repository_filters)
     database = (
         collect_lifecycle_bindings_from_db(db_path)
@@ -875,29 +885,42 @@ def reconcile_checkout_bindings(
     snapshot_sha256 = hashlib.sha256(
         consumer_surface.canonical_json_bytes(snapshot_material)
     ).hexdigest()
-    scope = f"checkout-binding-reconciliation:{snapshot_sha256}"
-    try:
-        position = consumer_surface.decode_cursor(
-            cursor,
-            scope,
-            snapshot_scope="checkout-binding-reconciliation",
-        )
-    except ValueError as exc:
-        raise CheckoutBindingCursorError(str(exc)) from exc
-    offset = 0 if position is None else position.get("offset")
-    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-        raise CheckoutBindingCursorError("cursor offset is invalid")
     all_bindings = full_projection["bindings"]
-    if offset > len(all_bindings):
-        raise CheckoutBindingCursorError("cursor offset exceeds reconciliation snapshot")
-    page_rows = all_bindings[offset : offset + limit]
-    next_offset = offset + len(page_rows)
-    has_more = next_offset < len(all_bindings)
-    next_cursor = (
-        consumer_surface.encode_cursor(scope, {"offset": next_offset})
-        if has_more
-        else None
-    )
+    if _single_complete_snapshot:
+        # Admission must inspect all relevant bindings from ONE consistent
+        # SQLite/Git snapshot. Never rely on a truncated subset or rescan WAL
+        # for each page. The bound is the existing 32 * 100-page admission cap.
+        if len(all_bindings) > MAX_SINGLE_ADMISSION_BINDINGS:
+            raise CheckoutBindingDatabaseError(
+                "complete admission reconciliation exceeds bounded capacity"
+            )
+        offset = 0
+        page_rows = all_bindings
+        has_more = False
+        next_cursor = None
+    else:
+        scope = f"checkout-binding-reconciliation:{snapshot_sha256}"
+        try:
+            position = consumer_surface.decode_cursor(
+                cursor,
+                scope,
+                snapshot_scope="checkout-binding-reconciliation",
+            )
+        except ValueError as exc:
+            raise CheckoutBindingCursorError(str(exc)) from exc
+        offset = 0 if position is None else position.get("offset")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise CheckoutBindingCursorError("cursor offset is invalid")
+        if offset > len(all_bindings):
+            raise CheckoutBindingCursorError("cursor offset exceeds reconciliation snapshot")
+        page_rows = all_bindings[offset : offset + limit]
+        next_offset = offset + len(page_rows)
+        has_more = next_offset < len(all_bindings)
+        next_cursor = (
+            consumer_surface.encode_cursor(scope, {"offset": next_offset})
+            if has_more
+            else None
+        )
     attention = [
         {
             "schema_version": RECONCILER_SCHEMA_VERSION,
