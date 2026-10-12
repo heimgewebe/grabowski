@@ -46,7 +46,7 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         with (
             patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
             patch.object(tasks, "_validate_command", return_value=argv),
-            patch.object(tasks, "_dispatch", return_value=fixture._launcher()),
+            patch.object(tasks, "_launch", return_value=fixture._launcher()),
             patch.object(
                 tasks, "_require_recovery_gate",
                 return_value={"checked_at_unix": 147},
@@ -854,6 +854,218 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                     count = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
                 self.assertEqual(count, 0)
 
+
+
+    def test_unknown_or_renamed_executable_must_run_below_os_write_boundary(self) -> None:
+        # Only build argv: never run a renamed executable, interpreter or agent.
+        # Read-only-by-default local tasks may not inherit the host filesystem.
+        for executable in ("/usr/bin/true", "/tmp/renamed-codex", "/tmp/opaque-script"):
+            with (
+                self.subTest(executable=executable),
+                patch.object(
+                    tasks, "_task_output_paths",
+                    return_value={"directory": self.root / "captured"},
+                ),
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(
+                    tasks, "_verified_task_effect_start",
+                    return_value={"effect_profile": "unknown", "agent_executable": None},
+                ),
+            ):
+                captured = tasks._task_output_capture_argv(
+                    {
+                        "task_id": "opaque-test",
+                        "argv_json": json.dumps([executable, "--data"]),
+                        "cwd": str(self.root),
+                        "host": "local",
+                    }
+                )
+                self.assertIn("/usr/bin/bwrap", captured)
+                self.assertIn("--ro-bind", captured)
+                self.assertIn(str(self.root), captured)
+
+    def test_nonagent_resume_identity_is_not_mutable_classification(self) -> None:
+        original = ["/bin/echo", "original"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=original),
+            patch.object(tasks, "_dispatch", return_value=fixture._launcher()),
+            patch.object(
+                tasks, "_require_recovery_gate",
+                return_value={"checked_at_unix": 151},
+            ),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            result = tasks.grabowski_task_start(
+                "local", original, cwd=str(self.root), runtime_seconds=60,
+                effect_profile="read_only",
+            )
+        task_id = str(result["task"]["task_id"])
+        injected = ["/bin/echo", "changed"]
+        with tasks._database_connection() as db:
+            db.execute(
+                "UPDATE tasks SET argv_json=?, argv_sha256=? WHERE task_id=?",
+                (
+                    tasks._canonical_json(injected),
+                    tasks.command_identity.argv_sha256(injected),
+                    task_id,
+                ),
+            )
+        with self.assertRaisesRegex(RuntimeError, "original|identity|effect"):
+            tasks._verified_task_effect_start(tasks._row_raw(task_id), command=injected)
+
+
+    def test_write_mount_requires_live_exact_owned_path_lease(self) -> None:
+        # A benign binary may write only where the lease grants a mount.
+        allowed = self.root / "build"
+        allowed.mkdir()
+        command = ["/usr/bin/true"]
+        record = {
+            "task_id": "bounded-write-test",
+            "host": "local",
+            "cwd": str(self.root),
+            "lease_owner_id": "task:bounded-write-test",
+            "argv_json": json.dumps(command),
+        }
+        lease = f"path:{allowed}"
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "workspace_write"},
+            ),
+            patch.object(tasks, "_record_resource_keys", return_value=[lease]),
+            patch.object(
+                tasks.resources, "inspect_resources",
+                return_value={lease: {"owner_id": "task:bounded-write-test"}},
+            ),
+        ):
+            sandbox = tasks._task_sandboxed_command_argv(record, command)
+        position = sandbox.index("--bind")
+        self.assertEqual(sandbox[position + 1: position + 3], [str(allowed)] * 2)
+        self.assertIn("--ro-bind", sandbox)
+        self.assertNotIn("--bind", sandbox[position + 3:])
+
+        for live_owner in (None, "foreign:task"):
+            with (
+                self.subTest(owner=live_owner),
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(
+                    tasks, "_verified_task_effect_start",
+                    return_value={"effect_profile": "workspace_write"},
+                ),
+                patch.object(tasks, "_record_resource_keys", return_value=[lease]),
+                patch.object(
+                    tasks.resources, "inspect_resources",
+                    return_value={lease: {"owner_id": live_owner}},
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "foreign path leases"):
+                    tasks._task_sandboxed_command_argv(record, command)
+
+    def test_actual_readonly_bwrap_denies_write_open_without_modifying_contents(self) -> None:
+        # Controlled kernel exercise. The test never writes through the opened FD.
+        import errno
+        import subprocess
+        from pathlib import Path
+
+        sandbox = tasks.agent_sandbox
+        try:
+            sandbox.require_bwrap()
+        except sandbox.AgentSandboxError:
+            self.skipTest("bubblewrap not installed on this test host")
+        target = Path(self.root) / "readonly-probe.txt"
+        target.write_text("unchanged", encoding="utf-8")
+        code = (
+            "import errno,os,sys\n"
+            "try:\n"
+            " fd=os.open(sys.argv[1],os.O_WRONLY);os.close(fd);sys.exit(27)\n"
+            "except OSError as exc:\n"
+            " print(exc.errno);sys.exit(0 if exc.errno==errno.EROFS else 26)\n"
+        )
+        argv = sandbox.runtime_sandbox_argv(
+            sandbox.minimal_sandbox_argv(
+                workspace=Path(self.root),
+                command=["/usr/bin/python3", "-c", code, str(target)],
+                workspace_writable=False,
+            )
+        )
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=20, check=False,
+        )
+        if completed.returncode != 0 and "No permissions to create" in completed.stderr:
+            self.skipTest("kernel does not permit namespaces in this runner")
+        self.assertEqual(
+            completed.returncode, 0,
+            f"missing EROFS: rc={completed.returncode} stdout={completed.stdout} stderr={completed.stderr}",
+        )
+        self.assertEqual(completed.stdout.strip(), str(errno.EROFS))
+        self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
+
+
+    def test_local_runtime_executable_gets_exact_read_only_venv_mount(self) -> None:
+        venv_root = self.root / "private-runtime"
+        runtime = venv_root / "bin" / "python"
+        runtime.parent.mkdir(parents=True)
+        runtime.write_text("test interpreter placeholder", encoding="utf-8")
+        command = [str(runtime), "-I", "-c", "pass"]
+        record = {"task_id": "venv-check", "host": "local", "cwd": str(self.root)}
+        with (
+            patch.object(tasks, "GRABOWSKI_RUNTIME_PYTHON", runtime),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            sandbox = tasks._task_sandboxed_command_argv(record, command)
+        mounts = [sandbox[i:i + 3] for i in range(len(sandbox) - 2)]
+        self.assertIn(["--ro-bind", str(venv_root), str(venv_root)], mounts)
+        self.assertNotIn(["--bind", str(venv_root), str(venv_root)], mounts)
+        self.assertIn("--clearenv", sandbox)
+
+    def test_linked_git_common_dir_requires_two_way_bounded_backlinks(self) -> None:
+        home = self.root / "test-home"
+        common = home / "repos" / "owned" / ".git"
+        gitdir = common / "worktrees" / "fixture"
+        gitdir.mkdir(parents=True)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        marker = workspace / ".git"
+        marker.write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+        (gitdir / "gitdir").write_text(f"{marker}\n", encoding="utf-8")
+        (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+        command = ["/usr/bin/true"]
+        record = {"task_id": "linked-check", "host": "local", "cwd": str(workspace)}
+        with (
+            patch.object(tasks.operator, "HOME", home),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "read_only"},
+            ),
+        ):
+            self.assertEqual(tasks._task_linked_git_common_dir(workspace), common)
+            argv = tasks._task_sandboxed_command_argv(record, command)
+            mounts = [argv[i:i + 3] for i in range(len(argv) - 2)]
+            self.assertIn(["--ro-bind", str(common), str(common)], mounts)
+            self.assertNotIn(["--bind", str(common), str(common)], mounts)
+            (gitdir / "gitdir").write_text(
+                str(self.root / "foreign" / ".git") + "\n", encoding="utf-8",
+            )
+            self.assertIsNone(tasks._task_linked_git_common_dir(workspace))
+            rejected = tasks._task_sandboxed_command_argv(record, command)
+            denied_mounts = [rejected[i:i + 3] for i in range(len(rejected) - 2)]
+            self.assertNotIn(["--ro-bind", str(common), str(common)], denied_mounts)
+            (gitdir / "gitdir").write_text(f"{marker}\n", encoding="utf-8")
+            honest_marker = workspace / "real-git-marker"
+            honest_marker.write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+            marker.unlink()
+            marker.symlink_to(honest_marker)
+            self.assertIsNone(tasks._task_linked_git_common_dir(workspace))
+            marker.unlink()
+            marker.write_text("gitdir: " + "x" * 4097, encoding="utf-8")
+            self.assertIsNone(tasks._task_linked_git_common_dir(workspace))
 
 
 if __name__ == "__main__":

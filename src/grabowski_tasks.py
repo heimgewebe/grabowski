@@ -31,6 +31,7 @@ import grabowski_resources as resources
 import grabowski_nonconflict as nonconflict
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
+import grabowski_agent_sandbox as agent_sandbox
 import grabowski_bureau_runtime_refresh_executor as bureau_runtime_refresh_executor
 import grabowski_lifecycle_projection as lifecycle_projection
 import grabowski_sqlite_store as sqlite_store
@@ -4794,7 +4795,8 @@ def _store_task_effect_start(
 
 
 def _verified_task_effect_start(
-    record: dict[str, Any], *, command: list[str] | None = None
+    record: dict[str, Any], *, command: list[str] | None = None,
+    enforce_transport_at_execution: bool = False,
 ) -> dict[str, Any] | None:
     """Fail closed for coding agents if their create-only start decision drifts."""
     if command is None:
@@ -4848,10 +4850,22 @@ def _verified_task_effect_start(
         or not isinstance(original["classification"], dict)
     ):
         raise RuntimeError("unverified agent effect: original start decision is invalid")
-    # An anchored task with no agent at either boundary keeps its original
-    # non-agent resume contract. Agent origins still require strict comparison.
+    # All persisted commands must retain their create-only command/effect/
+    # transport identity; a renamed agent may look like a non-agent.
     if original["agent_executable"] is None and not agent_known:
-        return launcher_classification
+        if (
+            command_identity.argv_sha256(command) != original["argv_sha256"]
+            or str(record["argv_sha256"]) != original["argv_sha256"]
+        ):
+            raise RuntimeError("persisted nonagent identity disagrees with original argv")
+        if (
+            enforce_transport_at_execution
+            and original["transport"] != fleet.fleet_host(str(record["host"]))["transport"]
+        ):
+            raise RuntimeError("original nonagent effect transport no longer matches host")
+        if launcher_classification != original["classification"]:
+            raise RuntimeError("persisted nonagent effect profile disagrees with original start decision")
+        return dict(original["classification"])
     if (
         command_identity.argv_sha256(command) != original["argv_sha256"]
         or str(record["argv_sha256"]) != original["argv_sha256"]
@@ -6998,8 +7012,147 @@ def _stage_task_output_capture_script(host: str, *, transport: str) -> dict[str,
     }
 
 
+def _task_small_owned_git_file(path: Path) -> str:
+    """Read one exact regular Git metadata file through a bounded O_NOFOLLOW fd."""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("Git backlink nofollow support is unavailable")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or not 1 <= metadata.st_size <= 4096
+        ):
+            raise ValueError("Git backlink is not a bounded owned regular file")
+        value = os.read(fd, 4097)
+        if len(value) != metadata.st_size:
+            raise ValueError("Git backlink changed during read")
+        return value.decode("utf-8").strip()
+    finally:
+        os.close(fd)
+
+
+def _task_linked_git_common_dir(workspace: Path) -> Path | None:
+    """Read an exact linked-checkout backlink, not a caller-provided Git path.
+
+    The .git file and its external gitdir must agree in both directions before
+    a directory outside the read-only workspace becomes visible to the child.
+    Invalid or unversioned workspaces receive no external Git bind.
+    """
+    marker = workspace / ".git"
+    try:
+        reference = _task_small_owned_git_file(marker)
+        if not reference.startswith("gitdir: "):
+            return None
+        gitdir_path = Path(reference.removeprefix("gitdir: "))
+        if not gitdir_path.is_absolute() or gitdir_path.is_symlink():
+            return None
+        gitdir = gitdir_path.resolve(strict=True)
+        if gitdir.parent.name != "worktrees" or gitdir.parent.parent.name != ".git":
+            return None
+        common = gitdir.parent.parent
+        if common.is_symlink() or not common.is_dir():
+            return None
+        if not common.is_relative_to((operator.HOME / "repos").resolve(strict=True)):
+            return None
+        marker_backlink = Path(_task_small_owned_git_file(gitdir / "gitdir"))
+        common_backlink = _task_small_owned_git_file(gitdir / "commondir")
+        if (
+            marker_backlink.resolve(strict=True) != marker.resolve(strict=True)
+            or (gitdir / common_backlink).resolve(strict=True) != common
+        ):
+            return None
+        return common
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def _task_sandboxed_command_argv(
+    record: dict[str, Any], command: list[str]
+) -> list[str]:
+    """Confine the untrusted child, not the trusted host-side output capture.
+
+    A process name and caller-declared effect are not confinement evidence.
+    This function is called for every local user-service attempt, including
+    re-launches, after verifying the immutable create-only start decision.
+    """
+    classification = _verified_task_effect_start(
+        record, command=command, enforce_transport_at_execution=True
+    )
+    if classification is None:
+        raise RuntimeError("task execution has no verified effect classification")
+    effect = classification["effect_profile"]
+    transport = fleet.fleet_host(str(record["host"]))["transport"]
+    if transport != "local":
+        if effect in {"read_only", "workspace_write", "repository_write"}:
+            raise RuntimeError("remote task has no verified filesystem sandbox")
+        # Non-local tasks retain a distinct non-isolated authority contract.
+        return command
+
+    if bureau_runtime_refresh_executor.is_executor_module_command(command):
+        # The reserved executor has its own server-verified intent and resource
+        # binding, not a user-selectable generic command exemption.
+        if effect not in {"unknown", "host_write"}:
+            raise RuntimeError("reserved executor has conflicting effect profile")
+        return command
+    if effect not in {"read_only", "unknown", "workspace_write", "repository_write"}:
+        raise RuntimeError("local task effect requires a verified sandbox route")
+
+    workspace = Path(str(record["cwd"]))
+    writable_paths: list[Path] = []
+    if effect in {"workspace_write", "repository_write"}:
+        resource_keys = _record_resource_keys(record)
+        write_keys: list[str] = []
+        for key in resource_keys:
+            if not key.startswith("path:"):
+                continue
+            allowed = Path(key.removeprefix("path:"))
+            if allowed != workspace and allowed.is_relative_to(workspace):
+                write_keys.append(key)
+                writable_paths.append(allowed)
+        if not write_keys:
+            raise RuntimeError("workspace writer requires bounded path leases")
+        owner = str(record.get("lease_owner_id") or _lease_owner(record["task_id"]))
+        active = resources.inspect_resources(write_keys)
+        if any(active.get(key, {}).get("owner_id") != owner for key in write_keys):
+            raise RuntimeError("workspace writer has missing or foreign path leases")
+
+    # Read-only dependencies are strictly selected by the server's own runtime
+    # binary or an exact two-way linked-checkout backlink. Neither binding
+    # grants a new writable mount, regardless of a caller-declared effect.
+    read_only: list[tuple[Path, Path]] = []
+    external_directories: set[Path] = set()
+    if command[0] == str(GRABOWSKI_RUNTIME_PYTHON):
+        runtime_root = GRABOWSKI_RUNTIME_PYTHON.parent.parent
+        read_only.append((runtime_root, runtime_root))
+        external_directories.update(
+            parent for parent in runtime_root.parents if parent != Path("/")
+        )
+    git_common_dir = _task_linked_git_common_dir(workspace)
+    if git_common_dir is not None:
+        external_directories.update(
+            parent for parent in git_common_dir.parents if parent != Path("/")
+        )
+
+    # No host bind is writable by default. A recognized executable, copied
+    # binary, interpreter script or unknown carrier receives the same mount
+    # restrictions. bwrap must execute successfully; no naked-command fallback.
+    return agent_sandbox.minimal_sandbox_argv(
+        workspace=workspace,
+        command=command,
+        workspace_writable=bool(writable_paths),
+        writable_paths=writable_paths,
+        git_common_dir=git_common_dir,
+        extra_read_only=read_only,
+        extra_directories=sorted(external_directories, key=str),
+    )
+
+
 def _task_output_capture_argv(record: dict[str, Any]) -> list[str]:
     command = json.loads(record["argv_json"])
+    command = _task_sandboxed_command_argv(record, command)
     paths = _task_output_paths(record)
     return [
         TASK_OUTPUT_CAPTURE_PYTHON,
@@ -7665,14 +7818,27 @@ def _launch(record: dict[str, Any]) -> dict[str, Any]:
             "launch_not_dispatched": True,
             "privileged_broker": None,
         }
-    return _dispatch(
-        record["host"],
-        _launch_argv(
+    try:
+        launch_argv = _launch_argv(
             record,
             include_managed_runtime=target["transport"] == "local",
-        ),
-        timeout_seconds=60,
-    )
+        )
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        # A failed sandbox/lease/identity preflight is an undispatched attempt,
+        # never a request to retry the original command without isolation.
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": _redact_reason(f"{type(exc).__name__}: {exc}"),
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "root_truth_observable": False,
+            "outcome_unknown": False,
+            "launch_not_dispatched": True,
+            "privileged_broker": None,
+        }
+    return _dispatch(record["host"], launch_argv, timeout_seconds=60)
 
 
 def _launch_state(result: dict[str, Any]) -> str:
