@@ -40,6 +40,7 @@ RECONCILER_STATES = frozenset(
 MAX_EVIDENCE = 32
 MAX_PAGE_LIMIT = 100
 MAX_BINDINGS = 10_000
+MAX_SINGLE_ADMISSION_BINDINGS = 3_200
 MAX_REPOSITORY_ERRORS = 100
 LIFECYCLE_PHASES = checkouts.LIFECYCLE_PHASES
 AUTHORITY_BLOCKER_SOURCE_KINDS = frozenset({"automation", "work_lane"})
@@ -607,20 +608,36 @@ def _binding_public(row: sqlite3.Row) -> dict[str, Any]:
 
 def collect_lifecycle_bindings_from_db(
     db_path: Path | str | None = None,
+    *,
+    _native_wal_snapshot: bool = False,
+    _wal_transition_retry_available: bool = True,
 ) -> dict[str, Any]:
     """Read every durable lifecycle binding from one pinned read-only transaction."""
     path = _database_path(db_path)
+    if type(_native_wal_snapshot) is not bool:
+        raise ValueError("native WAL snapshot mode must be boolean")
+    if type(_wal_transition_retry_available) is not bool:
+        raise ValueError("WAL transition retry flag must be boolean")
+    wal_path = Path(str(path) + "-wal")
+    native = _native_wal_snapshot and (wal_path.exists() or wal_path.is_symlink())
+    inventory = (
+        sqlite_store.inventory_native_wal_readonly_sqlite
+        if native else sqlite_store.inventory_readonly_sqlite
+    )
+    changed_message = "checkout database changed during reconciliation snapshot"
+    read_options: dict[str, Any] = {
+        "error_type": CheckoutBindingDatabaseError,
+        "message": changed_message,
+    }
+    if not native:
+        read_options["temporary_prefix"] = "grabowski-checkout-binding-snapshot."
+        read_options["allow_wal_copy"] = False
+    # Only a fully validated snapshot rejected on context-manager exit may
+    # be retried after a real no-WAL-to-WAL transition.  A malformed schema
+    # or partial read is never upgraded into a fresh positive admission.
+    snapshot_complete = False
     try:
-        with sqlite_store.inventory_readonly_sqlite(
-            path,
-            temporary_prefix="grabowski-checkout-binding-snapshot.",
-            error_type=CheckoutBindingDatabaseError,
-            message="checkout database changed during reconciliation snapshot",
-            # The default schema inventory copies live WAL into a temporary
-            # directory. Checkout reconciliation is published READ_ONLY and
-            # must fail closed rather than create files or update SQLite SHM.
-            allow_wal_copy=False,
-        ) as connection:
+        with inventory(path, **read_options) as connection:
             _validate_database(connection)
             try:
                 binding_rows = connection.execute(
@@ -693,6 +710,7 @@ def collect_lifecycle_bindings_from_db(
             snapshot_sha256 = hashlib.sha256(
                 consumer_surface.canonical_json_bytes(snapshot_material)
             ).hexdigest()
+            snapshot_complete = True
             return {
                 "database_path": str(path),
                 "database_schema_version": CHECKOUT_DATABASE_SCHEMA_VERSION,
@@ -700,9 +718,35 @@ def collect_lifecycle_bindings_from_db(
                 "bindings": bindings,
                 "retentions": retention_inventory,
                 "read_only": True,
-                "snapshot_mode": "immutable-file",
+                "snapshot_mode": "native-ro-wal" if native else "immutable-file",
             }
-    except CheckoutBindingDatabaseError:
+    except CheckoutBindingDatabaseError as exc:
+        # A legitimate writer may open WAL after the first no-WAL probe.
+        # Discard the stale immutable view and read one fresh native SQLite
+        # transaction.  No recursive retry after a second drift or when the
+        # source never completed schema/data validation.  Sidecar safety checks
+        # run again in the native reader and still deny invalid paths.
+        if (
+            _native_wal_snapshot
+            and _wal_transition_retry_available
+            and not native
+            and snapshot_complete
+            and str(exc) == changed_message
+            and (wal_path.exists() or wal_path.is_symlink())
+        ):
+            return collect_lifecycle_bindings_from_db(
+                path,
+                _native_wal_snapshot=True,
+                _wal_transition_retry_available=False,
+            )
+        if (
+            not snapshot_complete
+            and str(exc) == changed_message
+            and isinstance(exc.__context__, CheckoutBindingDatabaseError)
+        ):
+            # The immutable reader's exit identity check must not mask a
+            # genuine inner schema/semantic failure.
+            raise exc.__context__ from exc
         raise
     except (OSError, sqlite3.Error) as exc:
         raise CheckoutBindingDatabaseError(
@@ -835,16 +879,26 @@ def reconcile_checkout_bindings(
         checkouts.DEFAULT_GIT_READ_TIMEOUT_SECONDS
     ),
     _database_snapshot: dict[str, Any] | None = None,
+    _single_complete_snapshot: bool = False,
 ) -> dict[str, Any]:
-    """Compare the pinned durable binding snapshot with current Git observations."""
+    """Compare one pinned database/Git snapshot with worktrees.
+
+    Internal admission callers may request a complete bounded snapshot.
+    Public callers still get cursor-based pages with identical semantics.
+    """
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_PAGE_LIMIT:
         raise ValueError(f"limit must be between 1 and {MAX_PAGE_LIMIT}")
+    if type(_single_complete_snapshot) is not bool:
+        raise ValueError("single snapshot mode must be boolean")
+    if _single_complete_snapshot and cursor is not None:
+        raise CheckoutBindingCursorError("complete snapshot does not accept a cursor")
     filters = _normalize_filters(repository_filters)
-    database = (
-        collect_lifecycle_bindings_from_db(db_path)
-        if _database_snapshot is None
-        else _validated_database_snapshot(_database_snapshot)
-    )
+    if _database_snapshot is not None:
+        database = _validated_database_snapshot(_database_snapshot)
+    else:
+        database = collect_lifecycle_bindings_from_db(
+            db_path, _native_wal_snapshot=_single_complete_snapshot,
+        )
     bindings = list(database["bindings"])
     if filters is not None:
         allowed = set(filters)
@@ -875,29 +929,42 @@ def reconcile_checkout_bindings(
     snapshot_sha256 = hashlib.sha256(
         consumer_surface.canonical_json_bytes(snapshot_material)
     ).hexdigest()
-    scope = f"checkout-binding-reconciliation:{snapshot_sha256}"
-    try:
-        position = consumer_surface.decode_cursor(
-            cursor,
-            scope,
-            snapshot_scope="checkout-binding-reconciliation",
-        )
-    except ValueError as exc:
-        raise CheckoutBindingCursorError(str(exc)) from exc
-    offset = 0 if position is None else position.get("offset")
-    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-        raise CheckoutBindingCursorError("cursor offset is invalid")
     all_bindings = full_projection["bindings"]
-    if offset > len(all_bindings):
-        raise CheckoutBindingCursorError("cursor offset exceeds reconciliation snapshot")
-    page_rows = all_bindings[offset : offset + limit]
-    next_offset = offset + len(page_rows)
-    has_more = next_offset < len(all_bindings)
-    next_cursor = (
-        consumer_surface.encode_cursor(scope, {"offset": next_offset})
-        if has_more
-        else None
-    )
+    if _single_complete_snapshot:
+        # Admission must inspect all relevant bindings from ONE consistent
+        # SQLite/Git snapshot. Never rely on a truncated subset or rescan WAL
+        # for each page. The bound is the existing 32 * 100-page admission cap.
+        if len(all_bindings) > MAX_SINGLE_ADMISSION_BINDINGS:
+            raise CheckoutBindingDatabaseError(
+                "complete admission reconciliation exceeds bounded capacity"
+            )
+        offset = 0
+        page_rows = all_bindings
+        has_more = False
+        next_cursor = None
+    else:
+        scope = f"checkout-binding-reconciliation:{snapshot_sha256}"
+        try:
+            position = consumer_surface.decode_cursor(
+                cursor,
+                scope,
+                snapshot_scope="checkout-binding-reconciliation",
+            )
+        except ValueError as exc:
+            raise CheckoutBindingCursorError(str(exc)) from exc
+        offset = 0 if position is None else position.get("offset")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise CheckoutBindingCursorError("cursor offset is invalid")
+        if offset > len(all_bindings):
+            raise CheckoutBindingCursorError("cursor offset exceeds reconciliation snapshot")
+        page_rows = all_bindings[offset : offset + limit]
+        next_offset = offset + len(page_rows)
+        has_more = next_offset < len(all_bindings)
+        next_cursor = (
+            consumer_surface.encode_cursor(scope, {"offset": next_offset})
+            if has_more
+            else None
+        )
     attention = [
         {
             "schema_version": RECONCILER_SCHEMA_VERSION,
