@@ -24,7 +24,7 @@ import deploy_runtime as deploy_core
 import deploy_runtime_dual as deploy_dual
 import grabowski_midcutover_resume as midcutover
 
-OBJECT_ID_RE = re.compile(r"[0-9a-f]{40,64}")
+OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 SOURCE_KINDS = frozenset({"canonical-main", "detached-worktree"})
 MAX_CAPTURE_BYTES = 65_536
 MAX_MANIFEST_BYTES = 2_000_000

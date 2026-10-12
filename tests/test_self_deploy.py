@@ -88,6 +88,27 @@ SELF_DEPLOY._fresh_public_github_main = Mock(
     side_effect=lambda expected_head: expected_head
 )
 
+class SelfDeployGitObjectIdWidthTests(unittest.TestCase):
+    def test_self_deploy_api_and_runtime_use_only_exact_git_oid_widths(self):
+        # ExpectedHead is a Pydantic annotation: its schema regex must also
+        # anchor the whole object ID, not accept an arbitrary 40-hex prefix.
+        pattern = get_args(SELF_DEPLOY.ExpectedHead)[1]["pattern"]
+        self.assertEqual(pattern, SELF_DEPLOY.OBJECT_ID_RE.pattern)
+        self.assertTrue(pattern.startswith("^"))
+        self.assertTrue(pattern.endswith("$"))
+        for valid_length in (40, 64):
+            with self.subTest(valid=valid_length):
+                self.assertIsNotNone(
+                    SELF_DEPLOY.OBJECT_ID_RE.fullmatch("a" * valid_length)
+                )
+        for invalid_length in (0, 1, 39, 41, 52, 63, 65):
+            with self.subTest(invalid=invalid_length):
+                self.assertIsNone(
+                    SELF_DEPLOY.OBJECT_ID_RE.fullmatch("a" * invalid_length)
+                )
+        self.assertIsNone(SELF_DEPLOY.OBJECT_ID_RE.fullmatch("A" * 40))
+
+
 def _source_identity(repo: Path, head: str, *, kind: str = "canonical-main", canonical: Path | None = None) -> dict[str, object]:
     canonical_repo = canonical or repo
     material = {
@@ -337,6 +358,14 @@ def _unpersisted_outcome_unknown_blue_green_result(
 
 class SelfDeployToolTests(unittest.TestCase):
     def setUp(self) -> None:
+        # Lazy production imports must resolve the src/ contract module, not
+        # the equally named tools/ command-line wrapper, regardless of which
+        # other test modules inserted tools/ into sys.path before execution.
+        source_path = patch.object(
+            sys, "path", [str(SRC), *(p for p in sys.path if p != str(SRC))]
+        )
+        source_path.start()
+        self.addCleanup(source_path.stop)
         # These legacy tests exercise scheduler effects under synthetic task
         # identities; adversarial release-admission cases are in
         # test_grips_runtime_deploy.py and intentionally use the real check.
@@ -1149,12 +1178,19 @@ class SelfDeployToolTests(unittest.TestCase):
         repository = Path("/tmp/grabowski-auto-deploy-source")
         expected = _result("")
         SELF_DEPLOY.operator._require_operator_mutation.reset_mock()
-        with patch.object(
-            SELF_DEPLOY.operator,
-            "_run",
-            return_value=expected,
-            create=True,
-        ) as run:
+        # This test asserts the operator mutation gate and the request for
+        # checkout serialization, not a live task/broker initialization.
+        # Avoid resolving the unrelated tools/ vs src/ wrapper import here.
+        checkouts = types.ModuleType("grabowski_checkouts")
+        checkout_lock = Mock(return_value=nullcontext())
+        checkouts._operation_lock = checkout_lock
+        with (
+            patch.dict(sys.modules, {"grabowski_checkouts": checkouts}),
+            patch.object(
+                SELF_DEPLOY.operator, "_run",
+                return_value=expected, create=True,
+            ) as run,
+        ):
             observed = SELF_DEPLOY._mutating_git_result(
                 repository,
                 "worktree",
@@ -1164,6 +1200,7 @@ class SelfDeployToolTests(unittest.TestCase):
                 "a" * 40,
             )
         self.assertEqual(observed, expected)
+        checkout_lock.assert_called_once_with()
         SELF_DEPLOY.operator._require_operator_mutation.assert_called_once_with(
             "git_cli",
             path=str(repository),

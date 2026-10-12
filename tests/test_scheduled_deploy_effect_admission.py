@@ -41,6 +41,18 @@ def active(head: str = SERVING, release: str = "release-blue") -> dict:
     return {**material, "readback_sha256": worker.canonical_json_sha256(material)}
 
 
+class ScheduledGitObjectIdLengthTests(unittest.TestCase):
+    def test_object_ids_are_exact_sha1_or_sha256_widths(self):
+        # A 41–63-character hex value is neither a SHA-1 nor a SHA-256 OID.
+        for valid_length in (40, 64):
+            with self.subTest(valid=valid_length):
+                self.assertIsNotNone(worker.OBJECT_ID_RE.fullmatch("a" * valid_length))
+        for invalid_length in (0, 1, 39, 41, 52, 63, 65):
+            with self.subTest(invalid=invalid_length):
+                self.assertIsNone(worker.OBJECT_ID_RE.fullmatch("a" * invalid_length))
+        self.assertIsNone(worker.OBJECT_ID_RE.fullmatch("A" * 40))
+
+
 class DelayedRuntimeEffectAdmissionTests(unittest.TestCase):
     def test_unchanged_serving_source_requires_authoritative_readback(self):
         with patch.object(worker.deploy_dual, "observe_authoritative_routing", return_value=active()):

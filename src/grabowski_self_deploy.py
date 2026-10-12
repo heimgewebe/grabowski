@@ -46,7 +46,7 @@ DEPLOY_MUTATING = ToolAnnotations(
     openWorldHint=True,
 )
 
-OBJECT_ID_RE = re.compile(r"[0-9a-f]{40,64}")
+OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 ExpectedHead = Annotated[
     str,
     Field(
