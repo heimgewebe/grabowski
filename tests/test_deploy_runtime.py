@@ -27,6 +27,14 @@ TEST_AGENT_INSTRUCTIONS = (
 
 
 def load_module():
+    # Test discovery may already have imported deploy_runtime_dual, which keeps
+    # the first deploy_runtime module as core. Never replace that live identity:
+    # mocks and DeployError class checks must target the same module object.
+    existing = sys.modules.get("deploy_runtime")
+    if existing is not None:
+        if Path(getattr(existing, "__file__", "")).resolve() != MODULE_PATH.resolve():
+            raise RuntimeError("deploy_runtime is already bound to an unexpected file")
+        return existing
     spec = importlib.util.spec_from_file_location("deploy_runtime", MODULE_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError("deploy_runtime.py could not be loaded")
@@ -49,6 +57,16 @@ def _build_result(*args, **kwargs):
         TEST_AGENT_INSTRUCTIONS_IDENTITY,
     )
     return deploy_runtime.BuildResult(*args, **kwargs)
+
+
+class DeployRuntimeImportIdentityTests(unittest.TestCase):
+    def test_import_reuses_canonical_deployment_core_module(self) -> None:
+        # A replacement sys.modules entry leaves the already-imported dual
+        # module pointing to an obsolete class and bypasses test mocks.
+        self.assertIs(load_module(), deploy_runtime)
+        self.assertIs(sys.modules["deploy_runtime"], deploy_runtime)
+        self.assertIs(dual.core, deploy_runtime)
+        self.assertIs(dual.core.DeployError, deploy_runtime.DeployError)
 
 
 class DeployRuntimeTests(unittest.TestCase):
