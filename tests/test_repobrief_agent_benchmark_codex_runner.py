@@ -519,6 +519,10 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         output_alias_parent: bool = False,
         outside_protected_alias_rw: bool = False,
         outside_root_alias_rw: bool = False,
+        outside_same_device_hardlink: bool = False,
+        unrelated_tmpfs_rw: bool = False,
+        root_mount_rw: bool = False,
+        output_below_protected_backing: bool = False,
         output_epoch_in_source: bool = False,
         protected_bind_origin_in_output: str | None = None,
         protected_bind_origin_outside_output: bool = False,
@@ -566,6 +570,12 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 original_file = source / "src" / "frozen.txt"
                 original_file.write_text("frozen bytes\n", encoding="utf-8")
                 os.link(original_file, leaves["state"] / "existing-hardlink.txt")
+            if outside_same_device_hardlink:
+                original = source / "src" / "protected-external.txt"
+                original.write_text("protected data\n", encoding="utf-8")
+                scratch = Path(tmp) / "scratch"
+                scratch.mkdir()
+                os.link(original, scratch / "writable-alias.txt")
             request_root = (
                 Path(tmp) / "outside" / "requests"
                 if outside_home_rw
@@ -592,17 +602,35 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 return real_read_text(path, *args, **kwargs)
 
             def mount_line(
-                path: Path, options: str, *, mount_root: Path | None = None
+                path: Path,
+                options: str,
+                *,
+                mount_root: Path | None = None,
+                device: str = "8:1",
             ) -> bytes:
                 physical_root = path if mount_root is None else mount_root
                 return (
-                    f"123 100 8:1 {physical_root} {path} {options} - ext4 /dev/test {options}\n"
+                    f"123 100 {device} {physical_root} {path} {options} - ext4 /dev/test {options}\n"
                 ).encode()
 
             mounts = [
-                mount_line(Path("/"), "rw,relatime"),
-                mount_line(home, "ro,relatime"),
+                mount_line(
+                    Path("/"), "rw,relatime" if root_mount_rw else "ro,relatime"
+                ),
+                mount_line(
+                    home,
+                    "ro,relatime",
+                    mount_root=(
+                        Path("/backing/repo")
+                        if output_below_protected_backing
+                        else None
+                    ),
+                ),
             ]
+            if output_below_protected_backing:
+                mounts.append(
+                    mount_line(source, "ro,relatime", mount_root=Path("/backing/repo"))
+                )
             if output_alias_parent:
                 mounts.append(mount_line(epoch, "ro,relatime", mount_root=source))
             if protected_bind_origin_in_output or protected_bind_origin_outside_output:
@@ -617,12 +645,16 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                     path,
                     "rw,relatime",
                     mount_root=(
-                        source / path.name
-                        if output_alias_parent
+                        Path("/backing/repo") / path.relative_to(home)
+                        if output_below_protected_backing
                         else (
-                            source / "src"
-                            if output_alias_subdir and path == leaves["state"]
-                            else path
+                            source / path.name
+                            if output_alias_parent
+                            else (
+                                source / "src"
+                                if output_alias_subdir and path == leaves["state"]
+                                else path
+                            )
                         )
                     ),
                 )
@@ -634,12 +666,18 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 mounts.append(mount_line(unexpected, "rw,relatime"))
             if extra_system_rw:
                 mounts.append(mount_line(Path("/usr/bin"), "rw,relatime"))
+            if unrelated_tmpfs_rw:
+                ephemeral = Path(tmp) / "ephemeral"
+                ephemeral.mkdir()
+                mounts.append(mount_line(ephemeral, "rw,relatime", device="0:44"))
             if outside_home_rw:
                 writable_child = request_root / "nested"
                 writable_child.mkdir()
                 mounts.append(mount_line(writable_child, "rw,relatime"))
             if external_git_common_rw:
                 mounts.append(mount_line(common / "objects", "rw,relatime"))
+            if outside_same_device_hardlink:
+                mounts.append(mount_line(scratch, "rw,relatime"))
             if outside_protected_alias_rw or outside_root_alias_rw:
                 alias = Path(tmp) / "writable-alias"
                 alias.mkdir()
@@ -698,6 +736,15 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
     def test_only_four_private_output_mounts_are_admissible(self) -> None:
         self._probe()
 
+    def test_unrelated_tmpfs_cannot_alias_protected_storage(self) -> None:
+        self._probe(unrelated_tmpfs_rw=True)
+
+    def test_writable_filesystem_root_mount_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "filesystem root mount writable"
+        ):
+            self._probe(root_mount_rw=True)
+
     def test_protected_bind_origin_inside_output_is_rejected(self) -> None:
         for output in ("state", "transcripts", "evidence", "reports"):
             with self.subTest(output=output):
@@ -709,6 +756,18 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
 
     def test_protected_bind_sibling_of_outputs_is_admissible(self) -> None:
         self._probe(protected_bind_origin_outside_output=True)
+
+    def test_external_writable_hardlink_to_protected_file_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "unexpected writable mount sharing protected filesystem"
+        ):
+            self._probe(outside_same_device_hardlink=True)
+
+    def test_output_nested_inside_protected_physical_backing_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "writable output overlaps protected mount backing"
+        ):
+            self._probe(output_below_protected_backing=True)
 
     def test_ambient_capability_without_effective_privilege_is_rejected(self) -> None:
         with self.assertRaisesRegex(

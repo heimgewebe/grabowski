@@ -1051,17 +1051,19 @@ def validate_live_immutable_mounts(
         mount, mount_root, device = max(ancestors, key=lambda x: len(x[0].parts))
         return device, mount_root / target.relative_to(mount)
 
-    protected_backings = [
-        backing_identity(target)
+    protected_backings = {
+        label: backing_identity(target)
         for label, target in protected_targets.items()
         if label != "filesystem root"
-    ]
+    }
 
     allowed_outputs = set(outputs.values())
     observed_writable_outputs: set[Path] = set()
     for mount, mount_root, device, writable in mounts:
         if not writable:
             continue
+        if mount == Path("/"):
+            raise RunnerError("live Codex filesystem root mount writable")
         if any(
             mount == root or root in mount.parents
             for root in (
@@ -1102,10 +1104,26 @@ def validate_live_immutable_mounts(
                 and (
                     protected_root == mount_root or mount_root in protected_root.parents
                 )
-                for protected_device, protected_root in protected_backings
+                for protected_device, protected_root in protected_backings.values()
             ):
                 raise RunnerError(
                     "live Codex writable output contains protected mount backing"
+                )
+            # Only logical HOME/epoch parents may back writable output
+            # descendants. This also covers the repository-map parent when
+            # it is exactly the legitimate read-only epoch directory.
+            # All other protected physical roots must remain disjoint.
+            if any(
+                protected_targets[label] not in {home, epoch}
+                and device == protected_device
+                and protected_root in mount_root.parents
+                for label, (
+                    protected_device,
+                    protected_root,
+                ) in protected_backings.items()
+            ):
+                raise RunnerError(
+                    "live Codex writable output overlaps protected mount backing"
                 )
             observed_writable_outputs.add(mount)
             continue
@@ -1127,10 +1145,20 @@ def validate_live_immutable_mounts(
                 or protected_root in mount_root.parents
                 or mount_root in protected_root.parents
             )
-            for protected_device, protected_root in protected_backings
+            for protected_device, protected_root in protected_backings.values()
         ):
             raise RunnerError(
                 "live Codex has a writable alias of protected input mount"
+            )
+        # A hard link outside all four outputs can still write a protected
+        # inode whenever any other RW mount exposes the same filesystem.
+        # Unrelated tmpfs and virtual mounts cannot hard-link across devices.
+        if any(
+            device == protected_device
+            for protected_device, _ in protected_backings.values()
+        ):
+            raise RunnerError(
+                "live Codex unexpected writable mount sharing protected filesystem"
             )
     if observed_writable_outputs != allowed_outputs:
         raise RunnerError("live Codex private writable output mounts are missing")
