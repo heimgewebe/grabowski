@@ -748,6 +748,90 @@ def validate_toolchain(codex: str) -> str:
     return f"{bundled_rg.parent}:/usr/bin:/bin"
 
 
+def _kernel_procfs_mount_id(fd: int) -> int:
+    """Authenticate the kernel filesystem and mount object of an open proc FD."""
+    # Linux statfs begins with native long f_type; statx has a fixed 256-byte
+    # ABI with stx_mask at 0 and stx_mnt_id at 144.
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fstatfs = libc.fstatfs
+        statx = libc.statx
+        fstatfs.argtypes = (ctypes.c_int, ctypes.c_void_p)
+        fstatfs.restype = ctypes.c_int
+        statx.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+        )
+        statx.restype = ctypes.c_int
+        fs_info = ctypes.create_string_buffer(256)
+        mount_info = ctypes.create_string_buffer(256)
+        if fstatfs(fd, ctypes.byref(fs_info)) != 0:
+            raise RunnerError("live Codex kernel procfs type is unavailable")
+        if ctypes.c_long.from_buffer_copy(fs_info).value != 0x9FA0:
+            raise RunnerError("live Codex isolation source is not kernel procfs")
+        # AT_EMPTY_PATH binds statx to this exact opened file, not a later
+        # pathname lookup. STATX_MNT_ID identifies individual Linux binds.
+        if statx(fd, b"", 0x1000, 0x1000, ctypes.byref(mount_info)) != 0:
+            raise RunnerError("live Codex kernel procfs mount ID is unavailable")
+        mask = ctypes.c_uint32.from_buffer_copy(mount_info, 0).value
+        mount_id = ctypes.c_uint64.from_buffer_copy(mount_info, 144).value
+    except (AttributeError, OSError) as exc:
+        raise RunnerError("live Codex kernel procfs attestation unavailable") from exc
+    if not mask & 0x1000 or mount_id == 0:
+        raise RunnerError("live Codex kernel procfs mount ID is unavailable")
+    return mount_id
+
+
+def _authenticated_procfs_evidence() -> tuple[bytes, bytes]:
+    """Read status and mountinfo from FDs proven to be the same real procfs.
+
+    A read-only bind over /proc or either virtual file must not supply
+    security metadata from ordinary files or a different procfs mount object.
+    """
+    descriptors: list[int] = []
+
+    def opened(path: str, flags: int, *, directory_fd: int | None = None) -> int:
+        kwargs = {} if directory_fd is None else {"dir_fd": directory_fd}
+        descriptor = os.open(path, flags, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+
+    def bounded_read(descriptor: int, maximum: int) -> bytes:
+        result = bytearray()
+        while len(result) <= maximum:
+            chunk = os.read(descriptor, min(65536, maximum + 1 - len(result)))
+            if not chunk:
+                break
+            result.extend(chunk)
+        if not result or len(result) > maximum:
+            raise RunnerError("live Codex kernel procfs evidence size is unsafe")
+        return bytes(result)
+
+    try:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        proc = opened("/proc", directory_flags | os.O_NOFOLLOW)
+        self_dir = opened("self", directory_flags, directory_fd=proc)
+        status = opened("status", file_flags, directory_fd=self_dir)
+        mounts = opened("mountinfo", file_flags, directory_fd=self_dir)
+        mount_ids = {
+            _kernel_procfs_mount_id(fd) for fd in (proc, self_dir, status, mounts)
+        }
+        if len(mount_ids) != 1:
+            raise RunnerError("live Codex procfs mount identity is inconsistent")
+        if not all(stat.S_ISREG(os.fstat(fd).st_mode) for fd in (status, mounts)):
+            raise RunnerError("live Codex procfs sources are not regular files")
+        return bounded_read(status, 128 * 1024), bounded_read(mounts, 4 * 1024 * 1024)
+    except OSError as exc:
+        raise RunnerError("live Codex kernel procfs evidence is unavailable") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def validate_live_immutable_mounts(
     *,
     source: Path,
@@ -766,8 +850,18 @@ def validate_live_immutable_mounts(
         raise RunnerError("live Codex mount isolation requires Linux")
     if os.getuid() != os.geteuid() or os.geteuid() == 0:
         raise RunnerError("live Codex must have an unprivileged unchanged UID")
+    # A saved root UID/GID can be restored by an unprivileged process even with
+    # NoNewPrivs=1 and no capabilities; check every kernel credential slot.
     try:
-        status = Path("/proc/self/status").read_text(encoding="ascii")
+        user_ids = os.getresuid()
+        group_ids = os.getresgid()
+    except (AttributeError, OSError) as exc:
+        raise RunnerError("live Codex kernel execution identity unavailable") from exc
+    if user_ids != (os.geteuid(),) * 3 or group_ids != (os.getegid(),) * 3:
+        raise RunnerError("live Codex execution identity is unsafe")
+    try:
+        status_bytes, mount_info = _authenticated_procfs_evidence()
+        status = status_bytes.decode("ascii")
         fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
         no_new_privs = fields.get("NoNewPrivs", "").strip()
         capabilities = (
@@ -898,6 +992,7 @@ def validate_live_immutable_mounts(
     immutable_paths = {
         "filesystem root": Path("/"),
         "system tools": Path("/usr"),
+        "system loader configuration": Path("/etc"),
         # The provider binary and its bundled rg may be RO-bind-mounted from
         # another filesystem: another RW alias to either device is unsafe.
         "Codex executable": codex,
@@ -978,10 +1073,6 @@ def validate_live_immutable_mounts(
             if aliases:
                 raise RunnerError("live Codex writable output aliases protected source")
 
-    try:
-        mount_info = Path("/proc/self/mountinfo").read_bytes()
-    except OSError as exc:
-        raise RunnerError("live Codex mountinfo is unavailable") from exc
     if not mount_info or len(mount_info) > 4 * 1024 * 1024:
         raise RunnerError("live Codex mountinfo size is unsafe")
     mount_lines = mount_info.splitlines()

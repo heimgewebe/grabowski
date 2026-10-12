@@ -512,6 +512,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         extra_rw: str | None = None,
         writable_source: bool = False,
         extra_system_rw: bool = False,
+        unexpected_etc_rw: str | None = None,
         output_alias_source: bool = False,
         output_alias_subdir: bool = False,
         outside_home_rw: bool = False,
@@ -758,6 +759,10 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 mounts.append(mount_line(unexpected, "rw,relatime"))
             if extra_system_rw:
                 mounts.append(mount_line(Path("/usr/bin"), "rw,relatime"))
+            if unexpected_etc_rw is not None:
+                mounts.append(
+                    mount_line(Path(unexpected_etc_rw), "rw,relatime", device="8:9")
+                )
             if writable_software_alias is not None:
                 if writable_software_alias not in {"codex", "rg"}:
                     raise AssertionError("unknown software alias fixture")
@@ -810,6 +815,12 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                     return b"".join(mounts)
                 return real_read_bytes(path, *args, **kwargs)
 
+            def authenticated_procfs():
+                return (
+                    read_text(Path("/proc/self/status")).encode("ascii"),
+                    read_bytes(Path("/proc/self/mountinfo")),
+                )
+
             def statvfs(path: Path):
                 target = Path(path)
                 writable = target in leaves.values() or (
@@ -833,6 +844,11 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 patch.object(runner.Path, "home", return_value=home),
                 patch.object(runner.Path, "read_text", new=read_text),
                 patch.object(runner.Path, "read_bytes", new=read_bytes),
+                patch.object(
+                    runner,
+                    "_authenticated_procfs_evidence",
+                    side_effect=authenticated_procfs,
+                ),
                 patch.object(runner.os, "getuid", return_value=actual_uid),
                 patch.object(runner.os, "geteuid", return_value=actual_uid),
                 patch.object(runner.os, "statvfs", side_effect=statvfs),
@@ -939,6 +955,49 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             runner.RunnerError, "execution privileges are unsafe"
         ):
             self._probe(permitted_capabilities=1 << 21)
+
+    def test_writable_etc_loader_configuration_mount_is_rejected(self) -> None:
+        for mount in ("/etc", "/etc/ld.so.preload"):
+            with self.subTest(mount=mount):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "unexpected writable protected input bind mount"
+                ):
+                    self._probe(unexpected_etc_rw=mount)
+
+    def test_kernel_procfs_identity_rejects_ordinary_files(self) -> None:
+        with tempfile.TemporaryFile() as ordinary:
+            with self.assertRaisesRegex(runner.RunnerError, "not kernel procfs"):
+                runner._kernel_procfs_mount_id(ordinary.fileno())
+
+    def test_kernel_procfs_identity_rejects_a_file_bind_alias(self) -> None:
+        with patch.object(
+            runner, "_kernel_procfs_mount_id", side_effect=(11, 11, 12, 11)
+        ):
+            with self.assertRaisesRegex(runner.RunnerError, "procfs mount identity"):
+                runner._authenticated_procfs_evidence()
+
+    def test_kernel_procfs_evidence_is_available_on_real_host(self) -> None:
+        status_bytes, mounts_bytes = runner._authenticated_procfs_evidence()
+        self.assertIn(b"NoNewPrivs:", status_bytes)
+        self.assertIn(b" - ", mounts_bytes)
+
+    def test_saved_root_uid_cannot_pass_unprivileged_admission(self) -> None:
+        user = os.getuid()
+        self.assertNotEqual(user, 0)
+        with patch.object(runner.os, "getresuid", return_value=(user, user, 0)):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "execution identity is unsafe"
+            ):
+                self._probe()
+
+    def test_saved_root_gid_cannot_pass_unprivileged_admission(self) -> None:
+        group = os.getgid()
+        self.assertNotEqual(os.getuid(), 0)
+        with patch.object(runner.os, "getresgid", return_value=(group, group, 0)):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "execution identity is unsafe"
+            ):
+                self._probe()
 
     def test_preexisting_protected_hardlink_in_private_output_is_rejected(self) -> None:
         with self.assertRaisesRegex(runner.RunnerError, "hardlinked regular file"):
