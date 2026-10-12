@@ -1342,5 +1342,222 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         )
 
 
+    def test_external_role_receipt_is_an_isolated_kernel_mount(self) -> None:
+        """A real read-only role can atomically publish only into a fresh
+        private output sink outside its read-only Git checkout.
+
+        This proves the kernel boundary, not server task-admission authority.
+        """
+        import subprocess
+        from pathlib import Path
+        import grabowski_agent_role as agent_role
+
+        tasks.agent_sandbox.require_bwrap()
+        runtime = Path(tasks.GRABOWSKI_RUNTIME_PYTHON)
+        self.assertTrue(runtime.is_file(), "runtime venv missing from target host")
+
+        repo = self.root / "isolated-role-source"
+        repo.mkdir()
+        protected_repo_file = repo / "protected.txt"
+        protected_repo_file.write_text("repository is immutable", encoding="utf-8")
+
+        def git(*args: str) -> str:
+            completed = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), *args],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return completed.stdout.strip()
+
+        git("init", "-b", "role-fixture")
+        git("add", "--", "protected.txt")
+        git(
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "user.name=Fixture",
+            "-c", "user.email=fixture@localhost",
+            "commit", "-m", "baseline",
+        )
+        head = git("rev-parse", "HEAD")
+        bound_head, diff_sha256, dirty = agent_role.current_binding(repo, head)
+        self.assertEqual(bound_head, head)
+        self.assertFalse(dirty)
+
+        state_root = self.root / "private-role-state"
+        state_root.mkdir(mode=0o700)
+        protected_state_file = state_root / "manifest.json"
+        protected_state_file.write_text("controller only", encoding="utf-8")
+        receipt_dir = state_root / "one-attempt"
+        receipt_dir.mkdir(mode=0o700)
+        external_receipt = receipt_dir / "receipt.json"
+        sandbox_receipt = Path("/tmp/grabowski-scoped-role-receipt/receipt.json")
+        command = [
+            str(runtime), "-m", "grabowski_agent_role",
+            "--role", "tests", "--repository", str(repo),
+            "--expected-head", head,
+            "--expected-base-head", head,
+            "--expected-diff-sha256", diff_sha256,
+            "--expected-dirty", "false",
+            "--output", str(sandbox_receipt),
+            "--", "/usr/bin/true",
+        ]
+        runtime_root = runtime.parent.parent
+        parents = sorted(
+            (parent for parent in runtime_root.parents if parent != Path("/")),
+            key=lambda item: (len(item.parts), str(item)),
+        )
+        kwargs = {
+            "workspace": repo,
+            "command": command,
+            "workspace_writable": False,
+            "extra_read_only": ((runtime_root, runtime_root),),
+            "extra_directories": tuple(parents),
+        }
+        # A role may write into its private /tmp, but without a host bind the
+        # result disappears with the namespace: this is not a valid receipt.
+        no_host_receipt = tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
+        ephemeral = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(no_host_receipt),
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        self.assertEqual(ephemeral.returncode, 0, ephemeral.stderr)
+        self.assertFalse(external_receipt.exists())
+
+        bounded = tasks.agent_sandbox.minimal_sandbox_argv(
+            **kwargs,
+            extra_read_write_directories=((
+                receipt_dir, sandbox_receipt.parent,
+            ),),
+        )
+        self.assertIn(
+            ["--bind", str(receipt_dir), str(sandbox_receipt.parent)],
+            [bounded[index:index + 3] for index in range(len(bounded) - 2)],
+        )
+        completed = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(bounded),
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(external_receipt.is_file())
+        payload = json.loads(external_receipt.read_text(encoding="utf-8"))
+        self.assertEqual(payload["role"], "tests")
+        self.assertEqual(payload["returncode"], 0)
+        self.assertEqual(payload["head_before"], head)
+        self.assertEqual(payload["head_after"], head)
+        self.assertEqual(git("status", "--porcelain"), "")
+        self.assertEqual(
+            protected_repo_file.read_text(encoding="utf-8"),
+            "repository is immutable",
+        )
+        self.assertEqual(
+            protected_state_file.read_text(encoding="utf-8"),
+            "controller only",
+        )
+        # A reused attempt directory must never silently be bound for another
+        # role after its receipt has been written.
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "empty|fresh",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=((
+                    receipt_dir, sandbox_receipt.parent,
+                ),),
+            )
+
+
+    def test_external_receipt_bind_rejects_unsafe_source_or_target(self) -> None:
+        """Fail closed on forged external RW sinks and overlapping mounts."""
+        from pathlib import Path
+
+        source_workspace = self.root / "read-only-source"
+        source_workspace.mkdir()
+        state = self.root / "operator-private"
+        state.mkdir(mode=0o700)
+        fresh = state / "fresh-attempt"
+        fresh.mkdir(mode=0o700)
+        kwargs = {
+            "workspace": source_workspace,
+            "command": ["/usr/bin/true"],
+            "workspace_writable": False,
+        }
+
+        for unsafe in (
+            Path("/etc/receipt"),
+            Path("/tmp"),
+            Path("/tmp/ordinary-dir"),
+            Path("/tmp/grabowski-a/../b"),
+        ):
+            with self.subTest(target=str(unsafe)):
+                with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+                    tasks.agent_sandbox.minimal_sandbox_argv(
+                        **kwargs, extra_read_write_directories=((fresh, unsafe),),
+                    )
+
+        nested = source_workspace / "do-not-expose"
+        nested.mkdir(mode=0o700)
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "overlaps",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=((
+                    nested, Path("/tmp/grabowski-nested"),
+                ),),
+            )
+
+        misplaced = state / "not-private"
+        misplaced.mkdir(mode=0o755)
+        with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=((
+                    misplaced, Path("/tmp/grabowski-untrusted"),
+                ),),
+            )
+
+        link = state / "linked"
+        link.symlink_to(fresh, target_is_directory=True)
+        with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=((
+                    link, Path("/tmp/grabowski-linked"),
+                ),),
+            )
+        missing = state / "missing"
+        with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=((
+                    missing, Path("/tmp/grabowski-missing"),
+                ),),
+            )
+        parent_link = self.root / "redirected-parent"
+        parent_link.symlink_to(state, target_is_directory=True)
+        with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=((
+                    parent_link / "fresh-attempt", Path("/tmp/grabowski-parent-link"),
+                ),),
+            )
+
+        private_file = state / "protected-credential"
+        private_file.write_text("no sibling RW", encoding="utf-8")
+        private_file.chmod(0o600)
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "overlaps",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write=((
+                    private_file, Path("/tmp/grabowski-output/credential"),
+                ),),
+                extra_read_write_directories=((
+                    fresh, Path("/tmp/grabowski-output"),
+                ),),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

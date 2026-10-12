@@ -839,6 +839,7 @@ def minimal_sandbox_argv(
     extra_read_only: Iterable[tuple[Path, Path]] = (),
     extra_read_only_data_fds: Iterable[tuple[int, Path]] = (),
     extra_read_write: Iterable[tuple[Path, Path]] = (),
+    extra_read_write_directories: Iterable[tuple[Path, Path]] = (),
     extra_directories: Iterable[Path] = (),
 ) -> list[str]:
     """Build the sandbox argv without requiring bubblewrap on the build host.
@@ -955,6 +956,55 @@ def minimal_sandbox_argv(
         target = str(target_path)
         if target in seen_targets:
             raise AgentSandboxError(f"duplicate sandbox target: {target}")
+        seen_targets.add(target)
+        arguments.extend(["--bind", str(source), target])
+    # A workspace role writes its create-only receipt atomically and therefore
+    # needs a writable directory, not only a writable file. The caller must
+    # authenticate the exact task/role/attempt before requesting this mount.
+    # This primitive only admits one initially empty owner-private directory
+    # *outside* the read-only source workspace and exposes it under /tmp.
+    receipt_bindings = tuple(extra_read_write_directories)
+    if len(receipt_bindings) > 4:
+        raise AgentSandboxError("too many external receipt directories")
+    for source_value, target_value in receipt_bindings:
+        source_candidate = Path(source_value).expanduser()
+        if not source_candidate.is_absolute() or source_candidate.is_symlink():
+            raise AgentSandboxError("external receipt source must be an absolute non-symlink directory")
+        try:
+            canonical_source = source_candidate.resolve(strict=True)
+        except OSError as exc:
+            raise AgentSandboxError("external receipt source is unavailable") from exc
+        if source_candidate.absolute() != canonical_source:
+            raise AgentSandboxError("external receipt source must be a canonical non-symlink directory")
+        source = _private_directory(source_candidate, "external receipt directory")
+        if source == worktree or source.is_relative_to(worktree) or worktree.is_relative_to(source):
+            raise AgentSandboxError("external receipt directory overlaps the source workspace")
+        source_info = source.stat()
+        if stat.S_IMODE(source_info.st_mode) & 0o700 != 0o700:
+            raise AgentSandboxError("external receipt directory requires owner rwx")
+        try:
+            with os.scandir(source) as entries:
+                if next(entries, None) is not None:
+                    raise AgentSandboxError("external receipt directory must be fresh and empty")
+        except OSError as exc:
+            raise AgentSandboxError("external receipt directory cannot be safely inspected") from exc
+        target_path = Path(target_value)
+        target = str(target_path)
+        if (
+            not target_path.is_absolute()
+            or target_path.parent != Path("/tmp")
+            or not target_path.name.startswith("grabowski-")
+            or len(target_path.name) > 128
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for character in target_path.name)
+        ):
+            raise AgentSandboxError("external receipt target must be one private /tmp/grabowski-* directory")
+        if any(
+            Path(existing) == target_path
+            or Path(existing).is_relative_to(target_path)
+            or target_path.is_relative_to(Path(existing))
+            for existing in seen_targets
+        ):
+            raise AgentSandboxError("external receipt target overlaps an existing sandbox mount")
         seen_targets.add(target)
         arguments.extend(["--bind", str(source), target])
     arguments.extend(
