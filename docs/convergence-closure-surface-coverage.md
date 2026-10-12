@@ -113,3 +113,9 @@ Dieser Nachweis bedeutet nicht:
 - dass `convergence-assess` Task-, Merge-, Deployment-, Bureau- oder Runtime-Autorität erhält;
 - dass ein Prozessabschluss automatisch ein Systemabschluss ist;
 - dass ein erfolgreicher Effekt ohne nachfolgende Verifikation systemisch abgeschlossen ist.
+
+## Ergänzung vom 11. Oktober 2026 – externer PR-Merge
+
+Der neue Grip `saga-external-merge-closeout` erhält in `test_convergence_coverage_contract.py` die explizite aktuelle Klassifikation `preflight_or_evidence`. Er hängt nur nach Prüfung der ursprünglichen Saga-/Captain-Auditbindung und der externen GitHub-Mergeidentität ein Terminal-Audit an. Er führt keinen Captain-Merge aus und beansprucht weder Captain-Compliance noch systemische Konvergenz.
+
+Der historische Proof `docs/proofs/convergence-closure-surface-coverage-v1.json` bleibt absichtlich unverändert. Seine damalige Quellrevision wird nicht nachträglich um eine 2026-10-11 neu entstandene Oberfläche ergänzt. Künftige unbekannte Abschlussoberflächen müssen weiterhin den CI-Discovery-Test bestehen und einzeln klassifiziert werden.

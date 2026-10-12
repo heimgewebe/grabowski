@@ -9465,6 +9465,56 @@ class AgentWorkspaceTests(unittest.TestCase):
         ssh.assert_not_called()
         fallback.assert_not_called()
 
+    def test_cleanup_rejects_concurrent_task_attempt_after_live_terminal_probe(self) -> None:
+        task_id = "4" * 24
+        old_row = {
+            "task_id": task_id, "host": "local",
+            "unit": f"grabowski-task-{task_id}-a1.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        new_row = {
+            **old_row,
+            "unit": f"grabowski-task-{task_id}-a2.service",
+            "state": "running",
+            "attempt": 2,
+        }
+        first, second = mock.Mock(), mock.Mock()
+        first.execute.return_value.fetchone.return_value = old_row
+        second.execute.return_value.fetchone.return_value = new_row
+        local_host = (
+            "local", {"transport": "local", "target": "local", "enabled": True},
+            False,
+        )
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection",
+                side_effect=[first, second],
+            ) as reads,
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                return_value=local_host,
+            ),
+            mock.patch.object(
+                workspace.tasks, "_observe", return_value={"state": "completed"}
+            ) as probe,
+            mock.patch.object(
+                workspace.tasks, "_set_state",
+                side_effect=AssertionError("cleanup must never mutate task state"),
+            ) as persist,
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        probe.assert_called_once()
+        self.assertFalse(public["terminal"])
+        self.assertEqual("observation_error", public["state"])
+        self.assertTrue(public["reconcile_required"])
+        self.assertEqual("completed", public["persisted_state"])
+        self.assertEqual(2, reads.call_count)
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+        persist.assert_not_called()
+
     def test_cleanup_local_terminal_cannot_use_persisted_state_without_live_confirmation(self) -> None:
         task_id = "1" * 24
         row = {

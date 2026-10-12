@@ -10725,6 +10725,27 @@ def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
         except Exception as exc:
             unverified = True
             local_probe_error = _error_summary(exc)
+        if not unverified:
+            # The stored snapshot was released before the local systemd
+            # observation. A concurrent resume may replace its attempt/unit,
+            # so the observed old terminal cannot authorize checkout cleanup.
+            recheck = None
+            try:
+                recheck = checkouts._readonly_connection(tasks.TASK_DB)
+                if recheck is None:
+                    raise RuntimeError("post-probe task inventory is unavailable")
+                current = recheck.execute(
+                    "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+                ).fetchone()
+                if current is None or dict(current) != value:
+                    unverified = True
+                    local_probe_error = "task row changed during live terminal probe"
+            except Exception as exc:
+                unverified = True
+                local_probe_error = _error_summary(exc)
+            finally:
+                if recheck is not None:
+                    recheck.close()
     # For a mismatched/failed local probe, fail closed just like an unverified
     # remote transport; only an equal, live-observed terminal may unblock cleanup.
     state = (

@@ -8,6 +8,21 @@ ROOT = Path(__file__).resolve().parents[1]
 PROOF = ROOT / "docs" / "proofs" / "convergence-closure-surface-coverage-v1.json"
 AUDIT = ROOT / "docs" / "convergence-closure-surface-coverage.md"
 
+# This explicit current-code delta must not rewrite the historical July proof.
+CURRENT_SURFACE_ADDITIONS = {
+    "grip:saga-external-merge-closeout": {
+        "surface_kind": "grip",
+        "surface_id": "saga-external-merge-closeout",
+        "classification": "preflight_or_evidence",
+        "convergence_requirement": "audit_terminal_not_systemic",
+        "reason": (
+            "A verified external PR merge can be recorded as terminal Saga "
+            "provenance without a Captain apply, merge mutation, or system "
+            "convergence assessment."
+        ),
+    },
+}
+
 
 class ConvergenceCoverageContractTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -26,6 +41,12 @@ class ConvergenceCoverageContractTests(unittest.TestCase):
         for field in ("grabowski_commit", "protocol_commit"):
             self.assertRegex(self.proof["source"][field], r"^[0-9a-f]{40}$")
         self.assertEqual(len(self.surfaces), len(self.proof["surfaces"]))
+        self.assertTrue(self.surfaces.keys().isdisjoint(CURRENT_SURFACE_ADDITIONS))
+        for key, item in CURRENT_SURFACE_ADDITIONS.items():
+            self.assertEqual(key, f"{item['surface_kind']}:{item['surface_id']}")
+            self.assertIn(item["classification"], self.proof["allowed_classifications"])
+            self.assertTrue(item["convergence_requirement"])
+            self.assertTrue(item["reason"])
         allowed = set(self.proof["allowed_classifications"])
         self.assertTrue(allowed)
         for item in self.proof["surfaces"]:
@@ -47,7 +68,7 @@ class ConvergenceCoverageContractTests(unittest.TestCase):
         grip_names = set(
             re.findall(r'^    "([^"]+)": GripSpec\(', grip_source, re.MULTILINE)
         )
-        for key, item in self.surfaces.items():
+        for key, item in {**self.surfaces, **CURRENT_SURFACE_ADDITIONS}.items():
             available = tool_names if item["surface_kind"] == "tool" else grip_names
             self.assertIn(item["surface_id"], available, key)
 
@@ -71,7 +92,8 @@ class ConvergenceCoverageContractTests(unittest.TestCase):
             )
             if pattern.search(name)
         }
-        self.assertEqual(set(), (discovered_tools | discovered_grips) - self.surfaces.keys())
+        classified = self.surfaces.keys() | CURRENT_SURFACE_ADDITIONS.keys()
+        self.assertEqual(set(), (discovered_tools | discovered_grips) - classified)
         self.assertTrue(
             set(self.proof["discovery"]["required_explicit_surfaces"])
             <= self.surfaces.keys()
