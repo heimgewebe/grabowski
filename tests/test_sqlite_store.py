@@ -93,6 +93,40 @@ class SQLiteStoreTests(unittest.TestCase):
             finally:
                 keeper.close()
 
+    def test_wal_mode_quiescent_strict_reader_uses_immutable_uri_without_sidecars(self) -> None:
+        from contextlib import closing
+
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database = root / "wal-mode.sqlite3"
+            with closing(sqlite3.connect(database)) as writer, writer:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("CREATE TABLE sample(value INTEGER)")
+                writer.execute("INSERT INTO sample VALUES (42)")
+            before = sorted(item.name for item in root.iterdir())
+            self.assertEqual([database.name], before)
+            original_connect = sqlite3.connect
+            called_uris: list[str] = []
+
+            def capture(*args, **kwargs):
+                called_uris.append(str(args[0]))
+                return original_connect(*args, **kwargs)
+
+            with patch.object(sqlite_store.sqlite3, "connect", side_effect=capture):
+                with sqlite_store.inventory_readonly_sqlite(
+                    database,
+                    temporary_prefix="must-not-copy-",
+                    error_type=InventoryChanged,
+                    allow_wal_copy=False,
+                ) as connection:
+                    self.assertEqual(
+                        42, connection.execute("SELECT value FROM sample").fetchone()[0]
+                    )
+                    self.assertEqual(before, sorted(item.name for item in root.iterdir()))
+            self.assertEqual(1, len(called_uris))
+            self.assertTrue(called_uris[0].endswith("?mode=ro&immutable=1"))
+            self.assertEqual(before, sorted(item.name for item in root.iterdir()))
+
     def test_strict_observer_reads_quiescent_database_on_readonly_media(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

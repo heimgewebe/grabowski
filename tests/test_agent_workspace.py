@@ -9327,6 +9327,70 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertFalse(public["terminal"])
             self.assertTrue(public["reconcile_required"])
 
+    def test_cleanup_local_terminal_cannot_use_persisted_state_without_live_confirmation(self) -> None:
+        task_id = "1" * 24
+        row = {
+            "task_id": task_id, "host": "local", "unit": "local-task.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        local_host = ("local",
+                      {"transport": "local", "target": "local", "enabled": True},
+                      False)
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection", return_value=connection
+            ),
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host", return_value=local_host
+            ),
+            mock.patch.object(
+                workspace.tasks, "_observe", return_value={"state": "running"}
+            ) as live_probe,
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_status",
+                side_effect=AssertionError("cleanup cannot persist task state"),
+            ),
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        live_probe.assert_called_once()
+        self.assertEqual("completed", public["persisted_state"])
+        self.assertEqual("observation_error", public["state"])
+        self.assertFalse(public["terminal"])
+        self.assertTrue(public["reconcile_required"])
+
+    def test_cleanup_local_terminal_probe_error_blocks_cleanup(self) -> None:
+        task_id = "2" * 24
+        row = {
+            "task_id": task_id, "host": "local", "unit": "local-task.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection", return_value=connection
+            ),
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local", "target": "local", "enabled": True}, False),
+            ),
+            mock.patch.object(
+                workspace.tasks, "_observe", side_effect=RuntimeError("systemd unavailable")
+            ) as probe,
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        probe.assert_called_once()
+        self.assertEqual("observation_error", public["state"])
+        self.assertEqual("completed", public["persisted_state"])
+        self.assertFalse(public["terminal"])
+        self.assertTrue(public["reconcile_required"])
+
     def test_task_public_reads_persisted_state_without_status_refresh(self) -> None:
         task_db = workspace.tasks.TASK_DB
         task_db.parent.mkdir(parents=True, exist_ok=True)
@@ -9374,10 +9438,14 @@ class AgentWorkspaceTests(unittest.TestCase):
                               {"transport": "local", "target": "local", "enabled": True},
                               False),
             ) as resolver,
+            mock.patch.object(
+                workspace.tasks, "_observe", return_value={"state": "completed"}
+            ) as observe,
         ):
             public = workspace._workspace_cleanup_task_public("writer-task")
         task_status.assert_not_called()
         resolver.assert_called_once_with("heim-pc")
+        observe.assert_called_once()
         self.assertEqual(public["state"], "completed")
         self.assertTrue(public["terminal"])
         self.assertEqual(public["unit"], "writer.service")

@@ -10688,9 +10688,23 @@ def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
         except (OSError, ValueError, RuntimeError, PermissionError, TypeError):
             pass
     unverified = not local_confirmed
-    # An explicitly unknown outcome already denotes unresolved execution truth.
-    # Preserve it for callers without allowing stored terminal or active states
-    # from unverifiable transports to masquerade as current observations.
+    local_terminal_probed = False
+    local_probe_error: str | None = None
+    if local_confirmed and persisted_state in TERMINAL_TASK_STATES:
+        # The store connection has already closed. Cleanup is authorized to
+        # observe only a verified local user unit; never probe SSH/rootbroker.
+        # A persisted terminal status alone cannot release live resources.
+        local_terminal_probed = True
+        try:
+            observation = tasks._observe(value)
+            if observation.get("state") != persisted_state:
+                unverified = True
+                local_probe_error = "local systemd live state differs from persisted terminal state"
+        except Exception as exc:
+            unverified = True
+            local_probe_error = _error_summary(exc)
+    # For a mismatched/failed local probe, fail closed just like an unverified
+    # remote transport; only an equal, live-observed terminal may unblock cleanup.
     state = (
         "outcome_unknown" if unverified and persisted_state == "outcome_unknown"
         else "observation_error" if unverified
@@ -10699,10 +10713,14 @@ def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
     mode = (
         "persisted_only_rootbroker_not_probed" if privileged
         else "persisted_only_ssh_not_probed" if transport == "ssh"
+        else "local_user_systemd_terminal_probe_unverified"
+        if local_terminal_probed and unverified
         else "persisted_only_transport_unavailable" if unverified
-        else "persisted_only_local_user_systemd"
+        else "unpersisted_local_user_systemd_terminal"
+        if local_terminal_probed
+        else "persisted_only_local_user_systemd_nonterminal"
     )
-    return {
+    public = {
         "task_id": task_id,
         "host": value.get("host"),
         "unit": value.get("unit"),
@@ -10717,6 +10735,9 @@ def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
         "reconcile_required": unverified or state == "outcome_unknown",
         "observation_mode": mode,
     }
+    if local_probe_error is not None:
+        public["error"] = local_probe_error
+    return public
 
 
 def _workspace_cleanup_resource_snapshot() -> dict[str, Any]:

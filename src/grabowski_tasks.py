@@ -7559,10 +7559,24 @@ def _task_projection_root() -> Path:
     )
 
 
-def _task_current_projection() -> dict[str, Any]:
+def _task_current_projection(*, readiness_bounded: bool = False) -> dict[str, Any]:
+    # Ordinary archive writers retain the historical projection API.
+    # Readiness is a strict READ_ONLY safety surface: do not materialize or
+    # hash unbounded archive switches/segments before checking the budget.
+    limits = (
+        {
+            "max_switches": TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT,
+            "max_archived_bindings": TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT,
+            "max_total_records_bytes": 128 * 1024 * 1024,
+            "max_total_manifest_bytes": 64 * 1024 * 1024,
+            "max_total_switch_bytes": 64 * 1024 * 1024,
+        }
+        if readiness_bounded else {}
+    )
     return lifecycle_projection.load_task_archive_projection(
         projection_root=_task_projection_root(),
         archive_root=_task_archive_root(),
+        **limits,
     )
 
 
@@ -11446,7 +11460,7 @@ def _task_reconcile_ready_privileged_rows(
     record hashes. A modified archived task must fail closed, not be silently
     promoted into a fresh readiness attestation.
     """
-    projection = _task_current_projection()
+    projection = _task_current_projection(readiness_bounded=True)
     # The privileged WHERE clause alone cannot witness an archived task that
     # was deleted or had its backend/scope changed to evade that predicate.
     # Verify every bounded, immutable archive binding by indexed task_id
