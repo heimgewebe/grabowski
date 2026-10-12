@@ -8304,8 +8304,39 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                 "reconcile_required": True,
                 "receipt_status": "blocked",
             }
+        def _existing_role_reconciliation_block() -> dict[str, Any] | None:
+            # Task peek observes live systemd state without writing it; an
+            # unobserved Rootbroker task instead requires reconciliation.
+            # A persisted state mutation is not needed to block role admission.
+            existing_tasks = {
+                existing_role: _task_public(tasks_map[existing_role], read_only=True)
+                for existing_role in READ_ONLY_ROLES
+                if tasks_map.get(existing_role) is not None
+            }
+            reconcile_roles = sorted(
+                existing_role
+                for existing_role, value in existing_tasks.items()
+                if value.get("state") in {"observation_error", "outcome_unknown", "interrupted", "unknown"}
+                or value.get("reconcile_required") is True
+            )
+            if not reconcile_roles:
+                return None
+            return {
+                "workspace_id": identifier,
+                "state": "role_outcome_unknown",
+                "tasks": existing_tasks,
+                "reconcile_roles": reconcile_roles,
+                "snapshot": snapshot,
+                "reconcile_required": True,
+                "receipt_status": "blocked",
+            }
+
         for role in READ_ONLY_ROLES:
             if tasks_map.get(role) is None:
+                # Do not preflight a sibling if reconciliation is already required.
+                reconciliation_block = _existing_role_reconciliation_block()
+                if reconciliation_block is not None:
+                    return reconciliation_block
                 cached_preflight = _cached_role_preflight_block(
                     manifest, role, manifest["commands"][role]
                 )
@@ -8339,50 +8370,57 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
                         "preflight": preflight,
                         "receipt_status": "blocked",
                     }
-                intents = dict(manifest.get("task_start_intents", {}))
-                role_task_argv = _role_task_argv(
-                    manifest,
-                    role,
-                    str(snapshot["writer_head"]),
-                    str(snapshot["diff_sha256"]),
-                    bool(snapshot["dirty"]),
-                    output_path=_role_receipt_path(
-                        manifest, role, attempt=_role_final_attempt(manifest, role)
-                    ),
-                )
-                intent = {
-                    "role": role,
-                    "created_at": _utc(),
-                    "nonce": hashlib.sha256(
-                        f"{identifier}:{role}:{time.time_ns()}".encode("utf-8")
-                    ).hexdigest()[:24],
-                    "writer_head": snapshot["writer_head"],
-                    "diff_sha256": snapshot["diff_sha256"],
-                    "dirty": snapshot["dirty"],
-                    "command_sha256": _sha256_json(manifest["commands"][role]),
-                    "task_argv_sha256": _task_argv_sha256(role_task_argv),
-                    "task_host": _bound_task_host(manifest),
-                    "task_cwd": manifest["writer_worktree"],
-                }
-                intents[role] = intent
-                manifest["task_start_intents"] = intents
-                _write_manifest(manifest)
-                public = _start_role_task(manifest, role, snapshot)
-                tasks_map[role] = public["task_id"]
-                manifest["tasks"] = dict(tasks_map)
-                _append_workspace_event(
-                    manifest, "role_started", role=role, outcome="started",
-                    evidence={"task_id": public["task_id"], "writer_head": snapshot["writer_head"], "diff_sha256": snapshot["diff_sha256"]},
-                )
-                intents = dict(manifest.get("task_start_intents", {}))
-                intents.pop(role, None)
-                manifest["task_start_intents"] = intents
-                _write_manifest(manifest)
-                started_roles.append(role)
+                # The task-status refresher and task start share a reentrant mutation lock.
+                # Keep the final sibling observation, intent, and launch atomic.
+                with tasks._task_mutation_lock():
+                    # A sibling can become uncertain during a long toolchain preflight.
+                    reconciliation_block = _existing_role_reconciliation_block()
+                    if reconciliation_block is not None:
+                        return reconciliation_block
+                    intents = dict(manifest.get("task_start_intents", {}))
+                    role_task_argv = _role_task_argv(
+                        manifest,
+                        role,
+                        str(snapshot["writer_head"]),
+                        str(snapshot["diff_sha256"]),
+                        bool(snapshot["dirty"]),
+                        output_path=_role_receipt_path(
+                            manifest, role, attempt=_role_final_attempt(manifest, role)
+                        ),
+                    )
+                    intent = {
+                        "role": role,
+                        "created_at": _utc(),
+                        "nonce": hashlib.sha256(
+                            f"{identifier}:{role}:{time.time_ns()}".encode("utf-8")
+                        ).hexdigest()[:24],
+                        "writer_head": snapshot["writer_head"],
+                        "diff_sha256": snapshot["diff_sha256"],
+                        "dirty": snapshot["dirty"],
+                        "command_sha256": _sha256_json(manifest["commands"][role]),
+                        "task_argv_sha256": _task_argv_sha256(role_task_argv),
+                        "task_host": _bound_task_host(manifest),
+                        "task_cwd": manifest["writer_worktree"],
+                    }
+                    intents[role] = intent
+                    manifest["task_start_intents"] = intents
+                    _write_manifest(manifest)
+                    public = _start_role_task(manifest, role, snapshot)
+                    tasks_map[role] = public["task_id"]
+                    manifest["tasks"] = dict(tasks_map)
+                    _append_workspace_event(
+                        manifest, "role_started", role=role, outcome="started",
+                        evidence={"task_id": public["task_id"], "writer_head": snapshot["writer_head"], "diff_sha256": snapshot["diff_sha256"]},
+                    )
+                    intents = dict(manifest.get("task_start_intents", {}))
+                    intents.pop(role, None)
+                    manifest["task_start_intents"] = intents
+                    _write_manifest(manifest)
+                    started_roles.append(role)
         role_tasks = {role: _task_public(tasks_map[role]) for role in READ_ONLY_ROLES}
         reconcile_roles = sorted(
             role for role, value in role_tasks.items()
-            if value.get("state") in {"observation_error", "outcome_unknown", "interrupted"}
+            if value.get("state") in {"observation_error", "outcome_unknown", "interrupted", "unknown"}
             or value.get("reconcile_required") is True
         )
         if reconcile_roles:
