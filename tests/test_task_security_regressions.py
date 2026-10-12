@@ -1481,6 +1481,19 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             "workspace_writable": False,
         }
 
+        second = state / "second-attempt"
+        second.mkdir(mode=0o700)
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "one|too many",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=(
+                    (fresh, Path("/tmp/grabowski-first-receipt")),
+                    (second, Path("/tmp/grabowski-second-receipt")),
+                ),
+            )
+
         for unsafe in (
             Path("/etc/receipt"),
             Path("/tmp"),

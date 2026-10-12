@@ -964,8 +964,8 @@ def minimal_sandbox_argv(
     # This primitive only admits one initially empty owner-private directory
     # *outside* the read-only source workspace and exposes it under /tmp.
     receipt_bindings = tuple(extra_read_write_directories)
-    if len(receipt_bindings) > 4:
-        raise AgentSandboxError("too many external receipt directories")
+    if len(receipt_bindings) > 1:
+        raise AgentSandboxError("only one external receipt directory is allowed")
     for source_value, target_value in receipt_bindings:
         source_candidate = Path(source_value).expanduser()
         if not source_candidate.is_absolute() or source_candidate.is_symlink():
