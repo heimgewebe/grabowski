@@ -1068,5 +1068,222 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             self.assertIsNone(tasks._task_linked_git_common_dir(workspace))
 
 
+    def test_nested_framework_writer_needs_a_scoped_outer_writable_mount(self) -> None:
+        """Exercise a real writer process, not only its assembled bwrap argv.
+
+        This fixture synthesizes task lease truth only for command construction.
+        It does not establish admission authority for a production task.
+        """
+        import subprocess
+        from pathlib import Path
+
+        try:
+            tasks.agent_sandbox.require_bwrap()
+        except tasks.agent_sandbox.AgentSandboxError:
+            self.skipTest("target-host bubblewrap is unavailable")
+        runtime = Path(tasks.GRABOWSKI_RUNTIME_PYTHON)
+        if not runtime.is_file():
+            self.skipTest("Grabowski runtime Python is unavailable on this host")
+
+        repo = self.root / "writer-kernel-e2e"
+        repo.mkdir()
+        allowed = repo / "allowed"
+        allowed.mkdir()
+
+        def git(*arguments: str) -> str:
+            result = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), *arguments],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+        git("init", "-b", "topic")
+        git(
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "user.name=Sandbox Test",
+            "-c", "user.email=sandbox-test@localhost",
+            "commit", "--allow-empty", "-m", "scratch",
+        )
+        head = git("rev-parse", "HEAD")
+        output = allowed / "writer-receipt.json"
+        writer = [
+            str(runtime), "-m", "grabowski_agent_writer",
+            "--repository", str(repo),
+            "--expected-base-head", head,
+            "--expected-branch", "topic",
+            "--allowed-path", "allowed",
+            "--output", str(output),
+            "--", "/usr/bin/true",
+        ]
+        record = {
+            "task_id": "sandbox-writer-test",
+            "host": "local",
+            "cwd": str(repo),
+            "lease_owner_id": "task:sandbox-writer-test",
+        }
+        local = {"transport": "local", "target": "local"}
+
+        # Unknown effects never gain write rights from a module name.
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=local),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            read_only = tasks._task_sandboxed_command_argv(record, writer)
+        blocked = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(read_only),
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        if "No permissions to create" in blocked.stderr:
+            self.skipTest("target-host kernel disallows user namespaces")
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("Read-only file system", blocked.stderr)
+        self.assertFalse(output.exists())
+        self.assertEqual(git("status", "--porcelain"), "")
+
+        # A synthetic exact live path lease permits the real nested writer
+        # and its create-only receipt, without exposing sibling paths.
+        lease = f"path:{allowed}"
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=local),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "workspace_write"},
+            ),
+            patch.object(tasks, "_record_resource_keys", return_value=[lease]),
+            patch.object(
+                tasks.resources, "inspect_resources",
+                return_value={lease: {"owner_id": "task:sandbox-writer-test"}},
+            ),
+        ):
+            confined_writer = tasks._task_sandboxed_command_argv(record, writer)
+        completed = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(confined_writer),
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(output.is_file())
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(payload.get("role"), "writer")
+        self.assertEqual(payload.get("returncode"), 0)
+        self.assertEqual(payload.get("head_before"), payload.get("head_after"))
+        self.assertEqual(payload.get("head_before"), head)
+
+
+    def test_framework_role_receipt_requires_exact_outer_output_mount(self) -> None:
+        """A read-only role still needs an independently authorized receipt sink.
+
+        The narrow output lease below is synthetic and does not stand in for
+        production task admission or the workspace lifecycle authority.
+        """
+        import subprocess
+        from pathlib import Path
+        import grabowski_agent_role as agent_role
+
+        try:
+            tasks.agent_sandbox.require_bwrap()
+        except tasks.agent_sandbox.AgentSandboxError:
+            self.skipTest("target-host bubblewrap is unavailable")
+        runtime = Path(tasks.GRABOWSKI_RUNTIME_PYTHON)
+        if not runtime.is_file():
+            self.skipTest("Grabowski runtime Python is unavailable on this host")
+
+        repo = self.root / "role-kernel-e2e"
+        repo.mkdir()
+        output_root = repo / "output"
+        output_root.mkdir(mode=0o700)
+
+        def git(*arguments: str) -> str:
+            result = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), *arguments],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+        git("init", "-b", "topic")
+        git(
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "user.name=Sandbox Test",
+            "-c", "user.email=sandbox-test@localhost",
+            "commit", "--allow-empty", "-m", "scratch",
+        )
+        head = git("rev-parse", "HEAD")
+        bound_head, diff_digest, dirty = agent_role.current_binding(repo, head)
+        self.assertEqual(bound_head, head)
+        self.assertFalse(dirty)
+
+        output = output_root / "role-receipt.json"
+        command = [
+            str(runtime), "-m", "grabowski_agent_role",
+            "--role", "tests",
+            "--repository", str(repo),
+            "--expected-head", head,
+            "--expected-base-head", head,
+            "--expected-diff-sha256", diff_digest,
+            "--expected-dirty", "false",
+            "--output", str(output),
+            "--", "/usr/bin/true",
+        ]
+        record = {
+            "task_id": "sandbox-role-test",
+            "host": "local",
+            "cwd": str(repo),
+            "lease_owner_id": "task:sandbox-role-test",
+        }
+        local = {"transport": "local", "target": "local"}
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=local),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            read_only = tasks._task_sandboxed_command_argv(record, command)
+        blocked = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(read_only),
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        if "No permissions to create" in blocked.stderr:
+            self.skipTest("target-host kernel disallows user namespaces")
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("Read-only file system", blocked.stderr)
+        self.assertFalse(output.exists())
+
+        receipt_lease = f"path:{output_root}"
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=local),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "workspace_write"},
+            ),
+            patch.object(
+                tasks, "_record_resource_keys", return_value=[receipt_lease],
+            ),
+            patch.object(
+                tasks.resources, "inspect_resources",
+                return_value={
+                    receipt_lease: {"owner_id": "task:sandbox-role-test"}
+                },
+            ),
+        ):
+            allowed = tasks._task_sandboxed_command_argv(record, command)
+        result = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(allowed),
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(output.is_file())
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(payload.get("role"), "tests")
+        self.assertEqual(payload.get("returncode"), 0)
+        self.assertEqual(payload.get("head_before"), head)
+        self.assertEqual(payload.get("head_after"), head)
+
+
 if __name__ == "__main__":
     unittest.main()
