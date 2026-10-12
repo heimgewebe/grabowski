@@ -771,11 +771,57 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         env=pr_review_gate._env(),
     )
     if diff_bytes.returncode != 0:
+        diagnostic = diff_bytes.stderr + b"\n" + diff_bytes.stdout
         detail = diff_bytes.stderr.decode("utf-8", errors="replace")
-        raise SettlementError("cannot read current PR diff: " + " ".join(detail.split())[:400])
-    if not diff_bytes.stdout:
-        raise SettlementError("current PR diff is empty")
-    pull_request["diff_sha256"] = pr_review_gate.github_pr_diff_identity_sha256(diff_bytes.stdout)
+        if not pr_review_gate._github_pr_diff_too_large(
+            diagnostic, pull_request.get("changedFiles")
+        ):
+            raise SettlementError("cannot read current PR diff: " + " ".join(detail.split())[:400])
+        # GraphQL file pagination is complete and exact-head bound. Verify an
+        # independent GitHub REST file list before accepting a local Git diff.
+        count = pull_request["changedFiles"]
+        graphql_paths = [
+            item["path"] for item in _list_nodes(pull_request["files"], label="files")
+        ]
+        try:
+            rest_files = pr_review_gate._load_pull_file_evidence(
+                repo, repo_slug=repository, pr=pr_number
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise SettlementError("cannot read complete REST file evidence") from exc
+        if (
+            len(rest_files) != count
+            or len(graphql_paths) != count
+            or sorted(graphql_paths) != sorted(item["path"] for item in rest_files)
+        ):
+            raise SettlementError("GraphQL and REST PR file paths or counts drift")
+        view = {
+            "headRefOid": pull_request["headRefOid"],
+            "baseRefOid": pull_request["baseRefOid"],
+            "pullFilesEvidenceComplete": True,
+            "files": rest_files,
+        }
+        try:
+            local_diff = pr_review_gate._local_bound_pr_diff_bytes(repo, view)
+        except (RuntimeError, ValueError) as exc:
+            raise SettlementError("local PR diff fails exact base/head/file binding") from exc
+        # The PR may have advanced during REST pagination/local Git readback.
+        refreshed = _run_json(
+            repo, [
+                "gh", "pr", "view", str(pr_number), "--repo", repository,
+                "--json", "headRefOid,baseRefOid,changedFiles",
+            ],
+        )
+        if not isinstance(refreshed, dict) or any(
+            refreshed.get(field) != pull_request[field]
+            for field in ("headRefOid", "baseRefOid", "changedFiles")
+        ):
+            raise SettlementError("PR head, base or file count drifted during local diff readback")
+        pull_request["diff_sha256"] = pr_review_gate.github_pr_diff_identity_sha256(local_diff)
+    else:
+        if not diff_bytes.stdout:
+            raise SettlementError("current PR diff is empty")
+        pull_request["diff_sha256"] = pr_review_gate.github_pr_diff_identity_sha256(diff_bytes.stdout)
     return pull_request
 
 

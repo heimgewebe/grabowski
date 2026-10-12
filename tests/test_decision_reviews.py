@@ -325,7 +325,353 @@ def make_job(
     return directory
 
 
+ZERO_CLAUDE_SUBAGENTS = {
+    "spawned": 0, "started_in_background": 0, "max_depth": 0,
+    "spawned_by_subagents": 0, "completed": 0, "failed": 0,
+    "requested": {"background": 0, "foreground": 0, "unset": 0},
+    "refused": {"depth_limit": 0, "concurrency_limit": 0, "budget": 0},
+    "killed": {"parent": 0, "user": 0, "system": 0},
+    "by_type": {},
+}
+
+
+def stamp_claude_quota_429(directory: Path, *, envelope_updates: dict | None = None,
+                           receipt_updates: dict | None = None) -> None:
+    """Synthetic exact transcript and job-owned V2 receipt, no provider call."""
+    receipt_path = directory / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    envelope = {
+        "type": "result", "is_error": True, "terminal_reason": "api_error",
+        "api_error_status": 429, "duration_api_ms": 0, "modelUsage": {},
+        "permission_denials": [], "total_cost_usd": 0,
+        "usage": {
+            "input_tokens": 0, "output_tokens": 0, "iterations": [],
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+            "output_tokens_details": {"thinking_tokens": 0},
+            "cache_creation": {
+                "ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0,
+            },
+            "service_tier": "standard", "speed": "standard",
+            "inference_geo": "", "fallback_credit": None,
+            "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+        },
+        "subagent_stats": ZERO_CLAUDE_SUBAGENTS,
+        "result": "You've hit your weekly limit",
+    }
+    amendments = dict(envelope_updates or {})
+    if "usage" in amendments and isinstance(amendments["usage"], dict):
+        usage_amendments = amendments.pop("usage")
+        envelope["usage"] = {**envelope["usage"], **usage_amendments}
+    envelope.update(amendments)
+    payload = (json.dumps(envelope, separators=(",", ":")) + "\n").encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    receipt.update({
+        "verdict": "INVALID", "findings": [], "returncode": 126,
+        "failure_classification": "invalid_review_output",
+        "stdout_tail": payload.decode("utf-8"),
+        "stdout_bytes": len(payload), "stdout_sha256": digest,
+        "review_provider_envelope_bytes": len(payload),
+        "review_provider_envelope_sha256": digest,
+        "review_provider_contract": "claude-headless-bound-diff-json-v1",
+        "review_document_bytes": 0, "review_document_sha256": None,
+        "review_findings_normalized": False, "stderr_bytes": 0,
+    })
+    receipt.update(receipt_updates or {})
+    receipt["receipt_sha256"] = reviews._agent_role_receipt_sha256(receipt)
+    write_private(receipt_path, json.dumps(receipt))
+
+
 class DecisionReviewReconciliationTests(unittest.TestCase):
+    def test_v2_claude_429_blocks_until_exact_later_same_slot_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a88888888888", slot="claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            stamp_claude_quota_429(failed)
+            prior = self.reconcile(jobs)
+            self.assertEqual(prior["status"], "blocked")
+            self.assertIn("decision_review_slot_without_pass:claude", prior["errors"])
+            self.assertEqual(prior["attempts"][0]["classification"], "infrastructure_error")
+            make_job(
+                jobs, suffix="b99999999999", slot="claude",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_200,
+            )
+            settled = self.reconcile(jobs)
+        self.assertEqual(settled["status"], "settled")
+        self.assertEqual(settled["errors"], [])
+        self.assertEqual(settled["slots"][0]["independent_pass_count"], 1)
+        self.assertEqual(settled["slots"][0]["infrastructure_error_count"], 1)
+
+    def test_v2_429_known_reset_suffix_then_independent_pass_settles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a88888888888", slot="claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            stamp_claude_quota_429(
+                failed, envelope_updates={
+                    "result": "You've hit your weekly limit · resets Oct 13, 10am (UTC)"
+                },
+            )
+            make_job(
+                jobs, suffix="b99999999999", slot="claude",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_200,
+            )
+            outcome = self.reconcile(jobs)
+        self.assertEqual(outcome["status"], "settled")
+        self.assertEqual(outcome["errors"], [])
+
+    def test_v2_429_generic_pass_cannot_supersede_independent_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            make_job(
+                jobs, suffix="a11111111111", slot="claude",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_000,
+            )
+            quota = make_job(
+                jobs, suffix="b22222222222", slot="claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_100,
+            )
+            stamp_claude_quota_429(quota)
+            make_job(
+                jobs, suffix="c33333333333", slot="claude",
+                terminal_status="succeeded",
+                review_result=result("claude", "PASS_THIS_REVISION", 0),
+                created_at_unix=1_787_000_200,
+            )
+            blocked = self.reconcile(jobs)
+            self.assertEqual(blocked["status"], "blocked")
+            self.assertIn(
+                "decision_review_infrastructure_not_superseded:"
+                "claude:grabowski-job-b22222222222",
+                blocked["errors"],
+            )
+            make_job(
+                jobs, suffix="d44444444444", slot="claude",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_300,
+            )
+            settled = self.reconcile(jobs)
+        self.assertEqual(settled["status"], "settled")
+        self.assertEqual(settled["errors"], [])
+
+    def test_v2_429_near_misses_remain_blocking_even_after_valid_pass(self) -> None:
+        cases = [
+            ("http_401", {"api_error_status": 401}, {}),
+            ("nonzero_output", {"usage": {
+                "input_tokens": 0, "output_tokens": 1,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+            }}, {}),
+            ("unknown_server_tool", {"usage": {
+                "input_tokens": 0, "output_tokens": 0, "iterations": [],
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                "server_tool_use": {
+                    "web_search_requests": 0, "web_fetch_requests": 0,
+                    "code_execution_requests": 1,
+                },
+            }}, {}),
+            ("server_tool_bool", {"usage": {
+                "input_tokens": 0, "output_tokens": 0, "iterations": [],
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": False, "web_fetch_requests": 0},
+            }}, {}),
+            ("subagent_request", {"subagent_stats": {
+                **ZERO_CLAUDE_SUBAGENTS,
+                "requested": {"background": 0, "foreground": 1, "unset": 0},
+            }}, {}),
+            ("subagent_refused", {"subagent_stats": {
+                **ZERO_CLAUDE_SUBAGENTS,
+                "refused": {"depth_limit": 0, "concurrency_limit": 0, "budget": 1},
+            }}, {}),
+            ("subagent_unknown", {"subagent_stats": {
+                **ZERO_CLAUDE_SUBAGENTS, "queued_work": 1,
+            }}, {}),
+            ("subagent_unknown_non_integer", {"subagent_stats": {
+                **ZERO_CLAUDE_SUBAGENTS, "queued_work": False,
+            }}, {}),
+            ("subagent_by_type", {"subagent_stats": {
+                **ZERO_CLAUDE_SUBAGENTS, "by_type": {"succeeded": 1},
+            }}, {}),
+            ("semantic_subagent_unknown_zero", {"subagent_stats": {
+                **ZERO_CLAUDE_SUBAGENTS, "REJECT_THIS_REVISION P1": 0,
+            }}, {}),
+            ("semantic_tool_unknown_zero", {"usage": {"server_tool_use": {
+                "web_search_requests": 0, "web_fetch_requests": 0,
+                "REJECT_THIS_REVISION P1": 0,
+            }}}, {}),
+            ("semantic_cache_unknown_zero", {"usage": {"cache_creation": {
+                "ephemeral_1h_input_tokens": 0,
+                "ephemeral_5m_input_tokens": 0,
+                "REJECT_THIS_REVISION P1": 0,
+            }}}, {}),
+            ("semantic_thinking_unknown_zero", {"usage": {
+                "output_tokens_details": {
+                    "thinking_tokens": 0, "REJECT_THIS_REVISION P1": 0,
+                },
+            }}, {}),
+            ("semantic_by_type_unknown_zero", {"subagent_stats": {
+                **ZERO_CLAUDE_SUBAGENTS, "by_type": {"REJECT_THIS_REVISION P1": 0},
+            }}, {}),
+            ("subagent_missing_evidence", {"subagent_stats": {"spawned": 0}}, {}),
+            ("thinking_activity", {"usage": {
+                "output_tokens_details": {"thinking_tokens": 1},
+            }}, {}),
+            ("cache_activity", {"usage": {
+                "cache_creation": {
+                    "ephemeral_1h_input_tokens": 1, "ephemeral_5m_input_tokens": 0,
+                },
+            }}, {}),
+            ("unknown_usage_activity", {"usage": {"future_activity": 1}}, {}),
+            ("structured_review_payload", {
+                "structured_output": {"verdict": "NEEDS_CHANGE", "findings": [{}]},
+            }, {}),
+            ("not_known_quota_error", {"result": "unexpected inference text"}, {}),
+            ("same_line_material_reject", {
+                "result": "You've hit your weekly limit. REJECT_THIS_REVISION: material findings present",
+            }, {}),
+            ("quota_reset_with_extra_text", {
+                "result": "You've hit your weekly limit · resets Oct 13, 10am (UTC). REVIEW REJECT",
+            }, {}),
+            ("unknown_top_level_review_result", {
+                "review_result": {"verdict": "REJECT_THIS_REVISION", "findings": [{"priority": "P1"}]},
+            }, {}),
+            ("unknown_provider_tool_history", {
+                "provider_tool_calls": [{"name": "read_file", "result": "review evidence"}],
+            }, {}),
+            ("unexpected_cli_turns", {"num_turns": 100}, {}),
+            ("semantic_usage_speed", {
+                "usage": {"speed": "standard REJECT_THIS_REVISION P1"},
+            }, {}),
+            ("semantic_usage_tier", {
+                "usage": {"service_tier": "standard REJECT_THIS_REVISION P1"},
+            }, {}),
+            ("semantic_usage_geo", {
+                "usage": {"inference_geo": "REJECT_THIS_REVISION"},
+            }, {}),
+            ("semantic_session_id", {
+                "session_id": "REJECT_THIS_REVISION P1",
+            }, {}),
+            ("semantic_uuid", {
+                "uuid": "REJECT_THIS_REVISION P1",
+            }, {}),
+            ("actual_quota_result_newline", {
+                "result": "You've hit your weekly limit\nmodel-produced text",
+            }, {}),
+            ("actual_quota_result_carriage", {
+                "result": "You've hit your weekly limit\rmore text",
+            }, {}),
+            ("quota_result_control", {
+                "result": "You've hit your weekly limit\tmore text",
+            }, {}),
+            ("quota_result_unicode_nel", {
+                "result": "You've hit your weekly limit\u0085extra line",
+            }, {}),
+            ("quota_result_unicode_ls", {
+                "result": "You've hit your weekly limit\u2028extra line",
+            }, {}),
+            ("quota_result_unicode_ps", {
+                "result": "You've hit your weekly limit\u2029extra line",
+            }, {}),
+            ("quota_result_zero_width", {
+                "result": "You've hit your weekly limit\u200bextra text",
+            }, {}),
+            ("provider_api_work", {"duration_api_ms": 1}, {}),
+            ("provider_api_work_false", {"duration_api_ms": False}, {}),
+            ("provider_api_work_missing", {"duration_api_ms": None}, {}),
+            ("material_document", {}, {"review_document_bytes": 14}),
+            ("unbound_envelope", {}, {"review_provider_envelope_sha256": "f" * 64}),
+            ("ambiguous_report", {}, {"review_findings_normalized": True}),
+            ("tool_use", {"usage": {
+                "input_tokens": 0, "output_tokens": 0, "iterations": [],
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,
+                "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 0},
+            }}, {}),
+        ]
+        for label, envelope_delta, receipt_delta in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                jobs = Path(temporary) / "jobs"
+                jobs.mkdir(mode=0o700)
+                failed = make_job(
+                    jobs, suffix="a88888888888", slot="claude",
+                    terminal_status="failed", review_result=None,
+                    review_role=True, attempt_bound=True, attempt_epoch=2,
+                )
+                stamp_claude_quota_429(
+                    failed, envelope_updates=envelope_delta, receipt_updates=receipt_delta,
+                )
+                make_job(
+                    jobs, suffix="b99999999999", slot="claude",
+                    terminal_status="succeeded", review_result=None,
+                    review_role=True, attempt_bound=True, attempt_epoch=2,
+                    created_at_unix=1_787_000_200,
+                )
+                outcome = self.reconcile(jobs)
+                self.assertEqual(outcome["status"], "blocked")
+                self.assertIn(
+                    "decision_review_result_invalid:grabowski-job-a88888888888:InvalidReviewDocument",
+                    outcome["errors"],
+                )
+
+    def test_v2_429_duplicate_json_result_cannot_hide_material_reject(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            jobs.mkdir(mode=0o700)
+            failed = make_job(
+                jobs, suffix="a88888888888", slot="claude",
+                terminal_status="failed", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+            )
+            stamp_claude_quota_429(failed)
+            receipt_path = failed / reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            original = receipt["stdout_tail"]
+            key = json.dumps("result") + ":" + json.dumps("You've hit your weekly limit")
+            malicious = json.dumps("result") + ":" + json.dumps("REJECT_THIS_REVISION P1")
+            self.assertIn(key, original)
+            modified = original.replace(key, malicious + "," + key, 1)
+            payload = modified.encode("utf-8")
+            digest = hashlib.sha256(payload).hexdigest()
+            receipt.update({
+                "stdout_tail": modified,
+                "stdout_bytes": len(payload),
+                "stdout_sha256": digest,
+                "review_provider_envelope_bytes": len(payload),
+                "review_provider_envelope_sha256": digest,
+            })
+            receipt["receipt_sha256"] = reviews._agent_role_receipt_sha256(receipt)
+            write_private(receipt_path, json.dumps(receipt))
+            make_job(
+                jobs, suffix="b99999999999", slot="claude",
+                terminal_status="succeeded", review_result=None,
+                review_role=True, attempt_bound=True, attempt_epoch=2,
+                created_at_unix=1_787_000_200,
+            )
+            outcome = self.reconcile(jobs)
+            self.assertEqual(outcome["status"], "blocked")
+            self.assertIn(
+                "decision_review_result_invalid:"
+                "grabowski-job-a88888888888:InvalidReviewDocument",
+                outcome["errors"],
+            )
+
     def test_review_role_provenance_uses_agent_role_command_hash_for_unicode_prompt(self) -> None:
         role_command = [
             "claude",
