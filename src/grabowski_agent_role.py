@@ -1370,7 +1370,12 @@ def parse_review_document(
 def classify_result(role: str, command: list[str], repo: Path, payload: dict[str, Any]) -> str:
     """Classify one final role result without trusting user-controlled output text."""
     returncode = payload.get("returncode")
-    if payload.get("error") == "read-only role observed writer mutation":
+    if (
+        payload.get("postflight_error_type") is not None
+        or payload.get("error") == "read-only role observed writer mutation"
+    ):
+        # Post-provider binding uncertainty cannot be repaired as a presumed
+        # pre-result infrastructure failure, even when the provider said PASS.
         return "writer_binding_violation"
     if payload.get("error") == "role stdout or stderr exceeded the bounded capture limit":
         return "output_limit_exceeded"
@@ -1504,7 +1509,17 @@ def main(argv: list[str] | None = None) -> int:
         stdout_content_limit=review_content_limit,
         stdin_content=review_stdin,
     )
-    after_head, after_diff, after_dirty = current_binding(repo, args.expected_base_head)
+    # The provider has already executed. A concurrent writer may remove a
+    # transient untracked file between enumeration and lstat. Never lose the
+    # possibly material review verdict by crashing before create-only receipt.
+    # An unobservable postflight is always a binding violation, not a PASS or
+    # a retryable pre-provider failure.
+    postflight_error_type: str | None = None
+    try:
+        after_head, after_diff, after_dirty = current_binding(repo, args.expected_base_head)
+    except (OSError, RuntimeError) as exc:
+        after_head, after_diff, after_dirty = None, None, None
+        postflight_error_type = type(exc).__name__
     payload: dict[str, Any] = {
         "schema_version": 1,
         "role": args.role,
@@ -1536,7 +1551,11 @@ def main(argv: list[str] | None = None) -> int:
     if completed.output_limit_exceeded:
         payload["returncode"] = 124
         payload["error"] = "role stdout or stderr exceeded the bounded capture limit"
-    if after_head != before_head or after_diff != before_diff or after_dirty != before_dirty:
+    if postflight_error_type is not None:
+        payload["postflight_error_type"] = postflight_error_type
+        payload["returncode"] = 125
+        payload["error"] = "read-only role postflight binding unobservable"
+    elif after_head != before_head or after_diff != before_diff or after_dirty != before_dirty:
         payload["returncode"] = 125
         payload["error"] = "read-only role observed writer mutation"
     if args.role == "review":

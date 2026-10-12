@@ -362,6 +362,85 @@ class GrokReviewRoleTests(unittest.TestCase):
                 k: v for k, v in receipt.items() if k != "receipt_sha256"
             }))
 
+    def test_postflight_file_disappearance_seals_review_without_synthetic_pass(self) -> None:
+        # Regression for #1418: a real semantic review may precede the race.
+        finding = {
+            "severity": "P1", "path": "src/security.py", "line": 44,
+            "evidence": "A concrete authorization bypass exists",
+            "impact": "A protected effect could bypass admission",
+            "minimal_fix": "Bind effect-time authorization to the exact revision",
+        }
+        for verdict, findings in (("PASS", []), ("NEEDS_CHANGE", [finding])):
+            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as temporary:
+                unit = "grabowski-job-a11111111111"
+                directory = Path(temporary) / unit
+                directory.mkdir(mode=0o700)
+                output = directory / role.REVIEW_ATTEMPT_RECEIPT_NAME
+                head, base, diff = "a" * 40, "b" * 40, "c" * 64
+                document = json.dumps({"verdict": verdict, "findings": findings}).encode()
+                completed = SimpleNamespace(
+                    returncode=0,
+                    stdout_sha256=hashlib.sha256(document).hexdigest(),
+                    stderr_sha256=hashlib.sha256(b"").hexdigest(),
+                    stdout_bytes=len(document), stderr_bytes=0,
+                    stdout_tail="", stderr_tail="", output_limit_exceeded=False,
+                    stdout_content_exceeded=False, stdout_content=document,
+                )
+                environment = {
+                    "GRABOWSKI_REVIEW_ATTEMPT_UNIT": unit,
+                    "GRABOWSKI_JOB_UNIT": unit,
+                    "GRABOWSKI_JOB_ID": "a11111111111",
+                    "GRABOWSKI_JOB_ORIGIN_SHA256": "d" * 64,
+                    "GRABOWSKI_JOB_DIRECTORY": str(directory),
+                }
+                disappeared = FileNotFoundError(
+                    errno.ENOENT, "No such file or directory",
+                    str(ROOT / ".browser-semantic-test-disappeared"),
+                )
+                with (
+                    mock.patch.dict(os.environ, environment),
+                    mock.patch.object(
+                        role, "current_binding",
+                        side_effect=[(head, diff, False), disappeared],
+                    ),
+                    mock.patch.object(role, "committed_diff", return_value=b"frozen diff"),
+                    mock.patch.object(
+                        role, "_review_sandbox_argv",
+                        return_value=(["sandbox"], None, None),
+                    ),
+                    mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                    mock.patch.object(role, "run_bounded_capture", return_value=completed),
+                    mock.patch.object(
+                        role, "toolchain_probe",
+                        side_effect=AssertionError("not a toolchain error"),
+                    ),
+                ):
+                    result = role.main([
+                        "--role", "review", "--repository", str(ROOT),
+                        "--expected-head", head, "--expected-base-head", base,
+                        "--expected-diff-sha256", diff, "--expected-dirty", "false",
+                        "--output", str(output), "--", "grok", "--model", "grok-4.6",
+                        "Review immutable source",
+                    ])
+                self.assertEqual(result, 125)
+                receipt = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["failure_classification"], "writer_binding_violation")
+                self.assertEqual(receipt["postflight_error_type"], "FileNotFoundError")
+                self.assertIsNone(receipt["head_after"])
+                self.assertIsNone(receipt["diff_after"])
+                self.assertIsNone(receipt["worktree_dirty_after"])
+                self.assertEqual(receipt["verdict"], verdict)
+                self.assertEqual(receipt["findings"], findings)
+                self.assertEqual(receipt["review_attempt_unit"], unit)
+                self.assertEqual(receipt["review_attempt_origin_sha256"], "d" * 64)
+                self.assertEqual(
+                    receipt["receipt_sha256"],
+                    role.digest({key: val for key, val in receipt.items()
+                                 if key != "receipt_sha256"}),
+                )
+                with self.assertRaises(FileExistsError):
+                    role.write_receipt(output, {"verdict": "PASS"}, create_only=True)
+
     def test_role_main_rejects_cross_attempt_environment_before_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             unit = "grabowski-job-a11111111111"
