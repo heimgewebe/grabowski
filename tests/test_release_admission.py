@@ -186,6 +186,94 @@ class DecisionBoundReleaseReviewTests(unittest.TestCase):
         self.assertIn("historical pre-merge review authorization", result["does_not_establish"])
 
 
+class GitObjectWidthContractTests(unittest.TestCase):
+    """Syntax-only compatibility, never a substitute for protected R3/Captain."""
+
+    def test_exact_sha256_target_is_forwarded_to_real_check_origin_contract(self) -> None:
+        target = "b" * 64
+        response = Mock()
+        response.status = 200
+        response.getheader.return_value = ""
+        response.read.return_value = json.dumps({
+            "total_count": 2,
+            "check_runs": [
+                _ci_result("validate (3.10)", 201, sha=target),
+                _ci_result("validate (3.12)", 202, sha=target),
+            ],
+        }).encode()
+        connection = Mock()
+        connection.getresponse.return_value = response
+        with patch.object(admission.http.client, "HTTPSConnection", return_value=connection):
+            result = admission._fresh_github_checks(target)
+        self.assertEqual(target, result["checks"][0]["head_sha"])
+        self.assertIn(target, connection.request.call_args.args[1])
+
+    def test_incomplete_and_wrongcase_git_ids_reject_before_github_lookup(self) -> None:
+        with patch.object(admission.http.client, "HTTPSConnection") as connection:
+            for head in ("b" * 39, "b" * 41, "b" * 52, "b" * 63,
+                         "b" * 65, "B" * 40, "B" * 64):
+                with self.subTest(length=len(head), case=head[:1]):
+                    with self.assertRaises(admission.ReleaseAdmissionDenied):
+                        admission._fresh_github_checks(head)
+        connection.assert_not_called()
+
+    def test_exact_sha256_review_namespace_is_not_an_automatic_pass(self) -> None:
+        target = "b" * 64
+        serving = "a" * 64
+        decisions = types.ModuleType("grabowski_decision_reviews")
+        merge_guard = types.ModuleType("grabowski_merge_guard")
+        decisions.reconcile = Mock(return_value=_reconciliation(head=target, base=serving))
+        merge_guard.independent_review_reconciliation_summary = Mock(
+            return_value={"pass_count": 1, "admissible_slots": ["synthetic-only"],
+                          "errors": []})
+        with patch.dict(sys.modules, {
+            "grabowski_decision_reviews": decisions,
+            "grabowski_merge_guard": merge_guard,
+        }):
+            result = admission.validate_independent_release_review(
+                serving_head=serving, target_head=target,
+                diff_sha256=DIFF, review_pr=1452)
+        self.assertEqual(1, result["independent_pass_count"])
+        self.assertEqual(target, decisions.reconcile.call_args.kwargs["head_sha"])
+
+    def test_mixed_git_object_formats_deny_before_any_external_review(self) -> None:
+        with (
+            patch.object(admission, "validate_independent_release_review") as review,
+            patch.object(admission, "_fresh_github_checks") as ci,
+        ):
+            for serving, target, source_tree, target_tree in (
+                ("a" * 40, "b" * 64, "1" * 40, "2" * 64),
+                ("a" * 64, "b" * 64, "1" * 40, "2" * 64),
+                ("a" * 64, "b" * 64, "1" * 64, "2" * 40),
+                ("a" * 64, "b" * 63, "1" * 64, "2" * 64),
+            ):
+                with self.subTest(lengths=(len(serving), len(target),
+                                           len(source_tree), len(target_tree))):
+                    with self.assertRaises(admission.ReleaseAdmissionDenied):
+                        admission.validate_release(
+                            serving_head=serving, target_head=target,
+                            serving_release_id="test-only", serving_tree=source_tree,
+                            target_tree=target_tree, diff_sha256=DIFF, review_pr=1452)
+        review.assert_not_called()
+        ci.assert_not_called()
+
+    def test_matching_sha256_tree_ids_are_only_a_syntactic_admission(self) -> None:
+        with (
+            patch.object(admission, "validate_independent_release_review",
+                         return_value={"synthetic-only": True}) as review,
+            patch.object(admission, "_fresh_github_checks",
+                         return_value={"checks": [], "checks_sha256": "e" * 64}) as ci,
+        ):
+            response = admission.validate_release(
+                serving_head="a" * 64, target_head="b" * 64,
+                serving_release_id="test-only", serving_tree="1" * 64,
+                target_tree="2" * 64, diff_sha256=DIFF, review_pr=1452)
+        self.assertEqual("b" * 64, response["target_head"])
+        self.assertIn("Captain runtime-deploy decision", response["does_not_establish"])
+        review.assert_called_once()
+        ci.assert_called_once_with("b" * 64)
+
+
 class DirectSchedulerDenialTests(unittest.TestCase):
     def test_critical_source_cannot_use_review_pr_without_captain_context(self):
         import grabowski_self_deploy as deploy
