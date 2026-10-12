@@ -399,12 +399,23 @@ def _default_reconciliation(repo: str) -> dict[str, Any]:
             "source_snapshot": {"repository_errors": []},
         }
 
+    if (
+        grabowski_checkout_binding_reconciler.MAX_SINGLE_ADMISSION_BINDINGS
+        != MAX_COMPLETE_RECONCILIATIONS
+    ):
+        raise RuntimeError("single-snapshot reconciliation capacity contract drift")
+
     def load_page(cursor: str | None) -> dict[str, Any]:
+        if cursor is not None:
+            raise RuntimeError("single-snapshot reconciliation returned continuation")
+        # Previous pagination opened a fresh SQLite/WAL and Git snapshot for
+        # every 100 bindings. A concurrent writer could change any subsequent
+        # snapshot. One bounded result has one immutable source/Git identity.
         return grabowski_checkout_binding_reconciler.reconcile_checkout_bindings(
             db_path=grabowski_checkouts.CHECKOUT_DB,
             repository_filters=[repo],
             limit=MAX_RECONCILIATIONS,
-            cursor=cursor,
+            _single_complete_snapshot=True,
         )
 
     return _consume_reconciliation_pages(load_page)
