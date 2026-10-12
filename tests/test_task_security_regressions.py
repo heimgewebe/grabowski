@@ -1688,5 +1688,41 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             )
 
 
+    def test_writable_file_mount_cannot_alias_read_only_sources(self) -> None:
+        """Even a private individual file cannot be RW-aliased into a read-only tree."""
+        from pathlib import Path
+
+        workspace = self.root / "readonly-source"
+        workspace.mkdir()
+        git_common = self.root / "readonly-git-common"
+        git_common.mkdir()
+        runtime_root = self.root / "readonly-runtime"
+        runtime_root.mkdir()
+        for name, protected_root, options in (
+            ("workspace", workspace, {}),
+            ("git", git_common, {"git_common_dir": git_common}),
+            ("runtime", runtime_root, {
+                "extra_read_only": ((runtime_root, runtime_root),),
+            }),
+        ):
+            with self.subTest(source=name):
+                private = protected_root / "private.txt"
+                private.write_text("unchanged", encoding="utf-8")
+                private.chmod(0o600)
+                with self.assertRaisesRegex(
+                    tasks.agent_sandbox.AgentSandboxError, "read-only|overlap",
+                ):
+                    tasks.agent_sandbox.minimal_sandbox_argv(
+                        workspace=workspace,
+                        command=["/usr/bin/true"],
+                        workspace_writable=False,
+                        extra_read_write=((
+                            private, Path("/tmp/grabowski-private-file-alias"),
+                        ),),
+                        **options,
+                    )
+                self.assertEqual(private.read_text(encoding="utf-8"), "unchanged")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -966,6 +966,13 @@ def minimal_sandbox_argv(
             or worktree.is_relative_to(source)
         ):
             raise AgentSandboxError("extra writable source overlaps hidden workspace")
+        if any(
+            source == protected
+            or source.is_relative_to(protected)
+            or protected.is_relative_to(source)
+            for protected in read_only_sources
+        ):
+            raise AgentSandboxError("extra writable file overlaps a read-only mount source")
         target_path = Path(target_value)
         if (
             not target_path.is_absolute()
