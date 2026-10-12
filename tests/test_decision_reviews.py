@@ -2186,5 +2186,65 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
         self.assertEqual(reconciled["slots"][0]["independent_pass_count"], 1)
 
 
+    def test_sha256_decision_review_clock_key_binds_full_oid(self) -> None:
+        keys = {}
+        for width in (40, 64):
+            with self.subTest(width=width):
+                normalized = reviews.normalize_binding({
+                    **binding("independent-reviewer"),
+                    "head_sha": "a" * width, "base_sha": "b" * width,
+                })
+                key = job_origin._decision_review_order_key({
+                    "decision_bound_review": normalized,
+                })
+                self.assertIsNotNone(key)
+                expected = hashlib.sha256(job_origin.canonical_json_bytes({
+                    "repo": REPO, "pr": PR, "head_sha": "a" * width,
+                })).hexdigest()
+                self.assertEqual(expected, key)
+                keys[width] = key
+        self.assertNotEqual(keys[40], keys[64])
+        for width in (39, 41, 63, 65):
+            with self.subTest(malformed_width=width):
+                with self.assertRaisesRegex(ValueError, "invalid for causal ordering"):
+                    job_origin._decision_review_order_key({
+                        "decision_bound_review": {
+                            **binding("independent-reviewer"), "head_sha": "a" * width,
+                        },
+                    })
+
+    def test_sha256_decision_review_clock_allocates_monotone_nanos(self) -> None:
+        normalized = reviews.normalize_binding({
+            **binding("independent-reviewer"),
+            "head_sha": "a" * 64, "base_sha": "b" * 64,
+        })
+        created = 1_790_000_000
+        initial_ns = created * 1_000_000_000 + 123
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = root / "jobs"
+            jobs.mkdir()
+
+            def allocate(head: str) -> int:
+                scope = {
+                    "decision_bound_review": {**normalized, "head_sha": head},
+                    "started_at_unix_ns": initial_ns,
+                }
+                seconds = job_origin._allocate_decision_review_order(
+                    scope, created, order_root=root / "order", jobs_root=jobs,
+                )
+                self.assertEqual(created, seconds)
+                self.assertEqual(
+                    scope["started_at_unix_ns"],
+                    job_origin._validate_decision_review_order_point(scope, created),
+                )
+                return scope["started_at_unix_ns"]
+
+            first = allocate("a" * 64)
+            second = allocate("a" * 64)
+            other = allocate("c" * 64)
+            self.assertEqual(first + 1, second)
+            self.assertEqual(initial_ns, other)
+
 if __name__ == "__main__":
     unittest.main()
