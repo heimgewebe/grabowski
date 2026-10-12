@@ -1099,14 +1099,26 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             return result.stdout.strip()
 
         git("init", "-b", "topic")
+        protected = repo / "protected.txt"
+        protected.write_text("immutable baseline", encoding="utf-8")
+        git("add", "--", "protected.txt")
         git(
             "-c", "core.hooksPath=/dev/null",
             "-c", "user.name=Sandbox Test",
             "-c", "user.email=sandbox-test@localhost",
-            "commit", "--allow-empty", "-m", "scratch",
+            "commit", "-m", "scratch",
         )
         head = git("rev-parse", "HEAD")
         output = allowed / "writer-receipt.json"
+        created = allowed / "created.txt"
+        inner_code = (
+            "import errno,os,sys\n"
+            "try:\n"
+            " fd=os.open(sys.argv[1],os.O_WRONLY);os.close(fd);raise RuntimeError('outside writable')\n"
+            "except OSError as exc:\n"
+            " assert exc.errno==errno.EROFS,exc\n"
+            "with open(sys.argv[2],'w',encoding='utf-8') as f:f.write('bounded effect')\n"
+        )
         writer = [
             str(runtime), "-m", "grabowski_agent_writer",
             "--repository", str(repo),
@@ -1114,7 +1126,8 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             "--expected-branch", "topic",
             "--allowed-path", "allowed",
             "--output", str(output),
-            "--", "/usr/bin/true",
+            "--", "/usr/bin/python3", "-I", "-c", inner_code,
+            str(protected), str(created),
         ]
         record = {
             "task_id": "sandbox-writer-test",
@@ -1171,6 +1184,11 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         self.assertEqual(payload.get("returncode"), 0)
         self.assertEqual(payload.get("head_before"), payload.get("head_after"))
         self.assertEqual(payload.get("head_before"), head)
+        self.assertEqual(protected.read_text(encoding="utf-8"), "immutable baseline")
+        self.assertEqual(created.read_text(encoding="utf-8"), "bounded effect")
+        after = git("status", "--porcelain", "--untracked-files=all")
+        self.assertIn("allowed/created.txt", after)
+        self.assertNotIn("protected.txt", after)
 
 
     def test_framework_role_receipt_requires_exact_outer_output_mount(self) -> None:
