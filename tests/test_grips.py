@@ -23911,3 +23911,34 @@ class SagaExternalMergeCloseoutGripTests(unittest.TestCase):
             specs["saga-external-merge-closeout"]["availability"]["available"]
         )
         self.assertTrue(specs["saga-settle"]["availability"]["available"])
+
+    def test_existing_terminal_scan_accepts_spaced_json_and_detects_duplicates(self) -> None:
+        record = {"operation": "saga-external-merge-closeout",
+                  "plan_sha256": self.plan["plan_sha256"]}
+        raw = (json.dumps(record) + "\n").encode("utf-8")
+        snapshot = types.SimpleNamespace(
+            segments=[types.SimpleNamespace(captured_data=raw)]
+        )
+        with patch("grabowski_audit_query.capture_verified_audit_snapshot", return_value=snapshot):
+            self.assertEqual(record, grips._saga_external_merge_existing_audit(self.plan["plan_sha256"]))
+        snapshot.segments[0].captured_data = raw + raw
+        with patch("grabowski_audit_query.capture_verified_audit_snapshot", return_value=snapshot):
+            with self.assertRaisesRegex(grips.GripActionError, "multiple terminal"):
+                grips._saga_external_merge_existing_audit(self.plan["plan_sha256"])
+
+    def test_unpaginated_deep_compare_binds_rightmost_head(self) -> None:
+        original_github = self.github
+
+        def deep_compare(repo, argv):
+            result = original_github(repo, argv)
+            if argv[0] == "api" and "/compare/" in argv[1]:
+                self.assertNotIn("page=", argv[1])
+                body = json.loads(result["stdout"])
+                body["ahead_by"] = 300
+                result["stdout"] = json.dumps(body)
+            return result
+
+        self.github = deep_compare
+        result, append = self.run_closeout()
+        self.assertEqual("passed", result["status"])
+        append.assert_called_once()

@@ -12492,7 +12492,9 @@ def _saga_external_merge_existing_audit(plan_sha256: str) -> dict[str, Any] | No
             f"external merge verified audit snapshot unavailable: {type(exc).__name__}"
         ) from exc
 
-    needle = f'"plan_sha256":"{plan_sha256}"'.encode("ascii")
+    # Match the verified record's operation independently of JSON separators.
+    # After parsing, compare the exact plan SHA and reject any duplicate terminal.
+    needle = b'"saga-external-merge-closeout"'
     match: dict[str, Any] | None = None
     for segment in reversed(snapshot.segments):
         try:
