@@ -778,5 +778,83 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 tasks._require_direct_codex_filesystem_sandbox(argv)
 
 
+    def test_unverified_command_carrier_and_attached_python_source(self) -> None:
+        # Admission-only. No CLI, script, dynamic loader or coding agent starts.
+        dangerous = (
+            ["python3", "-cimport os;os.execvp('co'+'dex', ['co'+'dex','exec'])"],
+            ["python3", "-I", "-cimport os;os.execvp('co'+'dex', ['co'+'dex','exec'])"],
+            ["bash", "--rcfile", "/tmp/user-config.sh", "-ic", "printf safe"],
+            ["bash", "--init-file", "/tmp/user-config.sh", "-ic", "printf safe"],
+            ["systemd-run", "--user", "codex", "exec", "prompt"],
+            ["xargs", "codex", "exec", "prompt"],
+            ["script", "-c", "codex exec prompt", "/dev/null"],
+            ["flock", "/tmp/lock", "codex", "exec", "prompt"],
+            ["watch", "-n", "1", "codex", "exec", "prompt"],
+            ["unshare", "codex", "exec", "prompt"],
+            ["nsenter", "--target", "1", "codex", "exec", "prompt"],
+            ["setpriv", "codex", "exec", "prompt"],
+            ["runuser", "-u", "test", "--", "codex", "exec", "prompt"],
+            ["su", "-c", "codex exec prompt"],
+            ["ionice", "-c", "3", "bash", "-c", "codex exec prompt"],
+            ["taskset", "-c", "0", "codex", "exec", "prompt"],
+            ["chrt", "--fifo", "1", "codex", "exec", "prompt"],
+            ["sudo", "-E", "bash", "-c", "printf safe"],
+            ["doas", "-E", "bash", "-c", "printf safe"],
+        )
+        for argv in dangerous:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        # Normal literal interpreter output and non-agent command data stay
+        # permissible through this narrow name-based admission guard.
+        for argv in (
+            ["python3", "-cprint('safe')"],
+            ["python3", "-I", "-cprint('safe')"],
+            ["env", "FOO=bar", "cargo", "test"],
+            ["bash", "-c", "printf safe"],
+        ):
+            with self.subTest(allowed=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
+    def test_busybox_applet_alias_is_checked_at_actual_command_position(self) -> None:
+        # A symlinked BusyBox applet uses argv[0] as the applet selector.
+        # It does NOT expect an explicit argv[1] applet name.
+        alias = self.root / "env"
+        alias.symlink_to("/usr/bin/busybox")
+        argv = [str(alias), "FOO=bar", "codex", "exec", "prompt"]
+        with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+            tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_opaque_launcher_rejected_before_dispatch_or_task_insert(self) -> None:
+        # Synthetic task start only. No command is launched.
+        for argv in (
+            ["systemd-run", "--user", "codex", "exec", "prompt"],
+            ["python3", "-cimport os;os.execvp('co'+'dex',['co'+'dex','exec'])"],
+        ):
+            with (
+                self.subTest(argv=argv),
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(tasks, "_validate_command", return_value=argv),
+                patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 166}),
+                patch.object(tasks, "_dispatch") as dispatch,
+                patch.object(tasks, "_launch") as launch,
+                patch.object(tasks.resources, "acquire_resources") as acquire,
+                patch.object(tasks.base, "_append_audit"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks.grabowski_task_start(
+                        "local", argv, cwd=str(self.root), runtime_seconds=60
+                    )
+                dispatch.assert_not_called()
+                launch.assert_not_called()
+                acquire.assert_not_called()
+                with tasks._database_connection() as connection:
+                    count = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+                self.assertEqual(count, 0)
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4108,17 +4108,42 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
         "bunx", "yarn", "corepack", "uv", "uvx", "perl", "ruby",
         "time", "sudo", "doas", "busybox",
     }
+    # Commands that can execute an arbitrary, dynamically selected child must
+    # not gain write authority by passing a superficial argv token scan. The
+    # separately sandboxed agent-writer route is required for these launchers.
+    unverified_carriers = frozenset({
+        "systemd-run", "xargs", "script", "flock", "watch",
+        "unshare", "nsenter", "setpriv", "runuser", "su",
+        "ionice", "taskset", "chrt",
+        "npx", "npm", "pnpm", "bun", "bunx", "yarn",
+        "corepack", "uv", "uvx",
+    })
     # A filesystem symlink may rename a known prefix launcher. Recognize
     # its resolved executable before interpreting argv; argv0 alone is not
     # authority for selecting a less restrictive command path.
     resolved_binary = Path(resolved_executable).name.casefold()
-    if (
+    if resolved_binary == "busybox" and executable != "busybox":
+        # BusyBox symlink applets choose the child program from argv[0],
+        # not argv[1]. Treating it as a literal busybox invocation would
+        # skip the actual applet's command/assignment parsing.
+        if executable in {"ash", "hush"}:
+            executable = "sh"
+        elif executable not in wrappers and executable not in unverified_carriers:
+            raise RuntimeError(
+                "Codex filesystem sandbox cannot verify BusyBox applet alias"
+            )
+    elif (
         resolved_binary in wrappers
+        or resolved_binary in unverified_carriers
         or re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)?)?", resolved_binary)
         or resolved_binary == "ld.so"
         or re.fullmatch(r"ld-linux[^/]*\.so(?:\.[0-9]+)*", resolved_binary)
     ):
         executable = resolved_binary
+    if executable in unverified_carriers:
+        raise RuntimeError(
+            "Codex filesystem sandbox cannot verify opaque command launcher"
+        )
     python_interpreter = re.fullmatch(
         r"python(?:[0-9]+(?:\.[0-9]+)?)?", executable
     ) is not None
@@ -4297,8 +4322,14 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                 takes_value = {"--argv0"}
                 attached = option.startswith("--argv0=")
             else:
-                simple = {"-n", "-E", "-H", "-k", "-K", "-S", "-b", "-P",
-                          "--non-interactive", "--preserve-env", "--login",
+                # Preserved inherited environment can activate executable
+                # preload hooks without any NAME=value token in argv.
+                if option in {"-E", "--preserve-env"} or option.startswith("--preserve-env="):
+                    raise RuntimeError(
+                        "Codex filesystem sandbox cannot verify preserved environment"
+                    )
+                simple = {"-n", "-H", "-k", "-K", "-S", "-b", "-P",
+                          "--non-interactive", "--login",
                           "--set-home", "--reset-timestamp"}
                 takes_value = {"-u", "-g", "-C", "-p", "-D", "-r", "-t",
                                "--user", "--group", "--chdir",
@@ -4329,6 +4360,19 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
     # data, not program names. Keep literal -c payloads under inspection.
     payload_tokens = argv[1:]
     if executable in {"sh", "bash", "dash", "zsh", "fish"}:
+        # Interactive shell startup files execute before otherwise safe -c
+        # arguments. Reject them instead of inspecting only the -c body.
+        for shell_option in argv[1:]:
+            if shell_option in {"--rcfile", "--init-file"} or shell_option.startswith(
+                ("--rcfile=", "--init-file=")
+            ):
+                raise RuntimeError(
+                    "Codex filesystem sandbox cannot verify shell startup file"
+                )
+            if not shell_option.startswith("-") or (
+                not shell_option.startswith("--") and "c" in shell_option[1:]
+            ):
+                break
         shell_code = None
         for index, option in enumerate(argv[1:-1], 1):
             if (
@@ -4422,6 +4466,10 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                                 # The query-only forms of command do not exec.
                                 offset = len(segment)
                             continue
+                        if prefix in {"source", "."}:
+                            raise RuntimeError(
+                                "Codex filesystem sandbox cannot verify sourced shell code"
+                            )
                         if prefix == "eval":
                             _require_direct_codex_filesystem_sandbox(
                                 ["bash", "-c", " ".join(segment[offset + 1:])]
@@ -4445,11 +4493,17 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
             "-I", "-B", "-S", "-E", "-s", "-u",
         }:
             module_index += 1
-        if (
-            len(argv) > module_index + 1
-            and argv[module_index] == "-c"
-        ):
-            if not harmless_inline_source(argv[module_index + 1], "python"):
+        # Python accepts both -c 'code' and -ccode. Validate the latter
+        # with the same AST, never by scanning for the literal word codex.
+        code_flag = argv[module_index] if module_index < len(argv) else ""
+        if code_flag == "-c" or code_flag.startswith("-c"):
+            if code_flag == "-c":
+                if len(argv) <= module_index + 1:
+                    raise RuntimeError("Codex filesystem sandbox cannot verify Python inline code")
+                source = argv[module_index + 1]
+            else:
+                source = code_flag[2:]
+            if not harmless_inline_source(source, "python"):
                 raise RuntimeError("Codex filesystem sandbox cannot verify Python inline code")
             payload_tokens = []
         elif (
