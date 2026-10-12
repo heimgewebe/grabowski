@@ -2054,3 +2054,135 @@ def settle(
         ],
     }
     return {**body, "settlement_sha256": sha256_json(body), "receipt_status": "passed" if state in {"settled", "readback_pending"} else "blocked"}
+
+
+def settle_external_merge(
+    *,
+    plan_value: Any,
+    run_receipt_value: Any,
+    captain_result_value: Any,
+    readback_value: Any,
+) -> dict[str, Any]:
+    """Record an external merge as terminal, never as a Captain apply.
+
+    Both the Saga run and blocked Captain completion must already exist in the
+    verified immutable audit chain. Only the caller-owned GitHub readback
+    supplies the *subsequent* actual merge identity.
+    """
+    plan = validate_plan(plan_value)
+    if plan["saga_kind"] != "pr-settlement":
+        raise SagaError("external merge closeout applies only to PR sagas")
+    if not is_saga_run_receipt_ref(run_receipt_value):
+        raise SagaError("external merge closeout requires an immutable Saga run audit reference")
+    if not is_captain_audit_result_ref(captain_result_value):
+        raise SagaError("external merge closeout requires an immutable Captain audit reference")
+
+    run = _verified_saga_run_receipt_reference(
+        plan, validate_saga_run_receipt_ref(run_receipt_value)
+    )
+    if run.get("captain_ready") is not True or run.get("state") != "captain_required":
+        raise SagaError("external merge Saga run was not Captain-ready")
+
+    audit = _verified_captain_audit_reference_identity(
+        plan, validate_captain_audit_result_ref(captain_result_value),
+        require_passed=False,
+    )
+    # The historical pre-execution block deliberately has no successful
+    # merge verification in Captain. It does attest a no-dispatch boundary.
+    expected_provenance = {
+        "provenance_schema_version": 2,
+        "execution_invoked": False,
+        "dispatch_succeeded": False,
+        "verification_passed": False,
+        "remote_mutation_observed": False,
+        "merge_completion_verified": False,
+        "merge_queued": False,
+        "external_merge_observed": True,
+        "observed_merge_sha": None,
+        "provenance_mode": "unverified",
+    }
+    if audit.get("status") != "blocked" or audit.get("merge_provenance") != expected_provenance:
+        raise SagaError("Captain audit does not prove the exact external-merge no-dispatch boundary")
+
+    readback = _bounded_mapping(readback_value, "external_merge_readback")
+    if set(readback) != {"pr", "base_branch", "base_to_merge", "merge_to_current"}:
+        raise SagaError("external merge readback has missing or unexpected fields")
+    pr = _bounded_mapping(readback["pr"], "external_merge_readback.pr")
+    result, reasons = _settle_pr(plan, pr)
+    if result != "settled":
+        raise SagaError("external merge PR identity is not verified: " + ", ".join(reasons))
+    merge_sha = pr["mergeCommit"]["oid"]
+    expected = plan["expected_identity"]
+    branch = _bounded_mapping(readback["base_branch"], "external_merge_readback.base_branch")
+    if (
+        set(branch) != {"name", "sha", "protected"}
+        or branch["name"] != expected["base"]
+        or branch["protected"] is not True
+    ):
+        raise SagaError("external merge base branch identity or protection is invalid")
+    current_head = _sha40(branch.get("sha"), "external merge current protected base SHA")
+
+    def check_ancestry(name: str, left: str, right: str, *, require_ahead: bool) -> None:
+        comparison = _bounded_mapping(readback[name], f"external_merge_readback.{name}")
+        if set(comparison) != {"status", "ahead_by", "behind_by", "base", "merge_base", "head"}:
+            raise SagaError(f"external merge {name} ancestry shape is invalid")
+        ahead = comparison.get("ahead_by")
+        if (
+            comparison.get("base") != left
+            or comparison.get("head") != right
+            or comparison.get("merge_base") != left
+            or type(ahead) is not int
+            or type(comparison.get("behind_by")) is not int
+            or comparison["behind_by"] != 0
+            or ahead < (1 if require_ahead else 0)
+            or comparison.get("status") != ("ahead" if require_ahead else "ahead" if ahead else "identical")
+        ):
+            raise SagaError(f"external merge {name} ancestry is not proven")
+
+    check_ancestry("base_to_merge", expected["expected_base_sha"], merge_sha, require_ahead=True)
+    check_ancestry("merge_to_current", merge_sha, current_head, require_ahead=False)
+    if merge_sha == current_head and readback["merge_to_current"]["ahead_by"] != 0:
+        raise SagaError("external merge current branch identity contradicts ancestry")
+    if merge_sha != current_head and readback["merge_to_current"]["ahead_by"] == 0:
+        raise SagaError("external merge current branch head is inconsistent")
+
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski.saga_external_merge_settlement",
+        "saga_kind": "pr-settlement",
+        "state": "externally_merged",
+        "plan_sha256": plan["plan_sha256"],
+        "run_sha256": run["run_sha256"],
+        "reviewed_diff_sha256": expected["expected_diff_sha256"],
+        "captain_audit_intent_record_sha256": audit["intent_record_sha256"],
+        "captain_audit_completion_record_sha256": audit["completion_record_sha256"],
+        "blocked_captain_receipt_sha256": audit["receipt_sha256"],
+        "captain_result_status": "blocked",
+        "captain_execution": "not_performed",
+        "captain_dispatch_succeeded": False,
+        "merge_provenance": "external_no_captain_apply",
+        "pr": expected["pr"],
+        "repository": expected["repository"],
+        "base": expected["base"],
+        "expected_base_sha": expected["expected_base_sha"],
+        "head_sha": expected["expected_head"],
+        "merged_commit_sha": merge_sha,
+        "current_protected_base_sha": current_head,
+        "readback_sha256": sha256_json(readback),
+        "phase_status": {
+            "prepare": "passed",
+            "plan": "passed",
+            "apply": "not_performed_by_captain",
+            "readback": "passed",
+            "settle": "externally_merged",
+        },
+        "retry_allowed": False,
+        "required_next_action": "none; preserve Captain no-dispatch evidence",
+        "does_not_establish": [
+            "Captain_merge_compliance",
+            "Captain_apply_success",
+            "absence_of_external_side_effects",
+            "future_correctness",
+        ],
+    }
+    return {**body, "settlement_sha256": sha256_json(body)}
