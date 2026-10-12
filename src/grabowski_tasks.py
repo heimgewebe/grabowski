@@ -8178,7 +8178,9 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
             _root_task_payload(
                 record,
                 "show",
-                properties=list(fleet.TASK_UNIT_SHOW_PROPERTIES),
+                properties=[
+                    *fleet.TASK_UNIT_SHOW_PROPERTIES, "Id", "Names", "InvocationID",
+                ],
             ),
             timeout_seconds=30,
             max_output_bytes=8192,
@@ -11398,20 +11400,31 @@ TASK_RECONCILE_READY_SCOPE = "quiescent-privileged-terminal-observations"
 def _task_reconcile_ready_privileged_rows(
     connection: sqlite3.Connection,
 ) -> list[dict[str, Any]]:
-    """Bound the privileged task set before readiness attestation or verification."""
-    rows = connection.execute(
+    """Stream archived history; bind at most the current privileged cohort.
+
+    Archive exclusion requires the verified projection plus exact per-row
+    record hashes. A modified archived task must fail closed, not be silently
+    promoted into a fresh readiness attestation.
+    """
+    projection = _task_current_projection()
+    records: list[dict[str, Any]] = []
+    for row in connection.execute(
         "SELECT * FROM tasks "
         "WHERE execution_backend='systemd-root-broker' OR systemd_scope='system' "
-        "ORDER BY task_id LIMIT ?",
-        (TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT + 1,),
-    ).fetchall()
-    if len(rows) > TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT:
-        raise RuntimeError("Privileged task inventory exceeds readiness proof budget")
-    records = [dict(row) for row in rows]
-    if any(not _is_root_systemd_backend(record) for record in records):
-        raise RuntimeError("Privileged task scope does not have an approved observer")
+        "ORDER BY task_id"
+    ):
+        record = dict(row)
+        current = lifecycle_projection.bounded_current_task_projection(
+            [_task_archive_record(record)], projection=projection,
+        )
+        if not current:
+            continue
+        if len(records) >= TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT:
+            raise RuntimeError("Current privileged task inventory exceeds readiness proof budget")
+        if not _is_root_systemd_backend(record):
+            raise RuntimeError("Privileged task scope does not have an approved observer")
+        records.append(record)
     return records
-
 
 def _task_reconcile_ready_rootbroker_terminal_observed(
     record: dict[str, Any], observed: Any,
@@ -11433,6 +11446,17 @@ def _task_reconcile_ready_rootbroker_terminal_observed(
     if type(observed_at) is not int or not 0 <= now - observed_at <= 30:
         return False
     if not isinstance(props, dict) or props.get("LoadState") != "loaded":
+        return False
+    # Even a historical observation must refer to this exact unit invocation,
+    # not a default property response from another broker target.
+    unit = _authoritative_unit(record)
+    invocation = props.get("InvocationID")
+    if (
+        props.get("Id") != unit
+        or unit not in str(props.get("Names", "")).split()
+        or not isinstance(invocation, str)
+        or re.fullmatch(r"[0-9a-fA-F]{32}", invocation) is None
+    ):
         return False
     # Systemd can advertise a successful Result while the same unit remains
     # active, activating, or deactivating. A textual terminal classification
@@ -11477,37 +11501,134 @@ def _task_reconcile_ready_privileged_digest(
     ])
 
 
-def _clear_task_reconcile_ready_evidence() -> None:
+TASK_RECONCILE_READY_CYCLE_METADATA_KEY = "task_reconcile_ready_cycle_v1"
+TASK_RECONCILE_READY_CYCLE_PHASES = ("task", "active", "terminal")
+
+
+def _clear_task_reconcile_ready_evidence(*, preserve_cycle: bool = False) -> None:
     with _database_connection() as connection:
         connection.execute(
             "DELETE FROM metadata WHERE key=?",
             (TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
         )
+        if not preserve_cycle:
+            connection.execute(
+                "DELETE FROM metadata WHERE key=?",
+                (TASK_RECONCILE_READY_CYCLE_METADATA_KEY,),
+            )
+
+
+def _task_reconcile_ready_cycle_progress(
+    connection: sqlite3.Connection,
+    result: dict[str, Any],
+) -> bool:
+    """Record consecutive, error-free pages for all three fair phases.
+
+    Exact cursor continuation survives process loss. Missing/mismatched cursor
+    history or a failed page erases partial confidence; a final page alone
+    cannot invent a successful full scan.
+    """
+    batch = result.get("batch")
+    pages = (
+        {
+            "task": batch,
+            "active": batch.get("active_refresh"),
+            "terminal": batch.get("terminalization_recovery"),
+        }
+        if isinstance(batch, dict) else {}
+    )
+    invalid = (
+        bool(result.get("task_id"))
+        or bool(result.get("blocked"))
+        or len(pages) != 3
+        or any(
+            not isinstance(page, dict)
+            or type(page.get("cycle_completed")) is not bool
+            or "cursor_before" not in page
+            or (not page["cycle_completed"] and page.get("cursor_after") is None)
+            for page in pages.values()
+        )
+        or bool(pages.get("terminal", {}).get("failed"))
+    )
+    if invalid:
+        connection.execute(
+            "DELETE FROM metadata WHERE key=?",
+            (TASK_RECONCILE_READY_CYCLE_METADATA_KEY,),
+        )
+        return False
+    rows = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (TASK_RECONCILE_READY_CYCLE_METADATA_KEY,),
+    ).fetchall()
+    try:
+        if rows:
+            if len(rows) != 1 or not isinstance(rows[0][0], str):
+                raise ValueError("Reconcile readiness cycle is invalid")
+            if len(rows[0][0]) > 4096:
+                raise ValueError("Reconcile readiness cycle exceeds budget")
+            progress = json.loads(rows[0][0])
+            if (
+                not isinstance(progress, dict)
+                or set(progress) != {"schema_version", "phases"}
+                or progress["schema_version"] != 1
+                or not isinstance(progress["phases"], dict)
+                or set(progress["phases"]) - set(TASK_RECONCILE_READY_CYCLE_PHASES)
+            ):
+                raise ValueError("Reconcile readiness cycle shape is invalid")
+        else:
+            progress = {"schema_version": 1, "phases": {}}
+        phases = progress["phases"]
+        for name in TASK_RECONCILE_READY_CYCLE_PHASES:
+            page = pages[name]
+            before = _canonical_json(page["cursor_before"])
+            completed = page["cycle_completed"]
+            previous = phases.get(name)
+            if previous is None:
+                if page["cursor_before"] is not None:
+                    raise ValueError("Reconcile readiness cycle start was not witnessed")
+                previous = {"complete": False, "next": "null"}
+            elif (
+                not isinstance(previous, dict)
+                or set(previous) != {"complete", "next"}
+                or type(previous["complete"]) is not bool
+                or not isinstance(previous["next"], str)
+            ):
+                raise ValueError("Reconcile readiness phase shape is invalid")
+            if not previous["complete"]:
+                if before != previous["next"]:
+                    raise ValueError("Reconcile readiness cursor chain has a gap")
+                previous = {
+                    "complete": completed,
+                    "next": (
+                        "null" if completed
+                        else _canonical_json(page["cursor_after"])
+                    ),
+                }
+            phases[name] = previous
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        connection.execute(
+            "DELETE FROM metadata WHERE key=?",
+            (TASK_RECONCILE_READY_CYCLE_METADATA_KEY,),
+        )
+        return False
+    if all(phases[name]["complete"] for name in TASK_RECONCILE_READY_CYCLE_PHASES):
+        connection.execute(
+            "DELETE FROM metadata WHERE key=?",
+            (TASK_RECONCILE_READY_CYCLE_METADATA_KEY,),
+        )
+        return True
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (TASK_RECONCILE_READY_CYCLE_METADATA_KEY, _canonical_json(progress)),
+    )
+    return False
 
 
 def _publish_task_reconcile_ready_evidence(result: dict[str, Any]) -> None:
-    batch = result.get("batch")
-    if (
-        result.get("task_id")
-        or result.get("blocked")
-        or not isinstance(batch, dict)
-        or batch.get("cycle_completed") is not True
-        or "cursor_before" not in batch
-        or batch["cursor_before"] is not None
-        or not isinstance(batch.get("active_refresh"), dict)
-        or batch["active_refresh"].get("cycle_completed") is not True
-        or "cursor_before" not in batch["active_refresh"]
-        or batch["active_refresh"]["cursor_before"] is not None
-        or not isinstance(batch.get("terminalization_recovery"), dict)
-        or batch["terminalization_recovery"].get("cycle_completed") is not True
-        or "cursor_before" not in batch["terminalization_recovery"]
-        or batch["terminalization_recovery"]["cursor_before"] is not None
-        or batch["terminalization_recovery"].get("failed")
-    ):
-        # Final pages cannot attest errors on earlier pages. Certify only a
-        # single complete cycle beginning at all three initial cursors.
-        return
     with _database_connection() as connection:
+        if not _task_reconcile_ready_cycle_progress(connection, result):
+            return
         # Live process termination does not bump an SQLite revision. Therefore
         # a persisted active task cannot be certified from a status snapshot.
         if connection.execute(
@@ -11632,6 +11753,16 @@ def _task_reconcile_ready_evidence_snapshot(
             or resource_revision["revision"] != proof["resource_revision"]
         ):
             return {"status": "stale"}
+        # A broker observation recorded earlier is historical evidence, not
+        # current process truth. A systemd unit may restart without touching
+        # either SQLite revision, even within the nominal five-minute TTL.
+        # READ_ONLY must never elevate such a cache to live readiness.
+        if privileged_records:
+            return {
+                "status": "privileged_live_unverified",
+                "reconciled_at_unix": timestamp,
+                "privileged_task_count": len(privileged_records),
+            }
         return {"status": "verified", "reconciled_at_unix": timestamp}
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, sqlite3.Error) as exc:
         return {"status": "unavailable", "error_type": type(exc).__name__}
@@ -12460,7 +12591,7 @@ async def _grabowski_task_reconcile_check_tool(
 def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
-        _clear_task_reconcile_ready_evidence()
+        _clear_task_reconcile_ready_evidence(preserve_cycle=not bool(task_id))
         result = _reconcile_tasks_refresh_locked(task_id=task_id)
         base._append_audit(
             {
@@ -12549,7 +12680,7 @@ async def _grabowski_task_reconcile_resume_tool(
 def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
-        _clear_task_reconcile_ready_evidence()
+        _clear_task_reconcile_ready_evidence(preserve_cycle=not auto_resume)
         result, refresh = _reconcile_tasks_locked(auto_resume=auto_resume)
         base._append_audit(
             {

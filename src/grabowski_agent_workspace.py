@@ -10667,10 +10667,34 @@ def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
         if connection is not None:
             connection.close()
     persisted_state = str(value.get("state", "unknown"))
-    # The nominal rootbroker show is a privileged mutation. Cleanup planning
-    # may not classify persisted privileged terminal states as live outcomes.
-    privileged = tasks._is_root_systemd_backend(value)
-    state = "observation_error" if privileged else persisted_state
+    # A stored terminal state is usable only for an explicitly local
+    # user-systemd task. SSH/unknown transports cannot be observed by cleanup:
+    # SSH can modify known_hosts and ControlPath sockets even for "show".
+    # An unconfigured/legacy backend or scope also cannot certify execution.
+    backend = value.get("execution_backend")
+    scope = value.get("systemd_scope")
+    privileged = backend == "systemd-root-broker" or scope == "system"
+    transport = None
+    local_confirmed = False
+    if not privileged and backend == "systemd-user" and scope == "user":
+        try:
+            _, target, _ = tasks._resolve_task_dispatch_host(str(value.get("host")))
+            transport = target.get("transport")
+            local_confirmed = (
+                target.get("transport") == "local"
+                and target.get("target") == "local"
+                and target.get("enabled") is True
+            )
+        except (OSError, ValueError, RuntimeError, PermissionError, TypeError):
+            pass
+    unverified = not local_confirmed
+    state = "observation_error" if unverified else persisted_state
+    mode = (
+        "persisted_only_rootbroker_not_probed" if privileged
+        else "persisted_only_ssh_not_probed" if transport == "ssh"
+        else "persisted_only_transport_unavailable" if unverified
+        else "persisted_only_local_user_systemd"
+    )
     return {
         "task_id": task_id,
         "host": value.get("host"),
@@ -10683,11 +10707,8 @@ def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
         "argv_sha256": value.get("argv_sha256"),
         "cwd": value.get("cwd"),
         "outcome_receipt": None,
-        "reconcile_required": privileged or state == "outcome_unknown",
-        "observation_mode": (
-            "persisted_only_rootbroker_not_probed"
-            if privileged else "persisted_only"
-        ),
+        "reconcile_required": unverified or state == "outcome_unknown",
+        "observation_mode": mode,
     }
 
 

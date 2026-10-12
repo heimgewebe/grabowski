@@ -5817,6 +5817,157 @@ class TaskTests(unittest.TestCase):
             )
         )
 
+    def test_reconcile_ready_multipage_requires_all_three_complete_error_free_cycles(self) -> None:
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+
+        def page(before: object, after: object, done: bool, *, blocked: bool = False) -> dict:
+            return {
+                "mode": "refresh", "task_id": "", "scanned": 0,
+                "refreshed": [], "released": [], "resumed": [],
+                "blocked": [{"task_id": "denied"}] if blocked else [],
+                "batch": {
+                    "cycle_completed": done, "cursor_before": before,
+                    "cursor_after": after,
+                    "active_refresh": {
+                        "cycle_completed": done, "cursor_before": before,
+                        "cursor_after": after,
+                    },
+                    "terminalization_recovery": {
+                        "cycle_completed": done, "cursor_before": before,
+                        "cursor_after": after, "failed": [],
+                    },
+                },
+            }
+
+        first = page(None, "page-2", False)
+        final = page("page-2", None, True)
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", side_effect=[first, final]),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+            with tasks._task_readonly_snapshot() as reader:
+                self.assertNotEqual(
+                    "verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+                )
+            tasks._task_reconcile_refresh_after_guard("")
+            with tasks._task_readonly_snapshot() as reader:
+                self.assertEqual(
+                    "verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+                )
+
+        # An error on any earlier page must poison the cumulative proof.
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked",
+                         side_effect=[page(None, "page-2", False, blocked=True), final]),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+            tasks._task_reconcile_refresh_after_guard("")
+            with tasks._task_readonly_snapshot() as reader:
+                self.assertNotEqual(
+                    "verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+                )
+
+    def test_reconcile_ready_cannot_certify_current_privileged_live_truth_from_cache(self) -> None:
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        task_id = self._start()["task"]["task_id"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed', execution_backend='systemd-root-broker', "
+                "systemd_scope='system' WHERE task_id=?", (task_id,),
+            )
+        page = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        live = {
+            "state": "completed",
+            "properties": {"LoadState": "loaded", "ActiveState": "inactive",
+                           "SubState": "dead", "Result": "success", "ExecMainStatus": "0",
+                           "Id": tasks._row_raw(task_id)["unit"],
+                           "Names": tasks._row_raw(task_id)["unit"],
+                           "InvocationID": "a" * 32},
+            "observer": {"kind": "root-systemd-broker-show-v1"},
+            "probe": {"returncode": 0, "outcome_unknown": False},
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=page),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_observe", return_value=live),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        # Another invocation can become active without mutating either SQLite
+        # revision. An old observation must never certify *current* quiescence.
+        with tasks._task_readonly_snapshot() as reader:
+            snapshot = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("privileged_live_unverified", snapshot["status"])
+
+    def test_reconcile_ready_archive_projection_excludes_historical_privileged_rows(self) -> None:
+        with tasks._database_connection():
+            pass
+        base_id = self._start()["task"]["task_id"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed', execution_backend='systemd-root-broker', "
+                "systemd_scope='system' WHERE task_id=?", (base_id,),
+            )
+            original = dict(connection.execute(
+                "SELECT * FROM tasks WHERE task_id=?", (base_id,),
+            ).fetchone())
+            columns = list(original)
+            history = {}
+            for number in range(tasks.TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT + 3):
+                clone = {
+                    **original, "task_id": f"archived-task-{number:03d}",
+                    "unit": f"archived-task-{number:03d}.service",
+                    "authoritative_unit": f"archived-task-{number:03d}.service",
+                }
+                connection.execute(
+                    "INSERT INTO tasks (" + ",".join(columns) + ") VALUES (" +
+                    ",".join("?" for _ in columns) + ")",
+                    [clone[col] for col in columns],
+                )
+                history[clone["task_id"]] = {
+                    "record_sha256": tasks.lifecycle_projection.lifecycle.sha256_json(
+                        tasks._task_archive_record(clone)
+                    ),
+                    "segment_id": "test-segment",
+                    "switch_sha256": "a" * 64,
+                }
+        projection = {
+            "schema_version": 1, "archived_task_bindings": history,
+            "projection_sha256": "b" * 64,
+        }
+        with patch.object(tasks, "_task_current_projection", return_value=projection):
+            with tasks._task_readonly_snapshot() as connection:
+                current = tasks._task_reconcile_ready_privileged_rows(connection)
+                self.assertEqual([base_id], [item["task_id"] for item in current])
+            with tasks._database_connection() as connection:
+                connection.execute(
+                    "UPDATE tasks SET state='failed' WHERE task_id='archived-task-000'"
+                )
+            with tasks._task_readonly_snapshot() as connection:
+                with self.assertRaises(tasks.lifecycle_projection.LifecycleProjectionIntegrityError):
+                    tasks._task_reconcile_ready_privileged_rows(connection)
+
     def test_reconcile_ready_proof_requires_authorized_quiescent_refresh_and_current_revisions(self) -> None:
         # Build both existing stores without launching a process.
         with tasks._database_connection():
@@ -5993,14 +6144,19 @@ class TaskTests(unittest.TestCase):
                 },
             },
         }
+        unit = tasks._row_raw(task_id)["unit"]
         normal = {
             "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
             "Result": "success", "ExecMainCode": "1", "ExecMainStatus": "0",
+            "Id": unit, "Names": unit, "InvocationID": "a" * 32,
         }
         probes = (
             ("active", {**normal, "ActiveState": "active"}, False),
             ("missing_substate", {k: v for k, v in normal.items() if k != "SubState"}, False),
             ("deactivating", {**normal, "ActiveState": "deactivating"}, False),
+            ("wrong_id", {**normal, "Id": "another.service"}, False),
+            ("wrong_names", {**normal, "Names": "another.service"}, False),
+            ("absent_invocation", {**normal, "InvocationID": ""}, False),
             ("success", normal, True),
         )
         for label, props, should_verify in probes:
@@ -6020,7 +6176,7 @@ class TaskTests(unittest.TestCase):
                     tasks._task_reconcile_refresh_after_guard("")
                 with tasks._task_readonly_snapshot() as reader:
                     snapshot = tasks._task_reconcile_ready_evidence_snapshot(reader)
-                self.assertEqual("verified" if should_verify else "missing", snapshot["status"])
+                self.assertEqual("privileged_live_unverified" if should_verify else "missing", snapshot["status"])
 
     def test_rootbroker_readiness_denies_bad_probes_admission_and_oversized_scope(self) -> None:
         with tasks._database_connection():

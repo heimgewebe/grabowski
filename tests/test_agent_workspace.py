@@ -9289,6 +9289,44 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertFalse(public["terminal"])
         self.assertTrue(public["reconcile_required"])
 
+    def test_cleanup_remote_and_unresolved_terminal_task_fail_closed(self) -> None:
+        row = {
+            "task_id": "ssh-task", "host": "remote", "unit": "remote.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        for case, observer in (
+            ("ssh", ("remote", {"transport": "ssh"}, False)),
+            ("unknown", ValueError("Unknown fleet host")),
+        ):
+            with (
+                self.subTest(case=case),
+                mock.patch.object(
+                    workspace.checkouts, "_readonly_connection", return_value=connection
+                ),
+                mock.patch.object(
+                    workspace.tasks, "_resolve_task_dispatch_host",
+                    side_effect=observer if isinstance(observer, Exception) else None,
+                    return_value=None if isinstance(observer, Exception) else observer,
+                ),
+                mock.patch.object(
+                    workspace.tasks, "grabowski_task_status",
+                    side_effect=AssertionError("cleanup read cannot refresh"),
+                ),
+                mock.patch.object(
+                    workspace.tasks, "_observe",
+                    side_effect=AssertionError("cleanup read cannot probe"),
+                ),
+            ):
+                public = workspace._workspace_cleanup_task_public("ssh-task")
+            self.assertEqual("completed", public["persisted_state"])
+            self.assertEqual("observation_error", public["state"])
+            self.assertFalse(public["terminal"])
+            self.assertTrue(public["reconcile_required"])
+
     def test_task_public_reads_persisted_state_without_status_refresh(self) -> None:
         task_db = workspace.tasks.TASK_DB
         task_db.parent.mkdir(parents=True, exist_ok=True)
@@ -9303,12 +9341,14 @@ class AgentWorkspaceTests(unittest.TestCase):
                     attempt INTEGER NOT NULL,
                     resume_policy TEXT NOT NULL,
                     argv_sha256 TEXT NOT NULL,
-                    cwd TEXT NOT NULL
+                    cwd TEXT NOT NULL,
+                    execution_backend TEXT NOT NULL,
+                    systemd_scope TEXT NOT NULL
                 )
                 """
             )
             connection.execute(
-                "INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     "writer-task",
                     "heim-pc",
@@ -9318,15 +9358,26 @@ class AgentWorkspaceTests(unittest.TestCase):
                     "never",
                     "a" * 64,
                     str(self.git.writer),
+                    "systemd-user",
+                    "user",
                 ),
             )
-        with mock.patch.object(
-            workspace.tasks,
-            "grabowski_task_status",
-            side_effect=AssertionError("cleanup planning must not refresh task state"),
-        ) as task_status:
+        with (
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                side_effect=AssertionError("cleanup planning must not refresh task state"),
+            ) as task_status,
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                return_value=("heim-pc",
+                              {"transport": "local", "target": "local", "enabled": True},
+                              False),
+            ) as resolver,
+        ):
             public = workspace._workspace_cleanup_task_public("writer-task")
         task_status.assert_not_called()
+        resolver.assert_called_once_with("heim-pc")
         self.assertEqual(public["state"], "completed")
         self.assertTrue(public["terminal"])
         self.assertEqual(public["unit"], "writer.service")
