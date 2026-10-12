@@ -17,6 +17,17 @@ from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent
 
 SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
 SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
+GIT_OID = __import__("re").compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def _same_git_oid_format(*values: str) -> bool:
+    """Require complete lowercase Git OIDs of one SHA-1 or SHA-256 width."""
+    return bool(values) and all(
+        isinstance(value, str) and GIT_OID.fullmatch(value) is not None
+        for value in values
+    ) and len({len(value) for value in values}) == 1
+
+
 CREATE_ONLY_RECEIPT_LOCK_TIMEOUT_SECONDS = 6.0
 CREATE_ONLY_RECEIPT_LOCK_POLL_SECONDS = 0.05
 MAX_ROLE_OUTPUT_BYTES = 4 * 1024 * 1024
@@ -169,7 +180,7 @@ def safe_untracked_file(root: Path, relative: PurePosixPath) -> Path:
 
 
 def committed_diff(repo: Path, base: str, head: str) -> bytes:
-    if SHA40.fullmatch(base) is None or SHA40.fullmatch(head) is None:
+    if not _same_git_oid_format(base, head):
         raise RuntimeError("review diff requires exact base and head revisions")
     return git(
         repo,
@@ -664,7 +675,7 @@ def _grok_streaming_review_command(
     review_diff: bytes,
 ) -> tuple[tuple[str, ...], bytes]:
     """Build one tool-less Grok review command and its exact stdin prompt bytes."""
-    if SHA40.fullmatch(expected_head) is None or SHA40.fullmatch(expected_base_head) is None:
+    if not _same_git_oid_format(expected_head, expected_base_head):
         raise RuntimeError("Grok review requires exact bound head and base revisions")
     if len(review_diff) > MAX_GROK_REVIEW_INPUT_BYTES:
         raise RuntimeError(f"Grok review input exceeds {MAX_GROK_REVIEW_INPUT_BYTES} bytes")
@@ -953,7 +964,7 @@ def _claude_json_review_command(
     job starts; execution-only flags are owned here, never by the review actor.
     The exact authenticated review input goes through bounded stdin, never argv.
     """
-    if SHA40.fullmatch(expected_head) is None or SHA40.fullmatch(expected_base_head) is None:
+    if not _same_git_oid_format(expected_head, expected_base_head):
         raise RuntimeError("Claude review requires exact bound head and base revisions")
     if len(review_diff) > MAX_CLAUDE_REVIEW_INPUT_BYTES:
         raise RuntimeError("Claude review diff exceeds the bounded input limit")
@@ -1414,8 +1425,7 @@ def main(argv: list[str] | None = None) -> int:
     output = Path(args.output).resolve(strict=False)
     if (
         not command
-        or SHA40.fullmatch(args.expected_head) is None
-        or SHA40.fullmatch(args.expected_base_head) is None
+        or not _same_git_oid_format(args.expected_head, args.expected_base_head)
         or SHA256.fullmatch(args.expected_diff_sha256) is None
     ):
         parser.error("invalid command or binding")
