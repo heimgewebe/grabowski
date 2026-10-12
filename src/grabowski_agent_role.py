@@ -1551,13 +1551,6 @@ def main(argv: list[str] | None = None) -> int:
     if completed.output_limit_exceeded:
         payload["returncode"] = 124
         payload["error"] = "role stdout or stderr exceeded the bounded capture limit"
-    if postflight_error_type is not None:
-        payload["postflight_error_type"] = postflight_error_type
-        payload["returncode"] = 125
-        payload["error"] = "read-only role postflight binding unobservable"
-    elif after_head != before_head or after_diff != before_diff or after_dirty != before_dirty:
-        payload["returncode"] = 125
-        payload["error"] = "read-only role observed writer mutation"
     if args.role == "review":
         if completed.stdout_content_exceeded or completed.stdout_content is None:
             payload.update({
@@ -1636,6 +1629,20 @@ def main(argv: list[str] | None = None) -> int:
                 elif verdict != "PASS" and not findings:
                     payload["returncode"] = 126
                     payload["error"] = "non-PASS review must contain findings"
+    # The frozen repository fingerprint is mandatory even if review parsing
+    # independently failed. Never allow an INVALID document or output overflow
+    # to replace post-provider binding uncertainty with a weaker exit status.
+    if postflight_error_type is not None:
+        if isinstance(payload.get("error"), str):
+            payload["review_output_error"] = payload["error"]
+        payload["postflight_error_type"] = postflight_error_type
+        payload["returncode"] = 125
+        payload["error"] = "read-only role postflight binding unobservable"
+    elif after_head != before_head or after_diff != before_diff or after_dirty != before_dirty:
+        if isinstance(payload.get("error"), str):
+            payload["review_output_error"] = payload["error"]
+        payload["returncode"] = 125
+        payload["error"] = "read-only role observed writer mutation"
     payload["failure_classification"] = classify_result(args.role, command, repo, payload)
     if attempt_unit is not None:
         payload["review_attempt_unit"] = attempt_unit
