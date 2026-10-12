@@ -924,6 +924,12 @@ def minimal_sandbox_argv(
         read_only_sources.add(common)
     for source_value, target_value in (*adler_read_only, *tuple(extra_read_only)):
         source = _safe_existing_path(source_value, "extra_read_only source")
+        if not mount_workspace and (
+            source == worktree
+            or source.is_relative_to(worktree)
+            or worktree.is_relative_to(source)
+        ):
+            raise AgentSandboxError("extra read-only source overlaps hidden workspace")
         read_only_sources.add(source)
         if not target_value.is_absolute() or "\x00" in str(target_value):
             raise AgentSandboxError("extra_read_only target must be absolute")
@@ -954,6 +960,12 @@ def minimal_sandbox_argv(
         arguments.extend(["--perms", "0400", "--ro-bind-data", str(fd_value), target])
     for source_value, target_value in extra_read_write:
         source = _private_regular_file(source_value, "extra_read_write source")
+        if not mount_workspace and (
+            source == worktree
+            or source.is_relative_to(worktree)
+            or worktree.is_relative_to(source)
+        ):
+            raise AgentSandboxError("extra writable source overlaps hidden workspace")
         target_path = Path(target_value)
         if (
             not target_path.is_absolute()

@@ -1668,6 +1668,24 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 workspace_writable=False, git_common_dir=home,
                 mount_workspace=False,
             )
+        # A hidden home must not reappear through another sandbox target.
+        private_file.chmod(0o600)
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "hidden workspace",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=home, command=["/usr/bin/true"],
+                workspace_writable=False, mount_workspace=False,
+                extra_read_only=((private_file, Path("/tmp/grabowski-secret-read")),),
+            )
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "hidden workspace",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=home, command=["/usr/bin/true"],
+                workspace_writable=False, mount_workspace=False,
+                extra_read_write=((private_file, Path("/tmp/grabowski-secret-write")),),
+            )
 
 
 if __name__ == "__main__":
