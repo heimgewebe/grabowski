@@ -1818,5 +1818,67 @@ class CodexReviewSettlementTests(unittest.TestCase):
                 )
 
 
+class CodexReviewLiveLineLimitTests(unittest.TestCase):
+    def _live(
+        self, *, diagnostic: bytes, rest_path: str = "assets/a.js",
+        refreshed_head: str | None = None,
+    ) -> dict:
+        state = base_state(path="assets/a.js")
+        del state["diff_sha256"]
+        pr_payload = {"data": {"repository": {"pullRequest": state}}}
+        def fake_json(repo: Path, argv: list[str]):
+            del repo
+            if argv[:3] == ["gh", "api", "graphql"]:
+                return deepcopy(pr_payload)
+            if argv[:3] == ["gh", "pr", "view"]:
+                result = {key: state[key] for key in ("headRefOid", "baseRefOid", "changedFiles")}
+                if refreshed_head is not None:
+                    result["headRefOid"] = refreshed_head
+                return result
+            raise AssertionError(argv)
+        local = b"diff --git a/assets/a.js b/assets/a.js\n--- a/assets/a.js\n+++ b/assets/a.js\n@@ -1 +1 @@\n-old\n+new\n"
+        with (
+            mock.patch.object(settlement, "_run_json", side_effect=fake_json),
+            mock.patch.object(settlement.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout=b"", stderr=diagnostic
+            )),
+            mock.patch.object(
+                settlement.pr_review_gate, "_load_pull_file_evidence",
+                return_value=[{"path": rest_path, "status": "modified"}],
+            ),
+            mock.patch.object(
+                settlement.pr_review_gate, "_local_bound_pr_diff_bytes",
+                return_value=local,
+            ) as bound,
+        ):
+            result = settlement._live_state(Path("/tmp/schauwerk"), REPOSITORY, PR)
+            self.assertEqual(result["diff_sha256"], settlement.pr_review_gate.github_pr_diff_identity_sha256(local))
+            bound.assert_called_once()
+            return result
+
+    def test_codex_line_limit_uses_existing_exact_bound_local_diff(self) -> None:
+        self._live(
+            diagnostic=b"HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000) (PullRequest.diff too_large)",
+        )
+
+    def test_codex_line_limit_rejects_graphql_rest_file_path_drift(self) -> None:
+        with self.assertRaisesRegex(settlement.SettlementError, "path|file|drift"):
+            self._live(
+                diagnostic=b"HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000) (PullRequest.diff too_large)",
+                rest_path="assets/unexpected.js",
+            )
+
+    def test_codex_line_limit_rejects_head_drift_after_local_readback(self) -> None:
+        with self.assertRaisesRegex(settlement.SettlementError, "head|base|count|drift"):
+            self._live(
+                diagnostic=b"HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000) (PullRequest.diff too_large)",
+                refreshed_head="d" * 40,
+            )
+
+    def test_codex_generic_provider_error_remains_fail_closed(self) -> None:
+        with self.assertRaisesRegex(settlement.SettlementError, "cannot read current PR diff"):
+            self._live(diagnostic=b"HTTP 406: gateway overloaded")
+
+
 if __name__ == "__main__":
     unittest.main()
