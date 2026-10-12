@@ -18,7 +18,9 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_PATH = ROOT / "tools" / "repobrief_agent_benchmark_source_bootstrap.py"
-SUPPORT_PATH = Path(__file__).resolve().parent / "repobrief_agent_benchmark_preflight_cases.py"
+SUPPORT_PATH = (
+    Path(__file__).resolve().parent / "repobrief_agent_benchmark_preflight_cases.py"
+)
 SPEC = importlib.util.spec_from_file_location(
     "repobrief_agent_benchmark_preflight_cases", SUPPORT_PATH
 )
@@ -120,8 +122,8 @@ def _execute_with_test_provider_binding(*args, **kwargs):
             executable.read_bytes()
         ).hexdigest()
         kwargs["claude_credential_commitment_nonce"] = nonce
-        kwargs["claude_credential_commitment_sha256"] = support.preflight._commitment_sha256(
-            credential.read_bytes(), nonce
+        kwargs["claude_credential_commitment_sha256"] = (
+            support.preflight._commitment_sha256(credential.read_bytes(), nonce)
         )
         kwargs["claude_credential_commitment_issued_at"] = issued_at
         with mock.patch.dict(
@@ -135,9 +137,7 @@ def _execute_with_test_provider_binding(*args, **kwargs):
 
 support.fake_claude = _fake_claude
 support.preflight.execute_preflight = _execute_with_test_provider_binding
-RepoBriefAgentBenchmarkPreflightTests = (
-    support.RepoBriefAgentBenchmarkPreflightTests
-)
+RepoBriefAgentBenchmarkPreflightTests = support.RepoBriefAgentBenchmarkPreflightTests
 
 
 class SemanticPairSetupCompatibilityTests(unittest.TestCase):
@@ -169,9 +169,10 @@ class SemanticPairSetupCompatibilityTests(unittest.TestCase):
     def test_forged_dirty_setup_is_not_treated_as_clean(self) -> None:
         baseline, treatment = self._pair()
         treatment["setup"] = {"working_tree": "dirty", "fixture": "dirty-checkout"}
-        with self.assertRaisesRegex(support.runner.RunnerError, "dirty setup is not bound"):
+        with self.assertRaisesRegex(
+            support.runner.RunnerError, "dirty setup is not bound"
+        ):
             support.preflight._validate_pair(baseline, treatment)
-
 
 
 def _preflight_kwargs(root: Path, environment: dict) -> dict:
@@ -214,9 +215,7 @@ def _rate_limit_refusal_stream(
 ) -> bytes:
     session_id = f"provider-refusal-{request['condition']}"
     zero_server_tools = {"web_search_requests": 0, "web_fetch_requests": 0}
-    assistant_content: list[dict] = [
-        {"type": "text", "text": "session limit reached"}
-    ]
+    assistant_content: list[dict] = [{"type": "text", "text": "session limit reached"}]
     if include_tool_use:
         assistant_content.append(
             {
@@ -289,7 +288,9 @@ def _rate_limit_refusal_stream(
     ]
     if omit_session_id_for is not None:
         matching = [
-            message for message in messages if message.get("type") == omit_session_id_for
+            message
+            for message in messages
+            if message.get("type") == omit_session_id_for
         ]
         if not matching:
             raise AssertionError(f"unknown message type: {omit_session_id_for}")
@@ -414,9 +415,7 @@ class ClaudeExecutableIdentityTests(unittest.TestCase):
     def test_detects_same_path_mutation_during_hashing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             executable = Path(temporary) / "claude"
-            payload = b"a" * (
-                support.preflight._core.EXECUTABLE_HASH_CHUNK_BYTES * 2
-            )
+            payload = b"a" * (support.preflight._core.EXECUTABLE_HASH_CHUNK_BYTES * 2)
             executable.write_bytes(payload)
             executable.chmod(0o755)
             real_read = os.read
@@ -447,9 +446,7 @@ class ClaudeExecutableIdentityTests(unittest.TestCase):
             root = Path(temporary)
             executable = root / "claude"
             replacement = root / "replacement"
-            payload = b"a" * (
-                support.preflight._core.EXECUTABLE_HASH_CHUNK_BYTES * 2
-            )
+            payload = b"a" * (support.preflight._core.EXECUTABLE_HASH_CHUNK_BYTES * 2)
             executable.write_bytes(payload)
             executable.chmod(0o755)
             replacement.write_bytes(b"b" * len(payload))
@@ -587,9 +584,15 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             captured["argv"] = list(argv)
             captured["credential"] = support.preflight._credential_file.get()
             captured["command_sha256"] = support.preflight._command_sha256.get()
-            captured["commitment_nonce"] = support.preflight._credential_commitment_nonce.get()
-            captured["commitment_sha256"] = support.preflight._credential_commitment_sha256.get()
-            captured["commitment_issued_at"] = support.preflight._credential_commitment_issued_at.get()
+            captured["commitment_nonce"] = (
+                support.preflight._credential_commitment_nonce.get()
+            )
+            captured["commitment_sha256"] = (
+                support.preflight._credential_commitment_sha256.get()
+            )
+            captured["commitment_issued_at"] = (
+                support.preflight._credential_commitment_issued_at.get()
+            )
             return 0
 
         live_argv = [
@@ -644,7 +647,9 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
         self.assertEqual(captured["commitment_sha256"], "b" * 64)
         self.assertEqual(captured["commitment_issued_at"], "2026-09-06T04:00:00Z")
 
-    def test_live_provider_binding_resolves_symlinked_launcher_without_start(self) -> None:
+    def test_live_provider_binding_resolves_symlinked_launcher_without_start(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             executable = root / "claude-2.1.259"
@@ -658,20 +663,25 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             digest = hashlib.sha256(executable.read_bytes()).hexdigest()
             raw_credential_digest = hashlib.sha256(credential.read_bytes()).hexdigest()
             nonce = "ab" * 16
-            issued_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
-                "+00:00", "Z"
+            issued_at = (
+                datetime.now(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
             )
             commitment_sha256 = support.preflight._commitment_sha256(
                 credential.read_bytes(), nonce
             )
             credential_token = support.preflight._credential_file.set(credential)
             sha_token = support.preflight._command_sha256.set(digest)
-            commitment_nonce_token = support.preflight._credential_commitment_nonce.set(nonce)
+            commitment_nonce_token = support.preflight._credential_commitment_nonce.set(
+                nonce
+            )
             commitment_sha_token = support.preflight._credential_commitment_sha256.set(
                 commitment_sha256
             )
-            commitment_time_token = support.preflight._credential_commitment_issued_at.set(
-                issued_at
+            commitment_time_token = (
+                support.preflight._credential_commitment_issued_at.set(issued_at)
             )
             authorized_token = support.preflight._authorized_credential_sha256.set(None)
             try:
@@ -691,9 +701,15 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
                     quota_readiness.assert_not_called()
             finally:
                 support.preflight._authorized_credential_sha256.reset(authorized_token)
-                support.preflight._credential_commitment_issued_at.reset(commitment_time_token)
-                support.preflight._credential_commitment_sha256.reset(commitment_sha_token)
-                support.preflight._credential_commitment_nonce.reset(commitment_nonce_token)
+                support.preflight._credential_commitment_issued_at.reset(
+                    commitment_time_token
+                )
+                support.preflight._credential_commitment_sha256.reset(
+                    commitment_sha_token
+                )
+                support.preflight._credential_commitment_nonce.reset(
+                    commitment_nonce_token
+                )
                 support.preflight._command_sha256.reset(sha_token)
                 support.preflight._credential_file.reset(credential_token)
             self.assertEqual(binding["claude"]["path"], str(executable.resolve()))
@@ -711,7 +727,6 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             )
             self.assertNotIn("quota_readiness", binding)
 
-
     def test_noncanonical_credential_path_blocks_before_secret_read(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -726,11 +741,14 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             credential_token = support.preflight._credential_file.set(other)
             sha_token = support.preflight._command_sha256.set("0" * 64)
             nonce_token = support.preflight._credential_commitment_nonce.set("ab" * 16)
-            commitment_token = support.preflight._credential_commitment_sha256.set("0" * 64)
+            commitment_token = support.preflight._credential_commitment_sha256.set(
+                "0" * 64
+            )
             issued_token = support.preflight._credential_commitment_issued_at.set(
-                datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
-                    "+00:00", "Z"
-                )
+                datetime.now(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
             )
             authorized_token = support.preflight._authorized_credential_sha256.set(None)
             try:
@@ -817,7 +835,9 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             support.preflight._credential_commitment_sha256.reset(commitment_token)
             support.preflight._credential_commitment_nonce.reset(nonce_token)
 
-    def test_credential_commitment_mismatch_blocks_before_provider_binding(self) -> None:
+    def test_credential_commitment_mismatch_blocks_before_provider_binding(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             executable = root / "claude"
@@ -830,11 +850,14 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             credential_token = support.preflight._credential_file.set(credential)
             sha_token = support.preflight._command_sha256.set(digest)
             nonce_token = support.preflight._credential_commitment_nonce.set("ab" * 16)
-            commitment_token = support.preflight._credential_commitment_sha256.set("0" * 64)
+            commitment_token = support.preflight._credential_commitment_sha256.set(
+                "0" * 64
+            )
             issued_token = support.preflight._credential_commitment_issued_at.set(
-                datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
-                    "+00:00", "Z"
-                )
+                datetime.now(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
             )
             authorized_token = support.preflight._authorized_credential_sha256.set(None)
             try:
@@ -867,31 +890,62 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
     @staticmethod
     def _quota_http(body, status: int = 200):
         response = mock.Mock(status=status)
-        response.read.return_value = body if isinstance(body, bytes) else json.dumps(body).encode()
+        response.read.return_value = (
+            body if isinstance(body, bytes) else json.dumps(body).encode()
+        )
         http = mock.Mock()
         http.getresponse.return_value = response
         return http
 
     def _quota_call(self, body, *, credential=None, status: int = 200, now=None):
         http = self._quota_http(body, status)
-        connection = mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=http)
+        connection = mock.patch.object(
+            support.preflight.http.client, "HTTPSConnection", return_value=http
+        )
         if now is None:
             with connection:
-                return support.preflight._claude_quota_readiness(credential or self._quota_credential()), http
-        with connection, mock.patch.object(support.preflight, "_utc_now", return_value=now):
-            return support.preflight._claude_quota_readiness(credential or self._quota_credential()), http
+                return support.preflight._claude_quota_readiness(
+                    credential or self._quota_credential()
+                ), http
+        with (
+            connection,
+            mock.patch.object(support.preflight, "_utc_now", return_value=now),
+        ):
+            return support.preflight._claude_quota_readiness(
+                credential or self._quota_credential()
+            ), http
 
     @staticmethod
-    def _quota_argv(issued_at: str = "2026-09-15T03:00:00Z", *, nonce: str = "0" * 32, digest: str = "1" * 64) -> list[str]:
-        return ["--claude-quota-readiness-only", "--quota-commitment-nonce", nonce,
-                "--quota-commitment-sha256", digest, "--quota-commitment-issued-at", issued_at]
+    def _quota_argv(
+        issued_at: str = "2026-09-15T03:00:00Z",
+        *,
+        nonce: str = "0" * 32,
+        digest: str = "1" * 64,
+    ) -> list[str]:
+        return [
+            "--claude-quota-readiness-only",
+            "--quota-commitment-nonce",
+            nonce,
+            "--quota-commitment-sha256",
+            digest,
+            "--quota-commitment-issued-at",
+            issued_at,
+        ]
 
     def test_quota_readiness_is_explicitly_unknown_without_provider_probe(self) -> None:
-        with mock.patch.object(support.preflight.http.client, "HTTPSConnection") as connection, mock.patch("subprocess.run") as provider_call:
+        with (
+            mock.patch.object(
+                support.preflight.http.client, "HTTPSConnection"
+            ) as connection,
+            mock.patch("subprocess.run") as provider_call,
+        ):
             readiness = support.preflight._claude_quota_readiness()
         connection.assert_not_called()
         provider_call.assert_not_called()
-        self.assertEqual((readiness["status"], readiness["reason"]), ("unknown", "oauth_credential_unavailable"))
+        self.assertEqual(
+            (readiness["status"], readiness["reason"]),
+            ("unknown", "oauth_credential_unavailable"),
+        )
         self.assertIsNone(readiness["provider_available"])
         self.assertFalse(readiness["authentication_is_quota_evidence"])
         self.assertFalse(readiness["spend_and_credits_considered"])
@@ -900,63 +954,172 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
     def test_quota_readiness_observes_subscription_windows_without_spend(self) -> None:
         secret = "synthetic-oauth-access-token"
         now = datetime(2026, 9, 15, 5, 0, tzinfo=timezone.utc)
-        readiness, http = self._quota_call({
-            "five_hour": {"utilization": 25.0, "resets_at": "2026-09-15T06:00:00Z"},
-            "seven_day": {"utilization": 40.0, "resets_at": "2026-09-20T06:00:00Z"},
-            "extra_usage": {"is_enabled": True, "used_credits": 1},
-        }, credential=self._quota_credential(secret), now=now)
-        http.request.assert_called_once_with("GET", "/api/oauth/usage?at_wall=1&skip_spend=1", headers={
-            "Authorization": f"Bearer {secret}", "Accept": "application/json", "Content-Type": "application/json"})
+        readiness, http = self._quota_call(
+            {
+                "five_hour": {"utilization": 25.0, "resets_at": "2026-09-15T06:00:00Z"},
+                "seven_day": {"utilization": 40.0, "resets_at": "2026-09-20T06:00:00Z"},
+                "extra_usage": {"is_enabled": True, "used_credits": 1},
+            },
+            credential=self._quota_credential(secret),
+            now=now,
+        )
+        http.request.assert_called_once_with(
+            "GET",
+            "/api/oauth/usage?at_wall=1&skip_spend=1",
+            headers={
+                "Authorization": f"Bearer {secret}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
         http.close.assert_called_once_with()
-        self.assertEqual((readiness["status"], readiness["remaining_five_hour_quota"], readiness["remaining_weekly_quota"]), ("observed", 75.0, 60.0))
+        self.assertEqual(
+            (
+                readiness["status"],
+                readiness["remaining_five_hour_quota"],
+                readiness["remaining_weekly_quota"],
+            ),
+            ("observed", 75.0, 60.0),
+        )
         self.assertTrue(readiness["subscription_quota_not_exhausted"])
         self.assertNotIn(secret, json.dumps(readiness, sort_keys=True))
         self.assertNotIn("extra_usage", json.dumps(readiness, sort_keys=True))
-        exhausted, _ = self._quota_call({"five_hour": {"utilization": 100.0, "resets_at": None}, "seven_day": {"utilization": 50.0, "resets_at": None}})
+        exhausted, _ = self._quota_call(
+            {
+                "five_hour": {"utilization": 100.0, "resets_at": None},
+                "seven_day": {"utilization": 50.0, "resets_at": None},
+            }
+        )
         self.assertFalse(exhausted["subscription_quota_not_exhausted"])
-        self.assertEqual((exhausted["remaining_five_hour_quota"], exhausted["remaining_weekly_quota"]), (0.0, 50.0))
+        self.assertEqual(
+            (
+                exhausted["remaining_five_hour_quota"],
+                exhausted["remaining_weekly_quota"],
+            ),
+            (0.0, 50.0),
+        )
 
     def test_quota_readiness_fails_closed_on_invalid_bounded_evidence(self) -> None:
         valid = self._quota_credential()
         cases = [
             (b"not-json", "credential_json_invalid", None),
             (b"{}", "oauth_access_token_unavailable", None),
-            (valid, "required_usage_windows_unavailable", {"five_hour": {"utilization": 1.0, "resets_at": None}}),
-            (valid, "required_usage_windows_unavailable", {"five_hour": {"utilization": True, "resets_at": None}, "seven_day": {"utilization": 1.0, "resets_at": None}}),
-            (valid, "required_usage_windows_unavailable", {"five_hour": {"utilization": 101.0, "resets_at": None}, "seven_day": {"utilization": 1.0, "resets_at": None}}),
+            (
+                valid,
+                "required_usage_windows_unavailable",
+                {"five_hour": {"utilization": 1.0, "resets_at": None}},
+            ),
+            (
+                valid,
+                "required_usage_windows_unavailable",
+                {
+                    "five_hour": {"utilization": True, "resets_at": None},
+                    "seven_day": {"utilization": 1.0, "resets_at": None},
+                },
+            ),
+            (
+                valid,
+                "required_usage_windows_unavailable",
+                {
+                    "five_hour": {"utilization": 101.0, "resets_at": None},
+                    "seven_day": {"utilization": 1.0, "resets_at": None},
+                },
+            ),
             (valid, "usage_response_invalid", b"not-json"),
         ]
         for credential, reason, body in cases:
             with self.subTest(reason=reason, body=body):
                 if body is None:
-                    with mock.patch.object(support.preflight.http.client, "HTTPSConnection") as connection:
+                    with mock.patch.object(
+                        support.preflight.http.client, "HTTPSConnection"
+                    ) as connection:
                         result = support.preflight._claude_quota_readiness(credential)
                     connection.assert_not_called()
                 else:
                     result, _ = self._quota_call(body, credential=credential)
-                self.assertEqual((result["status"], result["reason"]), ("unknown", reason))
+                self.assertEqual(
+                    (result["status"], result["reason"]), ("unknown", reason)
+                )
         now = datetime(2026, 9, 15, 5, 0, tzinfo=timezone.utc)
-        for reset in ["not-a-timestamp", "2026-09-15T06:00:00", "2026-09-15T04:59:59Z", "2026-09-15T05:00:00Z", "0001-01-01T00:00:00+23:59"]:
+        for reset in [
+            "not-a-timestamp",
+            "2026-09-15T06:00:00",
+            "2026-09-15T04:59:59Z",
+            "2026-09-15T05:00:00Z",
+            "0001-01-01T00:00:00+23:59",
+        ]:
             with self.subTest(reset=reset):
-                result, _ = self._quota_call({"five_hour": {"utilization": 1.0, "resets_at": reset}, "seven_day": {"utilization": 1.0, "resets_at": "2026-09-20T06:00:00Z"}}, now=now)
+                result, _ = self._quota_call(
+                    {
+                        "five_hour": {"utilization": 1.0, "resets_at": reset},
+                        "seven_day": {
+                            "utilization": 1.0,
+                            "resets_at": "2026-09-20T06:00:00Z",
+                        },
+                    },
+                    now=now,
+                )
                 self.assertEqual(result["reason"], "required_usage_windows_unavailable")
         huge = b"9" * 5000
-        with mock.patch.object(support.preflight.http.client, "HTTPSConnection") as connection:
-            bad_credential = support.preflight._claude_quota_readiness(b'{"ignored":' + huge + b',"claudeAiOauth":{"accessToken":"synthetic-token"}}')
+        with mock.patch.object(
+            support.preflight.http.client, "HTTPSConnection"
+        ) as connection:
+            bad_credential = support.preflight._claude_quota_readiness(
+                b'{"ignored":'
+                + huge
+                + b',"claudeAiOauth":{"accessToken":"synthetic-token"}}'
+            )
         connection.assert_not_called()
         self.assertEqual(bad_credential["reason"], "credential_json_invalid")
-        bad_response, _ = self._quota_call(b'{"ignored":' + huge + b',"five_hour":{"utilization":1,"resets_at":null},"seven_day":{"utilization":1,"resets_at":null}}')
+        bad_response, _ = self._quota_call(
+            b'{"ignored":'
+            + huge
+            + b',"five_hour":{"utilization":1,"resets_at":null},"seven_day":{"utilization":1,"resets_at":null}}'
+        )
         self.assertEqual(bad_response["reason"], "usage_response_invalid")
 
-    def test_quota_readiness_deadline_and_failures_are_bounded_and_sanitized(self) -> None:
-        body = {"five_hour": {"utilization": 1.0, "resets_at": None}, "seven_day": {"utilization": 1.0, "resets_at": None}}
+    def test_quota_readiness_deadline_and_failures_are_bounded_and_sanitized(
+        self,
+    ) -> None:
+        body = {
+            "five_hour": {"utilization": 1.0, "resets_at": None},
+            "seven_day": {"utilization": 1.0, "resets_at": None},
+        }
         http = self._quota_http(body)
-        with mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=http), mock.patch.object(support.preflight.signal, "getsignal", return_value=signal.SIG_DFL), mock.patch.object(support.preflight.signal, "getitimer", return_value=(0.0, 0.0)), mock.patch.object(support.preflight.signal, "signal") as set_signal, mock.patch.object(support.preflight.signal, "setitimer") as set_timer:
-            self.assertEqual(support.preflight._claude_quota_readiness(self._quota_credential())["status"], "observed")
-        set_timer.assert_has_calls([mock.call(signal.ITIMER_REAL, 5.0), mock.call(signal.ITIMER_REAL, 0.0)])
+        with (
+            mock.patch.object(
+                support.preflight.http.client, "HTTPSConnection", return_value=http
+            ),
+            mock.patch.object(
+                support.preflight.signal, "getsignal", return_value=signal.SIG_DFL
+            ),
+            mock.patch.object(
+                support.preflight.signal, "getitimer", return_value=(0.0, 0.0)
+            ),
+            mock.patch.object(support.preflight.signal, "signal") as set_signal,
+            mock.patch.object(support.preflight.signal, "setitimer") as set_timer,
+        ):
+            self.assertEqual(
+                support.preflight._claude_quota_readiness(self._quota_credential())[
+                    "status"
+                ],
+                "observed",
+            )
+        set_timer.assert_has_calls(
+            [mock.call(signal.ITIMER_REAL, 5.0), mock.call(signal.ITIMER_REAL, 0.0)]
+        )
         self.assertGreaterEqual(set_signal.call_count, 2)
-        with mock.patch.object(support.preflight.signal, "getitimer", return_value=(1.0, 0.0)), mock.patch.object(support.preflight.http.client, "HTTPSConnection") as connection:
-            unavailable = support.preflight._claude_quota_readiness(self._quota_credential())
+        with (
+            mock.patch.object(
+                support.preflight.signal, "getitimer", return_value=(1.0, 0.0)
+            ),
+            mock.patch.object(
+                support.preflight.http.client, "HTTPSConnection"
+            ) as connection,
+        ):
+            unavailable = support.preflight._claude_quota_readiness(
+                self._quota_credential()
+            )
         connection.assert_not_called()
         self.assertEqual(unavailable["reason"], "usage_request_failed")
         secret = "synthetic-token-never-return-this"
@@ -964,38 +1127,102 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
         unauthorized, _ = self._quota_call(b"", credential=credential, status=401)
         broken = mock.Mock()
         broken.request.side_effect = OSError(f"network failure {secret}")
-        with mock.patch.object(support.preflight.http.client, "HTTPSConnection", return_value=broken):
+        with mock.patch.object(
+            support.preflight.http.client, "HTTPSConnection", return_value=broken
+        ):
             failed = support.preflight._claude_quota_readiness(credential)
-        oversized, _ = self._quota_call(b"x" * (support.preflight.CLAUDE_USAGE_MAX_RESPONSE_BYTES + 1), credential=credential)
-        self.assertEqual([unauthorized["reason"], failed["reason"], oversized["reason"]], ["usage_http_status_401", "usage_request_failed", "usage_response_too_large"])
+        oversized, _ = self._quota_call(
+            b"x" * (support.preflight.CLAUDE_USAGE_MAX_RESPONSE_BYTES + 1),
+            credential=credential,
+        )
+        self.assertEqual(
+            [unauthorized["reason"], failed["reason"], oversized["reason"]],
+            [
+                "usage_http_status_401",
+                "usage_request_failed",
+                "usage_response_too_large",
+            ],
+        )
         for result in (unauthorized, failed, oversized):
             self.assertNotIn(secret, json.dumps(result, sort_keys=True))
 
     def test_quota_readiness_only_mode_is_isolated_and_structured(self) -> None:
-        readiness = {"status": "observed", "provider_available": None, "subscription_quota_not_exhausted": True}
-        with mock.patch.object(support.preflight, "_validated_live_credential_binding", return_value=(b"synthetic-credential", mock.Mock(st_mode=0o100600), {"kind": "synthetic-commitment"})), mock.patch.object(support.preflight, "_claude_quota_readiness", return_value=readiness), mock.patch.object(support.preflight._core, "main") as core_main, mock.patch.object(support.preflight.sys, "stdout") as stdout:
+        readiness = {
+            "status": "observed",
+            "provider_available": None,
+            "subscription_quota_not_exhausted": True,
+        }
+        with (
+            mock.patch.object(
+                support.preflight,
+                "_validated_live_credential_binding",
+                return_value=(
+                    b"synthetic-credential",
+                    mock.Mock(st_mode=0o100600),
+                    {"kind": "synthetic-commitment"},
+                ),
+            ),
+            mock.patch.object(
+                support.preflight, "_claude_quota_readiness", return_value=readiness
+            ),
+            mock.patch.object(support.preflight._core, "main") as core_main,
+            mock.patch.object(support.preflight.sys, "stdout") as stdout,
+        ):
             stdout.write.return_value = None
             self.assertEqual(support.preflight.main(self._quota_argv()), 0)
         core_main.assert_not_called()
         stderr = io.StringIO()
-        with mock.patch.dict(os.environ, {support.preflight.CLAUDE_AUTH_ROOT_ENV: "relative-auth-root"}, clear=False), redirect_stderr(stderr), mock.patch.object(support.preflight._core, "main") as core_main:
+        with (
+            mock.patch.dict(
+                os.environ,
+                {support.preflight.CLAUDE_AUTH_ROOT_ENV: "relative-auth-root"},
+                clear=False,
+            ),
+            redirect_stderr(stderr),
+            mock.patch.object(support.preflight._core, "main") as core_main,
+        ):
             self.assertEqual(support.preflight.main(self._quota_argv()), 2)
         core_main.assert_not_called()
-        self.assertEqual(json.loads(stderr.getvalue())["error"], "canonical Claude auth root is invalid")
+        self.assertEqual(
+            json.loads(stderr.getvalue())["error"],
+            "canonical Claude auth root is invalid",
+        )
         with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary)
-            credential=root/".credentials.json"
-            credential_data=b"{}\n"
+            root = Path(temporary)
+            credential = root / ".credentials.json"
+            credential_data = b"{}\n"
             credential.write_bytes(credential_data)
             credential.chmod(0o600)
-            nonce="ab"*16
-            stderr=io.StringIO()
-            with mock.patch.dict(os.environ, {support.preflight.CLAUDE_AUTH_ROOT_ENV: str(root)}, clear=False), redirect_stderr(stderr), mock.patch.object(support.preflight._core, "main") as core_main, mock.patch.object(support.preflight, "_claude_quota_readiness") as quota_readiness:
-                status=support.preflight.main(self._quota_argv("0001-01-01T00:00:00+23:59", nonce=nonce, digest=support.preflight._commitment_sha256(credential_data, nonce)))
+            nonce = "ab" * 16
+            stderr = io.StringIO()
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {support.preflight.CLAUDE_AUTH_ROOT_ENV: str(root)},
+                    clear=False,
+                ),
+                redirect_stderr(stderr),
+                mock.patch.object(support.preflight._core, "main") as core_main,
+                mock.patch.object(
+                    support.preflight, "_claude_quota_readiness"
+                ) as quota_readiness,
+            ):
+                status = support.preflight.main(
+                    self._quota_argv(
+                        "0001-01-01T00:00:00+23:59",
+                        nonce=nonce,
+                        digest=support.preflight._commitment_sha256(
+                            credential_data, nonce
+                        ),
+                    )
+                )
         self.assertEqual(status, 2)
         core_main.assert_not_called()
         quota_readiness.assert_not_called()
-        self.assertEqual(json.loads(stderr.getvalue())["error"], "Claude credential commitment timestamp is invalid")
+        self.assertEqual(
+            json.loads(stderr.getvalue())["error"],
+            "Claude credential commitment timestamp is invalid",
+        )
 
     def test_live_call_requires_explicit_provider_bindings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1072,17 +1299,15 @@ class RepoBriefAgentBenchmarkPreflightAdapterTests(unittest.TestCase):
             ]
             self.assertEqual(len(invocations), 2)
             self.assertTrue(all("--version" not in item for item in invocations))
-            self.assertEqual(
-                report["dispatch_ledger"]["provider_process_intents"], 2
-            )
+            self.assertEqual(report["dispatch_ledger"]["provider_process_intents"], 2)
             self.assertIsNone(report["environment"]["claude"]["version"])
-            self.assertFalse(
-                report["environment"]["claude"]["version_probed"]
-            )
+            self.assertFalse(report["environment"]["claude"]["version_probed"])
 
 
 class ProviderExecutionClassificationTests(unittest.TestCase):
-    def test_exact_zero_work_rate_limit_refusal_is_classified_without_retry_authority(self) -> None:
+    def test_exact_zero_work_rate_limit_refusal_is_classified_without_retry_authority(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = support.fixture_environment(root)
@@ -1103,9 +1328,7 @@ class ProviderExecutionClassificationTests(unittest.TestCase):
             self.assertFalse(
                 summary["provider_execution"]["classification_grants_retry"]
             )
-            self.assertEqual(
-                summary["provider_execution"]["api_error_status"], 429
-            )
+            self.assertEqual(summary["provider_execution"]["api_error_status"], 429)
             self.assertEqual(
                 summary["provider_execution"]["rate_limit_type"], "five_hour"
             )
@@ -1120,9 +1343,7 @@ class ProviderExecutionClassificationTests(unittest.TestCase):
             "different-status": {"api_error_status": 503},
             "tool-use": {"include_tool_use": True},
             "overage-active": {"is_using_overage": True},
-            "missing-rate-limit-session": {
-                "omit_session_id_for": "rate_limit_event"
-            },
+            "missing-rate-limit-session": {"omit_session_id_for": "rate_limit_event"},
             "missing-assistant-session": {"omit_session_id_for": "assistant"},
             "missing-result-session": {"omit_session_id_for": "result"},
         }
@@ -1225,7 +1446,8 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             _ORIGINAL_EXECUTE_PREFLIGHT(**kwargs)
             kwargs["max_cost_usd"] = support.Decimal("0.50")
             with self.assertRaisesRegex(
-                support.preflight.PreflightError, "different schema, code, plan, path, or budget"
+                support.preflight.PreflightError,
+                "different schema, code, plan, path, or budget",
             ):
                 _ORIGINAL_EXECUTE_PREFLIGHT(**kwargs)
 
@@ -1254,12 +1476,8 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
                     "preflight-failed",
                 ],
             )
-            self.assertTrue(
-                events[2]["payload"]["transcript"]["outcome_ambiguous"]
-            )
-            self.assertEqual(
-                events[-1]["payload"]["provider_process_intents"], 1
-            )
+            self.assertTrue(events[2]["payload"]["transcript"]["outcome_ambiguous"])
+            self.assertEqual(events[-1]["payload"]["provider_process_intents"], 1)
             with self.assertRaisesRegex(
                 support.preflight.PreflightError, "blocks retry"
             ):
@@ -1297,7 +1515,9 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             )
             self.assertFalse(events[-1]["payload"]["retry_permitted"])
 
-    def test_ambiguous_launch_retry_keeps_test_authorization_across_clock_tick(self) -> None:
+    def test_ambiguous_launch_retry_keeps_test_authorization_across_clock_tick(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = support.fixture_environment(root)
@@ -1341,9 +1561,7 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
                 _execute_with_test_provider_binding(**kwargs)
             events = support.ledger_events(root / "state")
             failure = next(
-                event
-                for event in events
-                if event["event"] == "condition-failed"
+                event for event in events if event["event"] == "condition-failed"
             )
             transcript = failure["payload"]["transcript"]
             self.assertEqual(transcript["observed_cost_usd"], "1.25")
@@ -1437,7 +1655,6 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
                     max_cost_usd=support.Decimal("1.00"),
                 )
 
-
     def test_request_mutation_after_baseline_blocks_treatment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1478,7 +1695,9 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             )
             self.assertEqual(events[-1]["payload"]["fixture_intents"], 1)
 
-    def test_credential_mutation_after_intent_blocks_before_provider_spawn(self) -> None:
+    def test_credential_mutation_after_intent_blocks_before_provider_spawn(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = support.fixture_environment(root)
@@ -1545,8 +1764,9 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             events = support.ledger_events(root / "state")
             self.assertEqual(events[-1]["event"], "preflight-failed")
             self.assertEqual(events[-1]["payload"]["provider_process_intents"], 1)
-            self.assertEqual(events[-1]["payload"]["observed_costs"]["baseline"], "0.01")
-
+            self.assertEqual(
+                events[-1]["payload"]["observed_costs"]["baseline"], "0.01"
+            )
 
     def test_synthetic_cli_publishes_report_bound_in_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1622,7 +1842,9 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
             )
             self.assertEqual(events[-1]["payload"]["fixture_intents"], 0)
 
-    def test_source_mutation_before_authorization_publishes_no_authorization(self) -> None:
+    def test_source_mutation_before_authorization_publishes_no_authorization(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = support.fixture_environment(root)
@@ -1667,9 +1889,7 @@ class RepoBriefAgentBenchmarkPreflightLedgerTests(unittest.TestCase):
                 nonlocal calls
                 calls += 1
                 if calls == 3:
-                    (source / "mutation.txt").write_text(
-                        "changed", encoding="utf-8"
-                    )
+                    (source / "mutation.txt").write_text("changed", encoding="utf-8")
                 return original(source)
 
             with mock.patch.object(
@@ -1700,6 +1920,54 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
         codex_preflight._ENTRYPOINT_BOOTSTRAP_RAW = raw
         codex_preflight._ENTRYPOINT_BOOTSTRAP_IDENTITY = identity
         codex_preflight.core._register_startup_bootstrap_identity(identity)
+        # Existing producer/ledger tests use writable temporary fixtures and
+        # retain their original scope; mount isolation has explicit regressions.
+        mount_guard = mock.patch.object(
+            codex_preflight.codex_runner, "validate_live_immutable_mounts"
+        )
+        mount_guard.start()
+        self.addCleanup(mount_guard.stop)
+
+    def test_live_mount_rejection_precedes_create_only_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _baseline, _treatment = self._codex_pair(environment)
+            state_root = root / "state"
+            with (
+                mock.patch.object(
+                    codex_preflight.codex_runner,
+                    "validate_live_immutable_mounts",
+                    side_effect=codex_runner.RunnerError(
+                        "live Codex protected input mount writable: source"
+                    ),
+                ) as guard,
+                mock.patch.object(
+                    codex_preflight, "_validated_codex_provider_binding"
+                ) as provider_binding,
+                self.assertRaisesRegex(
+                    codex_runner.RunnerError,
+                    "protected input mount writable: source",
+                ),
+            ):
+                codex_preflight.authorize_pair(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=state_root,
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=root / "reports" / "preflight.json",
+                    codex_command="/unused/codex",
+                    codex_command_sha256="a" * 64,
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+            guard.assert_called_once()
+            provider_binding.assert_not_called()
+            self.assertFalse(state_root.exists())
 
     @staticmethod
     def _codex_pair(environment: dict) -> tuple[str, dict, dict]:
@@ -1748,7 +2016,9 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
         environment["baseline"], environment["treatment"] = requests
         return pair_id, requests[0], requests[1]
 
-    def test_codex_authorization_rejects_source_head_different_from_requested_commit(self) -> None:
+    def test_codex_authorization_rejects_source_head_different_from_requested_commit(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = support.fixture_environment(root)
@@ -1816,13 +2086,15 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             self.assertEqual(events[-1]["event"], "preflight-failed")
             self.assertEqual(events[-1]["payload"]["provider_process_intents"], 0)
 
-
     def test_frozen_g1_vendor_failure_refuses_preflight_publication(self) -> None:
         for vendor_failure in (
             "historical G1 vendor source is unavailable or linked",
             "historical G1 vendor source digest is not frozen",
         ):
-            with self.subTest(vendor_failure=vendor_failure), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(vendor_failure=vendor_failure),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 environment = support.fixture_environment(root)
                 pair_id, _baseline, _treatment = self._codex_pair(environment)
@@ -1848,14 +2120,18 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
                         return_value=b'{"tokens":{}}',
                     ),
                     mock.patch.object(
-                        loaded_codex, "_frozen_g1_mcp_profile",
+                        loaded_codex,
+                        "_frozen_g1_mcp_profile",
                         return_value=loaded_codex.MCP_PROFILE_FROZEN_G1,
                     ),
                     mock.patch.object(
-                        core, "_historical_g1_preflight_stage",
+                        core,
+                        "_historical_g1_preflight_stage",
                         side_effect=core.PreflightError(vendor_failure),
                     ) as staging,
-                    mock.patch.object(core.subprocess, "Popen", wraps=subprocess.Popen) as process,
+                    mock.patch.object(
+                        core.subprocess, "Popen", wraps=subprocess.Popen
+                    ) as process,
                     self.assertRaisesRegex(core.PreflightError, "historical G1 vendor"),
                 ):
                     codex_preflight.authorize_pair(
@@ -1881,17 +2157,11 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
                     ),
                     "historical G1 MCP started despite rejected vendor",
                 )
-                pair_root = next(
-                    (state_root / "preflight-dispatch-ledger").iterdir()
-                )
-                self.assertFalse(
-                    (pair_root / "authorization.json").exists()
-                )
+                pair_root = next((state_root / "preflight-dispatch-ledger").iterdir())
+                self.assertFalse((pair_root / "authorization.json").exists())
                 events = support.ledger_events(state_root)
                 self.assertEqual(events[-1]["event"], "preflight-failed")
-                self.assertEqual(
-                    events[-1]["payload"]["provider_process_intents"], 0
-                )
+                self.assertEqual(events[-1]["payload"]["provider_process_intents"], 0)
 
     def test_codex_producer_ledger_is_consumable_by_exact_runner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1941,9 +2211,7 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
             binding = authorization["binding"]
             report_from_disk = json.loads(report_out.read_text(encoding="utf-8"))
-            self.assertRegex(
-                authorization["report_evidence_sha256"], r"^[0-9a-f]{64}$"
-            )
+            self.assertRegex(authorization["report_evidence_sha256"], r"^[0-9a-f]{64}$")
             self.assertEqual(
                 authorization["report_evidence_sha256"],
                 codex_preflight.core._sha256_json(
@@ -1971,9 +2239,7 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             authentication = binding["provider"]["authentication"]
             self.assertEqual(authentication["mode"], "chatgpt_subscription")
             self.assertFalse(authentication["credential_digest_public"])
-            self.assertEqual(
-                authentication["credential_bytes"], len(b'{"tokens":{}}')
-            )
+            self.assertEqual(authentication["credential_bytes"], len(b'{"tokens":{}}'))
             commitment = authentication["commitment"]
             self.assertEqual(
                 commitment["kind"],
@@ -2171,7 +2437,8 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             authorization_path.rename(hidden)
             try:
                 with self.assertRaisesRegex(
-                    codex_runner.RunnerError, "preflight dispatch authorization is unavailable"
+                    codex_runner.RunnerError,
+                    "preflight dispatch authorization is unavailable",
                 ):
                     codex_runner._load_preflight_dispatch_authorization(
                         baseline, state_root, runtime_binding=runtime_binding
@@ -2179,7 +2446,9 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             finally:
                 hidden.rename(authorization_path)
 
-    def test_authorize_dispatch_rejects_cross_provider_binding_before_ledger(self) -> None:
+    def test_authorize_dispatch_rejects_cross_provider_binding_before_ledger(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = support.fixture_environment(root)
@@ -2249,7 +2518,9 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
                 mock.patch.object(
                     codex_preflight.core,
                     "probe_freshness",
-                    side_effect=codex_preflight.core.PreflightError("late preflight failure"),
+                    side_effect=codex_preflight.core.PreflightError(
+                        "late preflight failure"
+                    ),
                 ),
                 self.assertRaisesRegex(
                     codex_preflight.core.PreflightError, "late preflight failure"
@@ -2284,7 +2555,9 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             self.assertEqual(events[-1]["event"], "preflight-failed")
             self.assertFalse(events[-1]["payload"]["retry_permitted"])
 
-    def test_authorize_dispatch_keyboard_interrupt_records_terminal_failure(self) -> None:
+    def test_authorize_dispatch_keyboard_interrupt_records_terminal_failure(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = support.fixture_environment(root)
@@ -2359,7 +2632,9 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
                 mock.patch.object(
                     codex_preflight.core,
                     "_write_report_artifacts",
-                    side_effect=codex_preflight.core.PreflightError("report persistence failed"),
+                    side_effect=codex_preflight.core.PreflightError(
+                        "report persistence failed"
+                    ),
                 ),
                 self.assertRaisesRegex(
                     codex_preflight.core.PreflightError, "report persistence failed"
@@ -2463,7 +2738,9 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             self.assertNotIn("authorized", [event["event"] for event in events])
             self.assertEqual(events[-1]["event"], "preflight-failed")
 
-    def test_provider_specific_request_validation_has_no_cross_provider_fallback(self) -> None:
+    def test_provider_specific_request_validation_has_no_cross_provider_fallback(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             environment = support.fixture_environment(root)
@@ -2489,7 +2766,8 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
                 "sampling": {"temperature": 0},
             }
             treatment_path = next(
-                path for path in environment["request_root"].glob("*.json")
+                path
+                for path in environment["request_root"].glob("*.json")
                 if "treatment" in path.name
             )
             original_text = treatment_path.read_text(encoding="utf-8")
@@ -2501,16 +2779,21 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
                         json.dumps(candidate, sort_keys=True), encoding="utf-8"
                     )
                     with self.assertRaises(codex_preflight.core.PreflightError):
-                        codex_preflight.core.load_pair(environment["request_root"], pair_id)
+                        codex_preflight.core.load_pair(
+                            environment["request_root"], pair_id
+                        )
                     treatment_path.write_text(original_text, encoding="utf-8")
 
             mixed = json.loads(json.dumps(codex_baseline))
             mixed["runner"] = dict(claude_baseline["runner"])
             baseline_path = next(
-                path for path in environment["request_root"].glob("*.json")
+                path
+                for path in environment["request_root"].glob("*.json")
                 if "baseline" in path.name
             )
-            baseline_path.write_text(json.dumps(mixed, sort_keys=True), encoding="utf-8")
+            baseline_path.write_text(
+                json.dumps(mixed, sort_keys=True), encoding="utf-8"
+            )
             with self.assertRaisesRegex(
                 codex_preflight.core.PreflightError,
                 "paired requests use different provider contracts",
@@ -2519,7 +2802,9 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
 
 
 class McpCommandFileIdentityTests(unittest.TestCase):
-    def test_mcp_relative_script_is_authorized_against_explicit_preflight_base(self) -> None:
+    def test_mcp_relative_script_is_authorized_against_explicit_preflight_base(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / "server.py"
@@ -2558,7 +2843,7 @@ class McpCommandFileIdentityTests(unittest.TestCase):
             try:
                 support.preflight._core._rpc(
                     process,
-                    {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},
+                    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
                     timeout_seconds=2,
                 )
                 with self.assertRaisesRegex(
@@ -2567,7 +2852,12 @@ class McpCommandFileIdentityTests(unittest.TestCase):
                 ):
                     support.preflight._core._rpc(
                         process,
-                        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}},
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {},
+                        },
                         timeout_seconds=2,
                     )
             finally:
@@ -2603,7 +2893,12 @@ class McpCommandFileIdentityTests(unittest.TestCase):
                 ):
                     support.preflight._core._rpc(
                         process,
-                        {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}},
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {},
+                        },
                         timeout_seconds=2,
                     )
             finally:
@@ -2660,7 +2955,9 @@ class McpCommandFileIdentityTests(unittest.TestCase):
             completed.stderr,
         )
 
-    def test_immutable_bootstrap_captures_codex_preflight_before_execution(self) -> None:
+    def test_immutable_bootstrap_captures_codex_preflight_before_execution(
+        self,
+    ) -> None:
         source = Path(codex_preflight.__file__).resolve()
         completed = subprocess.run(
             [
@@ -2734,8 +3031,9 @@ class McpCommandFileIdentityTests(unittest.TestCase):
             finally:
                 codex_preflight.core._STARTUP_CODE_IDENTITIES.pop(key, None)
 
-
-    def test_codex_preflight_source_snapshot_identity_comes_from_open_descriptor(self) -> None:
+    def test_codex_preflight_source_snapshot_identity_comes_from_open_descriptor(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "codex-preflight.py"
             target.write_bytes(b"VALUE = 1\n")
@@ -2746,7 +3044,9 @@ class McpCommandFileIdentityTests(unittest.TestCase):
         self.assertEqual(identity["path"], str(target))
         self.assertEqual(identity["name"], target.name)
 
-    def test_preflight_core_startup_snapshot_identity_comes_from_open_descriptor(self) -> None:
+    def test_preflight_core_startup_snapshot_identity_comes_from_open_descriptor(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "preflight-core.py"
             target.write_bytes(b"VALUE = 2\n")
@@ -2773,8 +3073,9 @@ class McpCommandFileIdentityTests(unittest.TestCase):
         self.assertEqual(identity["path"], str(target))
         self.assertEqual(identity["sha256"], hashlib.sha256(b"{}\n").hexdigest())
 
-
-    def test_codex_preflight_source_snapshot_rejects_symlinked_parent_path(self) -> None:
+    def test_codex_preflight_source_snapshot_rejects_symlinked_parent_path(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             real_parent = root / "real"
@@ -2786,7 +3087,9 @@ class McpCommandFileIdentityTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "symlink-free|opened path"):
                 codex_preflight._read_source_snapshot(alias_parent / target.name)
 
-    def test_preflight_core_startup_snapshot_rejects_symlinked_parent_path(self) -> None:
+    def test_preflight_core_startup_snapshot_rejects_symlinked_parent_path(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             real_parent = root / "real"
@@ -2830,8 +3133,12 @@ class FrozenG2PreflightProofTests(unittest.TestCase):
             manifest=manifest,
             manifest_sha256=frozen["manifest_sha256"],
             mcp_command=[
-                sys.executable, str(server), "--bundle-root",
-                str(manifest), "--repo-root", str(source),
+                sys.executable,
+                str(server),
+                "--bundle-root",
+                str(manifest),
+                "--repo-root",
+                str(source),
             ],
         )
         value["taskset_id"] = frozen["taskset_id"]
@@ -2843,11 +3150,11 @@ class FrozenG2PreflightProofTests(unittest.TestCase):
             "Ein gleicher Commit reicht nicht für fresh."
         )
         value["setup"] = dict(codex_preflight.core.runner.FROZEN_G2_SETUP)
-        pair = f'{frozen["taskset_id"]}:{frozen["case_id"]}:r1'
+        pair = f"{frozen['taskset_id']}:{frozen['case_id']}:r1"
         value["pair_id"] = pair
         value["request_id"] = f"{pair}:treatment"
-        value["session_id"] = f'session:{value["request_id"]}'
-        value["workspace_id"] = f'workspace:{value["request_id"]}'
+        value["session_id"] = f"session:{value['request_id']}"
+        value["workspace_id"] = f"workspace:{value['request_id']}"
         value["runner"] = {
             "execution_contract": "grabowski-codex-cli-live-v1",
             "provider": "openai-codex-cli",
@@ -2928,7 +3235,10 @@ class FrozenG2PreflightProofTests(unittest.TestCase):
                     )
                 treatment["repobrief"]["mcp_command"].pop()
                 for manipulation in (
-                    "--wrong-root", "--wrong-head", "--mask-dirty", "--wrong-tools"
+                    "--wrong-root",
+                    "--wrong-head",
+                    "--mask-dirty",
+                    "--wrong-tools",
                 ):
                     treatment["repobrief"]["mcp_command"].append(manipulation)
                     with self.subTest(manipulation=manipulation):
@@ -2958,7 +3268,7 @@ class FrozenG2PreflightProofTests(unittest.TestCase):
         binding = {
             "taskset_id": frozen["taskset_id"],
             "taskset_sha256": frozen["taskset_sha256"],
-            "pair_id": f'{frozen["taskset_id"]}:{frozen["case_id"]}:r1',
+            "pair_id": f"{frozen['taskset_id']}:{frozen['case_id']}:r1",
         }
         source_state = {"clean": True, "head": frozen["repository"]["commit"]}
         report = {
@@ -2973,7 +3283,7 @@ class FrozenG2PreflightProofTests(unittest.TestCase):
                     codex_runner.base.DIRTY_FIXTURE_BYTES
                 ),
                 "status_sha256": codex_runner.base._sha256_bytes(
-                    f'?? {codex_runner.base.DIRTY_FIXTURE_NAME}'.encode()
+                    f"?? {codex_runner.base.DIRTY_FIXTURE_NAME}".encode()
                 ),
                 "mcp_result_sha256": "a" * 64,
                 "probe_ms": 10,
@@ -3000,9 +3310,7 @@ class FrozenG2PreflightProofTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     codex_runner.RunnerError, "bound G2 stale scenario proof"
                 ):
-                    codex_runner._require_g2_preflight_evidence(
-                        candidate, binding
-                    )
+                    codex_runner._require_g2_preflight_evidence(candidate, binding)
         # The proof requirement cannot accidentally apply to normal clean pairs.
         clean_binding = {
             **binding,
@@ -3011,7 +3319,6 @@ class FrozenG2PreflightProofTests(unittest.TestCase):
             ),
         }
         codex_runner._require_g2_preflight_evidence({}, clean_binding)
-
 
 
 if __name__ == "__main__":

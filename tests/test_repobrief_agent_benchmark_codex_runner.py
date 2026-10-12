@@ -20,7 +20,9 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "tools" / "repobrief_agent_benchmark_codex_runner.py"
 BOOTSTRAP_PATH = ROOT / "tools" / "repobrief_agent_benchmark_source_bootstrap.py"
-SPEC = importlib.util.spec_from_file_location("repobrief_agent_benchmark_codex_runner", MODULE_PATH)
+SPEC = importlib.util.spec_from_file_location(
+    "repobrief_agent_benchmark_codex_runner", MODULE_PATH
+)
 assert SPEC is not None and SPEC.loader is not None
 runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
@@ -39,7 +41,12 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
         repobrief = {
             "manifest": "/bundles/repo.bundle.manifest.json",
             "manifest_sha256": MANIFEST_SHA,
-            "mcp_command": ["/usr/bin/python3", "repobrief-mcp-stdio.py", "--bundle-root", "/bundles"],
+            "mcp_command": [
+                "/usr/bin/python3",
+                "repobrief-mcp-stdio.py",
+                "--bundle-root",
+                "/bundles",
+            ],
         }
     pair_id = "taskset:case:r1"
     request_id = f"{pair_id}:{condition}"
@@ -87,7 +94,6 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
     }
 
 
-
 def bind_manifest(
     value: dict,
     root: Path,
@@ -103,9 +109,7 @@ def bind_manifest(
         "version": "2.0",
         "snapshotProvenance": {"repositories": [repository]},
     }
-    raw = json.dumps(
-        manifest, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
     path = root / "repo.bundle.manifest.json"
     path.write_bytes(raw)
     value["repobrief"]["manifest"] = str(path)
@@ -113,7 +117,9 @@ def bind_manifest(
     return path
 
 
-def frozen_g2_request(*, condition: str = "baseline", commit: str | None = None) -> dict:
+def frozen_g2_request(
+    *, condition: str = "baseline", commit: str | None = None
+) -> dict:
     """Use the frozen task identity, independently of local test Git fixtures."""
 
     frozen = runner.base.FROZEN_G2_IDENTITY
@@ -262,7 +268,9 @@ def write_dispatch_authorization(
     }
     authorized_event_sha256 = runner.base._sha256_json(authorized_event)
     event_path = events_root / "0000-authorized.json"
-    event_path.write_text(json.dumps(authorized_event, sort_keys=True), encoding="utf-8")
+    event_path.write_text(
+        json.dumps(authorized_event, sort_keys=True), encoding="utf-8"
+    )
     event_path.chmod(0o600)
     path = pair_root / "authorization.json"
     report = {
@@ -302,8 +310,8 @@ def write_dispatch_authorization(
     authorization["report_evidence_sha256"] = runner.base._sha256_json(
         runner._preflight_report_evidence_projection(report)
     )
-    report["dispatch_ledger"]["authorization_sha256"] = (
-        runner.base._sha256_json(authorization)
+    report["dispatch_ledger"]["authorization_sha256"] = runner.base._sha256_json(
+        authorization
     )
 
     report_bytes = (
@@ -340,7 +348,14 @@ def proxy_command(upstream: Path, root: Path) -> list[str]:
         bootstrap_program(),
         str(MODULE_PATH),
         "--codex-mcp-proxy",
-        json.dumps([str(Path(sys.executable).resolve()), str(upstream), "--bundle-root", str(root)]),
+        json.dumps(
+            [
+                str(Path(sys.executable).resolve()),
+                str(upstream),
+                "--bundle-root",
+                str(root),
+            ]
+        ),
         str(manifest),
         str(manifest),
         digest,
@@ -377,14 +392,23 @@ def stream(value: dict, *, command: str = "cat src/example.py") -> bytes:
         },
         {
             "type": "item.completed",
-            "item": {"type": "agent_message", "text": json.dumps(answer(), sort_keys=True)},
+            "item": {
+                "type": "agent_message",
+                "text": json.dumps(answer(), sort_keys=True),
+            },
         },
         {
             "type": "turn.completed",
-            "usage": {"input_tokens": 120, "output_tokens": 30, "cached_input_tokens": 0},
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "cached_input_tokens": 0,
+            },
         },
     ]
-    return b"".join(json.dumps(event, sort_keys=True).encode("utf-8") + b"\n" for event in events)
+    return b"".join(
+        json.dumps(event, sort_keys=True).encode("utf-8") + b"\n" for event in events
+    )
 
 
 def git(arguments: list[str], cwd: Path) -> str:
@@ -412,7 +436,9 @@ def repository(root: Path) -> tuple[Path, str]:
 def planned_request_root(root: Path, value: dict) -> Path:
     result = root / "requests"
     result.mkdir()
-    (result / "request.json").write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+    (result / "request.json").write_text(
+        json.dumps(value, sort_keys=True), encoding="utf-8"
+    )
     return result
 
 
@@ -425,7 +451,9 @@ def repository_map(root: Path, source: Path) -> Path:
     return path
 
 
-def fixture_args(root: Path, fixture: Path, *, stderr: Path | None = None, returncode: int = 0) -> Namespace:
+def fixture_args(
+    root: Path, fixture: Path, *, stderr: Path | None = None, returncode: int = 0
+) -> Namespace:
     return Namespace(
         request_root=root / "requests",
         repository_map=root / "repositories.json",
@@ -443,21 +471,192 @@ def fixture_args(root: Path, fixture: Path, *, stderr: Path | None = None, retur
 
 def treatment_tools() -> list[dict]:
     metadata = {
-        'ask_context': ('RepoGround context pack', 'Build a cited context pack from one existing RepoGround bundle.'),
-        'grounding_verify': ('RepoGround grounding verifier', 'Verify declared citations and ranges against an existing RepoGround bundle.'),
-        'live_freshness': ('RepoGround live freshness', 'Compare snapshot Git provenance with the configured local checkout without refreshing it.'),
+        "ask_context": (
+            "RepoGround context pack",
+            "Build a cited context pack from one existing RepoGround bundle.",
+        ),
+        "grounding_verify": (
+            "RepoGround grounding verifier",
+            "Verify declared citations and ranges against an existing RepoGround bundle.",
+        ),
+        "live_freshness": (
+            "RepoGround live freshness",
+            "Compare snapshot Git provenance with the configured local checkout without refreshing it.",
+        ),
     }
-    annotations = {'readOnlyHint': True, 'destructiveHint': False, 'idempotentHint': True}
+    annotations = {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    }
     return [
         {
-            'name': name,
-            'title': metadata[name][0],
-            'description': metadata[name][1],
-            'inputSchema': json.loads(json.dumps(runner.EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[name])),
-            'annotations': dict(annotations),
+            "name": name,
+            "title": metadata[name][0],
+            "description": metadata[name][1],
+            "inputSchema": json.loads(
+                json.dumps(runner.EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[name])
+            ),
+            "annotations": dict(annotations),
         }
         for name in sorted(runner.UPSTREAM_MCP)
     ]
+
+
+class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
+    """The same mount namespace must reject nested writable source binds."""
+
+    def _probe(
+        self,
+        *,
+        extra_rw: str | None = None,
+        writable_source: bool = False,
+        extra_system_rw: bool = False,
+        output_alias_source: bool = False,
+        output_alias_subdir: bool = False,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = home / "repos" / "source"
+            (source / ".git").mkdir(parents=True)
+            (source / "src").mkdir()
+            epoch = home / ".local" / "state" / "grabowski" / "epoch"
+            epoch.mkdir(parents=True)
+            leaves = {
+                name: epoch / name
+                for name in ("state", "transcripts", "evidence", "reports")
+            }
+            for path in leaves.values():
+                path.mkdir(mode=0o700)
+            request_root = home / "taskset" / "requests"
+            request_root.mkdir(parents=True)
+            repository_map = epoch / "repository-map.json"
+            repository_map.write_text("{}\n", encoding="utf-8")
+            manifest = home / "bundle" / "manifest.json"
+            manifest.parent.mkdir()
+            manifest.write_text("{}\n", encoding="utf-8")
+
+            real_read_text = Path.read_text
+            real_read_bytes = Path.read_bytes
+            real_samefile = os.path.samefile
+
+            def read_text(path: Path, *args, **kwargs):
+                if str(path) == "/proc/self/status":
+                    return "NoNewPrivs:\t1\nCapEff:\t0000000000000000\n"
+                return real_read_text(path, *args, **kwargs)
+
+            def mount_line(
+                path: Path, options: str, *, mount_root: Path | None = None
+            ) -> bytes:
+                physical_root = path if mount_root is None else mount_root
+                return (
+                    f"123 100 8:1 {physical_root} {path} {options} - ext4 /dev/test {options}\n"
+                ).encode()
+
+            mounts = [
+                mount_line(Path("/"), "rw,relatime"),
+                mount_line(home, "ro,relatime"),
+            ]
+            mounts.extend(
+                mount_line(
+                    path,
+                    "rw,relatime",
+                    mount_root=(
+                        source / "src"
+                        if output_alias_subdir and path == leaves["state"]
+                        else path
+                    ),
+                )
+                for path in leaves.values()
+            )
+            if extra_rw:
+                unexpected = home / extra_rw
+                unexpected.mkdir(parents=True, exist_ok=True)
+                mounts.append(mount_line(unexpected, "rw,relatime"))
+            if extra_system_rw:
+                mounts.append(mount_line(Path("/usr/bin"), "rw,relatime"))
+
+            def read_bytes(path: Path, *args, **kwargs):
+                if str(path) == "/proc/self/mountinfo":
+                    return b"".join(mounts)
+                return real_read_bytes(path, *args, **kwargs)
+
+            def statvfs(path: Path):
+                target = Path(path)
+                writable = target in leaves.values() or (
+                    writable_source and target == source
+                )
+                return type(
+                    "ReadOnlyFlags", (), {"f_flag": 0 if writable else os.ST_RDONLY}
+                )()
+
+            def samefile(left, right):
+                if (
+                    output_alias_source
+                    and Path(left) == leaves["state"]
+                    and Path(right) == source
+                ):
+                    return True
+                return real_samefile(left, right)
+
+            with (
+                patch.object(runner.Path, "home", return_value=home),
+                patch.object(runner.Path, "read_text", new=read_text),
+                patch.object(runner.Path, "read_bytes", new=read_bytes),
+                patch.object(runner.os, "getuid", return_value=1000),
+                patch.object(runner.os, "geteuid", return_value=1000),
+                patch.object(runner.os, "statvfs", side_effect=statvfs),
+                patch.object(runner.os.path, "samefile", side_effect=samefile),
+            ):
+                runner.validate_live_immutable_mounts(
+                    source=source,
+                    request_root=request_root,
+                    repository_map=repository_map,
+                    manifest=manifest,
+                    state_root=leaves["state"],
+                    transcript_root=leaves["transcripts"],
+                    evidence_root=leaves["evidence"],
+                    report_root=leaves["reports"],
+                )
+
+    def test_only_four_private_output_mounts_are_admissible(self) -> None:
+        self._probe()
+
+    def test_writable_historical_source_blocks_admission(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "protected input mount writable: source"
+        ):
+            self._probe(writable_source=True)
+
+    def test_readonly_home_does_not_hide_writable_repository_bind(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "unexpected writable home bind mount"
+        ):
+            self._probe(extra_rw="repos/unexpected")
+
+    def test_nested_output_bind_cannot_alias_protected_data(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "unexpected writable home bind mount"
+        ):
+            self._probe(extra_rw=".local/state/grabowski/epoch/state/alias")
+
+    def test_nested_system_tool_bind_must_be_readonly(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "unexpected writable system tool bind mount"
+        ):
+            self._probe(extra_system_rw=True)
+
+    def test_writable_output_mount_cannot_alias_protected_source(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "writable output aliases protected source"
+        ):
+            self._probe(output_alias_source=True)
+
+    def test_output_mount_cannot_bind_protected_source_subdirectory(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "output mount root does not match writable target"
+        ):
+            self._probe(output_alias_subdir=True)
 
 
 class RepoBriefCodexRunnerTests(unittest.TestCase):
@@ -467,12 +666,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
         value = request()
         value["runner"]["model"] = "gpt-other"
-        with self.assertRaisesRegex(runner.RunnerError, "Codex runner contract mismatch"):
+        with self.assertRaisesRegex(
+            runner.RunnerError, "Codex runner contract mismatch"
+        ):
             runner.validate_request(value)
 
         value = request()
         value["runner"]["sampling"] = {"reasoning_effort": "high"}
-        with self.assertRaisesRegex(runner.RunnerError, "Codex runner contract mismatch"):
+        with self.assertRaisesRegex(
+            runner.RunnerError, "Codex runner contract mismatch"
+        ):
             runner.validate_request(value)
 
     def test_frozen_g2_request_setup_requires_exact_revision_and_provider(self) -> None:
@@ -520,9 +723,14 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             candidate["session_id"] = f"session:{candidate['request_id']}"
             candidate["workspace_id"] = f"workspace:{candidate['request_id']}"
             with self.subTest(condition=condition):
-                with self.assertRaisesRegex(runner.RunnerError, "pair_id does not match"):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "pair_id does not match"
+                ):
                     runner.validate_request(candidate)
-    def test_private_frozen_g2_checkout_is_reproducibly_dirty_and_read_only(self) -> None:
+
+    def test_private_frozen_g2_checkout_is_reproducibly_dirty_and_read_only(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, commit = repository(root)
@@ -536,9 +744,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 attestation = runner.base.attest_checkout_setup(value, checkout)
                 self.assertEqual(attestation["working_tree"], "dirty")
                 self.assertEqual(attestation["git_commit"], commit)
-                self.assertEqual(attestation["fixture_sha256"], runner.sha_bytes(
-                    runner.base.DIRTY_FIXTURE_BYTES
-                ))
+                self.assertEqual(
+                    attestation["fixture_sha256"],
+                    runner.sha_bytes(runner.base.DIRTY_FIXTURE_BYTES),
+                )
                 self.assertEqual(git(["status", "--porcelain"], source), "")
                 self.assertEqual(
                     git(["status", "--porcelain"], checkout),
@@ -559,22 +768,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             source, commit = repository(root)
             (root / "state").mkdir(mode=0o700)
             frozen = runner.base.FROZEN_G2_IDENTITY
-            with patch.dict(frozen, {
-                "repository": {**frozen["repository"], "commit": commit}
-            }):
+            with patch.dict(
+                frozen, {"repository": {**frozen["repository"], "commit": commit}}
+            ):
                 value = frozen_g2_request(condition="treatment", commit=commit)
                 value["repobrief"]["mcp_command"] = [
-                    sys.executable, "/fixture/mcp.py", "--bundle-root",
-                    "/snapshot", "--repo-root", str(source),
+                    sys.executable,
+                    "/fixture/mcp.py",
+                    "--bundle-root",
+                    "/snapshot",
+                    "--repo-root",
+                    str(source),
                 ]
                 checkout = runner.create_checkout(value, source, root / "state")
                 with patch.object(
-                    runner, "_validated_mcp_proxy_python",
+                    runner,
+                    "_validated_mcp_proxy_python",
                     return_value=sys.executable,
                 ):
                     command = runner.build_command(
-                        value, "/opt/codex", checkout,
-                        root / "answer.json", root / "codex-home",
+                        value,
+                        "/opt/codex",
+                        checkout,
+                        root / "answer.json",
+                        root / "codex-home",
                         authorized_mcp_files=[],
                         proxy_path=root / "proxy.py",
                         manifest_path=root / "staged.bundle.manifest.json",
@@ -582,7 +799,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         source=source,
                     )
                     config = next(
-                        item for item in command
+                        item
+                        for item in command
                         if item.startswith("mcp_servers.repobrief.args=")
                     )
                     proxy_args = json.loads(config.split("=", 1)[1])
@@ -595,8 +813,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     value["repobrief"]["mcp_command"][-1] = str(root / "wrong")
                     with self.assertRaisesRegex(runner.RunnerError, "source"):
                         runner.build_command(
-                            value, "/opt/codex", checkout,
-                            root / "answer.json", root / "codex-home",
+                            value,
+                            "/opt/codex",
+                            checkout,
+                            root / "answer.json",
+                            root / "codex-home",
                             authorized_mcp_files=[],
                             proxy_path=root / "proxy.py",
                             manifest_path=root / "staged.bundle.manifest.json",
@@ -632,9 +853,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "outcome": "answer",
             "reported_paths": ["src/example.py"],
             "reported_symbols": ["example"],
-            "citations": [
-                {"path": "src/example.py", "start_line": 1, "end_line": 2}
-            ],
+            "citations": [{"path": "src/example.py", "start_line": 1, "end_line": 2}],
             "claims": [claim],
             "asserted_sufficient_evidence": False,
         }
@@ -654,7 +873,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(runner.base.RunnerError, "duplicates"):
                     runner.base.validate_answer(candidate)
 
-    def test_codex_output_schema_fails_closed_on_uniqueness_contract_drift(self) -> None:
+    def test_codex_output_schema_fails_closed_on_uniqueness_contract_drift(
+        self,
+    ) -> None:
         drifted = json.loads(json.dumps(runner.base.ANSWER_SCHEMA))
         del drifted["properties"]["reported_paths"]["uniqueItems"]
         with (
@@ -745,9 +966,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             marker = root / "uploadpack-ran"
             uploadpack = root / "uploadpack-wrapper"
             uploadpack.write_text(
-                "#!/bin/sh\n"
-                f"printf ran > {str(marker)!r}\n"
-                'exec git-upload-pack "$@"\n',
+                f'#!/bin/sh\nprintf ran > {str(marker)!r}\nexec git-upload-pack "$@"\n',
                 encoding="utf-8",
             )
             uploadpack.chmod(0o700)
@@ -802,7 +1021,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             0,
             completed.stderr.decode("utf-8", errors="replace"),
         )
-        self.assertIn(b"Run one isolated read-only RepoBrief Codex benchmark request", completed.stdout)
+        self.assertIn(
+            b"Run one isolated read-only RepoBrief Codex benchmark request",
+            completed.stdout,
+        )
 
     def test_authorized_runtime_code_must_match_executed_runner_bytes(self) -> None:
         files = []
@@ -810,7 +1032,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             path = runner._runtime_code_path(name)
             raw = path.read_bytes()
             files.append(
-                {"name": name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+                {
+                    "name": name,
+                    "bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
             )
         code = {
             "files": files,
@@ -820,9 +1046,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         drifted["sha256"] = "0" * 64
         with (
             patch.object(runner, "_SELF_SOURCE_IDENTITY", drifted),
-            self.assertRaisesRegex(
-                runner.RunnerError, "differs from executed bytes"
-            ),
+            self.assertRaisesRegex(runner.RunnerError, "differs from executed bytes"),
         ):
             runner._validated_authorized_runtime_code(code)
 
@@ -832,7 +1056,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             path = runner._runtime_code_path(name)
             raw = path.read_bytes()
             files.append(
-                {"name": name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+                {
+                    "name": name,
+                    "bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
             )
         code = {
             "files": files,
@@ -848,9 +1076,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         }
         with (
             patch.object(runner, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", identity),
-            self.assertRaisesRegex(
-                runner.RunnerError, "differs from executed bytes"
-            ),
+            self.assertRaisesRegex(runner.RunnerError, "differs from executed bytes"),
         ):
             runner._validated_authorized_runtime_code(code)
 
@@ -886,19 +1112,28 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             auth.chmod(0o600)
             environment = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
             ok = subprocess.CompletedProcess(
-                ["codex", "login", "status"], 0,
-                stdout=b"Logged in using ChatGPT\n", stderr=b"",
+                ["codex", "login", "status"],
+                0,
+                stdout=b"Logged in using ChatGPT\n",
+                stderr=b"",
             )
-            with patch.object(runner, "provider_env", return_value=environment), patch.object(
-                runner.subprocess, "run", return_value=ok
+            with (
+                patch.object(runner, "provider_env", return_value=environment),
+                patch.object(runner.subprocess, "run", return_value=ok),
             ):
-                self.assertEqual(runner.validate_chatgpt_subscription("/opt/codex"), b"opaque-chatgpt-auth")
+                self.assertEqual(
+                    runner.validate_chatgpt_subscription("/opt/codex"),
+                    b"opaque-chatgpt-auth",
+                )
             bad = subprocess.CompletedProcess(
-                ["codex", "login", "status"], 0,
-                stdout=b"Logged in using API key\n", stderr=b"",
+                ["codex", "login", "status"],
+                0,
+                stdout=b"Logged in using API key\n",
+                stderr=b"",
             )
-            with patch.object(runner, "provider_env", return_value=environment), patch.object(
-                runner.subprocess, "run", return_value=bad
+            with (
+                patch.object(runner, "provider_env", return_value=environment),
+                patch.object(runner.subprocess, "run", return_value=bad),
             ):
                 with self.assertRaisesRegex(runner.RunnerError, "ChatGPT subscription"):
                     runner.validate_chatgpt_subscription("/opt/codex")
@@ -932,7 +1167,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, {"HOME": str(home)}, clear=True),
-                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(
+                    runner, "validate_toolchain", return_value="/usr/bin:/bin"
+                ),
                 patch.object(runner.subprocess, "run", side_effect=status),
             ):
                 self.assertEqual(
@@ -958,7 +1195,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, {"HOME": str(home)}, clear=True),
-                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(
+                    runner, "validate_toolchain", return_value="/usr/bin:/bin"
+                ),
                 patch.object(runner.subprocess, "run", side_effect=foreign_status),
             ):
                 with self.assertRaisesRegex(runner.RunnerError, "ChatGPT subscription"):
@@ -988,7 +1227,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, {"HOME": str(home)}, clear=True),
-                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(
+                    runner, "validate_toolchain", return_value="/usr/bin:/bin"
+                ),
                 patch.object(runner.subprocess, "run", side_effect=status),
             ):
                 returned = runner.validate_chatgpt_subscription("/opt/codex")
@@ -1009,8 +1250,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(auth.stat().st_mode), 0o600)
             self.assertIsNone(runner.cleanup_codex_home(runtime_home))
             self.assertFalse(runtime_home.exists())
-            with patch.object(runner.shutil, "rmtree", side_effect=OSError("cleanup failed")):
-                self.assertEqual(runner.cleanup_codex_home(Path("/tmp/example")), "OSError")
+            with patch.object(
+                runner.shutil, "rmtree", side_effect=OSError("cleanup failed")
+            ):
+                self.assertEqual(
+                    runner.cleanup_codex_home(Path("/tmp/example")), "OSError"
+                )
 
     def test_stderr_policy_is_explicit_and_fail_closed(self) -> None:
         empty = runner.classify_stderr(b"")
@@ -1043,9 +1288,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
         login_only = runner.classify_stderr(
             b"WARNING: proceeding, even though we could not create PATH aliases: "
-            b"Refusing to create helper binaries under temporary dir \"/tmp\" "
+            b'Refusing to create helper binaries under temporary dir "/tmp" '
             b"(codex_home: AbsolutePathBuf("
-            b"\"/tmp/grabowski-codex-auth-example/codex-runtime/session-example\"))\n"
+            b'"/tmp/grabowski-codex-auth-example/codex-runtime/session-example"))\n'
         )
         self.assertFalse(login_only["allowed"])
         self.assertEqual(login_only["classification"], "text_unqualified")
@@ -1066,18 +1311,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(runner.command_kind("rg foo#bar src"), "grep")
         self.assertEqual(runner.command_kind("rg --regexp=example src"), "grep")
         self.assertEqual(runner.command_kind("cat src/example.py"), "read_file")
-        self.assertEqual(runner.command_kind("sed -n '1,2p' src/example.py"), "read_file")
+        self.assertEqual(
+            runner.command_kind("sed -n '1,2p' src/example.py"), "read_file"
+        )
         self.assertEqual(
             runner.command_kind(
-                "/bin/bash -c \"rg -n 'finaliz|Finaliz' "
-                "--glob '*.py' --glob '*.md'\""
+                "/bin/bash -c \"rg -n 'finaliz|Finaliz' --glob '*.py' --glob '*.md'\""
             ),
             "grep",
         )
         self.assertEqual(
             runner.command_kind(
-                "/bin/bash -c \"sed -n '62,177p' "
-                "src/grabowski_job_finalizer.py\""
+                "/bin/bash -c \"sed -n '62,177p' src/grabowski_job_finalizer.py\""
             ),
             "read_file",
         )
@@ -1145,7 +1390,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         )
         self.assertNotIn(requirement, baseline)
         self.assertIn(requirement, treatment)
-        self.assertNotIn("may additionally use only these RepoGround MCP tools", treatment)
+        self.assertNotIn(
+            "may additionally use only these RepoGround MCP tools", treatment
+        )
         for name in (
             "ask_context",
             "grounding_verify",
@@ -1183,8 +1430,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         baseline_joined = " ".join(baseline)
         treatment_joined = " ".join(treatment)
         for flag in (
-            "--ephemeral", "--ignore-user-config", "--ignore-rules",
-            "--strict-config", "--json",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--strict-config",
+            "--json",
         ):
             self.assertIn(flag, baseline)
         self.assertNotIn("--sandbox", baseline)
@@ -1226,7 +1476,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             [expected_enabled_tools],
         )
         self.assertIn("--codex-mcp-proxy", treatment_joined)
-
 
     def test_validate_support_executable_enforces_permissions_and_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1303,7 +1552,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     executable=True,
                 )
 
-    def test_mcp_authorization_identity_normalizes_to_preflight_mode_contract(self) -> None:
+    def test_mcp_authorization_identity_normalizes_to_preflight_mode_contract(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "file"
             path.write_bytes(b"x")
@@ -1416,7 +1667,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 command,
             )
 
-    def test_raw_provider_evidence_is_written_before_unqualified_stderr_fails(self) -> None:
+    def test_raw_provider_evidence_is_written_before_unqualified_stderr_fails(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, commit = repository(root)
@@ -1429,7 +1682,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             stderr.write_bytes(b"warning: not yet qualified\n")
             args = fixture_args(root, fixture, stderr=stderr)
 
-            with self.assertRaisesRegex(runner.RunnerError, "after evidence persistence"):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "after evidence persistence"
+            ):
                 runner.execute(value, args)
 
             names = runner._provider_artifact_names(value)
@@ -1442,14 +1697,22 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
             self.assertEqual(diagnostics["semantic_interpretation"], "not_performed")
             self.assertEqual(
-                diagnostics["stderr"]["sha256"], hashlib.sha256(stderr.read_bytes()).hexdigest()
+                diagnostics["stderr"]["sha256"],
+                hashlib.sha256(stderr.read_bytes()).hexdigest(),
             )
-            self.assertEqual(diagnostics["stdout"]["sha256"], hashlib.sha256(fixture.read_bytes()).hexdigest())
+            self.assertEqual(
+                diagnostics["stdout"]["sha256"],
+                hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            )
             stderr_policy = json.loads(stderr_policy_path.read_text(encoding="utf-8"))
-            self.assertEqual(stderr_policy["stderr"]["classification"], "text_unqualified")
+            self.assertEqual(
+                stderr_policy["stderr"]["classification"], "text_unqualified"
+            )
             self.assertFalse(stderr_policy["stderr"]["allowed"])
 
-    def test_capture_diagnostics_are_persisted_before_stderr_classifier_runs(self) -> None:
+    def test_capture_diagnostics_are_persisted_before_stderr_classifier_runs(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             value = request()
@@ -1462,7 +1725,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "stderr_overflow": False,
             }
             now = datetime.now(timezone.utc)
-            with patch.object(runner, "classify_stderr", side_effect=runner.RunnerError("classifier boom")):
+            with patch.object(
+                runner,
+                "classify_stderr",
+                side_effect=runner.RunnerError("classifier boom"),
+            ):
                 with self.assertRaisesRegex(runner.RunnerError, "classifier boom"):
                     runner.persist_provider_capture(
                         value,
@@ -1474,13 +1741,22 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         synthetic_fixture=True,
                     )
             names = runner._provider_artifact_names(value)
-            self.assertEqual((root / "transcripts" / names["stdout"]).read_bytes(), b"captured\n")
-            self.assertEqual((root / "provider-evidence" / names["stderr"]).read_bytes(), b"diagnostic\n")
+            self.assertEqual(
+                (root / "transcripts" / names["stdout"]).read_bytes(), b"captured\n"
+            )
+            self.assertEqual(
+                (root / "provider-evidence" / names["stderr"]).read_bytes(),
+                b"diagnostic\n",
+            )
             diagnostics = json.loads(
-                (root / "provider-evidence" / names["diagnostics"]).read_text(encoding="utf-8")
+                (root / "provider-evidence" / names["diagnostics"]).read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(diagnostics["semantic_interpretation"], "not_performed")
-            self.assertFalse((root / "provider-evidence" / names["stderr_policy"]).exists())
+            self.assertFalse(
+                (root / "provider-evidence" / names["stderr_policy"]).exists()
+            )
 
     def test_partial_private_write_is_preserved_for_forensics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1489,16 +1765,20 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             path, descriptor = runner._open_private_directory(root, create_final=False)
             real_write = os.write
             calls = 0
+
             def flaky_write(fd, data):
                 nonlocal calls
                 if calls == 0:
                     calls += 1
                     return real_write(fd, bytes(data[:3]))
                 raise OSError("simulated disk failure")
+
             try:
                 with patch.object(runner.os, "write", side_effect=flaky_write):
                     with self.assertRaisesRegex(OSError, "simulated disk failure"):
-                        runner._write_private_dirfd(descriptor, "partial.bin", b"abcdef")
+                        runner._write_private_dirfd(
+                            descriptor, "partial.bin", b"abcdef"
+                        )
             finally:
                 os.close(descriptor)
             self.assertEqual((path / "partial.bin").read_bytes(), b"abc")
@@ -1510,16 +1790,20 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             path, descriptor = runner._open_private_directory(root, create_final=False)
             real_fsync = os.fsync
             calls = 0
+
             def flaky_fsync(fd):
                 nonlocal calls
                 calls += 1
                 if calls == 2:
                     raise OSError("simulated directory fsync failure")
                 return real_fsync(fd)
+
             try:
                 with patch.object(runner.os, "fsync", side_effect=flaky_fsync):
                     with self.assertRaisesRegex(OSError, "directory fsync failure"):
-                        runner._write_private_dirfd(descriptor, "durable.bin", b"complete")
+                        runner._write_private_dirfd(
+                            descriptor, "durable.bin", b"complete"
+                        )
             finally:
                 os.close(descriptor)
             self.assertEqual((path / "durable.bin").read_bytes(), b"complete")
@@ -1543,7 +1827,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 (root / "transcripts" / names["stdout"]).read_bytes(), b"not-json\n"
             )
             stderr_policy = json.loads(
-                (root / "provider-evidence" / names["stderr_policy"]).read_text(encoding="utf-8")
+                (root / "provider-evidence" / names["stderr_policy"]).read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(stderr_policy["stderr"]["classification"], "empty")
 
@@ -1563,7 +1849,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
             names = runner._provider_artifact_names(value)
             diagnostics = json.loads(
-                (root / "provider-evidence" / names["diagnostics"]).read_text(encoding="utf-8")
+                (root / "provider-evidence" / names["diagnostics"]).read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(diagnostics["returncode"], 7)
             self.assertTrue((root / "transcripts" / names["stdout"]).is_file())
@@ -1593,18 +1881,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             names = runner._provider_artifact_names(value)
             self.assertEqual(receipt["transcript"]["artifact"], names["stdout"])
             self.assertEqual(
-                (root / "transcripts" / names["stdout"]).read_bytes(), fixture.read_bytes()
+                (root / "transcripts" / names["stdout"]).read_bytes(),
+                fixture.read_bytes(),
             )
             diagnostics = json.loads(
-                (root / "provider-evidence" / names["diagnostics"]).read_text(encoding="utf-8")
+                (root / "provider-evidence" / names["diagnostics"]).read_text(
+                    encoding="utf-8"
+                )
             )
             stderr_policy = json.loads(
-                (root / "provider-evidence" / names["stderr_policy"]).read_text(encoding="utf-8")
+                (root / "provider-evidence" / names["stderr_policy"]).read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(stderr_policy["stderr"]["classification"], "empty")
             self.assertTrue(diagnostics["synthetic_fixture"])
 
-    def test_live_execution_requires_explicit_authorization_before_workspace_effect(self) -> None:
+    def test_live_execution_requires_explicit_authorization_before_workspace_effect(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = Namespace(
@@ -1620,7 +1915,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 stderr_fixture=None,
                 fixture_returncode=0,
             )
-            with self.assertRaisesRegex(runner.RunnerError, "explicit allow_live_provider"):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "explicit allow_live_provider"
+            ):
                 runner.execute(request(), args)
             self.assertFalse((root / "state").exists())
             self.assertFalse((root / "transcripts").exists())
@@ -1655,7 +1952,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertFalse((root / "transcripts").exists())
             self.assertFalse((root / "provider-evidence").exists())
 
-    def test_live_baseline_requires_dispatch_authorization_before_codex_status_or_launch(self) -> None:
+    def test_live_baseline_requires_dispatch_authorization_before_codex_status_or_launch(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, commit = repository(root)
@@ -1687,7 +1986,85 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             login_status.assert_not_called()
             provider_launch.assert_not_called()
 
-    def test_execute_wires_irreversible_effect_callbacks_into_failure_ledger(self) -> None:
+    def test_live_mount_drift_blocks_before_workspace_and_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request()
+            planned_request_root(root, value)
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "repositories.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "provider-evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            dispatch = {
+                "authorization": {"contract": "test"},
+                "provider_codex": {},
+                "provider_authentication": {},
+                "repository_map_bytes": b"{}",
+                "binding": {},
+            }
+            with ExitStack() as stack:
+                for name, value_to_return in (
+                    ("validate_executable", "/opt/codex"),
+                    ("validate_toolchain", "/usr/bin:/bin"),
+                    ("validate_chatgpt_subscription", b"opaque-chatgpt-auth"),
+                    ("_repository_root_from_authorized_map_bytes", root),
+                ):
+                    stack.enter_context(
+                        patch.object(runner, name, return_value=value_to_return)
+                    )
+                for name in (
+                    "_assert_authorized_codex_executable",
+                    "_assert_authorized_chatgpt_auth",
+                    "_assert_authorized_runtime_binding",
+                ):
+                    stack.enter_context(patch.object(runner, name))
+                stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_load_preflight_dispatch_authorization",
+                        return_value=dispatch,
+                    )
+                )
+                mount_guard = stack.enter_context(
+                    patch.object(
+                        runner,
+                        "validate_live_immutable_mounts",
+                        side_effect=runner.RunnerError(
+                            "live Codex protected input mount writable: source"
+                        ),
+                    )
+                )
+                evidence = stack.enter_context(
+                    patch.object(runner, "prepare_provider_evidence")
+                )
+                checkout = stack.enter_context(patch.object(runner, "create_checkout"))
+                intent = stack.enter_context(
+                    patch.object(runner, "_record_preflight_dispatch_intent")
+                )
+                provider = stack.enter_context(patch.object(runner, "run_bounded"))
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "protected input mount writable: source"
+                ):
+                    runner.execute(value, args)
+            mount_guard.assert_called_once()
+            evidence.assert_not_called()
+            checkout.assert_not_called()
+            intent.assert_not_called()
+            provider.assert_not_called()
+            self.assertFalse((root / "state" / "codex-workspaces").exists())
+
+    def test_execute_wires_irreversible_effect_callbacks_into_failure_ledger(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             value = request()
@@ -1749,6 +2126,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "_assert_authorized_codex_executable",
                     "_assert_authorized_chatgpt_auth",
                     "_assert_authorized_runtime_binding",
+                    "validate_live_immutable_mounts",
                     "close_provider_evidence_plan",
                     "write_schema",
                 ):
@@ -1775,7 +2153,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 )
                 stack.enter_context(
                     patch.object(
-                        runner.base, "attest_checkout_setup",
+                        runner.base,
+                        "attest_checkout_setup",
                         return_value={"working_tree": "clean"},
                     )
                 )
@@ -1787,7 +2166,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             failed.assert_called_once()
             self.assertTrue(failed.call_args.kwargs["provider_process_started"])
 
-    def test_treatment_manifest_mismatch_fails_before_workspace_consumption(self) -> None:
+    def test_treatment_manifest_mismatch_fails_before_workspace_consumption(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, commit = repository(root)
@@ -1808,7 +2189,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertFalse((root / "transcripts").exists())
             self.assertFalse((root / "provider-evidence").exists())
 
-    def test_treatment_manifest_symlink_fails_before_workspace_consumption(self) -> None:
+    def test_treatment_manifest_symlink_fails_before_workspace_consumption(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, commit = repository(root)
@@ -1818,7 +2201,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             manifest = root / "manifest.json"
             manifest.symlink_to(real_manifest)
             value["repobrief"]["manifest"] = str(manifest)
-            value["repobrief"]["manifest_sha256"] = hashlib.sha256(real_manifest.read_bytes()).hexdigest()
+            value["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                real_manifest.read_bytes()
+            ).hexdigest()
             planned_request_root(root, value)
             repository_map(root, source)
             fixture = root / "stdout.jsonl"
@@ -1828,7 +2213,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 runner.execute(value, args)
             self.assertFalse((root / "state").exists())
 
-    def test_existing_provider_artifact_fails_before_workspace_consumption(self) -> None:
+    def test_existing_provider_artifact_fails_before_workspace_consumption(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, commit = repository(root)
@@ -1863,7 +2250,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 runner.execute(value, args)
             self.assertFalse((root / "state" / "codex-workspaces").exists())
 
-    def test_live_execution_rejects_fixture_controls_before_workspace_effect(self) -> None:
+    def test_live_execution_rejects_fixture_controls_before_workspace_effect(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stderr = root / "stderr.txt"
@@ -1881,7 +2270,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 stderr_fixture=stderr,
                 fixture_returncode=0,
             )
-            with self.assertRaisesRegex(runner.RunnerError, "synthetic fixture controls"):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "synthetic fixture controls"
+            ):
                 runner.execute(request(), args)
             self.assertFalse((root / "state").exists())
 
@@ -1892,7 +2283,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             fixture.write_bytes(b"{}\n")
             args = fixture_args(root, fixture)
             args.allow_live_provider = True
-            with self.assertRaisesRegex(runner.RunnerError, "must not carry live-provider"):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "must not carry live-provider"
+            ):
                 runner.execute(request(), args)
             self.assertFalse((root / "state").exists())
 
@@ -1902,7 +2295,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             path.write_bytes(b"#!/bin/sh\nexit 0\n")
             path.chmod(0o700)
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            self.assertEqual(runner.validate_executable(str(path), digest), str(path.resolve()))
+            self.assertEqual(
+                runner.validate_executable(str(path), digest), str(path.resolve())
+            )
             with self.assertRaisesRegex(runner.RunnerError, "mismatched"):
                 runner.validate_executable(str(path), "0" * 64)
             with self.assertRaisesRegex(runner.RunnerError, "must be absolute"):
@@ -1945,10 +2340,14 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 timeout_seconds=2,
                 stdin_data=b"x" * (2 * 1024 * 1024),
             )
-            self.assertTrue(str(capture["capture_error"]).startswith("stdin_write_failed:"))
+            self.assertTrue(
+                str(capture["capture_error"]).startswith("stdin_write_failed:")
+            )
             self.assertIn(b"input-closed", capture["stderr"])
 
-    def test_run_bounded_converts_post_start_stream_exception_to_capture_error(self) -> None:
+    def test_run_bounded_converts_post_start_stream_exception_to_capture_error(
+        self,
+    ) -> None:
         real_selector = runner.selectors.DefaultSelector
 
         class FlakySelector:
@@ -1987,10 +2386,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             with patch.object(runner.selectors, "DefaultSelector", FlakySelector):
                 capture = runner.run_bounded(
-                    [sys.executable, str(script)], cwd=root, timeout_seconds=2, stdin_data=b""
+                    [sys.executable, str(script)],
+                    cwd=root,
+                    timeout_seconds=2,
+                    stdin_data=b"",
                 )
             self.assertIn(b"captured-before-selector-failure", capture["stdout"])
-            self.assertIn("capture_stream_failed:OSError", str(capture["capture_error"]))
+            self.assertIn(
+                "capture_stream_failed:OSError", str(capture["capture_error"])
+            )
 
     def test_run_bounded_emergency_reaps_unhandled_post_start_exception(self) -> None:
         real_popen = runner.subprocess.Popen
@@ -2020,9 +2424,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     stdin_data=b"",
                 )
 
-        self.assertIn(
-            "capture_unhandled:RuntimeError", str(capture["capture_error"])
-        )
+        self.assertIn("capture_unhandled:RuntimeError", str(capture["capture_error"]))
         self.assertIn("process", observed)
         self.assertIsNotNone(observed["process"].poll())
 
@@ -2060,7 +2462,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertIn("process", observed)
         self.assertIsNotNone(observed["process"].poll())
 
-    def test_run_bounded_retries_interrupted_provider_start_marker_after_popen(self) -> None:
+    def test_run_bounded_retries_interrupted_provider_start_marker_after_popen(
+        self,
+    ) -> None:
         callback_calls: list[int] = []
         provider_started: list[bool] = []
 
@@ -2108,7 +2512,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
         self.assertEqual(provider_started, [True])
 
-    def test_run_bounded_marks_provider_started_when_popen_interrupt_leaves_child(self) -> None:
+    def test_run_bounded_marks_provider_started_when_popen_interrupt_leaves_child(
+        self,
+    ) -> None:
         real_popen = runner.subprocess.Popen
         observed: dict[str, subprocess.Popen] = {}
         provider_started: list[bool] = []
@@ -2165,7 +2571,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         stdin_data=b"",
                     )
 
-    def test_direct_child_pids_falls_back_when_task_children_file_is_missing(self) -> None:
+    def test_direct_child_pids_falls_back_when_task_children_file_is_missing(
+        self,
+    ) -> None:
         child = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             stdout=subprocess.DEVNULL,
@@ -2185,7 +2593,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             child.kill()
             child.wait(timeout=5)
 
-    def test_run_bounded_uses_dedicated_process_group_and_kills_it_on_timeout(self) -> None:
+    def test_run_bounded_uses_dedicated_process_group_and_kills_it_on_timeout(
+        self,
+    ) -> None:
         real_popen = runner.subprocess.Popen
         launch_kwargs = []
 
@@ -2202,13 +2612,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 patch.object(runner.os, "killpg", wraps=runner.os.killpg) as killpg,
             ):
                 capture = runner.run_bounded(
-                    [sys.executable, str(script)], cwd=root, timeout_seconds=1, stdin_data=b""
+                    [sys.executable, str(script)],
+                    cwd=root,
+                    timeout_seconds=1,
+                    stdin_data=b"",
                 )
             self.assertEqual(capture["capture_error"], "timeout")
             self.assertTrue(launch_kwargs[0].get("start_new_session"))
             self.assertGreaterEqual(killpg.call_count, 1)
 
-    def test_run_bounded_kills_process_group_left_after_normal_provider_exit(self) -> None:
+    def test_run_bounded_kills_process_group_left_after_normal_provider_exit(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             child_state = root / "child.pid"
@@ -2232,7 +2647,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             capture = runner.run_bounded(
-                [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
+                [sys.executable, str(script)],
+                cwd=root,
+                timeout_seconds=3,
+                stdin_data=b"",
             )
             self.assertIsNone(capture["capture_error"])
             self.assertIn(
@@ -2250,7 +2668,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     self.fail("provider descendant survived process-group containment")
                 time.sleep(0.02)
 
-    def test_run_bounded_failed_post_exit_containment_remains_capture_error(self) -> None:
+    def test_run_bounded_failed_post_exit_containment_remains_capture_error(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             child_state = root / "child.pid"
@@ -2304,7 +2724,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(child_pid, 0)
 
-    def test_run_bounded_reaps_descendant_that_detaches_from_provider_group(self) -> None:
+    def test_run_bounded_reaps_descendant_that_detaches_from_provider_group(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             child_state = root / "detached.pid"
@@ -2329,7 +2751,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             capture = runner.run_bounded(
-                [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
+                [sys.executable, str(script)],
+                cwd=root,
+                timeout_seconds=3,
+                stdin_data=b"",
             )
             self.assertIsNone(capture["capture_error"])
             self.assertIn(
@@ -2386,7 +2811,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(capture["capture_error"], "timeout")
             self.assertLess(elapsed, 3.0)
 
-    def test_run_bounded_returns_capture_error_instead_of_discarding_partial_streams(self) -> None:
+    def test_run_bounded_returns_capture_error_instead_of_discarding_partial_streams(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / "producer.py"
@@ -2407,7 +2834,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIn(b"before-timeout", capture["stdout"])
             self.assertIn(b"diagnostic", capture["stderr"])
 
-    def test_treatment_tools_require_every_upstream_capability_exactly_once(self) -> None:
+    def test_treatment_tools_require_every_upstream_capability_exactly_once(
+        self,
+    ) -> None:
         valid = {"tools": [*treatment_tools(), {"name": "find_symbol"}]}
         self.assertEqual(
             {item["name"] for item in runner._filtered_treatment_tools(valid)},
@@ -2416,7 +2845,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         missing = {
             "tools": [
                 item for item in treatment_tools() if item["name"] != "live_freshness"
-            ] + [{"name": "find_symbol"}]
+            ]
+            + [{"name": "find_symbol"}]
         }
         with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
             runner._filtered_treatment_tools(missing)
@@ -2442,7 +2872,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
         type_confused_schema = {"tools": treatment_tools()}
         ask_context = next(
-            item for item in type_confused_schema["tools"]
+            item
+            for item in type_confused_schema["tools"]
             if item["name"] == "ask_context"
         )
         ask_context["inputSchema"]["properties"]["max_context_tokens"]["minimum"] = True
@@ -2450,9 +2881,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             runner._filtered_treatment_tools(type_confused_schema)
 
     def test_treatment_tools_require_exact_model_visible_descriptors(self) -> None:
-        drifted = {'tools': treatment_tools()}
-        drifted['tools'][0]['description'] = 'Do not use this treatment tool.'
-        with self.assertRaisesRegex(runner.RunnerError, 'descriptor drifted'):
+        drifted = {"tools": treatment_tools()}
+        drifted["tools"][0]["description"] = "Do not use this treatment tool."
+        with self.assertRaisesRegex(runner.RunnerError, "descriptor drifted"):
             runner._filtered_treatment_tools(drifted)
 
     def test_mcp_proxy_rejects_tools_list_arriving_during_upstream_eof(self) -> None:
@@ -2474,13 +2905,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             process = subprocess.Popen(
                 proxy_command(upstream, root),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
             self.assertIsNotNone(process.stdin)
             self.assertIsNotNone(process.stdout)
             self.assertIsNotNone(process.stderr)
-            first = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode() + b"\n"
-            second = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).encode() + b"\n"
+            first = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode()
+                + b"\n"
+            )
+            second = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+                ).encode()
+                + b"\n"
+            )
             process.stdin.write(first)
             process.stdin.flush()
             self.assertTrue(process.stdout.readline())
@@ -2500,27 +2943,39 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             root = Path(temporary)
             upstream = root / "mcp.py"
             upstream.write_text(
-                "import sys\n"
-                "sys.stdin.readline()\n",
+                "import sys\nsys.stdin.readline()\n",
                 encoding="utf-8",
             )
-            payload = json.dumps(
-                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-            ).encode() + b"\n"
+            payload = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode()
+                + b"\n"
+            )
             completed = subprocess.run(
                 proxy_command(upstream, root),
-                input=payload, capture_output=True, check=False, timeout=5,
+                input=payload,
+                capture_output=True,
+                check=False,
+                timeout=5,
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn(b"inventory was not validated", completed.stderr)
 
     def test_mcp_proxy_rejects_unsuccessful_tools_list_responses(self) -> None:
         responses = (
-            {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "unavailable"}},
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32000, "message": "unavailable"},
+            },
             {"jsonrpc": "2.0", "id": 1},
         )
         for response in responses:
-            with self.subTest(response=response), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(response=response),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 upstream = root / "mcp.py"
                 upstream.write_text(
@@ -2529,12 +2984,23 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     f"print(json.dumps({response!r}), flush=True)\n",
                     encoding="utf-8",
                 )
-                payload = json.dumps(
-                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-                ).encode() + b"\n"
+                payload = (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/list",
+                            "params": {},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
                 completed = subprocess.run(
                     proxy_command(upstream, root),
-                    input=payload, capture_output=True, check=False, timeout=5,
+                    input=payload,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertTrue(
@@ -2542,7 +3008,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     or b"response envelope is invalid" in completed.stderr
                 )
 
-    def test_mcp_proxy_coalesces_pipelined_resource_lists_to_first_snapshot(self) -> None:
+    def test_mcp_proxy_coalesces_pipelined_resource_lists_to_first_snapshot(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             count_path = root / "resource-list-count.txt"
@@ -2564,17 +3032,38 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             messages = [
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
-                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"repobrief_resource_read","arguments":{"action":"list"}}},
-                {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"repobrief_resource_read","arguments":{"action":"list"}}},
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "list"},
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "list"},
+                    },
+                },
             ]
             completed = subprocess.run(
                 proxy_command(upstream, root),
                 input=b"".join(json.dumps(item).encode() + b"\n" for item in messages),
-                capture_output=True, check=False, timeout=5,
+                capture_output=True,
+                check=False,
+                timeout=5,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-            responses = {item["id"]: item for item in map(json.loads, completed.stdout.decode().splitlines())}
+            responses = {
+                item["id"]: item
+                for item in map(json.loads, completed.stdout.decode().splitlines())
+            }
             first = responses[2]["result"]["content"][0]["text"]
             second = responses[3]["result"]["content"][0]["text"]
             self.assertEqual(first, second)
@@ -2584,7 +3073,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             self.assertEqual(count_path.read_text(), "1")
 
-    def test_mcp_proxy_rebinds_resource_read_live_freshness_to_logical_manifest(self) -> None:
+    def test_mcp_proxy_rebinds_resource_read_live_freshness_to_logical_manifest(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             observed_manifest = root / "observed-manifest-path.txt"
@@ -2625,21 +3116,31 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 return json.loads(process.stdout.readline())
 
             tools = roundtrip(
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
             )
             self.assertIn("result", tools)
             listed = roundtrip(
-                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-                    "name":"repobrief_resource_read",
-                    "arguments":{"action":"list"},
-                }}
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "list"},
+                    },
+                }
             )
             self.assertFalse(listed["result"]["isError"])
             read = roundtrip(
-                {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
-                    "name":"repobrief_resource_read",
-                    "arguments":{"action":"read","uri":"repobrief://frozen/a"},
-                }}
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "read", "uri": "repobrief://frozen/a"},
+                    },
+                }
             )
             self.assertFalse(read["result"]["isError"])
             assert process.stdin is not None
@@ -2661,7 +3162,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 str(logical_manifest),
             )
 
-    def test_rebind_resource_read_manifest_rejects_non_staged_freshness_path(self) -> None:
+    def test_rebind_resource_read_manifest_rejects_non_staged_freshness_path(
+        self,
+    ) -> None:
         staged_manifest = Path("/private/staged.bundle.manifest.json")
         logical_manifest = Path("/logical/repo.bundle.manifest.json")
         value = {
@@ -2703,7 +3206,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             process = subprocess.Popen(
                 proxy_command(upstream, root),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
             self.assertIsNotNone(process.stdin)
             self.assertIsNotNone(process.stdout)
@@ -2716,22 +3221,38 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 return json.loads(process.stdout.readline())
 
             tools = roundtrip(
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
             )
             self.assertIn("result", tools)
             listed = roundtrip(
-                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-                    "name":"repobrief_resource_read",
-                    "arguments":{"action":"list"},
-                }}
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "list"},
+                    },
+                }
             )
             self.assertFalse(listed["result"]["isError"])
-            process.stdin.write(json.dumps(
-                {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
-                    "name":"repobrief_resource_read",
-                    "arguments":{"action":"read","uri":"repobrief://frozen/a"},
-                }}
-            ).encode() + b"\n")
+            process.stdin.write(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "repobrief_resource_read",
+                            "arguments": {
+                                "action": "read",
+                                "uri": "repobrief://frozen/a",
+                            },
+                        },
+                    }
+                ).encode()
+                + b"\n"
+            )
             process.stdin.flush()
             process.stdin.close()
             stderr = process.stderr.read()
@@ -2759,40 +3280,92 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             messages = [
-                {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},
-                {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}},
-                {"jsonrpc":"2.0","id":3,"method":"prompts/list","params":{}},
-                {"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"repobrief://frozen/a"}},
-                {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"repobrief_resource_read","arguments":{"action":"read","uri":"repobrief://frozen/a"}}},
-                {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"repobrief_resource_read","arguments":{"action":"list"}}},
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+                {"jsonrpc": "2.0", "id": 3, "method": "prompts/list", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "resources/read",
+                    "params": {"uri": "repobrief://frozen/a"},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "read", "uri": "repobrief://frozen/a"},
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "list"},
+                    },
+                },
             ]
             payload = b"".join(json.dumps(item).encode() + b"\n" for item in messages)
             completed = subprocess.run(
                 proxy_command(upstream, root),
-                input=payload, capture_output=True, check=False, timeout=5,
+                input=payload,
+                capture_output=True,
+                check=False,
+                timeout=5,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-            responses = {item["id"]: item for item in map(json.loads, completed.stdout.decode().splitlines())}
+            responses = {
+                item["id"]: item
+                for item in map(json.loads, completed.stdout.decode().splitlines())
+            }
             self.assertEqual(set(responses[1]["result"]["capabilities"]), {"tools"})
             self.assertEqual(responses[1]["result"]["capabilities"]["tools"], {})
-            self.assertEqual({item["name"] for item in responses[2]["result"]["tools"]}, runner.ALLOWED_MCP)
+            self.assertEqual(
+                {item["name"] for item in responses[2]["result"]["tools"]},
+                runner.ALLOWED_MCP,
+            )
             self.assertIn("error", responses[3])
             self.assertIn("error", responses[4])
             self.assertTrue(responses[5]["result"]["isError"])
             self.assertFalse(responses[6]["result"]["isError"])
             frozen = json.loads(responses[6]["result"]["content"][0]["text"])
-            self.assertEqual([item["uri"] for item in frozen["resources"]], ["repobrief://frozen/a"])
+            self.assertEqual(
+                [item["uri"] for item in frozen["resources"]], ["repobrief://frozen/a"]
+            )
 
     def test_mcp_proxy_rejects_unterminated_upstream_frame(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            upstream = root / 'mcp.py'
-            response = {'jsonrpc': '2.0', 'id': 1, 'result': {'tools': treatment_tools()}}
-            upstream.write_text('import json, sys\n' 'sys.stdin.readline()\n' f'sys.stdout.write(json.dumps({response!r})); sys.stdout.flush()\n', encoding='utf-8')
-            payload = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}}).encode() + b'\n'
-            completed = subprocess.run(proxy_command(upstream, root), input=payload, capture_output=True, check=False, timeout=5)
+            upstream = root / "mcp.py"
+            response = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": treatment_tools()},
+            }
+            upstream.write_text(
+                "import json, sys\n"
+                "sys.stdin.readline()\n"
+                f"sys.stdout.write(json.dumps({response!r})); sys.stdout.flush()\n",
+                encoding="utf-8",
+            )
+            payload = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode()
+                + b"\n"
+            )
+            completed = subprocess.run(
+                proxy_command(upstream, root),
+                input=payload,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
             self.assertNotEqual(completed.returncode, 0)
-            self.assertIn(b'newline terminated', completed.stderr)
+            self.assertIn(b"newline terminated", completed.stderr)
 
     def test_mcp_proxy_rejects_oversized_upstream_line_before_newline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2809,7 +3382,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             started = time.monotonic()
             completed = subprocess.run(
                 proxy_command(upstream, root),
-                input=b"", capture_output=True, check=False, timeout=8,
+                input=b"",
+                capture_output=True,
+                check=False,
+                timeout=8,
             )
             elapsed = time.monotonic() - started
             self.assertNotEqual(completed.returncode, 0)
@@ -2818,7 +3394,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(upstream_pid, 0)
 
-    def test_mcp_proxy_reaps_failed_upstream_without_detaching_from_provider_group(self) -> None:
+    def test_mcp_proxy_reaps_failed_upstream_without_detaching_from_provider_group(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_path = root / "upstream.state"
@@ -2831,12 +3409,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "time.sleep(30)\n",
                 encoding="utf-8",
             )
-            payload = json.dumps(
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
-            ).encode() + b"\n"
+            payload = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode()
+                + b"\n"
+            )
             completed = subprocess.run(
                 proxy_command(upstream, root),
-                input=payload, capture_output=True, check=False, timeout=5,
+                input=payload,
+                capture_output=True,
+                check=False,
+                timeout=5,
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn(b"upstream-diagnostic", completed.stderr)
@@ -3007,10 +3591,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIsNone(arguments["repo"])
             self.assertIsNone(arguments["stem"])
             for selector, value in (
-                ("bundle_manifest", str(sibling)), ("repo", "other/repo"), ("stem", "other")
+                ("bundle_manifest", str(sibling)),
+                ("repo", "other/repo"),
+                ("stem", "other"),
             ):
                 conflicting = {"params": {"arguments": {selector: value}}}
-                with self.subTest(selector=selector), self.assertRaises(runner.RunnerError):
+                with (
+                    self.subTest(selector=selector),
+                    self.assertRaises(runner.RunnerError),
+                ):
                     runner._pin_treatment_arguments(conflicting, manifest)
 
     def test_staged_mcp_upstream_survives_later_source_replacement(self) -> None:
@@ -3071,7 +3660,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIsNone(runner.cleanup_staged_mcp_upstream(staged))
             self.assertFalse(runtime_dir.exists())
 
-    def test_mcp_manifest_drift_after_authorization_fails_before_private_staging(self) -> None:
+    def test_mcp_manifest_drift_after_authorization_fails_before_private_staging(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
@@ -3202,9 +3793,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 nonlocal mcp_script_reads
                 if label == "MCP script":
                     mcp_script_reads += 1
-                return original_source_read(
-                    path, label=label, max_bytes=max_bytes
-                )
+                return original_source_read(path, label=label, max_bytes=max_bytes)
 
             with patch.object(
                 runner,
@@ -3223,7 +3812,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertGreater(staged["source_tree"]["file_count"], 0)
             self.assertEqual(staged["argv"][1:3], ["-I", "-B"])
             self.assertTrue(
-                (runtime_dir / "merger" / "repoground" / "cli" / "mcp_stdio.py").is_file()
+                (
+                    runtime_dir / "merger" / "repoground" / "cli" / "mcp_stdio.py"
+                ).is_file()
             )
             staged_helper = runtime_dir / "merger" / "executable-helper.py"
             self.assertEqual(stat.S_IMODE(staged_helper.stat().st_mode), 0o700)
@@ -3397,9 +3988,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     and label == "RepoGround MCP launcher"
                 ):
                     return committed_launcher
-                return original_source_read(
-                    path, label=label, max_bytes=max_bytes
-                )
+                return original_source_read(path, label=label, max_bytes=max_bytes)
 
             try:
                 with patch.object(
@@ -3532,14 +4121,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     max_bytes=max_bytes,
                 )
 
-            with patch.object(
-                runner,
-                "MAX_MCP_SOURCE_TREE_BYTES",
-                1,
-            ), patch.object(
-                runner,
-                "_read_bound_regular_file",
-                side_effect=reject_oversized_source_read,
+            with (
+                patch.object(
+                    runner,
+                    "MAX_MCP_SOURCE_TREE_BYTES",
+                    1,
+                ),
+                patch.object(
+                    runner,
+                    "_read_bound_regular_file",
+                    side_effect=reject_oversized_source_read,
+                ),
             ):
                 with self.assertRaisesRegex(
                     runner.RunnerError,
@@ -3709,7 +4301,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         git(["config", "--unset", filter_key], source)
                     self.assertFalse(marker.exists())
 
-    def test_staged_repoground_mcp_upstream_accepts_sha256_generator_commit(self) -> None:
+    def test_staged_repoground_mcp_upstream_accepts_sha256_generator_commit(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "repoground-sha256"
@@ -3847,7 +4441,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(bindings[0]["path"], executable.resolve())
             runner._revalidate_mcp_file(bindings[0], label="MCP executable")
 
-    def test_preflight_mcp_authorization_binds_exact_program_files_before_launch(self) -> None:
+    def test_preflight_mcp_authorization_binds_exact_program_files_before_launch(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             executable = root / "python3"
@@ -3863,7 +4459,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 manifest.read_bytes()
             ).hexdigest()
             value["repobrief"]["mcp_command"] = [
-                str(executable), str(script), "--bundle-root", str(manifest)
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(manifest),
             ]
             authorized = [
                 file_identity(executable),
@@ -3887,7 +4486,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     value["repobrief"]["mcp_command"], manifest, loaded
                 )
 
-    def test_mcp_upstream_rejects_unrelated_or_drifted_manifest_authorization(self) -> None:
+    def test_mcp_upstream_rejects_unrelated_or_drifted_manifest_authorization(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             executable = Path(sys.executable).resolve()
@@ -3946,7 +4547,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 manifest.read_bytes()
             ).hexdigest()
             value["repobrief"]["mcp_command"] = [
-                str(Path(sys.executable).resolve()), str(script), "--bundle-root", str(root)
+                str(Path(sys.executable).resolve()),
+                str(script),
+                "--bundle-root",
+                str(root),
             ]
             authorized = [file_identity(Path(sys.executable)), file_identity(script)]
             state_root = write_dispatch_authorization(root, value, authorized)
@@ -3961,7 +4565,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             {"jsonrpc": 2, "id": 1, "method": "tools/list", "params": {}},
         )
         for message in cases:
-            with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 upstream = root / "mcp.py"
                 upstream.write_text("import sys\nsys.stdin.read()\n", encoding="utf-8")
@@ -3980,16 +4587,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             root = Path(temporary)
             upstream = root / "mcp.py"
             upstream.write_text("import sys\nsys.stdin.read()\n", encoding="utf-8")
-            payload = json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "tools/call",
-                    "params": {"name": "ask_context", "arguments": {"query": "where"}},
-                }
-            ).encode() + b"\n"
+            payload = (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "ask_context",
+                            "arguments": {"query": "where"},
+                        },
+                    }
+                ).encode()
+                + b"\n"
+            )
             completed = subprocess.run(
-                proxy_command(upstream, root), input=payload,
-                capture_output=True, check=False, timeout=5,
+                proxy_command(upstream, root),
+                input=payload,
+                capture_output=True,
+                check=False,
+                timeout=5,
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn(b"proxy stream failed", completed.stderr)
@@ -4011,19 +4627,33 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     f"print(json.dumps({{'jsonrpc':'2.0','id':2,'error':{error!r}}}), flush=True)\n",
                     encoding="utf-8",
                 )
-                payload = json.dumps(
-                    {"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}}
-                ).encode() + b"\n"
+                payload = (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "initialize",
+                            "params": {},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
                 completed = subprocess.run(
-                    proxy_command(upstream, root), input=payload,
-                    capture_output=True, check=False, timeout=5,
+                    proxy_command(upstream, root),
+                    input=payload,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(b"error response is invalid", completed.stderr)
 
     def test_mcp_proxy_rejects_type_alias_response_ids(self) -> None:
         for invalid_identifier in (True, 1.0, None, {"nested": "id"}):
-            with self.subTest(identifier=invalid_identifier), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(identifier=invalid_identifier),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 upstream = root / "mcp.py"
                 encoded = json.dumps(invalid_identifier)
@@ -4034,12 +4664,23 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "print(json.dumps({'jsonrpc':'2.0','id':INVALID,'result':{}}), flush=True)\n",
                     encoding="utf-8",
                 )
-                payload = json.dumps(
-                    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
-                ).encode() + b"\n"
+                payload = (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
                 completed = subprocess.run(
-                    proxy_command(upstream, root), input=payload,
-                    capture_output=True, check=False, timeout=5,
+                    proxy_command(upstream, root),
+                    input=payload,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(b"response envelope is invalid", completed.stderr)
@@ -4053,7 +4694,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             script = root / "server.py"
             script.write_text("pass\n", encoding="utf-8")
             for target, label, executable_flag in (
-                (executable, "MCP executable", True), (script, "MCP script", False)
+                (executable, "MCP executable", True),
+                (script, "MCP script", False),
             ):
                 link = root / (target.name + ".link")
                 link.symlink_to(target)
@@ -4063,7 +4705,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     target, label=label, executable=executable_flag
                 )
                 target.write_bytes(target.read_bytes() + b"# drift\n")
-                with self.assertRaisesRegex(runner.RunnerError, "changed during execution"):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "changed during execution"
+                ):
                     runner._revalidate_mcp_file(binding, label=label)
 
     def test_mcp_proxy_rejects_malformed_or_unknown_response_envelopes(self) -> None:
@@ -4075,7 +4719,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 999, "result": {"tools": treatment_tools()}},
         )
         for response in cases:
-            with self.subTest(response=response), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(response=response),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 upstream = root / "mcp.py"
                 upstream.write_text(
@@ -4084,20 +4731,38 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     f"print(json.dumps({response!r}), flush=True)\n",
                     encoding="utf-8",
                 )
-                payload = json.dumps(
-                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-                ).encode() + b"\n"
+                payload = (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/list",
+                            "params": {},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
                 completed = subprocess.run(
-                    proxy_command(upstream, root), input=payload, capture_output=True,
-                    check=False, timeout=5,
+                    proxy_command(upstream, root),
+                    input=payload,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(b"response envelope is invalid", completed.stderr)
 
     def test_mcp_proxy_rejects_explicit_null_treatment_request_id(self) -> None:
         for invalid in (
-            None, True, False, [], {}, 1.5,
-            float("inf"), float("-inf"), float("nan"),
+            None,
+            True,
+            False,
+            [],
+            {},
+            1.5,
+            float("inf"),
+            float("-inf"),
+            float("nan"),
         ):
             with self.subTest(invalid=invalid):
                 self.assertFalse(runner._valid_jsonrpc_request_id(invalid))
@@ -4118,8 +4783,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             messages = [
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
-                {"jsonrpc":"2.0","id":None,"method":"tools/call","params":{"name":"ask_context","arguments":{"query":"where"}}},
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "method": "tools/call",
+                    "params": {"name": "ask_context", "arguments": {"query": "where"}},
+                },
             ]
             completed = subprocess.run(
                 proxy_command(upstream, root),
@@ -4130,7 +4800,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             self.assertNotEqual(completed.returncode, 0)
 
-    def test_mcp_proxy_rejects_malformed_treatment_tool_result_before_forwarding(self) -> None:
+    def test_mcp_proxy_rejects_malformed_treatment_tool_result_before_forwarding(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             upstream = root / "mcp.py"
@@ -4146,17 +4818,26 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             messages = [
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
-                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask_context","arguments":{"query":"where"}}},
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "ask_context", "arguments": {"query": "where"}},
+                },
             ]
             completed = subprocess.run(
                 proxy_command(upstream, root),
                 input=b"".join(json.dumps(item).encode() + b"\n" for item in messages),
-                capture_output=True, check=False, timeout=5,
+                capture_output=True,
+                check=False,
+                timeout=5,
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn(b"treatment tool result is malformed", completed.stderr)
-            responses = [json.loads(line) for line in completed.stdout.decode().splitlines()]
+            responses = [
+                json.loads(line) for line in completed.stdout.decode().splitlines()
+            ]
             self.assertNotIn(2, {item.get("id") for item in responses})
 
     def test_mcp_proxy_rejects_tool_specific_treatment_payload_drift(self) -> None:
@@ -4166,7 +4847,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ("live_freshness", {}),
         )
         for tool_name, arguments in cases:
-            with self.subTest(tool=tool_name), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(tool=tool_name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 upstream = root / "mcp.py"
                 upstream.write_text(
@@ -4181,17 +4865,28 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 messages = [
-                    {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
-                    {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool_name,"arguments":arguments}},
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": tool_name, "arguments": arguments},
+                    },
                 ]
                 completed = subprocess.run(
                     proxy_command(upstream, root),
-                    input=b"".join(json.dumps(item).encode() + b"\n" for item in messages),
-                    capture_output=True, check=False, timeout=5,
+                    input=b"".join(
+                        json.dumps(item).encode() + b"\n" for item in messages
+                    ),
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(b"is malformed", completed.stderr)
-                responses = [json.loads(line) for line in completed.stdout.decode().splitlines()]
+                responses = [
+                    json.loads(line) for line in completed.stdout.decode().splitlines()
+                ]
                 self.assertNotIn(2, {item.get("id") for item in responses})
 
     def test_treatment_result_accepts_pinned_tool_specific_payloads(self) -> None:
@@ -4205,7 +4900,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "repo_root": None,
             "read_only_git_probe": False,
             "implicit_refresh": False,
-            "does_not_establish": list(runner.EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH),
+            "does_not_establish": list(
+                runner.EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH
+            ),
         }
         context_pack = {
             "kind": runner.EXPECTED_ASK_CONTEXT_PACK_KIND,
@@ -4222,7 +4919,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "answer_scaffold": {
                 "citation_obligations": [],
                 "caveats_to_surface": [],
-                "non_claims_to_surface": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+                "non_claims_to_surface": list(
+                    runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+                ),
             },
             "budget": {
                 "max_context_tokens": 1,
@@ -4239,8 +4938,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "truncated": False,
                 "does_not_establish_quality": True,
             },
-            "forbidden_operations": list(runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS),
-            "does_not_establish": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+            "forbidden_operations": list(
+                runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS
+            ),
+            "does_not_establish": list(
+                runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+            ),
         }
         verdict = {
             "kind": runner.EXPECTED_GROUNDING_VERDICT_KIND,
@@ -4254,7 +4957,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "diagnostics": [],
             "freshness_caveats": [],
             "availability_caveats": [],
-            "does_not_establish": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+            "does_not_establish": list(
+                runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+            ),
         }
         projection = {
             "mutation_boundary": {
@@ -4337,7 +5042,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             with self.subTest(non_staged_manifest=unexpected_path):
                 foreign["verdict"]["snapshot_ref"]["manifest_path"] = unexpected_path
                 with self.assertRaisesRegex(
-                    runner.RunnerError, "grounding snapshot manifest does not match staged manifest"
+                    runner.RunnerError,
+                    "grounding snapshot manifest does not match staged manifest",
                 ):
                     runner._validated_treatment_tool_result(
                         {
@@ -4363,13 +5069,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             external_manifest=external_manifest,
         )
         self.assertEqual(
-            rebound_ask["structuredContent"]["context_pack"]["snapshot_ref"]["manifest_path"],
+            rebound_ask["structuredContent"]["context_pack"]["snapshot_ref"][
+                "manifest_path"
+            ],
             str(external_manifest),
         )
         for unexpected_path in ("/foreign/context.json", str(external_manifest)):
             with self.subTest(ask_context_non_staged=unexpected_path):
                 invalid_ask = json.loads(json.dumps(staged_ask))
-                invalid_ask["context_pack"]["snapshot_ref"]["manifest_path"] = unexpected_path
+                invalid_ask["context_pack"]["snapshot_ref"]["manifest_path"] = (
+                    unexpected_path
+                )
                 with self.assertRaisesRegex(
                     runner.RunnerError,
                     "ask_context snapshot manifest does not match staged manifest",
@@ -4407,7 +5117,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         error = {
             "content": [{"type": "text", "text": "error"}],
             "structuredContent": {
-                "status": "error", "tool": "ask_context", "error": "boom"
+                "status": "error",
+                "tool": "ask_context",
+                "error": "boom",
             },
             "isError": True,
         }
@@ -4448,8 +5160,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             messages = [
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
-                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask_context","arguments":{"query":"where"}}},
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "ask_context", "arguments": {"query": "where"}},
+                },
             ]
             completed = subprocess.run(
                 proxy_command(upstream, root),
@@ -4459,7 +5176,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 timeout=5,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-            responses = {item["id"]: item for item in map(json.loads, completed.stdout.decode().splitlines())}
+            responses = {
+                item["id"]: item
+                for item in map(json.loads, completed.stdout.decode().splitlines())
+            }
             self.assertEqual(
                 responses[2]["result"]["content"][0]["text"],
                 runner.canonical(responses[2]["result"]["structuredContent"]),
@@ -4486,9 +5206,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
     def _codex_live_freshness_evidence(self, *, root: str | None, **overrides):
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
-            manifest = bind_manifest(
-                value, Path(directory), repo_root=root
-            )
+            manifest = bind_manifest(value, Path(directory), repo_root=root)
             payload = {
                 "kind": "repobrief.live_freshness",
                 "version": "v1",
@@ -4506,26 +5224,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "current_provenance": None,
             }
             payload.update(overrides)
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "live_freshness",
-                    "arguments": {},
-                    "result": {"structured_content": payload},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "live_freshness",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "live_freshness",
+                        "arguments": {},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "live_freshness",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                }
+            ]
             return runner._repoground_evidence_from_codex_events(value, events, calls)
 
     def test_codex_unhashable_optional_freshness_is_nonfatal(self) -> None:
@@ -4559,26 +5281,29 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "snapshot_provenance": {"git_commit": COMMIT},
                 },
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "grounding_verify",
-                    "arguments": {},
-                    "result": {"structured_content": original},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "grounding_verify",
+                        "arguments": {},
+                        "result": {"structured_content": original},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
             calls = [{"sequence": 1, "name": "grounding_verify", "status": "success"}]
             with patch.object(
-                runner, "_validated_treatment_structured_payload",
+                runner,
+                "_validated_treatment_structured_payload",
                 return_value=original,
             ):
-                self.assertIsNotNone(runner._repoground_evidence_from_codex_events(
-                    value, events, calls
-                ))
+                self.assertIsNotNone(
+                    runner._repoground_evidence_from_codex_events(value, events, calls)
+                )
             for path in (
                 ("verdict", "snapshot_ref", "freshness_status"),
                 ("live_freshness", "status"),
@@ -4592,12 +5317,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                             field = field[name]
                         field[path[-1]] = bad
                         with patch.object(
-                            runner, "_validated_treatment_structured_payload",
+                            runner,
+                            "_validated_treatment_structured_payload",
                             return_value=payload,
                         ):
-                            self.assertIsNone(runner._repoground_evidence_from_codex_events(
-                                value, events, calls
-                            ))
+                            self.assertIsNone(
+                                runner._repoground_evidence_from_codex_events(
+                                    value, events, calls
+                                )
+                            )
 
     def test_codex_fresh_evidence_requires_proven_read_only_probe(self) -> None:
         valid = self._codex_live_freshness_evidence(root="/tmp/repo")
@@ -4607,7 +5335,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ("root_none", "/tmp/repo", {"repo_root": None}),
             ("root_mismatch", "/tmp/repo", {"repo_root": "/tmp/other"}),
             ("manifest_without_root", None, {}),
-            ("stale_probe_false", "/tmp/repo", {"status": "stale", "read_only_git_probe": False}),
+            (
+                "stale_probe_false",
+                "/tmp/repo",
+                {"status": "stale", "read_only_git_probe": False},
+            ),
         ):
             with self.subTest(case=case):
                 self.assertIsNone(
@@ -4710,7 +5442,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                             "range_ref": {"ref": "example"},
                         }
                     ],
-                    "budget": {"context_bytes_used": 654, "max_context_bytes": 654, "token_derived_byte_ceiling": 654},
+                    "budget": {
+                        "context_bytes_used": 654,
+                        "max_context_bytes": 654,
+                        "token_derived_byte_ceiling": 654,
+                    },
                 },
                 "live_freshness": {
                     "kind": "repobrief.live_freshness",
@@ -4724,26 +5460,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "snapshot_provenance": {"git_commit": COMMIT.upper()},
                 },
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "ask_context",
-                    "arguments": {"query": "example"},
-                    "result": {"structured_content": payload},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "ask_context",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "ask_context",
+                        "arguments": {"query": "example"},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "ask_context",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                }
+            ]
             with patch.object(
                 runner,
                 "_validated_treatment_structured_payload",
@@ -4757,14 +5497,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 {
                     "target_commit": COMMIT,
                     "bundle_commit": COMMIT,
-                    "calls": [{
-                        "sequence": 1,
-                        "tool": "ask_context",
-                        "freshness_status": "fresh",
-                        "resolved_range_count": 1,
-                        "context_bytes_used": 654,
-                        "grounding_status": None,
-                    }],
+                    "calls": [
+                        {
+                            "sequence": 1,
+                            "tool": "ask_context",
+                            "freshness_status": "fresh",
+                            "resolved_range_count": 1,
+                            "context_bytes_used": 654,
+                            "grounding_status": None,
+                        }
+                    ],
                 },
             )
 
@@ -4797,8 +5539,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         }
         for label, forbidden, valid in (
             ("valid", ["secret_read", "snapshot_create_side_effect"], True),
-            ("nested_object", ["secret_read", "snapshot_create_side_effect", {"x": 1}], False),
-            ("nested_list", ["secret_read", "snapshot_create_side_effect", ["x"]], False),
+            (
+                "nested_object",
+                ["secret_read", "snapshot_create_side_effect", {"x": 1}],
+                False,
+            ),
+            (
+                "nested_list",
+                ["secret_read", "snapshot_create_side_effect", ["x"]],
+                False,
+            ),
             ("number", ["secret_read", "snapshot_create_side_effect", 1], False),
         ):
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
@@ -4813,10 +5563,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "status": "ok",
                     "request_semantics": "repobrief.ask_request.v1",
                     "context_pack_semantics": "repobrief.ask_context_pack.v1",
-                    "mutation_boundary": {**base_boundary, "forbidden_operations": forbidden},
+                    "mutation_boundary": {
+                        **base_boundary,
+                        "forbidden_operations": forbidden,
+                    },
                     "does_not_establish": {
                         "ref": "repobrief.does_not_establish.default.v1",
-                        "items": list(runner.EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH),
+                        "items": list(
+                            runner.EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH
+                        ),
                     },
                     "context_pack": {
                         "kind": "repobrief.ask_context_pack",
@@ -4829,7 +5584,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         },
                         "freshness": {"status": "fresh"},
                         "resolved_ranges": [],
-                        "budget": {"context_bytes_used": 1, "max_context_bytes": 1, "token_derived_byte_ceiling": 1},
+                        "budget": {
+                            "context_bytes_used": 1,
+                            "max_context_bytes": 1,
+                            "token_derived_byte_ceiling": 1,
+                        },
                     },
                     "live_freshness": {
                         "kind": "repobrief.live_freshness",
@@ -4843,32 +5602,45 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         "snapshot_provenance": {"git_commit": COMMIT},
                     },
                 }
-                events = [{
-                    "type": "item.completed",
-                    "item": {
-                        "type": "mcp_tool_call",
-                        "server": "repobrief",
-                        "tool": "ask_context",
-                        "arguments": {"query": "example"},
-                        "result": {"structured_content": payload},
-                        "error": None,
-                        "status": "completed",
-                    },
-                }]
-                calls = [{
-                    "sequence": 1, "name": "ask_context", "status": "success",
-                    "duration_ms": 0, "input_bytes": 1, "output_bytes": 1,
-                }]
+                events = [
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "mcp_tool_call",
+                            "server": "repobrief",
+                            "tool": "ask_context",
+                            "arguments": {"query": "example"},
+                            "result": {"structured_content": payload},
+                            "error": None,
+                            "status": "completed",
+                        },
+                    }
+                ]
+                calls = [
+                    {
+                        "sequence": 1,
+                        "name": "ask_context",
+                        "status": "success",
+                        "duration_ms": 0,
+                        "input_bytes": 1,
+                        "output_bytes": 1,
+                    }
+                ]
                 with (
-                    patch.object(runner.base, "_validated_ask_context_pack", return_value=None),
                     patch.object(
-                        runner.base, "_validated_live_freshness_payload",
+                        runner.base, "_validated_ask_context_pack", return_value=None
+                    ),
+                    patch.object(
+                        runner.base,
+                        "_validated_live_freshness_payload",
                         return_value=payload["live_freshness"],
                     ),
                 ):
                     if not valid:
                         with self.assertRaises(runner.RunnerError):
-                            runner.base._validated_read_only_frontdoor_projection(payload)
+                            runner.base._validated_read_only_frontdoor_projection(
+                                payload
+                            )
                     evidence = runner._repoground_evidence_from_codex_events(
                         value, events, calls
                     )
@@ -4882,15 +5654,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "artifact_role": "language_structure_json",
             "status": "resolved",
             "range_ref": {
-                "ref": "rust:fn:main", "path": "src/main.rs",
+                "ref": "rust:fn:main",
+                "path": "src/main.rs",
                 "range": {"start_line": 3, "end_line": 9},
             },
             "source_path": "src/main.rs",
             "source_line_range": {"start_line": 3, "end_line": 9},
         }
         canonical = {
-            "artifact_role": "canonical_md", "status": "resolved",
-            "range_ref": {"ref": "c1"}, "text_excerpt": "def example(): ...",
+            "artifact_role": "canonical_md",
+            "status": "resolved",
+            "range_ref": {"ref": "c1"},
+            "text_excerpt": "def example(): ...",
         }
         broken = copy.deepcopy(lang)
         broken["range_ref"]["range"]["start_line"] = True
@@ -4898,13 +5673,28 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ([lang, canonical], 2),
             ([lang], 1),
             ([{"status": "resolved"}], None),
-            ([{"status": "resolved", "range_ref": {"junk": "x"}, "text_excerpt": "fake"}], None),
-            ([{"artifact_role": "language_structure_json", "status": "resolved"}], None),
+            (
+                [
+                    {
+                        "status": "resolved",
+                        "range_ref": {"junk": "x"},
+                        "text_excerpt": "fake",
+                    }
+                ],
+                None,
+            ),
+            (
+                [{"artifact_role": "language_structure_json", "status": "resolved"}],
+                None,
+            ),
             ([broken], None),
             ([canonical, {**lang, "source_path": ""}], None),
         ]
         for ranges, expected in cases:
-            with self.subTest(ranges=ranges), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(ranges=ranges),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 value = request(condition="treatment")
                 manifest = bind_manifest(
                     value, Path(directory), commit=COMMIT.upper(), repo_root="/tmp/repo"
@@ -4925,7 +5715,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         },
                         "freshness": {"status": "fresh"},
                         "resolved_ranges": ranges,
-                        "budget": {"context_bytes_used": 10, "max_context_bytes": 10, "token_derived_byte_ceiling": 10},
+                        "budget": {
+                            "context_bytes_used": 10,
+                            "max_context_bytes": 10,
+                            "token_derived_byte_ceiling": 10,
+                        },
                     },
                     "live_freshness": {
                         "kind": "repobrief.live_freshness",
@@ -4939,22 +5733,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         "snapshot_provenance": {"git_commit": COMMIT.upper()},
                     },
                 }
-                events = [{
-                    "type": "item.completed",
-                    "item": {
-                        "type": "mcp_tool_call",
-                        "server": "repobrief",
-                        "tool": "ask_context",
-                        "arguments": {"query": "example"},
-                        "result": {"structured_content": payload},
-                        "error": None,
-                        "status": "completed",
-                    },
-                }]
-                calls = [{
-                    "sequence": 1, "name": "ask_context", "status": "success",
-                    "duration_ms": 0, "input_bytes": 1, "output_bytes": 1,
-                }]
+                events = [
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "mcp_tool_call",
+                            "server": "repobrief",
+                            "tool": "ask_context",
+                            "arguments": {"query": "example"},
+                            "result": {"structured_content": payload},
+                            "error": None,
+                            "status": "completed",
+                        },
+                    }
+                ]
+                calls = [
+                    {
+                        "sequence": 1,
+                        "name": "ask_context",
+                        "status": "success",
+                        "duration_ms": 0,
+                        "input_bytes": 1,
+                        "output_bytes": 1,
+                    }
+                ]
                 with patch.object(
                     runner,
                     "_validated_treatment_structured_payload",
@@ -4987,7 +5789,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "answer_scaffold": {
                     "citation_obligations": [],
                     "caveats_to_surface": [],
-                    "non_claims_to_surface": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+                    "non_claims_to_surface": list(
+                        runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+                    ),
                 },
                 "budget": {
                     "max_context_tokens": 4,
@@ -5004,8 +5808,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "truncated": False,
                     "does_not_establish_quality": True,
                 },
-                "forbidden_operations": list(runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS),
-                "does_not_establish": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+                "forbidden_operations": list(
+                    runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS
+                ),
+                "does_not_establish": list(
+                    runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+                ),
             }
 
         cases = (
@@ -5077,22 +5885,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         "snapshot_provenance": {"git_commit": COMMIT.upper()},
                     },
                 }
-                events = [{
-                    "type": "item.completed",
-                    "item": {
-                        "type": "mcp_tool_call",
-                        "server": "repobrief",
-                        "tool": "ask_context",
-                        "arguments": {"query": "example"},
-                        "result": {"structured_content": payload},
-                        "error": None,
-                        "status": "completed",
-                    },
-                }]
-                calls = [{
-                    "sequence": 1, "name": "ask_context", "status": "success",
-                    "duration_ms": 0, "input_bytes": 1, "output_bytes": 1,
-                }]
+                events = [
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "mcp_tool_call",
+                            "server": "repobrief",
+                            "tool": "ask_context",
+                            "arguments": {"query": "example"},
+                            "result": {"structured_content": payload},
+                            "error": None,
+                            "status": "completed",
+                        },
+                    }
+                ]
+                calls = [
+                    {
+                        "sequence": 1,
+                        "name": "ask_context",
+                        "status": "success",
+                        "duration_ms": 0,
+                        "input_bytes": 1,
+                        "output_bytes": 1,
+                    }
+                ]
                 with patch.object(
                     runner,
                     "_validated_treatment_structured_payload",
@@ -5136,9 +5952,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "version": "2.0",
                 "snapshotProvenance": {"repositories": []},
             }
-            raw = json.dumps(
-                malformed, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
+            raw = json.dumps(malformed, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
             manifest.write_bytes(raw)
             value["repobrief"]["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
             payload = {
@@ -5152,35 +5968,37 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "implicit_refresh": False,
                 "snapshot_provenance": {"git_commit": COMMIT},
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "live_freshness",
-                    "arguments": {},
-                    "result": {"structured_content": payload},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "live_freshness",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "live_freshness",
+                        "arguments": {},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "live_freshness",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                }
+            ]
             with patch.object(
                 runner,
                 "_validated_treatment_structured_payload",
                 return_value=payload,
             ):
                 self.assertIsNone(
-                    runner._repoground_evidence_from_codex_events(
-                        value, events, calls
-                    )
+                    runner._repoground_evidence_from_codex_events(value, events, calls)
                 )
 
     def test_codex_rejects_conflicting_grounding_freshness(self) -> None:
@@ -5214,35 +6032,37 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "snapshot_provenance": {"git_commit": COMMIT},
                 },
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "grounding_verify",
-                    "arguments": {},
-                    "result": {"structured_content": payload},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "grounding_verify",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "grounding_verify",
+                        "arguments": {},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "grounding_verify",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                }
+            ]
             with patch.object(
                 runner,
                 "_validated_treatment_structured_payload",
                 return_value=payload,
             ):
                 self.assertIsNone(
-                    runner._repoground_evidence_from_codex_events(
-                        value, events, calls
-                    )
+                    runner._repoground_evidence_from_codex_events(value, events, calls)
                 )
 
     def test_codex_projects_bound_not_comparable_evidence(self) -> None:
@@ -5259,26 +6079,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "read_only_git_probe": False,
                 "implicit_refresh": False,
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "live_freshness",
-                    "arguments": {},
-                    "result": {"structured_content": payload},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "live_freshness",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "live_freshness",
+                        "arguments": {},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "live_freshness",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                }
+            ]
             with patch.object(
                 runner,
                 "_validated_treatment_structured_payload",
@@ -5303,23 +6127,23 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 {
                     "target_commit": COMMIT,
                     "bundle_commit": COMMIT,
-                    "calls": [{
-                        "sequence": 1,
-                        "tool": "live_freshness",
-                        "freshness_status": "not_comparable",
-                        "resolved_range_count": None,
-                        "context_bytes_used": None,
-                        "grounding_status": None,
-                    }],
+                    "calls": [
+                        {
+                            "sequence": 1,
+                            "tool": "live_freshness",
+                            "freshness_status": "not_comparable",
+                            "resolved_range_count": None,
+                            "context_bytes_used": None,
+                            "grounding_status": None,
+                        }
+                    ],
                 },
             )
 
     def test_codex_projects_strict_unknown_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
-            manifest = bind_manifest(
-                value, Path(directory), repo_root="/tmp/repo"
-            )
+            manifest = bind_manifest(value, Path(directory), repo_root="/tmp/repo")
             payload = {
                 "kind": "repobrief.live_freshness",
                 "version": "v1",
@@ -5330,26 +6154,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "read_only_git_probe": True,
                 "implicit_refresh": False,
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "live_freshness",
-                    "arguments": {},
-                    "result": {"structured_content": payload},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "live_freshness",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "live_freshness",
+                        "arguments": {},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "live_freshness",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                }
+            ]
             with patch.object(
                 runner,
                 "_validated_treatment_structured_payload",
@@ -5367,9 +6195,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 return_value=payload,
             ):
                 self.assertIsNone(
-                    runner._repoground_evidence_from_codex_events(
-                        value, events, calls
-                    )
+                    runner._repoground_evidence_from_codex_events(value, events, calls)
                 )
 
             payload["repo_root"] = "/tmp/repo"
@@ -5380,9 +6206,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 return_value=payload,
             ):
                 self.assertIsNone(
-                    runner._repoground_evidence_from_codex_events(
-                        value, events, calls
-                    )
+                    runner._repoground_evidence_from_codex_events(value, events, calls)
                 )
 
     def test_malformed_outer_event_type_fails_closed_before_receipt(self) -> None:
@@ -5391,7 +6215,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         self.assertEqual(
             "success",
-            runner.receipt(value, stream(value), "transcript.jsonl", 0, now, now)["status"],
+            runner.receipt(value, stream(value), "transcript.jsonl", 0, now, now)[
+                "status"
+            ],
         )
         for malformed in ([], {}, 123, True, None):
             with self.subTest(value=repr(malformed)):
@@ -5405,9 +6231,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     runner.RunnerError,
                     r"Codex transcript line \d+ event type",
                 ):
-                    runner.receipt(
-                        value, raw, "transcript.jsonl", 0, now, now
-                    )
+                    runner.receipt(value, raw, "transcript.jsonl", 0, now, now)
 
     def test_malformed_completed_event_metadata_fails_closed(self) -> None:
         value = request(condition="treatment")
@@ -5415,7 +6239,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             with self.subTest(field=field):
                 events = [json.loads(line) for line in stream(value).splitlines()]
                 completed = next(
-                    event for event in events
+                    event
+                    for event in events
                     if event.get("type") == "item.completed"
                     and event["item"].get("type") == "command_execution"
                 )
@@ -5447,11 +6272,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     runner._repoground_evidence_from_codex_events(
                         value,
                         events,
-                        [{
-                            "sequence": 1,
-                            "name": "repobrief_resource_read",
-                            "status": "success",
-                        }],
+                        [
+                            {
+                                "sequence": 1,
+                                "name": "repobrief_resource_read",
+                                "status": "success",
+                            }
+                        ],
                     )
                 )
 
@@ -5462,20 +6289,20 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             uri = "repoground://snapshot/demo/canonical"
             resource = {
                 "contents": [{"uri": uri, "text": "\ud800", "mimeType": "text/plain"}],
-                "_meta": {"repoground": {
-                    "status": "available",
-                    "implicitRefresh": False,
-                    "snapshotContext": {},
-                    "identity": {},
-                    "liveFreshness": {},
-                }},
+                "_meta": {
+                    "repoground": {
+                        "status": "available",
+                        "implicitRefresh": False,
+                        "snapshotContext": {},
+                        "identity": {},
+                        "liveFreshness": {},
+                    }
+                },
             }
-            events = [
-                json.loads(line)
-                for line in stream(value).splitlines()
-            ]
+            events = [json.loads(line) for line in stream(value).splitlines()]
             tool_event = next(
-                event for event in events
+                event
+                for event in events
                 if event.get("type") == "item.completed"
                 and event["item"].get("type") == "command_execution"
             )
@@ -5484,10 +6311,14 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "server": "repobrief",
                 "tool": "repobrief_resource_read",
                 "arguments": {"action": "read", "uri": uri},
-                "result": {"content": [{
-                    "type": "text",
-                    "text": json.dumps(resource, sort_keys=True),
-                }]},
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(resource, sort_keys=True),
+                        }
+                    ]
+                },
                 "error": None,
                 "status": "completed",
             }
@@ -5496,9 +6327,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 for event in events
             )
             now = datetime.now(timezone.utc)
-            receipt = runner.receipt(
-                value, transcript, "transcript.jsonl", 0, now, now
-            )
+            receipt = runner.receipt(value, transcript, "transcript.jsonl", 0, now, now)
             self.assertEqual(receipt["status"], "success")
             self.assertEqual(receipt["tool_calls"][0]["status"], "success")
             self.assertNotIn("repoground_evidence", receipt)
@@ -5506,9 +6335,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
     def test_codex_projects_revision_bound_resource_read_not_list(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
-            manifest = bind_manifest(
-                value, Path(directory), repo_root="/tmp/repo"
-            )
+            manifest = bind_manifest(value, Path(directory), repo_root="/tmp/repo")
             uri = "repoground://snapshot/demo/canonical"
             live_freshness = {
                 "kind": "repobrief.live_freshness",
@@ -5522,11 +6349,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "snapshot_provenance": {"git_commit": COMMIT},
             }
             resource = {
-                "contents": [{
-                    "uri": uri,
-                    "text": "# Demo\n",
-                    "mimeType": "text/markdown",
-                }],
+                "contents": [
+                    {
+                        "uri": uri,
+                        "text": "# Demo\n",
+                        "mimeType": "text/markdown",
+                    }
+                ],
                 "_meta": {
                     "repoground": {
                         "status": "available",
@@ -5538,78 +6367,88 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 },
             }
             result = {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps(resource, sort_keys=True),
-                }]
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(resource, sort_keys=True),
+                    }
+                ]
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "repobrief_resource_read",
-                    "arguments": {"action": "read", "uri": uri},
-                    "result": result,
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "repobrief_resource_read",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1000,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "repobrief_resource_read",
+                        "arguments": {"action": "read", "uri": uri},
+                        "result": result,
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "repobrief_resource_read",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1000,
+                }
+            ]
             self.assertEqual(
-                runner._repoground_evidence_from_codex_events(
-                    value, events, calls
-                ),
+                runner._repoground_evidence_from_codex_events(value, events, calls),
                 {
                     "target_commit": COMMIT,
                     "bundle_commit": COMMIT,
-                    "calls": [{
-                        "sequence": 1,
-                        "tool": "repobrief_resource_read",
-                        "freshness_status": "fresh",
-                        "resolved_range_count": None,
-                        "context_bytes_used": len("# Demo\n".encode("utf-8")),
-                        "grounding_status": None,
-                    }],
+                    "calls": [
+                        {
+                            "sequence": 1,
+                            "tool": "repobrief_resource_read",
+                            "freshness_status": "fresh",
+                            "resolved_range_count": None,
+                            "context_bytes_used": len("# Demo\n".encode("utf-8")),
+                            "grounding_status": None,
+                        }
+                    ],
                 },
             )
 
             bad_surrogate_resource = json.loads(json.dumps(resource))
             bad_surrogate_resource["contents"][0]["text"] = "\ud800"
             events[0]["item"]["result"] = {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps(bad_surrogate_resource, sort_keys=True),
-                }],
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(bad_surrogate_resource, sort_keys=True),
+                    }
+                ],
             }
             self.assertIsNone(
-                runner._repoground_evidence_from_codex_events(
-                    value, events, calls
-                )
+                runner._repoground_evidence_from_codex_events(value, events, calls)
             )
 
             unknown = json.loads(json.dumps(resource))
             unknown_freshness = unknown["_meta"]["repoground"]["liveFreshness"]
-            unknown_freshness.update({
-                "status": "unknown",
-                "reason": "git_probe_failed",
-                "repo_root": "/tmp/repo",
-                "read_only_git_probe": True,
-                "implicit_refresh": False,
-            })
+            unknown_freshness.update(
+                {
+                    "status": "unknown",
+                    "reason": "git_probe_failed",
+                    "repo_root": "/tmp/repo",
+                    "read_only_git_probe": True,
+                    "implicit_refresh": False,
+                }
+            )
             unknown_freshness.pop("snapshot_provenance")
             events[0]["item"]["result"] = {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps(unknown, sort_keys=True),
-                }]
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(unknown, sort_keys=True),
+                    }
+                ]
             }
             unknown_evidence = runner._repoground_evidence_from_codex_events(
                 value, events, calls
@@ -5620,15 +6459,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
             unknown_freshness["repo_root"] = "/tmp/other-repo"
             events[0]["item"]["result"] = {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps(unknown, sort_keys=True),
-                }]
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(unknown, sort_keys=True),
+                    }
+                ]
             }
             self.assertIsNone(
-                runner._repoground_evidence_from_codex_events(
-                    value, events, calls
-                )
+                runner._repoground_evidence_from_codex_events(value, events, calls)
             )
 
             events[0]["item"]["result"] = result
@@ -5643,10 +6482,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     for field in removals:
                         freshness.pop(field)
                     events[0]["item"]["result"] = {
-                        "content": [{
-                            "type": "text",
-                            "text": json.dumps(invalid, sort_keys=True),
-                        }]
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(invalid, sort_keys=True),
+                            }
+                        ]
                     }
                     self.assertIsNone(
                         runner._repoground_evidence_from_codex_events(
@@ -5657,24 +6498,28 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             events[0]["item"]["result"] = result
             events[0]["item"]["arguments"] = {"action": "list"}
             self.assertIsNone(
-                runner._repoground_evidence_from_codex_events(
-                    value, events, calls
-                )
+                runner._repoground_evidence_from_codex_events(value, events, calls)
             )
 
     def test_normalize_rejects_boolean_token_counts(self) -> None:
-        for field, value in (('input_tokens', True), ('output_tokens', False)):
+        for field, value in (("input_tokens", True), ("output_tokens", False)):
             with self.subTest(field=field, value=value):
                 events = [json.loads(line) for line in stream(request()).splitlines()]
-                completed = next(event for event in events if event.get('type') == 'turn.completed')
-                completed['usage'][field] = value
-                with self.assertRaisesRegex(runner.RunnerError, 'Codex usage is invalid'):
+                completed = next(
+                    event for event in events if event.get("type") == "turn.completed"
+                )
+                completed["usage"][field] = value
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "Codex usage is invalid"
+                ):
                     runner.normalize(request(), events)
 
     def test_normalize_subtracts_cached_input_tokens_before_budget_check(self) -> None:
         value = request()
         events = [json.loads(line) for line in stream(value).splitlines()]
-        completed = next(event for event in events if event.get("type") == "turn.completed")
+        completed = next(
+            event for event in events if event.get("type") == "turn.completed"
+        )
         completed["usage"]["input_tokens"] = 100_000
         completed["usage"]["cached_input_tokens"] = 40_000
 
@@ -5693,13 +6538,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 )
                 completed["usage"]["cached_input_tokens"] = cached_input_tokens
 
-                with self.assertRaisesRegex(runner.RunnerError, "Codex usage is invalid"):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "Codex usage is invalid"
+                ):
                     runner.normalize(value, events)
 
     def test_normalize_r5_like_usage_still_exceeds_frozen_input_budget(self) -> None:
         value = request()
         events = [json.loads(line) for line in stream(value).splitlines()]
-        completed = next(event for event in events if event.get("type") == "turn.completed")
+        completed = next(
+            event for event in events if event.get("type") == "turn.completed"
+        )
         completed["usage"]["input_tokens"] = 422_147
         completed["usage"]["cached_input_tokens"] = 357_376
 
@@ -5710,7 +6559,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         value = request(condition="treatment")
         events = [json.loads(line) for line in stream(value).splitlines()]
         with self.assertRaisesRegex(
-            runner.RunnerError, "treatment used no successful RepoBrief tool or resource"
+            runner.RunnerError,
+            "treatment used no successful RepoBrief tool or resource",
         ):
             runner.normalize(value, events)
 
@@ -5741,13 +6591,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(calls[0]["status"], "success")
         self.assertEqual(normalized_answer, answer())
 
-    def test_normalize_accepts_codex_0158_repobrief_results_without_iserror(self) -> None:
+    def test_normalize_accepts_codex_0158_repobrief_results_without_iserror(
+        self,
+    ) -> None:
         cases = (
             (
                 "ask_context",
                 {"query": "finalizer"},
                 {
-                    "content": [{"type": "text", "text": "{\"status\":\"ok\"}"}],
+                    "content": [{"type": "text", "text": '{"status":"ok"}'}],
                     "structured_content": {"status": "ok", "tool": "ask_context"},
                 },
             ),
@@ -5755,7 +6607,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "live_freshness",
                 {},
                 {
-                    "content": [{"type": "text", "text": "{\"status\":\"fresh\"}"}],
+                    "content": [{"type": "text", "text": '{"status":"fresh"}'}],
                     "structured_content": {"status": "fresh"},
                 },
             ),
@@ -5763,7 +6615,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "grounding_verify",
                 {"declaration": {}},
                 {
-                    "content": [{"type": "text", "text": "{\"status\":\"warn\"}"}],
+                    "content": [{"type": "text", "text": '{"status":"warn"}'}],
                     "structured_content": {"status": "warn"},
                 },
             ),
@@ -5771,7 +6623,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "repobrief_resource_read",
                 {"action": "list"},
                 {
-                    "content": [{"type": "text", "text": "{\"resources\":[]}"}],
+                    "content": [{"type": "text", "text": '{"resources":[]}'}],
                 },
             ),
             (
@@ -5782,8 +6634,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         {
                             "type": "text",
                             "text": (
-                                "{\"_meta\":{},\"contents\":[{\"mimeType\":\"text/plain\","
-                                "\"text\":\"ok\",\"uri\":\"repobrief://frozen/a\"}]}"
+                                '{"_meta":{},"contents":[{"mimeType":"text/plain",'
+                                '"text":"ok","uri":"repobrief://frozen/a"}]}'
                             ),
                         }
                     ],
@@ -5811,15 +6663,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "status": "completed",
                 }
 
-                _input_tokens, _output_tokens, calls, normalized_answer = runner.normalize(
-                    value, events
+                _input_tokens, _output_tokens, calls, normalized_answer = (
+                    runner.normalize(value, events)
                 )
 
                 self.assertEqual([call["name"] for call in calls], [tool])
                 self.assertEqual(calls[0]["status"], "success")
                 self.assertEqual(normalized_answer, answer())
 
-    def test_normalize_rejects_codex_0158_unknown_structured_status_without_iserror(self) -> None:
+    def test_normalize_rejects_codex_0158_unknown_structured_status_without_iserror(
+        self,
+    ) -> None:
         cases = (
             ("ask_context", {"query": "finalizer"}, {}),
             ("ask_context", {"query": "finalizer"}, {"status": "failed"}),
@@ -5843,7 +6697,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "tool": tool,
                     "arguments": arguments,
                     "result": {
-                        "content": [{"type": "text", "text": json.dumps(structured_content)}],
+                        "content": [
+                            {"type": "text", "text": json.dumps(structured_content)}
+                        ],
                         "structured_content": structured_content,
                     },
                     "error": None,
@@ -5860,7 +6716,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         cases = (
             (
                 {"action": "read", "uri": "repobrief://frozen/a"},
-                {"content": [{"type": "text", "text": "list frozen resources before reading"}]},
+                {
+                    "content": [
+                        {"type": "text", "text": "list frozen resources before reading"}
+                    ]
+                },
             ),
             (
                 {"action": "list"},
@@ -5868,7 +6728,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "content": [
                         {
                             "type": "text",
-                            "text": "{\"code\":-32000,\"message\":\"unavailable\"}",
+                            "text": '{"code":-32000,"message":"unavailable"}',
                         }
                     ]
                 },
@@ -5880,8 +6740,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         {
                             "type": "text",
                             "text": (
-                                "{\"_meta\":{},\"contents\":[{\"mimeType\":\"text/plain\","
-                                "\"text\":\"wrong\",\"uri\":\"repobrief://frozen/other\"}]}"
+                                '{"_meta":{},"contents":[{"mimeType":"text/plain",'
+                                '"text":"wrong","uri":"repobrief://frozen/other"}]}'
                             ),
                         }
                     ]
@@ -5961,8 +6821,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerError, "paginated"):
             runner._freeze_resource_result({"resources": [], "nextCursor": "more"})
         with self.assertRaisesRegex(runner.RunnerError, "duplicate"):
-            runner._freeze_resource_result({"resources": [{"uri":"x"},{"uri":"x"}]})
-
+            runner._freeze_resource_result({"resources": [{"uri": "x"}, {"uri": "x"}]})
 
     def test_main_rejects_oversized_request_before_json_decode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -5973,11 +6832,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "-c",
                 bootstrap_program(),
                 str(MODULE_PATH),
-                "--request-root", str(root / "requests"),
-                "--repository-map", str(root / "repository-map.json"),
-                "--state-root", str(root / "state"),
-                "--transcript-root", str(root / "transcripts"),
-                "--provider-evidence-root", str(root / "provider-evidence"),
+                "--request-root",
+                str(root / "requests"),
+                "--repository-map",
+                str(root / "repository-map.json"),
+                "--state-root",
+                str(root / "state"),
+                "--transcript-root",
+                str(root / "transcripts"),
+                "--provider-evidence-root",
+                str(root / "provider-evidence"),
             ]
             completed = subprocess.run(
                 command,
@@ -5992,7 +6856,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 completed.stderr,
             )
 
-
     def test_staged_proxy_survives_later_source_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -6000,7 +6863,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             state_root.mkdir(mode=0o700)
             source = root / MODULE_PATH.name
             source.write_bytes(MODULE_PATH.read_bytes())
-            expected = {"name": source.name, "bytes": source.stat().st_size, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            expected = {
+                "name": source.name,
+                "bytes": source.stat().st_size,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
             with patch.object(runner, "__file__", str(source)):
                 binding = runner.stage_mcp_proxy(
                     state_root, expected, runtime_code_identity(runner.BASE_PATH)
@@ -6055,14 +6922,20 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             state_root.mkdir(mode=0o700)
             source = root / MODULE_PATH.name
             source.write_bytes(MODULE_PATH.read_bytes())
-            expected = {"name": source.name, "bytes": source.stat().st_size, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            expected = {
+                "name": source.name,
+                "bytes": source.stat().st_size,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
             with patch.object(runner, "__file__", str(source)):
                 binding = runner.stage_mcp_proxy(
                     state_root, expected, runtime_code_identity(runner.BASE_PATH)
                 )
             staged = Path(binding["path"])
             staged.write_text("# mutated stage\n", encoding="utf-8")
-            with self.assertRaisesRegex(runner.RunnerError, "proxy stage changed during execution"):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "proxy stage changed during execution"
+            ):
                 runner._revalidate_staged_mcp_proxy(binding)
             self.assertEqual(runner.cleanup_staged_mcp_proxy(binding), "RunnerError")
             self.assertTrue(staged.exists())
@@ -6074,7 +6947,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             state_root.mkdir(mode=0o700)
             source = root / MODULE_PATH.name
             source.write_bytes(MODULE_PATH.read_bytes())
-            expected = {"name": source.name, "bytes": source.stat().st_size, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            expected = {
+                "name": source.name,
+                "bytes": source.stat().st_size,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
             with patch.object(runner, "__file__", str(source)):
                 binding = runner.stage_mcp_proxy(
                     state_root, expected, runtime_code_identity(runner.BASE_PATH)
@@ -6103,7 +6980,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     manifest_path=staged_manifest.resolve(),
                     mcp_runtime_root=state_root.resolve(),
                 )
-            encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
+            encoded = next(
+                item
+                for item in command
+                if item.startswith("mcp_servers.repobrief.args=")
+            )
             proxy_args = json.loads(encoded.split("=", 1)[1])
             self.assertEqual(proxy_args[:2], ["-I", "-c"])
             self.assertEqual(proxy_args[2], bootstrap_program())
@@ -6135,7 +7016,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(runner.cleanup_staged_mcp_proxy(binding), "RunnerError")
             self.assertTrue(unexpected.exists())
 
-
     def test_codex_executable_must_match_preflight_provider_binding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -6166,20 +7046,35 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             path = runner._runtime_code_path(name)
             original_paths[name] = path
             data = path.read_bytes()
-            code_files.append({
-                "name": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()
-            })
-        code = {"files": code_files, "bundle_sha256": runner.base._sha256_json(code_files)}
+            code_files.append(
+                {
+                    "name": name,
+                    "bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            )
+        code = {
+            "files": code_files,
+            "bundle_sha256": runner.base._sha256_json(code_files),
+        }
         with tempfile.TemporaryDirectory() as temporary:
             replacement = Path(temporary) / "repobrief_agent_benchmark_runner.py"
-            replacement.write_bytes(original_paths[replacement.name].read_bytes() + b"\n# drift\n")
+            replacement.write_bytes(
+                original_paths[replacement.name].read_bytes() + b"\n# drift\n"
+            )
+
             def runtime_path(name: str) -> Path:
                 return replacement if name == replacement.name else original_paths[name]
+
             with patch.object(runner, "_runtime_code_path", side_effect=runtime_path):
-                with self.assertRaisesRegex(runner.RunnerError, "runtime code changed after preflight"):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "runtime code changed after preflight"
+                ):
                     runner._validated_authorized_runtime_code(code)
 
-    def test_staged_manifest_survives_original_replacement_and_binds_command(self) -> None:
+    def test_staged_manifest_survives_original_replacement_and_binds_command(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
@@ -6213,7 +7108,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     manifest_path=staged.resolve(),
                     mcp_runtime_root=state_root.resolve(),
                 )
-            encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
+            encoded = next(
+                item
+                for item in command
+                if item.startswith("mcp_servers.repobrief.args=")
+            )
             self.assertIn(str(staged), encoded)
             self.assertNotIn(str(manifest), encoded)
             runner._revalidate_staged_repoground_manifest(binding)
@@ -6238,9 +7137,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 file_identity(manifest),
             ]
 
-            first_stage = runner.stage_repoground_manifest(
-                state_root, authorized[-1]
-            )
+            first_stage = runner.stage_repoground_manifest(state_root, authorized[-1])
             staged_manifest = Path(first_stage["path"])
             rebound = runner._rebind_staged_manifest_authorization(
                 authorized, first_stage
@@ -6265,11 +7162,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 staged_manifest.read_bytes(),
             )
             self.assertIsNone(runner.cleanup_staged_mcp_upstream(second_stage))
-            self.assertIsNone(
-                runner.cleanup_staged_repoground_manifest(first_stage)
-            )
+            self.assertIsNone(runner.cleanup_staged_repoground_manifest(first_stage))
 
-    def test_staged_manifest_rebind_preserves_directory_bundle_authorization(self) -> None:
+    def test_staged_manifest_rebind_preserves_directory_bundle_authorization(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
@@ -6306,9 +7203,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 rebound,
             )
             self.assertIsNone(runner.cleanup_staged_mcp_upstream(second_stage))
-            self.assertIsNone(
-                runner.cleanup_staged_repoground_manifest(first_stage)
-            )
+            self.assertIsNone(runner.cleanup_staged_repoground_manifest(first_stage))
 
     def test_staged_manifest_preserves_relative_artifact_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -6403,9 +7298,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 file_identity(script),
                 file_identity(manifest),
             ]
-            first_stage = runner.stage_repoground_manifest(
-                state_root, authorized[-1]
-            )
+            first_stage = runner.stage_repoground_manifest(state_root, authorized[-1])
             staged_manifest = Path(first_stage["path"])
             artifact.write_text("drifted original\n", encoding="utf-8")
             rebound = runner._rebind_staged_manifest_authorization(
@@ -6434,11 +7327,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(completed.stdout, artifact_raw)
             self.assertIsNone(runner.cleanup_staged_mcp_upstream(second_stage))
-            self.assertIsNone(
-                runner.cleanup_staged_repoground_manifest(first_stage)
-            )
+            self.assertIsNone(runner.cleanup_staged_repoground_manifest(first_stage))
 
-    def test_live_dispatch_requires_terminal_success_before_second_condition(self) -> None:
+    def test_live_dispatch_requires_terminal_success_before_second_condition(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             treatment = request(condition="treatment")
@@ -6502,9 +7395,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             state = runner._validated_dispatch_event_state(
                 treatment, state_root, authorization
             )
-            self.assertEqual(
-                state["condition_intents"], ["baseline", "treatment"]
-            )
+            self.assertEqual(state["condition_intents"], ["baseline", "treatment"])
             self.assertEqual(
                 state["condition_outcomes"],
                 {"baseline": "condition-completed"},
@@ -6538,9 +7429,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
     def test_failed_or_ambiguous_first_dispatch_terminalizes_pair(self) -> None:
         for provider_process_started in (False, True):
-            with self.subTest(
-                provider_process_started=provider_process_started
-            ), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(provider_process_started=provider_process_started),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 treatment = request(condition="treatment")
                 manifest = root / "bundle.manifest.json"
@@ -6553,9 +7445,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     condition="baseline",
                     commit=treatment["repository"]["commit"],
                 )
-                state_root = write_dispatch_authorization(
-                    root, treatment, []
-                )
+                state_root = write_dispatch_authorization(root, treatment, [])
                 authorization = runner._load_preflight_dispatch_authorization(
                     baseline, state_root
                 )["authorization"]
@@ -6591,9 +7481,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     failed["payload"]["outcome_ambiguous"],
                     provider_process_started,
                 )
-                self.assertIsNone(
-                    failed["payload"]["observed_cost_usd"]
-                )
+                self.assertIsNone(failed["payload"]["observed_cost_usd"])
                 with self.assertRaisesRegex(
                     runner.RunnerError,
                     "pair is terminal after failure",
@@ -6681,9 +7569,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 baseline,
                 state_root,
                 authorization,
-                runner.RunnerError(
-                    "simulated post-write directory validation failure"
-                ),
+                runner.RunnerError("simulated post-write directory validation failure"),
                 provider_process_started=False,
             )
             terminal = runner._validated_dispatch_event_state(
@@ -6757,8 +7643,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ):
                 runner._manifest_artifact_paths(manifest, manifest.read_bytes())
 
-
-    def test_raw_persistence_failure_gets_best_effort_diagnostics_without_semantics(self) -> None:
+    def test_raw_persistence_failure_gets_best_effort_diagnostics_without_semantics(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             value = request()
@@ -6779,12 +7666,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "stderr_overflow": False,
             }
             now = datetime.now(timezone.utc)
-            with patch.object(
-                runner, "_write_private_dirfd", side_effect=selective_write
-            ), patch.object(
-                runner,
-                "classify_stderr",
-                side_effect=AssertionError("semantic classifier must not run"),
+            with (
+                patch.object(
+                    runner, "_write_private_dirfd", side_effect=selective_write
+                ),
+                patch.object(
+                    runner,
+                    "classify_stderr",
+                    side_effect=AssertionError("semantic classifier must not run"),
+                ),
             ):
                 with self.assertRaisesRegex(
                     runner.RunnerError, "failure_diagnostics_sha256"
@@ -6805,13 +7695,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(
                 diagnostics["raw_persisted"], {"stdout": False, "stderr": True}
             )
-            self.assertEqual(
-                diagnostics["semantic_interpretation"], "not_performed"
-            )
+            self.assertEqual(diagnostics["semantic_interpretation"], "not_performed")
             self.assertFalse(
                 (root / "provider-evidence" / names["stderr_policy"]).exists()
             )
-
 
     def test_manifest_artifact_contract_rejects_malformed_entries(self) -> None:
         cases = (
@@ -6828,7 +7715,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ),
         )
         for artifact, pattern in cases:
-            with self.subTest(artifact=artifact), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(artifact=artifact),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 manifest = root / "chosen.bundle.manifest.json"
                 manifest.write_text(
@@ -6836,12 +7726,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 with self.assertRaisesRegex(runner.RunnerError, pattern):
-                    runner._manifest_artifact_paths(
-                        manifest, manifest.read_bytes()
-                    )
+                    runner._manifest_artifact_paths(manifest, manifest.read_bytes())
 
-
-    def test_manifest_artifact_contract_rejects_conflicting_duplicate_paths(self) -> None:
+    def test_manifest_artifact_contract_rejects_conflicting_duplicate_paths(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             artifact = root / "brief.md"
@@ -6879,7 +7768,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             paths = runner._manifest_artifact_paths(manifest, manifest.read_bytes())
             self.assertEqual(len(paths), 1)
             self.assertEqual(paths[0][0], Path("brief.md"))
-
 
     def test_manifest_artifact_contract_enforces_aggregate_budgets(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -6929,12 +7817,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with patch.object(runner, "MAX_MCP_MANIFEST_ARTIFACTS", 1):
-                paths = runner._manifest_artifact_paths(
-                    manifest, manifest.read_bytes()
-                )
+                paths = runner._manifest_artifact_paths(manifest, manifest.read_bytes())
             self.assertEqual(len(paths), 1)
 
-    def test_staged_manifest_rejects_missing_or_nonregular_identity_artifact(self) -> None:
+    def test_staged_manifest_rejects_missing_or_nonregular_identity_artifact(
+        self,
+    ) -> None:
         for mode in ("missing", "directory", "symlink"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -6984,8 +7872,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(runner.RunnerError, pattern):
                     runner.stage_repoground_manifest(state_root, expected)
 
-
-    def test_manifest_stages_reject_declared_size_mismatch_before_content_read(self) -> None:
+    def test_manifest_stages_reject_declared_size_mismatch_before_content_read(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
@@ -7020,9 +7909,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     raise AssertionError(
                         "first stage must reject actual size before artifact content read"
                     )
-                return original_snapshot(
-                    path, label=label, max_bytes=max_bytes
-                )
+                return original_snapshot(path, label=label, max_bytes=max_bytes)
 
             with patch.object(
                 runner,
@@ -7057,9 +7944,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     raise AssertionError(
                         "second stage must reject actual size before artifact content read"
                     )
-                return original_snapshot(
-                    path, label=label, max_bytes=max_bytes
-                )
+                return original_snapshot(path, label=label, max_bytes=max_bytes)
 
             with patch.object(
                 runner,
@@ -7114,7 +7999,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ):
                 runner.stage_repoground_manifest(state_root, expected)
 
-    def test_preflight_authorization_rejects_legacy_projected_request_hash(self) -> None:
+    def test_preflight_authorization_rejects_legacy_projected_request_hash(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / "server.py"
@@ -7123,17 +8010,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             manifest.write_text("{}\n", encoding="utf-8")
             value = request(condition="treatment")
             value["repobrief"]["manifest"] = str(manifest)
-            value["repobrief"]["manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
-            value["repobrief"]["mcp_command"] = [str(Path(sys.executable).resolve()), str(script), "--bundle-root", str(root)]
+            value["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                manifest.read_bytes()
+            ).hexdigest()
+            value["repobrief"]["mcp_command"] = [
+                str(Path(sys.executable).resolve()),
+                str(script),
+                "--bundle-root",
+                str(root),
+            ]
             authorized = [file_identity(Path(sys.executable)), file_identity(script)]
             state_root = write_dispatch_authorization(root, value, authorized)
-            authorization_path = next((state_root / "preflight-dispatch-ledger").glob("*/authorization.json"))
-            authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
-            authorization["binding"]["requests"]["treatment"]["sha256"] = runner.base._sha256_json(
-                runner._preflight_request_projection(value)
+            authorization_path = next(
+                (state_root / "preflight-dispatch-ledger").glob("*/authorization.json")
             )
-            authorization["contract_sha256"] = runner.base._sha256_json(authorization["binding"])
-            authorization_path.write_text(json.dumps(authorization, sort_keys=True), encoding="utf-8")
+            authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
+            authorization["binding"]["requests"]["treatment"]["sha256"] = (
+                runner.base._sha256_json(runner._preflight_request_projection(value))
+            )
+            authorization["contract_sha256"] = runner.base._sha256_json(
+                authorization["binding"]
+            )
+            authorization_path.write_text(
+                json.dumps(authorization, sort_keys=True), encoding="utf-8"
+            )
             authorization_path.chmod(0o600)
             with self.assertRaisesRegex(runner.RunnerError, "treatment request"):
                 runner._load_preflight_mcp_authorization(value, state_root)
@@ -7149,7 +8049,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             manifest = root / "chosen.bundle.manifest.json"
             manifest.write_text("{}\n", encoding="utf-8")
             authorized = [file_identity(executable), file_identity(script)]
-            with patch.object(runner.Path, "cwd", side_effect=AssertionError("runtime cwd must not resolve an authorized relative script")):
+            with patch.object(
+                runner.Path,
+                "cwd",
+                side_effect=AssertionError(
+                    "runtime cwd must not resolve an authorized relative script"
+                ),
+            ):
                 argv, bindings, _manifest_authorization = runner._bind_mcp_upstream(
                     [str(executable), "server.py", "--bundle-root", str(root)],
                     manifest,
@@ -7160,7 +8066,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
     def test_mcp_proxy_rejects_invalid_client_params_before_forwarding(self) -> None:
         for params in (None, 1, "invalid", True):
-            with self.subTest(params=params), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(params=params),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 marker = root / "forwarded"
                 upstream = root / "mcp.py"
@@ -7172,7 +8081,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "    marker.write_text(line, encoding='utf-8')\n",
                     encoding="utf-8",
                 )
-                message = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": params}
+                message = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": params,
+                }
                 completed = subprocess.run(
                     proxy_command(upstream, root),
                     input=json.dumps(message).encode() + b"\n",
@@ -7183,7 +8097,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(b"benchmark MCP proxy stream failed", completed.stderr)
                 self.assertFalse(marker.exists())
-
 
     def test_source_bootstrap_path_identity_comes_from_open_descriptor(self) -> None:
         source = BOOTSTRAP_PATH.read_text(encoding="utf-8")
@@ -7203,8 +8116,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(identity["path"], str(target))
         self.assertEqual(identity["name"], target.name)
 
-
-
     def test_source_bootstrap_rejects_symlinked_parent_path(self) -> None:
         source = BOOTSTRAP_PATH.read_text(encoding="utf-8")
         prefix, separator, _tail = source.rpartition("\n_main()")
@@ -7220,7 +8131,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             target.write_bytes(b"VALUE = 4\n")
             alias_parent = root / "alias"
             alias_parent.symlink_to(real_parent, target_is_directory=True)
-            with self.assertRaisesRegex(RuntimeError, "symlink-free|opened target path"):
+            with self.assertRaisesRegex(
+                RuntimeError, "symlink-free|opened target path"
+            ):
                 read_target(alias_parent / target.name)
 
     def test_source_snapshot_path_identity_comes_from_open_descriptor(self) -> None:
@@ -7246,7 +8159,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "symlink-free|opened path"):
                 runner._read_source_snapshot(alias_parent / target.name)
 
-    def test_runtime_file_snapshot_path_identity_comes_from_open_descriptor(self) -> None:
+    def test_runtime_file_snapshot_path_identity_comes_from_open_descriptor(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "manifest.json"
             target.write_bytes(b"{}\n")
@@ -7260,7 +8175,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(raw, b"{}\n")
         self.assertEqual(identity["path"], str(target))
         self.assertEqual(identity["sha256"], hashlib.sha256(raw).hexdigest())
-
 
     def test_runtime_file_snapshot_rejects_symlinked_parent_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -7298,16 +8212,23 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
                 "manifest_sha256": runner.FROZEN_G1_LEGACY_IDENTITY["manifest_sha256"],
                 "stem": "lenskit",
             },
-            "freshness": {"status": "not_comparable", "caveats": [
-                {"kind": "stale_snapshot", "detail": "Freshness is not comparable."}
-            ]},
+            "freshness": {
+                "status": "not_comparable",
+                "caveats": [
+                    {"kind": "stale_snapshot", "detail": "Freshness is not comparable."}
+                ],
+            },
             "availability": {"status": "unknown", "caveats": []},
             "required_reading": {
-                "status": "pass", "task_profile": "basic_repo_question",
-                "required": ["agent_reading_pack"], "recommended": ["citation_map_jsonl"],
-                "missing_required": [], "missing_recommended": [],
+                "status": "pass",
+                "task_profile": "basic_repo_question",
+                "required": ["agent_reading_pack"],
+                "recommended": ["citation_map_jsonl"],
+                "missing_required": [],
+                "missing_recommended": [],
             },
-            "retrieval_hits": [], "resolved_ranges": [],
+            "retrieval_hits": [],
+            "resolved_ranges": [],
             "answer_scaffold": {
                 "citation_obligations": ["Cite evidence."],
                 "caveats_to_surface": [
@@ -7318,23 +8239,28 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
                 ),
             },
             "budget": {
-                "max_context_tokens": 8000, "max_answer_tokens": 1200,
-                "approx_context_chars_used": 0, "truncated": False,
+                "max_context_tokens": 8000,
+                "max_answer_tokens": 1200,
+                "approx_context_chars_used": 0,
+                "truncated": False,
                 "does_not_establish_quality": True,
             },
-            "forbidden_operations": list(runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS),
+            "forbidden_operations": list(
+                runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS
+            ),
             "does_not_establish": list(
                 runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
             ),
         }
 
-    def test_historical_g1_pack_accepted_without_inventing_modern_evidence(self) -> None:
+    def test_historical_g1_pack_accepted_without_inventing_modern_evidence(
+        self,
+    ) -> None:
         manifest = Path("/frozen/lenskit.bundle.manifest.json")
         pack = self._historical_pack(manifest)
         self.assertEqual(
-            runner._validated_frozen_g1_context_pack(
-                pack, expected_manifest=manifest
-            ), pack
+            runner._validated_frozen_g1_context_pack(pack, expected_manifest=manifest),
+            pack,
         )
         with self.assertRaises(runner.RunnerError):
             runner._validated_ask_context_pack(pack)
@@ -7381,7 +8307,9 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
                         pack, expected_manifest=manifest
                     )
 
-    def test_historical_g1_profile_is_bound_to_exact_request_not_schema_fallback(self) -> None:
+    def test_historical_g1_profile_is_bound_to_exact_request_not_schema_fallback(
+        self,
+    ) -> None:
         frozen = runner.FROZEN_G1_LEGACY_IDENTITY
         manifest = "/frozen/lenskit.bundle.manifest.json"
         req = request(condition="treatment")
@@ -7393,14 +8321,20 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
             setup={"working_tree": "clean", "fixture": "fresh-matching-snapshot"},
         )
         req["repobrief"] = {
-            "manifest": manifest, "manifest_sha256": frozen["manifest_sha256"],
+            "manifest": manifest,
+            "manifest_sha256": frozen["manifest_sha256"],
             "mcp_command": [
-                frozen["python_path"], frozen["launcher_path"],
-                "--bundle-root", manifest, "--repo-root", frozen["source_root"],
+                frozen["python_path"],
+                frozen["launcher_path"],
+                "--bundle-root",
+                manifest,
+                "--repo-root",
+                frozen["source_root"],
             ],
         }
         with patch.dict(
-            frozen, {"prompt_sha256": hashlib.sha256(req["prompt"].encode()).hexdigest()}
+            frozen,
+            {"prompt_sha256": hashlib.sha256(req["prompt"].encode()).hexdigest()},
         ):
             self.assertEqual(
                 runner._frozen_g1_mcp_profile(req), runner.MCP_PROFILE_FROZEN_G1
@@ -7425,7 +8359,9 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
                 runner.MCP_PROFILE_MODERN,
             )
 
-    def test_historical_g1_vendor_freeze_rejects_source_edits_and_symlinks(self) -> None:
+    def test_historical_g1_vendor_freeze_rejects_source_edits_and_symlinks(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             site = root / "site"
@@ -7437,19 +8373,29 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
             typing = root / "typing_extensions.py"
             typing.write_bytes(b"typing helper\\n")
             typing.chmod(0o600)
+
             def manifest_sha() -> str:
                 entries = [
-                    {"p": "jsonschema/__init__.py", "n": source.stat().st_size,
-                     "h": hashlib.sha256(source.read_bytes()).hexdigest()},
-                    {"p": "typing_extensions.py", "n": typing.stat().st_size,
-                     "h": hashlib.sha256(typing.read_bytes()).hexdigest()},
+                    {
+                        "p": "jsonschema/__init__.py",
+                        "n": source.stat().st_size,
+                        "h": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    },
+                    {
+                        "p": "typing_extensions.py",
+                        "n": typing.stat().st_size,
+                        "h": hashlib.sha256(typing.read_bytes()).hexdigest(),
+                    },
                 ]
                 return runner.sha_bytes(runner.canonical(entries).encode())
+
             with (
                 patch.object(runner, "FROZEN_G1_VENDOR_SITE_ROOT", site),
                 patch.object(runner, "FROZEN_G1_VENDOR_TYPING_EXT", typing),
                 patch.object(runner, "FROZEN_G1_VENDOR_PACKAGES", ("jsonschema",)),
-                patch.object(runner, "FROZEN_G1_VENDOR_MANIFEST_SHA256", manifest_sha()),
+                patch.object(
+                    runner, "FROZEN_G1_VENDOR_MANIFEST_SHA256", manifest_sha()
+                ),
             ):
                 entries = runner._frozen_g1_vendor_snapshot()
                 self.assertEqual(len(entries), 2)
@@ -7483,14 +8429,19 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
 class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
     """Frozen G1 dependency corruption must not consume a paid one-shot."""
 
-    def test_vendor_failure_before_one_shot_intent_prevents_provider_start(self) -> None:
+    def test_vendor_failure_before_one_shot_intent_prevents_provider_start(
+        self,
+    ) -> None:
         for failure in (
             "historical G1 vendor source is unavailable or linked",
             "historical G1 vendor source digest is not frozen",
             "historical G1 vendor path is unsafe",
             "historical G1 vendor metadata is unsafe",
         ):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 value = request(condition="treatment")
                 manifest = root / "manifest.json"
@@ -7553,37 +8504,40 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                         "_assert_authorized_codex_executable",
                         "_assert_authorized_chatgpt_auth",
                         "_assert_authorized_runtime_binding",
+                        "validate_live_immutable_mounts",
                         "close_provider_evidence_plan",
                         "write_schema",
                     ):
                         stack.enter_context(patch.object(runner, name))
                     stack.enter_context(
                         patch.object(
-                            runner, "_load_preflight_dispatch_authorization",
+                            runner,
+                            "_load_preflight_dispatch_authorization",
                             return_value=dispatch,
                         )
                     )
                     stack.enter_context(
                         patch.object(
-                            runner, "_frozen_g1_mcp_profile",
+                            runner,
+                            "_frozen_g1_mcp_profile",
                             return_value=runner.MCP_PROFILE_FROZEN_G1,
                         )
                     )
                     frozen_vendor = stack.enter_context(
                         patch.object(
-                            runner, "_frozen_g1_vendor_snapshot",
+                            runner,
+                            "_frozen_g1_vendor_snapshot",
                             side_effect=runner.RunnerError(failure),
                         )
                     )
                     intent = stack.enter_context(
                         patch.object(runner, "_record_preflight_dispatch_intent")
                     )
-                    provider = stack.enter_context(
-                        patch.object(runner, "run_bounded")
-                    )
+                    provider = stack.enter_context(patch.object(runner, "run_bounded"))
                     stack.enter_context(
                         patch.object(
-                            runner.base, "attest_checkout_setup",
+                            runner.base,
+                            "attest_checkout_setup",
                             return_value={"working_tree": "clean"},
                         )
                     )
@@ -7595,18 +8549,18 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 intent.assert_not_called()
                 provider.assert_not_called()
 
-
-
     def test_frozen_g1_baseline_pair_has_exact_identity(self) -> None:
         value = request(condition="baseline")
         identity = dict(runner.FROZEN_G1_LEGACY_IDENTITY)
-        identity.update({
-            "taskset_id": value["taskset_id"],
-            "taskset_sha256": value["taskset_sha256"],
-            "case_id": value["case_id"],
-            "repository": value["repository"],
-            "prompt_sha256": hashlib.sha256(value["prompt"].encode()).hexdigest(),
-        })
+        identity.update(
+            {
+                "taskset_id": value["taskset_id"],
+                "taskset_sha256": value["taskset_sha256"],
+                "case_id": value["case_id"],
+                "repository": value["repository"],
+                "prompt_sha256": hashlib.sha256(value["prompt"].encode()).hexdigest(),
+            }
+        )
         with patch.object(runner, "FROZEN_G1_LEGACY_IDENTITY", identity):
             self.assertTrue(runner._frozen_g1_baseline_pair(value))
             for key, other in (
@@ -7616,8 +8570,11 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
             ):
                 modified = json.loads(json.dumps(value))
                 modified[key] = other
-                with self.subTest(key=key), self.assertRaisesRegex(
-                    runner.RunnerError, "baseline identity is not authorized"
+                with (
+                    self.subTest(key=key),
+                    self.assertRaisesRegex(
+                        runner.RunnerError, "baseline identity is not authorized"
+                    ),
                 ):
                     runner._frozen_g1_baseline_pair(modified)
             unrelated = json.loads(json.dumps(value))
@@ -7675,13 +8632,15 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                     "_assert_authorized_codex_executable",
                     "_assert_authorized_chatgpt_auth",
                     "_assert_authorized_runtime_binding",
+                    "validate_live_immutable_mounts",
                     "close_provider_evidence_plan",
                     "write_schema",
                 ):
                     stack.enter_context(patch.object(runner, name))
                 stack.enter_context(
                     patch.object(
-                        runner, "_load_preflight_dispatch_authorization",
+                        runner,
+                        "_load_preflight_dispatch_authorization",
                         return_value=dispatch,
                     )
                 )
@@ -7690,7 +8649,8 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 )
                 vendor = stack.enter_context(
                     patch.object(
-                        runner, "_frozen_g1_vendor_snapshot",
+                        runner,
+                        "_frozen_g1_vendor_snapshot",
                         side_effect=runner.RunnerError("historical G1 vendor missing"),
                     )
                 )
@@ -7700,7 +8660,8 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 provider = stack.enter_context(patch.object(runner, "run_bounded"))
                 stack.enter_context(
                     patch.object(
-                        runner.base, "attest_checkout_setup",
+                        runner.base,
+                        "attest_checkout_setup",
                         return_value={"working_tree": "clean"},
                     )
                 )

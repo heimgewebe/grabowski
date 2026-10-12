@@ -6,6 +6,7 @@ the preflight core while binding the exact Codex runner, executable and ChatGPT
 subscription gate.  It creates one fail-closed dispatch authorization only; it
 does not execute a benchmark request and never grants retry authority.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -29,7 +30,6 @@ ENTRYPOINT_BOOTSTRAP_KIND = "grabowski.python_c_source_bootstrap"
 ENTRYPOINT_BOOTSTRAP_SCHEMA_VERSION = 1
 ENTRYPOINT_BOOTSTRAP_NAME = "repobrief_agent_benchmark_source_bootstrap.py"
 ENTRYPOINT_BOOTSTRAP_PATH = Path(__file__).with_name(ENTRYPOINT_BOOTSTRAP_NAME)
-
 
 
 def _open_absolute_regular_nofollow(path: Path, *, label: str) -> int:
@@ -71,13 +71,13 @@ def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
         raise RuntimeError(f"cannot safely load {path.name}")
     if before.st_size <= 0 or before.st_size > SOURCE_SNAPSHOT_MAX_BYTES:
         raise RuntimeError(f"cannot safely load {path.name}")
-    descriptor = _open_absolute_regular_nofollow(
-        requested, label=f"{path.name} source"
-    )
+    descriptor = _open_absolute_regular_nofollow(requested, label=f"{path.name} source")
     try:
         opened = os.fstat(descriptor)
         if (opened.st_dev, opened.st_ino, opened.st_size) != (
-            before.st_dev, before.st_ino, before.st_size
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
         ):
             raise RuntimeError(f"{path.name} changed before load")
         data = bytearray()
@@ -104,7 +104,11 @@ def _read_source_snapshot(path: Path) -> tuple[bytes, dict[str, Any]]:
         if (
             len(data) != opened.st_size
             or len(data) > SOURCE_SNAPSHOT_MAX_BYTES
-            or (after_descriptor.st_dev, after_descriptor.st_ino, after_descriptor.st_size)
+            or (
+                after_descriptor.st_dev,
+                after_descriptor.st_ino,
+                after_descriptor.st_size,
+            )
             != (opened.st_dev, opened.st_ino, opened.st_size)
             or (after.st_dev, after.st_ino, after.st_size)
             != (opened.st_dev, opened.st_ino, opened.st_size)
@@ -188,6 +192,7 @@ if __name__ == "__main__":
 else:
     _SELF_SOURCE_RAW, _SELF_SOURCE_IDENTITY = _read_source_snapshot(Path(__file__))
 
+
 def _load(name: str, path: Path) -> Any:
     raw, identity = _read_source_snapshot(path)
     spec = importlib.util.spec_from_file_location(name, path)
@@ -208,9 +213,13 @@ def _load(name: str, path: Path) -> Any:
 
 
 CORE_PATH = Path(__file__).with_name("repobrief_agent_benchmark_preflight_core.py")
-CODEX_RUNNER_PATH = Path(__file__).with_name("repobrief_agent_benchmark_codex_runner.py")
+CODEX_RUNNER_PATH = Path(__file__).with_name(
+    "repobrief_agent_benchmark_codex_runner.py"
+)
 core = _load("repobrief_agent_benchmark_preflight_core_for_codex", CORE_PATH)
-codex_runner = _load("repobrief_agent_benchmark_codex_runner_for_authorization", CODEX_RUNNER_PATH)
+codex_runner = _load(
+    "repobrief_agent_benchmark_codex_runner_for_authorization", CODEX_RUNNER_PATH
+)
 core._register_startup_code_identity(core.__grabowski_source_identity__)
 core._register_startup_code_identity(_SELF_SOURCE_IDENTITY)
 core._register_startup_code_identity(codex_runner.__grabowski_source_identity__)
@@ -239,9 +248,7 @@ def _codex_credential_commitment(credential_data: bytes) -> dict[str, Any]:
         "schema_version": 1,
         "kind": CODEX_CREDENTIAL_COMMITMENT_KIND,
         "nonce": nonce,
-        "commitment_sha256": _credential_commitment_sha256(
-            credential_data, nonce
-        ),
+        "commitment_sha256": _credential_commitment_sha256(credential_data, nonce),
     }
 
 
@@ -297,6 +304,25 @@ def authorize_pair(
             "Codex preflight authorization requires immutable source bootstrap"
         )
     core._register_startup_bootstrap_identity(_ENTRYPOINT_BOOTSTRAP_IDENTITY)
+    # Before core creates a one-shot ledger, verify effective nested mounts.
+    # Merely having a read-only /home parent is insufficient.
+    baseline, treatment = core.load_pair(request_root, pair_id)
+    source = core.runner.load_repository_root(baseline, repository_map)
+    repobrief = treatment.get("repobrief")
+    if not isinstance(repobrief, dict) or not isinstance(
+        repobrief.get("manifest"), str
+    ):
+        raise core.PreflightError("live Codex treatment manifest is unavailable")
+    codex_runner.validate_live_immutable_mounts(
+        source=source,
+        request_root=request_root,
+        repository_map=repository_map,
+        manifest=Path(repobrief["manifest"]),
+        state_root=state_root,
+        transcript_root=transcript_root,
+        evidence_root=evidence_root,
+        report_root=None if report_out is None else report_out.parent,
+    )
     provider_binding = _validated_codex_provider_binding(
         codex_command, codex_command_sha256
     )
@@ -354,7 +380,10 @@ def main(argv: list[str] | None = None) -> int:
             validator_command=core._command_array(args.validator_command),
         )
     except (core.PreflightError, codex_runner.RunnerError) as exc:
-        print(json.dumps({"status": "error", "error": str(exc)}, sort_keys=True), file=sys.stderr)
+        print(
+            json.dumps({"status": "error", "error": str(exc)}, sort_keys=True),
+            file=sys.stderr,
+        )
         return 2
     json.dump(report, sys.stdout, ensure_ascii=False, sort_keys=True)
     sys.stdout.write("\n")
