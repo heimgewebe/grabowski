@@ -11394,7 +11394,47 @@ def _reconcile_check_revision_snapshot(
 TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY = "task_reconcile_ready_evidence_v1"
 TASK_RECONCILE_READY_MAX_AGE_SECONDS = 300
 TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT = 32
-TASK_RECONCILE_READY_SCOPE = "quiescent-privileged-terminal-observations"
+TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT = 8192
+TASK_RECONCILE_READY_SQL_VM_CALLBACK_LIMIT = 1000
+TASK_RECONCILE_READY_PRIVILEGED_INDEX_NAME = "tasks_reconcile_ready_privileged_idx"
+TASK_RECONCILE_READY_PRIVILEGED_INDEX_SQL = (
+    "CREATE INDEX tasks_reconcile_ready_privileged_idx "
+    "ON tasks(task_id) "
+    "WHERE execution_backend='systemd-root-broker' OR systemd_scope='system'"
+)
+TASK_RECONCILE_READY_SCOPE = "quiescent-privileged-terminal-observations-v2"
+
+
+def _task_reconcile_ready_index_present(connection: sqlite3.Connection) -> bool:
+    """Verify the exact partial index, never trust an index name alone."""
+    rows = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+        (TASK_RECONCILE_READY_PRIVILEGED_INDEX_NAME,),
+    ).fetchall()
+    if not rows:
+        return False
+    if (
+        len(rows) != 1
+        or not isinstance(rows[0][0], str)
+        or _normalize_reconcile_contract_sql(rows[0][0])
+        != _normalize_reconcile_contract_sql(
+            TASK_RECONCILE_READY_PRIVILEGED_INDEX_SQL
+        )
+    ):
+        raise RuntimeError("Privileged readiness index contract is invalid")
+    return True
+
+
+def _ensure_task_reconcile_ready_index(
+    connection: sqlite3.Connection,
+) -> None:
+    """Install the bounded-query index only under explicit mutation admission."""
+    if _task_reconcile_ready_index_present(connection):
+        return
+    operator._require_operator_mutation("durable_job")
+    connection.execute(TASK_RECONCILE_READY_PRIVILEGED_INDEX_SQL)
+    if not _task_reconcile_ready_index_present(connection):
+        raise RuntimeError("Privileged readiness index installation failed")
 
 
 def _task_reconcile_ready_privileged_rows(
@@ -11407,23 +11447,88 @@ def _task_reconcile_ready_privileged_rows(
     promoted into a fresh readiness attestation.
     """
     projection = _task_current_projection()
-    records: list[dict[str, Any]] = []
-    for row in connection.execute(
-        "SELECT * FROM tasks "
-        "WHERE execution_backend='systemd-root-broker' OR systemd_scope='system' "
-        "ORDER BY task_id"
-    ):
-        record = dict(row)
-        current = lifecycle_projection.bounded_current_task_projection(
-            [_task_archive_record(record)], projection=projection,
+    # The privileged WHERE clause alone cannot witness an archived task that
+    # was deleted or had its backend/scope changed to evade that predicate.
+    # Verify every bounded, immutable archive binding by indexed task_id
+    # lookup before trusting the filtered privileged cohort.
+    bindings = projection.get("archived_task_bindings")
+    if not isinstance(bindings, dict):
+        raise lifecycle_projection.LifecycleProjectionIntegrityError(
+            "Privileged readiness archive bindings are invalid"
         )
-        if not current:
-            continue
-        if len(records) >= TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT:
-            raise RuntimeError("Current privileged task inventory exceeds readiness proof budget")
-        if not _is_root_systemd_backend(record):
-            raise RuntimeError("Privileged task scope does not have an approved observer")
-        records.append(record)
+    if len(bindings) > TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT:
+        raise RuntimeError(
+            "Archived task projection exceeds readiness integrity budget"
+        )
+    _projected_task_state_counts(connection, projection)
+    records: list[dict[str, Any]] = []
+    archived_count = 0
+    # Bound the SQL result itself, not merely the final current-row set.
+    sql_row_budget = (
+        TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT
+        + TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT + 1
+    )
+    has_index = _task_reconcile_ready_index_present(connection)
+    # A legacy schema may not have the partial index until the next explicitly
+    # authorized reconciliation. No READ_ONLY path is allowed to create it.
+    # The legacy query gets an SQLite VM instruction budget so scanning many
+    # unrelated normal tasks fails closed instead of monopolizing the service.
+    query = (
+        "SELECT * FROM tasks "
+        + (
+            f"INDEXED BY {TASK_RECONCILE_READY_PRIVILEGED_INDEX_NAME} "
+            if has_index else ""
+        )
+        + "WHERE execution_backend='systemd-root-broker' "
+        "OR systemd_scope='system' ORDER BY task_id LIMIT ?"
+    )
+    budget_callbacks = 0
+
+    def _readiness_query_budget() -> int:
+        nonlocal budget_callbacks
+        budget_callbacks += 1
+        return int(budget_callbacks > TASK_RECONCILE_READY_SQL_VM_CALLBACK_LIMIT)
+
+    if not has_index:
+        connection.set_progress_handler(_readiness_query_budget, 1000)
+    cursor = None
+    try:
+        cursor = connection.execute(query, (sql_row_budget,))
+        for row in cursor:
+            record = dict(row)
+            current = lifecycle_projection.bounded_current_task_projection(
+                [_task_archive_record(record)], projection=projection,
+            )
+            if not current:
+                archived_count += 1
+                if archived_count > TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT:
+                    raise RuntimeError(
+                        "Privileged archived history exceeds readiness proof budget"
+                    )
+                continue
+            if len(records) >= TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT:
+                raise RuntimeError(
+                    "Current privileged task inventory exceeds readiness proof budget"
+                )
+            if not _is_root_systemd_backend(record):
+                raise RuntimeError(
+                    "Privileged task scope does not have an approved observer"
+                )
+            records.append(record)
+    except sqlite3.OperationalError as exc:
+        if (
+            not has_index
+            and budget_callbacks > TASK_RECONCILE_READY_SQL_VM_CALLBACK_LIMIT
+        ):
+            raise RuntimeError(
+                "Privileged readiness query exceeds SQLite work budget"
+            ) from exc
+        raise
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if not has_index:
+            connection.set_progress_handler(None, 0)
     return records
 
 def _task_reconcile_ready_rootbroker_terminal_observed(
@@ -11488,15 +11593,10 @@ def _task_reconcile_ready_rootbroker_terminal_observed(
 def _task_reconcile_ready_privileged_digest(
     records: list[dict[str, Any]],
 ) -> str:
+    # Bind all persisted task fields, including authoritative unit and host.
+    # A terminal-state edit after observation must not replay a stale proof.
     return _sha256_json([
-        {
-            "task_id": record["task_id"],
-            "unit": record["unit"],
-            "attempt": record["attempt"],
-            "execution_backend": record["execution_backend"],
-            "systemd_scope": record["systemd_scope"],
-            "state": record["state"],
-        }
+        _sha256_json(_task_archive_record(record))
         for record in records
     ])
 
@@ -11556,6 +11656,23 @@ def _task_reconcile_ready_cycle_progress(
             (TASK_RECONCILE_READY_CYCLE_METADATA_KEY,),
         )
         return False
+    # A cursor sequence alone does not bind already-finished phases to the
+    # same task/resource-store generation as the remaining phases.
+    task_revision = _task_reconcile_revision_contract(connection)
+    with resources._resource_readonly_snapshot() as resource_connection:
+        resource_revision = resources._resource_reconcile_revision_contract(
+            resource_connection
+        )
+    if resource_revision is None:
+        connection.execute(
+            "DELETE FROM metadata WHERE key=?",
+            (TASK_RECONCILE_READY_CYCLE_METADATA_KEY,),
+        )
+        return False
+    epoch = _sha256_json({
+        "task_revision": task_revision["revision"],
+        "resource_revision": resource_revision["revision"],
+    })
     rows = connection.execute(
         "SELECT value FROM metadata WHERE key=?",
         (TASK_RECONCILE_READY_CYCLE_METADATA_KEY,),
@@ -11569,14 +11686,15 @@ def _task_reconcile_ready_cycle_progress(
             progress = json.loads(rows[0][0])
             if (
                 not isinstance(progress, dict)
-                or set(progress) != {"schema_version", "phases"}
-                or progress["schema_version"] != 1
+                or set(progress) != {"schema_version", "phases", "epoch"}
+                or progress["schema_version"] != 2
+                or progress["epoch"] != epoch
                 or not isinstance(progress["phases"], dict)
                 or set(progress["phases"]) - set(TASK_RECONCILE_READY_CYCLE_PHASES)
             ):
                 raise ValueError("Reconcile readiness cycle shape is invalid")
         else:
-            progress = {"schema_version": 1, "phases": {}}
+            progress = {"schema_version": 2, "phases": {}, "epoch": epoch}
         phases = progress["phases"]
         for name in TASK_RECONCILE_READY_CYCLE_PHASES:
             page = pages[name]
@@ -11594,7 +11712,14 @@ def _task_reconcile_ready_cycle_progress(
                 or not isinstance(previous["next"], str)
             ):
                 raise ValueError("Reconcile readiness phase shape is invalid")
-            if not previous["complete"]:
+            if previous["complete"]:
+                if (
+                    not completed
+                    or page["cursor_before"] is not None
+                    or page.get("cursor_after") is not None
+                ):
+                    raise ValueError("Reconcile readiness completed phase restarted")
+            else:
                 if before != previous["next"]:
                     raise ValueError("Reconcile readiness cursor chain has a gap")
                 previous = {
@@ -11625,59 +11750,124 @@ def _task_reconcile_ready_cycle_progress(
     return False
 
 
-def _publish_task_reconcile_ready_evidence(result: dict[str, Any]) -> None:
+def _prepare_task_reconcile_ready_evidence(
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Freeze a cycle and its store revisions while the caller holds the lock.
+
+    Never dispatch external Rootbroker observations from this SQL transaction.
+    """
     with _database_connection() as connection:
         if not _task_reconcile_ready_cycle_progress(connection, result):
-            return
-        # Live process termination does not bump an SQLite revision. Therefore
-        # a persisted active task cannot be certified from a status snapshot.
+            return None
+        # A schema index is installed only on this mutation-authorized path.
+        # READ_ONLY snapshots can only use an existing verified index.
+        _ensure_task_reconcile_ready_index(connection)
+        # Persisted running / unknown tasks forbid quiescent READY.
         if connection.execute(
             "SELECT 1 FROM tasks WHERE state IN "
             "('launching','running','outcome_unknown','interrupted') LIMIT 1"
         ).fetchone() is not None:
-            return
-        # Persisted terminal Rootbroker states are not live execution truth.
-        # Only this mutation-authorized reconciliation may perform broker show;
-        # every privileged task must be freshly and positively observed.
+            return None
         privileged_records = _task_reconcile_ready_privileged_rows(connection)
-        for record in privileged_records:
-            if not _is_terminal_state(str(record["state"])):
-                return
-            operator._require_operator_mutation(
-                "durable_job", task_id=str(record["task_id"])
-            )
-            observed = _observe(record)
-            if not _task_reconcile_ready_rootbroker_terminal_observed(record, observed):
-                return
+        if any(
+            not _is_terminal_state(str(record["state"]))
+            for record in privileged_records
+        ):
+            return None
         task_revision = _task_reconcile_revision_contract(connection)
         with resources._resource_readonly_snapshot() as resource_connection:
             if resource_connection.execute(
                 "SELECT 1 FROM task_terminalizations "
                 "WHERE phase='leases_revoked' LIMIT 1"
             ).fetchone() is not None:
-                return
+                return None
             resource_revision = resources._resource_reconcile_revision_contract(
                 resource_connection
             )
         if resource_revision is None:
-            return
-        material = {
-            "schema_version": 2,
+            return None
+        return {
             "task_revision": task_revision["revision"],
             "resource_revision": resource_revision["revision"],
-            "reconciled_at_unix": _now(),
-            "scope": TASK_RECONCILE_READY_SCOPE,
-            "privileged_task_count": len(privileged_records),
+            "privileged_records": privileged_records,
             "privileged_tasks_sha256": _task_reconcile_ready_privileged_digest(
                 privileged_records
             ),
         }
-        proof = {**material, "evidence_sha256": _sha256_json(material)}
-        connection.execute(
-            "INSERT INTO metadata(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY, _canonical_json(proof)),
+
+
+def _publish_task_reconcile_ready_evidence(
+    prepared: dict[str, Any] | None,
+) -> None:
+    """Observe without locks, then CAS-validate before persisting proof."""
+    if prepared is None:
+        return
+    records = prepared["privileged_records"]
+    # Rootbroker show may take 30s per unit. Hold neither a task SQLite
+    # connection nor the global task-mutation lock while probing it.
+    for record in records:
+        operator._require_operator_mutation(
+            "durable_job", task_id=str(record["task_id"])
         )
+        observed = _observe(record)
+        if not _task_reconcile_ready_rootbroker_terminal_observed(
+            record, observed
+        ):
+            return
+    # The complete cohort and both independent store revisions must remain
+    # unchanged from preparation THROUGH all external observations.
+    with _task_mutation_lock():
+        operator._require_operator_mutation("durable_job")
+        with _database_connection() as connection:
+            if connection.execute(
+                "SELECT 1 FROM tasks WHERE state IN "
+                "('launching','running','outcome_unknown','interrupted') LIMIT 1"
+            ).fetchone() is not None:
+                return
+            current_records = _task_reconcile_ready_privileged_rows(connection)
+            if (
+                len(current_records) != len(records)
+                or any(
+                    not _is_terminal_state(str(record["state"]))
+                    for record in current_records
+                )
+                or _task_reconcile_ready_privileged_digest(current_records)
+                != prepared["privileged_tasks_sha256"]
+            ):
+                return
+            task_revision = _task_reconcile_revision_contract(connection)
+            if task_revision["revision"] != prepared["task_revision"]:
+                return
+            with resources._resource_readonly_snapshot() as resource_connection:
+                if resource_connection.execute(
+                    "SELECT 1 FROM task_terminalizations "
+                    "WHERE phase='leases_revoked' LIMIT 1"
+                ).fetchone() is not None:
+                    return
+                resource_revision = resources._resource_reconcile_revision_contract(
+                    resource_connection
+                )
+                if (
+                    resource_revision is None
+                    or resource_revision["revision"] != prepared["resource_revision"]
+                ):
+                    return
+                material = {
+                    "schema_version": 3,
+                    "task_revision": task_revision["revision"],
+                    "resource_revision": resource_revision["revision"],
+                    "reconciled_at_unix": _now(),
+                    "scope": TASK_RECONCILE_READY_SCOPE,
+                    "privileged_task_count": len(current_records),
+                    "privileged_tasks_sha256": prepared["privileged_tasks_sha256"],
+                }
+                proof = {**material, "evidence_sha256": _sha256_json(material)}
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY, _canonical_json(proof)),
+                )
 
 
 def _task_reconcile_ready_evidence_snapshot(
@@ -11706,7 +11896,7 @@ def _task_reconcile_ready_evidence_snapshot(
         now = _now()
         if (
             type(proof["schema_version"]) is not int
-            or proof["schema_version"] != 2
+            or proof["schema_version"] != 3
             or proof["scope"] != TASK_RECONCILE_READY_SCOPE
             or type(proof["privileged_task_count"]) is not int
             or proof["privileged_task_count"] < 0
@@ -12603,11 +12793,15 @@ def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
             }
         )
         try:
-            _publish_task_reconcile_ready_evidence(result)
+            prepared = _prepare_task_reconcile_ready_evidence(result)
         except Exception:
-            # A successful authorized refresh remains valid if supplementary
-            # readiness publication is unavailable. Readiness stays unproven.
-            pass
+            # A successful refresh remains valid when readiness proof fails.
+            prepared = None
+    # No external Rootbroker observation while holding the mutation lock.
+    try:
+        _publish_task_reconcile_ready_evidence(prepared)
+    except Exception:
+        pass
     return _attach_task_output_cleanup(result)
 
 
@@ -12678,6 +12872,7 @@ async def _grabowski_task_reconcile_resume_tool(
 
 
 def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
+    prepared = None
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
         _clear_task_reconcile_ready_evidence(preserve_cycle=not auto_resume)
@@ -12694,9 +12889,14 @@ def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
         )
         if not auto_resume:
             try:
-                _publish_task_reconcile_ready_evidence(refresh)
+                prepared = _prepare_task_reconcile_ready_evidence(refresh)
             except Exception:
                 pass
+    # Never hold the global task lock across privileged Systemd show.
+    try:
+        _publish_task_reconcile_ready_evidence(prepared)
+    except Exception:
+        pass
     cleanup = _attach_task_output_cleanup(refresh)
     if "task_output_cleanup" in cleanup:
         result["task_output_cleanup"] = cleanup["task_output_cleanup"]

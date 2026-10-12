@@ -5817,6 +5817,384 @@ class TaskTests(unittest.TestCase):
             )
         )
 
+    def test_reconcile_ready_rejects_previous_complete_phase_restarted_before_other_phases_finish(self) -> None:
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+
+        def phase(before: object, after: object, complete: bool) -> dict:
+            return {"cursor_before": before, "cursor_after": after,
+                    "cycle_completed": complete}
+
+        first = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                **phase(None, None, True),
+                "active_refresh": phase(None, "active-1", False),
+                "terminalization_recovery": {
+                    **phase(None, "terminal-1", False), "failed": [],
+                },
+            },
+        }
+        restarted = {
+            **first, "batch": {
+                **phase(None, "task-new-1", False),
+                "active_refresh": phase("active-1", None, True),
+                "terminalization_recovery": {
+                    **phase("terminal-1", None, True), "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked",
+                         side_effect=[first, restarted]),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as reader:
+            self.assertNotEqual(
+                "verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+            )
+
+        # Previously-completed phases may remain idle while others finish.
+        idle = {**restarted, "batch": {
+            **phase(None, None, True),
+            "active_refresh": phase("active-1", None, True),
+            "terminalization_recovery": {
+                **phase("terminal-1", None, True), "failed": [],
+            },
+        }}
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked",
+                         side_effect=[first, idle]),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as reader:
+            self.assertEqual(
+                "verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+            )
+
+    def test_reconcile_ready_rejects_privileged_archive_history_scan_overflow(self) -> None:
+        with tasks._database_connection():
+            pass
+        current_task_id = self._start()["task"]["task_id"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed',execution_backend='systemd-root-broker',"
+                "systemd_scope='system' WHERE task_id=?", (current_task_id,),
+            )
+            row = dict(connection.execute(
+                "SELECT * FROM tasks WHERE task_id=?", (current_task_id,),
+            ).fetchone())
+            cols = list(row)
+            bindings = {}
+            for n in range(5):
+                old = {**row, "task_id": f"old-root-{n:02d}",
+                       "unit": f"old-root-{n:02d}.service",
+                       "authoritative_unit": f"old-root-{n:02d}.service"}
+                connection.execute(
+                    "INSERT INTO tasks (" + ",".join(cols) + ") VALUES (" +
+                    ",".join("?" for _ in cols) + ")", [old[c] for c in cols],
+                )
+                bindings[old["task_id"]] = {
+                    "record_sha256": tasks.lifecycle_projection.lifecycle.sha256_json(
+                        tasks._task_archive_record(old)
+                    ),
+                    "segment_id": "test-archive",
+                    "switch_sha256": "a" * 64,
+                }
+        with (
+            patch.object(tasks, "TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT", 1),
+            patch.object(tasks, "TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT", 3,
+                         create=True),
+            patch.object(tasks, "_task_current_projection", return_value={
+                "schema_version": 1, "archived_task_bindings": bindings,
+                "projection_sha256": "b" * 64,
+            }),
+            tasks._task_readonly_snapshot() as connection,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "budget"):
+                tasks._task_reconcile_ready_privileged_rows(connection)
+
+    def test_reconcile_ready_terminal_rootbroker_never_probes_under_locked_publication(self) -> None:
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        task_id = self._start()["task"]["task_id"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed',execution_backend='systemd-root-broker',"
+                "systemd_scope='system' WHERE task_id=?", (task_id,),
+            )
+        result = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        actual_lock = tasks._task_mutation_lock
+        lock_depth = 0
+
+        @contextmanager
+        def monitored_lock():
+            nonlocal lock_depth
+            with actual_lock():
+                lock_depth += 1
+                try:
+                    yield
+                finally:
+                    lock_depth -= 1
+
+        def assert_unlocked_probe(record: dict) -> dict:
+            self.assertEqual(0, lock_depth, "Rootbroker probe held task mutation lock")
+            # A separate immediate writer must be admitted while the slow
+            # Rootbroker observation is in flight (no task SQLite tx held).
+            with closing(sqlite3.connect(self.database, timeout=0.0)) as writer:
+                writer.execute("BEGIN IMMEDIATE")
+                writer.rollback()
+            unit = tasks._authoritative_unit(record)
+            return {
+                "state": "completed",
+                "observer": {"kind": "root-systemd-broker-show-v1"},
+                "probe": {"returncode": 0, "outcome_unknown": False},
+                "observed_at_unix": tasks._now(),
+                "properties": {
+                    "LoadState": "loaded", "ActiveState": "inactive",
+                    "SubState": "dead", "Result": "success",
+                    "ExecMainStatus": "0", "Id": unit, "Names": unit,
+                    "InvocationID": "a" * 32,
+                },
+            }
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_task_mutation_lock", monitored_lock),
+            patch.object(tasks, "_observe", side_effect=assert_unlocked_probe)
+            as privileged_probe,
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        privileged_probe.assert_called_once()
+        with tasks._task_readonly_snapshot() as reader:
+            self.assertEqual(
+                "privileged_live_unverified",
+                tasks._task_reconcile_ready_evidence_snapshot(reader)["status"],
+            )
+
+    def test_reconcile_ready_rejects_privileged_probe_identity_change_before_publish(self) -> None:
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        task_id = self._start()["task"]["task_id"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed',execution_backend='systemd-root-broker',"
+                "systemd_scope='system' WHERE task_id=?", (task_id,),
+            )
+        result = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+
+        def race_between_probe_and_insert(record: dict) -> dict:
+            # Change the authoritative unit WITHOUT changing a candidate-state
+            # revision; a weak cohort digest cannot detect this TOCTOU race.
+            with tasks._database_connection() as connection:
+                connection.execute(
+                    "UPDATE tasks SET authoritative_unit=? WHERE task_id=?",
+                    ("rebound-other.service", task_id),
+                )
+            unit = tasks._authoritative_unit(record)
+            return {
+                "state": "completed",
+                "observer": {"kind": "root-systemd-broker-show-v1"},
+                "probe": {"returncode": 0, "outcome_unknown": False},
+                "observed_at_unix": tasks._now(),
+                "properties": {
+                    "LoadState": "loaded", "ActiveState": "inactive",
+                    "SubState": "dead", "Result": "success",
+                    "ExecMainStatus": "0", "Id": unit, "Names": unit,
+                    "InvocationID": "a" * 32,
+                },
+            }
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_observe", side_effect=race_between_probe_and_insert)
+            as privileged_probe,
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        privileged_probe.assert_called_once()
+        with tasks._task_readonly_snapshot() as reader:
+            self.assertEqual(
+                "missing", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+            )
+
+    def test_reconcile_ready_index_requires_authorized_writer_and_query_uses_it(self) -> None:
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        with tasks._task_readonly_snapshot() as reader:
+            self.assertFalse(tasks._task_reconcile_ready_index_present(reader))
+            self.assertEqual([], tasks._task_reconcile_ready_privileged_rows(reader))
+            self.assertFalse(tasks._task_reconcile_ready_index_present(reader))
+        result = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        admissions = []
+
+        def deny_second_admission(operation: str, **kwargs: object) -> None:
+            admissions.append(operation)
+            if len(admissions) == 2:
+                raise PermissionError("index needs explicit mutation admission")
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation",
+                         side_effect=deny_second_admission),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as reader:
+            self.assertFalse(tasks._task_reconcile_ready_index_present(reader))
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as reader:
+            self.assertTrue(tasks._task_reconcile_ready_index_present(reader))
+            plan = reader.execute(
+                "EXPLAIN QUERY PLAN SELECT * FROM tasks "
+                "INDEXED BY tasks_reconcile_ready_privileged_idx "
+                "WHERE execution_backend='systemd-root-broker' "
+                "OR systemd_scope='system' ORDER BY task_id LIMIT ?", (33,),
+            ).fetchall()
+            self.assertTrue(any(
+                tasks.TASK_RECONCILE_READY_PRIVILEGED_INDEX_NAME in str(row[3])
+                for row in plan
+            ), plan)
+            self.assertEqual("verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+
+    def test_reconcile_ready_rejects_spoofed_privileged_index(self) -> None:
+        with tasks._database_connection() as writer:
+            writer.execute(
+                "CREATE INDEX tasks_reconcile_ready_privileged_idx ON tasks(state)"
+            )
+        with tasks._task_readonly_snapshot() as reader:
+            with self.assertRaisesRegex(RuntimeError, "index contract"):
+                tasks._task_reconcile_ready_privileged_rows(reader)
+
+    def test_reconcile_ready_legacy_sql_scan_has_instruction_budget(self) -> None:
+        with tasks._database_connection():
+            pass
+        task_id = self._start()["task"]["task_id"]
+        with tasks._database_connection() as writer:
+            base = dict(writer.execute(
+                "SELECT * FROM tasks WHERE task_id=?", (task_id,),
+            ).fetchone())
+            columns = list(base)
+            insert = ("INSERT INTO tasks (" + ",".join(columns) + ") VALUES ("
+                      + ",".join("?" for _ in columns) + ")")
+            for index in range(800):
+                old = {**base, "task_id": f"{index + 1:024x}",
+                       "state": "completed", "execution_backend": "systemd-user",
+                       "systemd_scope": "user"}
+                writer.execute(insert, [old[column] for column in columns])
+        with (
+            patch.object(tasks, "TASK_RECONCILE_READY_SQL_VM_CALLBACK_LIMIT", 1),
+            tasks._task_readonly_snapshot() as reader,
+        ):
+            self.assertFalse(tasks._task_reconcile_ready_index_present(reader))
+            with self.assertRaisesRegex(RuntimeError, "SQLite work budget"):
+                tasks._task_reconcile_ready_privileged_rows(reader)
+            self.assertEqual(801, reader.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+
+    def test_reconcile_ready_resource_revision_drift_during_rootbroker_probe_blocks_publication(self) -> None:
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        task_id = self._start()["task"]["task_id"]
+        with tasks._database_connection() as writer:
+            writer.execute(
+                "UPDATE tasks SET state='completed',execution_backend='systemd-root-broker',"
+                "systemd_scope='system' WHERE task_id=?", (task_id,),
+            )
+        result = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        def probe_and_mutate_resources(record: dict) -> dict:
+            with closing(tasks.resources._database()) as writer, writer:
+                writer.execute(
+                    "UPDATE metadata SET value=lower(hex(randomblob(32))) WHERE key=?",
+                    (tasks.resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+                )
+            unit = tasks._authoritative_unit(record)
+            return {
+                "state": "completed",
+                "observer": {"kind": "root-systemd-broker-show-v1"},
+                "probe": {"returncode": 0, "outcome_unknown": False},
+                "observed_at_unix": tasks._now(),
+                "properties": {
+                    "LoadState": "loaded", "ActiveState": "inactive",
+                    "SubState": "dead", "Result": "success", "ExecMainStatus": "0",
+                    "Id": unit, "Names": unit, "InvocationID": "a" * 32,
+                },
+            }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=result),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_observe", side_effect=probe_and_mutate_resources) as observe,
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        observe.assert_called_once()
+        with tasks._task_readonly_snapshot() as reader:
+            self.assertEqual("missing", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+
     def test_reconcile_ready_multipage_requires_all_three_complete_error_free_cycles(self) -> None:
         with tasks._database_connection():
             pass
@@ -5963,6 +6341,25 @@ class TaskTests(unittest.TestCase):
             with tasks._database_connection() as connection:
                 connection.execute(
                     "UPDATE tasks SET state='failed' WHERE task_id='archived-task-000'"
+                )
+            with tasks._task_readonly_snapshot() as connection:
+                with self.assertRaises(tasks.lifecycle_projection.LifecycleProjectionIntegrityError):
+                    tasks._task_reconcile_ready_privileged_rows(connection)
+            # A record that drops both privileged predicates disappears from
+            # the SQL result. Its archive binding still must be checked.
+            with tasks._database_connection() as connection:
+                connection.execute(
+                    "UPDATE tasks SET state='completed',execution_backend='systemd-user',"
+                    "systemd_scope='user' WHERE task_id='archived-task-000'"
+                )
+            with tasks._task_readonly_snapshot() as connection:
+                with self.assertRaises(tasks.lifecycle_projection.LifecycleProjectionIntegrityError):
+                    tasks._task_reconcile_ready_privileged_rows(connection)
+            # Missing archived rows also invalidate the verified archive
+            # projection, even though the privileged SQL scan cannot see them.
+            with tasks._database_connection() as connection:
+                connection.execute(
+                    "DELETE FROM tasks WHERE task_id='archived-task-000'"
                 )
             with tasks._task_readonly_snapshot() as connection:
                 with self.assertRaises(tasks.lifecycle_projection.LifecycleProjectionIntegrityError):

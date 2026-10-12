@@ -6564,6 +6564,16 @@ def _operator_system_overview(
         # An authorized reconciliation cannot certify quiescence while
         # tasks remain active. Do not recommend an impossible retry loop.
         next_action = "wait for active tasks to terminalize, then run authorized reconciliation"
+    elif reconciliation_evidence.get("status") == "privileged_live_unverified":
+        # READ_ONLY cannot certify a live rootbroker unit from a persisted
+        # terminal observation. Repeating reconciliation alone cannot make
+        # the cached proof current. Verified terminal tasks require an
+        # authorized archival closeout before this cohort can be quiescent.
+        next_action = (
+            "inspect current privileged tasks with authorized live observation; "
+            "archive independently verified terminal tasks through the "
+            "authorized task-closeout-archive workflow"
+        )
     elif reconciliation_evidence.get("status") != "verified":
         next_action = "reconcile live task outcomes through an authorized mutation-capable path"
     elif obligations.get("integrity_error_count"):
