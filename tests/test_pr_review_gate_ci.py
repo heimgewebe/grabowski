@@ -362,6 +362,192 @@ class ReviewEvidenceCiWorkflowContractTests(unittest.TestCase):
         self.assertIn("MEMBER", text)
         self.assertIn("COLLABORATOR", text)
         self.assertNotIn("secrets.", text)
+        self.assertIn("fetch-depth: 0", text)
+        self.assertIn("persist-credentials: false", text)
+        self.assertIn("ref: ${{ github.event.repository.default_branch }}", text)
+        self.assertNotIn("ref: ${{ github.event.pull_request.head.sha }}", text)
+
+
+
+class ReviewEvidenceOversizedDiffTests(unittest.TestCase):
+    @staticmethod
+    def _git(repo, *argv):
+        import subprocess
+        return subprocess.run(["git", *argv], cwd=repo, check=True,
+                              capture_output=True).stdout.strip().decode("ascii")
+
+    def _real_pr(self, root):
+        repo = Path(root)
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.email", "fixture@example.invalid")
+        self._git(repo, "config", "user.name", "Fixture")
+        (repo / "note.txt").write_text("before\n", encoding="utf-8")
+        self._git(repo, "add", "note.txt")
+        self._git(repo, "commit", "-qm", "base")
+        base = self._git(repo, "rev-parse", "HEAD")
+        (repo / "note.txt").write_text("after\n", encoding="utf-8")
+        self._git(repo, "add", "note.txt")
+        self._git(repo, "commit", "-qm", "head")
+        head = self._git(repo, "rev-parse", "HEAD")
+        return base, head
+
+    def _known_406(self):
+        return ci.CiEvidenceError(
+            "command failed: gh pr diff: HTTP 406: Sorry, "
+            "the diff exceeded the maximum number of lines (20000)"
+        )
+
+    def test_known_406_uses_exact_git_commit_diff(self):
+        import os
+        import tempfile
+        import subprocess
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            base, head = self._real_pr(tmp)
+            expected_raw = subprocess.run(
+                ["git", "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                 "--ignore-submodules=none", "--no-color", base, head, "--"],
+                cwd=tmp, check=True, capture_output=True,
+            ).stdout
+            initial = {"state": "OPEN", "headRefOid": head, "baseRefOid": base,
+                       "changedFiles": 1}
+            prior = Path.cwd()
+            try:
+                os.chdir(tmp)
+                with mock.patch.object(ci, "_run_bytes", side_effect=self._known_406()), \
+                     mock.patch.object(ci, "load_live_pr", return_value=initial), \
+                     mock.patch.object(gate, "_load_pull_file_evidence",
+                                       return_value=[{"path": "note.txt", "status": "modified"}]):
+                    hashes = ci.current_diff_sha256s("heimgewebe/grabowski", 42)
+            finally:
+                os.chdir(prior)
+            expected = tuple(dict.fromkeys((
+                gate.github_pr_diff_identity_sha256(expected_raw),
+                gate.github_pr_diff_identity_sha256_v1(expected_raw),
+            )))
+            self.assertEqual(hashes, expected)
+
+    def test_empty_successful_provider_diff_is_not_authoritative(self):
+        from unittest import mock
+        with mock.patch.object(ci, "_run_bytes", return_value=b""):
+            with self.assertRaisesRegex(ci.CiEvidenceError, "empty"):
+                ci.current_diff_sha256s("heimgewebe/grabowski", 42)
+
+    def test_other_provider_failures_never_trigger_fallback(self):
+        from unittest import mock
+        messages = ("HTTP 401: invalid credentials", "HTTP 403: forbidden",
+                    "HTTP 429: rate limited", "HTTP 406: arbitrary response",
+                    "HTTP 406: only a partial diff was returned")
+        for message in messages:
+            with self.subTest(message=message), \
+                 mock.patch.object(ci, "_run_bytes",
+                                   side_effect=ci.CiEvidenceError(message)), \
+                 mock.patch.object(ci, "load_live_pr") as pr:
+                with self.assertRaises(ci.CiEvidenceError):
+                    ci.current_diff_sha256s("heimgewebe/grabowski", 42)
+                pr.assert_not_called()
+
+    def test_file_limit_marker_requires_actual_file_count_over_cap(self):
+        from unittest import mock
+        with mock.patch.object(
+            ci, "_run_bytes",
+            side_effect=ci.CiEvidenceError("HTTP 406: PullRequest.diff too_large"),
+        ), mock.patch.object(
+            ci, "load_live_pr", return_value={"changedFiles": 100}
+        ), mock.patch.object(ci, "_bound_oversized_diff") as fallback:
+            with self.assertRaises(ci.CiEvidenceError):
+                ci.current_diff_sha256s("heimgewebe/grabowski", 42)
+            fallback.assert_not_called()
+
+    def test_fetch_requires_token_and_validated_ref(self):
+        from unittest import mock
+        repo = Path("/tmp/no-repo-effects")
+        with mock.patch.object(ci, "_trusted_revision_git", return_value=b""), \
+             mock.patch.dict(ci.os.environ, {"GH_TOKEN": ""}):
+            with self.assertRaisesRegex(ci.CiEvidenceError, "token"):
+                ci._fetch_exact_review_objects(
+                    repo, "heimgewebe/grabowski", 42,
+                    base="a" * 40, head="b" * 40, base_ref="main",
+                )
+        with mock.patch.dict(ci.os.environ, {"GH_TOKEN": "dummy"}):
+            with self.assertRaisesRegex(ci.CiEvidenceError, "untrusted"):
+                ci._fetch_exact_review_objects(
+                    repo, "heimgewebe/../evil", 42,
+                    base="a" * 40, head="b" * 40, base_ref="main",
+                )
+
+    def test_fetch_binds_head_and_does_not_expose_token_in_argv(self):
+        from unittest import mock
+        repo = Path("/tmp/no-repo-effects")
+        expected_head = "b" * 40
+        with mock.patch.dict(ci.os.environ, {"GH_TOKEN": "dummy-secret"}), \
+             mock.patch.object(ci, "_trusted_revision_git",
+                               side_effect=[b"", expected_head.encode(), b""]) as git, \
+             mock.patch.object(ci, "_bounded_git_capture", return_value=b"") as fetch:
+            ci._fetch_exact_review_objects(
+                repo, "heimgewebe/grabowski", 42,
+                base="a" * 40, head=expected_head, base_ref="main",
+            )
+        self.assertIn("refs/heads/main:refs/review-evidence/base", fetch.call_args.args[0])
+        self.assertIn("refs/pull/42/head:refs/review-evidence/head", fetch.call_args.args[0])
+        self.assertIn("--no-write-fetch-head", fetch.call_args.args[0])
+        self.assertNotIn("dummy-secret", " ".join(fetch.call_args.args[0]))
+        self.assertEqual(fetch.call_args.kwargs["env"]["GH_TOKEN"], "dummy-secret")
+        self.assertEqual(git.call_count, 3)
+
+    def test_fetch_rejects_mismatching_pinned_head(self):
+        from unittest import mock
+        with mock.patch.dict(ci.os.environ, {"GH_TOKEN": "dummy"}), \
+             mock.patch.object(ci, "_trusted_revision_git",
+                               side_effect=[b"", b"f" * 40]), \
+             mock.patch.object(ci, "_bounded_git_capture", return_value=b""):
+            with self.assertRaisesRegex(ci.CiEvidenceError, "pinned head"):
+                ci._fetch_exact_review_objects(
+                    Path("/tmp/no-repo-effects"), "heimgewebe/grabowski", 42,
+                    base="a" * 40, head="b" * 40, base_ref="main",
+                )
+
+    def test_known_406_rejects_unmatched_rest_path(self):
+        import os
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            base, head = self._real_pr(tmp)
+            state = {"state": "OPEN", "headRefOid": head,
+                     "baseRefOid": base, "changedFiles": 1}
+            previous = Path.cwd()
+            try:
+                os.chdir(tmp)
+                with mock.patch.object(ci, "_run_bytes", side_effect=self._known_406()), \
+                     mock.patch.object(ci, "load_live_pr", return_value=state), \
+                     mock.patch.object(gate, "_load_pull_file_evidence",
+                                       return_value=[{"path": "wrong.txt", "status": "modified"}]):
+                    with self.assertRaises(ci.CiEvidenceError):
+                        ci.current_diff_sha256s("heimgewebe/grabowski", 42)
+            finally:
+                os.chdir(previous)
+
+    def test_known_406_rejects_head_drift_during_local_readback(self):
+        import os
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            base, head = self._real_pr(tmp)
+            state = {"state": "OPEN", "headRefOid": head,
+                     "baseRefOid": base, "changedFiles": 1}
+            newer = dict(state, headRefOid="f" * 40)
+            previous = Path.cwd()
+            try:
+                os.chdir(tmp)
+                with mock.patch.object(ci, "_run_bytes", side_effect=self._known_406()), \
+                     mock.patch.object(ci, "load_live_pr", side_effect=[state, newer]), \
+                     mock.patch.object(gate, "_load_pull_file_evidence",
+                                       return_value=[{"path": "note.txt", "status": "modified"}]):
+                    with self.assertRaises(ci.CiEvidenceError):
+                        ci.current_diff_sha256s("heimgewebe/grabowski", 42)
+            finally:
+                os.chdir(previous)
+
 
 
 if __name__ == "__main__":
