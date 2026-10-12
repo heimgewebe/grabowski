@@ -198,8 +198,9 @@ def bound_local_pr_git_diff(
     if (
         not isinstance(merge_base, str)
         or not isinstance(head, str)
-        or re.fullmatch(r"[0-9a-f]{40}", merge_base) is None
-        or re.fullmatch(r"[0-9a-f]{40}", head) is None
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", merge_base) is None
+        or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head) is None
+        or len(merge_base) != len(head)
         or max_diff_bytes <= 0 or max_diff_bytes > LOCAL_PR_DIFF_MAX_BYTES
     ):
         raise BoundLocalDiffError("invalid local PR revision or byte budget")
@@ -275,8 +276,12 @@ def bound_local_pr_git_diff(
         snapshot = scratch / "snapshot.git"
         empty_template = scratch / "empty-template"
         empty_template.mkdir()
+        object_format = "sha256" if len(head) == 64 else "sha1"
         _bounded_git_capture(
-            ["git", "init", "-q", "--bare", f"--template={empty_template}", str(snapshot)],
+            [
+                "git", "init", "-q", "--bare", f"--object-format={object_format}",
+                f"--template={empty_template}", str(snapshot),
+            ],
             cwd=str(scratch), env=env, timeout=remaining_timeout(), stdout_limit=8192,
         )
         object_dir = (common / "objects").resolve(strict=True)

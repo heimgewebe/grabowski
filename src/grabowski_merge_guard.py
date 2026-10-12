@@ -1566,11 +1566,12 @@ def _merge_guard_unique_merge_base(
     if result["returncode"] != 0:
         return None, ["merge_guard_local_merge_base_failed"]
     values = result["stdout_bytes"].splitlines()
-    if len(values) != 1 or _SHA40_RE.fullmatch(
-        values[0].decode("ascii", errors="replace")
-    ) is None:
+    if len(values) != 1:
         return None, ["merge_guard_local_merge_base_missing_or_ambiguous"]
-    return values[0].decode("ascii"), []
+    merge_base = values[0].decode("ascii", errors="replace")
+    if not _same_git_oid_format(base_sha, head_sha, merge_base):
+        return None, ["merge_guard_local_merge_base_missing_or_ambiguous"]
+    return merge_base, []
 
 
 def _merge_guard_local_changed_paths(
