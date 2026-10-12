@@ -1701,6 +1701,91 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertEqual(result["decision"], "blocked")
         self.assertIn("reconciliation-unobservable", result["blocker_codes"])
 
+    def test_default_reconciliation_single_db_and_git_view_for_many_bindings(self) -> None:
+        import hashlib
+        from unittest import mock
+        import grabowski_checkouts as checkouts
+        import grabowski_checkout_binding_reconciler as reconciler
+
+        rows = [
+            {
+                "checkout_key": f"{index:064x}",
+                "repo_common_dir": str(self.repo / ".git"),
+                "repo_path": str(self.repo),
+                "checkout_path": str(self.repo.parent / "worktrees" / f"child-{index}"),
+                "expected_branch": f"work-{index}",
+                "expected_head": "a" * 40,
+                "owner_id": "operator:test",
+                "phase": "active",
+                "source": {"kind": "bureau_task", "id": f"T{index}"},
+                "retention": None,
+                "latest_archive": None,
+            }
+            for index in range(225)
+        ]
+        material = {"database_schema_version": "1", "bindings": rows, "retentions": []}
+        database = {
+            **material,
+            "read_only": True,
+            "snapshot_sha256": hashlib.sha256(
+                reconciler.consumer_surface.canonical_json_bytes(material)
+            ).hexdigest(),
+        }
+        git = {
+            "worktrees": [],
+            "observable_repo_paths": [str(self.repo)],
+            "observations": [{"requested_repo_path": str(self.repo)}],
+            "errors": [],
+            "errors_truncated": False,
+        }
+        database_path = Path(self.temporary.name) / "checkouts.sqlite3"
+        database_path.touch()
+        with (
+            mock.patch.object(checkouts, "CHECKOUT_DB", database_path),
+            mock.patch.object(
+                reconciler, "collect_lifecycle_bindings_from_db",
+                return_value=database,
+            ) as capture,
+            mock.patch.object(
+                reconciler, "collect_git_worktrees_for_repos",
+                return_value=git,
+            ) as observe,
+        ):
+            result = admission._default_reconciliation(str(self.repo))
+        self.assertEqual(capture.call_count, 1, "never copy WAL per page")
+        self.assertEqual(observe.call_count, 1, "never re-observe Git per page")
+        self.assertEqual(len(result["bindings"]), 225)
+        self.assertEqual(result["count"], 225)
+        self.assertEqual(result["pagination"]["complete"], True)
+        self.assertEqual(result["pagination"]["has_more"], False)
+        self.assertTrue(result["snapshot_sha256"])
+
+    def test_single_snapshot_wal_drift_remains_fail_closed(self) -> None:
+        from unittest import mock
+        import grabowski_checkouts as checkouts
+        import grabowski_checkout_binding_reconciler as reconciler
+
+        path = Path(self.temporary.name) / "checkouts.sqlite3"
+        path.touch()
+        with (
+            mock.patch.object(checkouts, "CHECKOUT_DB", path),
+            mock.patch.object(
+                reconciler, "collect_lifecycle_bindings_from_db",
+                side_effect=reconciler.CheckoutBindingDatabaseError(
+                    "checkout database changed during reconciliation snapshot"
+                ),
+            ) as capture,
+            mock.patch.object(
+                reconciler, "collect_git_worktrees_for_repos",
+            ) as observe,
+        ):
+            with self.assertRaisesRegex(
+                reconciler.CheckoutBindingDatabaseError, "changed",
+            ):
+                admission._default_reconciliation(str(self.repo))
+        capture.assert_called_once()
+        observe.assert_not_called()
+
     def test_snapshot_bound_reconciliation_pagination_is_consumed_completely(
         self,
     ) -> None:

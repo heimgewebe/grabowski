@@ -87,6 +87,26 @@ _PRE_RESULT_INFRASTRUCTURE_STATUSES = frozenset(
     {"failed", "timed_out", "signalled", "terminated_unclear"}
 )
 _VERDICTS = frozenset({"PASS_THIS_REVISION", "REJECT_THIS_REVISION"})
+# Only the observed human-readable no-inference quota response is an
+# infrastructure error. Unknown message shapes are ambiguous, never review PASS.
+_CLAUDE_QUOTA_RESULT_RE = re.compile(
+    r"You've hit your weekly limit"
+    r"(?: · resets (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(?:[1-9]|[12][0-9]|3[01]), "
+    r"(?:[1-9]|1[0-2])(?::[0-5][0-9])?(?:am|pm) \(UTC\))?\Z"
+)
+# New provider fields must be understood before claiming zero semantic output.
+_CLAUDE_QUOTA_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\Z"
+)
+_CLAUDE_QUOTA_ENVELOPE_FIELDS = frozenset({
+    "type", "is_error", "terminal_reason", "api_error_status", "duration_api_ms",
+    "modelUsage", "structured_output", "result", "usage", "subagent_stats",
+    "permission_denials", "total_cost_usd", "duration_ms", "num_turns",
+    "stop_reason", "session_id", "fast_mode_state",
+    "fast_mode_disabled_reason", "subtype", "uuid", "queued_turn_count",
+    "result_index",
+})
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -1006,6 +1026,187 @@ def _normalize_review_role_provenance(
     return value
 
 
+def _claude_no_external_activity(usage: Any, subagents: Any) -> bool:
+    """Require known zero-activity counters; reject unknown names even when zero."""
+    def strictly_zero(value: Any) -> bool:
+        return type(value) is int and value == 0
+    if not isinstance(usage, dict):
+        return False
+    # A newly introduced usage field is ambiguous until its semantics are known.
+    known_usage = {
+        "input_tokens", "output_tokens", "cache_creation_input_tokens",
+        "cache_read_input_tokens", "server_tool_use", "output_tokens_details",
+        "cache_creation", "service_tier", "inference_geo", "iterations",
+        "speed", "fallback_credit",
+    }
+    if set(usage) - known_usage:
+        return False
+    for section, required in (
+        ("output_tokens_details", {"thinking_tokens"}),
+        ("cache_creation", {"ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"}),
+    ):
+        fields = usage.get(section)
+        if (
+            not isinstance(fields, dict)
+            or set(fields) != required
+            or any(not strictly_zero(value) for value in fields.values())
+        ):
+            return False
+    if (
+        usage.get("service_tier") != "standard"
+        or usage.get("speed") != "standard"
+        or usage.get("inference_geo") != ""
+        or usage.get("fallback_credit") is not None
+    ):
+        return False
+    tools = usage.get("server_tool_use")
+    if (
+        not isinstance(tools, dict)
+        or set(tools) != {"web_search_requests", "web_fetch_requests"}
+        or any(not strictly_zero(value) for value in tools.values())
+    ):
+        return False
+    scalar = {
+        "spawned", "started_in_background", "max_depth",
+        "spawned_by_subagents", "completed", "failed",
+    }
+    groups = {
+        "requested": {"background", "foreground", "unset"},
+        "refused": {"depth_limit", "concurrency_limit", "budget"},
+        "killed": {"parent", "user", "system"},
+    }
+    if (
+        not isinstance(subagents, dict)
+        or any(not strictly_zero(subagents.get(field)) for field in scalar)
+    ):
+        return False
+    for name, required in groups.items():
+        counters = subagents.get(name)
+        if (
+            not isinstance(counters, dict)
+            or set(counters) != required
+            or any(not strictly_zero(value) for value in counters.values())
+        ):
+            return False
+    if "by_type" in subagents:
+        types = subagents["by_type"]
+        if types != {}:
+            return False
+    if set(subagents) - (scalar | set(groups) | {"by_type"}):
+        return False
+    return True
+
+
+def _proven_claude_quota_failure_before_review(
+    receipt: dict[str, Any], provenance: dict[str, Any]
+) -> bool:
+    """Accept only an exact, bound 429 transport envelope with zero model work.
+
+    This never grants a review PASS: a later independent PASS from the same
+    registered provider slot is still mandatory before settlement.
+    """
+    if (
+        provenance.get("schema_version") != 2
+        or provenance.get("review_route", {}).get("provider_family") != "anthropic"
+        or receipt.get("verdict") != "INVALID"
+        or receipt.get("findings") != []
+        or receipt.get("failure_classification") != "invalid_review_output"
+        or receipt.get("returncode") != 126
+        or receipt.get("review_document_bytes") != 0
+        or receipt.get("review_document_sha256") is not None
+        or receipt.get("review_findings_normalized") is not False
+        or receipt.get("stderr_bytes") != 0
+        or receipt.get("review_provider_contract") != "claude-headless-bound-diff-json-v1"
+    ):
+        return False
+    tail = receipt.get("stdout_tail")
+    if not isinstance(tail, str):
+        return False
+    encoded = tail.encode("utf-8")
+    if (
+        not encoded
+        or type(receipt.get("stdout_bytes")) is not int
+        or len(encoded) != receipt["stdout_bytes"]
+        or receipt.get("review_provider_envelope_bytes") != len(encoded)
+        or receipt.get("stdout_sha256") != hashlib.sha256(encoded).hexdigest()
+        or receipt.get("review_provider_envelope_sha256") != receipt["stdout_sha256"]
+    ):
+        return False
+    # object_pairs_hook rejects duplicates at every depth. json.loads otherwise
+    # silently takes the last value and can hide semantic REJECT material.
+    def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for name, item in pairs:
+            if name in value:
+                raise ValueError("duplicate Claude quota envelope JSON field")
+            value[name] = item
+        return value
+
+    try:
+        envelope = json.loads(tail, object_pairs_hook=unique_json_object)
+    except ValueError:
+        return False
+    if not isinstance(envelope, dict) or set(envelope) - _CLAUDE_QUOTA_ENVELOPE_FIELDS:
+        return False
+    # The actual 429 result has one CLI wrapper turn, not one model turn.
+    # An unexpected count, tool trace or provider state is not pre-result proof.
+    for zero_key in ("queued_turn_count", "result_index"):
+        if zero_key in envelope and (
+            type(envelope[zero_key]) is not int or envelope[zero_key] != 0
+        ):
+            return False
+    if "num_turns" in envelope and (
+        type(envelope["num_turns"]) is not int or envelope["num_turns"] != 1
+    ):
+        return False
+    if "duration_ms" in envelope and (
+        type(envelope["duration_ms"]) is not int or envelope["duration_ms"] < 0
+    ):
+        return False
+    for key, expected in (
+        ("stop_reason", "stop_sequence"), ("subtype", "success"),
+        ("fast_mode_state", "off"),
+        ("fast_mode_disabled_reason", "sdk_opt_in_required"),
+    ):
+        if key in envelope and envelope[key] != expected:
+            return False
+    for key in ("session_id", "uuid"):
+        if key in envelope and (
+            not isinstance(envelope[key], str)
+            or _CLAUDE_QUOTA_UUID_RE.fullmatch(envelope[key]) is None
+        ):
+            return False
+    usage = envelope.get("usage")
+    subagents = envelope.get("subagent_stats")
+    return (
+        envelope.get("type") == "result"
+        and envelope.get("is_error") is True
+        and envelope.get("terminal_reason") == "api_error"
+        and type(envelope.get("api_error_status")) is int
+        and envelope["api_error_status"] == 429
+        and type(envelope.get("duration_api_ms")) is int
+        and envelope["duration_api_ms"] == 0
+        and envelope.get("modelUsage") == {}
+        and envelope.get("structured_output") is None
+        and isinstance(envelope.get("result"), str)
+        and len(envelope["result"]) <= 256
+        and _CLAUDE_QUOTA_RESULT_RE.fullmatch(envelope["result"]) is not None
+        and isinstance(usage, dict) and usage.get("iterations") == []
+        and envelope.get("permission_denials") == []
+        and type(envelope.get("total_cost_usd")) in {int, float}
+        and envelope["total_cost_usd"] == 0
+        and isinstance(usage, dict)
+        and all(
+            type(usage.get(field)) is int and usage[field] == 0
+            for field in (
+                "input_tokens", "output_tokens",
+                "cache_creation_input_tokens", "cache_read_input_tokens",
+            )
+        )
+        and _claude_no_external_activity(usage, subagents)
+    )
+
+
 def _validated_review_role_evidence(
     metadata: dict[str, Any], binding: dict[str, Any], provenance: dict[str, Any] | None
 ) -> dict[str, Any] | None:
@@ -1065,6 +1266,10 @@ def _validated_review_role_evidence(
         "role_receipt_sha256": expected_receipt_sha256,
         "review_route": provenance["review_route"],
         "result": result,
+        "pre_result_quota_failure_verified": (
+            result is None
+            and _proven_claude_quota_failure_before_review(receipt, provenance)
+        ),
     }
 
 
@@ -1359,8 +1564,17 @@ def reconcile(
             # Preserve legacy handling for old immutable attempts, but never
             # supersede the new ambiguous evidence on a later PASS.
             if provenance is not None and provenance.get("schema_version") == 2:
-                attempt["classification"] = "invalid_result"
-                errors.append(f"decision_review_result_invalid:{directory.name}:InvalidReviewDocument")
+                if (
+                    role_evidence is not None
+                    and role_evidence.get("pre_result_quota_failure_verified") is True
+                    and attempt["terminal_status"] in _PRE_RESULT_INFRASTRUCTURE_STATUSES
+                    and attempt["terminal_status"] == "failed"
+                ):
+                    attempt["classification"] = "infrastructure_error"
+                    attempt["pre_result_quota_failure_verified"] = True
+                else:
+                    attempt["classification"] = "invalid_result"
+                    errors.append(f"decision_review_result_invalid:{directory.name}:InvalidReviewDocument")
             else:
                 attempt["classification"] = "infrastructure_error"
             attempts.append(attempt)
@@ -1398,9 +1612,19 @@ def reconcile(
         ]
         unsuperseded_infrastructure = []
         for infrastructure_attempt in infrastructure:
+            eligible_passes = passes
+            if infrastructure_attempt.get("pre_result_quota_failure_verified") is True:
+                # A legacy generic PASS cannot replace authenticated Claude
+                # quota evidence. The later PASS itself must be independent
+                # and from the same provider family, not merely an old PASS.
+                family = infrastructure_attempt.get("review_provider_family")
+                eligible_passes = [
+                    item for item in independent_passes
+                    if item.get("review_provider_family") == family
+                ]
             if not any(
                 _attempt_started_after(pass_attempt, infrastructure_attempt)
-                for pass_attempt in passes
+                for pass_attempt in eligible_passes
             ):
                 unsuperseded_infrastructure.append(infrastructure_attempt)
         if not passes and not rejects:
