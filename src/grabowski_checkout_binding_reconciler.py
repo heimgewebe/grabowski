@@ -608,16 +608,27 @@ def _binding_public(row: sqlite3.Row) -> dict[str, Any]:
 
 def collect_lifecycle_bindings_from_db(
     db_path: Path | str | None = None,
+    *,
+    _native_wal_snapshot: bool = False,
 ) -> dict[str, Any]:
     """Read every durable lifecycle binding from one pinned read-only transaction."""
     path = _database_path(db_path)
+    if type(_native_wal_snapshot) is not bool:
+        raise ValueError("native WAL snapshot mode must be boolean")
+    wal_path = Path(str(path) + "-wal")
+    native = _native_wal_snapshot and (wal_path.exists() or wal_path.is_symlink())
+    inventory = (
+        sqlite_store.inventory_native_wal_readonly_sqlite
+        if native else sqlite_store.inventory_readonly_sqlite
+    )
+    read_options: dict[str, Any] = {
+        "error_type": CheckoutBindingDatabaseError,
+        "message": "checkout database changed during reconciliation snapshot",
+    }
+    if not native:
+        read_options["temporary_prefix"] = "grabowski-checkout-binding-snapshot."
     try:
-        with sqlite_store.inventory_readonly_sqlite(
-            path,
-            temporary_prefix="grabowski-checkout-binding-snapshot.",
-            error_type=CheckoutBindingDatabaseError,
-            message="checkout database changed during reconciliation snapshot",
-        ) as connection:
+        with inventory(path, **read_options) as connection:
             _validate_database(connection)
             try:
                 binding_rows = connection.execute(
@@ -698,9 +709,11 @@ def collect_lifecycle_bindings_from_db(
                 "retentions": retention_inventory,
                 "read_only": True,
                 "snapshot_mode": (
-                    "immutable-file"
-                    if not Path(str(path) + "-wal").exists()
-                    else "copied-database-and-wal"
+                    "native-ro-wal" if native else (
+                        "immutable-file"
+                        if not Path(str(path) + "-wal").exists()
+                        else "copied-database-and-wal"
+                    )
                 ),
             }
     except CheckoutBindingDatabaseError:
@@ -850,11 +863,12 @@ def reconcile_checkout_bindings(
     if _single_complete_snapshot and cursor is not None:
         raise CheckoutBindingCursorError("complete snapshot does not accept a cursor")
     filters = _normalize_filters(repository_filters)
-    database = (
-        collect_lifecycle_bindings_from_db(db_path)
-        if _database_snapshot is None
-        else _validated_database_snapshot(_database_snapshot)
-    )
+    if _database_snapshot is not None:
+        database = _validated_database_snapshot(_database_snapshot)
+    else:
+        database = collect_lifecycle_bindings_from_db(
+            db_path, _native_wal_snapshot=_single_complete_snapshot,
+        )
     bindings = list(database["bindings"])
     if filters is not None:
         allowed = set(filters)
