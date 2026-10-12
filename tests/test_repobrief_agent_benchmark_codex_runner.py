@@ -516,6 +516,10 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         output_alias_subdir: bool = False,
         outside_home_rw: bool = False,
         external_git_common_rw: bool = False,
+        output_alias_parent: bool = False,
+        outside_protected_alias_rw: bool = False,
+        outside_root_alias_rw: bool = False,
+        output_epoch_in_source: bool = False,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -532,8 +536,15 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             else:
                 (source / ".git").mkdir()
             (source / "src").mkdir()
-            epoch = home / ".local" / "state" / "grabowski" / "epoch"
-            epoch.mkdir(parents=True)
+            if output_alias_parent:
+                for name in ("state", "transcripts", "evidence", "reports"):
+                    (source / name).mkdir()
+            epoch = (
+                source
+                if output_epoch_in_source
+                else home / ".local" / "state" / "grabowski" / "epoch"
+            )
+            epoch.mkdir(parents=True, exist_ok=output_epoch_in_source)
             leaves = {
                 name: epoch / name
                 for name in ("state", "transcripts", "evidence", "reports")
@@ -573,14 +584,20 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 mount_line(Path("/"), "rw,relatime"),
                 mount_line(home, "ro,relatime"),
             ]
+            if output_alias_parent:
+                mounts.append(mount_line(epoch, "ro,relatime", mount_root=source))
             mounts.extend(
                 mount_line(
                     path,
                     "rw,relatime",
                     mount_root=(
-                        source / "src"
-                        if output_alias_subdir and path == leaves["state"]
-                        else path
+                        source / path.name
+                        if output_alias_parent
+                        else (
+                            source / "src"
+                            if output_alias_subdir and path == leaves["state"]
+                            else path
+                        )
                     ),
                 )
                 for path in leaves.values()
@@ -597,6 +614,16 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 mounts.append(mount_line(writable_child, "rw,relatime"))
             if external_git_common_rw:
                 mounts.append(mount_line(common / "objects", "rw,relatime"))
+            if outside_protected_alias_rw or outside_root_alias_rw:
+                alias = Path(tmp) / "writable-alias"
+                alias.mkdir()
+                mounts.append(
+                    mount_line(
+                        alias,
+                        "rw,relatime",
+                        mount_root=(Path("/") if outside_root_alias_rw else source),
+                    )
+                )
 
             def read_bytes(path: Path, *args, **kwargs):
                 if str(path) == "/proc/self/mountinfo":
@@ -692,6 +719,30 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             runner.RunnerError, "output mount root does not match writable target"
         ):
             self._probe(output_alias_subdir=True)
+
+    def test_readonly_epoch_parent_alias_to_source_blocks_output_mounts(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "epoch parent mount has unexpected backing root"
+        ):
+            self._probe(output_alias_parent=True)
+
+    def test_writable_source_alias_outside_home_blocks_admission(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "writable alias of protected input mount"
+        ):
+            self._probe(outside_protected_alias_rw=True)
+
+    def test_writable_filesystem_root_alias_outside_home_blocks_admission(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "writable alias of protected input mount"
+        ):
+            self._probe(outside_root_alias_rw=True)
+
+    def test_output_epoch_cannot_overlap_historical_source(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "output epoch overlaps protected input subtree"
+        ):
+            self._probe(output_epoch_in_source=True)
 
 
 class RepoBriefCodexRunnerTests(unittest.TestCase):

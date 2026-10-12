@@ -896,6 +896,32 @@ def validate_live_immutable_mounts(
         if not read_only:
             raise RunnerError(f"live Codex protected input mount writable: {label}")
 
+    # A writable epoch must be disjoint from historical inputs even before
+    # looking at mount roots: an output path resolving inside a source checkout
+    # could be given an exact RW leaf remount and evade samefile checks.
+    immutable_epoch_roots = {
+        target
+        for label, target in protected_targets.items()
+        if label
+        in {
+            "repository parent",
+            "source parent",
+            "source",
+            "Git metadata parent",
+            "Git metadata",
+            "Git common parent",
+            "Git common directory",
+            "request parent",
+            "request root",
+            "manifest parent",
+            "manifest",
+            "runner parent",
+            "runner source",
+        }
+    }
+    if any(epoch == root or root in epoch.parents for root in immutable_epoch_roots):
+        raise RunnerError("live Codex output epoch overlaps protected input subtree")
+
     # An RO directory can still hide an RW bind below it. Include protected
     # source and metadata directories even when they live outside HOME.
     protected_directories = {
@@ -952,6 +978,55 @@ def validate_live_immutable_mounts(
             )
         )
 
+    # The allowed writable leaves cannot be trusted if a read-only bind
+    # underneath HOME first redirects their epoch parent onto source data.
+    # Check every intermediate mount's underlying root against its closest
+    # ancestor, not merely each writable leaf against that (possibly aliased)
+    # intermediate mount.
+    for mount, mount_root, device, _writable in mounts:
+        if mount == home or home not in mount.parents:
+            continue
+        if mount != epoch and mount not in epoch.parents:
+            continue
+        ancestors = [
+            (parent, parent_root, parent_device)
+            for parent, parent_root, parent_device, _rw in mounts
+            if parent in mount.parents
+        ]
+        if not ancestors:
+            raise RunnerError("live Codex epoch parent mount has no safe ancestor")
+        parent, parent_root, parent_device = max(
+            ancestors, key=lambda item: len(item[0].parts)
+        )
+        if device != parent_device or mount_root != parent_root / mount.relative_to(
+            parent
+        ):
+            raise RunnerError(
+                "live Codex epoch parent mount has unexpected backing root"
+            )
+
+    # The mountpoint alone is not a source identity: a writable bind at
+    # /tmp/alias could expose immutable source inodes even while their original
+    # pathname remains read-only. Compare device + filesystem-relative mount
+    # roots for every protected input; ignore only the filesystem-wide root,
+    # whose ST_RDONLY flag was checked above, and the exact four outputs.
+    def backing_identity(target: Path) -> tuple[bytes, Path]:
+        ancestors = [
+            (mount, mount_root, device)
+            for mount, mount_root, device, _rw in mounts
+            if mount == target or mount in target.parents
+        ]
+        if not ancestors:
+            raise RunnerError("live Codex protected input mount backing is unavailable")
+        mount, mount_root, device = max(ancestors, key=lambda x: len(x[0].parts))
+        return device, mount_root / target.relative_to(mount)
+
+    protected_backings = [
+        backing_identity(target)
+        for label, target in protected_targets.items()
+        if label != "filesystem root"
+    ]
+
     allowed_outputs = set(outputs.values())
     observed_writable_outputs: set[Path] = set()
     for mount, mount_root, device, writable in mounts:
@@ -999,6 +1074,18 @@ def validate_live_immutable_mounts(
         ):
             raise RunnerError(
                 "live Codex has an unexpected writable protected input bind mount"
+            )
+        if mount != Path("/") and any(
+            device == protected_device
+            and (
+                mount_root == protected_root
+                or protected_root in mount_root.parents
+                or mount_root in protected_root.parents
+            )
+            for protected_device, protected_root in protected_backings
+        ):
+            raise RunnerError(
+                "live Codex has a writable alias of protected input mount"
             )
     if observed_writable_outputs != allowed_outputs:
         raise RunnerError("live Codex private writable output mounts are missing")
