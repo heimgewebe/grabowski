@@ -47,6 +47,14 @@ DEPLOY_MUTATING = ToolAnnotations(
 )
 
 OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def _same_git_oid_format(*values: str) -> bool:
+    """Accept only complete lowercase Git object IDs of one SHA-1/256 format."""
+    return bool(values) and all(
+        isinstance(value, str) and OBJECT_ID_RE.fullmatch(value) is not None
+        for value in values
+    ) and len({len(value) for value in values}) == 1
 ExpectedHead = Annotated[
     str,
     Field(
@@ -5233,8 +5241,8 @@ def _deployment_schedule_preflight(
 
 
 def _fresh_public_github_main(expected_head: str) -> str:
-    if re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
-        raise ValueError("public GitHub main verification requires one full SHA-1 commit id")
+    if not isinstance(expected_head, str) or OBJECT_ID_RE.fullmatch(expected_head) is None:
+        raise ValueError("public GitHub main verification requires one full Git object ID")
 
     argv = [
         "/usr/bin/python3",
@@ -5284,7 +5292,7 @@ def _fresh_public_github_main(expected_head: str) -> str:
     if not isinstance(target, dict) or target.get("type") != "commit":
         raise RuntimeError("fresh public GitHub main lookup returned an invalid object")
     head = target.get("sha")
-    if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+    if not _same_git_oid_format(head, expected_head):
         raise RuntimeError("fresh public GitHub main lookup returned an invalid commit")
     return head
 
@@ -5428,7 +5436,7 @@ def _require_release_source_admission(
     only critical-release authority is an ephemeral accepted Captain action,
     whose exact review/CI/serving evidence is re-read before effects.
     """
-    if not isinstance(expected_head, str) or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
+    if not isinstance(expected_head, str) or OBJECT_ID_RE.fullmatch(expected_head) is None:
         raise DeploySchedulePreEffectRefusal("release admission blocked: exact target head is invalid")
     deployment = base._deployment_metadata()
     if (
@@ -5446,12 +5454,16 @@ def _require_release_source_admission(
     release_id = deployment.get("release_id")
     if (
         not isinstance(serving_head, str)
-        or re.fullmatch(r"[0-9a-f]{40}", serving_head) is None
+        or OBJECT_ID_RE.fullmatch(serving_head) is None
         or not isinstance(release_id, str)
         or not release_id
     ):
         raise DeploySchedulePreEffectRefusal(
             "release admission blocked: serving source identity is missing"
+        )
+    if not _same_git_oid_format(serving_head, expected_head):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: serving/target Git object formats differ"
         )
     process = serving_process.identity(
         current_release_id=release_id,
@@ -5569,7 +5581,8 @@ def _require_release_source_admission(
                 or result.get("stderr_truncated") is not False
                 or result.get("stderr") != ""
                 or not isinstance(result.get("stdout"), str)
-                or re.fullmatch(r"[0-9a-f]{40}\n?", result["stdout"]) is None
+                or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\n?", result["stdout"]) is None
+                or not _same_git_oid_format(result["stdout"].strip(), expected_head)
             ):
                 raise DeploySchedulePreEffectRefusal(
                     "release admission blocked: exact source tree unavailable"
@@ -5580,7 +5593,7 @@ def _require_release_source_admission(
             CANONICAL_REPOSITORY,
             "diff", "--no-ext-diff", "--no-textconv",
             "--no-renames", "--ignore-submodules=none",
-            "--raw", "--abbrev=40", "-z",
+            "--raw", "--abbrev=64", "-z",
             serving_head, expected_head, "--",
             max_output_bytes=262_144,
         )
@@ -5631,7 +5644,7 @@ def _require_release_source_admission(
     document_diff = _git_result(
         CANONICAL_REPOSITORY,
         "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
-        "--ignore-submodules=none", "--raw", "--abbrev=40", "-z",
+        "--ignore-submodules=none", "--raw", "--abbrev=64", "-z",
         serving_head, expected_head, "--",
         max_output_bytes=262_144,
     )
@@ -5663,14 +5676,18 @@ def _require_release_source_admission(
     for index in range(0, len(fields), 2):
         header, path = fields[index : index + 2]
         match = re.fullmatch(
-            r":([0-7]{6}) ([0-7]{6}) [0-9a-f]{40} [0-9a-f]{40} ([AMD])",
+            r":([0-7]{6}) ([0-7]{6}) ((?:[0-9a-f]{40}|[0-9a-f]{64})) ((?:[0-9a-f]{40}|[0-9a-f]{64})) ([AMD])",
             header,
         )
         if match is None:
             raise DeploySchedulePreEffectRefusal(
                 "release admission blocked: non-plain documentation change"
             )
-        old_mode, new_mode, operation = match.groups()
+        old_mode, new_mode, old_oid, new_oid, operation = match.groups()
+        if not _same_git_oid_format(old_oid, new_oid, expected_head):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: documentation Git object formats differ"
+            )
         if (
             old_mode not in {"000000", "100644"}
             or new_mode not in {"000000", "100644"}
