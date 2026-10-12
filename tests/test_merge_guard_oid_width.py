@@ -167,6 +167,49 @@ class MergeGuardGitObjectWidthTests(TestCase):
         self.assertIn("merge_guard_expected_head_invalid", errors)
 
 
+    def test_unique_merge_base_requires_matching_full_git_oid_width(self) -> None:
+        for width in (40, 64):
+            with self.subTest(width=width):
+                ancestor = "c" * width
+                with patch.object(
+                    guard, "_merge_guard_local_git_bytes",
+                    return_value={
+                        "returncode": 0,
+                        "stdout_bytes": (ancestor + "\n").encode("ascii"),
+                    },
+                ):
+                    actual, errors = guard._merge_guard_unique_merge_base(
+                        Path("/synthetic"),
+                        base_sha="a" * width,
+                        head_sha="b" * width,
+                    )
+                self.assertEqual((ancestor, []), (actual, errors))
+
+        for base, head, result in (
+            ("a" * 40, "b" * 40, "c" * 64),
+            ("a" * 64, "b" * 64, "c" * 40),
+            ("a" * 40, "b" * 64, "c" * 40),
+            ("a" * 64, "b" * 40, "c" * 64),
+            ("a" * 64, "b" * 64, "c" * 63),
+            ("a" * 64, "b" * 64, "c" * 65),
+            ("a" * 64, "b" * 64, "C" * 64),
+        ):
+            with self.subTest(base=len(base), head=len(head), result=len(result)):
+                with patch.object(
+                    guard, "_merge_guard_local_git_bytes",
+                    return_value={
+                        "returncode": 0,
+                        "stdout_bytes": (result + "\n").encode("ascii"),
+                    },
+                ):
+                    actual, errors = guard._merge_guard_unique_merge_base(
+                        Path("/synthetic"), base_sha=base, head_sha=head,
+                    )
+                self.assertIsNone(actual)
+                self.assertEqual(
+                    ["merge_guard_local_merge_base_missing_or_ambiguous"], errors,
+                )
+
     def test_real_sha256_git_repo_commit_diff_and_format_patch(self) -> None:
         def git(repo: Path, *args: str) -> bytes:
             process = subprocess.run(
