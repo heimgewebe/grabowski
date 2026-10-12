@@ -63,10 +63,17 @@ class ArtifactTests(unittest.TestCase):
         self.root_patch = patch.object(
             artifacts.base, "_roots", return_value=(self.root,)
         )
+        # Exercise the real audit append and rollback code, but never append
+        # unit-test records to the live, globally shared production audit.
+        self.audit_patch = patch.object(
+            artifacts.base, "AUDIT_LOG", self.root / "write-audit.jsonl"
+        )
         self.resource_patch.start()
         self.root_patch.start()
+        self.audit_patch.start()
 
     def tearDown(self) -> None:
+        self.audit_patch.stop()
         self.root_patch.stop()
         self.resource_patch.stop()
         self.temporary.cleanup()
@@ -694,6 +701,8 @@ class ArtifactTests(unittest.TestCase):
                 "git-diff.v1", str(repository), base_commit, head_commit
             )
         self.assertEqual(result["repository"], "other-owner/other-repository")
+        # Publication succeeded only after a real append in the private audit.
+        self.assertGreater((self.root / "write-audit.jsonl").stat().st_size, 0)
 
     def test_text_artifact_requires_canonical_origin_identity(self) -> None:
         repository, base_commit, head_commit = self._repository_with_two_commits()
