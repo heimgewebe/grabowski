@@ -23723,6 +23723,10 @@ class SagaExternalMergeCloseoutGripTests(unittest.TestCase):
         self.branch_reads = 0
         self.bad_compare = False
         self.stale_branch = False
+        self.stale_late_branch = False
+        self.persisted_terminal: dict[str, object] | None = None
+        self.closeout_lock_dir = tempfile.TemporaryDirectory(prefix="grabowski-1371-saga-lock-")
+        self.addCleanup(self.closeout_lock_dir.cleanup)
 
     def github(self, repo: Path, argv: list[str]) -> dict[str, object]:
         del repo
@@ -23740,18 +23744,23 @@ class SagaExternalMergeCloseoutGripTests(unittest.TestCase):
                 "name": "main", "sha": self.current_sha,
                 "protected": True,
             }
-            if self.stale_branch and self.branch_reads == 2:
+            if (
+                (self.stale_branch and self.branch_reads == 2)
+                or (self.stale_late_branch and self.branch_reads == 3)
+            ):
                 value["sha"] = "f" * 40
         elif argv[0] == "api" and "/compare/" in argv[1]:
             if argv[1].endswith("..." + self.merge_sha):
                 value = {
                     "status": "ahead", "ahead_by": 2, "behind_by": 0,
                     "base": "b" * 40, "merge_base": "b" * 40,
+                    "head": self.merge_sha,
                 }
             else:
                 value = {
                     "status": "ahead", "ahead_by": 3, "behind_by": 0,
                     "base": self.merge_sha, "merge_base": self.merge_sha,
+                    "head": self.current_sha,
                 }
                 if self.bad_compare:
                     value["merge_base"] = "f" * 40
@@ -23762,18 +23771,33 @@ class SagaExternalMergeCloseoutGripTests(unittest.TestCase):
     def run_closeout(self, audit_append=None, **updates):
         params = {**self.parameters, **updates}
         append = audit_append or Mock(return_value="7" * 64)
+
+        def durable_append(record):
+            digest = append(record)
+            if isinstance(digest, str) and len(digest) == 64:
+                self.persisted_terminal = {**deepcopy(record), "record_sha256": digest}
+            return digest
+
         fake_work_acquire = types.ModuleType("grabowski_work_acquire")
         fake_work_acquire.operator = types.SimpleNamespace(
-            base=types.SimpleNamespace(_append_audit_with_digest=append)
+            base=types.SimpleNamespace(_append_audit_with_digest=durable_append)
         )
+        def lookup(plan_sha256):
+            value = self.persisted_terminal
+            return (
+                deepcopy(value)
+                if isinstance(value, dict) and value.get("plan_sha256") == plan_sha256
+                else None
+            )
+
         with patch.dict(sys.modules, {"grabowski_work_acquire": fake_work_acquire}), patch.object(
-            grip_orchestration,
-            "_verified_saga_run_receipt_reference",
-            return_value=self.run,
+            grips, "SAGA_EXTERNAL_MERGE_LOCK_ROOT", Path(self.closeout_lock_dir.name)
         ), patch.object(
-            grip_orchestration,
-            "_verified_captain_audit_reference_identity",
-            return_value=self.audit,
+            grips, "_saga_external_merge_existing_audit", side_effect=lookup
+        ), patch.object(
+            grip_orchestration, "_verified_saga_run_receipt_reference", return_value=self.run
+        ), patch.object(
+            grip_orchestration, "_verified_captain_audit_reference_identity", return_value=self.audit
         ):
             outcome = grips.run_grip(
                 "saga-external-merge-closeout", params,
@@ -23803,7 +23827,7 @@ class SagaExternalMergeCloseoutGripTests(unittest.TestCase):
         )
 
     def test_stale_branch_or_wrong_ancestry_cannot_write_audit(self) -> None:
-        for key in ("stale_branch", "bad_compare"):
+        for key in ("stale_branch", "stale_late_branch", "bad_compare"):
             with self.subTest(key=key):
                 self.calls.clear()
                 self.branch_reads = 0
@@ -23836,6 +23860,47 @@ class SagaExternalMergeCloseoutGripTests(unittest.TestCase):
         self.assertEqual("failed", result["status"])
         append.assert_called_once()
         self.assertNotIn("settlement_audit_record_sha256", result["output"])
+
+    def test_repeated_same_external_merge_never_appends_another_terminal_audit(self) -> None:
+        append = Mock(return_value="7" * 64)
+        first, _ = self.run_closeout(audit_append=append)
+        second, _ = self.run_closeout(audit_append=append)
+        self.assertEqual("passed", first["status"])
+        self.assertEqual("passed", second["status"])
+        self.assertEqual(first["output"]["settlement_sha256"], second["output"]["settlement_sha256"])
+        self.assertEqual(1, append.call_count)
+
+    def test_replay_after_base_advances_returns_original_immutable_terminal(self) -> None:
+        append = Mock(return_value="7" * 64)
+        first, _ = self.run_closeout(audit_append=append)
+        self.assertEqual("passed", first["status"])
+        old_sha = first["output"]["settlement_sha256"]
+        old_base = first["output"]["current_protected_base_sha"]
+        self.current_sha = "f" * 40
+        second, _ = self.run_closeout(audit_append=append)
+        self.assertEqual("passed", second["status"])
+        self.assertTrue(second["output"]["terminal_audit_reused"])
+        self.assertEqual(old_sha, second["output"]["settlement_sha256"])
+        self.assertEqual(old_base, second["output"]["current_protected_base_sha"])
+        self.assertEqual(self.current_sha, second["output"]["observed_current_protected_base_sha"])
+        append.assert_called_once()
+
+    def test_conflicting_saved_terminal_blocks_without_append(self) -> None:
+        append = Mock(return_value="7" * 64)
+        first, _ = self.run_closeout(audit_append=append)
+        self.assertEqual("passed", first["status"])
+        assert self.persisted_terminal is not None
+        self.persisted_terminal["merged_commit_sha"] = "f" * 40
+        second, _ = self.run_closeout(audit_append=append)
+        self.assertEqual("failed", second["status"])
+        append.assert_called_once()
+
+    def test_same_saga_concurrent_lock_fails_closed_before_append(self) -> None:
+        with patch.object(grips, "SAGA_EXTERNAL_MERGE_LOCK_ROOT", Path(self.closeout_lock_dir.name)):
+            with grips._saga_external_merge_lock(self.plan["plan_sha256"]):
+                result, append = self.run_closeout()
+        self.assertEqual("blocked", result["status"])
+        append.assert_not_called()
 
     def test_surface_keeps_observer_readonly(self) -> None:
         specs = {

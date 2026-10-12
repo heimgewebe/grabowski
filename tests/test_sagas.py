@@ -878,11 +878,11 @@ class ExternalMergeSagaSettlementTests(unittest.TestCase):
             },
             "base_to_merge": {
                 "status": "ahead", "ahead_by": 2, "behind_by": 0,
-                "base": BASE, "merge_base": BASE,
+                "base": BASE, "merge_base": BASE, "head": self.merge_sha,
             },
             "merge_to_current": {
                 "status": "ahead", "ahead_by": 3, "behind_by": 0,
-                "base": self.merge_sha, "merge_base": self.merge_sha,
+                "base": self.merge_sha, "merge_base": self.merge_sha, "head": self.current_sha,
             },
         }
 
@@ -973,6 +973,12 @@ class ExternalMergeSagaSettlementTests(unittest.TestCase):
             )),
             ("wrong_merge_ancestor", lambda x: x["merge_to_current"].update(
                 merge_base="f" * 40
+            )),
+            ("wrong_base_compare_head", lambda x: x["base_to_merge"].update(
+                head="f" * 40
+            )),
+            ("wrong_current_compare_head", lambda x: x["merge_to_current"].update(
+                head="f" * 40
             )),
             ("branch_rewind", lambda x: x["base_branch"].update(
                 sha=self.merge_sha

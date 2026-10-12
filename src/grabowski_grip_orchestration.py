@@ -2122,13 +2122,14 @@ def settle_external_merge(
         raise SagaError("external merge base branch identity or protection is invalid")
     current_head = _sha40(branch.get("sha"), "external merge current protected base SHA")
 
-    def check_ancestry(name: str, left: str, *, require_ahead: bool) -> None:
+    def check_ancestry(name: str, left: str, right: str, *, require_ahead: bool) -> None:
         comparison = _bounded_mapping(readback[name], f"external_merge_readback.{name}")
-        if set(comparison) != {"status", "ahead_by", "behind_by", "base", "merge_base"}:
+        if set(comparison) != {"status", "ahead_by", "behind_by", "base", "merge_base", "head"}:
             raise SagaError(f"external merge {name} ancestry shape is invalid")
         ahead = comparison.get("ahead_by")
         if (
             comparison.get("base") != left
+            or comparison.get("head") != right
             or comparison.get("merge_base") != left
             or type(ahead) is not int
             or type(comparison.get("behind_by")) is not int
@@ -2138,8 +2139,8 @@ def settle_external_merge(
         ):
             raise SagaError(f"external merge {name} ancestry is not proven")
 
-    check_ancestry("base_to_merge", expected["expected_base_sha"], require_ahead=True)
-    check_ancestry("merge_to_current", merge_sha, require_ahead=False)
+    check_ancestry("base_to_merge", expected["expected_base_sha"], merge_sha, require_ahead=True)
+    check_ancestry("merge_to_current", merge_sha, current_head, require_ahead=False)
     if merge_sha == current_head and readback["merge_to_current"]["ahead_by"] != 0:
         raise SagaError("external merge current branch identity contradicts ancestry")
     if merge_sha != current_head and readback["merge_to_current"]["ahead_by"] == 0:
