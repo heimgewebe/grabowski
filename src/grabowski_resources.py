@@ -8005,8 +8005,12 @@ def inspect_resource(
 ) -> dict[str, Any] | None:
     key = normalize_resource_key(resource_key)
     now = _now()
-    # The public READ_ONLY inspector may never initialize, migrate or copy
-    # a WAL store, including on a deny/kill-switch/audit failure.
+    if not isinstance(read_only, bool):
+        raise ValueError("read_only must be boolean")
+    # Public READ_ONLY uses a strict snapshot; the default may open/migrate
+    # SQLite and must pass mutation admission before touching the store.
+    if not read_only:
+        operator._require_operator_mutation("resource_lease")
     source = _resource_readonly_snapshot() if read_only else closing(_database())
     with source as connection:
         row = connection.execute(
@@ -8030,6 +8034,7 @@ def inspect_resources(resource_keys: Iterable[str]) -> dict[str, dict[str, Any]]
         return {}
     now = _now()
     placeholders = ",".join("?" for _item in keys)
+    operator._require_operator_mutation("resource_lease")
     with closing(_database()) as connection:
         rows = connection.execute(
             f"SELECT * FROM leases WHERE resource_key IN ({placeholders})",
@@ -8519,6 +8524,8 @@ def grabowski_resource_list(
             raise ValueError(
                 "schema_only cannot be combined with resource-list filters"
             )
+        # Inventory may copy an active WAL to a temporary file.
+        operator._require_operator_mutation("resource_lease")
         return _resource_schema_inventory()
     # Ordinary listings can initialize or migrate the resource store.
     operator._require_operator_mutation("resource_lease")

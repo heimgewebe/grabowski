@@ -12458,6 +12458,8 @@ def grabowski_task_list(
             raise ValueError(
                 "schema_only cannot be combined with task-list filters or projections"
             )
+        # Schema inspection can copy live WAL sidecars; never bypass mutation admission.
+        operator._require_operator_mutation("durable_job")
         return _task_schema_inventory()
     # Ordinary task-list may recover terminalizations and migrate task storage.
     if not read_only:
