@@ -45,7 +45,7 @@ REVIEW_ROLE_LAUNCHER_PREFIX = (
     REVIEW_ROLE_MODULE,
 )
 _REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
-_SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
+_GIT_OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SLOT_RE = re.compile(r"[A-Za-z0-9._:-]{1,64}\Z")
 _UNIT_RE = re.compile(r"grabowski-job-([0-9a-f]{12})\Z")
@@ -307,10 +307,12 @@ def normalize_binding(value: Any) -> dict[str, Any]:
     head_sha = value.get("head_sha")
     base_sha = value.get("base_sha")
     diff_sha256 = value.get("diff_sha256")
-    if not isinstance(head_sha, str) or _SHA40_RE.fullmatch(head_sha.lower()) is None:
-        raise ValueError("decision review head_sha must be a 40 character SHA")
-    if not isinstance(base_sha, str) or _SHA40_RE.fullmatch(base_sha.lower()) is None:
-        raise ValueError("decision review base_sha must be a 40 character SHA")
+    if not isinstance(head_sha, str) or _GIT_OID_RE.fullmatch(head_sha.lower()) is None:
+        raise ValueError("decision review head_sha must be an exact Git object ID")
+    if not isinstance(base_sha, str) or _GIT_OID_RE.fullmatch(base_sha.lower()) is None:
+        raise ValueError("decision review base_sha must be an exact Git object ID")
+    if len(head_sha) != len(base_sha):
+        raise ValueError("decision review head/base Git object formats differ")
     if not isinstance(diff_sha256, str) or _SHA256_RE.fullmatch(diff_sha256.lower()) is None:
         raise ValueError("decision review diff_sha256 must be a 64 character SHA-256")
     slot = value.get("slot")
