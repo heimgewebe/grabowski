@@ -8113,6 +8113,12 @@ def _start_job(
         else JOB_PREFIX + uuid.uuid4().hex[:12]
     )
     metadata_temp_cleanup = _cleanup_stale_job_metadata_temps(_jobs_root())
+    if decision_review_binding is not None:
+        # No orphan job directory for a role-launcher preflight rejection.
+        command = decision_reviews.bind_job_review_role_argv(
+            command, decision_review_binding,
+            cwd=working_directory, attempt_directory=_jobs_root() / unit,
+        )
     directory = _job_directory(unit, create=True)
     stdout_path = directory / "stdout.log"
     stderr_path = directory / "stderr.log"
@@ -8138,9 +8144,13 @@ def _start_job(
             decision_review_binding
         )
         scope["decision_bound_review"] = normalized_review_binding
+        # A new attempt may never recover historical V1 role provenance from
+        # an alternate executable form after its launch.
+        scope["decision_review_attempt_epoch"] = 2
         scope["started_at_unix_ns"] = started_at_unix_ns
         review_provenance = decision_reviews.review_role_provenance(
-            command, normalized_review_binding, cwd=working_directory
+            command, normalized_review_binding, cwd=working_directory,
+            attempt_directory=directory,
         )
         if review_provenance is not None:
             scope["decision_review_provenance"] = review_provenance
@@ -8293,6 +8303,11 @@ def _start_job(
         "GRABOWSKI_JOB_STDERR_PATH": finalization_contract["receipt_paths"]["stderr"],
         "GRABOWSKI_JOB_FINALIZATION_PATH": finalization_contract["receipt_paths"]["finalization"],
     }
+    if (
+        decision_review_binding is not None
+        and scope.get("decision_review_provenance", {}).get("schema_version") == 2
+    ):
+        environment["GRABOWSKI_REVIEW_ATTEMPT_UNIT"] = unit
     if "expected_head" in finalization_contract:
         environment["GRABOWSKI_JOB_EXPECTED_HEAD"] = finalization_contract["expected_head"]
     systemd_argv.extend(f"--setenv={key}={value}" for key, value in environment.items())

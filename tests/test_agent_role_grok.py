@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import errno
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
+import threading
 import json
 import os
 from pathlib import Path
@@ -8,6 +12,7 @@ import tempfile
 from types import SimpleNamespace
 import sys
 import unittest
+from typing import Any
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +28,381 @@ def stream_bytes(events: list[dict]) -> bytes:
     return ("\n".join(json.dumps(event, separators=(",", ":")) for event in events) + "\n").encode()
 
 
+
+def _create_only_process_writer(
+    path: str, attempt: int, ready: Any, start: Any, results: Any,
+) -> None:
+    """Spawn-safe writer: exercise the real directory lock between OS processes."""
+    ready.set()
+    if not start.wait(10):
+        results.put("start-timeout")
+        return
+    try:
+        role.write_receipt(Path(path), {"attempt": attempt}, create_only=True)
+    except FileExistsError:
+        results.put("exists")
+    except Exception as exc:
+        results.put(type(exc).__name__)
+    else:
+        results.put("created")
+
+
 class GrokReviewRoleTests(unittest.TestCase):
+
+    def test_create_only_receipt_is_private_and_cannot_be_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "receipts"
+            parent.mkdir(mode=0o700)
+            path = parent / "attempt.json"
+            role.write_receipt(path, {"verdict": "PASS"}, create_only=True)
+            original = path.read_bytes()
+            self.assertEqual(json.loads(original), {"verdict": "PASS"})
+            self.assertEqual(os.stat(path).st_nlink, 1)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                role.write_receipt(path, {"verdict": "NEEDS_CHANGE"}, create_only=True)
+            self.assertEqual(path.read_bytes(), original)
+            os.chmod(parent, 0o750)
+            with self.assertRaises(PermissionError):
+                role.write_receipt(parent / "other.json", {}, create_only=True)
+
+    def test_fdopen_failure_closes_raw_descriptor_and_removes_temp(self) -> None:
+        # A failure to wrap an already opened fd must not exhaust a long-lived
+        # reviewer/operator process. Both legacy replace and create-only paths
+        # have the same pre-ownership constructor boundary.
+        for create_only in (False, True):
+            with self.subTest(create_only=create_only):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    target = root / "attempt.json"
+                    real_open = os.open
+                    opened_temporary: list[int] = []
+
+                    def capture_open(name, flags, *args, **kwargs):
+                        fd = real_open(name, flags, *args, **kwargs)
+                        if (
+                            isinstance(name, str)
+                            and name.startswith(".attempt.json.")
+                            and name.endswith(".tmp")
+                        ):
+                            opened_temporary.append(fd)
+                        return fd
+
+                    with (
+                        mock.patch.object(role.os, "open", side_effect=capture_open),
+                        mock.patch.object(
+                            role.os, "fdopen",
+                            side_effect=OSError(errno.EMFILE, "synthetic fdopen failure"),
+                        ),
+                        self.assertRaisesRegex(OSError, "synthetic fdopen failure"),
+                    ):
+                        role.write_receipt(
+                            target, {"verdict": "PASS"}, create_only=create_only
+                        )
+
+                    self.assertEqual(len(opened_temporary), 1)
+                    with self.assertRaises(OSError) as closed:
+                        os.fstat(opened_temporary[0])
+                    self.assertEqual(closed.exception.errno, errno.EBADF)
+                    self.assertFalse(target.exists())
+                    self.assertEqual(list(root.glob("*.tmp")), [])
+                    self.assertFalse(
+                        any(p.name.startswith(".attempt.json.") for p in root.iterdir())
+                    )
+
+    def test_create_only_receipt_rejects_link_attacks(self) -> None:
+        for kind in ("symlink", "hardlink", "parent-symlink"):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    parent = root / "receipts"
+                    parent.mkdir(mode=0o700)
+                    target = root / "real.json"
+                    target.write_text('{"untouched": true}', encoding="utf-8")
+                    os.chmod(target, 0o600)
+                    path = parent / "attempt.json"
+                    if kind == "parent-symlink":
+                        alias = root / "link"
+                        alias.symlink_to(parent, target_is_directory=True)
+                        path = alias / "attempt.json"
+                        with self.assertRaises(OSError):
+                            role.write_receipt(path, {}, create_only=True)
+                    else:
+                        if kind == "symlink":
+                            path.symlink_to(target)
+                        else:
+                            os.link(target, path)
+                        with self.assertRaises(PermissionError):
+                            role.write_receipt(path, {}, create_only=True)
+                    self.assertEqual(json.loads(target.read_text()), {"untouched": True})
+
+    def test_create_only_receipt_race_has_exactly_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "review.json"
+            barrier = threading.Barrier(2)
+            def write(value: int) -> str:
+                barrier.wait()
+                try:
+                    role.write_receipt(path, {"attempt": value}, create_only=True)
+                    return "created"
+                except FileExistsError:
+                    return "exists"
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                a = pool.submit(write, 1)
+                b = pool.submit(write, 2)
+                self.assertEqual(sorted([a.result(), b.result()]), ["created", "exists"])
+            self.assertIn(json.loads(path.read_text())["attempt"], (1, 2))
+            self.assertFalse(any(p.name.endswith(".tmp") for p in path.parent.iterdir()))
+
+
+    def test_create_only_receipt_link_unlink_window_is_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "review.json"
+            linked = threading.Event()
+            release_link = threading.Event()
+            contender_attempted_lock = threading.Event()
+            thread_state = threading.local()
+            real_link = os.link
+            real_flock = role.fcntl.flock
+
+            def pause_after_link(*args: Any, **kwargs: Any) -> None:
+                real_link(*args, **kwargs)
+                linked.set()
+                if not release_link.wait(5):
+                    raise TimeoutError("synthetic link window was not released")
+
+            def observe_lock(fd: int, mode: int) -> None:
+                if getattr(thread_state, "contender", False):
+                    contender_attempted_lock.set()
+                real_flock(fd, mode)
+
+            def contend() -> str:
+                thread_state.contender = True
+                try:
+                    role.write_receipt(path, {"attempt": 2}, create_only=True)
+                except FileExistsError:
+                    return "exists"
+                return "unexpected-create"
+
+            with (
+                mock.patch.object(role.os, "link", side_effect=pause_after_link),
+                mock.patch.object(role.fcntl, "flock", side_effect=observe_lock),
+                ThreadPoolExecutor(max_workers=2) as pool,
+            ):
+                first = pool.submit(role.write_receipt, path, {"attempt": 1}, create_only=True)
+                try:
+                    self.assertTrue(linked.wait(3), "first writer never published its link")
+                    self.assertEqual(os.stat(path).st_nlink, 2)
+                    second = pool.submit(contend)
+                    self.assertTrue(
+                        contender_attempted_lock.wait(3),
+                        "contender never attempted its directory lock",
+                    )
+                    self.assertFalse(second.done(), "contender must wait for unlink")
+                finally:
+                    release_link.set()
+                first.result(timeout=4)
+                self.assertEqual(second.result(timeout=4), "exists")
+            self.assertEqual(json.loads(path.read_text()), {"attempt": 1})
+            self.assertEqual(os.stat(path).st_nlink, 1)
+            self.assertFalse(any(item.name.endswith(".tmp") for item in path.parent.iterdir()))
+
+    def test_create_only_receipt_two_processes_have_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "review.json"
+            context = multiprocessing.get_context("spawn")
+            start = context.Event()
+            ready = [context.Event(), context.Event()]
+            results = context.Queue()
+            processes = [
+                context.Process(
+                    target=_create_only_process_writer,
+                    args=(str(path), attempt, ready[attempt - 1], start, results),
+                )
+                for attempt in (1, 2)
+            ]
+            try:
+                for process in processes:
+                    process.start()
+                for event in ready:
+                    self.assertTrue(event.wait(10), "writer did not reach start gate")
+                start.set()
+                for process in processes:
+                    process.join(timeout=10)
+                self.assertTrue(all(not process.is_alive() for process in processes))
+                self.assertEqual([process.exitcode for process in processes], [0, 0])
+                outcomes = sorted(results.get(timeout=3) for _ in processes)
+                self.assertEqual(outcomes, ["created", "exists"])
+            finally:
+                start.set()
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                    if process.pid is not None:
+                        process.join(timeout=3)
+                results.close()
+                results.join_thread()
+            self.assertIn(json.loads(path.read_text())["attempt"], (1, 2))
+            self.assertEqual(os.stat(path).st_nlink, 1)
+
+    def test_create_only_receipt_directory_lock_timeout_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "review.json"
+            directory_fd = os.open(
+                temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            try:
+                role.fcntl.flock(directory_fd, role.fcntl.LOCK_EX)
+                with (
+                    mock.patch.object(role, "CREATE_ONLY_RECEIPT_LOCK_TIMEOUT_SECONDS", 0.02),
+                    mock.patch.object(role, "CREATE_ONLY_RECEIPT_LOCK_POLL_SECONDS", 0.005),
+                    self.assertRaisesRegex(TimeoutError, "role receipt directory lock timed out"),
+                ):
+                    role.write_receipt(path, {"attempt": 2}, create_only=True)
+                self.assertFalse(path.exists())
+                self.assertFalse(any(item.name.endswith(".tmp") for item in path.parent.iterdir()))
+            finally:
+                role.fcntl.flock(directory_fd, role.fcntl.LOCK_UN)
+                os.close(directory_fd)
+
+    def test_create_only_receipt_parent_mode_change_during_wait_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "review.json"
+            fd = os.open(
+                temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            )
+            real_flock = role.fcntl.flock
+            attempted = threading.Event()
+
+            def observe_lock(descriptor: int, flags: int) -> None:
+                if flags & role.fcntl.LOCK_NB:
+                    attempted.set()
+                real_flock(descriptor, flags)
+
+            try:
+                real_flock(fd, role.fcntl.LOCK_EX)
+                with (
+                    mock.patch.object(role.fcntl, "flock", side_effect=observe_lock),
+                    ThreadPoolExecutor(max_workers=1) as pool,
+                ):
+                    pending = pool.submit(
+                        role.write_receipt, path, {"attempt": 2}, create_only=True,
+                    )
+                    try:
+                        self.assertTrue(attempted.wait(3), "writer never reached the lock")
+                        os.chmod(temporary, 0o755)
+                    finally:
+                        real_flock(fd, role.fcntl.LOCK_UN)
+                    with self.assertRaisesRegex(PermissionError, "parent must be owner-private"):
+                        pending.result(timeout=4)
+                self.assertFalse(path.exists())
+            finally:
+                os.chmod(temporary, 0o700)
+                os.close(fd)
+
+    def test_create_only_receipt_crash_after_link_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "receipts"
+            parent.mkdir(mode=0o700)
+            target = parent / "attempt.json"
+            interrupted = parent / ".attempt.interrupted.tmp"
+            interrupted.write_text('{"attempt": 1}\n', encoding="utf-8")
+            interrupted.chmod(0o600)
+            os.link(interrupted, target)
+            self.assertEqual(target.stat().st_nlink, 2)
+            original = target.read_bytes()
+            with self.assertRaisesRegex(PermissionError, "one owner-controlled regular file"):
+                role.write_receipt(target, {"attempt": 2}, create_only=True)
+            self.assertEqual(target.read_bytes(), original)
+            self.assertEqual(interrupted.read_bytes(), original)
+            self.assertEqual(target.stat().st_nlink, 2)
+
+
+    def test_role_main_binds_review_receipt_to_job_unit_and_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            unit = "grabowski-job-a11111111111"
+            directory = Path(temporary) / unit
+            directory.mkdir(mode=0o700)
+            output = directory / role.REVIEW_ATTEMPT_RECEIPT_NAME
+            head, base, diff = "a" * 40, "b" * 40, "c" * 64
+            document = b'{"verdict":"PASS","findings":[]}'
+            completed = SimpleNamespace(
+                returncode=0, stdout_sha256=hashlib.sha256(document).hexdigest(),
+                stderr_sha256="e" * 64, stdout_bytes=len(document), stderr_bytes=0,
+                stdout_tail="", stderr_tail="", output_limit_exceeded=False,
+                stdout_content_exceeded=False, stdout_content=document,
+            )
+            environment = {
+                "GRABOWSKI_REVIEW_ATTEMPT_UNIT": unit,
+                "GRABOWSKI_JOB_UNIT": unit,
+                "GRABOWSKI_JOB_ID": "a11111111111",
+                "GRABOWSKI_JOB_ORIGIN_SHA256": "d" * 64,
+                "GRABOWSKI_JOB_DIRECTORY": str(directory),
+            }
+            with (
+                mock.patch.dict(os.environ, environment),
+                mock.patch.object(role, "current_binding", side_effect=[(head, diff, False)] * 2),
+                mock.patch.object(role, "committed_diff", return_value=b"frozen diff"),
+                mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], None, None)),
+                mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                mock.patch.object(role, "run_bounded_capture", return_value=completed),
+                mock.patch.object(role, "classify_result", return_value="passed"),
+            ):
+                self.assertEqual(role.main([
+                    "--role", "review", "--repository", str(ROOT),
+                    "--expected-head", head, "--expected-base-head", base,
+                    "--expected-diff-sha256", diff, "--expected-dirty", "false",
+                    "--output", str(output), "--", "grok", "--model", "grok-4.6",
+                    "Review the frozen diff",
+                ]), 0)
+            receipt = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["review_attempt_unit"], unit)
+            self.assertEqual(receipt["review_attempt_origin_sha256"], "d" * 64)
+            self.assertEqual(receipt["receipt_sha256"], role.digest({
+                k: v for k, v in receipt.items() if k != "receipt_sha256"
+            }))
+
+    def test_role_main_rejects_cross_attempt_environment_before_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            unit = "grabowski-job-a11111111111"
+            directory = Path(temporary) / unit
+            directory.mkdir(mode=0o700)
+            output = directory / role.REVIEW_ATTEMPT_RECEIPT_NAME
+            head, base, diff = "a" * 40, "b" * 40, "c" * 64
+            completed = SimpleNamespace(
+                returncode=0, stdout_sha256="d" * 64, stderr_sha256="e" * 64,
+                stdout_bytes=0, stderr_bytes=0, stdout_tail="", stderr_tail="",
+                output_limit_exceeded=False, stdout_content_exceeded=False,
+                stdout_content=b'{"verdict":"PASS","findings":[]}',
+            )
+            environment = {
+                "GRABOWSKI_REVIEW_ATTEMPT_UNIT": unit,
+                "GRABOWSKI_JOB_UNIT": "grabowski-job-b22222222222",
+                "GRABOWSKI_JOB_ID": "a11111111111",
+                "GRABOWSKI_JOB_ORIGIN_SHA256": "d" * 64,
+                "GRABOWSKI_JOB_DIRECTORY": str(directory),
+            }
+            with (
+                mock.patch.dict(os.environ, environment),
+                mock.patch.object(role, "current_binding", side_effect=AssertionError("snapshot must not execute")) as current_binding,
+                mock.patch.object(role, "committed_diff", return_value=b"frozen diff"),
+                mock.patch.object(role, "_review_sandbox_argv", return_value=(["sandbox"], None, None)),
+                mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                mock.patch.object(role, "run_bounded_capture", side_effect=AssertionError("reviewer must not execute")) as execute,
+                mock.patch.object(role, "classify_result", return_value="passed"),
+                self.assertRaisesRegex(RuntimeError, "attempt binding is invalid"),
+            ):
+                role.main([
+                    "--role", "review", "--repository", str(ROOT),
+                    "--expected-head", head, "--expected-base-head", base,
+                    "--expected-diff-sha256", diff, "--expected-dirty", "false",
+                    "--output", str(output), "--", "grok", "--model", "grok-4.6",
+                    "Review the frozen diff",
+                ])
+            current_binding.assert_not_called()
+            execute.assert_not_called()
+            self.assertFalse(output.exists())
+
     def test_streaming_review_command_embeds_bound_diff_without_repository_tools(self) -> None:
         prepared = ("/opt/grabowski-external/grok", "--model", "grok-4.6", "-p", "review this")
         head = "a" * 40
@@ -377,6 +756,822 @@ class GrokReviewRoleTests(unittest.TestCase):
                         role._grok_streaming_review_command(
                             prepared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff"
                         )
+
+    def test_claude_review_sandbox_binds_frozen_diff_stdin_headlessly(self) -> None:
+        repo = Path("/tmp/claude-review-worktree")
+        declared = [
+            "claude", "--model", "claude-opus-5-5", "--effort", "high",
+            "--permission-mode", "plan", "Review exact committed change",
+        ]
+        prepared = PreparedSandboxCommand(
+            command=("/opt/grabowski-external/claude", *declared[1:]),
+        )
+        raw_diff = b"diff --git a/a.py b/a.py\n+interesting_but_untrusted\n"
+        with (
+            mock.patch.object(role, "prepare_external_agent_command",
+                              return_value=prepared) as prepare,
+            mock.patch.object(role, "sandbox_argv",
+                              return_value=["read-only-sandbox"]) as sandbox,
+        ):
+            argv, contract, stdin = role._review_sandbox_argv(
+                repo, declared, expected_head="a" * 40,
+                expected_base_head="b" * 40, review_diff=raw_diff,
+            )
+        self.assertEqual(["read-only-sandbox"], argv)
+        self.assertEqual(role.CLAUDE_REVIEW_JSON_CONTRACT, contract)
+        self.assertIsInstance(stdin, bytes)
+        self.assertIn(b"interesting_but_untrusted", stdin)
+        self.assertIn(b"a" * 40, stdin)
+        self.assertIn(b"b" * 40, stdin)
+        self.assertIn(hashlib.sha256(raw_diff).hexdigest().encode(), stdin)
+        self.assertIn(b"do not use any external tool", stdin.lower())
+        self.assertIn(b"cli-internal structuredoutput", stdin.lower())
+        prepare.assert_called_once_with(declared)
+        self.assertEqual(declared, sandbox.call_args.kwargs["declared_command"])
+        actual = sandbox.call_args.args[1]
+        self.assertEqual("/opt/grabowski-external/claude", actual[0])
+        self.assertIn("-p", actual)
+        self.assertEqual(1, actual.count("-p"))
+        self.assertEqual("2", actual[actual.index("--max-turns") + 1])
+        self.assertIn("exact", actual[-1].lower())
+        self.assertIn("stdin", actual[-1].lower())
+        self.assertNotEqual(declared[-1], actual[-1])
+        self.assertEqual("json", actual[actual.index("--output-format") + 1])
+        self.assertEqual("plan", actual[actual.index("--permission-mode") + 1])
+        schema = json.loads(actual[actual.index("--json-schema") + 1])
+        self.assertEqual(["PASS", "NEEDS_CHANGE", "BLOCK"],
+                         schema["properties"]["verdict"]["enum"])
+        self.assertEqual(["verdict", "findings"], schema["required"])
+        for flag in ("--tools=", "--no-session-persistence", "--safe-mode"):
+            self.assertIn(flag, actual)
+        self.assertEqual("mcp__*", actual[actual.index("--disallowedTools") + 1])
+        self.assertNotIn("Review exact committed change", actual)
+        self.assertNotIn("interesting_but_untrusted", " ".join(actual))
+
+    def test_claude_fable_review_route_accepts_registered_cli_shape(self) -> None:
+        repo = Path("/tmp/claude-review-worktree")
+        declared = [
+            "claude", "-p", "--safe-mode", "--permission-mode", "plan",
+            "--model", "claude-fable-5", "--effort", "high",
+            "Review only the exact current revision",
+        ]
+        prepared = PreparedSandboxCommand(
+            command=("/opt/grabowski-external/claude", *declared[1:]),
+        )
+        frozen = b"diff --git a/a.py b/a.py\n+safe only\n"
+        with (
+            mock.patch.object(role, "prepare_external_agent_command",
+                              return_value=prepared) as prepare,
+            mock.patch.object(role, "sandbox_argv",
+                              return_value=["read-only-sandbox"]) as sandbox,
+        ):
+            argv, contract, stdin = role._review_sandbox_argv(
+                repo, declared, expected_head="a" * 40,
+                expected_base_head="b" * 40, review_diff=frozen,
+            )
+        self.assertEqual(["read-only-sandbox"], argv)
+        self.assertEqual(role.CLAUDE_REVIEW_JSON_CONTRACT, contract)
+        self.assertIn(frozen, stdin)
+        prepare.assert_called_once_with(declared)
+        actual = sandbox.call_args.args[1]
+        self.assertEqual(declared, sandbox.call_args.kwargs["declared_command"])
+        self.assertEqual(1, actual.count("-p"))
+        self.assertEqual(1, actual.count("--safe-mode"))
+        self.assertEqual("claude-fable-5", actual[actual.index("--model") + 1])
+        self.assertEqual("high", actual[actual.index("--effort") + 1])
+        self.assertEqual("plan", actual[actual.index("--permission-mode") + 1])
+        self.assertEqual("2", actual[actual.index("--max-turns") + 1])
+        self.assertIn("stdin", actual[-1].lower())
+        self.assertNotIn("safe only", " ".join(actual))
+        self.assertEqual("mcp__*", actual[actual.index("--disallowedTools") + 1])
+
+    def test_claude_review_denies_external_tools_but_not_internal_structured_output(self) -> None:
+        """The restricted reviewer must not globally deny its own JSON-schema tool."""
+        routes = (
+            (
+                "/opt/grabowski-external/claude", "--model", "claude-opus-5-5",
+                "--effort", "high", "--permission-mode", "plan", "Review exact diff",
+            ),
+            (
+                "/opt/grabowski-external/claude", "-p", "--safe-mode",
+                "--permission-mode", "plan", "--model", "claude-fable-5",
+                "--effort", "high", "Review exact diff",
+            ),
+        )
+        for declared in routes:
+            with self.subTest(model=declared):
+                actual, stdin = role._claude_json_review_command(
+                    declared, expected_head="a" * 40,
+                    expected_base_head="b" * 40, review_diff=b"diff --git a/a b/a\n",
+                )
+                self.assertEqual("mcp__*", actual[actual.index("--disallowedTools") + 1])
+                self.assertNotIn("*", actual)
+                self.assertIn("--tools=", actual)
+                self.assertIn("--safe-mode", actual)
+                self.assertIn("--no-session-persistence", actual)
+                self.assertEqual("plan", actual[actual.index("--permission-mode") + 1])
+                self.assertEqual("2", actual[actual.index("--max-turns") + 1])
+                self.assertEqual("json", actual[actual.index("--output-format") + 1])
+                schema = json.loads(actual[actual.index("--json-schema") + 1])
+                self.assertEqual(["verdict", "findings"], schema["required"])
+                self.assertIn(b"BEGIN UNTRUSTED REVIEW INPUT", stdin)
+                self.assertNotIn("Review exact diff", " ".join(actual))
+
+    def test_claude_review_preserves_invalid_structured_output_denial(self) -> None:
+        """Permission-denied StructuredOutput cannot masquerade as a PASS."""
+        denied = {
+            "type": "result", "subtype": "error_max_turns", "is_error": True,
+            "structured_output": None,
+            "permission_denials": [{
+                "tool_name": "StructuredOutput",
+                "tool_input": {"verdict": "PASS", "findings": []},
+            }],
+        }
+        result, error, _metadata = role._extract_claude_review_document(
+            json.dumps(denied).encode("utf-8")
+        )
+        self.assertIsNone(result)
+        self.assertIsNotNone(error)
+
+    def test_claude_review_bound_input_rejects_unsafe_or_oversized_diff(self) -> None:
+        command = (
+            "/opt/grabowski-external/claude", "--model", "claude-opus-5-5",
+            "--effort", "high", "--permission-mode", "plan",
+            "Review only the exact diff",
+        )
+        for content, reason in (
+            (b"\xff", "UTF-8"),
+            (b"x" * (role.MAX_CLAUDE_REVIEW_INPUT_BYTES + 1), "exceeds"),
+        ):
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    role._claude_json_review_command(
+                        command, expected_head="a" * 40,
+                        expected_base_head="b" * 40, review_diff=content,
+                    )
+
+    @staticmethod
+    def _clean_claude_success_envelope() -> dict:
+        """Document the observed successful-review metadata contract."""
+        return {
+            "type": "result", "subtype": "success", "is_error": False,
+            "permission_denials": [],
+            "usage": {"server_tool_use": {
+                "web_search_requests": 0, "web_fetch_requests": 0,
+            }},
+            "modelUsage": {"claude-opus-5-5": {
+                "inputTokens": 120, "outputTokens": 30, "webSearchRequests": 0,
+            }},
+            "subagent_stats": {
+                "spawned": 0,
+                "started_in_background": 0, "max_depth": 0,
+                "spawned_by_subagents": 0, "completed": 0, "failed": 0,
+                "killed": {"parent": 0, "user": 0, "system": 0},
+                "requested": {"background": 0, "foreground": 0, "unset": 0},
+                "refused": {
+                    "depth_limit": 0, "concurrency_limit": 0, "budget": 0,
+                },
+            },
+            "structured_output": {"verdict": "PASS", "findings": []},
+        }
+
+    def test_claude_result_requires_successful_typed_envelope(self) -> None:
+        clean = self._clean_claude_success_envelope()
+        review, error, metadata = role._extract_claude_review_document(
+            json.dumps(clean).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual({"verdict": "PASS", "findings": []}, json.loads(review))
+        self.assertEqual(role.CLAUDE_REVIEW_JSON_CONTRACT,
+                         metadata["review_provider_contract"])
+        valid_empty_denials, valid_error, _ = role._extract_claude_review_document(
+            json.dumps({**clean, "permission_denials": []}).encode()
+        )
+        self.assertIsNone(valid_error)
+        self.assertEqual({"verdict": "PASS", "findings": []},
+                         json.loads(valid_empty_denials))
+        for malformed in (
+            json.dumps({**clean, "permission_denials": [
+                {"tool_name": "Bash", "tool_input": {"command": "disallowed"}}
+            ]}).encode(),
+            json.dumps({**clean, "permission_denials": "none"}).encode(),
+            json.dumps({**clean, "permission_denials": {}}).encode(),
+            b"not-json",
+            b'{"verdict":"PASS","findings":[]}',
+            json.dumps({**clean, "is_error": True}).encode(),
+            json.dumps({**clean, "subtype": "error"}).encode(),
+            json.dumps({**clean, "structured_output": []}).encode(),
+            json.dumps({**clean, "structured_output": {
+                "verdict": "PASS", "findings": [], "extra": "forged",
+            }}).encode(),
+        ):
+            with self.subTest(malformed=malformed[:45]):
+                document, rejected, _meta = role._extract_claude_review_document(
+                    malformed
+                )
+                self.assertIsNone(document)
+                self.assertIsNotNone(rejected)
+
+    def test_claude_result_rejects_server_web_and_subagent_activity(self) -> None:
+        """Change one counter in a complete success envelope; assert the rejection cause."""
+        base = self._clean_claude_success_envelope()
+        document, error, _ = role._extract_claude_review_document(
+            json.dumps(base).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(base["structured_output"], json.loads(document))
+
+        server_error = "Claude review reports forbidden server tool activity"
+        model_error = "Claude review reports forbidden model web activity"
+        agent_error = "Claude review subagent evidence is missing or nonzero"
+        forbidden = (
+            (("usage", "server_tool_use", "web_search_requests"), 1, server_error),
+            (("usage", "server_tool_use", "web_fetch_requests"), 1, server_error),
+            (("usage", "server_tool_use", "code_execution_requests"), 1, server_error),
+            (("usage", "server_tool_use", "code_execution_requests"), True, server_error),
+            (("usage", "server_tool_use", "code_execution_requests"), "0", server_error),
+            (("usage", "server_tool_use", "web_search_requests"), True, server_error),
+            (("usage", "server_tool_use", "web_fetch_requests"), "0", server_error),
+            (("modelUsage", "claude-opus-5-5", "webSearchRequests"), 1, model_error),
+            (("modelUsage", "claude-opus-5-5", "webFetchRequests"), 1, model_error),
+            (("modelUsage", "claude-opus-5-5", "webFetchRequests"), True, model_error),
+            (("modelUsage", "claude-opus-5-5", "webFetchRequests"), "0", model_error),
+            (("modelUsage", "claude-opus-5-5", "webSearchRequests"), "0", model_error),
+            (("modelUsage", "claude-opus-5-5", "codeExecutionRequests"), 1, model_error),
+            (("modelUsage", "claude-opus-5-5", "codeExecutionRequests"), True, model_error),
+            (("modelUsage", "claude-opus-5-5", "codeExecutionRequests"), "0", model_error),
+            (("subagent_stats", "spawned"), 1, agent_error),
+            (("subagent_stats", "spawned"), -1, agent_error),
+        )
+        for keys, invalid_value, expected_error in forbidden:
+            with self.subTest(keys=keys, invalid_value=invalid_value):
+                modified = json.loads(json.dumps(base))
+                target = modified
+                for key in keys[:-1]:
+                    target = target[key]
+                target[keys[-1]] = invalid_value
+                self.assertTrue(
+                    {"web_search_requests", "web_fetch_requests"}.issubset(
+                        modified["usage"]["server_tool_use"]
+                    )
+                )
+                self.assertEqual(
+                    120, modified["modelUsage"]["claude-opus-5-5"]["inputTokens"]
+                )
+                document, rejected, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(document)
+                self.assertEqual(expected_error, rejected)
+
+    def test_claude_result_rejects_attempted_or_refused_subagents(self) -> None:
+        """CLI 2.1.285: spawned=0 excludes neither requested nor refused attempts."""
+        clean = self._clean_claude_success_envelope()
+        attempt_error = "Claude review subagent attempt evidence is missing or nonzero"
+        stats = clean["subagent_stats"]
+        accepted, error, _ = role._extract_claude_review_document(
+            json.dumps(clean).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(clean["structured_output"], json.loads(accepted))
+
+        # Unknown future activity counters are admitted only as typed zeros.
+        for category in ("requested", "refused"):
+            future_zero = {
+                **clean,
+                "subagent_stats": {
+                    **stats,
+                    category: {**stats[category], "future_counter": 0},
+                },
+            }
+            document, rejected, _ = role._extract_claude_review_document(
+                json.dumps(future_zero).encode()
+            )
+            self.assertIsNone(rejected)
+            self.assertEqual(clean["structured_output"], json.loads(document))
+
+        for category in ("requested", "refused"):
+            required = stats[category]
+            for key in (*required, "future_counter"):
+                for invalid_value in (1, -1, True, "0"):
+                    with self.subTest(category=category, key=key, value=invalid_value):
+                        modified = {
+                            **clean,
+                            "subagent_stats": {
+                                **stats,
+                                category: {**required, key: invalid_value},
+                            },
+                        }
+                        document, rejected, _ = role._extract_claude_review_document(
+                            json.dumps(modified).encode()
+                        )
+                        self.assertIsNone(document)
+                        self.assertEqual(attempt_error, rejected)
+
+            for missing_key in required:
+                with self.subTest(category=category, missing_key=missing_key):
+                    modified = {
+                        **clean,
+                        "subagent_stats": {
+                            **stats,
+                            category: {
+                                key: value for key, value in required.items()
+                                if key != missing_key
+                            },
+                        },
+                    }
+                    document, rejected, _ = role._extract_claude_review_document(
+                        json.dumps(modified).encode()
+                    )
+                    self.assertIsNone(document)
+                    self.assertEqual(attempt_error, rejected)
+
+            for invalid in (None, False, 0, "0", [], {}):
+                with self.subTest(category=category, malformed=invalid):
+                    modified = {
+                        **clean,
+                        "subagent_stats": {**stats, category: invalid},
+                    }
+                    document, rejected, _ = role._extract_claude_review_document(
+                        json.dumps(modified).encode()
+                    )
+                    self.assertIsNone(document)
+                    self.assertEqual(attempt_error, rejected)
+
+            missing = {key: value for key, value in stats.items() if key != category}
+            document, rejected, _ = role._extract_claude_review_document(
+                json.dumps({**clean, "subagent_stats": missing}).encode()
+            )
+            self.assertIsNone(document)
+            self.assertEqual(attempt_error, rejected)
+
+    def test_claude_result_rejects_all_subagent_activity_counters(self) -> None:
+        """CLI 2.1.285 reports activity beyond spawned, requested and refused."""
+        base = self._clean_claude_success_envelope()
+        complete, error, _ = role._extract_claude_review_document(
+            json.dumps(base).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(base["structured_output"], json.loads(complete))
+        expected_error = "Claude review subagent evidence is missing or nonzero"
+        scalars = (
+            "started_in_background", "max_depth", "spawned_by_subagents",
+            "completed", "failed",
+        )
+        for key in scalars:
+            for invalid in (1, -1, True, "0"):
+                with self.subTest(scalar=key, invalid=invalid):
+                    modified = json.loads(json.dumps(base))
+                    modified["subagent_stats"][key] = invalid
+                    document, rejected, _ = role._extract_claude_review_document(
+                        json.dumps(modified).encode()
+                    )
+                    self.assertIsNone(document)
+                    self.assertEqual(expected_error, rejected)
+            with self.subTest(missing_scalar=key):
+                modified = json.loads(json.dumps(base))
+                del modified["subagent_stats"][key]
+                document, rejected, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(document)
+                self.assertEqual(expected_error, rejected)
+
+        for key in ("parent", "user", "system", "future_counter"):
+            for invalid in (1, -1, True, "0"):
+                with self.subTest(killed=key, invalid=invalid):
+                    modified = json.loads(json.dumps(base))
+                    modified["subagent_stats"]["killed"][key] = invalid
+                    document, rejected, _ = role._extract_claude_review_document(
+                        json.dumps(modified).encode()
+                    )
+                    self.assertIsNone(document)
+                    self.assertEqual(expected_error, rejected)
+
+        for key in ("parent", "user", "system"):
+            with self.subTest(missing_killed=key):
+                modified = json.loads(json.dumps(base))
+                del modified["subagent_stats"]["killed"][key]
+                document, rejected, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(document)
+                self.assertEqual(expected_error, rejected)
+        for invalid in (None, True, 0, "0", [], {}):
+            with self.subTest(killed_shape=invalid):
+                modified = json.loads(json.dumps(base))
+                modified["subagent_stats"]["killed"] = invalid
+                document, rejected, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(document)
+                self.assertEqual(expected_error, rejected)
+
+        # by_type is optional for zero spawns in the original CLI initializer.
+        for invalid in (
+            {"Explore": 1}, {"Explore": -1}, {"Explore": True},
+            {"Explore": "0"}, None, False, 1, [],
+        ):
+            with self.subTest(by_type=invalid):
+                modified = json.loads(json.dumps(base))
+                modified["subagent_stats"]["by_type"] = invalid
+                document, rejected, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(document)
+                self.assertEqual(expected_error, rejected)
+
+        # Unknown top-level counters must not silently create a false PASS.
+        for invalid in (1, -1, True, "0", {"nested_counter": 0}):
+            with self.subTest(unknown_counter=invalid):
+                modified = json.loads(json.dumps(base))
+                modified["subagent_stats"]["future_activity_counter"] = invalid
+                document, rejected, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(document)
+                self.assertEqual(expected_error, rejected)
+
+        # Current and future typed-zero fields remain compatible.
+        for valid_extra in (
+            {"by_type": {}},
+            {"by_type": {"Explore": 0}},
+            {"future_activity_counter": 0},
+            {"killed": {
+                **base["subagent_stats"]["killed"], "future_counter": 0,
+            }},
+        ):
+            with self.subTest(valid_extra=valid_extra):
+                modified = json.loads(json.dumps(base))
+                modified["subagent_stats"].update(valid_extra)
+                document, accepted_error, _ = role._extract_claude_review_document(
+                    json.dumps(modified).encode()
+                )
+                self.assertIsNone(accepted_error)
+                self.assertEqual(base["structured_output"], json.loads(document))
+
+    def test_claude_result_requires_explicit_zero_activity_proof(self) -> None:
+        """Missing fields must not be promoted to tool-free execution."""
+        complete = self._clean_claude_success_envelope()
+        for missing in (
+            "permission_denials", "usage", "modelUsage", "subagent_stats",
+        ):
+            with self.subTest(missing=missing):
+                incomplete = {
+                    key: value for key, value in complete.items()
+                    if key != missing
+                }
+                document, error, _ = role._extract_claude_review_document(
+                    json.dumps(incomplete).encode()
+                )
+                self.assertIsNone(document)
+                self.assertIsNotNone(error)
+        for incomplete in (
+            {**complete, "usage": {"server_tool_use": {}}},
+            {**complete, "usage": {"server_tool_use": {
+                "web_search_requests": 0,
+            }}},
+            {**complete, "modelUsage": {
+                "claude-opus-5-5": {},
+            }},
+            {**complete, "subagent_stats": {}},
+        ):
+            with self.subTest(incomplete=incomplete):
+                document, error, _ = role._extract_claude_review_document(
+                    json.dumps(incomplete).encode()
+                )
+                self.assertIsNone(document)
+                self.assertIsNotNone(error)
+
+        # Newly introduced activity counters may be present but must be zero.
+        future_zero = {
+            **complete, "usage": {"server_tool_use": {
+                **complete["usage"]["server_tool_use"],
+                "code_execution_requests": 0,
+            }},
+        }
+        document, error, _ = role._extract_claude_review_document(
+            json.dumps(future_zero).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(complete["structured_output"], json.loads(document))
+
+    def test_claude_structured_findings_revalidated_locally(self) -> None:
+        valid_finding = {
+            "severity": "P2", "path": "src/role.py", "line": 12,
+            "evidence": "Concrete broken trust boundary",
+            "impact": "Incorrect irreversible reviewer receipt",
+            "minimal_fix": "Validate the exact finding fields before signing",
+        }
+        envelope = {
+            **self._clean_claude_success_envelope(),
+            "structured_output": {
+                "verdict": "NEEDS_CHANGE", "findings": [valid_finding],
+            },
+        }
+        document, error, _meta = role._extract_claude_review_document(
+            json.dumps(envelope).encode()
+        )
+        self.assertIsNone(error)
+        self.assertEqual(envelope["structured_output"], json.loads(document))
+        mutations = (
+            {},
+            {**valid_finding, "extra": "forged"},
+            {**valid_finding, "severity": "P0"},
+            {**valid_finding, "severity": []},
+            {**valid_finding, "line": 0},
+            {**valid_finding, "line": True},
+            {**valid_finding, "line": "12"},
+            {**valid_finding, "path": " "},
+            {**valid_finding, "evidence": ""},
+            {**valid_finding, "impact": " "},
+            {**valid_finding, "minimal_fix": ""},
+        )
+        for invalid in mutations:
+            with self.subTest(invalid=invalid):
+                payload = {
+                    **envelope,
+                    "structured_output": {
+                        "verdict": "BLOCK", "findings": [invalid],
+                    },
+                }
+                result, failure, _meta = role._extract_claude_review_document(
+                    json.dumps(payload).encode()
+                )
+                self.assertIsNone(result)
+                self.assertIsNotNone(failure)
+        for payload in (
+            {"verdict": "PASS", "findings": [valid_finding]},
+            {"verdict": "BLOCK", "findings": []},
+            {"verdict": "PENDING", "findings": []},
+            {"verdict": [], "findings": []},
+            {"verdict": {}, "findings": []},
+            {"verdict": "PASS", "findings": {}},
+        ):
+            with self.subTest(payload=payload):
+                result, failure, _meta = role._extract_claude_review_document(
+                    json.dumps({
+                        **envelope, "structured_output": payload,
+                    }).encode()
+                )
+                self.assertIsNone(result)
+                self.assertIsNotNone(failure)
+
+    def test_claude_review_selects_only_the_bound_route(self) -> None:
+        # Provider selection grants no authority to pass caller-supplied review text.
+        # Dirty Claude still requires the verified frozen-writer artifact.
+        source = [
+            "claude", "--model", "claude-opus-5-5", "--effort", "high",
+            "--permission-mode", "plan", "Please review the current draft",
+        ]
+        self.assertTrue(role._is_claude_review_route(source))
+        self.assertFalse(role._is_claude_review_route(["grok"]))
+
+    def test_dirty_claude_main_uses_same_verified_patch_as_grok(self) -> None:
+        head, base, binding = "a" * 40, "b" * 40, "c" * 64
+        patch = b"diff --git a/app.py b/app.py\n+frozen writer change\n"
+        envelope = json.dumps(self._clean_claude_success_envelope()).encode()
+        completed = SimpleNamespace(
+            returncode=0, stdout_sha256=hashlib.sha256(envelope).hexdigest(),
+            stderr_sha256=hashlib.sha256(b"").hexdigest(),
+            stdout_bytes=len(envelope), stderr_bytes=0,
+            stdout_tail="", stderr_tail="",
+            output_limit_exceeded=False, stdout_content_exceeded=False,
+            stdout_content=envelope,
+        )
+        routes = (
+            ("claude", "--model", "claude-opus-5-5", "--effort", "high",
+             "--permission-mode", "plan", "Review the frozen change"),
+            ("claude", "-p", "--safe-mode", "--permission-mode", "plan",
+             "--model", "claude-fable-5", "--effort", "high", "Review the frozen change"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "gaw-b2345678"
+            workspace.mkdir(mode=0o700)
+            artifact = workspace / "writer.patch"
+            artifact.write_bytes(patch)
+            os.chmod(artifact, 0o600)
+            sha = hashlib.sha256(patch).hexdigest()
+            for index, command in enumerate(routes):
+                with (
+                    self.subTest(command=command),
+                    mock.patch.dict(os.environ, {}, clear=True),
+                    mock.patch.object(role, "current_binding",
+                                      side_effect=[(head, binding, True)] * 2),
+                    mock.patch.object(role, "committed_diff") as committed,
+                    mock.patch.object(
+                        role, "_review_sandbox_argv",
+                        return_value=(["sandbox"], role.CLAUDE_REVIEW_JSON_CONTRACT, b"stdin"),
+                    ) as sandbox,
+                    mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                    mock.patch.object(role, "run_bounded_capture", return_value=completed),
+                ):
+                    receipt_path = root / f"review-{index}.json"
+                    self.assertEqual(role.main([
+                        "--role", "review", "--repository", str(ROOT),
+                        "--expected-head", head, "--expected-base-head", base,
+                        "--expected-diff-sha256", binding,
+                        "--expected-dirty", "true",
+                        "--review-input-root", str(root),
+                        "--review-input-path", str(artifact),
+                        "--review-input-sha256", sha,
+                        "--output", str(receipt_path), "--", *command,
+                    ]), 0)
+                    committed.assert_not_called()
+                    self.assertEqual(patch, sandbox.call_args.kwargs["review_diff"])
+                    self.assertEqual(
+                        "frozen_writer_patch", sandbox.call_args.kwargs["review_input_source"]
+                    )
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    self.assertEqual("frozen_writer_patch", receipt["review_input_source"])
+                    self.assertEqual(sha, receipt["review_input_sha256"])
+                    self.assertEqual("PASS", receipt["verdict"])
+
+    def test_dirty_claude_invalid_patch_hash_blocks_before_provider(self) -> None:
+        head, base, binding = "a" * 40, "b" * 40, "c" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "gaw-b2345678"
+            workspace.mkdir(mode=0o700)
+            artifact = workspace / "writer.patch"
+            artifact.write_bytes(b"diff --git a/file b/file\n+safe input\n")
+            os.chmod(artifact, 0o600)
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(role, "current_binding", return_value=(head, binding, True)),
+                mock.patch.object(role, "_review_sandbox_argv") as sandbox,
+                mock.patch.object(role, "run_bounded_capture") as execute,
+                self.assertRaisesRegex(RuntimeError, "SHA-256 mismatch"),
+            ):
+                role.main([
+                    "--role", "review", "--repository", str(ROOT),
+                    "--expected-head", head, "--expected-base-head", base,
+                    "--expected-diff-sha256", binding, "--expected-dirty", "true",
+                    "--review-input-root", str(root),
+                    "--review-input-path", str(artifact),
+                    "--review-input-sha256", "0" * 64,
+                    "--output", str(root / "invalid.json"), "--",
+                    "claude", "--model", "claude-opus-5-5",
+                    "--effort", "high", "--permission-mode", "plan", "Review this",
+                ])
+            sandbox.assert_not_called()
+            execute.assert_not_called()
+
+    def test_clean_claude_rejects_unexpected_frozen_patch(self) -> None:
+        head, base, binding = "a" * 40, "b" * 40, "c" * 64
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(role, "current_binding", return_value=(head, binding, False)),
+            mock.patch.object(role, "committed_diff") as committed,
+            mock.patch.object(role, "_review_sandbox_argv") as sandbox,
+            self.assertRaisesRegex(RuntimeError, "clean Claude review"),
+        ):
+            role.main([
+                "--role", "review", "--repository", str(ROOT),
+                "--expected-head", head, "--expected-base-head", base,
+                "--expected-diff-sha256", binding, "--expected-dirty", "false",
+                "--review-input-root", "/tmp/gaw-root",
+                "--review-input-path", "/tmp/gaw-root/gaw-b2345678/writer.patch",
+                "--review-input-sha256", "d" * 64,
+                "--output", "/tmp/claude-clean-unexpected-artifact.json", "--",
+                "claude", "--model", "claude-opus-5-5",
+                "--effort", "high", "--permission-mode", "plan", "Review this",
+            ])
+        committed.assert_not_called()
+        sandbox.assert_not_called()
+
+    def test_claude_prompt_identifies_frozen_patch_not_committed_diff(self) -> None:
+        declared = (
+            "/opt/grabowski-external/claude", "--model", "claude-opus-5-5",
+            "--effort", "high", "--permission-mode", "plan", "Review exact input",
+        )
+        diff = b"diff --git a/f b/f\n+frozen\n"
+        actual, prompt = role._claude_json_review_command(
+            declared, expected_head="a" * 40, expected_base_head="b" * 40,
+            review_diff=diff, review_input_source="frozen_writer_patch",
+        )
+        self.assertIn(b"verified frozen writer patch", prompt)
+        self.assertNotIn(b"committed Git diff", prompt)
+        self.assertIn(hashlib.sha256(diff).hexdigest().encode(), prompt)
+        self.assertIn(b"frozen", prompt)
+        self.assertNotIn("frozen", " ".join(actual))
+        self.assertIn("review input", actual[-1].lower())
+        self.assertNotIn("git diff", actual[-1].lower())
+        with self.assertRaisesRegex(RuntimeError, "source"):
+            role._claude_json_review_command(
+                declared, expected_head="a" * 40, expected_base_head="b" * 40,
+                review_diff=diff, review_input_source="caller_supplied_text",
+            )
+
+    def test_claude_main_emits_job_bound_receipt_from_success_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            unit = "grabowski-job-a11111111111"
+            directory = Path(temporary) / unit
+            directory.mkdir(mode=0o700)
+            output = directory / role.REVIEW_ATTEMPT_RECEIPT_NAME
+            head, base, workspace = "a" * 40, "b" * 40, "c" * 64
+            frozen_diff = b"diff --git a/source b/source\\n+only reviewed bytes\\n"
+            prompt = b"exact immutable review input"
+            envelope = json.dumps(self._clean_claude_success_envelope()).encode()
+            completed = SimpleNamespace(
+                returncode=0,
+                stdout_sha256=hashlib.sha256(envelope).hexdigest(),
+                stderr_sha256=hashlib.sha256(b"").hexdigest(),
+                stdout_bytes=len(envelope), stderr_bytes=0,
+                stdout_tail="", stderr_tail="",
+                output_limit_exceeded=False, stdout_content_exceeded=False,
+                stdout_content=envelope,
+            )
+            environment = {
+                "GRABOWSKI_REVIEW_ATTEMPT_UNIT": unit,
+                "GRABOWSKI_JOB_UNIT": unit,
+                "GRABOWSKI_JOB_ID": "a11111111111",
+                "GRABOWSKI_JOB_ORIGIN_SHA256": "d" * 64,
+                "GRABOWSKI_JOB_DIRECTORY": str(directory),
+            }
+            with (
+                mock.patch.dict(os.environ, environment),
+                mock.patch.object(
+                    role, "current_binding",
+                    side_effect=[(head, workspace, False)] * 2,
+                ),
+                mock.patch.object(
+                    role, "committed_diff", return_value=frozen_diff
+                ) as committed,
+                mock.patch.object(
+                    role, "_review_sandbox_argv",
+                    return_value=(["sandbox"], role.CLAUDE_REVIEW_JSON_CONTRACT, prompt),
+                ),
+                mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                mock.patch.object(
+                    role, "run_bounded_capture", return_value=completed
+                ) as execute,
+            ):
+                self.assertEqual(role.main([
+                    "--role", "review", "--repository", str(ROOT),
+                    "--expected-head", head,
+                    "--expected-base-head", base,
+                    "--expected-diff-sha256", workspace,
+                    "--expected-dirty", "false",
+                    "--output", str(output), "--",
+                    "claude", "--model", "claude-opus-5-5",
+                    "--effort", "high", "--permission-mode", "plan",
+                    "Review only the exact frozen Git diff",
+                ]), 0)
+            committed.assert_called_once_with(ROOT, base, head)
+            self.assertEqual(prompt, execute.call_args.kwargs["stdin_content"])
+            receipt = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual("PASS", receipt["verdict"])
+            self.assertEqual([], receipt["findings"])
+            self.assertEqual("passed", receipt["failure_classification"])
+            self.assertEqual(unit, receipt["review_attempt_unit"])
+            self.assertEqual("d" * 64, receipt["review_attempt_origin_sha256"])
+            self.assertEqual("committed_diff", receipt["review_input_source"])
+            self.assertEqual(
+                hashlib.sha256(frozen_diff).hexdigest(),
+                receipt["review_input_sha256"],
+            )
+            self.assertEqual(
+                hashlib.sha256(prompt).hexdigest(),
+                receipt["review_prompt_sha256"],
+            )
+            self.assertEqual(role.CLAUDE_REVIEW_JSON_CONTRACT,
+                             receipt["review_provider_contract"])
+            self.assertEqual(receipt["receipt_sha256"], role.digest({
+                k: v for k, v in receipt.items() if k != "receipt_sha256"
+            }))
+
+    def test_claude_main_refuses_dirty_source_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "denied.json"
+            head, base, workspace = "a" * 40, "b" * 40, "c" * 64
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch.object(
+                    role, "current_binding",
+                    return_value=(head, workspace, True),
+                ),
+                mock.patch.object(role, "committed_diff") as frozen,
+                mock.patch.object(role, "_review_sandbox_argv") as sandbox,
+                mock.patch.object(role, "run_bounded_capture") as execute,
+                self.assertRaisesRegex(RuntimeError, "requires the frozen writer patch artifact"),
+            ):
+                role.main([
+                    "--role", "review", "--repository", str(ROOT),
+                    "--expected-head", head,
+                    "--expected-base-head", base,
+                    "--expected-diff-sha256", workspace,
+                    "--expected-dirty", "true",
+                    "--output", str(output), "--",
+                    "claude", "--model", "claude-opus-5-5",
+                    "--effort", "high", "--permission-mode", "plan",
+                    "Review only the exact frozen Git diff",
+                ])
+            frozen.assert_not_called()
+            sandbox.assert_not_called()
+            execute.assert_not_called()
+            self.assertFalse(output.exists())
 
     def test_codex_review_sandbox_inserts_exec_without_changing_declared_command(self) -> None:
         repo = Path("/tmp/repo")

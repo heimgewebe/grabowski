@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sys
+import types
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -691,6 +693,60 @@ class OperatorOptimizationReportTests(unittest.TestCase):
         )
         self.assertTrue(result["source_health"]["bounded_source_set_complete"])
         self.assertTrue(result["source_health"]["complete"])
+
+    def diagnostic_report(self, provider=None) -> dict:
+        return optimization.build_operator_optimization_report(
+            [REPOSITORY],
+            now_unix=1_785_220_000,
+            health_provider=provider,
+            audit_provider=audit_provider,
+            friction_provider=friction_provider,
+            outcome_provider=outcome_provider,
+            current_work_provider=current_work_provider,
+        )
+
+    def test_default_integrity_provider_preserves_degraded_status(self) -> None:
+        diagnostic = Mock(return_value={
+            "healthy": False,
+            "runtime": {"release_id": "bad-release", "repo_head": "b" * 40},
+        })
+        liveness = Mock(return_value={"healthy": True, "integrity_evaluated": False})
+        with patch.dict(sys.modules, {
+            "grabowski_mcp": types.SimpleNamespace(grabowski_status=diagnostic),
+            "grabowski_read_surface": types.SimpleNamespace(grabowski_runtime_health=liveness),
+        }):
+            result = self.diagnostic_report()
+        diagnostic.assert_called_once_with(view="minimal")
+        liveness.assert_not_called()
+        self.assertFalse(result["source_health"]["runtime_healthy"])
+        self.assertIn("runtime_health_degraded", {item["id"] for item in result["findings"]})
+
+    def test_injected_liveness_cannot_establish_runtime_integrity(self) -> None:
+        for metadata in (
+            {"integrity_evaluated": False},
+            {"health_scope": "mcp_tool_dispatch"},
+        ):
+            with self.subTest(metadata=metadata):
+                result = self.diagnostic_report(lambda: {"healthy": True, **metadata})
+                self.assertIsNone(result["source_health"]["runtime_healthy"])
+                self.assertFalse(result["source_health"]["runtime_available"])
+                self.assertFalse(result["source_health"]["complete"])
+                self.assertIn("runtime_integrity_not_evaluated", {
+                    warning["code"] for warning in result["warnings"]
+                })
+
+    def test_default_integrity_diagnostic_failure_remains_unknown(self) -> None:
+        for response in ({}, {"healthy": "yes", "runtime": {}}, {"healthy": True}):
+            with self.subTest(response=response), patch.dict(sys.modules, {
+                "grabowski_mcp": types.SimpleNamespace(
+                    grabowski_status=Mock(return_value=response)
+                ),
+                "grabowski_read_surface": types.SimpleNamespace(),
+            }):
+                result = self.diagnostic_report()
+            self.assertIsNone(result["source_health"]["runtime_healthy"])
+            self.assertFalse(result["source_health"]["runtime_available"])
+            self.assertIn("source_unavailable", {item["code"] for item in result["warnings"]})
 
     def test_partial_source_failure_is_explicit_not_false_green(self) -> None:
         def broken_health() -> dict:

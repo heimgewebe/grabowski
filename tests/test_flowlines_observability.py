@@ -639,6 +639,115 @@ class FlowlinesObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.root.isError)
         self.assertEqual(self.exporter.get_finished_spans(), ())
 
+    async def test_unverified_client_user_without_session_reports_once_without_private_data(self) -> None:
+        mcp = self.server()
+        arguments = {
+            "value": "private-value-do-not-log",
+            "reason": "Reason contains private-reason-do-not-log",
+            "user_intent": "private-intent-do-not-log",
+        }
+        with self.assertLogs(flowlines.LOGGER, level="WARNING") as records:
+            for _ in range(2):
+                result = await self.call(
+                    mcp,
+                    arguments=arguments,
+                    meta={"user.id": "spoofed-test-user", "user.email": "private@example.invalid"},
+                )
+                self.assertFalse(result.root.isError)
+        self.assertEqual(self.exporter.get_finished_spans(), ())
+        self.assertEqual(len(records.output), 1)
+        self.assertIn("client_session_id_missing", records.output[0])
+        for secret in (
+            "private-value-do-not-log",
+            "private-reason-do-not-log",
+            "private-intent-do-not-log",
+            "spoofed-test-user",
+            "private@example.invalid",
+        ):
+            self.assertNotIn(secret, records.output[0])
+
+    async def test_verified_connector_without_session_emits_redacted_tool_span(self) -> None:
+        mcp = self.server(verified_resolver=lambda _ctx: {"id": "enrolled-connector"})
+        result = await self.call(
+            mcp,
+            arguments={
+                "value": "private-value-do-not-export",
+                "reason": "Read a harmless value",
+                "user_intent": "Verify stateless MCP tool telemetry",
+            },
+            meta={
+                "user.id": "spoofed-client-user",
+                "user.email": "private@example.invalid",
+            },
+        )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(
+            result.root.structuredContent, {"value": "private-value-do-not-export"}
+        )
+        spans = self.exporter.get_finished_spans()
+        self.assertEqual(len(spans), 1)
+        attrs = spans[0].attributes
+        self.assertEqual(attrs["user.id"], "enrolled-connector")
+        self.assertNotIn("session.id", attrs)
+        self.assertEqual(attrs["mcp.method.name"], "tools/call")
+        self.assertEqual(attrs["gen_ai.tool.name"], "echo")
+        for private_value in (
+            "private-value-do-not-export",
+            "spoofed-client-user",
+            "private@example.invalid",
+        ):
+            self.assertNotIn(private_value, str(attrs))
+
+    async def test_missing_verified_identity_never_admits_sessionless_span(self) -> None:
+        mcp = self.server(verified_resolver=lambda _ctx: {"id": " "})
+        result = await self.call(
+            mcp,
+            arguments={
+                "value": "hello",
+                "reason": "Read a harmless value",
+                "user_intent": "Reject unverified sessionless analytics",
+            },
+            meta={"user.id": "spoofed-client-user"},
+        )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(self.exporter.get_finished_spans(), ())
+
+    async def test_failing_diagnostic_logger_keeps_domain_call_fail_open(self) -> None:
+        mcp = self.server()
+        with mock.patch.object(
+            flowlines.LOGGER, "warning", side_effect=RuntimeError("logging transport unavailable")
+        ):
+            result = await self.call(
+                mcp,
+                arguments={
+                    "value": "hello",
+                    "reason": "Read the fixture value",
+                    "user_intent": "Verify diagnostics stay fail-open",
+                },
+                meta={},
+            )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(result.root.structuredContent, {"value": "hello"})
+        self.assertEqual(self.exporter.get_finished_spans(), ())
+
+    async def test_verified_identity_failure_reports_bounded_reason_once(self) -> None:
+        mcp = self.server(verified_resolver=lambda _ctx: (_ for _ in ()).throw(RuntimeError("private-transport-detail")))
+        with self.assertLogs(flowlines.LOGGER, level="WARNING") as records:
+            result = await self.call(
+                mcp,
+                arguments={
+                    "value": "private-value",
+                    "reason": "Check identity",
+                    "user_intent": "Verify Flowlines diagnostic",
+                },
+                meta=self.meta(),
+            )
+        self.assertFalse(result.root.isError)
+        self.assertEqual(self.exporter.get_finished_spans(), ())
+        self.assertEqual(len(records.output), 1)
+        self.assertIn("verified_connector_identity_unavailable", records.output[0])
+        self.assertNotIn("private-transport-detail", records.output[0])
+
     async def test_span_setup_failure_is_fail_open_and_calls_domain_once(self) -> None:
         calls = 0
         mcp = FastMCP("grabowski-test", instructions="fixture")
