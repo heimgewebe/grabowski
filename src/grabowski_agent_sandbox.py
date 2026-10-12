@@ -935,8 +935,12 @@ def minimal_sandbox_argv(
         ):
             raise AgentSandboxError("extra read-only source overlaps hidden workspace")
         read_only_sources.add(source)
-        if not target_value.is_absolute() or "\x00" in str(target_value):
-            raise AgentSandboxError("extra_read_only target must be absolute")
+        if (
+            not target_value.is_absolute()
+            or "\x00" in str(target_value)
+            or ".." in target_value.parts
+        ):
+            raise AgentSandboxError("extra_read_only target must be an absolute safe path")
         target = str(target_value)
         if target in seen_targets:
             raise AgentSandboxError(f"duplicate sandbox target: {target}")
@@ -981,6 +985,7 @@ def minimal_sandbox_argv(
         if (
             not target_path.is_absolute()
             or "\x00" in str(target_path)
+            or ".." in target_path.parts
             or target_path == Path("/tmp")
             or not target_path.is_relative_to(Path("/tmp"))
         ):

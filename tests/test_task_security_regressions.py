@@ -1617,6 +1617,31 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             )
 
 
+    def test_extra_mount_targets_reject_parent_traversal(self) -> None:
+        """An apparent /tmp path must not remount a protected /etc target."""
+        from pathlib import Path
+
+        worktree = self.root / "mount-target-traversal"
+        worktree.mkdir()
+        private_file = self.root / "mount-private-file"
+        private_file.write_text("private", encoding="utf-8")
+        private_file.chmod(0o600)
+        forged_target = Path("/tmp/../etc/passwd")
+        cases = (
+            ("read_only", {"extra_read_only": ((private_file, forged_target),)}),
+            ("fd_data", {"extra_read_only_data_fds": ((0, forged_target),)}),
+            ("read_write", {"extra_read_write": ((private_file, forged_target),)}),
+        )
+        for kind, extra in cases:
+            with self.subTest(kind=kind):
+                with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+                    tasks.agent_sandbox.minimal_sandbox_argv(
+                        workspace=worktree,
+                        command=["/usr/bin/true"],
+                        workspace_writable=False,
+                        **extra,
+                    )
+
     def test_opaque_home_can_be_invisible_to_real_kernel_child(self) -> None:
         """A default operator-home cwd must be hidden, not merely read-only.
 
