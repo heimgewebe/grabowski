@@ -10688,7 +10688,14 @@ def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
         except (OSError, ValueError, RuntimeError, PermissionError, TypeError):
             pass
     unverified = not local_confirmed
-    state = "observation_error" if unverified else persisted_state
+    # An explicitly unknown outcome already denotes unresolved execution truth.
+    # Preserve it for callers without allowing stored terminal or active states
+    # from unverifiable transports to masquerade as current observations.
+    state = (
+        "outcome_unknown" if unverified and persisted_state == "outcome_unknown"
+        else "observation_error" if unverified
+        else persisted_state
+    )
     mode = (
         "persisted_only_rootbroker_not_probed" if privileged
         else "persisted_only_ssh_not_probed" if transport == "ssh"
