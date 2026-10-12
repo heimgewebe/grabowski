@@ -1517,7 +1517,7 @@ def main(argv: list[str] | None = None) -> int:
     postflight_error_type: str | None = None
     try:
         after_head, after_diff, after_dirty = current_binding(repo, args.expected_base_head)
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         after_head, after_diff, after_dirty = None, None, None
         postflight_error_type = type(exc).__name__
     payload: dict[str, Any] = {

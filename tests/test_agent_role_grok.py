@@ -7,6 +7,7 @@ import multiprocessing
 import threading
 import json
 import os
+import subprocess
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -362,7 +363,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                 k: v for k, v in receipt.items() if k != "receipt_sha256"
             }))
 
-    def test_postflight_file_disappearance_seals_review_without_synthetic_pass(self) -> None:
+    def test_postflight_failures_seal_review_without_synthetic_pass(self) -> None:
         # Regression for #1418: a real semantic review may precede the race.
         finding = {
             "severity": "P1", "path": "src/security.py", "line": 44,
@@ -370,8 +371,18 @@ class GrokReviewRoleTests(unittest.TestCase):
             "impact": "A protected effect could bypass admission",
             "minimal_fix": "Bind effect-time authorization to the exact revision",
         }
-        for verdict, findings in (("PASS", []), ("NEEDS_CHANGE", [finding])):
-            with self.subTest(verdict=verdict), tempfile.TemporaryDirectory() as temporary:
+        failures = (
+            FileNotFoundError(errno.ENOENT, "No such file or directory",
+                              str(ROOT / ".browser-semantic-test-disappeared")),
+            subprocess.CalledProcessError(1, ["git", "rev-parse", "HEAD"]),
+            subprocess.TimeoutExpired(["git", "rev-parse", "HEAD"], 30),
+        )
+        for (verdict, findings), failure in (
+            ((verdict, findings), error)
+            for verdict, findings in (("PASS", []), ("NEEDS_CHANGE", [finding]))
+            for error in failures
+        ):
+            with self.subTest(verdict=verdict, failure=type(failure).__name__), tempfile.TemporaryDirectory() as temporary:
                 unit = "grabowski-job-a11111111111"
                 directory = Path(temporary) / unit
                 directory.mkdir(mode=0o700)
@@ -393,15 +404,11 @@ class GrokReviewRoleTests(unittest.TestCase):
                     "GRABOWSKI_JOB_ORIGIN_SHA256": "d" * 64,
                     "GRABOWSKI_JOB_DIRECTORY": str(directory),
                 }
-                disappeared = FileNotFoundError(
-                    errno.ENOENT, "No such file or directory",
-                    str(ROOT / ".browser-semantic-test-disappeared"),
-                )
                 with (
                     mock.patch.dict(os.environ, environment),
                     mock.patch.object(
                         role, "current_binding",
-                        side_effect=[(head, diff, False), disappeared],
+                        side_effect=[(head, diff, False), failure],
                     ),
                     mock.patch.object(role, "committed_diff", return_value=b"frozen diff"),
                     mock.patch.object(
@@ -425,7 +432,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                 self.assertEqual(result, 125)
                 receipt = json.loads(output.read_text(encoding="utf-8"))
                 self.assertEqual(receipt["failure_classification"], "writer_binding_violation")
-                self.assertEqual(receipt["postflight_error_type"], "FileNotFoundError")
+                self.assertEqual(receipt["postflight_error_type"], type(failure).__name__)
                 self.assertIsNone(receipt["head_after"])
                 self.assertIsNone(receipt["diff_after"])
                 self.assertIsNone(receipt["worktree_dirty_after"])
