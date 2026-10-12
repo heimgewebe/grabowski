@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import Counter
@@ -16286,6 +16285,8 @@ def _run_captain_runtime_deploy(
 
             release_scope = _captain_release_scope(expected_head, review_pr)
         else:
+            from contextlib import nullcontext
+
             release_scope = nullcontext()
         with release_scope:
             schedule = (
