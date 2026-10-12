@@ -27,6 +27,14 @@ TEST_AGENT_INSTRUCTIONS = (
 
 
 def load_module():
+    # Reuse an already imported deployer; replacing its module object splits
+    # security-critical exception types and low-level mock/lock identities.
+    loaded = sys.modules.get("deploy_runtime")
+    if loaded is not None:
+        origin = getattr(loaded, "__file__", None)
+        if not isinstance(origin, str) or Path(origin).resolve() != MODULE_PATH.resolve():
+            raise RuntimeError("deploy_runtime import origin drift")
+        return loaded
     spec = importlib.util.spec_from_file_location("deploy_runtime", MODULE_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError("deploy_runtime.py could not be loaded")
@@ -52,6 +60,10 @@ def _build_result(*args, **kwargs):
 
 
 class DeployRuntimeTests(unittest.TestCase):
+    def test_discovery_preserves_one_canonical_deploy_core(self) -> None:
+        self.assertIs(dual.core, deploy_runtime)
+        self.assertIs(sys.modules["deploy_runtime"], deploy_runtime)
+
     def setUp(self) -> None:
         # These are synthetic post-admission rollback/activation tests.
         # Source-changing direct-call negatives live in the dedicated
