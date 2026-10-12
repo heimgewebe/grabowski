@@ -10128,6 +10128,73 @@ class TaskTests(unittest.TestCase):
                 self.assertEqual("unpersisted_readonly_probe", public["observation_mode"])
                 self.assertEqual(before, self.database.read_bytes())
 
+    def test_local_task_peek_transport_flip_cannot_dispatch_ssh(self) -> None:
+        created = self._start()["task"]
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                side_effect=[
+                    ("local", {"transport": "local", "target": "local", "enabled": True}, False),
+                    ("remote", {"transport": "ssh", "target": "remote", "enabled": True}, False),
+                ],
+            ) as resolve,
+            patch.object(
+                tasks.operator, "_run",
+                return_value={"returncode": 0, "stdout": "", "stderr": ""},
+            ) as local,
+            patch.object(
+                tasks.fleet, "run_fleet_host",
+                side_effect=AssertionError("readonly local task peek launched SSH"),
+            ) as ssh,
+            patch.object(
+                tasks.fleet, "run_fleet_task_unit_show",
+                side_effect=AssertionError("readonly local task peek used SSH fallback"),
+            ) as fallback,
+            patch.object(tasks, "_classify_observation", return_value="completed"),
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=AssertionError("readonly local task peek mutated"),
+            ),
+        ):
+            public = tasks.grabowski_task_peek(created["task_id"])
+        resolve.assert_called_once()
+        local.assert_called_once()
+        command = local.call_args.args[0]
+        self.assertEqual(["systemctl", "--user", "show"], command[:3])
+        ssh.assert_not_called()
+        fallback.assert_not_called()
+        self.assertEqual("completed", public["state"])
+        self.assertEqual("unpersisted_readonly_probe", public["observation_mode"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_local_task_peek_never_enters_fleet_denial_fallback(self) -> None:
+        created = self._start()["task"]
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local", "target": "local", "enabled": True}, False),
+            ) as resolve,
+            patch.object(
+                tasks, "_dispatch", side_effect=tasks.fleet.FleetCommandDenied("deny")
+            ) as dispatch,
+            patch.object(
+                tasks.fleet, "run_fleet_task_unit_show",
+                side_effect=AssertionError("SSH fallback must never run"),
+            ) as fallback,
+            patch.object(
+                tasks.operator, "_run",
+                return_value={"returncode": 0, "stdout": "", "stderr": ""},
+            ) as local,
+            patch.object(tasks, "_classify_observation", return_value="completed"),
+        ):
+            public = tasks.grabowski_task_peek(created["task_id"])
+        self.assertEqual("completed", public["state"])
+        resolve.assert_called_once()
+        local.assert_called_once()
+        dispatch.assert_not_called()
+        fallback.assert_not_called()
+
     def test_remote_task_peek_never_launches_effectful_ssh(self) -> None:
         created = self._start(host="remote")["task"]
         before = self.database.read_bytes()

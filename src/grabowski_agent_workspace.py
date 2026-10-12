@@ -8308,11 +8308,33 @@ def grabowski_agent_workspace_collect(workspace_id: str) -> dict[str, Any]:
             # Task peek observes live systemd state without writing it; an
             # unobserved Rootbroker task instead requires reconciliation.
             # A persisted state mutation is not needed to block role admission.
-            existing_tasks = {
-                existing_role: _task_public(tasks_map[existing_role], read_only=True)
-                for existing_role in READ_ONLY_ROLES
-                if tasks_map.get(existing_role) is not None
-            }
+            existing_tasks: dict[str, dict[str, Any]] = {}
+            for existing_role in READ_ONLY_ROLES:
+                task_id = tasks_map.get(existing_role)
+                if task_id is None:
+                    continue
+                value = _task_public(task_id, read_only=True)
+                if (
+                    value.get("reconcile_required") is True
+                    and value.get("observation_mode") == "unpersisted_readonly_probe"
+                    and value.get("persisted_state") in {"running", "launching"}
+                    and value.get("state") in TERMINAL_TASK_STATES
+                ):
+                    # Collect is already mutation-admitted; its role-start path
+                    # rechecks this under the reentrant task mutation lock.
+                    # A *known local terminal* may now be persisted through the
+                    # ordinary status writer before admitting its sibling.
+                    # Unknown, remote and privileged outcomes remain blocked.
+                    refreshed = _task_public(task_id)
+                    if (
+                        refreshed.get("state") == value["state"]
+                        and refreshed.get("terminal") is True
+                        and refreshed.get("reconcile_required") is not True
+                    ):
+                        value = _task_public(task_id, read_only=True)
+                    else:
+                        value = refreshed
+                existing_tasks[existing_role] = value
             reconcile_roles = sorted(
                 existing_role
                 for existing_role, value in existing_tasks.items()
@@ -10696,7 +10718,7 @@ def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
         # A persisted terminal status alone cannot release live resources.
         local_terminal_probed = True
         try:
-            observation = tasks._observe(value)
+            observation = tasks._observe(value, bound_local_user=True)
             if observation.get("state") != persisted_state:
                 unverified = True
                 local_probe_error = "local systemd live state differs from persisted terminal state"

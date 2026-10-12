@@ -8662,6 +8662,98 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual("reconcile_role_task_outcome", selected)
 
+    def test_collect_quickly_completed_tests_refreshes_and_starts_review(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        manifest["tasks"]["tests"] = "tests-task"
+        workspace._write_manifest(manifest)
+        refreshed = False
+        calls = []
+        started = []
+
+        def role_status(task_id: str, *, read_only: bool = False) -> dict:
+            nonlocal refreshed
+            calls.append((task_id, read_only))
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            if task_id == "tests-task":
+                if not read_only:
+                    refreshed = True
+                    return {"task_id": task_id, "state": "completed", "terminal": True}
+                return {
+                    "task_id": task_id, "state": "completed", "terminal": True,
+                    "persisted_state": "completed" if refreshed else "running",
+                    "observation_mode": "unpersisted_readonly_probe",
+                    "reconcile_required": not refreshed,
+                }
+            if task_id == "review-task":
+                return {"task_id": task_id, "state": "running", "terminal": False}
+            raise AssertionError(f"unexpected task {task_id}")
+
+        def role_start(_manifest: dict, role: str, _snapshot: dict) -> dict:
+            started.append(role)
+            return {"task_id": "review-task"}
+
+        with (
+            mock.patch.object(workspace, "_task_public", side_effect=role_status),
+            mock.patch.object(workspace, "_start_role_task", side_effect=role_start),
+            mock.patch.object(
+                workspace, "_role_toolchain_preflight",
+                side_effect=passing_toolchain_preflight,
+            ),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            first = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+            second = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("collecting", first["state"])
+        self.assertEqual(["review"], first["started_roles"])
+        self.assertEqual("collecting", second["state"])
+        self.assertEqual(["review"], started)
+        self.assertTrue(refreshed)
+        self.assertIn(("tests-task", False), calls)
+        self.assertIn(("tests-task", True), calls)
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual("review-task", persisted["tasks"]["review"])
+        self.assertEqual({}, persisted["task_start_intents"])
+
+    def test_collect_failed_terminal_refresh_still_blocks_review(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        manifest["tasks"]["tests"] = "tests-task"
+        workspace._write_manifest(manifest)
+        attempts = []
+
+        def role_status(task_id: str, *, read_only: bool = False) -> dict:
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            if task_id != "tests-task":
+                raise AssertionError("unexpected task")
+            attempts.append(read_only)
+            if not read_only:
+                return {
+                    "task_id": task_id, "state": "observation_error",
+                    "terminal": False, "reconcile_required": True,
+                }
+            return {
+                "task_id": task_id, "state": "completed", "terminal": True,
+                "persisted_state": "running",
+                "observation_mode": "unpersisted_readonly_probe",
+                "reconcile_required": True,
+            }
+
+        with (
+            mock.patch.object(workspace, "_task_public", side_effect=role_status),
+            mock.patch.object(workspace, "_start_role_task") as start,
+            mock.patch.object(workspace, "_role_toolchain_preflight") as preflight,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("role_outcome_unknown", result["state"])
+        self.assertEqual(["tests"], result["reconcile_roles"])
+        self.assertIn(False, attempts)
+        start.assert_not_called()
+        preflight.assert_not_called()
+
     def test_collect_existing_uncertain_role_blocks_missing_sibling(self) -> None:
         cases = (
             ("tests", "outcome_unknown", False),
@@ -9326,6 +9418,52 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual("observation_error", public["state"])
             self.assertFalse(public["terminal"])
             self.assertTrue(public["reconcile_required"])
+
+    def test_cleanup_local_terminal_transport_flip_cannot_launch_ssh(self) -> None:
+        task_id = "3" * 24
+        row = {
+            "task_id": task_id, "host": "local", "unit": f"grabowski-task-{task_id}-a1.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection", return_value=connection
+            ),
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                side_effect=[
+                    ("local", {"transport": "local", "target": "local", "enabled": True}, False),
+                    ("remote", {"transport": "ssh", "target": "remote", "enabled": True}, False),
+                ],
+            ) as resolve,
+            mock.patch.object(
+                workspace.tasks.operator, "_run",
+                return_value={"returncode": 0, "stdout": "", "stderr": ""},
+            ) as local,
+            mock.patch.object(
+                workspace.tasks.fleet, "run_fleet_host",
+                side_effect=AssertionError("cleanup reached SSH process"),
+            ) as ssh,
+            mock.patch.object(
+                workspace.tasks.fleet, "run_fleet_task_unit_show",
+                side_effect=AssertionError("cleanup reached SSH fallback"),
+            ) as fallback,
+            mock.patch.object(
+                workspace.tasks, "_classify_observation", return_value="completed"
+            ),
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        self.assertEqual("completed", public["state"])
+        self.assertTrue(public["terminal"])
+        self.assertFalse(public["reconcile_required"])
+        resolve.assert_called_once()
+        local.assert_called_once()
+        ssh.assert_not_called()
+        fallback.assert_not_called()
 
     def test_cleanup_local_terminal_cannot_use_persisted_state_without_live_confirmation(self) -> None:
         task_id = "1" * 24

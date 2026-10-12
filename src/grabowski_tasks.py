@@ -7439,7 +7439,7 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
         }
         result["reconcile_required"] = True
         return result
-    observation = _observe(record)
+    observation = _observe(record, bound_local_user=True)
     result["state"] = _effective_observed_state(record, observation["state"])
     result["last_observation"] = observation
     result["observation_mode"] = "unpersisted_readonly_probe"
@@ -8186,7 +8186,15 @@ def _set_state(
     chronik.record_task_state_safely(updated, state)
     return updated
 
-def _observe(record: dict[str, Any]) -> dict[str, Any]:
+def _observe(
+    record: dict[str, Any], *, bound_local_user: bool = False
+) -> dict[str, Any]:
+    if bound_local_user and (
+        _is_root_systemd_backend(record)
+        or _execution_backend(record) != "systemd-user"
+        or _systemd_scope(record) != "user"
+    ):
+        raise RuntimeError("bound local observation requires user-systemd task")
     if _is_root_systemd_backend(record):
         result = privileged.root_task_systemd_request(
             _root_task_payload(
@@ -8231,34 +8239,47 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
         "execution_backend": _execution_backend(record),
         "systemd_scope": _systemd_scope(record),
     }
-    try:
-        result = _dispatch(
-            record["host"],
+    if bound_local_user:
+        # A prior local transport check must bind the actual process boundary.
+        # Never re-enter Fleet discovery/SSH or its denial fallback from a
+        # READ_ONLY caller: a registry switch could otherwise create writes.
+        result = operator._run(
             command,
+            cwd=operator.HOME,
             timeout_seconds=30,
-            allow_legacy_local_alias=True,
+            max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
         )
-    except fleet.FleetCommandDenied:
-        # Production hosts intentionally do not expose generic systemctl through
-        # fleet_run.  Reconcile still needs one fixed read-only observation shape
-        # for Grabowski-owned task units, so fall back to the narrow fleet helper.
-        observed = fleet.run_fleet_task_unit_show(
-            record["host"],
-            _authoritative_unit(record),
-            fleet.TASK_UNIT_SHOW_PROPERTIES,
-            timeout_seconds=30,
-            max_output_bytes=8192,
-        )
-        result = observed["result"]
-        observer = {
-            "host": observed["host"],
-            "transport": observed["transport"],
-            "roles": observed["roles"],
-            "kind": observed["observer"],
-            "execution_backend": _execution_backend(record),
-            "systemd_scope": _systemd_scope(record),
-            "fallback_from": "fleet-dispatch-permission-denied",
-        }
+        observer["kind"] = "bound-local-user-systemd-show-v1"
+        observer["transport"] = "local"
+    else:
+        try:
+            result = _dispatch(
+                record["host"],
+                command,
+                timeout_seconds=30,
+                allow_legacy_local_alias=True,
+            )
+        except fleet.FleetCommandDenied:
+            # Production hosts intentionally do not expose generic systemctl through
+            # fleet_run.  Reconcile still needs one fixed read-only observation shape
+            # for Grabowski-owned task units, so fall back to the narrow fleet helper.
+            observed = fleet.run_fleet_task_unit_show(
+                record["host"],
+                _authoritative_unit(record),
+                fleet.TASK_UNIT_SHOW_PROPERTIES,
+                timeout_seconds=30,
+                max_output_bytes=8192,
+            )
+            result = observed["result"]
+            observer = {
+                "host": observed["host"],
+                "transport": observed["transport"],
+                "roles": observed["roles"],
+                "kind": observed["observer"],
+                "execution_backend": _execution_backend(record),
+                "systemd_scope": _systemd_scope(record),
+                "fallback_from": "fleet-dispatch-permission-denied",
+            }
     properties: dict[str, str] = {}
     for line in result.get("stdout", "").splitlines():
         if "=" in line:
