@@ -1285,5 +1285,62 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         self.assertEqual(payload.get("head_after"), head)
 
 
+    def test_opaque_executor_module_needs_verified_origin(self) -> None:
+        """A Python module name cannot itself exempt a local child from bwrap.
+
+        The synthetic classification models an unrecognized task. This test
+        does not pretend to establish the reserved executor's server authority.
+        """
+        command = [
+            "/usr/bin/python3",
+            "-m",
+            "grabowski_bureau_runtime_refresh_executor",
+            "--not-an-authorized-intent",
+        ]
+        record = {
+            "task_id": "untrusted-executor-module",
+            "host": "local",
+            "cwd": str(self.root),
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            try:
+                result = tasks._task_sandboxed_command_argv(record, command)
+            except (RuntimeError, PermissionError):
+                return  # Fail-closed denial is also safe.
+        self.assertNotEqual(result, command, "module name alone bypassed bwrap")
+        self.assertIn("--ro-bind", result)
+
+    def test_opaque_default_operator_home_is_not_mounted_as_readable_workspace(
+        self,
+    ) -> None:
+        """Default cwd may not disclose an entire operator home to a child."""
+        from pathlib import Path
+
+        home = self.root / "operator-home"
+        home.mkdir(mode=0o700)
+        (home / ".private-fixture").write_text("never expose", encoding="utf-8")
+        record = {"task_id": "opaque-home", "host": "local", "cwd": str(home)}
+        with (
+            patch.object(tasks.operator, "HOME", home),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            sandbox = tasks._task_sandboxed_command_argv(record, ["/usr/bin/true"])
+        mounted = [sandbox[i : i + 3] for i in range(len(sandbox) - 2)]
+        self.assertFalse(
+            ["--ro-bind", str(home), str(home)] in mounted,
+            "read-only is not confidential: operator home was disclosed",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
