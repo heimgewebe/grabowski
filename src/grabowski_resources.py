@@ -1499,7 +1499,7 @@ def _expired_same_owner_repository_reentry(
     now: int,
 ) -> dict[str, Any] | None:
     """Bind an expired same-owner retry to its unchanged exact worktree scope."""
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         row = connection.execute(
             "SELECT * FROM leases WHERE resource_key=?", (resource_key,)
         ).fetchone()
@@ -1557,7 +1557,7 @@ def repository_scope_manifest_for_owner(
     key = normalize_resource_key(resource_key)
     if not key.startswith("repo:") or scoped_repository_resource_root(key) is not None:
         raise ValueError("resource_key must be one broad repository lease")
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         row = connection.execute(
             "SELECT * FROM leases WHERE resource_key=?", (key,)
         ).fetchone()
@@ -3001,7 +3001,7 @@ def _reconcile_verified_leases(
     released: list[dict[str, Any]] = []
     retained: list[dict[str, Any]] = []
     now = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             placeholders = ",".join("?" for _ in keys)
@@ -3129,7 +3129,7 @@ def assess_nonconflict(
     owner = _owner(requesting_owner)
     if not blocked_key.startswith("repo:"):
         now = _now()
-        with _database() as connection:
+        with closing(_database()) as connection, connection:
             row = connection.execute(
                 "SELECT * FROM leases WHERE resource_key=?", (blocked_key,)
             ).fetchone()
@@ -3173,7 +3173,7 @@ def assess_nonconflict(
         )
     normalized_scope = nonconflict.normalize_scope_manifest(requested_scope)
     now = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         row = connection.execute(
             "SELECT * FROM leases WHERE resource_key=?", (blocked_key,)
         ).fetchone()
@@ -4027,7 +4027,7 @@ def pending_task_terminalizations(
         raise ValueError("cursor requires high_water")
     if after is not None and after > boundary:
         raise ValueError("cursor cannot be greater than high_water")
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         if boundary is None:
             boundary_row = connection.execute(
                 "SELECT prepared_at_unix, task_id FROM task_terminalizations "
@@ -4100,7 +4100,7 @@ def pending_task_terminalizations_exist(
         raise ValueError("cursor requires high_water")
     if after is not None and after > boundary:
         raise ValueError("cursor cannot be greater than high_water")
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         if boundary is None:
             return (
                 connection.execute(
@@ -4161,7 +4161,7 @@ def begin_task_terminalization(
     requested_json = _canonical_json(requested_keys)
     requested_sha256 = hashlib.sha256(requested_json.encode("utf-8")).hexdigest()
     now = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             connection.execute(
@@ -4316,7 +4316,7 @@ def complete_task_terminalization(
     if not isinstance(lifecycle_receipt_sha256, str) or SHA256_RE.fullmatch(lifecycle_receipt_sha256) is None:
         raise ValueError("lifecycle_receipt_sha256 is invalid")
     now = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             row = connection.execute(
@@ -4358,7 +4358,7 @@ def release_task_authority_adoption(
     guard_owner = _owner(guard_owner_id)
     identifier = _task_identifier(task_id)
     released: dict[str, Any] | None = None
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             row = connection.execute(
@@ -4404,7 +4404,7 @@ def task_lease_delegation_evidence(
     now = _now() if now_unix is None else int(now_unix)
     bindings: list[dict[str, str]] = []
     minimum_expiry: int | None = None
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         terminalization = connection.execute(
             "SELECT transition_sha256 FROM task_terminalizations WHERE task_id=?",
             (task_id,),
@@ -4472,7 +4472,7 @@ def operator_lease_delegation_evidence(
     if DIRECT_OPERATOR_OWNER_RE.fullmatch(owner) is None:
         raise ValueError("direct Operator lease owner is invalid")
     now = _now() if now_unix is None else int(now_unix)
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         rows = connection.execute(
             "SELECT * FROM leases WHERE owner_id=? AND expires_at_unix>? ORDER BY resource_key",
             (owner, now),
@@ -4528,7 +4528,7 @@ def bureau_run_lease_delegation_evidence(
     if matched is None:
         raise ValueError("Bureau run lease owner is invalid")
     now = _now() if now_unix is None else int(now_unix)
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         rows = connection.execute(
             "SELECT * FROM leases WHERE owner_id=? AND expires_at_unix>? "
             "ORDER BY resource_key",
@@ -4666,7 +4666,7 @@ def reconcile_delegated_operator_leases(
     released: list[dict[str, Any]] = []
     already_absent: list[str] = []
     retained: list[dict[str, str]] = []
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             current_owner_rows = connection.execute(
@@ -5084,7 +5084,7 @@ def acquire_merge_guard_resources(
     held_keys: list[str] = []
     task_adoption: dict[str, Any] | None = None
     observed_at_unix_ns = 0
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             observed_at_unix_ns = time.time_ns()
@@ -5665,7 +5665,7 @@ def user_systemd_uncertainty_status(
 ) -> dict[str, Any] | None:
     raw_keys = list(resource_keys)
     wanted = normalize_resource_keys(raw_keys) if raw_keys else []
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         active = [
             fence
             for _, fence in _user_systemd_uncertainties_from_connection(connection)
@@ -5812,7 +5812,7 @@ def prepare_user_systemd_uncertainty_fence(
         "clearance": None,
     }
     metadata_key = _user_systemd_uncertainty_metadata_key(unit)
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             _check_user_systemd_uncertainty_conflicts(connection, keys=keys)
@@ -5847,7 +5847,7 @@ def update_user_systemd_uncertainty_fence(
         raise ValueError("user-systemd uncertainty fence id is invalid")
     if phase not in USER_SYSTEMD_UNCERTAINTY_PHASES:
         raise ValueError("user-systemd uncertainty phase is invalid")
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             found = _user_systemd_uncertainty_by_id(connection, fence_id)
@@ -5887,7 +5887,7 @@ def rebind_user_systemd_stop_recovery_fence(
         expected_owner_id=owner,
         resource_keys=keys,
     )
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             found = _user_systemd_uncertainty_by_id(connection, fence_id)
@@ -5966,7 +5966,7 @@ def clear_user_systemd_uncertainty_fence(
         raise ValueError("user-systemd uncertainty clearance outcome is invalid")
     if not isinstance(evidence_sha256, str) or SHA256_RE.fullmatch(evidence_sha256) is None:
         raise ValueError("user-systemd uncertainty evidence digest is invalid")
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             found = _user_systemd_uncertainty_by_id(connection, fence_id)
@@ -6502,7 +6502,7 @@ def _overlay_live_same_owner_branch_attempt(
     and all pre-existing metadata are preserved. Expiry may be extended only for
     the bounded attempt lifetime and is restored after terminal Git readback.
     """
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             row = connection.execute(
@@ -6720,7 +6720,7 @@ def complete_branch_mutation_attempt(attempt_lease: dict[str, Any]) -> dict[str,
         if not isinstance(expected, dict):
             raise ValueError("attempt-only lease snapshot is missing")
         expected_snapshot = _release_lease_snapshot(expected)
-        with _database() as connection:
+        with closing(_database()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 row = connection.execute(
@@ -6791,7 +6791,7 @@ def complete_branch_mutation_attempt(attempt_lease: dict[str, Any]) -> dict[str,
     expected_previous_expires = attempt_lease.get("previous_expires_at_unix")
     if not isinstance(expected_previous_expires, int) or expected_previous_expires <= 0:
         raise ValueError("preexisting lease previous expiry is invalid")
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             row = connection.execute(
@@ -7098,7 +7098,7 @@ def prepare_runtime_refresh_executor_lease_binding(
     threshold = now + minimum_remaining_seconds
     originals: list[dict[str, Any]] = []
     expected_bound: list[dict[str, Any]] = []
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         placeholders = ",".join("?" for _ in keys)
         rows = connection.execute(
             f"SELECT * FROM leases WHERE resource_key IN ({placeholders}) ORDER BY resource_key",
@@ -7181,7 +7181,7 @@ def restore_runtime_refresh_executor_lease_binding_plan(plan: dict[str, Any]) ->
     original_by_key = {item["resource_key"]: item for item in originals}
     bound_by_key = {item["resource_key"]: item for item in bound}
     restored_keys: list[str] = []
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             placeholders = ",".join("?" for _ in keys)
@@ -7368,7 +7368,7 @@ def bind_runtime_refresh_executor_leases(
         expected_bound = plan["bound_leases"]
     threshold = current_now + minimum_remaining_seconds
     originals: list[dict[str, Any]] = []
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             placeholders = ",".join("?" for _ in keys)
@@ -7556,7 +7556,7 @@ def unbind_runtime_refresh_executor_leases(binding: dict[str, Any]) -> dict[str,
     )
     original_by_key = {item["resource_key"]: item for item in originals}
     bound_by_key = {item["resource_key"]: item for item in bound}
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             placeholders = ",".join("?" for _ in keys)
@@ -7714,7 +7714,7 @@ def rebind_same_owner_resources(
     original_by_key = {item["resource_key"]: item for item in original}
     now = _now()
     requested_expires = now + ttl
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
             observed_rows: dict[str, sqlite3.Row] = {}

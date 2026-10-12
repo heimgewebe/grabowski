@@ -3343,6 +3343,53 @@ class ResourceTests(unittest.TestCase):
         with patch.object(resources, "_now", return_value=120):
             self.assertEqual(resources.inspect_resource(key), second["leases"][0])
 
+    def test_rebind_closes_connection_when_precondition_rejects_retained_traceback(self) -> None:
+        # sqlite3.Connection.__exit__ does not close the connection. Holding
+        # a traceback or sqlite handle must not keep WAL/SHM open after rebind.
+        key = "component:rebind-close-connection"
+        owner = "operator:rebind-close-connection"
+        acquired = resources.acquire_resources(
+            owner, [key], purpose="rebind connection close", metadata={}
+        )
+        snapshot = resources._release_lease_snapshot(acquired["leases"][0])
+        original_database = resources._database
+        opened: list[sqlite3.Connection] = []
+
+        def record_open() -> sqlite3.Connection:
+            connection = original_database()
+            opened.append(connection)
+            return connection
+
+        def reject_before_commit() -> None:
+            raise RuntimeError("synthetic precommit rejection")
+
+        with patch.object(resources, "_database", side_effect=record_open):
+            try:
+                resources.rebind_same_owner_resources(
+                    owner, [key],
+                    purpose="rebind connection close",
+                    ttl_seconds=3600,
+                    metadata={},
+                    expected_current_leases=[snapshot],
+                    expected_original_leases=[snapshot],
+                    _commit_precondition=reject_before_commit,
+                )
+            except RuntimeError as exc:
+                held_exception = exc
+            else:
+                self.fail("synthetic precommit must reject")
+        self.assertIn("synthetic precommit", str(held_exception))
+        self.assertEqual(1, len(opened))
+        for connection in opened:
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+        self.assertFalse(Path(str(self.database) + "-wal").exists())
+        self.assertFalse(Path(str(self.database) + "-shm").exists())
+        self.assertEqual(
+            acquired["leases"][0]["resource_key"],
+            resources.inspect_resource(key, read_only=True)["resource_key"],
+        )
+
     def test_same_owner_rebind_restores_journaled_identity_after_expiry(self) -> None:
         key = "component:bureau-resume-rebind"
         owner = "bureau-run:BUR-RUN-20260803T112652Z-594b4414fc"

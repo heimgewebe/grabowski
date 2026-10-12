@@ -7414,6 +7414,31 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
         }
         result["reconcile_required"] = True
         return result
+    # SSH itself can update known_hosts or create ControlPath sockets.
+    # The READ_ONLY contract permits an unpersisted local user-systemd
+    # observation, but never a fleet SSH invocation without admission.
+    try:
+        _, target, _ = _resolve_task_dispatch_host(str(record["host"]))
+        transport = target.get("transport")
+    except (OSError, ValueError, RuntimeError, PermissionError):
+        transport = None
+    if transport != "local":
+        result["state"] = "observation_error"
+        result["last_observation"] = None
+        result["observation_mode"] = (
+            "persisted_only_ssh_not_probed"
+            if transport == "ssh" else "persisted_only_transport_unavailable"
+        )
+        result["observation_unavailable_reason"] = (
+            "ssh_observation_requires_mutation_gate"
+            if transport == "ssh" else "fleet_transport_unverified"
+        )
+        result["systemd_unit_health"] = {
+            "status": "unknown",
+            "reason": result["observation_unavailable_reason"],
+        }
+        result["reconcile_required"] = True
+        return result
     observation = _observe(record)
     result["state"] = _effective_observed_state(record, observation["state"])
     result["last_observation"] = observation
@@ -11366,6 +11391,90 @@ def _reconcile_check_revision_snapshot(
 # revision-bound readiness proof in the existing task metadata table.
 TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY = "task_reconcile_ready_evidence_v1"
 TASK_RECONCILE_READY_MAX_AGE_SECONDS = 300
+TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT = 32
+TASK_RECONCILE_READY_SCOPE = "quiescent-privileged-terminal-observations"
+
+
+def _task_reconcile_ready_privileged_rows(
+    connection: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    """Bound the privileged task set before readiness attestation or verification."""
+    rows = connection.execute(
+        "SELECT * FROM tasks "
+        "WHERE execution_backend='systemd-root-broker' OR systemd_scope='system' "
+        "ORDER BY task_id LIMIT ?",
+        (TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT + 1,),
+    ).fetchall()
+    if len(rows) > TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT:
+        raise RuntimeError("Privileged task inventory exceeds readiness proof budget")
+    records = [dict(row) for row in rows]
+    if any(not _is_root_systemd_backend(record) for record in records):
+        raise RuntimeError("Privileged task scope does not have an approved observer")
+    return records
+
+
+def _task_reconcile_ready_rootbroker_terminal_observed(
+    record: dict[str, Any], observed: Any,
+) -> bool:
+    """Require a coherent, recent privileged Systemd *terminal* observation."""
+    if not isinstance(observed, dict):
+        return False
+    observer, probe, props = (
+        observed.get("observer"), observed.get("probe"), observed.get("properties")
+    )
+    if not isinstance(observer, dict) or observer.get("kind") != "root-systemd-broker-show-v1":
+        return False
+    if not isinstance(probe, dict) or type(probe.get("returncode")) is not int:
+        return False
+    if probe["returncode"] != 0 or probe.get("outcome_unknown"):
+        return False
+    observed_at = observed.get("observed_at_unix")
+    now = _now()
+    if type(observed_at) is not int or not 0 <= now - observed_at <= 30:
+        return False
+    if not isinstance(props, dict) or props.get("LoadState") != "loaded":
+        return False
+    # Systemd can advertise a successful Result while the same unit remains
+    # active, activating, or deactivating. A textual terminal classification
+    # alone does not certify that the privileged unit is quiescent.
+    if props.get("ActiveState") not in {"inactive", "failed"}:
+        return False
+    if props.get("SubState") not in {"dead", "failed"}:
+        return False
+    state = str(record.get("state"))
+    if observed.get("state") != state:
+        return False
+    allowed_results = {
+        "completed": {"success"},
+        "failed": {"exit-code", "resources", "protocol", "watchdog"},
+        "signalled": {"signal", "core-dump"},
+        "timed_out": {"timeout"},
+    }
+    if props.get("Result") not in allowed_results.get(state, set()):
+        return False
+    if state == "completed":
+        return (
+            props.get("ActiveState") == "inactive"
+            and props.get("SubState") == "dead"
+            and props.get("ExecMainStatus") in {"", "0"}
+        )
+    return True
+
+
+def _task_reconcile_ready_privileged_digest(
+    records: list[dict[str, Any]],
+) -> str:
+    return _sha256_json([
+        {
+            "task_id": record["task_id"],
+            "unit": record["unit"],
+            "attempt": record["attempt"],
+            "execution_backend": record["execution_backend"],
+            "systemd_scope": record["systemd_scope"],
+            "state": record["state"],
+        }
+        for record in records
+    ])
 
 
 def _clear_task_reconcile_ready_evidence() -> None:
@@ -11406,6 +11515,19 @@ def _publish_task_reconcile_ready_evidence(result: dict[str, Any]) -> None:
             "('launching','running','outcome_unknown','interrupted') LIMIT 1"
         ).fetchone() is not None:
             return
+        # Persisted terminal Rootbroker states are not live execution truth.
+        # Only this mutation-authorized reconciliation may perform broker show;
+        # every privileged task must be freshly and positively observed.
+        privileged_records = _task_reconcile_ready_privileged_rows(connection)
+        for record in privileged_records:
+            if not _is_terminal_state(str(record["state"])):
+                return
+            operator._require_operator_mutation(
+                "durable_job", task_id=str(record["task_id"])
+            )
+            observed = _observe(record)
+            if not _task_reconcile_ready_rootbroker_terminal_observed(record, observed):
+                return
         task_revision = _task_reconcile_revision_contract(connection)
         with resources._resource_readonly_snapshot() as resource_connection:
             if resource_connection.execute(
@@ -11419,11 +11541,15 @@ def _publish_task_reconcile_ready_evidence(result: dict[str, Any]) -> None:
         if resource_revision is None:
             return
         material = {
-            "schema_version": 1,
+            "schema_version": 2,
             "task_revision": task_revision["revision"],
             "resource_revision": resource_revision["revision"],
             "reconciled_at_unix": _now(),
-            "scope": "quiescent-active-tasks-and-terminalizations",
+            "scope": TASK_RECONCILE_READY_SCOPE,
+            "privileged_task_count": len(privileged_records),
+            "privileged_tasks_sha256": _task_reconcile_ready_privileged_digest(
+                privileged_records
+            ),
         }
         proof = {**material, "evidence_sha256": _sha256_json(material)}
         connection.execute(
@@ -11450,6 +11576,7 @@ def _task_reconcile_ready_evidence_snapshot(
         expected_fields = {
             "schema_version", "task_revision", "resource_revision",
             "reconciled_at_unix", "scope", "evidence_sha256",
+            "privileged_task_count", "privileged_tasks_sha256",
         }
         if not isinstance(proof, dict) or set(proof) != expected_fields:
             return {"status": "invalid"}
@@ -11458,8 +11585,13 @@ def _task_reconcile_ready_evidence_snapshot(
         now = _now()
         if (
             type(proof["schema_version"]) is not int
-            or proof["schema_version"] != 1
-            or proof["scope"] != "quiescent-active-tasks-and-terminalizations"
+            or proof["schema_version"] != 2
+            or proof["scope"] != TASK_RECONCILE_READY_SCOPE
+            or type(proof["privileged_task_count"]) is not int
+            or proof["privileged_task_count"] < 0
+            or proof["privileged_task_count"] > TASK_RECONCILE_READY_PRIVILEGED_TASK_LIMIT
+            or not isinstance(proof["privileged_tasks_sha256"], str)
+            or not SHA256.fullmatch(proof["privileged_tasks_sha256"])
             or type(timestamp) is not int
             or not 0 <= now - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS
             or proof["evidence_sha256"] != _sha256_json(material)
@@ -11470,6 +11602,21 @@ def _task_reconcile_ready_evidence_snapshot(
             "('launching','running','outcome_unknown','interrupted') LIMIT 1"
         ).fetchone() is not None:
             return {"status": "active_tasks"}
+        # READ_ONLY verification does not repeat privileged effects. It checks
+        # the immutable identity cohort that was live-probed under mutation
+        # admission and rejects preexisting v1 proofs lacking this guarantee.
+        privileged_records = _task_reconcile_ready_privileged_rows(task_connection)
+        if any(
+            not _is_terminal_state(str(record["state"]))
+            for record in privileged_records
+        ):
+            return {"status": "active_privileged_tasks"}
+        if (
+            len(privileged_records) != proof["privileged_task_count"]
+            or _task_reconcile_ready_privileged_digest(privileged_records)
+            != proof["privileged_tasks_sha256"]
+        ):
+            return {"status": "privileged_tasks_changed"}
         task_revision = _task_reconcile_revision_contract(task_connection)
         with resources._resource_readonly_snapshot() as resource_connection:
             resource_revision = resources._resource_reconcile_revision_contract(

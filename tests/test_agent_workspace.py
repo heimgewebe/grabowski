@@ -8935,6 +8935,10 @@ class AgentWorkspaceTests(unittest.TestCase):
                                           "state": "completed", "terminal": True},
                         ) as refresh,
                         mock.patch.object(
+                            workspace.tasks, "_resolve_task_dispatch_host",
+                            return_value=("heim-pc", {"transport": "local"}, False),
+                        ),
+                        mock.patch.object(
                             workspace.tasks, "_observe", return_value=observed
                         ) as observer,
                         mock.patch.object(
@@ -9029,6 +9033,10 @@ class AgentWorkspaceTests(unittest.TestCase):
                 mock.patch.object(
                     workspace.tasks, "grabowski_task_status",
                     return_value={"task_id": "writer-task", "state": "completed"},
+                ),
+                mock.patch.object(
+                    workspace.tasks, "_resolve_task_dispatch_host",
+                    return_value=("heim-pc", {"transport": "local"}, False),
                 ),
                 mock.patch.object(
                     workspace.tasks, "_observe",
@@ -9245,6 +9253,39 @@ class AgentWorkspaceTests(unittest.TestCase):
         mutating_reader.assert_not_called()
         connection.close.assert_called_once_with()
         self.assertEqual("outcome_unknown", public["state"])
+        self.assertFalse(public["terminal"])
+        self.assertTrue(public["reconcile_required"])
+
+    def test_cleanup_persisted_rootbroker_terminal_is_not_live_truth(self) -> None:
+        task_id = "persisted-rootbroker-terminal"
+        row = {
+            "task_id": task_id, "host": "heim-pc", "unit": "root.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-root-broker", "systemd_scope": "system",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection", return_value=connection
+            ) as reader,
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_status",
+                side_effect=AssertionError("cleanup read cannot mutate"),
+            ) as status,
+            mock.patch.object(
+                workspace.tasks, "_observe",
+                side_effect=AssertionError("cleanup read cannot probe privileged unit"),
+            ) as observe,
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        reader.assert_called_once_with(workspace.tasks.TASK_DB)
+        connection.close.assert_called_once_with()
+        status.assert_not_called()
+        observe.assert_not_called()
+        self.assertEqual("completed", public["persisted_state"])
+        self.assertEqual("observation_error", public["state"])
         self.assertFalse(public["terminal"])
         self.assertTrue(public["reconcile_required"])
 

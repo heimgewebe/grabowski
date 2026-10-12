@@ -10647,9 +10647,7 @@ def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
             raise RuntimeError("task inventory projection is unavailable")
         row = connection.execute(
             """
-            SELECT task_id, host, unit, state, attempt, resume_policy,
-                   argv_sha256, cwd
-            FROM tasks
+            SELECT * FROM tasks
             WHERE task_id=?
             """,
             (task_id,),
@@ -10668,19 +10666,28 @@ def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
     finally:
         if connection is not None:
             connection.close()
-    state = str(value.get("state", "unknown"))
+    persisted_state = str(value.get("state", "unknown"))
+    # The nominal rootbroker show is a privileged mutation. Cleanup planning
+    # may not classify persisted privileged terminal states as live outcomes.
+    privileged = tasks._is_root_systemd_backend(value)
+    state = "observation_error" if privileged else persisted_state
     return {
         "task_id": task_id,
         "host": value.get("host"),
         "unit": value.get("unit"),
         "state": state,
+        "persisted_state": persisted_state,
         "terminal": state in TERMINAL_TASK_STATES,
         "attempt": value.get("attempt"),
         "resume_policy": value.get("resume_policy"),
         "argv_sha256": value.get("argv_sha256"),
         "cwd": value.get("cwd"),
         "outcome_receipt": None,
-        "reconcile_required": state == "outcome_unknown",
+        "reconcile_required": privileged or state == "outcome_unknown",
+        "observation_mode": (
+            "persisted_only_rootbroker_not_probed"
+            if privileged else "persisted_only"
+        ),
     }
 
 
