@@ -10195,6 +10195,52 @@ class TaskTests(unittest.TestCase):
         dispatch.assert_not_called()
         fallback.assert_not_called()
 
+    def test_task_peek_rejects_concurrent_resume_after_local_observation(self) -> None:
+        created = self._start()["task"]
+        task_id = created["task_id"]
+        old_attempt = int(created["attempt"])
+        next_attempt = old_attempt + 1
+        next_unit = tasks._task_unit(task_id, next_attempt)
+        observed_calls = []
+
+        def resume_during_observation(_record, *, bound_local_user=False):
+            observed_calls.append(bound_local_user)
+            with tasks._database_connection() as connection:
+                connection.execute(
+                    "UPDATE tasks SET attempt=?, unit=? WHERE task_id=?",
+                    (next_attempt, next_unit, task_id),
+                )
+            return {
+                "state": "completed",
+                "properties": {},
+                "observed_at_unix": tasks._now(),
+            }
+
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local", "target": "local", "enabled": True}, False),
+            ),
+            patch.object(tasks, "_observe", side_effect=resume_during_observation),
+            patch.object(
+                tasks, "_set_state",
+                side_effect=AssertionError("READ_ONLY peek cannot persist the observation"),
+            ) as persist,
+            patch.object(
+                tasks, "_maintain_record_resources",
+                side_effect=AssertionError("READ_ONLY peek cannot renew leases"),
+            ) as renew,
+        ):
+            result = tasks.grabowski_task_peek(task_id)
+        self.assertEqual([True], observed_calls)
+        self.assertEqual(next_attempt, tasks._row_raw(task_id)["attempt"])
+        self.assertEqual("observation_error", result["state"])
+        self.assertEqual("persisted_only_task_changed_after_probe", result["observation_mode"])
+        self.assertTrue(result["reconcile_required"])
+        self.assertIsNone(result["last_observation"])
+        persist.assert_not_called()
+        renew.assert_not_called()
+
     def test_remote_task_peek_never_launches_effectful_ssh(self) -> None:
         created = self._start(host="remote")["task"]
         before = self.database.read_bytes()

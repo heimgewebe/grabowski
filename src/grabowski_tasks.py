@@ -7440,6 +7440,26 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
         result["reconcile_required"] = True
         return result
     observation = _observe(record, bound_local_user=True)
+    # The first immutable task snapshot is released during live systemd
+    # observation. A concurrent resume may replace the attempt/unit before
+    # the probe finishes. Never project an old unit's terminal state as the
+    # current task; a second strictly non-writing snapshot binds the answer
+    # to the same persisted row, including its revision-bearing fields.
+    with _task_readonly_snapshot() as connection:
+        current_row = connection.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (identifier,)
+        ).fetchone()
+    if current_row is None or dict(current_row) != record:
+        result["state"] = "observation_error"
+        result["last_observation"] = None
+        result["observation_mode"] = "persisted_only_task_changed_after_probe"
+        result["observation_unavailable_reason"] = "task_row_drift_during_local_probe"
+        result["systemd_unit_health"] = {
+            "status": "unknown",
+            "reason": "task_row_drift_during_local_probe",
+        }
+        result["reconcile_required"] = True
+        return result
     result["state"] = _effective_observed_state(record, observation["state"])
     result["last_observation"] = observation
     result["observation_mode"] = "unpersisted_readonly_probe"
