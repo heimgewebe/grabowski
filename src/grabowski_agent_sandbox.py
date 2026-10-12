@@ -836,6 +836,7 @@ def minimal_sandbox_argv(
     workspace_writable: bool,
     writable_paths: Iterable[Path] = (),
     git_common_dir: Path | None = None,
+    mount_workspace: bool = True,
     extra_read_only: Iterable[tuple[Path, Path]] = (),
     extra_read_only_data_fds: Iterable[tuple[int, Path]] = (),
     extra_read_write: Iterable[tuple[Path, Path]] = (),
@@ -856,7 +857,13 @@ def minimal_sandbox_argv(
         directory=True,
     )
     writable = _normalized_writable_paths(worktree, writable_paths)
-    adler_read_only, adler_directories = _adler_inbox_sandbox_binding(worktree)
+    if not isinstance(mount_workspace, bool):
+        raise AgentSandboxError("mount_workspace must be a boolean")
+    if not mount_workspace and (workspace_writable or writable or common is not None):
+        raise AgentSandboxError("hidden workspace cannot be writable or expose Git metadata")
+    adler_read_only, adler_directories = (
+        _adler_inbox_sandbox_binding(worktree) if mount_workspace else ((), ())
+    )
     if workspace_writable and not writable:
         raise AgentSandboxError("writer sandbox requires at least one bounded writable path")
     if not workspace_writable and writable:
@@ -904,7 +911,8 @@ def minimal_sandbox_argv(
         _bind_file(arguments, path)
     _bind_fixed_system_file(arguments, "/etc/resolv.conf")
     _bind_dir(arguments, "/etc/ssl/certs")
-    arguments.extend(["--ro-bind", str(worktree), str(worktree)])
+    if mount_workspace:
+        arguments.extend(["--ro-bind", str(worktree), str(worktree)])
     for target in writable:
         arguments.extend(["--bind", str(target), str(target)])
     if common is not None and common != worktree:
@@ -1046,7 +1054,7 @@ def minimal_sandbox_argv(
     arguments.extend(
         [
             "--chdir",
-            str(worktree),
+            str(worktree) if mount_workspace else "/tmp",
             "--",
             *command,
         ]

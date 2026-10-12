@@ -1599,5 +1599,58 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             )
 
 
+    def test_opaque_home_can_be_invisible_to_real_kernel_child(self) -> None:
+        """A default operator-home cwd must be hidden, not merely read-only.
+
+        This exercises an opt-in primitive on the real Linux kernel.
+        Separate trusted task admission must later select it for opaque cwd=None.
+        """
+        from pathlib import Path
+        import subprocess
+
+        home = self.root / "opaque-home"
+        home.mkdir(mode=0o700)
+        private_file = home / "private-token.txt"
+        private_file.write_text("operator-only", encoding="utf-8")
+        child_code = (
+            "import os,sys\n"
+            "print(os.getcwd())\n"
+            "sys.exit(0 if os.getcwd()=='/tmp' and "
+            "not os.path.lexists(sys.argv[1]) else 33)\n"
+        )
+        sandbox = tasks.agent_sandbox.minimal_sandbox_argv(
+            workspace=home,
+            command=["/usr/bin/python3", "-I", "-c", child_code, str(private_file)],
+            workspace_writable=False,
+            mount_workspace=False,
+        )
+        self.assertNotIn(
+            ["--ro-bind", str(home), str(home)],
+            [sandbox[i:i + 3] for i in range(len(sandbox) - 2)],
+        )
+        completed = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(sandbox),
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "/tmp")
+        self.assertEqual(private_file.read_text(encoding="utf-8"), "operator-only")
+
+        writable = home / "write"
+        writable.mkdir(mode=0o700)
+        with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=home, command=["/usr/bin/true"],
+                workspace_writable=True, writable_paths=(writable,),
+                mount_workspace=False,
+            )
+        with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=home, command=["/usr/bin/true"],
+                workspace_writable=False, git_common_dir=home,
+                mount_workspace=False,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
