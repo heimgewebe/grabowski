@@ -827,5 +827,175 @@ class SagaContractTests(unittest.TestCase):
         self.assertIn("pr_merge_commit_missing", result["reasons"])
 
 
+class ExternalMergeSagaSettlementTests(unittest.TestCase):
+    """Original no-dispatch Captain audit is not a retroactive merge PASS."""
+
+    def setUp(self) -> None:
+        helper = SagaContractTests()
+        self.plan = sagas.build_plan(
+            "pr-settlement", helper.pr_target(), "external-merge-terminal-regression"
+        )
+        self.run = sagas.build_run_receipt(
+            self.plan, helper.mechanic_result(self.plan)
+        )
+        self.run_ref = {
+            "schema_version": 1,
+            "kind": grip_orchestration.SAGA_RUN_RECEIPT_REF_KIND,
+            "record_sha256": "9" * 64,
+        }
+        self.captain_ref = {
+            "schema_version": 1,
+            "kind": grip_orchestration.CAPTAIN_AUDIT_RESULT_REF_KIND,
+            "completion_record_sha256": "d" * 64,
+        }
+        self.merge_sha = "c" * 40
+        self.current_sha = "e" * 40
+        self.audit = {
+            "status": "blocked",
+            "receipt_sha256": "1" * 64,
+            "intent_record_sha256": "c" * 64,
+            "completion_record_sha256": "d" * 64,
+            "merge_provenance": {
+                "provenance_schema_version": 2,
+                "execution_invoked": False,
+                "dispatch_succeeded": False,
+                "verification_passed": False,
+                "remote_mutation_observed": False,
+                "merge_completion_verified": False,
+                "merge_queued": False,
+                "external_merge_observed": True,
+                "observed_merge_sha": None,
+                "provenance_mode": "unverified",
+            },
+        }
+        self.readback = {
+            "pr": {
+                "number": 876, "state": "MERGED", "baseRefName": "main",
+                "headRefOid": HEAD, "mergeCommit": {"oid": self.merge_sha},
+            },
+            "base_branch": {
+                "name": "main", "sha": self.current_sha, "protected": True,
+            },
+            "base_to_merge": {
+                "status": "ahead", "ahead_by": 2, "behind_by": 0,
+                "base": BASE, "merge_base": BASE, "head": self.merge_sha,
+            },
+            "merge_to_current": {
+                "status": "ahead", "ahead_by": 3, "behind_by": 0,
+                "base": self.merge_sha, "merge_base": self.merge_sha, "head": self.current_sha,
+            },
+        }
+
+    def evaluate(self, *, readback=None, audit=None, run_ref=None, captain_ref=None):
+        with patch.object(
+            grip_orchestration,
+            "_verified_saga_run_receipt_reference",
+            return_value=self.run,
+        ), patch.object(
+            grip_orchestration,
+            "_verified_captain_audit_reference_identity",
+            return_value=self.audit if audit is None else audit,
+        ):
+            return grip_orchestration.settle_external_merge(
+                plan_value=self.plan,
+                run_receipt_value=self.run_ref if run_ref is None else run_ref,
+                captain_result_value=(
+                    self.captain_ref if captain_ref is None else captain_ref
+                ),
+                readback_value=self.readback if readback is None else readback,
+            )
+
+    def test_true_external_merge_is_terminal_without_captain_authority(self) -> None:
+        value = self.evaluate()
+        self.assertEqual("externally_merged", value["state"])
+        self.assertEqual("blocked", value["captain_result_status"])
+        self.assertEqual("not_performed", value["captain_execution"])
+        self.assertEqual("external_no_captain_apply", value["merge_provenance"])
+        self.assertFalse(value["captain_dispatch_succeeded"])
+        self.assertEqual(
+            "not_performed_by_captain", value["phase_status"]["apply"]
+        )
+        self.assertEqual(self.merge_sha, value["merged_commit_sha"])
+        self.assertEqual(DIFF, value["reviewed_diff_sha256"])
+        self.assertFalse(value["retry_allowed"])
+        self.assertEqual(
+            value["settlement_sha256"],
+            sagas.sha256_json(
+                {k: v for k, v in value.items() if k != "settlement_sha256"}
+            ),
+        )
+
+    def test_rejects_unaudited_or_unprepared_caller_data(self) -> None:
+        with self.assertRaisesRegex(
+            sagas.SagaError, "immutable Saga run audit reference"
+        ):
+            self.evaluate(run_ref=self.run)
+        with self.assertRaisesRegex(
+            sagas.SagaError, "immutable Captain audit reference"
+        ):
+            self.evaluate(captain_ref={"status": "passed"})
+
+    def test_rejects_captain_like_or_ambiguous_preexecution_audit(self) -> None:
+        mutations = [
+            ("status", "passed"),
+            ("provenance_mode", "captain_dispatch_verified"),
+            ("execution_invoked", True),
+            ("dispatch_succeeded", True),
+            ("remote_mutation_observed", True),
+            ("verification_passed", True),
+            ("merge_completion_verified", True),
+            ("external_merge_observed", False),
+            ("observed_merge_sha", "f" * 40),
+        ]
+        for name, value in mutations:
+            with self.subTest(name=name):
+                record = copy.deepcopy(self.audit)
+                if name == "status":
+                    record[name] = value
+                else:
+                    record["merge_provenance"][name] = value
+                with self.assertRaisesRegex(
+                    sagas.SagaError, "no-dispatch boundary"
+                ):
+                    self.evaluate(audit=record)
+
+    def test_rejects_rewritten_pr_or_missing_protected_ancestry(self) -> None:
+        invalid = [
+            ("head", lambda x: x["pr"].update(headRefOid="f" * 40)),
+            ("number", lambda x: x["pr"].update(number=877)),
+            ("base", lambda x: x["pr"].update(baseRefName="dev")),
+            ("not_merged", lambda x: x["pr"].update(state="OPEN")),
+            ("no_merge_sha", lambda x: x["pr"].update(mergeCommit={})),
+            ("unprotected", lambda x: x["base_branch"].update(protected=False)),
+            ("base_sha", lambda x: x["base_to_merge"].update(base="f" * 40)),
+            ("not_descended", lambda x: x["base_to_merge"].update(
+                status="diverged", behind_by=1
+            )),
+            ("wrong_merge_ancestor", lambda x: x["merge_to_current"].update(
+                merge_base="f" * 40
+            )),
+            ("wrong_base_compare_head", lambda x: x["base_to_merge"].update(
+                head="f" * 40
+            )),
+            ("wrong_current_compare_head", lambda x: x["merge_to_current"].update(
+                head="f" * 40
+            )),
+            ("branch_rewind", lambda x: x["base_branch"].update(
+                sha=self.merge_sha
+            )),
+            ("boolean_ahead", lambda x: x["base_to_merge"].update(
+                ahead_by=True
+            )),
+        ]
+        for name, mutate in invalid:
+            with self.subTest(name=name):
+                readback = copy.deepcopy(self.readback)
+                mutate(readback)
+                with self.assertRaises(sagas.SagaError):
+                    self.evaluate(readback=readback)
+
+    def test_no_legacy_apply_was_reclassified_as_settled(self) -> None:
+        self.assertEqual("external_no_captain_apply", self.evaluate()["merge_provenance"])
+
 if __name__ == "__main__":
     unittest.main()
