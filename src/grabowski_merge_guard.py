@@ -65,7 +65,17 @@ def _require_merge_guard_resource_authority(
     return authority
 
 
-_SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
+_GIT_OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+
+
+def _same_git_oid_format(*values: str) -> bool:
+    """Only exact lowercase Git OIDs of the same SHA-1/SHA-256 object format."""
+    return bool(values) and all(
+        isinstance(value, str) and _GIT_OID_RE.fullmatch(value) is not None
+        for value in values
+    ) and len({len(value) for value in values}) == 1
+
+
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 _GITHUB_REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
@@ -95,11 +105,11 @@ def _merge_guard_mbox_patch_matches_diff(
         or not diff_bytes
         or len(patch_bytes) > _MERGE_GUARD_MAX_DIFF_BYTES
         or len(diff_bytes) > _MERGE_GUARD_MAX_DIFF_BYTES
-        or _SHA40_RE.fullmatch(expected_head) is None
+        or _GIT_OID_RE.fullmatch(expected_head) is None
     ):
         return False
     boundaries = list(re.finditer(
-        rb"(?m)^From (?P<sha>[0-9a-f]{40}) Mon Sep 17 00:00:00 2001\r?$",
+        rb"(?m)^From (?P<sha>(?:[0-9a-f]{40}|[0-9a-f]{64})) Mon Sep 17 00:00:00 2001\r?$",
         patch_bytes,
     ))
     if (
@@ -107,6 +117,7 @@ def _merge_guard_mbox_patch_matches_diff(
         or boundaries[0].start() != 0
         or len(boundaries) > 250
         or boundaries[-1].group("sha") != expected_head.encode("ascii")
+        or any(len(boundary.group("sha")) != len(expected_head) for boundary in boundaries)
     ):
         return False
     sections: list[bytes] = []
@@ -192,7 +203,7 @@ _CODEX_CLEAN_FOOTER_PATTERN = (
 _CODEX_CLEAN_RESULT_RE = re.compile(
     r"\ACodex Review: Didn't find any major issues\. "
     r"(?:[^\n]{0,79}[.!?]|[^\n]{0,62}:[a-z0-9_+-]{1,16}:)\n\n"
-    r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`\n\n"
+    r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,64})`\n\n"
     + _CODEX_CLEAN_FOOTER_PATTERN
     + r"\Z"
 )
@@ -1400,7 +1411,7 @@ def _merge_guard_commit_probe(
     repo_path: Path, sha: str
 ) -> tuple[bool, dict[str, Any]]:
     info: dict[str, Any] = {"sha": sha}
-    if not isinstance(sha, str) or _SHA40_RE.fullmatch(sha) is None:
+    if not isinstance(sha, str) or _GIT_OID_RE.fullmatch(sha) is None:
         info["returncode"] = None
         info["valid"] = False
         return False, info
@@ -1443,9 +1454,10 @@ def _merge_guard_ensure_pr_objects(
         or isinstance(pr_number, bool)
         or pr_number < 1
         or not isinstance(base_sha, str)
-        or _SHA40_RE.fullmatch(base_sha) is None
+        or _GIT_OID_RE.fullmatch(base_sha) is None
         or not isinstance(head_sha, str)
-        or _SHA40_RE.fullmatch(head_sha) is None
+        or _GIT_OID_RE.fullmatch(head_sha) is None
+        or len(base_sha) != len(head_sha)
     ):
         return receipt, ["merge_guard_pr_object_binding_invalid"]
 
@@ -1518,8 +1530,9 @@ def _merge_guard_local_changed_paths(
     if (
         not isinstance(base_sha, str)
         or not isinstance(head_sha, str)
-        or _SHA40_RE.fullmatch(base_sha) is None
-        or _SHA40_RE.fullmatch(head_sha) is None
+        or _GIT_OID_RE.fullmatch(base_sha) is None
+        or _GIT_OID_RE.fullmatch(head_sha) is None
+        or len(base_sha) != len(head_sha)
     ):
         return [], info, ["merge_guard_local_changed_paths_revision_invalid"]
     try:
@@ -1590,8 +1603,9 @@ def _merge_guard_local_diff_bytes(
     if (
         not isinstance(base_sha, str)
         or not isinstance(head_sha, str)
-        or _SHA40_RE.fullmatch(base_sha) is None
-        or _SHA40_RE.fullmatch(head_sha) is None
+        or _GIT_OID_RE.fullmatch(base_sha) is None
+        or _GIT_OID_RE.fullmatch(head_sha) is None
+        or len(base_sha) != len(head_sha)
     ):
         return b"", info, ["merge_guard_local_diff_revision_invalid"]
     try:
@@ -1669,8 +1683,9 @@ def _merge_guard_legacy_local_review_diff_identity(
         or not isinstance(base_sha, str)
         or not isinstance(head_sha, str)
         or not isinstance(expected_sha256, str)
-        or _SHA40_RE.fullmatch(base_sha) is None
-        or _SHA40_RE.fullmatch(head_sha) is None
+        or _GIT_OID_RE.fullmatch(base_sha) is None
+        or _GIT_OID_RE.fullmatch(head_sha) is None
+        or len(base_sha) != len(head_sha)
         or _SHA256_RE.fullmatch(expected_sha256) is None
         or not changed_paths
         or len(changed_paths) > _MERGE_GUARD_MAX_CHANGED_PATHS
@@ -1703,7 +1718,7 @@ def _merge_guard_legacy_local_review_diff_identity(
         except UnicodeDecodeError:
             evidence["reason"] = "unique_merge_base_invalid"
             return False, evidence
-        if _SHA40_RE.fullmatch(common_ancestor) is None:
+        if not _same_git_oid_format(common_ancestor, base_sha):
             evidence["reason"] = "unique_merge_base_invalid"
             return False, evidence
         evidence["common_ancestor_sha"] = common_ancestor
@@ -2154,7 +2169,7 @@ def _exact_base_content_git_head_cas_update_pr_head(
     through authoritative remote-ref readback before retry safety is classified.
     """
 
-    if _SHA40_RE.fullmatch(base_sha) is None or _SHA40_RE.fullmatch(head_sha) is None:
+    if not _same_git_oid_format(base_sha, head_sha):
         raise RuntimeError("exact PR-head convergence requires canonical commit SHAs")
     if type(pr_number) is not int or pr_number <= 0:
         raise RuntimeError("exact PR-head convergence pull request number is invalid")
@@ -2270,7 +2285,7 @@ def _exact_base_content_git_head_cas_update_pr_head(
             fields[0]
             if len(fields) == 2
             and fields[1] == ref_name
-            and _SHA40_RE.fullmatch(fields[0]) is not None
+            and _GIT_OID_RE.fullmatch(fields[0]) is not None
             else None
         )
         return sha, info
@@ -2397,7 +2412,7 @@ def _exact_base_content_git_head_cas_update_pr_head(
         if len(parent_fields) != 3 or parent_fields[1:] != [head_sha, base_sha]:
             raise RuntimeError("exact PR-head convergence parent binding failed")
         merge_sha = parent_fields[0]
-        if _SHA40_RE.fullmatch(merge_sha) is None:
+        if not _same_git_oid_format(merge_sha, head_sha):
             raise RuntimeError(
                 "exact PR-head convergence merge commit identity invalid"
             )
@@ -2406,7 +2421,7 @@ def _exact_base_content_git_head_cas_update_pr_head(
         merge_tree_sha = (
             merge_tree["stdout"].strip() if merge_tree["returncode"] == 0 else ""
         )
-        if _SHA40_RE.fullmatch(merge_tree_sha) is None:
+        if not _same_git_oid_format(merge_tree_sha, head_sha):
             raise RuntimeError("exact PR-head convergence merge tree identity invalid")
         evidence["merge_tree_sha"] = merge_tree_sha
 
@@ -2502,7 +2517,7 @@ def _exact_base_git_cas_merge(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if _GITHUB_REPOSITORY_RE.fullmatch(repo_slug) is None:
         raise RuntimeError("exact-base merge repository identity is invalid")
-    if _SHA40_RE.fullmatch(base_sha) is None or _SHA40_RE.fullmatch(head_sha) is None:
+    if not _same_git_oid_format(base_sha, head_sha):
         raise RuntimeError("exact-base merge requires canonical commit SHAs")
     if type(pr_number) is not int or pr_number <= 0:
         raise RuntimeError("exact-base merge pull request number is invalid")
@@ -2653,12 +2668,12 @@ def _exact_base_git_cas_merge(
         if len(parent_fields) != 3 or parent_fields[1:] != [base_sha, head_sha]:
             raise RuntimeError("exact-base merge parent binding failed")
         merge_sha = parent_fields[0]
-        if _SHA40_RE.fullmatch(merge_sha) is None:
+        if not _same_git_oid_format(merge_sha, base_sha):
             raise RuntimeError("exact-base merge commit identity invalid")
         evidence["merge_sha"] = merge_sha
         merge_tree = run("verify-merge-tree", temp_root, ["rev-parse", "HEAD^{tree}"])
         merge_tree_sha = merge_tree["stdout"].strip() if merge_tree["returncode"] == 0 else ""
-        if _SHA40_RE.fullmatch(merge_tree_sha) is None:
+        if not _same_git_oid_format(merge_tree_sha, base_sha):
             raise RuntimeError("exact-base merge tree identity invalid")
         evidence["merge_tree_sha"] = merge_tree_sha
         remote_head_before = run(
@@ -4976,10 +4991,16 @@ class CaptainMergeGuardRunner:
             errors.append("merge_guard_server_bureau_run_lease_delegation_required")
         if _OWNER_RE.fullmatch(self.lease_owner_id) is None:
             errors.append("merge_guard_lease_owner_invalid")
-        if _SHA40_RE.fullmatch(expected_head) is None:
+        if _GIT_OID_RE.fullmatch(expected_head) is None:
             errors.append("merge_guard_expected_head_invalid")
-        if _SHA40_RE.fullmatch(expected_base_sha) is None:
+        if _GIT_OID_RE.fullmatch(expected_base_sha) is None:
             errors.append("merge_guard_expected_base_sha_invalid")
+        if (
+            _GIT_OID_RE.fullmatch(expected_head) is not None
+            and _GIT_OID_RE.fullmatch(expected_base_sha) is not None
+            and len(expected_head) != len(expected_base_sha)
+        ):
+            errors.append("merge_guard_expected_git_object_format_mismatch")
         if _SHA256_RE.fullmatch(expected_diff) is None:
             errors.append("merge_guard_expected_diff_sha256_invalid")
         replay_fields = sorted(_MERGE_GUARD_REPLAY_PARAMETERS.intersection(self.parameters))
@@ -5031,7 +5052,7 @@ class CaptainMergeGuardRunner:
             errors.append("merge_guard_live_view_not_object")
             return None, errors
         base_sha = viewed.get("baseRefOid")
-        if not isinstance(base_sha, str) or _SHA40_RE.fullmatch(base_sha) is None:
+        if not isinstance(base_sha, str) or _GIT_OID_RE.fullmatch(base_sha) is None:
             errors.append("merge_guard_base_sha_missing_or_invalid")
         elif base_sha != expected_base_sha:
             errors.append("merge_guard_base_sha_drift")
@@ -5511,7 +5532,7 @@ class CaptainMergeGuardRunner:
                         evidence["observed_merge_sha"] = observed_merge
                         evidence["matched"] = (
                             isinstance(expected_merge, str)
-                            and _SHA40_RE.fullmatch(expected_merge) is not None
+                            and _GIT_OID_RE.fullmatch(expected_merge) is not None
                             and observed_merge == expected_merge
                         )
                         self.receipt["exact_base_git_cas_post_view"] = evidence
@@ -6023,12 +6044,9 @@ class CaptainMergeGuardRunner:
 
         merge_sha = exact.get("merge_sha")
         merge_tree_sha = exact.get("merge_tree_sha")
-        if not isinstance(merge_sha, str) or _SHA40_RE.fullmatch(merge_sha) is None:
+        if not _same_git_oid_format(merge_sha, expected_head):
             errors.append("exact_base_cas_reconciliation_merge_sha_invalid")
-        if (
-            not isinstance(merge_tree_sha, str)
-            or _SHA40_RE.fullmatch(merge_tree_sha) is None
-        ):
+        if not _same_git_oid_format(merge_tree_sha, expected_head):
             errors.append("exact_base_cas_reconciliation_merge_tree_sha_invalid")
         commit_identity = exact.get("commit_identity")
         if (
