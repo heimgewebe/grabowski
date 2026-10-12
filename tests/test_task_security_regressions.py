@@ -1518,6 +1518,33 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 ),),
             )
 
+        # A writable alias into an independently RO-mounted Git common-dir
+        # or runtime tree would defeat the read-only kernel promise.
+        git_common = self.root / "git-common"
+        git_common.mkdir(mode=0o700)
+        git_shadow = git_common / "private-shadow"
+        git_shadow.mkdir(mode=0o700)
+        with self.assertRaisesRegex(tasks.agent_sandbox.AgentSandboxError, "read-only|overlap"):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                git_common_dir=git_common,
+                extra_read_write_directories=((
+                    git_shadow, Path("/tmp/grabowski-git-shadow"),
+                ),),
+            )
+        runtime_root = self.root / "readonly-runtime"
+        runtime_root.mkdir(mode=0o700)
+        runtime_shadow = runtime_root / "private-shadow"
+        runtime_shadow.mkdir(mode=0o700)
+        with self.assertRaisesRegex(tasks.agent_sandbox.AgentSandboxError, "read-only|overlap"):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_only=((runtime_root, runtime_root),),
+                extra_read_write_directories=((
+                    runtime_shadow, Path("/tmp/grabowski-runtime-shadow"),
+                ),),
+            )
+
         misplaced = state / "not-private"
         misplaced.mkdir(mode=0o755)
         with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):

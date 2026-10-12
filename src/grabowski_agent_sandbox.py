@@ -910,10 +910,13 @@ def minimal_sandbox_argv(
     if common is not None and common != worktree:
         arguments.extend(["--ro-bind", str(common), str(common)])
     seen_targets = {str(worktree), *(str(item) for item in writable)}
+    read_only_sources = {worktree}
     if common is not None:
         seen_targets.add(str(common))
+        read_only_sources.add(common)
     for source_value, target_value in (*adler_read_only, *tuple(extra_read_only)):
         source = _safe_existing_path(source_value, "extra_read_only source")
+        read_only_sources.add(source)
         if not target_value.is_absolute() or "\x00" in str(target_value):
             raise AgentSandboxError("extra_read_only target must be absolute")
         target = str(target_value)
@@ -977,8 +980,13 @@ def minimal_sandbox_argv(
         if source_candidate.absolute() != canonical_source:
             raise AgentSandboxError("external receipt source must be a canonical non-symlink directory")
         source = _private_directory(source_candidate, "external receipt directory")
-        if source == worktree or source.is_relative_to(worktree) or worktree.is_relative_to(source):
-            raise AgentSandboxError("external receipt directory overlaps the source workspace")
+        if any(
+            source == protected
+            or source.is_relative_to(protected)
+            or protected.is_relative_to(source)
+            for protected in read_only_sources
+        ):
+            raise AgentSandboxError("external receipt directory overlaps a read-only mount source")
         source_info = source.stat()
         if stat.S_IMODE(source_info.st_mode) & 0o700 != 0o700:
             raise AgentSandboxError("external receipt directory requires owner rwx")
