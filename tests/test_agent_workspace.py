@@ -1656,7 +1656,9 @@ class AgentWorkspaceTests(unittest.TestCase):
             ) as mutation_gate:
                 result = workspace._require_live_lane_binding(plan)
             self.assertTrue(result["valid"])
-            mutation_gate.assert_called_once_with("resource_lease")
+            # Every nested SQLite/lease read rechecks mutation admission.
+            self.assertGreaterEqual(mutation_gate.call_count, 1)
+            self.assertEqual([mock.call("resource_lease")] * mutation_gate.call_count, mutation_gate.call_args_list)
         finally:
             keeper.close()
         # SQLite fixture connections may survive keeper.close() on Python 3.12.

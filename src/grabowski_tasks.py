@@ -7401,10 +7401,10 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
         # The rootbroker's nominally observational show operation creates a
         # reference file and invokes a privileged client.  READ_ONLY callers
         # must not execute that effect or present stored active as live truth.
-        # Unobserved active tasks have an explicitly nonterminal diagnostic
-        # state; their actual persisted state remains separate and available.
-        terminal = _is_terminal_state(str(record["state"]))
-        result["state"] = record["state"] if terminal else "observation_error"
+        # Persisted terminal states are not proof of current privileged state.
+        # Every unprobed Rootbroker task remains explicitly nonterminal until
+        # a mutation-admitted live observation reconciles the true outcome.
+        result["state"] = "observation_error"
         result["last_observation"] = None
         result["observation_mode"] = "persisted_only_rootbroker_not_probed"
         result["observation_unavailable_reason"] = "privileged_broker_requires_mutation_gate"
@@ -7412,7 +7412,7 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
             "status": "unknown",
             "reason": "rootbroker_live_observation_requires_mutation_gate",
         }
-        result["reconcile_required"] = not terminal
+        result["reconcile_required"] = True
         return result
     observation = _observe(record)
     result["state"] = _effective_observed_state(record, observation["state"])

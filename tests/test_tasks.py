@@ -9410,6 +9410,40 @@ class TaskTests(unittest.TestCase):
         self.assertTrue(result["reconcile_required"])
         self.assertIsNone(result["last_observation"])
 
+    def test_root_broker_peek_persisted_terminal_requires_live_reconciliation(self) -> None:
+        created = self._start()["task"]
+        task_id = created["task_id"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET execution_backend='systemd-root-broker', "
+                "systemd_scope='system', state='completed' WHERE task_id=?",
+                (task_id,),
+            )
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                tasks.privileged, "root_task_systemd_request",
+                side_effect=AssertionError("read-only must not invoke privileged rootbroker"),
+            ) as broker,
+            patch.object(
+                tasks, "_observe",
+                side_effect=AssertionError("read-only must not trigger rootbroker observation"),
+            ) as probe,
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=PermissionError("mutation denied"),
+            ) as gate,
+        ):
+            result = tasks.grabowski_task_peek(task_id)
+        broker.assert_not_called()
+        probe.assert_not_called()
+        gate.assert_not_called()
+        self.assertEqual("completed", result["persisted_state"])
+        self.assertEqual("observation_error", result["state"])
+        self.assertTrue(result["reconcile_required"])
+        self.assertEqual("persisted_only_rootbroker_not_probed", result["observation_mode"])
+        self.assertEqual(before, self.database.read_bytes())
+
     def test_task_list_denied_mutation_cannot_recover_or_open_store(self) -> None:
         with (
             patch.object(

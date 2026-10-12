@@ -6825,6 +6825,60 @@ class CheckoutLifecycleTests(unittest.TestCase):
             finally:
                 keeper.close()
 
+    def test_public_checkout_inventory_rejects_nested_resource_and_task_wal(self) -> None:
+        # Both fanouts run under the same no-SHM scope as checkout inventory.
+        # A writer may have committed WAL bytes while no SHM sidecar exists.
+        checkout = checkouts._database()
+        checkout.close()
+        self.assertFalse(Path(str(self.checkout_db) + "-wal").exists())
+        for kind in ("resource", "task"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                source = directory / "source.sqlite3"
+                target = directory / "observed.sqlite3"
+                keeper = sqlite3.connect(source)
+                try:
+                    self.assertEqual(
+                        "wal", keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+                    )
+                    keeper.execute("PRAGMA wal_autocheckpoint=0")
+                    keeper.execute("CREATE TABLE sample(value INTEGER)")
+                    keeper.execute("INSERT INTO sample VALUES (42)")
+                    keeper.commit()
+                    shutil.copyfile(source, target)
+                    shutil.copyfile(
+                        Path(str(source) + "-wal"), Path(str(target) + "-wal")
+                    )
+                    before = {
+                        item.name: item.read_bytes()
+                        for item in directory.iterdir() if item.name.startswith("observed")
+                    }
+                    self.assertNotIn("observed.sqlite3-shm", before)
+                    module = checkouts.resources if kind == "resource" else checkouts.tasks
+                    database_name = "RESOURCE_DB" if kind == "resource" else "TASK_DB"
+                    with patch.object(module, database_name, target), patch.object(
+                        module, "_database",
+                        side_effect=AssertionError("READ_ONLY requested writable SQLite"),
+                    ) as writer:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "Strict read-only snapshot unavailable"
+                        ):
+                            checkouts.grabowski_checkout_inventory(
+                                str(self.repo), include_processes=False,
+                                include_tasks=kind == "task",
+                                include_resources=kind == "resource",
+                            )
+                    writer.assert_not_called()
+                    self.assertEqual(
+                        before, {
+                            item.name: item.read_bytes()
+                            for item in directory.iterdir()
+                            if item.name.startswith("observed")
+                        },
+                    )
+                finally:
+                    keeper.close()
+
     def test_public_checkout_inventory_refuses_orphaned_shm(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
