@@ -93,8 +93,12 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
                 return [[{"filename": "assets/a.js", "status": "modified"}]]
             raise AssertionError(argv)
 
-        def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False):
+        def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False, env_override=None):
             del repo, allow_nonzero
+            if argv[0] == "git" and "--is-shallow-repository" in argv:
+                return b"false\n"
+            if argv[0] == "git" and "merge-base" in argv:
+                return b"b" * 40 + bytes([10])
             if argv[0] == "git" and "--name-only" in argv:
                 return b"assets/a.js\0"
             if argv[0] == "git" and "diff" in argv:
@@ -109,6 +113,7 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
                 return_value=(None, "command failed: gh pr diff 226", True),
             ),
             mock.patch.object(pr_review_gate, "_run_bytes", side_effect=fake_run_bytes),
+            mock.patch.object(pr_review_gate, "bound_local_pr_git_diff", return_value=local_diff),
         ):
             state = pr_review_gate.load_pr_state(Path("/tmp/commonworld"), 226)
 
@@ -192,8 +197,12 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
                 return [[{"filename": "assets/a.js", "status": "modified"}]]
             raise AssertionError(argv)
 
-        def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False):
+        def fake_run_bytes(repo: Path, argv: list[str], *, allow_nonzero: bool = False, env_override=None):
             del repo, allow_nonzero
+            if argv[0] == "git" and "--is-shallow-repository" in argv:
+                return b"false\n"
+            if argv[0] == "git" and "merge-base" in argv:
+                return b"b" * 40 + bytes([10])
             if argv[0] == "git" and "--name-only" in argv:
                 return b"assets/other.js\0"
             raise AssertionError(argv)
@@ -218,7 +227,7 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
         completed = mock.Mock(
             returncode=1,
             stdout=b"",
-            stderr=b"GraphQL: PullRequest.diff too_large",
+            stderr=b"HTTP 406: PullRequest.diff too_large",
         )
         with (
             mock.patch.object(pr_review_gate.shutil, "which", return_value="/usr/bin/gh"),
@@ -240,6 +249,293 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
             pr_review_gate.GITHUB_PR_DIFF_MAX_FILES,
             merge_guard._MERGE_GUARD_GITHUB_DIFF_MAX_FILES,
         )
+
+    def test_github_line_limit_with_259_files_enables_only_bound_fallback(self) -> None:
+        error = b"HTTP 406: Sorry, the diff exceeded the maximum number of lines (20000) (PullRequest.diff too_large)"
+        with (
+            mock.patch.object(pr_review_gate.shutil, "which", return_value="/usr/bin/gh"),
+            mock.patch.object(pr_review_gate.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout=b"", stderr=error,
+            )),
+        ):
+            for count in (1, 259, 300):
+                with self.subTest(changed_files=count):
+                    _, _, too_large = pr_review_gate._current_pr_diff_bytes(
+                        Path("/tmp/commonworld"), 226, changed_files=count
+                    )
+                    self.assertTrue(too_large)
+            _, _, invalid = pr_review_gate._current_pr_diff_bytes(
+                Path("/tmp/commonworld"), 226, changed_files=False
+            )
+            self.assertFalse(invalid)
+        for diagnostic in (
+            b"HTTP 406: PullRequest.diff too_large",
+            b"HTTP 401: diff exceeded the maximum number of lines (20000) (PullRequest.diff too_large)",
+            b"HTTP 406: request temporarily unavailable",
+            b"HTTP 406: diff exceeded the maximum number of files (300) (PullRequest.diff too_large)",
+        ):
+            with (
+                mock.patch.object(pr_review_gate.shutil, "which", return_value="/usr/bin/gh"),
+                mock.patch.object(pr_review_gate.subprocess, "run", return_value=mock.Mock(
+                    returncode=1, stdout=b"", stderr=diagnostic,
+                )),
+            ):
+                _, _, too_large = pr_review_gate._current_pr_diff_bytes(
+                    Path("/tmp/commonworld"), 226, changed_files=259
+                )
+                self.assertFalse(too_large, diagnostic)
+
+    def test_rest_only_http_406_line_limit_without_graphql_marker(self) -> None:
+        # Reported by gh CLI: this REST endpoint error contains no
+        # PullRequest.diff too_large GraphQL marker.
+        diagnostic = (
+            b"HTTP 406: Sorry, the diff exceeded the maximum number of lines "
+            b"(20000) (https://api.github.com/repos/heimgewebe/schauwerk/pulls/203)"
+        )
+        with (
+            mock.patch.object(pr_review_gate.shutil, "which", return_value="/usr/bin/gh"),
+            mock.patch.object(pr_review_gate.subprocess, "run", return_value=mock.Mock(
+                returncode=1, stdout=b"", stderr=diagnostic,
+            )),
+        ):
+            _, _, too_large = pr_review_gate._current_pr_diff_bytes(
+                Path("/tmp/commonworld"), 203, changed_files=259
+            )
+        self.assertTrue(too_large)
+        for invalid in (
+            b"HTTP 406: request temporarily unavailable",
+            b"HTTP 401: Sorry, the diff exceeded the maximum number of lines (20000)",
+            b"HTTP 403: Sorry, the diff exceeded the maximum number of lines (20000)",
+            b"HTTP 406: Sorry, the diff exceeded the maximum number of lines",
+            b"HTTP 406: PullRequest.diff too_large",
+        ):
+            with self.subTest(diagnostic=invalid):
+                self.assertFalse(pr_review_gate._github_pr_diff_too_large(invalid, 259))
+
+    def test_file_cap_fallback_rejects_non_406_authorization_errors(self) -> None:
+        for diagnostic in (
+            b"GraphQL: PullRequest.diff too_large",
+            b"HTTP 401: PullRequest.diff too_large",
+            b"HTTP 403: diff exceeded the maximum number of files (300)",
+        ):
+            self.assertFalse(pr_review_gate._github_pr_diff_too_large(diagnostic, 301))
+        self.assertTrue(pr_review_gate._github_pr_diff_too_large(
+            b"HTTP 406: diff exceeded the maximum number of files (300)", 301
+        ))
+
+    def test_local_pr_diff_ignores_git_replace_refs_and_injected_object_directory(self) -> None:
+        import grabowski_merge_guard as merge_guard
+        import os
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="pr-diff-replacements-") as d:
+            repo = Path(d)
+
+            def git(*args: str) -> str:
+                result = subprocess.run(
+                    ["git", *args], cwd=repo, check=True,
+                    text=True, capture_output=True,
+                )
+                return result.stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.email", "review@example.invalid")
+            git("config", "user.name", "Review")
+            (repo / "base.txt").write_text("base\\n")
+            git("add", ".")
+            git("commit", "-qm", "base")
+            base = git("rev-parse", "HEAD")
+            (repo / "test.txt").write_text("change\\n")
+            git("add", ".")
+            git("commit", "-qm", "head")
+            head = git("rev-parse", "HEAD")
+            view = {
+                "baseRefOid": base,
+                "headRefOid": head,
+                "pullFilesEvidenceComplete": True,
+                "files": [{"path": "test.txt", "status": "added"}],
+            }
+            clean = pr_review_gate._local_bound_pr_diff_bytes(repo, view)
+            git("replace", "--graft", head)
+            # Deprecated local grafts also alter merge-base under
+            # GIT_NO_REPLACE_OBJECTS=1 unless separately neutralized.
+            grafts = repo / ".git" / "info" / "grafts"
+            grafts.parent.mkdir(exist_ok=True)
+            grafts.write_text(head + "\n")
+            with mock.patch.dict(
+                os.environ, {"GIT_OBJECT_DIRECTORY": str(repo / "missing-objects")},
+            ):
+                bounded = pr_review_gate._local_bound_pr_diff_bytes(repo, view)
+            self.assertEqual(clean, bounded)
+            merge_base, errors = merge_guard._merge_guard_unique_merge_base(
+                repo, base_sha=base, head_sha=head
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(merge_base, base)
+
+    def test_gitlink_diff_path_cannot_be_suppressed_by_checkout_submodule_config(self) -> None:
+        import subprocess
+
+        with tempfile.TemporaryDirectory(prefix="review-gitlink-ignored-") as d:
+            repo = Path(d)
+
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    ["git", *args], cwd=repo, check=True,
+                    text=True, capture_output=True,
+                ).stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.email", "review@example.invalid")
+            git("config", "user.name", "Review")
+            (repo / "seed.txt").write_text("seed\n")
+            git("add", "seed.txt")
+            git("commit", "-qm", "seed")
+            submodule_old = git("rev-parse", "HEAD")
+            git("update-index", "--add", "--cacheinfo", "160000", submodule_old, "deps/module")
+            git("commit", "-qm", "gitlink-base")
+            base = git("rev-parse", "HEAD")
+            git("update-index", "--cacheinfo", "160000", base, "deps/module")
+            git("commit", "-qm", "gitlink-head")
+            head = git("rev-parse", "HEAD")
+            git("config", "diff.ignoreSubmodules", "all")
+            self.assertEqual(git("diff", "--name-only", base, head), "")
+            view = {
+                "baseRefOid": base,
+                "headRefOid": head,
+                "pullFilesEvidenceComplete": True,
+                "files": [{"path": "deps/module", "status": "modified"}],
+            }
+            payload = pr_review_gate._local_bound_pr_diff_bytes(repo, view)
+            self.assertIn(b"deps/module", payload)
+            import grabowski_merge_guard as merge_guard
+            paths, _info, errors = merge_guard._merge_guard_local_changed_paths(
+                repo, base_sha=base, head_sha=head,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(paths, ["deps/module"])
+
+    def test_gitlink_diff_path_cannot_be_suppressed_by_committed_gitmodules_ignore(self) -> None:
+        import subprocess
+        import grabowski_merge_guard as merge_guard
+
+        with tempfile.TemporaryDirectory(prefix="review-gitmodules-ignored-") as d:
+            repo = Path(d)
+
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    ["git", *args], cwd=repo, check=True,
+                    text=True, capture_output=True,
+                ).stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.email", "review@example.invalid")
+            git("config", "user.name", "Review")
+            (repo / "seed.txt").write_text("seed\n")
+            (repo / ".gitmodules").write_text(
+                '[submodule "module"]\n'
+                '    path = deps/module\n'
+                '    url = https://example.invalid/module\n'
+                '    ignore = all\n'
+            )
+            git("add", ".")
+            git("commit", "-qm", "seed")
+            previous = git("rev-parse", "HEAD")
+            git("update-index", "--add", "--cacheinfo", "160000", previous, "deps/module")
+            git("commit", "-qm", "gitlink-base")
+            base = git("rev-parse", "HEAD")
+            git("update-index", "--cacheinfo", "160000", base, "deps/module")
+            git("commit", "-qm", "gitlink-head")
+            head = git("rev-parse", "HEAD")
+            self.assertEqual(git("diff", "--name-only", base, head), "")
+            self.assertEqual(
+                git("diff", "--ignore-submodules=none", "--name-only", base, head),
+                "deps/module",
+            )
+            view = {
+                "baseRefOid": base,
+                "headRefOid": head,
+                "pullFilesEvidenceComplete": True,
+                "files": [{"path": "deps/module", "status": "modified"}],
+            }
+            self.assertIn(b"deps/module", pr_review_gate._local_bound_pr_diff_bytes(repo, view))
+            paths, _info, errors = merge_guard._merge_guard_local_changed_paths(
+                repo, base_sha=base, head_sha=head,
+            )
+            self.assertEqual(errors, [])
+            self.assertEqual(paths, ["deps/module"])
+
+    def test_advanced_base_uses_single_merge_base_not_two_endpoint_diff(self) -> None:
+        import subprocess
+        with tempfile.TemporaryDirectory(prefix="review-mergebase-diverge-") as d:
+            repo = Path(d)
+            def git(*args: str) -> str:
+                return subprocess.run(["git", *args],cwd=repo,check=True,text=True,
+                    capture_output=True).stdout.strip()
+            git("init","-q")
+            git("config","user.email","review@example.invalid")
+            git("config","user.name","Review")
+            git("config","gc.auto","0")
+            (repo/"seed.txt").write_text("seed\n")
+            git("add","seed.txt")
+            git("commit","-q","-m","seed")
+            seed=git("rev-parse","HEAD")
+            git("checkout","-q","-b","feature")
+            (repo/"feature.txt").write_text("feature\n")
+            git("add","feature.txt")
+            git("commit","-q","-m","feature")
+            head=git("rev-parse","HEAD")
+            git("checkout","-q","-B","main",seed)
+            (repo/"base-only.txt").write_text("base only\n")
+            git("add","base-only.txt")
+            git("commit","-q","-m","main-advanced")
+            base=git("rev-parse","HEAD")
+            expected=pr_review_gate.github_pr_diff_identity_sha256(
+                subprocess.run(["git","diff",seed,head],cwd=repo,check=True,
+                    capture_output=True).stdout
+            )
+            view={"baseRefOid":base,"headRefOid":head,
+                "pullFilesEvidenceComplete":True,
+                "files":[{"path":"feature.txt","status":"added"}]}
+            payload=pr_review_gate._local_bound_pr_diff_bytes(repo,view)
+            self.assertEqual(pr_review_gate.github_pr_diff_identity_sha256(payload),expected)
+            self.assertIn(b"feature.txt",payload)
+            self.assertNotIn(b"base-only.txt",payload)
+
+    def test_local_bound_diff_rejects_shallow_history_before_merge_base(self) -> None:
+        view = {
+            "baseRefOid": "b" * 40,
+            "headRefOid": "a" * 40,
+            "pullFilesEvidenceComplete": True,
+            "files": [{"path": "feature.txt", "status": "added"}],
+        }
+        with (
+            mock.patch.object(pr_review_gate, "_run_bytes", return_value=b"true\n") as git,
+            mock.patch.object(pr_review_gate, "bound_local_pr_git_diff") as local_diff,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "complete history"):
+                pr_review_gate._local_bound_pr_diff_bytes(Path("/tmp"), view)
+        self.assertEqual(git.call_count, 1)
+        self.assertIn("rev-parse", git.call_args.args[1])
+        local_diff.assert_not_called()
+
+    def test_local_bound_diff_rejects_ambiguous_merge_base(self) -> None:
+        view = {
+            "baseRefOid": "b" * 40,
+            "headRefOid": "a" * 40,
+            "pullFilesEvidenceComplete": True,
+            "files": [{"path": "feature.txt", "status": "added"}],
+        }
+        with mock.patch.object(
+            pr_review_gate, "_run_bytes",
+            side_effect=[
+                b"false\n",
+                b"a" * 40 + bytes([10]) + b"b" * 40 + bytes([10]),
+            ],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exactly one valid merge base"):
+                pr_review_gate._local_bound_pr_diff_bytes(Path("/tmp"), view)
 
     def test_local_diff_fallback_rejects_untrusted_file_metadata(self) -> None:
         invalid_path = {
