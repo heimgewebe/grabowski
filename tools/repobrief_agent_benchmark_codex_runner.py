@@ -870,14 +870,19 @@ def validate_live_immutable_mounts(
         "home": home,
         "repository parent": home / "repos",
         "epoch parent": epoch,
+        "source parent": source_path.parent,
         "source": source_path,
+        "Git metadata parent": git_dir.parent,
         "Git metadata": git_dir,
+        "Git common parent": common_dir.parent,
         "Git common directory": common_dir,
         "request parent": request_root.parent,
         "request root": request_root,
+        "repository map parent": repository_map.parent,
         "repository map": repository_map,
         "manifest": manifest,
         "manifest parent": manifest.parent,
+        "runner parent": Path(__file__).parent,
         "runner source": Path(__file__),
     }
     protected_targets = {}
@@ -890,6 +895,14 @@ def validate_live_immutable_mounts(
             raise RunnerError(f"live Codex {label} mount check failed") from exc
         if not read_only:
             raise RunnerError(f"live Codex protected input mount writable: {label}")
+
+    # An RO directory can still hide an RW bind below it. Include protected
+    # source and metadata directories even when they live outside HOME.
+    protected_directories = {
+        target
+        for label, target in protected_targets.items()
+        if label not in {"filesystem root", "system tools", "home"} and target.is_dir()
+    }
 
     # A writable bind of a protected directory onto an output leaf is unsafe
     # even when the original path remains read-only in this namespace.
@@ -980,6 +993,13 @@ def validate_live_immutable_mounts(
             # No writable submount of HOME may be an accidental or malicious
             # alias to original plans, sources, credentials or repo metadata.
             raise RunnerError("live Codex has an unexpected writable home bind mount")
+        if any(
+            mount == protected or protected in mount.parents
+            for protected in protected_directories
+        ):
+            raise RunnerError(
+                "live Codex has an unexpected writable protected input bind mount"
+            )
     if observed_writable_outputs != allowed_outputs:
         raise RunnerError("live Codex private writable output mounts are missing")
 

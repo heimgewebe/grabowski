@@ -514,11 +514,23 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         extra_system_rw: bool = False,
         output_alias_source: bool = False,
         output_alias_subdir: bool = False,
+        outside_home_rw: bool = False,
+        external_git_common_rw: bool = False,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
             source = home / "repos" / "source"
-            (source / ".git").mkdir(parents=True)
+            source.mkdir(parents=True)
+            if external_git_common_rw:
+                git_dir = Path(tmp) / "external" / "linked-git"
+                common = Path(tmp) / "external" / "git-common"
+                git_dir.mkdir(parents=True)
+                common.mkdir(parents=True)
+                (git_dir / "commondir").write_text(str(common), encoding="utf-8")
+                (source / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+                (common / "objects").mkdir()
+            else:
+                (source / ".git").mkdir()
             (source / "src").mkdir()
             epoch = home / ".local" / "state" / "grabowski" / "epoch"
             epoch.mkdir(parents=True)
@@ -528,7 +540,11 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             }
             for path in leaves.values():
                 path.mkdir(mode=0o700)
-            request_root = home / "taskset" / "requests"
+            request_root = (
+                Path(tmp) / "outside" / "requests"
+                if outside_home_rw
+                else home / "taskset" / "requests"
+            )
             request_root.mkdir(parents=True)
             repository_map = epoch / "repository-map.json"
             repository_map.write_text("{}\n", encoding="utf-8")
@@ -575,6 +591,12 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 mounts.append(mount_line(unexpected, "rw,relatime"))
             if extra_system_rw:
                 mounts.append(mount_line(Path("/usr/bin"), "rw,relatime"))
+            if outside_home_rw:
+                writable_child = request_root / "nested"
+                writable_child.mkdir()
+                mounts.append(mount_line(writable_child, "rw,relatime"))
+            if external_git_common_rw:
+                mounts.append(mount_line(common / "objects", "rw,relatime"))
 
             def read_bytes(path: Path, *args, **kwargs):
                 if str(path) == "/proc/self/mountinfo":
@@ -599,12 +621,13 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                     return True
                 return real_samefile(left, right)
 
+            actual_uid = os.getuid()
             with (
                 patch.object(runner.Path, "home", return_value=home),
                 patch.object(runner.Path, "read_text", new=read_text),
                 patch.object(runner.Path, "read_bytes", new=read_bytes),
-                patch.object(runner.os, "getuid", return_value=1000),
-                patch.object(runner.os, "geteuid", return_value=1000),
+                patch.object(runner.os, "getuid", return_value=actual_uid),
+                patch.object(runner.os, "geteuid", return_value=actual_uid),
                 patch.object(runner.os, "statvfs", side_effect=statvfs),
                 patch.object(runner.os.path, "samefile", side_effect=samefile),
             ):
@@ -633,6 +656,18 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             runner.RunnerError, "unexpected writable home bind mount"
         ):
             self._probe(extra_rw="repos/unexpected")
+
+    def test_readonly_request_outside_home_blocks_nested_writable_bind(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "unexpected writable protected input bind mount"
+        ):
+            self._probe(outside_home_rw=True)
+
+    def test_readonly_external_git_common_blocks_nested_writable_bind(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "unexpected writable protected input bind mount"
+        ):
+            self._probe(external_git_common_rw=True)
 
     def test_nested_output_bind_cannot_alias_protected_data(self) -> None:
         with self.assertRaisesRegex(
