@@ -520,6 +520,9 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         outside_protected_alias_rw: bool = False,
         outside_root_alias_rw: bool = False,
         output_epoch_in_source: bool = False,
+        permitted_capabilities: int = 0,
+        ambient_capabilities: int = 0,
+        protected_hardlink: bool = False,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -551,6 +554,10 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             }
             for path in leaves.values():
                 path.mkdir(mode=0o700)
+            if protected_hardlink:
+                original_file = source / "src" / "frozen.txt"
+                original_file.write_text("frozen bytes\n", encoding="utf-8")
+                os.link(original_file, leaves["state"] / "existing-hardlink.txt")
             request_root = (
                 Path(tmp) / "outside" / "requests"
                 if outside_home_rw
@@ -569,7 +576,11 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
 
             def read_text(path: Path, *args, **kwargs):
                 if str(path) == "/proc/self/status":
-                    return "NoNewPrivs:\t1\nCapEff:\t0000000000000000\n"
+                    return (
+                        "NoNewPrivs:\t1\nCapEff:\t0000000000000000\n"
+                        f"CapPrm:\t{permitted_capabilities:016x}\n"
+                        f"CapAmb:\t{ambient_capabilities:016x}\n"
+                    )
                 return real_read_text(path, *args, **kwargs)
 
             def mount_line(
@@ -671,6 +682,22 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
 
     def test_only_four_private_output_mounts_are_admissible(self) -> None:
         self._probe()
+
+    def test_ambient_capability_without_effective_privilege_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "execution privileges are unsafe"
+        ):
+            self._probe(ambient_capabilities=1 << 21)
+
+    def test_permitted_capability_without_effective_privilege_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "execution privileges are unsafe"
+        ):
+            self._probe(permitted_capabilities=1 << 21)
+
+    def test_preexisting_protected_hardlink_in_private_output_is_rejected(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "hardlinked regular file"):
+            self._probe(protected_hardlink=True)
 
     def test_writable_historical_source_blocks_admission(self) -> None:
         with self.assertRaisesRegex(

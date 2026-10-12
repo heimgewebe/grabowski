@@ -769,8 +769,10 @@ def validate_live_immutable_mounts(
         status = Path("/proc/self/status").read_text(encoding="ascii")
         fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
         no_new_privs = fields.get("NoNewPrivs", "").strip()
-        caps = fields.get("CapEff", "").strip()
-        no_caps = bool(caps) and int(caps, 16) == 0
+        capabilities = (
+            fields.get(name, "").strip() for name in ("CapEff", "CapPrm", "CapAmb")
+        )
+        no_caps = all(value != "" and int(value, 16) == 0 for value in capabilities)
     except (OSError, ValueError) as exc:
         raise RunnerError("live Codex kernel privilege state unavailable") from exc
     if no_new_privs != "1" or not no_caps:
@@ -831,6 +833,34 @@ def validate_live_immutable_mounts(
             raise RunnerError(f"live Codex {name} output mount unavailable") from exc
         if not writable:
             raise RunnerError(f"live Codex {name} output is read-only")
+
+    # A pre-existing hard link in an RW leaf can modify a protected inode
+    # through a second pathname even when the source mount remains RO.
+    # The runner creates isolated Git clones with --no-hardlinks; bounded
+    # readback also admits ordinary existing ledger/session files.
+    entries_seen = 0
+    pending = [(path, 0) for path in outputs.values()]
+    while pending:
+        directory, depth = pending.pop()
+        if depth > 32:
+            raise RunnerError("live Codex private output scan depth exceeded")
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    entries_seen += 1
+                    if entries_seen > 65536:
+                        raise RunnerError(
+                            "live Codex private output scan entry budget exceeded"
+                        )
+                    metadata = entry.stat(follow_symlinks=False)
+                    if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1:
+                        raise RunnerError(
+                            "live Codex private output contains hardlinked regular file"
+                        )
+                    if stat.S_ISDIR(metadata.st_mode):
+                        pending.append((Path(entry.path), depth + 1))
+        except OSError as exc:
+            raise RunnerError("live Codex private output scan unavailable") from exc
 
     source_path = resolved(source, "source")
     git_marker = source_path / ".git"
