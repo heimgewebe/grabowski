@@ -745,6 +745,143 @@ def observed_repo(*records: dict) -> dict:
 
 
 class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
+    def test_native_admission_recovers_wal_created_during_immutable_read(self) -> None:
+        """A real writer can start WAL after the initial no-sidecar decision."""
+        import grabowski_checkout_binding_reconciler as reconciler
+
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "checkouts.sqlite3"
+            create_checkout_db(database)
+            insert_binding(database, checkout_key="key-a", checkout_path=CHECKOUT)
+            self.assertFalse(Path(str(database) + "-wal").exists())
+            original_validate = reconciler._validate_database
+            keeper = None
+            validation_count = 0
+
+            def switch_to_wal_after_schema_read(connection: sqlite3.Connection) -> None:
+                nonlocal keeper, validation_count
+                original_validate(connection)
+                validation_count += 1
+                if keeper is not None:
+                    return
+                keeper = sqlite3.connect(database, timeout=2)
+                self.assertEqual(keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+                keeper.execute("PRAGMA wal_autocheckpoint=0")
+                keeper.execute("BEGIN IMMEDIATE")
+                keeper.execute(
+                    "UPDATE lifecycle_bindings SET expected_head=? WHERE checkout_key='key-a'",
+                    ("b" * 40,),
+                )
+                keeper.execute(
+                    "UPDATE retention SET expected_head=? WHERE checkout_key='key-a'",
+                    ("b" * 40,),
+                )
+                keeper.commit()
+                self.assertTrue(Path(str(database) + "-wal").is_file())
+                self.assertTrue(Path(str(database) + "-shm").is_file())
+
+            try:
+                with mock.patch.object(
+                    reconciler, "_validate_database",
+                    side_effect=switch_to_wal_after_schema_read,
+                ):
+                    observed = collect_lifecycle_bindings_from_db(
+                        database, _native_wal_snapshot=True,
+                    )
+                self.assertEqual(validation_count, 2)
+                self.assertEqual(observed["snapshot_mode"], "native-ro-wal")
+                self.assertEqual(len(observed["bindings"]), 1)
+                self.assertEqual(observed["bindings"][0]["expected_head"], "b" * 40)
+                self.assertEqual(
+                    observed["bindings"][0]["retention"]["expected_head"],
+                    "b" * 40,
+                )
+            finally:
+                if keeper is not None:
+                    keeper.close()
+
+    def test_native_admission_wal_transition_retry_is_bounded(self) -> None:
+        import grabowski_checkout_binding_reconciler as reconciler
+
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "checkouts.sqlite3"
+            create_checkout_db(database)
+            insert_binding(database, checkout_key="key-a", checkout_path=CHECKOUT)
+            keeper = None
+            validation_count = 0
+            original_validate = reconciler._validate_database
+
+            def create_wal_during_initial_read(connection: sqlite3.Connection) -> None:
+                nonlocal keeper, validation_count
+                original_validate(connection)
+                validation_count += 1
+                if keeper is None:
+                    keeper = sqlite3.connect(database)
+                    self.assertEqual(keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+                    keeper.execute("INSERT INTO metadata(key,value) VALUES('wal-live','yes')")
+                    keeper.commit()
+
+            try:
+                with (
+                    mock.patch.object(
+                        reconciler, "_validate_database",
+                        side_effect=create_wal_during_initial_read,
+                    ),
+                    mock.patch.object(
+                        reconciler.sqlite_store,
+                        "inventory_native_wal_readonly_sqlite",
+                        side_effect=CheckoutBindingDatabaseError(
+                            "checkout database changed during reconciliation snapshot"
+                        ),
+                    ) as native,
+                    self.assertRaises(CheckoutBindingDatabaseError),
+                ):
+                    collect_lifecycle_bindings_from_db(
+                        database, _native_wal_snapshot=True,
+                    )
+                self.assertEqual(validation_count, 1)
+                native.assert_called_once()
+            finally:
+                if keeper is not None:
+                    keeper.close()
+
+    def test_native_admission_does_not_retry_schema_error_on_wal_transition(self) -> None:
+        import grabowski_checkout_binding_reconciler as reconciler
+
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "checkouts.sqlite3"
+            create_checkout_db(database)
+            keeper = None
+
+            def malformed_schema_with_wal(_: sqlite3.Connection) -> None:
+                nonlocal keeper
+                keeper = sqlite3.connect(database)
+                self.assertEqual(keeper.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+                keeper.execute("INSERT INTO metadata(key,value) VALUES('wal-live','yes')")
+                keeper.commit()
+                raise CheckoutBindingDatabaseError("checkout schema version cannot be read")
+
+            try:
+                with (
+                    mock.patch.object(
+                        reconciler, "_validate_database",
+                        side_effect=malformed_schema_with_wal,
+                    ) as validate,
+                    mock.patch.object(
+                        reconciler.sqlite_store,
+                        "inventory_native_wal_readonly_sqlite",
+                    ) as native,
+                    self.assertRaisesRegex(CheckoutBindingDatabaseError, "schema version"),
+                ):
+                    collect_lifecycle_bindings_from_db(
+                        database, _native_wal_snapshot=True,
+                    )
+                validate.assert_called_once()
+                native.assert_not_called()
+            finally:
+                if keeper is not None:
+                    keeper.close()
+
     def test_native_wal_snapshot_survives_commit_during_bound_read(self) -> None:
         """A real WAL writer must not invalidate a pinned SQLite read transaction."""
         import threading

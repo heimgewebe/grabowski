@@ -610,23 +610,31 @@ def collect_lifecycle_bindings_from_db(
     db_path: Path | str | None = None,
     *,
     _native_wal_snapshot: bool = False,
+    _wal_transition_retry_available: bool = True,
 ) -> dict[str, Any]:
     """Read every durable lifecycle binding from one pinned read-only transaction."""
     path = _database_path(db_path)
     if type(_native_wal_snapshot) is not bool:
         raise ValueError("native WAL snapshot mode must be boolean")
+    if type(_wal_transition_retry_available) is not bool:
+        raise ValueError("WAL transition retry flag must be boolean")
     wal_path = Path(str(path) + "-wal")
     native = _native_wal_snapshot and (wal_path.exists() or wal_path.is_symlink())
     inventory = (
         sqlite_store.inventory_native_wal_readonly_sqlite
         if native else sqlite_store.inventory_readonly_sqlite
     )
+    changed_message = "checkout database changed during reconciliation snapshot"
     read_options: dict[str, Any] = {
         "error_type": CheckoutBindingDatabaseError,
-        "message": "checkout database changed during reconciliation snapshot",
+        "message": changed_message,
     }
     if not native:
         read_options["temporary_prefix"] = "grabowski-checkout-binding-snapshot."
+    # Only a fully validated snapshot rejected on context-manager exit may
+    # be retried after a real no-WAL-to-WAL transition.  A malformed schema
+    # or partial read is never upgraded into a fresh positive admission.
+    snapshot_complete = False
     try:
         with inventory(path, **read_options) as connection:
             _validate_database(connection)
@@ -701,6 +709,7 @@ def collect_lifecycle_bindings_from_db(
             snapshot_sha256 = hashlib.sha256(
                 consumer_surface.canonical_json_bytes(snapshot_material)
             ).hexdigest()
+            snapshot_complete = True
             return {
                 "database_path": str(path),
                 "database_schema_version": CHECKOUT_DATABASE_SCHEMA_VERSION,
@@ -716,7 +725,33 @@ def collect_lifecycle_bindings_from_db(
                     )
                 ),
             }
-    except CheckoutBindingDatabaseError:
+    except CheckoutBindingDatabaseError as exc:
+        # A legitimate writer may open WAL after the first no-WAL probe.
+        # Discard the stale immutable view and read one fresh native SQLite
+        # transaction.  No recursive retry after a second drift or when the
+        # source never completed schema/data validation.  Sidecar safety checks
+        # run again in the native reader and still deny invalid paths.
+        if (
+            _native_wal_snapshot
+            and _wal_transition_retry_available
+            and not native
+            and snapshot_complete
+            and str(exc) == changed_message
+            and (wal_path.exists() or wal_path.is_symlink())
+        ):
+            return collect_lifecycle_bindings_from_db(
+                path,
+                _native_wal_snapshot=True,
+                _wal_transition_retry_available=False,
+            )
+        if (
+            not snapshot_complete
+            and str(exc) == changed_message
+            and isinstance(exc.__context__, CheckoutBindingDatabaseError)
+        ):
+            # The immutable reader's exit identity check must not mask a
+            # genuine inner schema/semantic failure.
+            raise exc.__context__ from exc
         raise
     except (OSError, sqlite3.Error) as exc:
         raise CheckoutBindingDatabaseError(
