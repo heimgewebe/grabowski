@@ -520,6 +520,11 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         outside_protected_alias_rw: bool = False,
         outside_root_alias_rw: bool = False,
         outside_same_device_hardlink: bool = False,
+        writable_software_alias: str | None = None,
+        stacked_source_writable_alias: bool = False,
+        stacked_source_hidden_child: bool = False,
+        stacked_source_visible_first: bool = False,
+        hidden_codex_before_parent_mount: bool = False,
         unrelated_tmpfs_rw: bool = False,
         root_mount_rw: bool = False,
         output_below_protected_backing: bool = False,
@@ -545,6 +550,13 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             else:
                 (source / ".git").mkdir()
             (source / "src").mkdir()
+            codex_root = Path(tmp) / "software" / "codex"
+            (codex_root / "bin").mkdir(parents=True)
+            (codex_root / "codex-path").mkdir()
+            codex = codex_root / "bin" / "codex"
+            codex.write_bytes(b"codex immutable executable")
+            bundled_rg = codex_root / "codex-path" / "rg"
+            bundled_rg.write_bytes(b"bundled rg immutable executable")
             if output_alias_parent:
                 for name in ("state", "transcripts", "evidence", "reports"):
                     (source / name).mkdir()
@@ -601,6 +613,9 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                     )
                 return real_read_text(path, *args, **kwargs)
 
+            mount_number = [100]
+            mount_paths: list[tuple[Path, int]] = []
+
             def mount_line(
                 path: Path,
                 options: str,
@@ -608,9 +623,26 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 mount_root: Path | None = None,
                 device: str = "8:1",
             ) -> bytes:
+                # Real /proc/self/mountinfo identifies each mount uniquely.
+                # Stacking a second mount at the same path makes the covered
+                # mount its parent, irrespective of emitted line order.
+                mount_number[0] += 1
+                mount_id = mount_number[0]
+                parents = [
+                    (index, mountpoint, identifier)
+                    for index, (mountpoint, identifier) in enumerate(mount_paths)
+                    if mountpoint == path or mountpoint in path.parents
+                ]
+                parent_id = (
+                    max(parents, key=lambda row: (len(row[1].parts), row[0]))[2]
+                    if parents
+                    else 0
+                )
+                mount_paths.append((path, mount_id))
                 physical_root = path if mount_root is None else mount_root
                 return (
-                    f"123 100 {device} {physical_root} {path} {options} - ext4 /dev/test {options}\n"
+                    f"{mount_id} {parent_id} {device} {physical_root} {path} "
+                    f"{options} - ext4 /dev/test {options}\n"
                 ).encode()
 
             mounts = [
@@ -627,12 +659,72 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                     ),
                 ),
             ]
+            if hidden_codex_before_parent_mount:
+                # A bind at the executable pathname is covered by a later
+                # RO mount of its parent directory; its backing is invisible.
+                mounts.append(
+                    mount_line(
+                        codex,
+                        "ro,relatime",
+                        mount_root=Path("/covered-codex"),
+                        device="8:5",
+                    )
+                )
+            mounts.extend(
+                (
+                    mount_line(
+                        codex_root,
+                        "ro,relatime",
+                        mount_root=Path("/private-codex-package"),
+                        device="8:2",
+                    ),
+                    mount_line(
+                        bundled_rg,
+                        "ro,relatime",
+                        mount_root=Path("/private-rg-binary"),
+                        device="8:3",
+                    ),
+                )
+            )
             if output_below_protected_backing:
                 mounts.append(
                     mount_line(source, "ro,relatime", mount_root=Path("/backing/repo"))
                 )
             if output_alias_parent:
                 mounts.append(mount_line(epoch, "ro,relatime", mount_root=source))
+            if stacked_source_writable_alias or stacked_source_hidden_child:
+                covered = mount_line(
+                    source,
+                    "ro,relatime",
+                    mount_root=Path("/covered-source"),
+                    device="8:5",
+                )
+                hidden = (
+                    mount_line(
+                        source / "src",
+                        "rw,relatime",
+                        mount_root=Path("/covered-source/src"),
+                        device="8:5",
+                    )
+                    if stacked_source_hidden_child
+                    else None
+                )
+                visible = mount_line(
+                    source,
+                    "ro,relatime",
+                    mount_root=Path("/visible-source"),
+                    device="8:4",
+                )
+                stack = (
+                    [covered, visible] if hidden is None else [covered, hidden, visible]
+                )
+                if stacked_source_visible_first:
+                    stack = (
+                        [visible, covered]
+                        if hidden is None
+                        else [visible, hidden, covered]
+                    )
+                mounts.extend(stack)
             if protected_bind_origin_in_output or protected_bind_origin_outside_output:
                 backing = (
                     leaves[protected_bind_origin_in_output] / "frozen-source"
@@ -666,6 +758,19 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 mounts.append(mount_line(unexpected, "rw,relatime"))
             if extra_system_rw:
                 mounts.append(mount_line(Path("/usr/bin"), "rw,relatime"))
+            if writable_software_alias is not None:
+                if writable_software_alias not in {"codex", "rg"}:
+                    raise AssertionError("unknown software alias fixture")
+                external_alias = Path(tmp) / "external-software-alias"
+                external_alias.mkdir()
+                mounts.append(
+                    mount_line(
+                        external_alias,
+                        "rw,relatime",
+                        mount_root=Path("/unrelated-writable"),
+                        device="8:2" if writable_software_alias == "codex" else "8:3",
+                    )
+                )
             if unrelated_tmpfs_rw:
                 ephemeral = Path(tmp) / "ephemeral"
                 ephemeral.mkdir()
@@ -678,6 +783,17 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 mounts.append(mount_line(common / "objects", "rw,relatime"))
             if outside_same_device_hardlink:
                 mounts.append(mount_line(scratch, "rw,relatime"))
+            if stacked_source_writable_alias:
+                source_alias = Path(tmp) / "stacked-source-rw-alias"
+                source_alias.mkdir()
+                mounts.append(
+                    mount_line(
+                        source_alias,
+                        "rw,relatime",
+                        mount_root=Path("/unrelated-visible-source-alias"),
+                        device="8:4",
+                    )
+                )
             if outside_protected_alias_rw or outside_root_alias_rw:
                 alias = Path(tmp) / "writable-alias"
                 alias.mkdir()
@@ -724,6 +840,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             ):
                 runner.validate_live_immutable_mounts(
                     source=source,
+                    codex=codex,
                     request_root=request_root,
                     repository_map=repository_map,
                     manifest=manifest,
@@ -735,6 +852,48 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
 
     def test_only_four_private_output_mounts_are_admissible(self) -> None:
         self._probe()
+
+    def test_codex_executable_and_bundled_rg_writable_backing_aliases_are_rejected(
+        self,
+    ) -> None:
+        for executable in ("codex", "rg"):
+            with self.subTest(executable=executable):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "unexpected writable mount sharing protected filesystem",
+                ):
+                    self._probe(writable_software_alias=executable)
+
+    def test_visible_stacked_source_must_block_same_filesystem_writable_alias(
+        self,
+    ) -> None:
+        for visible_first in (False, True):
+            with self.subTest(visible_first=visible_first):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "unexpected writable mount sharing protected filesystem",
+                ):
+                    self._probe(
+                        stacked_source_writable_alias=True,
+                        stacked_source_visible_first=visible_first,
+                    )
+
+    def test_hidden_writable_submount_under_covered_source_is_not_accessible(
+        self,
+    ) -> None:
+        self._probe(stacked_source_hidden_child=True)
+
+    def test_hidden_binary_mount_below_later_parent_bind_cannot_mask_alias(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError,
+            "unexpected writable mount sharing protected filesystem",
+        ):
+            self._probe(
+                hidden_codex_before_parent_mount=True,
+                writable_software_alias="codex",
+            )
 
     def test_unrelated_tmpfs_cannot_alias_protected_storage(self) -> None:
         self._probe(unrelated_tmpfs_rw=True)

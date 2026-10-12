@@ -315,6 +315,7 @@ def authorize_pair(
         raise core.PreflightError("live Codex treatment manifest is unavailable")
     codex_runner.validate_live_immutable_mounts(
         source=source,
+        codex=Path(codex_command),
         request_root=request_root,
         repository_map=repository_map,
         manifest=Path(repobrief["manifest"]),

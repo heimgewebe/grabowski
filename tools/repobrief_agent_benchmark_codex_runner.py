@@ -751,6 +751,7 @@ def validate_toolchain(codex: str) -> str:
 def validate_live_immutable_mounts(
     *,
     source: Path,
+    codex: Path,
     request_root: Path,
     repository_map: Path,
     manifest: Path | None,
@@ -897,6 +898,10 @@ def validate_live_immutable_mounts(
     immutable_paths = {
         "filesystem root": Path("/"),
         "system tools": Path("/usr"),
+        # The provider binary and its bundled rg may be RO-bind-mounted from
+        # another filesystem: another RW alias to either device is unsafe.
+        "Codex executable": codex,
+        "Codex bundled rg": codex.parent.parent / "codex-path" / "rg",
         "home": home,
         "repository parent": home / "repos",
         "epoch parent": epoch,
@@ -994,19 +999,97 @@ def validate_live_immutable_mounts(
             raise RunnerError("live Codex mountinfo path is invalid")
         return result
 
-    mounts: list[tuple[Path, Path, bytes, bool]] = []
+    # Mountpoint text alone is not a visible mount identity. Linux can stack
+    # multiple mounts at one path, with each new mount naming the covered
+    # mount as parent. Select the unique top of that chain, independent of
+    # mountinfo line order. Descendants of a covered mount are inaccessible.
+    records: dict[int, tuple[int, Path, Path, bytes, bool]] = {}
+    at_point: dict[Path, list[int]] = {}
     for line in mount_lines:
         fields = line.split(b" - ", 1)[0].split()
-        if len(fields) < 6:
+        if (
+            len(fields) < 6
+            or len(fields[0]) > 20
+            or len(fields[1]) > 20
+            or not fields[0].isdigit()
+            or not fields[1].isdigit()
+        ):
             raise RunnerError("live Codex mountinfo is malformed")
-        mounts.append(
-            (
-                decode_mountinfo_field(fields[4]),
-                decode_mountinfo_field(fields[3]),
-                fields[2],
-                b"rw" in fields[5].split(b","),
-            )
+        mount_id, parent_id = int(fields[0]), int(fields[1])
+        point = decode_mountinfo_field(fields[4])
+        if mount_id == 0 or mount_id in records:
+            raise RunnerError("live Codex mountinfo mount IDs are invalid")
+        if mount_id == parent_id:
+            if point != Path("/"):
+                raise RunnerError("live Codex mountinfo mount parent is invalid")
+            parent_id = 0  # The namespace root may name itself as parent.
+        records[mount_id] = (
+            parent_id,
+            point,
+            decode_mountinfo_field(fields[3]),
+            fields[2],
+            b"rw" in fields[5].split(b","),
         )
+        at_point.setdefault(point, []).append(mount_id)
+    if Path("/") not in at_point:
+        raise RunnerError("live Codex mountinfo namespace root is missing")
+
+    top_at_point: dict[Path, int] = {}
+    for point, ids in at_point.items():
+        group = set(ids)
+        covered = {records[mount_id][0] for mount_id in ids} & group
+        possible_top = group - covered
+        if len(possible_top) != 1:
+            raise RunnerError("live Codex mountinfo mount stack is ambiguous")
+        top = next(iter(possible_top))
+        chain: set[int] = set()
+        current = top
+        while current in group:
+            if current in chain:
+                raise RunnerError("live Codex mountinfo mount stack is cyclic")
+            chain.add(current)
+            current = records[current][0]
+        if chain != group:
+            raise RunnerError("live Codex mountinfo mount stack is disconnected")
+        top_at_point[point] = top
+
+    # A mount can also be covered by a *later ancestor mount*, not only
+    # another mount at the same point. Work out visible parent prefixes from
+    # the namespace root downwards. A hidden child never supplies a backing
+    # identity or a writable alias, and cannot hide the actually visible one.
+    visible_at_point: dict[Path, int] = {}
+    for point in sorted(top_at_point, key=lambda path: (len(path.parts), str(path))):
+        mount_id = top_at_point[point]
+        parent_id = records[mount_id][0]
+        while parent_id in records and records[parent_id][1] == point:
+            parent_id = records[parent_id][0]  # Skip covered same-path stack.
+        if point == Path("/"):
+            if parent_id in records:
+                raise RunnerError(
+                    "live Codex mountinfo namespace root parent is invalid"
+                )
+            visible_at_point[point] = mount_id
+            continue
+        if parent_id not in records or records[parent_id][1] not in point.parents:
+            raise RunnerError("live Codex mountinfo parent topology is invalid")
+        nearest_visible_parent = next(
+            (parent for parent in point.parents if parent in visible_at_point),
+            None,
+        )
+        if nearest_visible_parent is None:
+            raise RunnerError("live Codex mountinfo visible parent is missing")
+        if parent_id == visible_at_point[nearest_visible_parent]:
+            visible_at_point[point] = mount_id
+
+    mounts: list[tuple[Path, Path, bytes, bool]] = [
+        (
+            records[mount_id][1],
+            records[mount_id][2],
+            records[mount_id][3],
+            records[mount_id][4],
+        )
+        for mount_id in visible_at_point.values()
+    ]
 
     # The allowed writable leaves cannot be trusted if a read-only bind
     # underneath HOME first redirects their epoch parent onto source data.
@@ -7404,8 +7487,10 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
     # or creating provider evidence. The second check immediately before the
     # irreversible intent remains authoritative against later mount drift.
     if dispatch_authorization is not None:
+        assert codex is not None
         validate_live_immutable_mounts(
             source=source,
+            codex=Path(codex),
             request_root=args.request_root,
             repository_map=args.repository_map,
             manifest=(
@@ -7498,6 +7583,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 # staging and immediately before the irreversible one-shot intent.
                 validate_live_immutable_mounts(
                     source=source,
+                    codex=Path(codex),
                     request_root=args.request_root,
                     repository_map=args.repository_map,
                     manifest=(
