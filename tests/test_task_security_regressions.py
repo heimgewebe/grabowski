@@ -1724,5 +1724,40 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 self.assertEqual(private.read_text(encoding="utf-8"), "unchanged")
 
 
+    def test_git_metadata_must_not_be_a_bounded_writable_path(self) -> None:
+        """An owned path lease must not make repository bookkeeping writable."""
+        workspace = self.root / "git-metadata-scope"
+        workspace.mkdir()
+        gitdir = workspace / ".git"
+        gitdir.mkdir()
+        config = gitdir / "config"
+        config.write_text("[core]\\n", encoding="utf-8")
+        for target in (gitdir, config):
+            with self.subTest(target=str(target)):
+                with self.assertRaisesRegex(
+                    tasks.agent_sandbox.AgentSandboxError, "Git|git|metadata",
+                ):
+                    tasks.agent_sandbox.minimal_sandbox_argv(
+                        workspace=workspace,
+                        command=["/usr/bin/true"],
+                        workspace_writable=True,
+                        writable_paths=(target,),
+                    )
+        parent = workspace / "allowed-parent"
+        parent.mkdir()
+        nested_git = parent / ".git"
+        nested_git.mkdir()
+        (nested_git / "config").write_text("[core]\\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "Git|git|metadata",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=workspace,
+                command=["/usr/bin/true"],
+                workspace_writable=True,
+                writable_paths=(parent,),
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

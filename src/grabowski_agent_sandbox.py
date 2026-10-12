@@ -595,6 +595,8 @@ def _validate_writable_tree(target: Path) -> None:
                         raise AgentSandboxError(
                             f"writable path crosses a filesystem boundary: {entry.path}"
                         )
+                    if entry.name == ".git":
+                        raise AgentSandboxError("Git metadata may not occur inside a writable sandbox scope")
                     if stat.S_ISLNK(item.st_mode):
                         continue
                     if stat.S_ISDIR(item.st_mode):
@@ -809,9 +811,11 @@ def _normalized_writable_paths(worktree: Path, values: Iterable[Path]) -> list[P
     for value in values:
         target = _safe_existing_path(value, "writable_path")
         try:
-            target.relative_to(worktree)
+            relative = target.relative_to(worktree)
         except ValueError as exc:
             raise AgentSandboxError(f"writable path escapes workspace: {target}") from exc
+        if ".git" in relative.parts:
+            raise AgentSandboxError("Git metadata may not be a writable sandbox scope")
         if target == worktree:
             raise AgentSandboxError("whole-workspace writable bind is not allowed")
         metadata = target.stat()
