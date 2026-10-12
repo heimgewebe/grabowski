@@ -7925,11 +7925,12 @@ def _day1_task_output_attestation_diagnostic(
     not authenticate the code or captured stdout to a same-UID adversary.
     """
     backend = _execution_backend(record)
-    reason = (
-        "same_uid_capture_and_receipt_storage"
-        if backend == "systemd-user"
-        else "root_task_backend_lacks_protected_source_and_output_attestation"
-    )
+    if backend == "systemd-user":
+        reason = "same_uid_capture_and_receipt_storage"
+    elif backend == "systemd-root-broker":
+        reason = "root_task_backend_lacks_protected_source_and_output_attestation"
+    else:
+        raise ValueError(f"unsupported execution backend: {backend}")
     return {
         "schema_version": 1,
         "kind": "grabowski_day1_output_attestation_diagnostic",

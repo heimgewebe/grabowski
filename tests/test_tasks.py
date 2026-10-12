@@ -14053,6 +14053,39 @@ class RuntimeContractTests(unittest.TestCase):
         self.assertFalse(
             evidence["day1_output_attestation"]["day1_admission_authorized"]
         )
+        # The new diagnostic is confined to the explicit evidence projection.
+        # Exercise both established non-evidence views with a complete public
+        # record rather than a partial stub that would raise KeyError.
+        public_record = {
+            "task_id": "a" * 24,
+            "host": "test-host",
+            "unit": "grabowski-task-test.service",
+            "authoritative_unit": "grabowski-task-test.service",
+            "execution_backend": "systemd-user",
+            "systemd_scope": "user",
+            "attempt": 1,
+            "state": "completed",
+            "resume_policy": "never",
+            "argv_sha256": "b" * 64,
+            "created_at_unix": 1,
+            "updated_at_unix": 2,
+            "resource_keys": [],
+            "systemd_unit_health": {"state": "healthy"},
+            "argv": ["true"],
+            "cwd": "/",
+            "runtime_seconds": 10,
+            "memory_max_bytes": None,
+            "last_observation": None,
+            "lease_owner_id": "lane:test",
+            "chronik_outbox_enabled": False,
+        }
+        with patch.object(tasks, "_public", return_value=public_record):
+            for view in ("minimal", "standard"):
+                with self.subTest(view=view):
+                    projection = tasks._public_for_view(
+                        {"execution_backend": "systemd-user"}, view
+                    )
+                    self.assertNotIn("day1_output_attestation", projection)
         with self.assertRaises(ValueError):
             tasks._day1_task_output_attestation_diagnostic(
                 {"execution_backend": "made-up-attested-backend"}
