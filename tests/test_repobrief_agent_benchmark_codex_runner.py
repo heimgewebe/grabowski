@@ -520,6 +520,8 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         outside_protected_alias_rw: bool = False,
         outside_root_alias_rw: bool = False,
         output_epoch_in_source: bool = False,
+        protected_bind_origin_in_output: str | None = None,
+        protected_bind_origin_outside_output: bool = False,
         permitted_capabilities: int = 0,
         ambient_capabilities: int = 0,
         protected_hardlink: bool = False,
@@ -554,6 +556,12 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             }
             for path in leaves.values():
                 path.mkdir(mode=0o700)
+            if protected_bind_origin_in_output:
+                backing = leaves[protected_bind_origin_in_output] / "frozen-source"
+                backing.mkdir()
+                (backing / "original.txt").write_text("protected\n", encoding="utf-8")
+            if protected_bind_origin_outside_output:
+                (epoch / "frozen-source").mkdir()
             if protected_hardlink:
                 original_file = source / "src" / "frozen.txt"
                 original_file.write_text("frozen bytes\n", encoding="utf-8")
@@ -597,6 +605,13 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             ]
             if output_alias_parent:
                 mounts.append(mount_line(epoch, "ro,relatime", mount_root=source))
+            if protected_bind_origin_in_output or protected_bind_origin_outside_output:
+                backing = (
+                    leaves[protected_bind_origin_in_output] / "frozen-source"
+                    if protected_bind_origin_in_output
+                    else epoch / "frozen-source"
+                )
+                mounts.append(mount_line(source, "ro,relatime", mount_root=backing))
             mounts.extend(
                 mount_line(
                     path,
@@ -682,6 +697,18 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
 
     def test_only_four_private_output_mounts_are_admissible(self) -> None:
         self._probe()
+
+    def test_protected_bind_origin_inside_output_is_rejected(self) -> None:
+        for output in ("state", "transcripts", "evidence", "reports"):
+            with self.subTest(output=output):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "writable output contains protected mount backing",
+                ):
+                    self._probe(protected_bind_origin_in_output=output)
+
+    def test_protected_bind_sibling_of_outputs_is_admissible(self) -> None:
+        self._probe(protected_bind_origin_outside_output=True)
 
     def test_ambient_capability_without_effective_privilege_is_rejected(self) -> None:
         with self.assertRaisesRegex(

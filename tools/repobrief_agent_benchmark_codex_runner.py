@@ -1092,6 +1092,21 @@ def validate_live_immutable_mounts(
                 raise RunnerError(
                     "live Codex output mount root does not match writable target"
                 )
+            # The output's ordinary home/epoch ancestry is harmless, but a
+            # protected RO bind sourced from inside this RW leaf is not:
+            # the original protected files would still be writable here.
+            # Only equality or protected descendants of this output root
+            # are forbidden; an ancestor such as HOME is not an alias leak.
+            if any(
+                device == protected_device
+                and (
+                    protected_root == mount_root or mount_root in protected_root.parents
+                )
+                for protected_device, protected_root in protected_backings
+            ):
+                raise RunnerError(
+                    "live Codex writable output contains protected mount backing"
+                )
             observed_writable_outputs.add(mount)
             continue
         if mount == home or home in mount.parents:
