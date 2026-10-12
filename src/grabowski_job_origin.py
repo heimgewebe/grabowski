@@ -51,7 +51,7 @@ DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES = 10_000
 DECISION_REVIEW_ORDER_MAX_METADATA_BYTES = 256 * 1024
 DECISION_REVIEW_ORDER_MAX_NS = (1 << 63) - 1
 _DECISION_REVIEW_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
-_DECISION_REVIEW_SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
+_DECISION_REVIEW_GIT_OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _DECISION_REVIEW_ORDER_FIELDS = {
     "schema_version",
     "kind",
@@ -100,7 +100,7 @@ def _decision_review_order_key(scope: dict[str, Any]) -> str | None:
         or not isinstance(pr, int)
         or pr <= 0
         or not isinstance(head_sha, str)
-        or _DECISION_REVIEW_SHA40_RE.fullmatch(head_sha.strip().lower()) is None
+        or _DECISION_REVIEW_GIT_OID_RE.fullmatch(head_sha.strip().lower()) is None
     ):
         raise ValueError("decision review binding is invalid for causal ordering")
     material = {
