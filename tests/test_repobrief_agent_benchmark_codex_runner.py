@@ -2214,12 +2214,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 for name, value_to_return in (
                     ("validate_executable", "/opt/codex"),
                     ("validate_toolchain", "/usr/bin:/bin"),
-                    ("validate_chatgpt_subscription", b"opaque-chatgpt-auth"),
                     ("_repository_root_from_authorized_map_bytes", root),
                 ):
                     stack.enter_context(
                         patch.object(runner, name, return_value=value_to_return)
                     )
+                login_status = stack.enter_context(
+                    patch.object(
+                        runner,
+                        "validate_chatgpt_subscription",
+                        return_value=b"opaque-chatgpt-auth",
+                    )
+                )
                 for name in (
                     "_assert_authorized_codex_executable",
                     "_assert_authorized_chatgpt_auth",
@@ -2255,6 +2261,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 ):
                     runner.execute(value, args)
             mount_guard.assert_called_once()
+            login_status.assert_not_called()
             evidence.assert_not_called()
             checkout.assert_not_called()
             intent.assert_not_called()

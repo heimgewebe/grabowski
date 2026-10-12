@@ -7367,10 +7367,6 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
             dispatch_authorization["provider_codex"],
         )
         validate_toolchain(codex)
-        auth_data = validate_chatgpt_subscription(codex)
-        _assert_authorized_chatgpt_auth(
-            auth_data, dispatch_authorization["provider_authentication"]
-        )
         if request["condition"] == "treatment":
             authorized_mcp_files = list(dispatch_authorization["mcp_files"])
             proxy_code = dispatch_authorization["proxy_code"]
@@ -7421,6 +7417,13 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
             transcript_root=args.transcript_root,
             evidence_root=args.provider_evidence_root,
             runtime_binding=dispatch_authorization["binding"],
+        )
+        # Even the non-inferential Codex login-status call executes the Codex
+        # binary. The kernel write boundary must hold before any such process.
+        assert codex is not None
+        auth_data = validate_chatgpt_subscription(codex)
+        _assert_authorized_chatgpt_auth(
+            auth_data, dispatch_authorization["provider_authentication"]
         )
     evidence_plan = prepare_provider_evidence(
         request, args.transcript_root, args.provider_evidence_root
