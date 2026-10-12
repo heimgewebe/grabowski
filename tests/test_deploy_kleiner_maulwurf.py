@@ -14,9 +14,22 @@ for import_root in (ROOT / "src", ROOT / "tools"):
         sys.path.insert(0, str(import_root))
 
 import deploy_kleiner_maulwurf as km
+import deploy_runtime_dual as dual
 
 
 class KleinerMaulwurfDeployTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Legacy tests below exercise post-admission stop/start/rollback and
+        # fleet/snapshot behavior; the dedicated EffectBoundaryTests exercise
+        # the *real* kernel lock and serving-source gates without any mocks.
+        for target, name in (
+            (km.core, "require_canonical_deployment_lock_held"),
+            (dual, "require_locked_release_source_admission"),
+        ):
+            preflight = patch.object(target, name)
+            preflight.start()
+            self.addCleanup(preflight.stop)
+
     def _state(self) -> km.CutoverState:
         old_binding = {"release_id": "old-release", "repo_head": "a" * 40}
         new_binding = {"release_id": "new-release", "repo_head": "b" * 40}
@@ -593,6 +606,143 @@ class KleinerMaulwurfDeployTests(unittest.TestCase):
             Path.home() / ".local/share/grabowski-mcp",
         )
         self.assertEqual(km.CANONICAL_SELECTOR, km.ingress.DEFAULT_SELECTOR_FILE)
+
+
+def authoritative_serving(head: str) -> dict:
+    """Synthetic readback used only for fail-closed negative admission tests."""
+    selector = {
+        "selector_sha256": "2" * 64,
+        "generation": 2,
+        "selected_slot": "canonical",
+        "upstream_port": 18181,
+        "runtime_binding_sha256": "1" * 64,
+        "repo_head": head,
+        "release_id": "test-serving-release",
+    }
+    ingress = {
+        "selector_sha256": selector["selector_sha256"],
+        "selector_generation": selector["generation"],
+        "selected_slot": selector["selected_slot"],
+        "upstream_port": selector["upstream_port"],
+        "runtime_binding_sha256": selector["runtime_binding_sha256"],
+        "repo_head": head,
+        "release_id": selector["release_id"],
+    }
+    material = {"authoritative": True, "selector": selector, "ingress": ingress}
+    return {**material, "readback_sha256": dual._json_sha256(material)}
+
+
+class KleinerMaulwurfEffectBoundaryTests(unittest.TestCase):
+    """No external/privileged effects: all positive evidence is synthetic only."""
+
+    def test_direct_prepare_requires_canonical_kernel_lock_before_runtime_access(self):
+        with (
+            patch.object(km.core, "require_runtime_replaceable",
+                         side_effect=AssertionError("runtime preflight reached")) as runtime,
+            patch.object(km.core, "snapshot_from_worktree") as snapshot,
+            patch.object(km.core, "build_release") as build,
+        ):
+            with self.assertRaisesRegex(km.core.DeployError, "canonical deployment lock"):
+                km._prepare_deploy(ROOT, "b" * 40)
+        runtime.assert_not_called()
+        snapshot.assert_not_called()
+        build.assert_not_called()
+
+    def test_direct_cutover_requires_canonical_kernel_lock_before_stop(self):
+        state = SimpleNamespace(snapshot=SimpleNamespace(repo_head="b" * 40))
+        with (
+            patch.object(km, "_verify_pre_cutover_preimage",
+                         side_effect=AssertionError("effect preflight reached")) as preflight,
+            patch.object(km, "_stop_stack") as stop,
+            patch.object(km.core, "activate_pointer") as pointer,
+        ):
+            with self.assertRaisesRegex(km.core.DeployError, "canonical deployment lock"):
+                km._run_cutover(state, timeout_seconds=10)
+        preflight.assert_not_called()
+        stop.assert_not_called()
+        pointer.assert_not_called()
+
+    def test_locked_prepare_rejects_new_source_before_snapshot(self):
+        serving, new_head = "a" * 40, "b" * 40
+        with (
+            patch.object(km.core, "require_canonical_deployment_lock_held"),
+            patch.object(dual, "observe_authoritative_routing",
+                         return_value=authoritative_serving(serving)),
+            patch.object(km.core, "require_runtime_replaceable") as runtime,
+            patch.object(km.core, "snapshot_from_worktree") as snapshot,
+            patch.object(km.core, "build_release") as build,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "release admission blocked"):
+                km._prepare_deploy(ROOT, new_head)
+        runtime.assert_not_called()
+        snapshot.assert_not_called()
+        build.assert_not_called()
+
+    def test_locked_cutover_rejects_new_source_before_service_stop(self):
+        state = SimpleNamespace(snapshot=SimpleNamespace(repo_head="b" * 40))
+        with (
+            patch.object(km.core, "require_canonical_deployment_lock_held"),
+            patch.object(dual, "observe_authoritative_routing",
+                         return_value=authoritative_serving("a" * 40)),
+            patch.object(km, "_verify_pre_cutover_preimage") as preflight,
+            patch.object(km, "_stop_stack") as stop,
+            patch.object(km.core, "activate_pointer") as pointer,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "release admission blocked"):
+                km._run_cutover(state, timeout_seconds=10)
+        preflight.assert_not_called()
+        stop.assert_not_called()
+        pointer.assert_not_called()
+
+    def test_locked_public_deploy_rejects_new_source_before_prepare(self):
+        from contextlib import nullcontext
+        with (
+            patch.object(km.core, "deployment_lock", return_value=nullcontext()),
+            patch.object(km.core, "require_canonical_deployment_lock_held"),
+            patch.object(dual, "observe_authoritative_routing",
+                         return_value=authoritative_serving("a" * 40)),
+            patch.object(km, "_prepare_deploy") as prepare,
+            patch.object(km, "_run_cutover") as cutover,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "release admission blocked"):
+                km.deploy(repo=ROOT, expected_head="b" * 40, timeout_seconds=10)
+        prepare.assert_not_called()
+        cutover.assert_not_called()
+
+    def test_sha256_unchanged_serving_preserves_full_object_id(self):
+        """Only syntactic interoperability: fake cutover proves no release grant."""
+        from contextlib import nullcontext
+        full_head = "e" * 64
+        state = SimpleNamespace(snapshot=SimpleNamespace(repo_head=full_head))
+        with (
+            patch.object(km.core, "deployment_lock", return_value=nullcontext()),
+            patch.object(km.core, "require_canonical_deployment_lock_held"),
+            patch.object(dual, "observe_authoritative_routing",
+                         return_value=authoritative_serving(full_head)),
+            patch.object(km, "_prepare_deploy", return_value=state) as prepare,
+            patch.object(km, "_run_cutover", return_value={"ok": True}) as cutover,
+        ):
+            self.assertEqual(
+                km.deploy(repo=ROOT, expected_head=full_head, timeout_seconds=10),
+                {"ok": True},
+            )
+        prepare.assert_called_once_with(ROOT, full_head)
+        cutover.assert_called_once_with(state, timeout_seconds=10)
+
+    def test_sha256_source_uses_full_commit_identity_not_prefix(self):
+        from contextlib import nullcontext
+        full_head = "c" * 64
+        different = full_head[:12] + "d" * 52
+        with (
+            patch.object(km.core, "deployment_lock", return_value=nullcontext()),
+            patch.object(km.core, "require_canonical_deployment_lock_held"),
+            patch.object(dual, "observe_authoritative_routing",
+                         return_value=authoritative_serving(different)),
+            patch.object(km, "_prepare_deploy") as prepare,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "release admission blocked"):
+                km.deploy(repo=ROOT, expected_head=full_head, timeout_seconds=10)
+        prepare.assert_not_called()
 
 
 if __name__ == "__main__":
