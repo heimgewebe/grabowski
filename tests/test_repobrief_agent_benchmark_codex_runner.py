@@ -592,7 +592,8 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
         )
         for peer, admitted in (
             ((1, 0, 0), True),
-            ((2, 0, 0), False),
+            ((2, 0, 0), True),
+            ((0, 0, 0), False),
             ((1, os.getuid(), os.getgid()), False),
         ):
             with self.subTest(peer=peer):
@@ -604,8 +605,8 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                     connection.getsockopt.return_value = struct.pack("3i", *peer)
                     if admitted:
                         runner._attest_root_system_manager_channels()
-                        self.assertEqual(socket_factory.call_count, 2)
-                        self.assertEqual(lstat.call_count, 4)
+                        self.assertEqual(socket_factory.call_count, 1)
+                        self.assertEqual(lstat.call_count, 2)
                     else:
                         with self.assertRaisesRegex(
                             runner.RunnerError,
@@ -614,9 +615,35 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                             runner._attest_root_system_manager_channels()
                         self.assertEqual(socket_factory.call_count, 1)
 
+    def test_root_only_private_socket_allows_verified_system_bus(self) -> None:
+        # A DynamicUser cannot connect to PID 1's root-only private socket.
+        # An independently root-attested accessible system bus must suffice.
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+
+        def stat_channel(path):
+            if path == "/run/systemd/private":
+                raise PermissionError("root-only systemd channel")
+            self.assertEqual(path, "/run/dbus/system_bus_socket")
+            return root_socket
+
+        with (
+            patch.object(runner.os, "lstat", side_effect=stat_channel),
+            patch.object(runner.socket, "socket") as socket_factory,
+        ):
+            connection = socket_factory.return_value.__enter__.return_value
+            connection.getsockopt.return_value = struct.pack("3i", 321, 0, 0)
+            runner._attest_root_system_manager_channels()
+            self.assertEqual(socket_factory.call_count, 1)
+            self.assertEqual(
+                [c.args[0] for c in connection.connect.call_args_list],
+                ["/run/dbus/system_bus_socket"],
+            )
+
     def test_root_owned_independent_dbus_broker_peer_is_accepted(self) -> None:
-        # Systemd's private channel is PID 1, but its system D-Bus broker may
-        # be an independently managed root process with a different PID.
+        # The accessible system D-Bus broker can be a distinct root process,
+        # so its PID must not be assumed to be 1.
         root_socket = os.stat_result(
             (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
         )
@@ -625,16 +652,13 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
             patch.object(runner.socket, "socket") as socket_factory,
         ):
             connection = socket_factory.return_value.__enter__.return_value
-            connection.getsockopt.side_effect = (
-                struct.pack("3i", 1, 0, 0),
-                struct.pack("3i", 321, 0, 0),
-            )
+            connection.getsockopt.return_value = struct.pack("3i", 321, 0, 0)
             runner._attest_root_system_manager_channels()
-            self.assertEqual(socket_factory.call_count, 2)
-            self.assertEqual(lstat.call_count, 4)
+            self.assertEqual(socket_factory.call_count, 1)
+            self.assertEqual(lstat.call_count, 2)
             self.assertEqual(
                 [call.args[0] for call in connection.connect.call_args_list],
-                ["/run/systemd/private", "/run/dbus/system_bus_socket"],
+                ["/run/dbus/system_bus_socket"],
             )
 
     def test_root_manager_rejects_forged_or_invalid_dbus_broker_peer(self) -> None:
@@ -651,9 +675,8 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                     patch.object(runner.os, "lstat", return_value=root_socket),
                     patch.object(runner.socket, "socket") as socket_factory,
                 ):
-                    socket_factory.return_value.__enter__.return_value.getsockopt.side_effect = (
-                        struct.pack("3i", 1, 0, 0),
-                        struct.pack("3i", *peer),
+                    socket_factory.return_value.__enter__.return_value.getsockopt.return_value = struct.pack(
+                        "3i", *peer
                     )
                     with self.assertRaisesRegex(
                         runner.RunnerError,

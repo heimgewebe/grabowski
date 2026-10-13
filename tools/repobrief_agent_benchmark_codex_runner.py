@@ -864,46 +864,43 @@ def _authenticated_procfs_cgroup() -> bytes:
 
 
 def _attest_root_system_manager_channels() -> None:
-    """Reject impostor manager sockets before trusting systemctl output.
+    """Authenticate the accessible root-owned system bus before systemctl.
 
-    Kernel SO_PEERCRED is independent of systemctl's plain-text properties.
-    A read-only socket bind remains connectable, so its mount flags alone
-    cannot authenticate a root service that reports device isolation.
+    The root systemd private socket is often mode 0700 and unavailable to
+    DynamicUser. We must never connect to it from this unprivileged runner.
+    The accessible system bus socket must be root-owned and served by a
+    kernel-attested root UID/GID peer; RO socket binds are still connectable.
+    A same-UID fake bus is rejected even if its systemctl output claims an
+    isolated service.
     """
-    for channel in ("/run/systemd/private", "/run/dbus/system_bus_socket"):
-        try:
-            before = os.lstat(channel)
-            if not stat.S_ISSOCK(before.st_mode) or before.st_uid != 0:
-                raise RunnerError("live Codex system manager channel is untrusted")
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer_socket:
-                peer_socket.settimeout(2)
-                peer_socket.connect(channel)
-                credentials = peer_socket.getsockopt(
-                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
-                )
-                manager_identity = struct.unpack("3i", credentials)
-            after = os.lstat(channel)
-        except (OSError, struct.error) as exc:
-            raise RunnerError("live Codex system manager channel unavailable") from exc
-        # Only the root systemd private channel is served by PID 1. The
-        # system bus socket can legitimately be served by an independent
-        # root-owned broker; SO_PEERCRED remains a kernel-authenticated proof
-        # of its root identity, not an assumption about the broker's PID.
-        peer_pid, peer_uid, peer_gid = manager_identity
-        if (
-            peer_pid <= 0
-            or peer_uid != 0
-            or peer_gid != 0
-            or (channel == "/run/systemd/private" and peer_pid != 1)
-            or (
-                before.st_dev,
-                before.st_ino,
-                before.st_mode,
-                before.st_uid,
-            )
-            != (after.st_dev, after.st_ino, after.st_mode, after.st_uid)
-        ):
+    channel = "/run/dbus/system_bus_socket"
+    try:
+        before = os.lstat(channel)
+        if not stat.S_ISSOCK(before.st_mode) or before.st_uid != 0:
             raise RunnerError("live Codex system manager channel is untrusted")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer_socket:
+            peer_socket.settimeout(2)
+            peer_socket.connect(channel)
+            credentials = peer_socket.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+            )
+            peer_pid, peer_uid, peer_gid = struct.unpack("3i", credentials)
+        after = os.lstat(channel)
+    except (OSError, struct.error) as exc:
+        raise RunnerError("live Codex system manager channel unavailable") from exc
+    if (
+        peer_pid <= 0
+        or peer_uid != 0
+        or peer_gid != 0
+        or (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_uid,
+        )
+        != (after.st_dev, after.st_ino, after.st_mode, after.st_uid)
+    ):
+        raise RunnerError("live Codex system manager channel is untrusted")
 
 
 def _assert_root_owned_device_policy() -> None:
