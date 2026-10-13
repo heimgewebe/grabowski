@@ -16,6 +16,8 @@ from typing import Iterable
 BWRAP = Path(os.environ.get("GRABOWSKI_BWRAP_BIN", "/usr/bin/bwrap"))
 TAIL_BYTES = 12000
 MAX_WRITABLE_SCOPE_ENTRIES = 100_000
+MAX_MOUNTINFO_BYTES = 1_048_576
+MAX_MOUNTINFO_ENTRIES = 4096
 _GIT_COMMAND_CONFIG = (
     ("core.hooksPath", "/dev/null"),
     ("core.fsmonitor", "false"),
@@ -806,6 +808,38 @@ def _adler_inbox_sandbox_binding(worktree: Path) -> tuple[tuple[tuple[Path, Path
     return ((source, target),), directories
 
 
+def _kernel_mount_points() -> frozenset[Path]:
+    """Read bounded Linux mount identity; st_dev alone misses same-device bind mounts."""
+    try:
+        with open("/proc/self/mountinfo", "rb") as stream:
+            raw = stream.read(MAX_MOUNTINFO_BYTES + 1)
+    except OSError as exc:
+        raise AgentSandboxError("Linux mount identity is unavailable") from exc
+    if not raw or len(raw) > MAX_MOUNTINFO_BYTES or not raw.endswith(b"\n"):
+        raise AgentSandboxError("Linux mount identity is missing or exceeds its budget")
+    mounts: set[Path] = set()
+    for line in raw.splitlines():
+        head, separator, _tail = line.partition(b" - ")
+        fields = head.split(b" ")
+        if not separator or len(fields) < 6:
+            raise AgentSandboxError("Linux mount identity contains a malformed entry")
+        encoded_path = fields[4]
+        for escape, actual in (
+            (b"\\040", b" "),
+            (b"\\011", b"\t"),
+            (b"\\012", b"\n"),
+            (b"\\134", b"\\"),
+        ):
+            encoded_path = encoded_path.replace(escape, actual)
+        mount = Path(os.fsdecode(encoded_path))
+        if not mount.is_absolute() or ".." in mount.parts or "\x00" in str(mount):
+            raise AgentSandboxError("Linux mount identity contains an unsafe mountpoint")
+        mounts.add(mount)
+        if len(mounts) > MAX_MOUNTINFO_ENTRIES:
+            raise AgentSandboxError("Linux mount identity exceeds its entry budget")
+    return frozenset(mounts)
+
+
 def _normalized_writable_paths(worktree: Path, values: Iterable[Path]) -> list[Path]:
     candidates: list[Path] = []
     workspace_device = worktree.stat().st_dev
@@ -833,8 +867,17 @@ def _normalized_writable_paths(worktree: Path, values: Iterable[Path]) -> list[P
         if any(candidate == parent or candidate.is_relative_to(parent) for parent in collapsed):
             continue
         collapsed.append(candidate)
-    for candidate in collapsed:
-        _validate_writable_tree(candidate)
+    if collapsed:
+        mount_points = _kernel_mount_points()
+        for candidate in collapsed:
+            if any(
+                mount == candidate or mount.is_relative_to(candidate)
+                for mount in mount_points
+            ):
+                raise AgentSandboxError(
+                    f"writable scope includes a kernel mount boundary: {candidate}"
+                )
+            _validate_writable_tree(candidate)
     return collapsed
 
 

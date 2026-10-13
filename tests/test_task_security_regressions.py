@@ -1789,6 +1789,94 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
 
 
+
+
+    def test_writable_mountinfo_missing_or_unbounded_fails_closed(self) -> None:
+        """A read-only task needs no mount snapshot; a writer does."""
+        from pathlib import Path
+
+        workspace = self.root / "mountinfo-workspace"
+        workspace.mkdir()
+        allowed = workspace / "allowed"
+        allowed.mkdir()
+        kwargs = {
+            "workspace": workspace,
+            "command": ["/usr/bin/true"],
+            "workspace_writable": True,
+            "writable_paths": (allowed,),
+        }
+        with patch("builtins.open", side_effect=OSError("mountinfo missing")):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "mount identity is unavailable"
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
+            readonly = tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=workspace,
+                command=["/usr/bin/true"],
+                workspace_writable=False,
+            )
+            self.assertIn("--ro-bind", readonly)
+        with patch.object(tasks.agent_sandbox, "MAX_MOUNTINFO_BYTES", 1):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "mount identity.*budget"
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
+
+
+    def test_real_kernel_same_device_bind_mount_is_not_a_writer_scope(self) -> None:
+        """An alternate same-device mount root cannot inherit one path lease."""
+        import subprocess
+        from pathlib import Path
+
+        tasks.agent_sandbox.require_bwrap()
+        workspace = self.root / "same device workspace"
+        workspace.mkdir()
+        allowed = workspace / "allowed"
+        allowed.mkdir()
+        outside = self.root / "outside-bind-root"
+        outside.mkdir()
+        (outside / "private.txt").write_text("protected", encoding="utf-8")
+        self.assertEqual(workspace.stat().st_dev, outside.stat().st_dev)
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.dont_write_bytecode = True\n"
+            "sys.path.insert(0, '/opt')\n"
+            "import grabowski_agent_sandbox as sandbox\n"
+            "try:\n"
+            "    sandbox.minimal_sandbox_argv(\n"
+            "        workspace=Path('/mnt/same device workspace'),\n"
+            "        command=['/usr/bin/true'], workspace_writable=True,\n"
+            "        writable_paths=[Path('/mnt/same device workspace/allowed')],\n"
+            "    )\n"
+            "except sandbox.AgentSandboxError:\n"
+            "    print('REJECTED')\n"
+            "else:\n"
+            "    print('ACCEPTED')\n"
+        )
+        sandbox_module = Path(tasks.agent_sandbox.__file__).resolve(strict=True)
+        outer = [
+            str(tasks.agent_sandbox.require_bwrap()),
+            "--die-with-parent", "--new-session",
+            "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            "--cap-drop", "ALL",
+            "--ro-bind", "/usr", "/usr",
+            "--symlink", "usr/bin", "/bin",
+            "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib64", "/lib64",
+            "--proc", "/proc", "--dev", "/dev",
+            "--ro-bind", str(self.root), "/mnt",
+            "--bind", str(outside), "/mnt/same device workspace/allowed",
+            "--ro-bind", str(sandbox_module), "/opt/grabowski_agent_sandbox.py",
+            "--", "/usr/bin/python3", "-I", "-c", script,
+        ]
+        run = subprocess.run(
+            outer, capture_output=True, text=True, check=False, timeout=40
+        )
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.strip(), "REJECTED")
+
+
     def test_git_metadata_must_not_be_a_bounded_writable_path(self) -> None:
         """An owned path lease must not make repository bookkeeping writable."""
         workspace = self.root / "git-metadata-scope"
