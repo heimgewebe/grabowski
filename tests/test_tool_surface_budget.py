@@ -184,6 +184,83 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         self.assertFalse(report["valid"])
         self.assertIn("tool capability semantics drift", report["errors"][0])
 
+    def test_security_reclassifications_preserve_frozen_baseline(self) -> None:
+        approved = self.contract["security_reclassifications"]
+        self.assertEqual(
+            sorted(approved), ["grabowski_task_list", "grabowski_task_status"]
+        )
+        baseline = {
+            item["tool"]: item for item in self.contract["baseline"]["tools"]
+        }
+        for name, entry in approved.items():
+            with self.subTest(name=name):
+                self.assertEqual(entry["baseline_sha256"], budget._sha256(baseline[name]))
+                self.assertTrue(baseline[name]["read_only"])
+                self.assertEqual(baseline[name]["authority_class"], "read")
+                current = entry["tool_contract"]
+                self.assertFalse(current["read_only"])
+                self.assertEqual(current["authority_class"], "mutation")
+                self.assertTrue(set(baseline[name]["effects"]).issubset(current["effects"]))
+                self.assertIn(current["risk_class"], {"medium", "high", "critical"})
+        result = self._validate(copy.deepcopy(self.contract))
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["security_reclassification_count"], 2)
+
+    def test_legacy_v1_schema_is_compatible_but_not_a_semantic_bypass(self) -> None:
+        old_contract = copy.deepcopy(self.contract)
+        del old_contract["security_reclassifications"]
+        self.assertEqual(budget.validate_schema(old_contract, self.schema), [])
+        result = self._validate(old_contract)
+        self.assertFalse(result["valid"])
+        self.assertIn("tool capability semantics drift", result["errors"][0])
+
+
+    def test_security_reclassification_rejects_risk_downgrade_and_forgery(self) -> None:
+        cases = (
+            ("read_only", True),
+            ("authority_class", "read"),
+            ("risk_class", "low"),
+            ("effects", []),
+            ("reversibility", "not-applicable"),
+        )
+        for field, value in cases:
+            with self.subTest(field=field):
+                contract = copy.deepcopy(self.contract)
+                contract["security_reclassifications"]["grabowski_task_list"][
+                    "tool_contract"
+                ][field] = value
+                result = self._validate(contract)
+                self.assertFalse(result["valid"], result)
+                self.assertIn("security reclassification", result["errors"][0])
+
+        tampered = copy.deepcopy(self.contract)
+        tampered["security_reclassifications"]["grabowski_task_status"][
+            "baseline_sha256"
+        ] = "f" * 64
+        self.assertIn("baseline mismatch", self._validate(tampered)["errors"][0])
+
+        forged = copy.deepcopy(self.contract)
+        forged["security_reclassifications"]["grabowski_status"] = copy.deepcopy(
+            forged["security_reclassifications"]["grabowski_task_status"]
+        )
+        self.assertIn("security reclassification", self._validate(forged)["errors"][0])
+
+        without_evidence = copy.deepcopy(self.contract)
+        without_evidence["security_reclassifications"]["grabowski_task_list"][
+            "evidence_refs"
+        ] = []
+        self.assertIn(
+            "independent evidence", self._validate(without_evidence)["errors"][0]
+        )
+
+    def test_security_reclassification_schema_rejects_missing_tool_contract(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        del contract["security_reclassifications"]["grabowski_task_status"]["tool_contract"]
+        errors = budget.validate_schema(contract, self.schema)
+        self.assertTrue(errors)
+        self.assertTrue(any("tool_contract" in error for error in errors))
+
+
     def test_arbitrary_fixed_cap_is_rejected(self) -> None:
         contract = copy.deepcopy(self.contract)
         contract["policy"]["fixed_tool_cap"] = 125

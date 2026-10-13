@@ -872,10 +872,15 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_task_status": {
         "category": "task",
-        "purpose": "Observe one persistent task and refresh its recorded state.",
-        "risk_class": "low",
-        "effects": ["state-refresh"],
-        "reversibility": "not-applicable",
+        "purpose": "Refresh one task, maintain its leases, and conditionally stop a revoked task unit.",
+        "risk_class": "high",
+        "effects": [
+            "state-refresh",
+            "lease-renewal",
+            "terminalization-recovery",
+            "possible-process-stop",
+        ],
+        "reversibility": "conditional",
     },
     "grabowski_task_logs": {
         "category": "task",
@@ -900,10 +905,10 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_task_list": {
         "category": "task",
-        "purpose": "List recent persistent task records with optional state filtering.",
-        "risk_class": "low",
-        "effects": [],
-        "reversibility": "not-applicable",
+        "purpose": "List persistent tasks and recover pending terminalizations in normal views.",
+        "risk_class": "medium",
+        "effects": ["state-refresh", "terminalization-recovery"],
+        "reversibility": "conditional",
     },
     "grabowski_chronik_outbox_import": {
         "category": "coding-memory",

@@ -848,6 +848,56 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         self.assertFalse(tasks.resources.inspect_resources(keys))
 
 
+    def test_task_status_scoped_blockade_denies_before_lease_renewal(self) -> None:
+        """A task-id-only preflight cannot match workspace/host hard stops.
+
+        Require both the early global/task check and a scope-complete check
+        after durable record lookup, before any observation or lease effect.
+        """
+        task_id = self._start_claude()
+        record = tasks._row_raw(task_id)
+        expected = {
+            "path": record["cwd"],
+            "repo": record["cwd"],
+            "task_id": task_id,
+            "owner_id": record["lease_owner_id"],
+            "host": record["host"],
+            "service": tasks._authoritative_unit(record),
+        }
+        for field in ("path", "repo", "owner_id", "host", "service"):
+            with self.subTest(blocked_scope=field):
+                calls = []
+                def require(capability, **kwargs):
+                    calls.append((capability, dict(kwargs)))
+                    if kwargs.get(field) == expected[field]:
+                        raise PermissionError("scoped status blockade")
+                with patch.object(
+                    tasks.operator, "_require_operator_mutation",
+                    side_effect=require,
+                ), patch.object(
+                    tasks, "_row", wraps=tasks._row
+                ) as recover, patch.object(
+                    tasks, "_observe"
+                ) as observe, patch.object(
+                    tasks.resources, "renew_resources"
+                ) as renew, patch.object(
+                    tasks, "_set_state"
+                ) as persist:
+                    with self.assertRaisesRegex(
+                        PermissionError, "scoped status blockade"
+                    ):
+                        tasks.grabowski_task_status(task_id)
+                self.assertGreaterEqual(len(calls), 2)
+                self.assertEqual(calls[0][0], "durable_job")
+                self.assertEqual(calls[0][1].get("task_id"), task_id)
+                for key, value in expected.items():
+                    self.assertEqual(calls[1][1].get(key), value, key)
+                recover.assert_not_called()
+                observe.assert_not_called()
+                renew.assert_not_called()
+                persist.assert_not_called()
+
+
     def test_task_status_requires_mutation_gate_before_record_or_lease_access(self) -> None:
         """A status read is a write-capable lease and lifecycle operation.
 

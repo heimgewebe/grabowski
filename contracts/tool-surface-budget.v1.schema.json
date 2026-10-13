@@ -84,6 +84,16 @@
         "$ref": "#/$defs/addition"
       }
     },
+    "security_reclassifications": {
+      "type": "object",
+      "maxProperties": 8,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,127}$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/security_reclassification"
+      }
+    },
     "retired_tools": {
       "type": "object",
       "propertyNames": {
@@ -238,6 +248,22 @@
           "minLength": 1,
           "maxLength": 128
         }
+      }
+    },
+    "security_reclassification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline_sha256",
+        "tool_contract",
+        "rationale",
+        "evidence_refs"
+      ],
+      "properties": {
+        "baseline_sha256": {"$ref": "#/$defs/sha256"},
+        "tool_contract": {"$ref": "#/$defs/tool_projection"},
+        "rationale": {"type": "string", "minLength": 24, "maxLength": 4096},
+        "evidence_refs": {"$ref": "#/$defs/string_list"}
       }
     },
     "addition": {

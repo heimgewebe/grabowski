@@ -24,7 +24,7 @@ BASELINE_TOOL_COUNT = 125
 BASELINE_TOOL_NAMES_SHA256 = "a84638ec397aa635aa55546d579f009c237f64ffed39eafe2bff525762f46418"
 BASELINE_TOOL_SEMANTICS_SHA256 = "ed7e499ec8f243ac9be7d67ba60b83b6866b2a4644d249ead7982db8450dc0dd"
 TOOL_SURFACE_SCHEMA_SHA256 = (
-    "44e47b96f6adc2d0015dfdf9fd65db18f05d150c1bf7436297e7d1247121f534"
+    "4cb38bd3ac4b45b5138c043047d389f55c8c59bbef60851bf6bf372607025948"
 )
 ADDITION_KINDS = frozenset(
     {
@@ -452,9 +452,10 @@ def validate_contract(
             "migration_candidates",
             "does_not_establish",
         }
-        if set(contract) != required_top:
+        allowed_top = {*required_top, "security_reclassifications"}
+        if not required_top.issubset(contract) or not set(contract).issubset(allowed_top):
             raise ToolSurfaceBudgetError(
-                f"top-level keys invalid; missing={sorted(required_top-set(contract))} extra={sorted(set(contract)-required_top)}"
+                f"top-level keys invalid; missing={sorted(required_top-set(contract))} extra={sorted(set(contract)-allowed_top)}"
             )
         if contract.get("schema_version") != SCHEMA_VERSION or contract.get("contract_id") != CONTRACT_ID:
             raise ToolSurfaceBudgetError("unsupported tool-surface budget contract identity")
@@ -523,6 +524,63 @@ def validate_contract(
                 raise ToolSurfaceBudgetError(f"only baseline tools may be retired: {name}")
             _validate_retirement(name, value)
 
+        # Historical baseline authority never changes. A bounded explicit
+        # exception can only tighten a formerly read-only tool into a
+        # mutation, with its exact original projection, richer effect list
+        # and independent evidence bound in this versioned contract.
+        reclassifications_raw = contract.get("security_reclassifications", {})
+        if not isinstance(reclassifications_raw, dict) or len(reclassifications_raw) > 8:
+            raise ToolSurfaceBudgetError("security reclassifications must be a bounded object")
+        reclassified: dict[str, dict[str, Any]] = {}
+        risk_rank = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+        for name, entry in sorted(reclassifications_raw.items()):
+            _tool_name(name, label="security reclassification")
+            if name not in baseline_tools or name in retirements_raw:
+                raise ToolSurfaceBudgetError(
+                    f"security reclassification is not a current baseline tool: {name}"
+                )
+            if not isinstance(entry, dict) or set(entry) != {
+                "baseline_sha256", "tool_contract", "rationale", "evidence_refs"
+            }:
+                raise ToolSurfaceBudgetError(
+                    f"security reclassification has invalid evidence shape: {name}"
+                )
+            prior = baseline_tools[name]
+            if entry["baseline_sha256"] != _sha256(prior):
+                raise ToolSurfaceBudgetError(
+                    f"security reclassification baseline mismatch: {name}"
+                )
+            observed = capability_projection(entry["tool_contract"])
+            if observed != entry["tool_contract"] or observed["tool"] != name:
+                raise ToolSurfaceBudgetError(
+                    f"security reclassification tool projection mismatch: {name}"
+                )
+            if (
+                prior["read_only"] is not True
+                or prior["authority_class"] != "read"
+                or observed["read_only"] is not False
+                or observed["authority_class"] != "mutation"
+                or observed["category"] != prior["category"]
+                or not set(prior["effects"]).issubset(observed["effects"])
+                or not observed["effects"]
+                or prior["risk_class"] not in risk_rank
+                or observed["risk_class"] not in risk_rank
+                or risk_rank[observed["risk_class"]] < max(
+                    1, risk_rank[prior["risk_class"]]
+                )
+                or observed["reversibility"] == "not-applicable"
+            ):
+                raise ToolSurfaceBudgetError(
+                    f"security reclassification must strictly increase mutation safety: {name}"
+                )
+            _text(entry["rationale"], label=f"{name}.security rationale", minimum=24)
+            refs = _string_list(entry["evidence_refs"], label=f"{name}.security evidence")
+            if len(refs) < 2:
+                raise ToolSurfaceBudgetError(
+                    f"security reclassification lacks independent evidence: {name}"
+                )
+            reclassified[name] = observed
+
         expected_current = (set(baseline_tools) - set(retirements_raw)) | set(additions)
         actual_current = set(runtime_tools)
         unbudgeted = sorted(actual_current - expected_current)
@@ -532,7 +590,7 @@ def validate_contract(
         if missing:
             raise ToolSurfaceBudgetError(f"budgeted-tools-missing-from-runtime: {missing}")
         for name in sorted(actual_current):
-            expected_projection = baseline_tools.get(name) or additions.get(name)
+            expected_projection = reclassified.get(name) or baseline_tools.get(name) or additions.get(name)
             if expected_projection != capabilities[name]:
                 raise ToolSurfaceBudgetError(f"tool capability semantics drift: {name}")
 
@@ -597,6 +655,7 @@ def validate_contract(
             "baseline_tool_count": len(baseline_tools),
             "current_tool_count": len(actual_current),
             "accepted_addition_count": len(additions),
+            "security_reclassification_count": len(reclassified),
             "retired_tool_count": len(retirements_raw),
             "operation_count": len(operation_values),
             "migration_candidate_count": len(migration_candidates),

@@ -11031,7 +11031,23 @@ def grabowski_task_status(task_id: str) -> dict[str, Any]:
     operator._require_operator_mutation(
         "durable_job", task_id=_validate_task_id(task_id),
     )
+    # _row may replay a pending terminalization, including durable writes.
+    # Read only the persisted identity first, enforce every scope, and THEN
+    # allow recovery. Recheck after recovery to reject unit/attempt drift.
+    def require_scoped(record: dict[str, Any]) -> None:
+        operator._require_operator_mutation(
+            "durable_job",
+            path=record["cwd"],
+            repo=record["cwd"],
+            task_id=record["task_id"],
+            owner_id=record.get("lease_owner_id"),
+            service=_authoritative_unit(record),
+            host=record["host"],
+        )
+
+    require_scoped(_row_raw(task_id))
     record = _row(task_id)
+    require_scoped(record)
     observation = _observe(record)
     effective_state = _effective_observed_state(record, observation["state"])
     lease_maintenance = _maintain_record_resources(record, effective_state)
@@ -14055,7 +14071,7 @@ async def _grabowski_task_resume_tool(task_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(grabowski_task_resume, task_id)
 
 
-@mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_task_list", annotations=MUTATING)
 async def _grabowski_task_list_tool(
     limit: int = DEFAULT_TASK_LIST_LIMIT,
     state: str | None = None,

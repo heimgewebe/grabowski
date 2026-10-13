@@ -152,11 +152,11 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_privileged_broker_status` | privileged-reference | yes | low | Inspect the root-owned privileged broker installation without executing it. |
 | `grabowski_task_start` | task | no | variable | Start a persistent local or fleet task, or return a pre-dispatch typed-read reroute before persistence. |
 | `grabowski_task_routing_shadow_seal` | task | no | medium | Seal one terminal direct-task routing-shadow case with explicit semantic outcome or abstention and evidence-bound execution provenance. |
-| `grabowski_task_status` | task | no | low | Observe one persistent task and refresh its recorded state. |
+| `grabowski_task_status` | task | no | high | Refresh one task, maintain its leases, and conditionally stop a revoked task unit. |
 | `grabowski_task_logs` | task | yes | low | Read redacted journal output for one local or fleet task. |
 | `grabowski_task_cancel` | task | no | medium | Stop one task process group while retaining its persistent record. |
 | `grabowski_task_resume` | task | no | variable | Recreate a missing or stopped task unit from its persistent record. |
-| `grabowski_task_list` | task | yes | low | List recent persistent task records with optional state filtering. |
+| `grabowski_task_list` | task | no | medium | List persistent tasks and recover pending terminalizations in normal views. |
 | `grabowski_chronik_outbox_import` | coding-memory | no | medium | Import one redacted Grabowski outbox JSONL into optional local Chronik. |
 | `grabowski_chronik_history` | coding-memory | yes | low | Read bounded historical coding events without asserting current truth. |
 | `grabowski_operator_historical_recall` | operator-recall | yes | low | Read evidence-bound operator recall derived from validated Chronik history. |
