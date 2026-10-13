@@ -1527,6 +1527,48 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 ):
                     runner.validate_request(candidate)
 
+    def test_create_checkout_rejects_tracked_symlink_before_consuming_workspace(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, _ = repository(root)
+            (source / "src" / "escape").symlink_to("../../outside")
+            git(["add", "src/escape"], source)
+            git(["commit", "-m", "tracked symlink"], source)
+            commit = git(["rev-parse", "HEAD"], source)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            candidate = request(commit=commit)
+            candidate["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            workspace_name = hashlib.sha256(
+                candidate["workspace_id"].encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "unsupported tracked Git tree entry",
+            ):
+                runner.create_checkout(candidate, source, state)
+            self.assertFalse((state / "codex-workspaces" / workspace_name).exists())
+
+    def test_create_checkout_regular_tracked_files_remain_usable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            candidate = request(commit=commit)
+            candidate["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(candidate, source, state)
+            self.assertTrue((checkout / "src" / "example.py").is_file())
+            self.assertEqual(git(["rev-parse", "HEAD"], checkout), commit)
+
     def test_private_frozen_g2_checkout_is_reproducibly_dirty_and_read_only(
         self,
     ) -> None:

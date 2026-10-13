@@ -2086,7 +2086,69 @@ def close_provider_evidence_plan(plan: Mapping[str, Any]) -> None:
             pass
 
 
+def _assert_checkout_tree_has_regular_blobs(source: Path, commit: str) -> None:
+    """Reject tracked links and gitlinks before a one-use checkout is created.
+
+    Stream Git's NUL-framed tree listing under fixed limits. A checkout may be
+    read-only for the model yet live inside a writable private state root; a
+    tracked symlink there must never reach the later output-special-file scan.
+    """
+    try:
+        process = subprocess.Popen(
+            ["git", "ls-tree", "-r", "--full-tree", "-z", commit],
+            cwd=source,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise RunnerError("benchmark source Git tree cannot be inspected") from exc
+    try:
+        if process.stdout is None:
+            raise RunnerError("benchmark source Git tree stream is unavailable")
+        remainder = b""
+        total_bytes = 0
+        total_entries = 0
+        while chunk := process.stdout.read1(64 * 1024):
+            total_bytes += len(chunk)
+            if total_bytes > 16 * 1024 * 1024:
+                raise RunnerError(
+                    "benchmark source Git tree listing exceeds byte budget"
+                )
+            *records, remainder = (remainder + chunk).split(bytes((0,)))
+            if len(remainder) > 8192:
+                raise RunnerError("benchmark source Git tree entry exceeds byte budget")
+            total_entries += len(records)
+            if total_entries > 100_000:
+                raise RunnerError("benchmark source Git tree has too many entries")
+            for record in records:
+                if not (
+                    record.startswith(b"100644 blob ")
+                    or record.startswith(b"100755 blob ")
+                ):
+                    raise RunnerError("unsupported tracked Git tree entry")
+        if remainder or process.wait() != 0:
+            raise RunnerError("benchmark source Git tree inspection was incomplete")
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        raise
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+
+
 def create_checkout(request: Mapping[str, Any], source: Path, state_root: Path) -> Path:
+    # Validate the fixed tree before allocating this one-shot workspace ID.
+    scenario = base.validated_setup(request)
+    commit = str(request["repository"]["commit"])
+    if base._run_checked(
+        ["git", "rev-parse", "HEAD"], cwd=source
+    ) != commit or base._run_checked(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
+    ):
+        raise RunnerError("benchmark source checkout is not clean at requested commit")
+    _assert_checkout_tree_has_regular_blobs(source, commit)
     workspace_id = str(request["workspace_id"])
     workspace_name = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()
     parent_path, parent_fd = _open_private_directory(state_root / "codex-workspaces")
@@ -2107,9 +2169,7 @@ def create_checkout(request: Mapping[str, Any], source: Path, state_root: Path) 
     finally:
         os.close(parent_fd)
     workspace = parent_path / workspace_name
-    scenario = base.validated_setup(request)
     checkout = workspace / ("source" if scenario == "dirty" else "repo")
-    commit = str(request["repository"]["commit"])
     if base._run_checked(
         ["git", "rev-parse", "HEAD"], cwd=source
     ) != commit or base._run_checked(
