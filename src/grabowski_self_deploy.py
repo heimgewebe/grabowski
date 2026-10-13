@@ -3129,7 +3129,12 @@ def _origin_main_fetch_effect_evidence(
     resolved_target: str,
     fetch_result: dict[str, Any],
     public_before_fetch: str,
+    phase: str,
 ) -> dict[str, Any]:
+    # Only the two owner-controlled call sites can classify when this ODB
+    # mutation occurred; the phase is inside the digest-bound receipt.
+    if phase not in {"admission", "refresh"}:
+        raise RuntimeError("protected-main object import phase is invalid")
     if (
         pre_fetch_snapshot.get("target_object_present") is not False
         or resolved_target != expected_head
@@ -3142,7 +3147,11 @@ def _origin_main_fetch_effect_evidence(
         )
     material = {
         "schema_version": 1,
-        "kind": "grabowski_runtime_deploy_origin_main_fetch_effect",
+        "kind": (
+            "grabowski_runtime_deploy_origin_main_fetch_effect"
+            if phase == "admission"
+            else "grabowski_runtime_deploy_origin_main_refresh_fetch_effect"
+        ),
         "canonical_repository": str(plan["canonical_repository"]),
         "expected_head": expected_head,
         "previous_head": pre_fetch_snapshot["current_head"],
@@ -3324,6 +3333,7 @@ def _fetch_exact_release_admission_target(
                 resolved_target=observed_head,
                 fetch_result=result,
                 public_before_fetch=public_before,
+                phase="admission",
             )
         )
         after = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
@@ -3505,6 +3515,7 @@ def _refresh_canonical_origin_main(
                 resolved_target=resolved_target,
                 fetch_result=fetch_result,
                 public_before_fetch=public_before_fetch,
+                phase="refresh",
             )
         after_fetch = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
         if _canonical_main_refresh_state(after_fetch) != _canonical_main_refresh_state(

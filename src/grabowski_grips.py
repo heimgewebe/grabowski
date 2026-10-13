@@ -16107,7 +16107,10 @@ def _runtime_deploy_origin_main_fetch_effect_evidence_valid(
     )
     return bool(
         evidence.get("schema_version") == 1
-        and evidence.get("kind") == "grabowski_runtime_deploy_origin_main_fetch_effect"
+        and evidence.get("kind") in {
+            "grabowski_runtime_deploy_origin_main_fetch_effect",
+            "grabowski_runtime_deploy_origin_main_refresh_fetch_effect",
+        }
         and evidence.get("expected_head") == expected_head
         and evidence.get("effect_observed") is True
         and isinstance(evidence.get("canonical_repository"), str)
@@ -16417,6 +16420,10 @@ def _runtime_deploy_local_mutation_evidence_valid(
         # two individually checked, digest-bound mutation receipts. The two
         # alternative refresh representations remain mutually exclusive.
         "grabowski_runtime_deploy_origin_main_fetch_effect": -2,
+        # A target object can disappear after early admission leases close.
+        # Ref-refresh may then legitimately import the same OID only after
+        # pending-unit promotion / stale index reconciliation.
+        "grabowski_runtime_deploy_origin_main_refresh_fetch_effect": 1,
         "grabowski_runtime_deploy_origin_main_refresh": 2,
         "grabowski_runtime_deploy_origin_main_refresh_effect": 2,
         "grabowski_runtime_deploy_rootbroker_authority_effect": 3,
@@ -16444,7 +16451,10 @@ def _runtime_deploy_local_mutation_evidence_valid(
                 effect,
                 expected_head=expected_head,
             )
-        elif kind == "grabowski_runtime_deploy_origin_main_fetch_effect":
+        elif kind in {
+            "grabowski_runtime_deploy_origin_main_fetch_effect",
+            "grabowski_runtime_deploy_origin_main_refresh_fetch_effect",
+        }:
             valid = _runtime_deploy_origin_main_fetch_effect_evidence_valid(
                 effect,
                 expected_head=expected_head,

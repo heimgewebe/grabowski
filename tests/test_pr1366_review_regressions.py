@@ -856,7 +856,7 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
         evidence = raised.exception.local_mutation_evidence
         self.assertEqual(
             evidence["kind"],
-            "grabowski_runtime_deploy_origin_main_fetch_effect",
+            "grabowski_runtime_deploy_origin_main_refresh_fetch_effect",
         )
         self.assertEqual(
             evidence["target_object"],

@@ -510,6 +510,15 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             "effect_observed": True,
         }
         imported = {**imported_material, "evidence_sha256": grips.sha256_json(imported_material)}
+        # A fresh ODB fetch inside ref-refresh follows index reconciliation;
+        # it is not the admission-only fetch recorded before the index.
+        late_material = {
+            **imported_material,
+            "kind": "grabowski_runtime_deploy_origin_main_refresh_fetch_effect",
+        }
+        late_import = {
+            **late_material, "evidence_sha256": grips.sha256_json(late_material)
+        }
         promotion = {"schema_version": 1, "kind": "grabowski_runtime_deploy_pending_unit_promotion"}
         reconciliation = {"schema_version": 1, "kind": "grabowski_runtime_deploy_stale_pending_reconciliation"}
         def accepts(effects):
@@ -533,6 +542,12 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             self.assertTrue(accepts([imported, promotion]))
             self.assertTrue(accepts([imported, reconciliation]))
             self.assertTrue(accepts([imported, promotion, reconciliation]))
+            self.assertTrue(accepts([promotion, late_import]))
+            self.assertTrue(accepts([reconciliation, late_import]))
+            self.assertTrue(accepts([imported, promotion, late_import]))
+            self.assertFalse(accepts([late_import, promotion]))
+            self.assertFalse(accepts([late_import, imported]))
+            self.assertFalse(accepts([late_import, late_import]))
             self.assertFalse(accepts([promotion, imported]))
             self.assertFalse(accepts([imported, promotion, promotion]))
 
