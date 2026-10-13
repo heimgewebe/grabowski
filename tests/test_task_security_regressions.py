@@ -1745,8 +1745,8 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             "   Path('/mnt/receipt-kernel-sink'),\n"
             "   Path('/tmp/grabowski-scoped-receipt'))],\n"
             " )\n"
-            "except sandbox.AgentSandboxError:\n"
-            " print('REJECTED')\n"
+            "except sandbox.AgentSandboxError as exc:\n"
+            " print('REJECTED:' + str(exc))\n"
             "else:\n"
             " print('ACCEPTED')\n"
         )
@@ -1769,7 +1769,7 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             outer, capture_output=True, text=True, check=False, timeout=40,
         )
         self.assertEqual(checked.returncode, 0, checked.stderr)
-        self.assertEqual(checked.stdout.strip(), "REJECTED")
+        self.assertIn("mount boundary", checked.stdout)
 
 
     def test_external_receipt_bind_rejects_unsafe_source_or_target(self) -> None:
@@ -2078,6 +2078,99 @@ class TaskSecurityRegressionTests(unittest.TestCase):
 
 
 
+    def test_nonhome_workspace_does_not_require_a_mounted_operator_home(self) -> None:
+        """A nested kernel namespace has no host HOME, but can still attest mounts."""
+        from pathlib import Path
+
+        workspace = self.root / "isolated-nonhome-workspace"
+        workspace.mkdir()
+        absent_home = self.root / "unmounted-operator-home"
+        self.assertFalse(absent_home.exists())
+        with patch.object(Path, "home", return_value=absent_home):
+            argv = tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=workspace, command=["/usr/bin/true"],
+                workspace_writable=False,
+            )
+        self.assertIn(
+            ["--ro-bind", str(workspace), str(workspace)],
+            [argv[index:index + 3] for index in range(len(argv) - 2)],
+        )
+
+    def test_writable_scope_rejects_mount_alias_at_workspace_root(self) -> None:
+        """A same-device bind at workspace root is not identity evidence."""
+        from pathlib import Path
+
+        workspace = self.root / "alias-worktree-root"
+        workspace.mkdir()
+        allowed = workspace / "allowed"
+        allowed.mkdir()
+        with patch.object(
+            tasks.agent_sandbox, "_kernel_mount_points",
+            return_value=frozenset({workspace}),
+        ):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "mount boundary",
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(
+                    workspace=workspace,
+                    command=["/usr/bin/true"], workspace_writable=True,
+                    writable_paths=(allowed,),
+                )
+
+    def test_real_kernel_same_device_workspace_root_alias_denied(self) -> None:
+        """Check the actual mountinfo reason, not merely any preflight denial."""
+        import subprocess
+        from pathlib import Path
+
+        tasks.agent_sandbox.require_bwrap()
+        workspace = self.root / "real-alias-workspace"
+        workspace.mkdir()
+        allowed = workspace / "allowed"
+        allowed.mkdir()
+        unrelated = self.root / "unrelated-same-device"
+        unrelated.mkdir()
+        (unrelated / "allowed").mkdir()
+        self.assertEqual(workspace.stat().st_dev, unrelated.stat().st_dev)
+        sandbox_file = Path(tasks.agent_sandbox.__file__).resolve(strict=True)
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.dont_write_bytecode = True\n"
+            "sys.path.insert(0, '/opt')\n"
+            "import grabowski_agent_sandbox as sandbox\n"
+            "try:\n"
+            " sandbox.minimal_sandbox_argv(\n"
+            "  workspace=Path('/mnt/real-alias-workspace'),\n"
+            "  command=['/usr/bin/true'], workspace_writable=True,\n"
+            "  writable_paths=[Path('/mnt/real-alias-workspace/allowed')],\n"
+            " )\n"
+            "except sandbox.AgentSandboxError as exc:\n"
+            " print('REJECTED:' + str(exc))\n"
+            "else:\n"
+            " print('ACCEPTED')\n"
+        )
+        outer = [
+            str(tasks.agent_sandbox.require_bwrap()),
+            "--die-with-parent", "--new-session", "--unshare-pid",
+            "--unshare-ipc", "--unshare-uts", "--cap-drop", "ALL",
+            "--ro-bind", "/usr", "/usr",
+            "--symlink", "usr/bin", "/bin",
+            "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib64", "/lib64",
+            "--proc", "/proc", "--dev", "/dev",
+            "--ro-bind", str(self.root), "/mnt",
+            "--bind", str(unrelated), "/mnt/real-alias-workspace",
+            "--ro-bind", str(sandbox_file), "/opt/grabowski_agent_sandbox.py",
+            "--", "/usr/bin/python3", "-I", "-c", script,
+        ]
+        checked = subprocess.run(
+            outer, capture_output=True, text=True, check=False, timeout=40,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertIn("mount boundary", checked.stdout)
+        self.assertNotIn("ACCEPTED", checked.stdout)
+
+
     def test_writable_mountinfo_missing_or_unbounded_fails_closed(self) -> None:
         """A read-only task needs no mount snapshot; a writer does."""
         from pathlib import Path
@@ -2136,8 +2229,8 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             "        command=['/usr/bin/true'], workspace_writable=True,\n"
             "        writable_paths=[Path('/mnt/same device workspace/allowed')],\n"
             "    )\n"
-            "except sandbox.AgentSandboxError:\n"
-            "    print('REJECTED')\n"
+            "except sandbox.AgentSandboxError as exc:\n"
+            "    print('REJECTED:' + str(exc))\n"
             "else:\n"
             "    print('ACCEPTED')\n"
         )
@@ -2161,7 +2254,7 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             outer, capture_output=True, text=True, check=False, timeout=40
         )
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(run.stdout.strip(), "REJECTED")
+        self.assertIn("mount boundary", run.stdout)
 
 
     def test_git_metadata_must_not_be_a_bounded_writable_path(self) -> None:

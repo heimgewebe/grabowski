@@ -871,7 +871,12 @@ def _normalized_writable_paths(worktree: Path, values: Iterable[Path]) -> list[P
         mount_points = _kernel_mount_points()
         for candidate in collapsed:
             if any(
-                mount == candidate or mount.is_relative_to(candidate)
+                mount == worktree
+                or mount.is_relative_to(candidate)
+                or (
+                    mount.is_relative_to(worktree)
+                    and candidate.is_relative_to(mount)
+                )
                 for mount in mount_points
             ):
                 raise AgentSandboxError(
@@ -917,7 +922,7 @@ def minimal_sandbox_argv(
         # HOME/repos; all other home descendants require a distinct verified
         # authority route rather than a broad read-only mount.
         try:
-            home = Path.home().resolve(strict=True)
+            home = Path.home().resolve(strict=False)
         except OSError as exc:
             raise AgentSandboxError("operator home identity is unavailable") from exc
         repositories = home / "repos"
