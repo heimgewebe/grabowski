@@ -320,6 +320,56 @@ class TaskSecurityRegressionTests(unittest.TestCase):
 
 
 
+    def test_revoked_running_task_lease_cannot_be_silently_reacquired(self) -> None:
+        """A current unit observation is not authority to restore a lost lease.
+
+        This uses a synthetic still-running unit and a real private resource
+        database. Revocation must be followed by a verified stop/reconcile,
+        never an implicit writable regrant during task_status().
+        """
+        import sqlite3
+
+        task_id = self._start_claude()
+        record = tasks._row_raw(task_id)
+        keys = tasks._record_resource_keys(record)
+        self.assertTrue(keys)
+        with sqlite3.connect(self.fixtures.resource_database) as database:
+            database.execute(
+                "DELETE FROM leases WHERE resource_key IN ("
+                + ",".join("?" for _ in keys) + ")",
+                keys,
+            )
+        self.assertFalse(tasks.resources.inspect_resources(keys))
+        observed_running = {
+            "state": "running",
+            "properties": {
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+                "Result": "success",
+            },
+            "observer": {"kind": "test", "execution_backend": "systemd-user"},
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(tasks, "_observe", return_value=observed_running),
+            patch.object(
+                tasks.resources, "acquire_resources",
+                wraps=tasks.resources.acquire_resources,
+            ) as regrant,
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            status = tasks.grabowski_task_status(task_id)
+        regrant.assert_not_called()
+        maintenance = status["lease_maintenance"]
+        self.assertIsInstance(maintenance, dict)
+        self.assertIs(maintenance["maintained"], False)
+        # A visible, still-running unit with no grant remains a live writer.
+        # A failed renewal alone is not a cgroup-stop or reconciliation proof.
+        self.assertNotEqual(status["state"], "running")
+        self.assertIsNone(tasks.resources.inspect_resource(keys[0]))
+
+
     def test_env_split_short_clusters_do_not_bypass_codex_guard(self) -> None:
         commands = (
             ["/usr/bin/env", "-iS", "codex exec prompt"],
