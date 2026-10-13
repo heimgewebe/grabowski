@@ -11699,9 +11699,41 @@ def _clear_task_reconcile_ready_evidence(*, preserve_cycle: bool = False) -> Non
             )
 
 
+def _task_reconcile_ready_store_epoch(
+    connection: sqlite3.Connection,
+) -> str | None:
+    """Read both revision tokens without changing either store."""
+    task_revision = _task_reconcile_revision_contract(connection)
+    with resources._resource_readonly_snapshot() as resource_connection:
+        resource_revision = resources._resource_reconcile_revision_contract(
+            resource_connection
+        )
+    if resource_revision is None:
+        return None
+    return _sha256_json({
+        "task_revision": task_revision["revision"],
+        "resource_revision": resource_revision["revision"],
+    })
+
+
+def _task_reconcile_ready_pre_page_epoch() -> str | None:
+    """Capture the store generation before an authorized page mutates it.
+
+    The caller already owns the task-mutation lock. An unavailable or invalid
+    source cannot extend readiness confidence.
+    """
+    try:
+        with _database_connection() as connection:
+            return _task_reconcile_ready_store_epoch(connection)
+    except Exception:
+        return None
+
+
 def _task_reconcile_ready_cycle_progress(
     connection: sqlite3.Connection,
     result: dict[str, Any],
+    *,
+    prior_epoch: str | None,
 ) -> bool:
     """Record consecutive, error-free pages for all three fair phases.
 
@@ -11737,23 +11769,17 @@ def _task_reconcile_ready_cycle_progress(
             (TASK_RECONCILE_READY_CYCLE_METADATA_KEY,),
         )
         return False
-    # A cursor sequence alone does not bind already-finished phases to the
-    # same task/resource-store generation as the remaining phases.
-    task_revision = _task_reconcile_revision_contract(connection)
-    with resources._resource_readonly_snapshot() as resource_connection:
-        resource_revision = resources._resource_reconcile_revision_contract(
-            resource_connection
-        )
-    if resource_revision is None:
+    # Earlier pages are bound to their *post-write* revision tokens. Compare
+    # against the next page's pre-write tokens, not the revisions changed by
+    # this page's own _set_state / terminalization recovery operations.
+    # A different writer between pages invalidates the cumulative cycle.
+    current_epoch = _task_reconcile_ready_store_epoch(connection)
+    if prior_epoch is None or current_epoch is None:
         connection.execute(
             "DELETE FROM metadata WHERE key=?",
             (TASK_RECONCILE_READY_CYCLE_METADATA_KEY,),
         )
         return False
-    epoch = _sha256_json({
-        "task_revision": task_revision["revision"],
-        "resource_revision": resource_revision["revision"],
-    })
     rows = connection.execute(
         "SELECT value FROM metadata WHERE key=?",
         (TASK_RECONCILE_READY_CYCLE_METADATA_KEY,),
@@ -11769,13 +11795,13 @@ def _task_reconcile_ready_cycle_progress(
                 not isinstance(progress, dict)
                 or set(progress) != {"schema_version", "phases", "epoch"}
                 or progress["schema_version"] != 2
-                or progress["epoch"] != epoch
+                or progress["epoch"] != prior_epoch
                 or not isinstance(progress["phases"], dict)
                 or set(progress["phases"]) - set(TASK_RECONCILE_READY_CYCLE_PHASES)
             ):
                 raise ValueError("Reconcile readiness cycle shape is invalid")
         else:
-            progress = {"schema_version": 2, "phases": {}, "epoch": epoch}
+            progress = {"schema_version": 2, "phases": {}, "epoch": current_epoch}
         phases = progress["phases"]
         for name in TASK_RECONCILE_READY_CYCLE_PHASES:
             page = pages[name]
@@ -11817,6 +11843,7 @@ def _task_reconcile_ready_cycle_progress(
             (TASK_RECONCILE_READY_CYCLE_METADATA_KEY,),
         )
         return False
+    progress["epoch"] = current_epoch
     if all(phases[name]["complete"] for name in TASK_RECONCILE_READY_CYCLE_PHASES):
         connection.execute(
             "DELETE FROM metadata WHERE key=?",
@@ -11833,13 +11860,17 @@ def _task_reconcile_ready_cycle_progress(
 
 def _prepare_task_reconcile_ready_evidence(
     result: dict[str, Any],
+    *,
+    prior_epoch: str | None,
 ) -> dict[str, Any] | None:
     """Freeze a cycle and its store revisions while the caller holds the lock.
 
     Never dispatch external Rootbroker observations from this SQL transaction.
     """
     with _database_connection() as connection:
-        if not _task_reconcile_ready_cycle_progress(connection, result):
+        if not _task_reconcile_ready_cycle_progress(
+            connection, result, prior_epoch=prior_epoch
+        ):
             return None
         # A schema index is installed only on this mutation-authorized path.
         # READ_ONLY snapshots can only use an existing verified index.
@@ -12991,6 +13022,9 @@ def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
         _clear_task_reconcile_ready_evidence(preserve_cycle=not bool(task_id))
+        prior_epoch = (
+            _task_reconcile_ready_pre_page_epoch() if not task_id else None
+        )
         result = _reconcile_tasks_refresh_locked(task_id=task_id)
         base._append_audit(
             {
@@ -13002,7 +13036,9 @@ def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
             }
         )
         try:
-            prepared = _prepare_task_reconcile_ready_evidence(result)
+            prepared = _prepare_task_reconcile_ready_evidence(
+                result, prior_epoch=prior_epoch
+            )
         except Exception:
             # A successful refresh remains valid when readiness proof fails.
             prepared = None
@@ -13085,6 +13121,9 @@ def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
         _clear_task_reconcile_ready_evidence(preserve_cycle=not auto_resume)
+        prior_epoch = (
+            _task_reconcile_ready_pre_page_epoch() if not auto_resume else None
+        )
         result, refresh = _reconcile_tasks_locked(auto_resume=auto_resume)
         base._append_audit(
             {
@@ -13098,7 +13137,9 @@ def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
         )
         if not auto_resume:
             try:
-                prepared = _prepare_task_reconcile_ready_evidence(refresh)
+                prepared = _prepare_task_reconcile_ready_evidence(
+                    refresh, prior_epoch=prior_epoch
+                )
             except Exception:
                 pass
     # Never hold the global task lock across privileged Systemd show.

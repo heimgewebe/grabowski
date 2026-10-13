@@ -6195,6 +6195,107 @@ class TaskTests(unittest.TestCase):
         with tasks._task_readonly_snapshot() as reader:
             self.assertEqual("missing", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
 
+    def test_reconcile_ready_pages_bind_post_write_revision_and_reject_external_drift(self) -> None:
+        # An authorized refresh changes task revisions during each page. Its
+        # own writes must not discard a continuous error-free page sequence.
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        record = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?",
+                (record["task_id"],),
+            )
+
+        def page(before: object, after: object, complete: bool) -> dict:
+            phase = {
+                "cursor_before": before, "cursor_after": after,
+                "cycle_completed": complete,
+            }
+            return {
+                "mode": "refresh", "task_id": "", "scanned": 1,
+                "refreshed": [], "released": [], "resumed": [], "blocked": [],
+                "batch": {
+                    **phase,
+                    "active_refresh": dict(phase),
+                    "terminalization_recovery": {**phase, "failed": []},
+                },
+            }
+
+        first = page(None, "next-page", False)
+        last = page("next-page", None, True)
+
+        def run_pages(*, mutate_between: bool, resource_drift_between: bool = False) -> str:
+            steps = iter((first, last))
+
+            def refresh(**_kwargs: object) -> dict:
+                with tasks._database_connection() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET state='running' WHERE task_id=?",
+                        (record["task_id"],),
+                    )
+                    connection.execute(
+                        "UPDATE tasks SET state='completed' WHERE task_id=?",
+                        (record["task_id"],),
+                    )
+                return next(steps)
+
+            with (
+                patch.object(tasks.operator, "_require_operator_mutation"),
+                patch.object(tasks, "_reconcile_tasks_refresh_locked", side_effect=refresh),
+                patch.object(tasks.base, "_append_audit"),
+            ):
+                tasks._task_reconcile_refresh_after_guard("")
+                if mutate_between:
+                    with tasks._database_connection() as connection:
+                        # A separate writer between pages invalidates proof.
+                        connection.execute(
+                            "UPDATE tasks SET state='running' WHERE task_id=?",
+                            (record["task_id"],),
+                        )
+                        connection.execute(
+                            "UPDATE tasks SET state='completed' WHERE task_id=?",
+                            (record["task_id"],),
+                        )
+                if resource_drift_between:
+                    with closing(tasks.resources._database()) as writer, writer:
+                        writer.execute(
+                            "UPDATE metadata SET value=lower(hex(randomblob(32))) WHERE key=?",
+                            (tasks.resources.RESOURCE_RECONCILE_REVISION_METADATA_KEY,),
+                        )
+                tasks._task_reconcile_refresh_after_guard("")
+            observed = {
+                "state": "completed",
+                "properties": {
+                    "LoadState": "loaded", "ActiveState": "inactive",
+                    "SubState": "dead", "Result": "success",
+                },
+                "probe": {"returncode": 0, "timed_out": False},
+                "observer": {
+                    "kind": "bound-local-user-systemd-show-v1",
+                    "transport": "local",
+                },
+                "observed_at_unix": tasks._now(),
+            }
+            with (
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(tasks, "_observe", return_value=observed),
+            ):
+                with tasks._task_readonly_snapshot() as connection:
+                    return tasks._task_reconcile_ready_evidence_snapshot(connection)["status"]
+
+        self.assertEqual("verified", run_pages(mutate_between=False))
+        self.assertNotEqual("verified", run_pages(mutate_between=True))
+        self.assertNotEqual(
+            "verified",
+            run_pages(mutate_between=False, resource_drift_between=True),
+        )
+
     def test_reconcile_ready_multipage_requires_all_three_complete_error_free_cycles(self) -> None:
         with tasks._database_connection():
             pass
