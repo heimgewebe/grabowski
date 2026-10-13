@@ -5690,6 +5690,58 @@ def _require_release_source_admission(expected_head: str) -> dict[str, Any]:
     }
 
 
+
+def _protected_release_admission_target_snapshot(
+    expected_head: str,
+) -> dict[str, Any]:
+    """Inspect the missing public-main target only under ODB/checkout leases.
+
+    Porcelain status can invoke repository-configured process/clean filters;
+    even a preflight must never run it as an uncoordinated read. The caller
+    holds the scheduler lock. The eventual object import independently
+    reacquires these resources and revalidates the snapshot before effects.
+    """
+    plan = _origin_main_refresh_plan(expected_head)
+    resource_keys = [
+        plan["operation_key"],
+        plan["canonical_key"],
+        plan["common_dir_key"],
+        plan["objects_key"],
+        plan["origin_main_ref_key"],
+    ]
+    acquisition = _acquire_origin_main_refresh_resources(plan, expected_head)
+    try:
+        for key in resource_keys:
+            _lease_for_key(acquisition, key)
+        _require_origin_main_refresh_checkout_certainty(plan)
+        snapshot = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("canonical_repository") != str(plan["canonical_repository"])
+            or snapshot.get("target_head") != expected_head
+            or type(snapshot.get("target_object_present")) is not bool
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "protected release admission target snapshot identity is invalid"
+            )
+        return snapshot
+    finally:
+        leases = [
+            _lease_for_key(acquisition, key) for key in resource_keys
+        ]
+        result = _release_origin_main_refresh_resources(plan, resource_keys, leases)
+        released = result.get("released") if isinstance(result, dict) else None
+        if (
+            not isinstance(released, list)
+            or len(released) != len(resource_keys)
+            or not all(isinstance(item, dict) for item in released)
+            or {item.get("resource_key") for item in released} != set(resource_keys)
+        ):
+            raise RuntimeError(
+                "protected release admission snapshot lease closeout incomplete"
+            )
+
+
 def _grabowski_runtime_deploy_schedule_impl(
     expected_head: ExpectedHead,
     delay_seconds: DelaySeconds = 8,
@@ -5702,34 +5754,25 @@ def _grabowski_runtime_deploy_schedule_impl(
     """Implement one source-identity-bound self-deployment schedule attempt."""
     # Preserve the early pre-effect denial. Only an explicitly missing target
     # object can defer the ancestry portion into the protected schedule lock.
-    admission_snapshot: dict[str, Any] | None = None
+    needs_target_object_admission = False
     try:
         _require_release_source_admission(expected_head)
     except DeploySchedulePreEffectRefusal as exc:
         if str(exc) != "release admission blocked: source ancestry is unproved":
             raise
-        admission_snapshot = _canonical_main_refresh_candidate(expected_head)
-        if admission_snapshot.get("target_object_present") is not False:
-            raise
+        needs_target_object_admission = True
     with _deploy_schedule_lock():
-        if admission_snapshot is not None:
-            locked_snapshot = _canonical_main_refresh_candidate(expected_head)
-            if (
-                _canonical_main_refresh_state(locked_snapshot)
-                != _canonical_main_refresh_state(admission_snapshot)
-            ):
-                raise DeploySchedulePreEffectRefusal(
-                    "release admission object import canonical identity drifted under lock"
-                )
-            if locked_snapshot.get("target_object_present") is False:
+        if needs_target_object_admission:
+            # A lock waiter must not read a prior importer's live source
+            # leases. Acquire our own ODB/checkout leases before any status
+            # check that may execute repository-configured filters.
+            snapshot = _protected_release_admission_target_snapshot(expected_head)
+            if snapshot["target_object_present"] is False:
                 _fetch_exact_release_admission_target(
-                    expected_head, admission_snapshot,
+                    expected_head, snapshot,
                     local_mutation_tracker=local_mutation_tracker,
                 )
-            elif locked_snapshot.get("target_object_present") is not True:
-                raise DeploySchedulePreEffectRefusal(
-                    "release admission object import target presence is unproved"
-                )
+        # Re-admit even when another scheduler imported the exact object.
         # Mandatory re-admission under the lock even when an earlier read
         # succeeded. No index, Git-ref, Rootbroker, or dispatch effect precedes it.
         _require_release_source_admission(expected_head)

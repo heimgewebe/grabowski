@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import sys
 import types
@@ -296,7 +296,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         with (
             patch.object(deploy, "_require_release_source_admission", side_effect=admit),
             patch.object(
-                deploy, "_canonical_main_refresh_candidate",
+                deploy, "_protected_release_admission_target_snapshot",
                 return_value={"target_object_present": False},
             ),
             patch.object(deploy, "_deploy_schedule_lock", return_value=nullcontext()),
@@ -317,6 +317,128 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
 
 
 
+
+
+    def test_missing_target_snapshot_waits_for_schedule_lock(self) -> None:
+        """An in-flight importer must release its leases before the waiter reads status."""
+        deploy = real_deploy
+        expected = "b" * 40
+        calls: list[str] = []
+
+        def admission(_head: str) -> dict:
+            calls.append("admission")
+            if calls.count("admission") == 1:
+                raise deploy.DeploySchedulePreEffectRefusal(
+                    "release admission blocked: source ancestry is unproved"
+                )
+            return {"status": "non-runtime-documentation"}
+
+        @contextmanager
+        def lock():
+            calls.append("lock-enter")
+            try:
+                yield
+            finally:
+                calls.append("lock-exit")
+
+        def protected_snapshot(_head: str) -> dict:
+            self.assertIn("lock-enter", calls)
+            calls.append("leased-snapshot")
+            return {"target_object_present": True}
+
+        def stop_before_effect(_head: str) -> str:
+            calls.append("public-main")
+            raise RuntimeError("stop before effect")
+
+        with (
+            patch.object(deploy, "_require_release_source_admission", side_effect=admission),
+            patch.object(deploy, "_deploy_schedule_lock", side_effect=lock),
+            patch.object(deploy, "_protected_release_admission_target_snapshot",
+                         side_effect=protected_snapshot, create=True),
+            patch.object(deploy, "_canonical_main_refresh_candidate",
+                         side_effect=AssertionError("unguarded Git status")) as porcelain,
+            patch.object(deploy, "_fetch_exact_release_admission_target") as fetch,
+            patch.object(deploy, "_fresh_public_github_main", side_effect=stop_before_effect),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop before effect"):
+                deploy._grabowski_runtime_deploy_schedule_impl(
+                    expected, local_mutation_tracker={},
+                )
+        self.assertEqual(
+            ["admission", "lock-enter", "leased-snapshot", "admission", "public-main", "lock-exit"],
+            calls,
+        )
+        porcelain.assert_not_called()
+        fetch.assert_not_called()
+
+    def test_guarded_missing_target_snapshot_owns_checkout_odb_leases(self) -> None:
+        deploy = real_deploy
+        expected = "b" * 40
+        repo = Path("/fixture/canonical")
+        keys = ("operation_key", "canonical_key", "common_dir_key",
+                "objects_key", "origin_main_ref_key")
+        plan = {"canonical_repository": repo, "owner_id": "fixture:review-snapshot",
+                **{name: f"fixture:{name}" for name in keys}}
+        leases = [{"resource_key": plan[k]} for k in keys]
+        events: list[str] = []
+        snapshot = {
+            "canonical_repository": str(repo),
+            "target_head": expected,
+            "target_object_present": False,
+        }
+
+        def acquire(_plan: dict, _head: str) -> dict:
+            events.append("acquire")
+            return {"leases": leases}
+
+        def verify(_plan: dict) -> None:
+            events.append("verify-checkout")
+
+        def observe(head: str, owner: str) -> dict:
+            self.assertEqual((expected, plan["owner_id"]), (head, owner))
+            events.append("status-under-lease")
+            return snapshot
+
+        def release(_plan: dict, resource_keys: list, observed: list) -> dict:
+            self.assertEqual([plan[k] for k in keys], resource_keys)
+            self.assertEqual(leases, observed)
+            events.append("release")
+            return {"released": leases}
+
+        with (
+            patch.object(deploy, "_origin_main_refresh_plan", return_value=plan),
+            patch.object(deploy, "_acquire_origin_main_refresh_resources", side_effect=acquire),
+            patch.object(deploy, "_lease_for_key", side_effect=lambda _acq, key: {"resource_key": key}),
+            patch.object(deploy, "_require_origin_main_refresh_checkout_certainty", side_effect=verify),
+            patch.object(deploy, "_canonical_main_refresh_candidate", side_effect=observe),
+            patch.object(deploy, "_release_origin_main_refresh_resources", side_effect=release),
+        ):
+            self.assertEqual(
+                snapshot, deploy._protected_release_admission_target_snapshot(expected)
+            )
+        self.assertEqual(
+            ["acquire", "verify-checkout", "status-under-lease", "release"], events
+        )
+
+    def test_guarded_missing_target_snapshot_rejects_lease_conflict_before_status(self) -> None:
+        deploy = real_deploy
+        with (
+            patch.object(deploy, "_origin_main_refresh_plan", return_value={
+                "operation_key": "fixture:operation",
+                "canonical_key": "fixture:canonical",
+                "common_dir_key": "fixture:common",
+                "objects_key": "fixture:objects",
+                "origin_main_ref_key": "fixture:ref",
+            }),
+            patch.object(
+                deploy, "_acquire_origin_main_refresh_resources",
+                side_effect=deploy.DeploySchedulePreEffectRefusal("resource busy"),
+            ),
+            patch.object(deploy, "_canonical_main_refresh_candidate") as porcelain,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "resource busy"):
+                deploy._protected_release_admission_target_snapshot("b" * 40)
+        porcelain.assert_not_called()
 
     def test_target_imported_by_lock_winner_reuses_object_before_readmission(self) -> None:
         deploy = real_deploy
@@ -350,8 +472,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
 
         with (
             patch.object(deploy, "_require_release_source_admission", side_effect=admission),
-            patch.object(deploy, "_canonical_main_refresh_candidate",
-                         side_effect=[initial, reobserved]) as candidate,
+            patch.object(deploy, "_protected_release_admission_target_snapshot",
+                         return_value=reobserved) as candidate,
             patch.object(deploy, "_deploy_schedule_lock", return_value=nullcontext()),
             patch.object(deploy, "_fetch_exact_release_admission_target") as fetch,
             patch.object(deploy, "_fresh_public_github_main", side_effect=stop_before_effect),
@@ -363,7 +485,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                     expected, local_mutation_tracker={}
                 )
         self.assertEqual(["admission", "admission", "public-main"], events)
-        self.assertEqual(2, candidate.call_count)
+        candidate.assert_called_once_with(expected)
         fetch.assert_not_called()
         inflight.assert_not_called()
         rootbroker.assert_not_called()
@@ -388,18 +510,18 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                          side_effect=deploy.DeploySchedulePreEffectRefusal(
                              "release admission blocked: source ancestry is unproved"
                          )) as admission,
-            patch.object(deploy, "_canonical_main_refresh_candidate",
-                         side_effect=[initial, drifted]),
+            patch.object(deploy, "_protected_release_admission_target_snapshot",
+                         return_value=drifted),
             patch.object(deploy, "_deploy_schedule_lock", return_value=nullcontext()),
             patch.object(deploy, "_fetch_exact_release_admission_target") as fetch,
             patch.object(deploy, "_fresh_public_github_main") as public,
             patch.object(deploy.privileged, "ensure_rootbroker_authority") as rootbroker,
         ):
-            with self.assertRaisesRegex(RuntimeError, "drift"):
+            with self.assertRaisesRegex(RuntimeError, "source ancestry"):
                 deploy._grabowski_runtime_deploy_schedule_impl(
                     expected, local_mutation_tracker={}
                 )
-        admission.assert_called_once_with(expected)
+        self.assertEqual(2, admission.call_count)
         fetch.assert_not_called()
         public.assert_not_called()
         rootbroker.assert_not_called()
@@ -423,7 +545,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                     side_effect=deploy.DeploySchedulePreEffectRefusal(message),
                 ),
                 patch.object(
-                    deploy, "_canonical_main_refresh_candidate",
+                    deploy, "_protected_release_admission_target_snapshot",
                     return_value=snapshot,
                 ) as candidate,
                 patch.object(deploy, "_deploy_schedule_lock") as schedule_lock,
@@ -435,7 +557,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                         target, local_mutation_tracker={}
                     )
             self.assertEqual(1 if need_snapshot else 0, candidate.call_count)
-            schedule_lock.assert_not_called()
+            self.assertEqual(1 if need_snapshot else 0, schedule_lock.call_count)
             fetch.assert_not_called()
             broker.assert_not_called()
 
@@ -656,7 +778,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
 
         with (
             patch.object(deploy, "_require_release_source_admission", side_effect=admission),
-            patch.object(deploy, "_canonical_main_refresh_candidate",
+            patch.object(deploy, "_protected_release_admission_target_snapshot",
                          return_value={"target_object_present": False}),
             patch.object(deploy, "_deploy_schedule_lock", return_value=nullcontext()),
             patch.object(deploy, "_fetch_exact_release_admission_target", side_effect=fetch),
