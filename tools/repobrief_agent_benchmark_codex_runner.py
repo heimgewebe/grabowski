@@ -834,17 +834,29 @@ def _authenticated_procfs_evidence() -> tuple[bytes, bytes]:
             os.close(descriptor)
 
 
-def _authenticated_procfs_cgroup() -> bytes:
-    """Read this process's cgroup from genuine, same-mount kernel procfs FDs."""
+def _authenticated_procfs_cgroup(pid: int | None = None) -> bytes:
+    """Read our or a kernel-authenticated peer's cgroup from genuine procfs FDs.
+
+    Numeric PID lookups must never trust a mounted ordinary-file stand-in;
+    every opened descriptor is checked against one genuine procfs mount ID.
+    """
+    if pid is not None and (type(pid) is not int or pid <= 0):
+        raise RunnerError("live Codex device isolation procfs PID is invalid")
     descriptors: list[int] = []
     try:
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
         file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
         proc = os.open("/proc", directory_flags | os.O_NOFOLLOW)
         descriptors.append(proc)
-        self_dir = os.open("self", directory_flags, dir_fd=proc)
-        descriptors.append(self_dir)
-        cgroup = os.open("cgroup", file_flags, dir_fd=self_dir)
+        target = "self" if pid is None else str(pid)
+        # proc/self is the trusted kernel-provided symlink; numeric peers
+        # must be opened without following any further pathname links.
+        target_flags = (
+            directory_flags if pid is None else directory_flags | os.O_NOFOLLOW
+        )
+        target_dir = os.open(target, target_flags, dir_fd=proc)
+        descriptors.append(target_dir)
+        cgroup = os.open("cgroup", file_flags, dir_fd=target_dir)
         descriptors.append(cgroup)
         if len({_kernel_procfs_mount_id(fd) for fd in descriptors}) != 1:
             raise RunnerError("live Codex device isolation procfs identity differs")
@@ -863,18 +875,56 @@ def _authenticated_procfs_cgroup() -> bytes:
             os.close(descriptor)
 
 
+def _authenticated_live_broker_cgroup(
+    peer_socket: socket.socket, peer_pid: int
+) -> bytes:
+    """Kernel-bind a nonroot D-Bus socket peer to its observed cgroup.
+
+    Linux SO_PEERPIDFD (77, from asm-generic/socket.h) yields the pidfd
+    of the *connected socket peer*. os.pidfd_open(peer_pid) is insufficient:
+    the numeric PID could already refer to another process. A readable
+    pidfd means the original peer has exited. Reject that state both
+    before and after opening /proc/<pid>/cgroup, while the socket remains
+    open, rather than trusting a recycled PID or a stale mock service.
+    """
+    try:
+        raw_pidfd = peer_socket.getsockopt(socket.SOL_SOCKET, 77, struct.calcsize("i"))
+        (pidfd,) = struct.unpack("i", raw_pidfd)
+    except (OSError, struct.error) as exc:
+        raise RunnerError(
+            "live Codex system manager channel peer pidfd unavailable"
+        ) from exc
+    if pidfd < 0:
+        raise RunnerError("live Codex system manager channel peer pidfd invalid")
+    try:
+        with selectors.DefaultSelector() as monitor:
+            monitor.register(pidfd, selectors.EVENT_READ)
+            if monitor.select(timeout=0):
+                raise RunnerError("live Codex system manager channel peer exited")
+            peer_cgroup = _authenticated_procfs_cgroup(peer_pid)
+            if monitor.select(timeout=0):
+                raise RunnerError("live Codex system manager channel peer exited")
+            return peer_cgroup
+    except RunnerError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise RunnerError(
+            "live Codex system manager channel peer pidfd unavailable"
+        ) from exc
+    finally:
+        os.close(pidfd)
+
+
 def _attest_root_system_manager_channels() -> None:
     """Authenticate the accessible root-owned system bus before systemctl.
 
     The root systemd private socket is often mode 0700 and unavailable to
     DynamicUser. We must never connect to it from this unprivileged runner.
-    The accessible system bus socket must be root-owned and served by a
-    kernel-attested peer distinct from this DynamicUser. Valid distro system
-    buses may drop their UID/GID to a messagebus/dbus service account; the
-    root-owned socket inode and read-only mount boundary anchor the service,
-    not an assumption that its post-start peer credentials remain root.
-    A same-UID fake bus is rejected even if its systemctl output claims an
-    isolated service.
+    Authenticate the accessible root-owned system-bus inode and its
+    SO_PEERCRED peer. A nonroot dbus-daemon is allowed only if genuine kernel
+    procfs and an SO_PEERPIDFD-backed live process both bind it to a known
+    root systemd D-Bus unit; arbitrary nonroot peers and same-UID fakes are
+    rejected before systemctl is called.
     """
     channel = "/run/dbus/system_bus_socket"
     try:
@@ -888,24 +938,42 @@ def _attest_root_system_manager_channels() -> None:
                 socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
             )
             peer_pid, peer_uid, peer_gid = struct.unpack("3i", credentials)
-        after = os.lstat(channel)
+            after = os.lstat(channel)
+            if (
+                peer_pid <= 0
+                or peer_uid < 0
+                or peer_gid < 0
+                or (peer_uid == 0) != (peer_gid == 0)
+                or (
+                    peer_uid != 0
+                    and (peer_uid == os.geteuid() or peer_gid == os.getegid())
+                )
+                or (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_mode,
+                    before.st_uid,
+                )
+                != (after.st_dev, after.st_ino, after.st_mode, after.st_uid)
+            ):
+                raise RunnerError("live Codex system manager channel is untrusted")
+            if peer_uid != 0:
+                try:
+                    peer_cgroup = _authenticated_live_broker_cgroup(
+                        peer_socket, peer_pid
+                    )
+                except RunnerError as exc:
+                    raise RunnerError(
+                        "live Codex system manager channel is untrusted"
+                    ) from exc
+                if peer_cgroup not in {
+                    b"0::/system.slice/dbus.service\n",
+                    b"0::/system.slice/dbus-broker.service\n",
+                    b"0::/system.slice/dbus-daemon.service\n",
+                }:
+                    raise RunnerError("live Codex system manager channel is untrusted")
     except (OSError, struct.error) as exc:
         raise RunnerError("live Codex system manager channel unavailable") from exc
-    if (
-        peer_pid <= 0
-        or peer_uid < 0
-        or peer_gid < 0
-        or (peer_uid == 0) != (peer_gid == 0)
-        or (peer_uid != 0 and (peer_uid == os.geteuid() or peer_gid == os.getegid()))
-        or (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_uid,
-        )
-        != (after.st_dev, after.st_ino, after.st_mode, after.st_uid)
-    ):
-        raise RunnerError("live Codex system manager channel is untrusted")
 
 
 def _assert_root_owned_device_policy() -> None:

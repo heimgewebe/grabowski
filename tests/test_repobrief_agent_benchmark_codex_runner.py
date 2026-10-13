@@ -610,6 +610,11 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                 with (
                     patch.object(runner.os, "lstat", return_value=root_socket) as lstat,
                     patch.object(runner.socket, "socket") as socket_factory,
+                    patch.object(
+                        runner,
+                        "_authenticated_live_broker_cgroup",
+                        return_value=b"0::/system.slice/dbus-broker.service\n",
+                    ) as kernel_cgroup,
                 ):
                     connection = socket_factory.return_value.__enter__.return_value
                     connection.getsockopt.return_value = struct.pack("3i", *peer)
@@ -617,6 +622,10 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                         runner._attest_root_system_manager_channels()
                         self.assertEqual(socket_factory.call_count, 1)
                         self.assertEqual(lstat.call_count, 2)
+                        if peer[1] != 0:
+                            kernel_cgroup.assert_called_once_with(connection, peer[0])
+                        else:
+                            kernel_cgroup.assert_not_called()
                     else:
                         with self.assertRaisesRegex(
                             runner.RunnerError,
@@ -624,6 +633,128 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                         ):
                             runner._attest_root_system_manager_channels()
                         self.assertEqual(socket_factory.call_count, 1)
+
+    def test_nonroot_system_bus_requires_authenticated_dbus_unit_cgroup(self) -> None:
+        socket_file = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        for cgroup in (
+            b"0::/user.slice/user-1200.slice/user@1200.service\n",
+            b"0::/system.slice/unrelated.service\n",
+            b"0::/system.slice/dbus-broker.service/attacker.scope\n",
+            b"0::/system.slice/dbus.service\n1:cpu:/other\n",
+            b"",
+        ):
+            with self.subTest(cgroup=cgroup):
+                with (
+                    patch.object(runner.os, "lstat", return_value=socket_file),
+                    patch.object(runner.socket, "socket") as socket_factory,
+                    patch.object(
+                        runner,
+                        "_authenticated_live_broker_cgroup",
+                        return_value=cgroup,
+                    ) as read_cgroup,
+                ):
+                    peer_socket = socket_factory.return_value.__enter__.return_value
+                    peer_socket.getsockopt.return_value = struct.pack(
+                        "3i", 321, os.geteuid() + 200, os.getegid() + 200
+                    )
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "system manager channel"
+                    ):
+                        runner._attest_root_system_manager_channels()
+                    read_cgroup.assert_called_once_with(peer_socket, 321)
+
+    def test_authenticated_peer_cgroup_uses_genuine_kernel_procfs(self) -> None:
+        current_pid = os.getpid()
+        self.assertEqual(
+            runner._authenticated_procfs_cgroup(current_pid),
+            runner._authenticated_procfs_cgroup(),
+        )
+
+    def test_nonroot_system_bus_pidfd_binds_to_real_live_peer(self) -> None:
+        # This exercises the real kernel socket option, not a mocked PID.
+        connection, other = runner.socket.socketpair()
+        with connection, other:
+            try:
+                raw = connection.getsockopt(runner.socket.SOL_SOCKET, 77, 4)
+            except OSError as exc:
+                self.skipTest(f"Linux SO_PEERPIDFD is unavailable: {exc}")
+            os.close(struct.unpack("i", raw)[0])
+            self.assertEqual(
+                runner._authenticated_live_broker_cgroup(connection, os.getpid()),
+                runner._authenticated_procfs_cgroup(),
+            )
+
+    def test_nonroot_bus_rejects_forgery_even_with_allowed_cgroup_without_pidfd(
+        self,
+    ) -> None:
+        # Before SO_PEERPIDFD this fake broker would be admitted solely
+        # because its numeric PID appeared to belong to dbus.service.
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket),
+            patch.object(runner.socket, "socket") as socket_factory,
+            patch.object(
+                runner,
+                "_authenticated_procfs_cgroup",
+                return_value=b"0::/system.slice/dbus.service\n",
+            ) as cgroup,
+        ):
+            connection = socket_factory.return_value.__enter__.return_value
+            connection.getsockopt.side_effect = [
+                struct.pack("3i", 321, os.geteuid() + 200, os.getegid() + 200),
+                OSError("SO_PEERPIDFD unavailable"),
+            ]
+            with self.assertRaisesRegex(runner.RunnerError, "system manager channel"):
+                runner._attest_root_system_manager_channels()
+            self.assertEqual(connection.getsockopt.call_count, 2)
+            cgroup.assert_not_called()
+
+    def test_nonroot_system_bus_rejects_unavailable_peer_pidfd(self) -> None:
+        connection = mock.Mock()
+        connection.getsockopt.side_effect = OSError("SO_PEERPIDFD unsupported")
+        with patch.object(runner, "_authenticated_procfs_cgroup") as cgroup:
+            with self.assertRaisesRegex(runner.RunnerError, "peer pidfd unavailable"):
+                runner._authenticated_live_broker_cgroup(connection, 321)
+            cgroup.assert_not_called()
+
+    def test_nonroot_system_bus_rejects_exited_peer_before_cgroup_read(self) -> None:
+        read_fd, write_fd = os.pipe()
+        try:
+            os.close(write_fd)
+            connection = mock.Mock()
+            connection.getsockopt.return_value = struct.pack("i", os.dup(read_fd))
+            with patch.object(runner, "_authenticated_procfs_cgroup") as cgroup:
+                with self.assertRaisesRegex(runner.RunnerError, "peer exited"):
+                    runner._authenticated_live_broker_cgroup(connection, 321)
+                cgroup.assert_not_called()
+        finally:
+            os.close(read_fd)
+
+    def test_nonroot_system_bus_rejects_exit_during_cgroup_read(self) -> None:
+        # An old PID may be recycled after the broker exits. Even an otherwise
+        # allowed cgroup must be rejected when the original peer is gone.
+        read_fd, write_fd = os.pipe()
+        try:
+            connection = mock.Mock()
+            connection.getsockopt.return_value = struct.pack("i", os.dup(read_fd))
+
+            def peer_exits(_pid: int) -> bytes:
+                os.write(write_fd, b"x")
+                return b"0::/system.slice/dbus.service\n"
+
+            with patch.object(
+                runner, "_authenticated_procfs_cgroup", side_effect=peer_exits
+            ) as cgroup:
+                with self.assertRaisesRegex(runner.RunnerError, "peer exited"):
+                    runner._authenticated_live_broker_cgroup(connection, 321)
+                cgroup.assert_called_once_with(321)
+        finally:
+            os.close(write_fd)
+            os.close(read_fd)
 
     def test_root_only_private_socket_allows_verified_system_bus(self) -> None:
         # A DynamicUser cannot connect to PID 1's root-only private socket.
