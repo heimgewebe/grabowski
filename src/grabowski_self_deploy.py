@@ -63,7 +63,10 @@ CANONICAL_REPOSITORY = Path.home() / "repos/grabowski"
 AUTO_DEPLOY_SOURCE_ROOT = Path.home() / "repos" / ".grabowski-deploy-worktrees"
 AUTO_DEPLOY_SOURCE_PREFIX = "auto-current-main"
 AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS = 7_200
-ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS = 300
+# Object import and protected-main ref refresh perform multiple separately
+# bounded Git and public-main probes under the same path/ODB leases. Five
+# minutes can expire before the fetch and post-fetch readback finish.
+ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS = 1_800
 ORIGIN_MAIN_REFRESH_OPERATION = "runtime-deploy-origin-main-refresh"
 CANONICAL_OPERATOR_MODULE = "grabowski_operator"
 PUBLIC_GITHUB_REPOSITORY_URL = "https://github.com/heimgewebe/grabowski.git"
@@ -3194,16 +3197,22 @@ def _fetch_exact_release_admission_target(
             "status": "outcome_unknown",
             "effect_may_have_started": True,
         }
-        result = _mutating_git_result(
-            canonical,
-            "fetch",
-            "--no-auto-maintenance",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--no-recurse-submodules",
-            PUBLIC_GITHUB_REPOSITORY_URL,
-            PUBLIC_GITHUB_MAIN_REF,
-        )
+        try:
+            result = _mutating_git_result(
+                canonical,
+                "fetch",
+                "--no-auto-maintenance",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--no-recurse-submodules",
+                PUBLIC_GITHUB_REPOSITORY_URL,
+                PUBLIC_GITHUB_MAIN_REF,
+            )
+        except DeploySchedulePreEffectRefusal:
+            # The exact operator preflight failed before Git process launch.
+            # Do not misclassify a proven no-effect as an uncertain fetch.
+            local_mutation_tracker.pop("admission_target_fetch", None)
+            raise
         if (
             type(result.get("returncode")) is not int
             or result["returncode"] != 0
@@ -5704,10 +5713,23 @@ def _grabowski_runtime_deploy_schedule_impl(
             raise
     with _deploy_schedule_lock():
         if admission_snapshot is not None:
-            _fetch_exact_release_admission_target(
-                expected_head, admission_snapshot,
-                local_mutation_tracker=local_mutation_tracker,
-            )
+            locked_snapshot = _canonical_main_refresh_candidate(expected_head)
+            if (
+                _canonical_main_refresh_state(locked_snapshot)
+                != _canonical_main_refresh_state(admission_snapshot)
+            ):
+                raise DeploySchedulePreEffectRefusal(
+                    "release admission object import canonical identity drifted under lock"
+                )
+            if locked_snapshot.get("target_object_present") is False:
+                _fetch_exact_release_admission_target(
+                    expected_head, admission_snapshot,
+                    local_mutation_tracker=local_mutation_tracker,
+                )
+            elif locked_snapshot.get("target_object_present") is not True:
+                raise DeploySchedulePreEffectRefusal(
+                    "release admission object import target presence is unproved"
+                )
         # Mandatory re-admission under the lock even when an earlier read
         # succeeded. No index, Git-ref, Rootbroker, or dispatch effect precedes it.
         _require_release_source_admission(expected_head)

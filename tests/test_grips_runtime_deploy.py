@@ -318,6 +318,92 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
 
 
 
+    def test_target_imported_by_lock_winner_reuses_object_before_readmission(self) -> None:
+        deploy = real_deploy
+        expected = "b" * 40
+        initial = {
+            "canonical_repository": str(deploy.CANONICAL_REPOSITORY),
+            "current_head": "a" * 40,
+            "current_branch": "main",
+            "target_head": expected,
+            "origin_main": "c" * 40,
+            "clean": True,
+            "shallow": False,
+            "target_object_present": False,
+        }
+        reobserved = {**initial, "target_object_present": True}
+        events: list[str] = []
+
+        def admission(head: str) -> dict:
+            self.assertEqual(expected, head)
+            events.append("admission")
+            if events.count("admission") == 1:
+                raise deploy.DeploySchedulePreEffectRefusal(
+                    "release admission blocked: source ancestry is unproved"
+                )
+            return {"status": "non-runtime-documentation"}
+
+        def stop_before_effect(head: str) -> str:
+            self.assertEqual(expected, head)
+            events.append("public-main")
+            raise RuntimeError("stop before any effect")
+
+        with (
+            patch.object(deploy, "_require_release_source_admission", side_effect=admission),
+            patch.object(deploy, "_canonical_main_refresh_candidate",
+                         side_effect=[initial, reobserved]) as candidate,
+            patch.object(deploy, "_deploy_schedule_lock", return_value=nullcontext()),
+            patch.object(deploy, "_fetch_exact_release_admission_target") as fetch,
+            patch.object(deploy, "_fresh_public_github_main", side_effect=stop_before_effect),
+            patch.object(deploy, "inflight_runtime_job_evidence") as inflight,
+            patch.object(deploy.privileged, "ensure_rootbroker_authority") as rootbroker,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop before any effect"):
+                deploy._grabowski_runtime_deploy_schedule_impl(
+                    expected, local_mutation_tracker={}
+                )
+        self.assertEqual(["admission", "admission", "public-main"], events)
+        self.assertEqual(2, candidate.call_count)
+        fetch.assert_not_called()
+        inflight.assert_not_called()
+        rootbroker.assert_not_called()
+
+    def test_target_imported_by_lock_winner_does_not_hide_ref_drift(self) -> None:
+        deploy = real_deploy
+        expected = "b" * 40
+        initial = {
+            "canonical_repository": str(deploy.CANONICAL_REPOSITORY),
+            "current_head": "a" * 40,
+            "current_branch": "main",
+            "target_head": expected,
+            "origin_main": "c" * 40,
+            "clean": True,
+            "shallow": False,
+            "target_object_present": False,
+        }
+        drifted = {**initial, "origin_main": "d" * 40,
+                   "target_object_present": True}
+        with (
+            patch.object(deploy, "_require_release_source_admission",
+                         side_effect=deploy.DeploySchedulePreEffectRefusal(
+                             "release admission blocked: source ancestry is unproved"
+                         )) as admission,
+            patch.object(deploy, "_canonical_main_refresh_candidate",
+                         side_effect=[initial, drifted]),
+            patch.object(deploy, "_deploy_schedule_lock", return_value=nullcontext()),
+            patch.object(deploy, "_fetch_exact_release_admission_target") as fetch,
+            patch.object(deploy, "_fresh_public_github_main") as public,
+            patch.object(deploy.privileged, "ensure_rootbroker_authority") as rootbroker,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "drift"):
+                deploy._grabowski_runtime_deploy_schedule_impl(
+                    expected, local_mutation_tracker={}
+                )
+        admission.assert_called_once_with(expected)
+        fetch.assert_not_called()
+        public.assert_not_called()
+        rootbroker.assert_not_called()
+
     def test_missing_object_is_only_allowed_fetch_exception(self) -> None:
         deploy = real_deploy
         target = "b" * 40
@@ -352,6 +438,56 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             schedule_lock.assert_not_called()
             fetch.assert_not_called()
             broker.assert_not_called()
+
+    def test_object_import_acquisition_uses_budgeted_ttl_under_exact_scopes(self) -> None:
+        deploy = real_deploy
+        repo = Path("/fixture/canonical")
+        keys = (
+            "operation_key", "canonical_key", "common_dir_key",
+            "objects_key", "origin_main_ref_key",
+        )
+        plan = {
+            "canonical_repository": repo,
+            "owner_id": "fixture:release-import",
+            **{key: f"fixture:{key}" for key in keys},
+        }
+        resources = types.ModuleType("grabowski_resources")
+        resources.operation_scope_contract = Mock(return_value={"scope": "locked"})
+        resources.acquire_resources = Mock(return_value={"leases": []})
+        resources.ResourceConflict = type("ResourceConflict", (RuntimeError,), {})
+        with patch.dict(sys.modules, {"grabowski_resources": resources}):
+            receipt = deploy._acquire_origin_main_refresh_resources(plan, "b" * 40)
+        self.assertEqual({"leases": []}, receipt)
+        resources.operation_scope_contract.assert_called_once()
+        resources.acquire_resources.assert_called_once()
+        args, kwargs = resources.acquire_resources.call_args
+        self.assertEqual(plan["owner_id"], args[0])
+        self.assertEqual([plan[k] for k in keys], args[1])
+        self.assertEqual(
+            deploy.ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS,
+            kwargs["ttl_seconds"],
+        )
+        self.assertEqual({"scope": "locked"}, kwargs["metadata"]["operation_scope"])
+
+    def test_object_import_lease_ttl_covers_bounded_slow_git_reads(self) -> None:
+        # Prior fixed five-minute leases could lapse while independent bounded
+        # Git reads, public-main checks and the actual fetch were still active.
+        # This includes a margin for the shared ref-refresh path and cleanup.
+        deploy = real_deploy
+        worst_case_read_budget = 14 * 30
+        github_budget = 2 * deploy.PUBLIC_GITHUB_LOOKUP_TIMEOUT_SECONDS
+        fetch_budget = 60
+        coordination_and_finalization_budget = 300
+        lower_bound = (
+            worst_case_read_budget
+            + github_budget
+            + fetch_budget
+            + coordination_and_finalization_budget
+        )
+        self.assertGreaterEqual(
+            deploy.ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS,
+            lower_bound,
+        )
 
     def test_exact_target_fetch_preserves_refs_and_oid_format(self) -> None:
         deploy = real_deploy
@@ -549,6 +685,68 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         plan.assert_not_called()
 
 
+
+    def test_pre_effect_git_refusal_does_not_forge_fetch_uncertainty(self) -> None:
+        """No-process preflight denial must not become evidence of a Git effect."""
+        deploy = real_deploy
+        expected = "b" * 40
+        repo = Path("/fixture/canonical")
+        snapshot = {
+            "canonical_repository": str(repo),
+            "current_head": "a" * 40,
+            "current_branch": "main",
+            "target_head": expected,
+            "origin_main": "c" * 40,
+            "clean": True,
+            "shallow": False,
+            "target_object_present": False,
+        }
+        names = ("operation_key", "canonical_key", "common_dir_key",
+                 "objects_key", "origin_main_ref_key")
+        plan = {"canonical_repository": repo, "owner_id": "fixture:preflight",
+                **{name: name for name in names}}
+        leases = [{"resource_key": name} for name in names]
+        for error, effect_may_have_started in (
+            (deploy.DeploySchedulePreEffectRefusal("operator preflight denied"), False),
+            (RuntimeError("unknown git dispatch failure"), True),
+        ):
+            tracker: dict = {}
+            with (
+                self.subTest(error=type(error).__name__),
+                patch.object(deploy, "_origin_main_refresh_plan", return_value=plan),
+                patch.object(deploy, "_acquire_origin_main_refresh_resources",
+                             return_value={"leases": leases}),
+                patch.object(deploy, "_lease_for_key",
+                             side_effect=lambda _acq, key: {"resource_key": key}),
+                patch.object(deploy, "_require_origin_main_refresh_checkout_certainty"),
+                patch.object(deploy, "_canonical_main_refresh_candidate",
+                             return_value=snapshot),
+                patch.object(deploy, "_git_result",
+                             return_value=self._git_success("sha1")),
+                patch.object(deploy, "_fresh_public_github_main",
+                             return_value=expected),
+                patch.object(deploy, "_append_deploy_audit") as audit,
+                patch.object(deploy, "_mutating_git_result",
+                             side_effect=error) as git_mutate,
+                patch.object(deploy, "_release_origin_main_refresh_resources",
+                             return_value={"released": leases}) as release,
+                patch.object(deploy.privileged, "ensure_rootbroker_authority") as rootbroker,
+            ):
+                with self.assertRaisesRegex(type(error), str(error)):
+                    deploy._fetch_exact_release_admission_target(
+                        expected, snapshot, local_mutation_tracker=tracker,
+                    )
+            self.assertEqual(
+                "admission_target_fetch" in tracker, effect_may_have_started
+            )
+            if effect_may_have_started:
+                self.assertEqual(
+                    "outcome_unknown", tracker["admission_target_fetch"]["status"]
+                )
+            git_mutate.assert_called_once()
+            audit.assert_called_once()
+            release.assert_called_once()
+            rootbroker.assert_not_called()
 
     def test_object_fetch_failure_is_ambiguity_not_release_success(self) -> None:
         deploy = real_deploy
