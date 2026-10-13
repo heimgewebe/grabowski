@@ -6671,6 +6671,74 @@ def _start_role_task(manifest: dict[str, Any], role: str, snapshot: dict[str, An
         ),
     )
     cwd = str(manifest["writer_worktree"])
+    # A module name or an in-memory manifest is not evidence that a
+    # framework role is authorized. The collect lock journals its exact
+    # start intent before this call. Re-read it immediately before dispatch.
+    persisted = _manifest(str(manifest["workspace_id"]))
+    persisted_role = persisted.get("roles", {}).get(role)
+    persisted_tasks = persisted.get("tasks")
+    if (
+        persisted.get("creation_state") != "ready"
+        or persisted.get("close_receipt") is not None
+        or not isinstance(persisted_role, dict)
+        or persisted_role.get("access") != "read_only"
+        or persisted_role.get("merge_authority") is not False
+        or not isinstance(persisted_tasks, dict)
+        or persisted_tasks.get(role) is not None
+        or persisted.get("writer_worktree") != cwd
+        or persisted.get("expected_base_head") != manifest.get("expected_base_head")
+    ):
+        raise AgentWorkspaceError("role start intent has no current workspace authority")
+    current_frozen = persisted.get("frozen_writer")
+    if (
+        not isinstance(current_frozen, dict)
+        or type(snapshot.get("dirty")) is not bool
+        or any(
+            current_frozen.get(name) != snapshot.get(name)
+            for name in ("writer_head", "diff_sha256", "dirty")
+        )
+    ):
+        raise AgentWorkspaceError("role start intent has a stale frozen snapshot")
+    output = _role_receipt_path(
+        persisted, role, attempt=_role_final_attempt(persisted, role)
+    )
+    if os.path.lexists(output):
+        raise AgentWorkspaceError("role receipt destination already exists")
+    persisted_argv = _role_task_argv(
+        persisted, role,
+        str(snapshot["writer_head"]), str(snapshot["diff_sha256"]),
+        snapshot["dirty"], output_path=output,
+    )
+    if persisted_argv != argv:
+        raise AgentWorkspaceError("role start intent command or output has drifted")
+    intents = persisted.get("task_start_intents")
+    local_intents = manifest.get("task_start_intents")
+    pending = intents.get(role) if isinstance(intents, dict) else None
+    local_pending = (
+        local_intents.get(role) if isinstance(local_intents, dict) else None
+    )
+    expected_intent = {
+        "role": role,
+        "writer_head": snapshot["writer_head"],
+        "diff_sha256": snapshot["diff_sha256"],
+        "dirty": snapshot["dirty"],
+        "command_sha256": _sha256_json(persisted["commands"][role]),
+        "task_argv_sha256": _task_argv_sha256(argv),
+        "task_host": host,
+        "task_cwd": cwd,
+    }
+    if (
+        not isinstance(pending, dict)
+        or pending != local_pending
+        or set(pending) != {*expected_intent, "created_at", "nonce"}
+        or any(pending.get(key) != value for key, value in expected_intent.items())
+        or not isinstance(pending.get("created_at"), str)
+        or not pending["created_at"]
+        or not isinstance(pending.get("nonce"), str)
+        or re.fullmatch(r"[0-9a-f]{24}", pending["nonce"]) is None
+    ):
+        raise AgentWorkspaceError("role start intent is missing or differs from its persisted authority")
+    _require_live_lane_binding(persisted, _run)
     task = tasks.grabowski_task_start(
         host=host,
         argv=argv,

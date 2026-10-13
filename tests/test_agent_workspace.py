@@ -5556,6 +5556,90 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(retry["reconcile_required"])
         retry_start.assert_not_called()
 
+    def test_read_only_role_start_requires_current_persisted_intent(self) -> None:
+        """Never dispatch a wrapper based on an unbound or drifted role label."""
+        manifest = self.manifest()
+        role_name = "tests"
+        snapshot = {
+            "writer_head": self.git.base,
+            "diff_sha256": "a" * 64,
+            "dirty": False,
+        }
+        manifest["frozen_writer"] = dict(snapshot)
+        argv = workspace._role_task_argv(
+            manifest, role_name,
+            snapshot["writer_head"], snapshot["diff_sha256"],
+            snapshot["dirty"],
+            output_path=workspace._role_receipt_path(manifest, role_name),
+        )
+        intent = {
+            "role": role_name,
+            "created_at": workspace._utc(),
+            "nonce": "c" * 24,
+            "writer_head": snapshot["writer_head"],
+            "diff_sha256": snapshot["diff_sha256"],
+            "dirty": False,
+            "command_sha256": workspace._sha256_json(manifest["commands"][role_name]),
+            "task_argv_sha256": workspace._task_argv_sha256(argv),
+            "task_host": workspace.AGENT_WORKSPACE_TASK_HOST,
+            "task_cwd": str(self.git.writer),
+        }
+        task_public = {
+            "task_id": "scoped-role-test",
+            "host": workspace.AGENT_WORKSPACE_TASK_HOST,
+            "argv_sha256": workspace._task_argv_sha256(argv),
+            "cwd": str(self.git.writer),
+            "attempt": 1,
+            "resume_policy": "never",
+        }
+
+        def expect_denied() -> None:
+            with mock.patch.object(
+                workspace.tasks, "grabowski_task_start",
+                return_value={"task": task_public},
+            ) as dispatch:
+                with self.assertRaisesRegex(
+                    workspace.AgentWorkspaceError, "role start intent|role receipt",
+                ):
+                    workspace._start_role_task(manifest, role_name, snapshot)
+                dispatch.assert_not_called()
+
+        expect_denied()  # No intent, even though argv looks like a valid wrapper.
+        manifest["task_start_intents"][role_name] = intent
+        workspace._write_manifest(manifest)
+        with mock.patch.object(
+            workspace.tasks, "grabowski_task_start",
+            return_value={"task": task_public},
+        ) as dispatch:
+            self.assertEqual(
+                workspace._start_role_task(manifest, role_name, snapshot),
+                task_public,
+            )
+        dispatch.assert_called_once()
+
+        for key, value in (
+            ("role", "review"),
+            ("nonce", "invalid"),
+            ("writer_head", "b" * 40),
+            ("diff_sha256", "b" * 64),
+            ("dirty", True),
+            ("task_argv_sha256", "b" * 64),
+            ("task_host", "untrusted-remote"),
+            ("task_cwd", str(self.git.repo)),
+        ):
+            with self.subTest(tampered=key):
+                altered = dict(manifest)
+                altered["task_start_intents"] = {
+                    role_name: {**intent, key: value}
+                }
+                workspace._write_manifest(altered)
+                expect_denied()
+
+        workspace._write_manifest(manifest)
+        receipt = workspace._role_receipt_path(manifest, role_name)
+        receipt.write_text("already published", encoding="utf-8")
+        expect_denied()
+
     def test_started_task_must_echo_host_argv_and_cwd_binding(self) -> None:
         argv = ["/usr/bin/true"]
         valid = {
