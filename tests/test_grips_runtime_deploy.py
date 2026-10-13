@@ -620,6 +620,72 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         admission.assert_called_once_with("b" * 40)
 
 
+
+    def test_captain_missing_exact_public_target_defers_only_object_import(self) -> None:
+        """Captain may schedule protected import, never claim an independent R3."""
+        deploy = real_deploy
+        expected = "b" * 40
+        snapshot = {
+            "canonical_repository": str(deploy.CANONICAL_REPOSITORY),
+            "target_head": expected,
+            "target_object_present": False,
+        }
+        denial = deploy.DeploySchedulePreEffectRefusal(
+            "release admission blocked: source ancestry is unproved"
+        )
+        with (
+            patch.object(deploy, "_require_release_source_admission", side_effect=denial) as admit,
+            patch.object(deploy, "_canonical_main_refresh_candidate", return_value=snapshot) as candidate,
+            patch.object(deploy, "_fresh_public_github_main", return_value=expected) as public,
+            patch.object(deploy, "_fetch_exact_release_admission_target") as fetch,
+            patch.object(deploy.privileged, "ensure_rootbroker_authority") as rootbroker,
+        ):
+            gate = grips._captain_independent_review_gate(
+                {"expected_head": expected}, [{"action": "runtime-deploy"}],
+            )
+        self.assertEqual("pass", gate["status"])
+        self.assertIsNone(gate["details"]["required"])
+        self.assertIs(gate["details"]["protected_import_pending"], True)
+        self.assertIs(gate["details"]["release_authorized"], False)
+        self.assertIs(gate["details"]["full_readmission_required"], True)
+        admit.assert_called_once_with(expected)
+        candidate.assert_called_once_with(expected)
+        public.assert_called_once_with(expected)
+        fetch.assert_not_called()
+        rootbroker.assert_not_called()
+
+    def test_captain_missing_target_deferred_path_fails_closed_on_any_drift(self) -> None:
+        deploy = real_deploy
+        expected = "b" * 40
+        good = {
+            "canonical_repository": str(deploy.CANONICAL_REPOSITORY),
+            "target_head": expected,
+            "target_object_present": False,
+        }
+        denial = deploy.DeploySchedulePreEffectRefusal(
+            "release admission blocked: source ancestry is unproved"
+        )
+        for snapshot, remote in (
+            ({**good, "target_object_present": True}, expected),
+            ({**good, "target_head": "c" * 40}, expected),
+            ({**good, "canonical_repository": "/tmp/untrusted"}, expected),
+            ({"target_object_present": False}, expected),
+            (None, expected),
+            (good, "c" * 40),
+        ):
+            with (
+                self.subTest(snapshot=snapshot, remote=remote),
+                patch.object(deploy, "_require_release_source_admission", side_effect=denial),
+                patch.object(deploy, "_canonical_main_refresh_candidate", return_value=snapshot),
+                patch.object(deploy, "_fresh_public_github_main", return_value=remote),
+                patch.object(deploy, "_fetch_exact_release_admission_target") as fetch,
+            ):
+                gate = grips._captain_independent_review_gate(
+                    {"expected_head": expected}, [{"action": "runtime-deploy"}],
+                )
+            self.assertEqual("blocked", gate["status"])
+            fetch.assert_not_called()
+
     def test_source_diff_without_explicit_transport_completeness_blocks(self) -> None:
         deploy = real_deploy
         observed = self._git_success("docs/guide.md\x00")

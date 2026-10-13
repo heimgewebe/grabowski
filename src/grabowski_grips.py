@@ -13804,9 +13804,51 @@ def _captain_independent_review_gate(
                 ["runtime_deploy_admission_target_count_invalid"],
             )
         try:
-            from grabowski_self_deploy import _require_release_source_admission
+            import grabowski_self_deploy as release_deploy
 
-            release = _require_release_source_admission(parameters.get("expected_head"))
+            expected_head = parameters.get("expected_head")
+            try:
+                release = release_deploy._require_release_source_admission(expected_head)
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                # The local ODB can lag behind authenticated public main. The
+                # scheduler's bounded lease-protected object import is the only
+                # allowed continuation; no source-changing release is admitted
+                # here, and the scheduler must redo the *whole* policy before
+                # any Rootbroker or dispatch effect.
+                if (
+                    type(exc) is not getattr(
+                        release_deploy, "DeploySchedulePreEffectRefusal", None
+                    )
+                    or str(exc) != "release admission blocked: source ancestry is unproved"
+                ):
+                    raise
+                if not _is_hex_sha(expected_head, lengths=(40, 64)):
+                    raise
+                snapshot = release_deploy._canonical_main_refresh_candidate(expected_head)
+                if (
+                    not isinstance(snapshot, dict)
+                    or snapshot.get("canonical_repository") != str(release_deploy.CANONICAL_REPOSITORY)
+                    or snapshot.get("target_head") != expected_head
+                    or snapshot.get("target_object_present") is not False
+                    or release_deploy._fresh_public_github_main(expected_head) != expected_head
+                ):
+                    raise release_deploy.DeploySchedulePreEffectRefusal(
+                        "release admission object import preflight identity drift"
+                    ) from exc
+                return _captain_gate(
+                    "independent-review-policy",
+                    "pass",
+                    "only a protected exact Git object import may proceed; "
+                    "critical release R3/CI admission is not yet established",
+                    {
+                        "required": None,
+                        "protected_import_pending": True,
+                        "release_authorized": False,
+                        "full_readmission_required": True,
+                        "release_source_status": "exact-public-main-object-pending",
+                        "target_head": expected_head,
+                    },
+                )
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             return _captain_gate(
                 "independent-review-policy",
