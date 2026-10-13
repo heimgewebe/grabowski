@@ -832,6 +832,104 @@ def _authenticated_procfs_evidence() -> tuple[bytes, bytes]:
             os.close(descriptor)
 
 
+def _authenticated_procfs_cgroup() -> bytes:
+    """Read this process's cgroup from genuine, same-mount kernel procfs FDs."""
+    descriptors: list[int] = []
+    try:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        proc = os.open("/proc", directory_flags | os.O_NOFOLLOW)
+        descriptors.append(proc)
+        self_dir = os.open("self", directory_flags, dir_fd=proc)
+        descriptors.append(self_dir)
+        cgroup = os.open("cgroup", file_flags, dir_fd=self_dir)
+        descriptors.append(cgroup)
+        if len({_kernel_procfs_mount_id(fd) for fd in descriptors}) != 1:
+            raise RunnerError("live Codex device isolation procfs identity differs")
+        if not stat.S_ISREG(os.fstat(cgroup).st_mode):
+            raise RunnerError("live Codex device isolation procfs cgroup is unsafe")
+        data = os.read(cgroup, 8193)
+        if not data or len(data) > 8192:
+            raise RunnerError("live Codex device isolation cgroup evidence is unsafe")
+        return data
+    except OSError as exc:
+        raise RunnerError(
+            "live Codex device isolation cgroup evidence unavailable"
+        ) from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _assert_root_owned_device_policy() -> None:
+    """Bind raw-device denial to the kernel process cgroup and root systemd.
+
+    Read-only mounts and a clean /dev pathname alone do not deny opening a
+    raw block device via an unrelated mount.  Require a root-system-manager
+    unit whose kernel-bound cgroup is active, whose /dev is private, and whose
+    device cgroup has no extra DeviceAllow entries.  Missing/inconsistent
+    policy is a dispatch denial, never a soft warning.
+    """
+    try:
+        cgroup_data = _authenticated_procfs_cgroup().decode("ascii")
+    except (UnicodeError, OSError) as exc:
+        raise RunnerError("live Codex device isolation cgroup unavailable") from exc
+    match = re.fullmatch(
+        r"0::(/system\.slice/(grabowski-rab-[A-Za-z0-9_.@-]{1,100}\.service))\n?",
+        cgroup_data,
+    )
+    if match is None:
+        raise RunnerError("live Codex device isolation lacks root-owned system unit")
+    cgroup, unit = match.groups()
+    required = {
+        "ActiveState": "active",
+        "LoadState": "loaded",
+        "ControlGroup": cgroup,
+        "PrivateDevices": "yes",
+        "DevicePolicy": "closed",
+        "DeviceAllow": "",
+        "Delegate": "no",
+    }
+    argv = [
+        "/usr/bin/systemctl",
+        "--system",
+        "show",
+        unit,
+        "--no-pager",
+        *(f"--property={name}" for name in sorted(required)),
+    ]
+    try:
+        completed = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=5,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RunnerError(
+            "live Codex device isolation system manager unavailable"
+        ) from exc
+    if (
+        completed.returncode != 0
+        or not isinstance(completed.stdout, str)
+        or len(completed.stdout) > 16384
+    ):
+        raise RunnerError("live Codex device isolation system manager readback failed")
+    actual: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key not in required or key in actual:
+            raise RunnerError(
+                "live Codex device isolation system manager evidence invalid"
+            )
+        actual[key] = value
+    if actual != required:
+        raise RunnerError("live Codex device isolation system device policy unsafe")
+
+
 def validate_live_immutable_mounts(
     *,
     source: Path,
@@ -1343,6 +1441,7 @@ def validate_live_immutable_mounts(
             )
     if observed_writable_outputs != allowed_outputs:
         raise RunnerError("live Codex private writable output mounts are missing")
+    _assert_root_owned_device_policy()
 
 
 def provider_env(

@@ -503,6 +503,106 @@ def treatment_tools() -> list[dict]:
     ]
 
 
+class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
+    """A user-owned runner must not infer root device isolation from mountinfo."""
+
+    CGROUP = b"0::/system.slice/grabowski-rab-benchmark.service\n"
+    UNIT = "grabowski-rab-benchmark.service"
+    PROPERTIES = {
+        "ActiveState": "active",
+        "LoadState": "loaded",
+        "ControlGroup": "/system.slice/grabowski-rab-benchmark.service",
+        "PrivateDevices": "yes",
+        "DevicePolicy": "closed",
+        "DeviceAllow": "",
+        "Delegate": "no",
+    }
+
+    def _probe(
+        self,
+        *,
+        cgroup: bytes = CGROUP,
+        properties: dict[str, str] | None = None,
+        returncode: int = 0,
+        extra_output: str = "",
+    ) -> None:
+        state = self.PROPERTIES if properties is None else properties
+        output = (
+            "".join(f"{key}={value}\n" for key, value in state.items()) + extra_output
+        )
+        completion = subprocess.CompletedProcess(
+            args=["/usr/bin/systemctl"],
+            returncode=returncode,
+            stdout=output,
+            stderr="",
+        )
+        with (
+            patch.object(runner, "_authenticated_procfs_cgroup", return_value=cgroup),
+            patch.object(runner.subprocess, "run", return_value=completion) as run,
+        ):
+            runner._assert_root_owned_device_policy()
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], ["/usr/bin/systemctl", "--system", "show"])
+        self.assertIn(self.UNIT, command)
+
+    def test_exact_root_owned_systemd_device_policy_is_accepted(self) -> None:
+        self._probe()
+
+    def test_user_scope_and_relative_cgroup_cannot_claim_root_policy(self) -> None:
+        for cgroup in (
+            b"0::/user.slice/user-1000.slice/user@1000.service\n",
+            b"0::/system.slice/other.service\n",
+            b"0::/system.slice/../grabowski-rab-benchmark.service\n",
+            b"0::/system.slice/grabowski-rab-benchmark.service/../other\n",
+            b"0::/system.slice/grabowski-rab-benchmark.service\n1:cpu:/foo\n",
+            b"",
+        ):
+            with self.subTest(cgroup=cgroup):
+                with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+                    self._probe(cgroup=cgroup)
+
+    def test_device_policy_settings_fail_closed(self) -> None:
+        failures = (
+            ("PrivateDevices", "no"),
+            ("DevicePolicy", "auto"),
+            ("DevicePolicy", "strict"),
+            ("DeviceAllow", "/dev/sda rwm"),
+            ("Delegate", "yes"),
+            ("ControlGroup", "/system.slice/other.service"),
+            ("ActiveState", "inactive"),
+            ("LoadState", "not-found"),
+        )
+        for key, value in failures:
+            with self.subTest(key=key, value=value):
+                changed = dict(self.PROPERTIES)
+                changed[key] = value
+                with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+                    self._probe(properties=changed)
+
+    def test_missing_or_duplicate_device_properties_are_rejected(self) -> None:
+        without = dict(self.PROPERTIES)
+        del without["DeviceAllow"]
+        with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+            self._probe(properties=without)
+
+    def test_failed_root_system_manager_readback_is_rejected(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+            self._probe(returncode=1)
+
+    def test_duplicate_device_policy_is_rejected(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+            self._probe(extra_output="DevicePolicy=closed\n")
+
+    def test_kernel_cgroup_reader_rejects_procfs_file_alias(self) -> None:
+        with patch.object(runner, "_kernel_procfs_mount_id", side_effect=(11, 11, 12)):
+            with self.assertRaisesRegex(runner.RunnerError, "procfs identity"):
+                runner._authenticated_procfs_cgroup()
+
+    def test_kernel_cgroup_evidence_uses_real_procfs(self) -> None:
+        data = runner._authenticated_procfs_cgroup()
+        self.assertIn(b":", data)
+
+
 class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
     """The same mount namespace must reject nested writable source binds."""
 
@@ -536,6 +636,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         ambient_capabilities: int = 0,
         protected_hardlink: bool = False,
         private_output_special: tuple[str, str] | None = None,
+        device_policy_denied: bool = False,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -863,6 +964,15 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 patch.object(runner.os, "geteuid", return_value=actual_uid),
                 patch.object(runner.os, "statvfs", side_effect=statvfs),
                 patch.object(runner.os.path, "samefile", side_effect=samefile),
+                patch.object(
+                    runner,
+                    "_assert_root_owned_device_policy",
+                    side_effect=(
+                        runner.RunnerError("live Codex device isolation missing")
+                        if device_policy_denied
+                        else None
+                    ),
+                ),
             ):
                 runner.validate_live_immutable_mounts(
                     source=source,
@@ -875,6 +985,10 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                     evidence_root=leaves["evidence"],
                     report_root=leaves["reports"],
                 )
+
+    def test_root_owned_device_policy_is_mandatory_for_mount_admission(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+            self._probe(device_policy_denied=True)
 
     def test_only_four_private_output_mounts_are_admissible(self) -> None:
         self._probe()
