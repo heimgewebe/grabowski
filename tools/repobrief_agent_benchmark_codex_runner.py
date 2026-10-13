@@ -878,7 +878,7 @@ def _authenticated_procfs_cgroup(pid: int | None = None) -> bytes:
 def _authenticated_live_broker_cgroup(
     peer_socket: socket.socket, peer_pid: int
 ) -> bytes:
-    """Kernel-bind a nonroot D-Bus socket peer to its observed cgroup.
+    """Kernel-bind every D-Bus socket peer, including UID-0, to its cgroup.
 
     Linux SO_PEERPIDFD (77, from asm-generic/socket.h) yields the pidfd
     of the *connected socket peer*. os.pidfd_open(peer_pid) is insufficient:
@@ -921,10 +921,10 @@ def _attest_root_system_manager_channels() -> None:
     The root systemd private socket is often mode 0700 and unavailable to
     DynamicUser. We must never connect to it from this unprivileged runner.
     Authenticate the accessible root-owned system-bus inode and its
-    SO_PEERCRED peer. A nonroot dbus-daemon is allowed only if genuine kernel
-    procfs and an SO_PEERPIDFD-backed live process both bind it to a known
-    root systemd D-Bus unit; arbitrary nonroot peers and same-UID fakes are
-    rejected before systemctl is called.
+    SO_PEERCRED peer. Every peer, including UID-0, requires genuine procfs
+    and an SO_PEERPIDFD-backed live process. Root PID 1 must belong to
+    /init.scope; any other peer must belong to an exact system D-Bus unit.
+    Arbitrary root or nonroot broker impostors fail before systemctl is called.
     """
     channel = "/run/dbus/system_bus_socket"
     try:
@@ -957,21 +957,27 @@ def _attest_root_system_manager_channels() -> None:
                 != (after.st_dev, after.st_ino, after.st_mode, after.st_uid)
             ):
                 raise RunnerError("live Codex system manager channel is untrusted")
-            if peer_uid != 0:
-                try:
-                    peer_cgroup = _authenticated_live_broker_cgroup(
-                        peer_socket, peer_pid
-                    )
-                except RunnerError as exc:
-                    raise RunnerError(
-                        "live Codex system manager channel is untrusted"
-                    ) from exc
-                if peer_cgroup not in {
+            # A root-owned socket can still be served by an arbitrary UID-0
+            # process. Bind *every* peer to its live pidfd and kernel cgroup,
+            # including root peers, before trusting any systemd property.
+            try:
+                peer_cgroup = _authenticated_live_broker_cgroup(peer_socket, peer_pid)
+            except RunnerError as exc:
+                raise RunnerError(
+                    "live Codex system manager channel is untrusted"
+                ) from exc
+            if peer_uid == 0 and peer_pid == 1:
+                # On the target host the genuine root system manager is PID 1
+                # under init.scope. An unrelated root process cannot qualify.
+                trusted_cgroups = {b"0::/init.scope\n"}
+            else:
+                trusted_cgroups = {
                     b"0::/system.slice/dbus.service\n",
                     b"0::/system.slice/dbus-broker.service\n",
                     b"0::/system.slice/dbus-daemon.service\n",
-                }:
-                    raise RunnerError("live Codex system manager channel is untrusted")
+                }
+            if peer_cgroup not in trusted_cgroups:
+                raise RunnerError("live Codex system manager channel is untrusted")
     except (OSError, struct.error) as exc:
         raise RunnerError("live Codex system manager channel unavailable") from exc
 

@@ -593,18 +593,17 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
         root_socket = os.stat_result(
             (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
         )
-        # A root-installed broker may legitimately serve as messagebus/dbus.
-        # A fake same-DynamicUser peer must never inherit that trust.
         broker_uid, broker_gid = os.geteuid() + 200, os.getegid() + 200
-        for peer, admitted in (
-            ((1, 0, 0), True),
-            ((2, 0, 0), True),
-            ((321, broker_uid, broker_gid), True),
-            ((0, 0, 0), False),
-            ((321, os.geteuid(), os.getegid()), False),
-            ((321, os.geteuid(), broker_gid), False),
-            ((321, broker_uid, os.getegid()), False),
-            ((321, 0, 2000), False),
+        allowed_service = b"0::/system.slice/dbus-broker.service\n"
+        for peer, broker_cgroup, admitted in (
+            ((1, 0, 0), b"0::/init.scope\n", True),
+            ((321, 0, 0), allowed_service, True),
+            ((321, broker_uid, broker_gid), allowed_service, True),
+            ((0, 0, 0), allowed_service, False),
+            ((321, os.geteuid(), os.getegid()), allowed_service, False),
+            ((321, os.geteuid(), broker_gid), allowed_service, False),
+            ((321, broker_uid, os.getegid()), allowed_service, False),
+            ((321, 0, 2000), allowed_service, False),
         ):
             with self.subTest(peer=peer):
                 with (
@@ -613,7 +612,7 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                     patch.object(
                         runner,
                         "_authenticated_live_broker_cgroup",
-                        return_value=b"0::/system.slice/dbus-broker.service\n",
+                        return_value=broker_cgroup,
                     ) as kernel_cgroup,
                 ):
                     connection = socket_factory.return_value.__enter__.return_value
@@ -622,17 +621,81 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                         runner._attest_root_system_manager_channels()
                         self.assertEqual(socket_factory.call_count, 1)
                         self.assertEqual(lstat.call_count, 2)
-                        if peer[1] != 0:
-                            kernel_cgroup.assert_called_once_with(connection, peer[0])
-                        else:
-                            kernel_cgroup.assert_not_called()
+                        kernel_cgroup.assert_called_once_with(connection, peer[0])
                     else:
                         with self.assertRaisesRegex(
-                            runner.RunnerError,
-                            "system manager channel",
+                            runner.RunnerError, "system manager channel"
                         ):
                             runner._attest_root_system_manager_channels()
-                        self.assertEqual(socket_factory.call_count, 1)
+                        kernel_cgroup.assert_not_called()
+
+    def test_root_system_bus_rejects_unattested_root_peer(self) -> None:
+        # A foreign root-owned broker must not forge root systemd properties.
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket),
+            patch.object(runner.socket, "socket") as factory,
+            patch.object(
+                runner,
+                "_authenticated_live_broker_cgroup",
+                return_value=b"0::/system.slice/unrelated.service\n",
+            ) as kernel_cgroup,
+        ):
+            connection = factory.return_value.__enter__.return_value
+            connection.getsockopt.return_value = struct.pack("3i", 321, 0, 0)
+            with self.assertRaisesRegex(runner.RunnerError, "system manager channel"):
+                runner._attest_root_system_manager_channels()
+            kernel_cgroup.assert_called_once_with(connection, 321)
+
+    def test_root_pid1_only_accepts_verified_init_scope(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        for cgroup in (
+            b"0::/system.slice/dbus-broker.service\n",
+            b"0::/system.slice/other.service\n",
+            b"0::/init.scope/attacker.scope\n",
+            b"0::/user.slice/user-1000.slice/user@1000.service\n",
+            b"",
+        ):
+            with self.subTest(cgroup=cgroup):
+                with (
+                    patch.object(runner.os, "lstat", return_value=root_socket),
+                    patch.object(runner.socket, "socket") as factory,
+                    patch.object(
+                        runner,
+                        "_authenticated_live_broker_cgroup",
+                        return_value=cgroup,
+                    ) as kernel_cgroup,
+                ):
+                    peer_socket = factory.return_value.__enter__.return_value
+                    peer_socket.getsockopt.return_value = struct.pack("3i", 1, 0, 0)
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "system manager channel"
+                    ):
+                        runner._attest_root_system_manager_channels()
+                    kernel_cgroup.assert_called_once_with(peer_socket, 1)
+
+    def test_root_bus_rejects_missing_pidfd_before_cgroup_read(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket),
+            patch.object(runner.socket, "socket") as factory,
+            patch.object(runner, "_authenticated_procfs_cgroup") as procfs,
+        ):
+            peer_socket = factory.return_value.__enter__.return_value
+            peer_socket.getsockopt.side_effect = [
+                struct.pack("3i", 321, 0, 0),
+                OSError("no live peer pidfd"),
+            ]
+            with self.assertRaisesRegex(runner.RunnerError, "system manager channel"):
+                runner._attest_root_system_manager_channels()
+            self.assertEqual(peer_socket.getsockopt.call_count, 2)
+            procfs.assert_not_called()
 
     def test_nonroot_system_bus_requires_authenticated_dbus_unit_cgroup(self) -> None:
         socket_file = os.stat_result(
@@ -757,8 +820,7 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
             os.close(read_fd)
 
     def test_root_only_private_socket_allows_verified_system_bus(self) -> None:
-        # A DynamicUser cannot connect to PID 1's root-only private socket.
-        # An independently root-attested accessible system bus must suffice.
+        # The unprivileged runner must not use PID 1's private root socket.
         root_socket = os.stat_result(
             (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
         )
@@ -772,10 +834,16 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
         with (
             patch.object(runner.os, "lstat", side_effect=stat_channel),
             patch.object(runner.socket, "socket") as socket_factory,
+            patch.object(
+                runner,
+                "_authenticated_live_broker_cgroup",
+                return_value=b"0::/system.slice/dbus-broker.service\n",
+            ) as kernel_cgroup,
         ):
             connection = socket_factory.return_value.__enter__.return_value
             connection.getsockopt.return_value = struct.pack("3i", 321, 0, 0)
             runner._attest_root_system_manager_channels()
+            kernel_cgroup.assert_called_once_with(connection, 321)
             self.assertEqual(socket_factory.call_count, 1)
             self.assertEqual(
                 [c.args[0] for c in connection.connect.call_args_list],
@@ -783,18 +851,23 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
             )
 
     def test_root_owned_independent_dbus_broker_peer_is_accepted(self) -> None:
-        # The accessible system D-Bus broker can be a distinct root process,
-        # so its PID must not be assumed to be 1.
+        # A separate root broker is trusted only inside the real D-Bus unit.
         root_socket = os.stat_result(
             (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
         )
         with (
             patch.object(runner.os, "lstat", return_value=root_socket) as lstat,
             patch.object(runner.socket, "socket") as socket_factory,
+            patch.object(
+                runner,
+                "_authenticated_live_broker_cgroup",
+                return_value=b"0::/system.slice/dbus-broker.service\n",
+            ) as kernel_cgroup,
         ):
             connection = socket_factory.return_value.__enter__.return_value
             connection.getsockopt.return_value = struct.pack("3i", 321, 0, 0)
             runner._attest_root_system_manager_channels()
+            kernel_cgroup.assert_called_once_with(connection, 321)
             self.assertEqual(socket_factory.call_count, 1)
             self.assertEqual(lstat.call_count, 2)
             self.assertEqual(
