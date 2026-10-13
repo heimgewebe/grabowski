@@ -9465,6 +9465,164 @@ class AgentWorkspaceTests(unittest.TestCase):
         ssh.assert_not_called()
         fallback.assert_not_called()
 
+    def test_cleanup_cancelled_task_requires_quiescent_bound_local_unit(self) -> None:
+        task_id = "c" * 24
+        row = {
+            "task_id": task_id, "host": "local",
+            "unit": f"grabowski-task-{task_id}-a1.service",
+            "state": "cancelled", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        quiescent = {
+            "state": "completed",
+            "properties": {"LoadState": "loaded", "ActiveState": "inactive", "Result": "success"},
+            "probe": {"returncode": 0, "timed_out": False},
+            "observer": {"kind": "bound-local-user-systemd-show-v1", "transport": "local"},
+        }
+        cases = [
+            ("completed_quiescent", {}, True),
+            ("failed_quiescent", {
+                "state": "failed",
+                "properties": {"LoadState": "loaded", "ActiveState": "failed", "Result": "exit-code"},
+            }, True),
+            ("still_running", {
+                "state": "running",
+                "properties": {"LoadState": "loaded", "ActiveState": "active", "Result": "success"},
+            }, False),
+            ("spoofed_terminal_while_active", {
+                "properties": {"LoadState": "loaded", "ActiveState": "active", "Result": "success"},
+            }, False),
+            ("unknown_live_outcome", {"state": "outcome_unknown"}, False),
+            ("unloaded_unit", {
+                "properties": {"LoadState": "not-found", "ActiveState": "inactive", "Result": "success"},
+            }, False),
+            ("failed_probe", {"probe": {"returncode": 1, "timed_out": False}}, False),
+            ("unbound_observer", {
+                "observer": {"kind": "fleet-dispatch-v1", "transport": "local"},
+            }, False),
+            ("incomplete_observation", {"properties": {}}, False),
+        ]
+        for name, changes, terminal in cases:
+            with self.subTest(case=name):
+                observation = {**quiescent, **changes}
+                first = mock.Mock()
+                second = mock.Mock()
+                first.execute.return_value.fetchone.return_value = row
+                second.execute.return_value.fetchone.return_value = row
+                with (
+                    mock.patch.object(
+                        workspace.checkouts, "_readonly_connection",
+                        side_effect=[first, second]
+                    ) as reads,
+                    mock.patch.object(
+                        workspace.tasks, "_resolve_task_dispatch_host",
+                        return_value=(
+                            "local", {"transport": "local", "target": "local", "enabled": True}, False
+                        ),
+                    ),
+                    mock.patch.object(
+                        workspace.tasks, "_observe", return_value=observation
+                    ) as observed,
+                    mock.patch.object(
+                        workspace.tasks, "grabowski_task_status",
+                        side_effect=AssertionError("cleanup may not mutate task state"),
+                    ) as mutate,
+                ):
+                    public = workspace._workspace_cleanup_task_public(task_id)
+                observed.assert_called_once_with(row, bound_local_user=True)
+                first.close.assert_called_once()
+                if terminal:
+                    second.close.assert_called_once()
+                    self.assertEqual(2, reads.call_count)
+                else:
+                    second.close.assert_not_called()
+                    self.assertEqual(1, reads.call_count)
+                mutate.assert_not_called()
+                self.assertEqual("cancelled", public["persisted_state"])
+                self.assertEqual(terminal, public["terminal"])
+                self.assertEqual(not terminal, public["reconcile_required"])
+                self.assertEqual(
+                    "cancelled" if terminal else "observation_error", public["state"]
+                )
+
+    def test_cleanup_cancelled_remote_task_never_launches_probe(self) -> None:
+        task_id = "d" * 24
+        row = {
+            "task_id": task_id, "host": "remote", "unit": "remote.service",
+            "state": "cancelled", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        with (
+            mock.patch.object(workspace.checkouts, "_readonly_connection", return_value=connection),
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh", "target": "remote", "enabled": True}, False),
+            ),
+            mock.patch.object(
+                workspace.tasks, "_observe",
+                side_effect=AssertionError("cleanup cannot launch remote task probe"),
+            ) as remote,
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        remote.assert_not_called()
+        self.assertEqual("observation_error", public["state"])
+        self.assertFalse(public["terminal"])
+        self.assertTrue(public["reconcile_required"])
+
+    def test_cleanup_rejects_concurrent_task_attempt_after_live_terminal_probe(self) -> None:
+        task_id = "4" * 24
+        old_row = {
+            "task_id": task_id, "host": "local",
+            "unit": f"grabowski-task-{task_id}-a1.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        new_row = {
+            **old_row,
+            "unit": f"grabowski-task-{task_id}-a2.service",
+            "state": "running",
+            "attempt": 2,
+        }
+        first, second = mock.Mock(), mock.Mock()
+        first.execute.return_value.fetchone.return_value = old_row
+        second.execute.return_value.fetchone.return_value = new_row
+        local_host = (
+            "local", {"transport": "local", "target": "local", "enabled": True},
+            False,
+        )
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection",
+                side_effect=[first, second],
+            ) as reads,
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                return_value=local_host,
+            ),
+            mock.patch.object(
+                workspace.tasks, "_observe", return_value={"state": "completed"}
+            ) as probe,
+            mock.patch.object(
+                workspace.tasks, "_set_state",
+                side_effect=AssertionError("cleanup must never mutate task state"),
+            ) as persist,
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        probe.assert_called_once()
+        self.assertFalse(public["terminal"])
+        self.assertEqual("observation_error", public["state"])
+        self.assertTrue(public["reconcile_required"])
+        self.assertEqual("completed", public["persisted_state"])
+        self.assertEqual(2, reads.call_count)
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+        persist.assert_not_called()
+
     def test_cleanup_local_terminal_cannot_use_persisted_state_without_live_confirmation(self) -> None:
         task_id = "1" * 24
         row = {

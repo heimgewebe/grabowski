@@ -10719,12 +10719,58 @@ def _workspace_cleanup_task_public(task_id: str | None) -> dict[str, Any]:
         local_terminal_probed = True
         try:
             observation = tasks._observe(value, bound_local_user=True)
-            if observation.get("state") != persisted_state:
+            observed_state = observation.get("state")
+            if persisted_state == "cancelled":
+                # Systemd cannot report the Grabowski-specific "cancelled"
+                # label. Require positive evidence that the exact local user
+                # unit is loaded and quiescent, not merely a terminal-looking
+                # classification or a missing/unknown unit.
+                properties = observation.get("properties")
+                probe = observation.get("probe")
+                observer = observation.get("observer")
+                cancellation_quiescent = bool(
+                    observed_state in {"completed", "failed", "timed_out", "signalled"}
+                    and isinstance(properties, dict)
+                    and properties.get("LoadState") == "loaded"
+                    and properties.get("ActiveState") in {"inactive", "failed"}
+                    and isinstance(probe, dict)
+                    and type(probe.get("returncode")) is int
+                    and probe["returncode"] == 0
+                    and probe.get("timed_out") is False
+                    and isinstance(observer, dict)
+                    and observer.get("kind") == "bound-local-user-systemd-show-v1"
+                    and observer.get("transport") == "local"
+                )
+                if not cancellation_quiescent:
+                    unverified = True
+                    local_probe_error = "cancelled task has no proven quiescent local user-systemd unit"
+            elif observed_state != persisted_state:
                 unverified = True
                 local_probe_error = "local systemd live state differs from persisted terminal state"
         except Exception as exc:
             unverified = True
             local_probe_error = _error_summary(exc)
+        if not unverified:
+            # A concurrent resume may change the attempted task or unit while
+            # the external local terminal probe runs. Never authorize cleanup
+            # using the observed terminal state of a superseded attempt.
+            recheck = None
+            try:
+                recheck = checkouts._readonly_connection(tasks.TASK_DB)
+                if recheck is None:
+                    raise RuntimeError("post-probe task inventory is unavailable")
+                current = recheck.execute(
+                    "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+                ).fetchone()
+                if current is None or dict(current) != value:
+                    unverified = True
+                    local_probe_error = "task row changed during live terminal probe"
+            except Exception as exc:
+                unverified = True
+                local_probe_error = _error_summary(exc)
+            finally:
+                if recheck is not None:
+                    recheck.close()
     # For a mismatched/failed local probe, fail closed just like an unverified
     # remote transport; only an equal, live-observed terminal may unblock cleanup.
     state = (
