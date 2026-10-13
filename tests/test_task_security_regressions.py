@@ -1763,15 +1763,19 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 ):
                     tasks.agent_sandbox.minimal_sandbox_argv(**args)
 
-        # Read-only tasks do not require mountinfo; writable host sinks do.
+        # Even read-only host sources may conceal a foreign mount alias;
+        # missing mountinfo must now deny all visible host source mounts.
         with patch.object(
             tasks.agent_sandbox, "_kernel_mount_points",
             side_effect=tasks.agent_sandbox.AgentSandboxError("mountinfo unavailable"),
         ):
-            tasks.agent_sandbox.minimal_sandbox_argv(
-                workspace=workspace, command=["/usr/bin/true"],
-                workspace_writable=False,
-            )
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "mountinfo unavailable",
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(
+                    workspace=workspace, command=["/usr/bin/true"],
+                    workspace_writable=False,
+                )
             with self.assertRaisesRegex(
                 tasks.agent_sandbox.AgentSandboxError, "mountinfo unavailable",
             ):
@@ -1860,6 +1864,96 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 workspace=workspace,
                 command=["/usr/bin/true"], workspace_writable=False,
             )
+
+
+    def test_read_only_mount_sources_reject_same_device_kernel_aliases(self) -> None:
+        """Read-only does not mean confidential when a host bind replaces a source."""
+        from pathlib import Path
+
+        workspace = self.root / "ro-alias-workspace"
+        workspace.mkdir()
+        nested = workspace / "foreign-mount"
+        nested.mkdir()
+        common = self.root / "ro-git-common"
+        common.mkdir()
+        auxiliary = self.root / "ro-external-library"
+        auxiliary.mkdir()
+        for source_root, mounted, options in (
+            (workspace, workspace, {}),
+            (workspace, nested, {}),
+            (common, common, {"git_common_dir": common}),
+            (
+                auxiliary, auxiliary,
+                {"extra_read_only": ((auxiliary, auxiliary),)},
+            ),
+        ):
+            with self.subTest(mounted=str(mounted)), patch.object(
+                tasks.agent_sandbox, "_kernel_mount_points",
+                return_value=frozenset({mounted}),
+            ):
+                with self.assertRaisesRegex(
+                    tasks.agent_sandbox.AgentSandboxError, "mount boundary",
+                ):
+                    tasks.agent_sandbox.minimal_sandbox_argv(
+                        workspace=workspace,
+                        command=["/usr/bin/true"],
+                        workspace_writable=False,
+                        **options,
+                    )
+
+    def test_real_kernel_read_only_nested_bind_alias_is_rejected(self) -> None:
+        """Reject a nested same-device foreign mount in a ro-bound cwd."""
+        import subprocess
+        from pathlib import Path
+
+        tasks.agent_sandbox.require_bwrap()
+        workspace = self.root / "ro-nested-alias"
+        workspace.mkdir()
+        nested = workspace / "foreign-state"
+        nested.mkdir()
+        outside = self.root / "foreign-secret-state"
+        outside.mkdir()
+        (outside / "private.txt").write_text(
+            "read-only is not confidential", encoding="utf-8"
+        )
+        self.assertEqual(workspace.stat().st_dev, outside.stat().st_dev)
+        module = Path(tasks.agent_sandbox.__file__).resolve(strict=True)
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.dont_write_bytecode = True\n"
+            "sys.path.insert(0, '/opt')\n"
+            "import grabowski_agent_sandbox as sandbox\n"
+            "try:\n"
+            " sandbox.minimal_sandbox_argv(\n"
+            "  workspace=Path('/mnt/ro-nested-alias'),\n"
+            "  command=['/usr/bin/true'], workspace_writable=False,\n"
+            " )\n"
+            "except sandbox.AgentSandboxError as exc:\n"
+            " print('REJECTED:' + str(exc))\n"
+            "else:\n"
+            " print('ACCEPTED')\n"
+        )
+        outer = [
+            str(tasks.agent_sandbox.require_bwrap()),
+            "--die-with-parent", "--new-session", "--unshare-pid",
+            "--unshare-ipc", "--unshare-uts", "--cap-drop", "ALL",
+            "--ro-bind", "/usr", "/usr",
+            "--symlink", "usr/bin", "/bin",
+            "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib64", "/lib64",
+            "--proc", "/proc", "--dev", "/dev",
+            "--ro-bind", str(self.root), "/mnt",
+            "--bind", str(outside), "/mnt/ro-nested-alias/foreign-state",
+            "--ro-bind", str(module), "/opt/grabowski_agent_sandbox.py",
+            "--", "/usr/bin/python3", "-I", "-c", script,
+        ]
+        checked = subprocess.run(
+            outer, capture_output=True, text=True, check=False, timeout=40,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertIn("mount boundary", checked.stdout)
+        self.assertNotIn("ACCEPTED", checked.stdout)
 
 
     def test_read_only_ipc_scan_budget_fails_closed(self) -> None:
@@ -2332,7 +2426,7 @@ class TaskSecurityRegressionTests(unittest.TestCase):
 
 
     def test_writable_mountinfo_missing_or_unbounded_fails_closed(self) -> None:
-        """A read-only task needs no mount snapshot; a writer does."""
+        """Unobservable kernel mount identity denies all visible host mounts."""
         from pathlib import Path
 
         workspace = self.root / "mountinfo-workspace"
@@ -2350,12 +2444,14 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 tasks.agent_sandbox.AgentSandboxError, "mount identity is unavailable"
             ):
                 tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
-            readonly = tasks.agent_sandbox.minimal_sandbox_argv(
-                workspace=workspace,
-                command=["/usr/bin/true"],
-                workspace_writable=False,
-            )
-            self.assertIn("--ro-bind", readonly)
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "mount identity is unavailable"
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(
+                    workspace=workspace,
+                    command=["/usr/bin/true"],
+                    workspace_writable=False,
+                )
         with patch.object(tasks.agent_sandbox, "MAX_MOUNTINFO_BYTES", 1):
             with self.assertRaisesRegex(
                 tasks.agent_sandbox.AgentSandboxError, "mount identity.*budget"

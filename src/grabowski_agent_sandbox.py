@@ -628,6 +628,16 @@ def _reject_exposed_host_ipc_tree(worktree: Path) -> None:
     This check does not replace server-owned task/role authority or remove the
     remaining same-UID path-replacement race before bwrap executes.
     """
+    # A foreign bind of another host directory into the mounted source is a
+    # confidentiality boundary even when all its entries are regular files and
+    # st_dev remains unchanged. Missing mountinfo also denies the host bind.
+    if any(
+        mount == worktree or mount.is_relative_to(worktree)
+        for mount in _kernel_mount_points()
+    ):
+        raise AgentSandboxError(
+            f"read-only host source includes a kernel mount boundary: {worktree}"
+        )
     pending = [worktree]
     entries_seen = 0
     while pending:
