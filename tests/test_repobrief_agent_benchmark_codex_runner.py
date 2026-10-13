@@ -516,6 +516,13 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
         "DevicePolicy": "closed",
         "DeviceAllow": "",
         "Delegate": "no",
+        "DynamicUser": "yes",
+        "User": "grabowski-rab-benchmark",
+        "Group": "grabowski-rab-benchmark",
+        "PrivateTmp": "yes",
+        "PrivateIPC": "yes",
+        "UID": str(os.geteuid()),
+        "GID": str(os.getegid()),
     }
 
     def _probe(
@@ -571,6 +578,15 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
             ("ControlGroup", "/system.slice/other.service"),
             ("ActiveState", "inactive"),
             ("LoadState", "not-found"),
+            ("DynamicUser", "no"),
+            ("User", "alex"),
+            ("Group", "docker"),
+            ("PrivateTmp", "no"),
+            ("PrivateIPC", "no"),
+            ("UID", "9999"),
+            ("GID", "9999"),
+            ("UID", ""),
+            ("GID", ""),
         )
         for key, value in failures:
             with self.subTest(key=key, value=value):
@@ -627,6 +643,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         stacked_source_visible_first: bool = False,
         hidden_codex_before_parent_mount: bool = False,
         unrelated_tmpfs_rw: bool = False,
+        shared_runtime_tmpfs_rw: bool = False,
         unrelated_local_rw: bool = False,
         root_backing_isolated: bool = False,
         root_mount_rw: bool = False,
@@ -641,6 +658,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         device_policy_denied: bool = False,
         opaque_union_filesystem: str | None = None,
         supplementary_groups: tuple[int, ...] = (),
+        primary_gid: int | None = None,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -938,6 +956,15 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                         ephemeral, "rw,relatime", device="0:44", filesystem_type="tmpfs"
                     )
                 )
+            if shared_runtime_tmpfs_rw:
+                mounts.append(
+                    mount_line(
+                        Path("/run/user") / str(os.getuid()),
+                        "rw,relatime",
+                        device="0:45",
+                        filesystem_type="tmpfs",
+                    )
+                )
             if unrelated_local_rw:
                 foreign = Path(tmp) / "foreign-local-rw"
                 foreign.mkdir()
@@ -1018,6 +1045,27 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 patch.object(runner.os, "getuid", return_value=actual_uid),
                 patch.object(runner.os, "geteuid", return_value=actual_uid),
                 patch.object(
+                    runner.os,
+                    "getgid",
+                    return_value=primary_gid
+                    if primary_gid is not None
+                    else os.getgid(),
+                ),
+                patch.object(
+                    runner.os,
+                    "getegid",
+                    return_value=primary_gid
+                    if primary_gid is not None
+                    else os.getegid(),
+                ),
+                patch.object(
+                    runner.os,
+                    "getresgid",
+                    return_value=(primary_gid,) * 3
+                    if primary_gid is not None
+                    else os.getresgid(),
+                ),
+                patch.object(
                     runner.os, "getgroups", return_value=list(supplementary_groups)
                 ),
                 patch.object(runner.os, "statvfs", side_effect=statvfs),
@@ -1079,6 +1127,19 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         self._probe(supplementary_groups=())
         self._probe(supplementary_groups=(os.getegid(),))
 
+    def test_privileged_primary_group_cannot_pass_with_no_supplementary_groups(
+        self,
+    ) -> None:
+        for privileged_gid in (0, 996, 999):
+            with self.subTest(primary_gid=privileged_gid):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "execution identity is unsafe"
+                ):
+                    self._probe(
+                        primary_gid=privileged_gid,
+                        supplementary_groups=(privileged_gid,),
+                    )
+
     def test_root_owned_device_policy_is_mandatory_for_mount_admission(self) -> None:
         with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
             self._probe(device_policy_denied=True)
@@ -1128,8 +1189,17 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 writable_software_alias="codex",
             )
 
-    def test_unrelated_tmpfs_cannot_alias_protected_storage(self) -> None:
-        self._probe(unrelated_tmpfs_rw=True)
+    def test_unrelated_writable_tmpfs_is_not_accepted_as_private_runtime(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "writable.*(tmpfs|runtime|mount)"
+        ):
+            self._probe(unrelated_tmpfs_rw=True)
+
+    def test_shared_user_runtime_tmpfs_is_rejected_before_codex_dispatch(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "writable.*(tmpfs|runtime|mount)"
+        ):
+            self._probe(shared_runtime_tmpfs_rw=True)
 
     def test_extra_writable_local_filesystem_is_rejected(self) -> None:
         with self.assertRaisesRegex(runner.RunnerError, "writable.*filesystem"):

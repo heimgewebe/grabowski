@@ -881,7 +881,21 @@ def _assert_root_owned_device_policy() -> None:
     if match is None:
         raise RunnerError("live Codex device isolation lacks root-owned system unit")
     cgroup, unit = match.groups()
+    # The root-manager-owned dynamic user separates this service from the
+    # invoking user's same-UID desktop, container and user-systemd sockets.
+    # The unique system unit name must equal its own dynamic user and group.
+    sandbox_identity = unit.removesuffix(".service")
     required = {
+        "User": sandbox_identity,
+        "Group": sandbox_identity,
+        "DynamicUser": "yes",
+        "PrivateTmp": "yes",
+        "PrivateIPC": "yes",
+        # Numeric UID/GID must also match the real process, not only the
+        # unit's declared user/group strings. Prevent credential drift or
+        # a separate same-UID worker masquerading as the dynamic service.
+        "UID": str(os.geteuid()),
+        "GID": str(os.getegid()),
         "ActiveState": "active",
         "LoadState": "loaded",
         "ControlGroup": cgroup,
@@ -960,7 +974,11 @@ def validate_live_immutable_mounts(
         user_ids != (os.geteuid(),) * 3
         or group_ids != (os.getegid(),) * 3
         or os.getegid() == 0
+        or os.getegid() != os.geteuid()
     ):
+        # Primary docker/libvirt GIDs are privileged even if supplementary
+        # group membership is empty. The root-owned DynamicUser unit below
+        # must also attest this private non-root UID/GID.
         raise RunnerError("live Codex execution identity is unsafe")
     # NoNewPrivs and dropping effective capabilities do not revoke group access
     # to privileged Unix sockets such as Docker's. An inherited supplementary
@@ -1514,7 +1532,8 @@ def validate_live_immutable_mounts(
         # through an opaque block backing even when its mount device differs.
         # The four checked output leaves are the sole persistent RW mounts;
         # unrelated memory-backed/kernel virtual mounts are handled separately.
-        if records[visible_at_point[mount]][5] in {
+        filesystem_type = records[visible_at_point[mount]][5]
+        if filesystem_type in {
             b"ext2",
             b"ext3",
             b"ext4",
@@ -1531,6 +1550,22 @@ def validate_live_immutable_mounts(
             raise RunnerError(
                 "live Codex unexpected writable persistent filesystem mount"
             )
+        # A writable tmpfs outside these root-systemd private paths may
+        # expose same-UID sockets (user systemd, container daemon, D-Bus).
+        # RO bind mounting a socket also permits connect(), so the
+        # DynamicUser + private IPC root-owned attestation remains required.
+        # /dev is private through PrivateDevices=yes; /tmp through
+        # PrivateTmp=yes. Unexpected /run or user-session mounts must fail.
+        isolated_volatile_mounts = {
+            (Path("/dev"), b"tmpfs"),
+            (Path("/dev/shm"), b"tmpfs"),
+            (Path("/dev/pts"), b"devpts"),
+            (Path("/dev/mqueue"), b"mqueue"),
+            (Path("/tmp"), b"tmpfs"),
+            (Path("/var/tmp"), b"tmpfs"),
+        }
+        if (mount, filesystem_type) not in isolated_volatile_mounts:
+            raise RunnerError("live Codex unexpected writable runtime mount")
     if observed_writable_outputs != allowed_outputs:
         raise RunnerError("live Codex private writable output mounts are missing")
     _assert_root_owned_device_policy()
