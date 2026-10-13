@@ -646,6 +646,8 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         shared_runtime_tmpfs_rw: bool = False,
         unrelated_local_rw: bool = False,
         root_backing_isolated: bool = False,
+        runtime_loader_bind: str | None = None,
+        runtime_loader_alias_at: str | None = None,
         root_mount_rw: bool = False,
         output_below_protected_backing: bool = False,
         output_epoch_in_source: bool = False,
@@ -737,6 +739,14 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             real_read_text = Path.read_text
             real_read_bytes = Path.read_bytes
             real_samefile = os.path.samefile
+            real_resolve = Path.resolve
+
+            def resolve(path: Path, *args, **kwargs):
+                # The test host may be usr-merged; emulate a distinct visible
+                # /bin or /lib mount without changing the host's actual links.
+                if runtime_loader_bind is not None and str(path) == runtime_loader_bind:
+                    return path
+                return real_resolve(path, *args, **kwargs)
 
             def read_text(path: Path, *args, **kwargs):
                 if str(path) == "/proc/self/status":
@@ -786,6 +796,21 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 mount_line(
                     Path("/"), "rw,relatime" if root_mount_rw else "ro,relatime"
                 ),
+            ]
+            # A /tmp bind must precede children physically mounted beneath
+            # /tmp. Otherwise the fixture's mount parent chain is impossible
+            # and admission fails for topology rather than backing alias.
+            if runtime_loader_alias_at == "/tmp":
+                mounts.append(
+                    mount_line(
+                        Path("/tmp"),
+                        "rw,relatime",
+                        mount_root=Path("/"),
+                        device="0:51",
+                        filesystem_type="tmpfs",
+                    )
+                )
+            mounts.append(
                 mount_line(
                     home,
                     "ro,relatime",
@@ -795,8 +820,8 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                         else None
                     ),
                     device="8:22" if root_backing_isolated else "8:1",
-                ),
-            ]
+                )
+            )
             if root_backing_isolated:
                 # Isolate every non-root protected inode from the root device.
                 # Otherwise the existing HOME/source alias check masks this P1.
@@ -809,6 +834,37 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                         ),
                     )
                 )
+            if runtime_loader_bind is not None:
+                if runtime_loader_bind not in {"/bin", "/sbin", "/lib", "/lib64"}:
+                    raise AssertionError("unknown runtime loader mount")
+                mounts.append(
+                    mount_line(
+                        Path(runtime_loader_bind),
+                        "ro,relatime",
+                        mount_root=Path("/isolated-runtime/tools"),
+                        device="0:51",
+                        filesystem_type="tmpfs",
+                    )
+                )
+                if (
+                    runtime_loader_alias_at is not None
+                    and runtime_loader_alias_at != "/tmp"
+                ):
+                    if runtime_loader_alias_at not in {
+                        "/tmp",
+                        "/var/tmp",
+                        "/dev/shm",
+                    }:
+                        raise AssertionError("unexpected writable runtime alias")
+                    mounts.append(
+                        mount_line(
+                            Path(runtime_loader_alias_at),
+                            "rw,relatime",
+                            mount_root=Path("/"),
+                            device="0:51",
+                            filesystem_type="tmpfs",
+                        )
+                    )
             if hidden_codex_before_parent_mount:
                 # A bind at the executable pathname is covered by a later
                 # RO mount of its parent directory; its backing is invisible.
@@ -1035,6 +1091,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             actual_uid = os.getuid()
             with (
                 patch.object(runner.Path, "home", return_value=home),
+                patch.object(runner.Path, "resolve", new=resolve),
                 patch.object(runner.Path, "read_text", new=read_text),
                 patch.object(runner.Path, "read_bytes", new=read_bytes),
                 patch.object(
@@ -1146,6 +1203,29 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
 
     def test_only_four_private_output_mounts_are_admissible(self) -> None:
         self._probe()
+
+    def test_separate_runtime_loader_and_tool_backings_cannot_alias_private_tmpfs(
+        self,
+    ) -> None:
+        for runtime_path in ("/bin", "/sbin", "/lib", "/lib64"):
+            for writable_alias in ("/tmp", "/var/tmp", "/dev/shm"):
+                with self.subTest(runtime=runtime_path, alias=writable_alias):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "writable alias of protected input mount|"
+                        "unexpected writable mount sharing protected filesystem",
+                    ):
+                        self._probe(
+                            runtime_loader_bind=runtime_path,
+                            runtime_loader_alias_at=writable_alias,
+                        )
+
+    def test_separate_runtime_readonly_bind_without_writable_alias_is_allowed(
+        self,
+    ) -> None:
+        for runtime_path in ("/bin", "/sbin", "/lib", "/lib64"):
+            with self.subTest(runtime=runtime_path):
+                self._probe(runtime_loader_bind=runtime_path)
 
     def test_codex_executable_and_bundled_rg_writable_backing_aliases_are_rejected(
         self,

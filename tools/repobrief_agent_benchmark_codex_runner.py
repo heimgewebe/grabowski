@@ -1148,6 +1148,29 @@ def validate_live_immutable_mounts(
         "runner parent": Path(__file__).parent,
         "runner source": Path(__file__),
     }
+    # On non-usr-merged hosts, /bin and the shared loader trees may have
+    # distinct RO bind mounts backed by writable private tmpfs. Protect each
+    # actual filesystem backing, not only the common /usr path spelling.
+    # Absent optional multiarch directories are harmless; an inaccessible or
+    # dangling existing runtime path must instead fail closed.
+    for runtime_path in (
+        Path("/bin"),
+        Path("/sbin"),
+        Path("/lib"),
+        Path("/lib64"),
+        Path("/lib32"),
+        Path("/libx32"),
+    ):
+        try:
+            runtime_path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RunnerError(
+                "live Codex runtime loader/tool path is unavailable"
+            ) from exc
+        immutable_paths[f"runtime {runtime_path}"] = runtime_path
+
     protected_targets = {}
     for label, path in immutable_paths.items():
         target = resolved(Path(path), label)
