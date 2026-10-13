@@ -320,14 +320,71 @@ class TaskSecurityRegressionTests(unittest.TestCase):
 
 
 
-    def test_untrusted_task_unit_must_restrict_host_abstract_unix_sockets(self) -> None:
-        """Bubblewrap alone shares host network-namespace AF_UNIX abstract IPC.
+    def test_kernel_sandbox_denies_host_abstract_unix_but_allows_inet(self) -> None:
+        """Actual AF_UNIX abstract host-write attempt under an opaque bwrap child.
 
-        Kernel proof on this host: a synthetic local abstract socket accepts
-        data from a ro-bound bwrap child even with --unshare-ipc. The outer
-        systemd task unit must deny AF_UNIX socket creation while preserving
-        AF_INET/AF_INET6 for legitimate remote APIs. This checks launch policy,
-        not an independent runtime systemd security attestation.
+        AF_INET socket creation must still work for legitimate remote APIs.
+        Only a newly created synthetic listener inside this test is contacted.
+        """
+        import os
+        import socket
+        import subprocess
+
+        tasks.agent_sandbox.require_bwrap()
+        workspace = self.root / "abstract-namespace-probe"
+        workspace.mkdir()
+        name = "pr1386-synthetic-abstract-" + str(os.getpid())
+        code = (
+            "import errno,sys,socket,json\n"
+            "tcp=socket.socket(socket.AF_INET,socket.SOCK_STREAM);tcp.close()\n"
+            "try:\n"
+            " local=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n"
+            " local.connect('\\0'+sys.argv[1])\n"
+            " local.sendall(b'SYNTHETIC-ONLY')\n"
+            " print(json.dumps({'tcp':'ALLOWED','host_unix':'CONNECTED'}))\n"
+            "except OSError as exc:\n"
+            " print(json.dumps({'tcp':'ALLOWED','host_unix':'BLOCKED','errno':exc.errno}))\n"
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind("\0" + name)
+            listener.listen(1)
+            record = {
+                "task_id": "opaque-abstract-ipc",
+                "host": "local", "cwd": str(workspace),
+            }
+            with (
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(
+                    tasks, "_verified_task_effect_start",
+                    return_value={"effect_profile": "unknown"},
+                ),
+            ):
+                argv = tasks._task_sandboxed_command_argv(
+                    record, ["/usr/bin/python3", "-I", "-c", code, name],
+                )
+            result = subprocess.run(
+                tasks.agent_sandbox.runtime_sandbox_argv(argv),
+                capture_output=True, text=True, check=False, timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout.strip())
+            if output.get("host_unix") == "CONNECTED":
+                listener.settimeout(2)
+                with listener.accept()[0] as connection:
+                    self.assertEqual(connection.recv(64), b"SYNTHETIC-ONLY")
+            self.assertEqual(output["tcp"], "ALLOWED")
+            self.assertEqual(output["host_unix"], "BLOCKED")
+            self.assertEqual(output.get("errno"), 1)
+
+
+    def test_untrusted_task_unit_must_restrict_host_abstract_unix_sockets(self) -> None:
+        """The real systemd child argv must carry the already E2E-tested gate.
+
+        Bubblewrap shares the host network namespace: --unshare-ipc alone does
+        not block abstract AF_UNIX. Unlike a synthetic systemd property check,
+        this verifies that output capture launches the *filtered* bwrap child.
+        The independent kernel test proves that its filter actually denies
+        AF_UNIX; this assertion binds that binary path to the task unit.
         """
         identifier = "a" * 24
         argv = ["/usr/bin/true"]
@@ -344,15 +401,113 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             "io_weight": 100,
             "memory_max_bytes": None,
         }
-        with patch.object(
-            tasks, "_task_output_capture_argv", return_value=["/usr/bin/true"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+            patch.object(
+                tasks, "_task_output_paths",
+                return_value={"directory": self.root / "captured"},
+            ),
         ):
+            captured = tasks._task_output_capture_argv(record)
+        expected_prefix = [
+            tasks.agent_sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+            tasks.agent_sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
+            str(tasks.agent_sandbox.require_bwrap()),
+        ]
+        self.assertEqual(captured[5:11], expected_prefix)
+        self.assertLess(len(captured[9].encode("utf-8")), 4096)
+        with patch.object(tasks, "_task_output_capture_argv", return_value=captured):
             command = tasks._launch_argv(record, include_managed_runtime=False)
         self.assertEqual(
-            command.count("--property=RestrictAddressFamilies=AF_INET AF_INET6"),
-            1,
+            command[command.index("--") + 1:],
+            tasks.command_identity.systemd_escape_argv(captured),
         )
         self.assertNotIn("--property=RestrictAddressFamilies=AF_UNIX", command)
+
+    def test_runtime_sandbox_rewraps_bare_bwrap_and_rejects_forged_launcher(self) -> None:
+        """Legacy bare bwrap callers cannot drop the kernel filter by mistake."""
+        sandbox = tasks.agent_sandbox
+        resolved = str(sandbox.require_bwrap())
+        argv = sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
+        self.assertEqual(
+            argv[:6],
+            [sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+             sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE, resolved],
+        )
+        self.assertEqual(argv[6:], ["--version"])
+        with self.assertRaisesRegex(sandbox.AgentSandboxError, "unrecognized"):
+            sandbox.runtime_sandbox_argv(
+                [sandbox.SANDBOX_LAUNCH_PYTHON, "-c", "print('bypass')"]
+            )
+
+    def test_kernel_seccomp_inherits_into_exec_and_blocks_raw_socket_bypass(self) -> None:
+        """A second exec and high-domain-bit raw syscalls keep the kernel ban."""
+        import os
+        import subprocess
+
+        if os.uname().machine not in {"x86_64", "aarch64"}:
+            self.skipTest("raw socket syscall numbers need a known Linux ABI")
+        workspace = self.root / "seccomp-inherited"
+        workspace.mkdir()
+        code = (
+            "import ctypes,json,os,socket,subprocess\n"
+            "nr={'x86_64':41,'aarch64':198}[os.uname().machine]\n"
+            "libc=ctypes.CDLL(None,use_errno=True)\n"
+            "ret=libc.syscall(ctypes.c_long(nr),ctypes.c_ulong((1<<32)|1),"
+            "ctypes.c_long(socket.SOCK_STREAM),ctypes.c_long(0))\n"
+            "failure=ctypes.get_errno()\n"
+            "sub=subprocess.run(['/bin/sh','-c',"
+            "\"/usr/bin/python3 -I -c 'import socket; socket.socket(socket.AF_UNIX)'\""
+            "],capture_output=True,text=True)\n"
+            "print(json.dumps({'ret':ret,'errno':failure,"
+            "'child_denied':sub.returncode!=0 and '[Errno 1]' in sub.stderr}))\n"
+        )
+        record = {"task_id": "opaque-raw-syscall", "host": "local", "cwd": str(workspace)}
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_verified_task_effect_start",
+                         return_value={"effect_profile": "unknown"}),
+        ):
+            command = tasks._task_sandboxed_command_argv(
+                record, ["/usr/bin/python3", "-I", "-c", code],
+            )
+        result = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(command),
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcome = json.loads(result.stdout.strip())
+        self.assertEqual(outcome["ret"], -1)
+        self.assertEqual(outcome["errno"], 1)
+        self.assertTrue(outcome["child_denied"], outcome)
+
+    def test_unavailable_seccomp_library_fails_closed_before_exec(self) -> None:
+        """Fault-injected libseccomp absence may not reach bubblewrap or child."""
+        import subprocess
+
+        sandbox = tasks.agent_sandbox
+        sandbox.require_bwrap()
+        candidate = sandbox.minimal_sandbox_argv(
+            workspace=self.root,
+            command=["/usr/bin/true"],
+            workspace_writable=False,
+        )
+        argv = sandbox.runtime_sandbox_argv(candidate)
+        # Change only the synthetic launcher source for this negative test.
+        missing = argv[4].replace(
+            "libseccomp.so.2", "pr1386-deliberately-missing-seccomp.so.2"
+        )
+        self.assertNotEqual(missing, argv[4])
+        argv[4] = missing
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn("AF_UNIX sandbox enforcement unavailable", result.stderr)
 
 
     def test_revoked_running_task_lease_cannot_be_silently_reacquired(self) -> None:

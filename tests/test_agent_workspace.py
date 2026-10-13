@@ -6445,8 +6445,13 @@ class AgentWorkspaceTests(unittest.TestCase):
         binary.chmod(0o755)
         with mock.patch.object(sandbox, "BWRAP", binary):
             argv = sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
-        self.assertEqual(argv[0], str(binary.resolve()))
-        self.assertEqual(argv[1:], ["--version"])
+        self.assertEqual(
+            argv[:5],
+            [sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+             sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE],
+        )
+        self.assertEqual(argv[5:], [str(binary.resolve()), "--version"])
+        self.assertLess(len(argv[4].encode("utf-8")), 4096)
 
     def test_bounded_capture_does_not_wait_for_detached_pipe_holder(self) -> None:
         started = time.monotonic()

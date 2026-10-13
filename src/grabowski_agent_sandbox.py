@@ -14,6 +14,94 @@ import tempfile
 from typing import Iterable
 
 BWRAP = Path(os.environ.get("GRABOWSKI_BWRAP_BIN", "/usr/bin/bwrap"))
+SANDBOX_LAUNCH_PYTHON = "/usr/bin/python3"
+# Host-side *trusted* launcher: install a libseccomp rule before execing bwrap.
+# The filter survives exec and all descendants, blocks host abstract AF_UNIX
+# socket creation, and keeps AF_INET/AF_INET6 available for remote APIs.
+# Missing libseccomp or failed filter installation is a hard launch denial.
+# This does not itself isolate localhost TCP or revoke a running task lease.
+_HOST_UNIX_DENY_LAUNCH_SOURCE = """\
+import ctypes
+import os
+import stat
+import sys
+
+class _ArgCmp(ctypes.Structure):
+    _fields_ = [
+        ("arg", ctypes.c_uint),
+        ("op", ctypes.c_int),
+        ("datum_a", ctypes.c_uint64),
+        ("datum_b", ctypes.c_uint64),
+    ]
+
+if (len(sys.argv) < 3 or not os.path.isabs(sys.argv[1])
+        or os.path.islink(sys.argv[1]) or not os.path.isfile(sys.argv[1])
+        or not os.access(sys.argv[1], os.X_OK)):
+    raise SystemExit(126)
+
+try:
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("seccomp is Linux-only")
+    multiarch = {
+        "x86_64": "x86_64-linux-gnu",
+        "aarch64": "aarch64-linux-gnu",
+    }.get(os.uname().machine)
+    if not multiarch:
+        raise RuntimeError("unsupported seccomp architecture")
+    # Never load a library from a task-controlled directory or loader search.
+    # A missing trusted system library fails closed rather than launching bwrap.
+    candidates = (
+        "/lib/" + multiarch + "/libseccomp.so.2",
+        "/usr/lib/" + multiarch + "/libseccomp.so.2",
+        "/lib64/libseccomp.so.2",
+        "/usr/lib64/libseccomp.so.2",
+    )
+    lib = None
+    for candidate in candidates:
+        try:
+            info = os.stat(candidate)
+            if (stat.S_ISREG(info.st_mode) and info.st_uid == 0
+                    and info.st_mode & 0o022 == 0):
+                lib = ctypes.CDLL(candidate)
+                break
+        except OSError:
+            pass
+    if lib is None:
+        raise RuntimeError("trusted libseccomp is unavailable")
+    lib.seccomp_init.argtypes = [ctypes.c_uint32]
+    lib.seccomp_init.restype = ctypes.c_void_p
+    lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    lib.seccomp_syscall_resolve_name.restype = ctypes.c_int
+    lib.seccomp_rule_add.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint, _ArgCmp
+    ]
+    lib.seccomp_rule_add.restype = ctypes.c_int
+    lib.seccomp_load.argtypes = [ctypes.c_void_p]
+    lib.seccomp_load.restype = ctypes.c_int
+    ctx = lib.seccomp_init(0x7fff0000)
+    syscall = lib.seccomp_syscall_resolve_name(b"socket")
+    # SCMP_CMP_MASKED_EQ checks the low 32 bits; a malicious raw syscall may
+    # otherwise set high bits that Linux discards when casting domain to int.
+    if (not ctx or syscall < 0
+            or lib.seccomp_rule_add(
+                ctx, 0x00050001, syscall, 1,
+                _ArgCmp(0, 7, 0xffffffff, 1)
+            ) != 0):
+        raise RuntimeError("AF_UNIX seccomp rule unavailable")
+    if ctypes.CDLL(None).prctl(38, 1, 0, 0, 0) != 0:
+        raise RuntimeError("no_new_privs unavailable")
+    if lib.seccomp_load(ctx) != 0:
+        raise RuntimeError("AF_UNIX seccomp install failed")
+    lib.seccomp_release.argtypes = [ctypes.c_void_p]
+    lib.seccomp_release(ctx)
+except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
+    sys.stderr.write("grabowski: AF_UNIX sandbox enforcement unavailable\\n")
+    raise SystemExit(125)
+
+os.execv(sys.argv[1], sys.argv[1:])
+"""
+
+
 TAIL_BYTES = 12000
 MAX_WRITABLE_SCOPE_ENTRIES = 100_000
 MAX_READ_ONLY_SCOPE_ENTRIES = 100_000
@@ -492,11 +580,30 @@ def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def runtime_sandbox_argv(arguments: list[str]) -> list[str]:
-    """Bind execution to the validated, resolved bubblewrap binary."""
+    """Resolve bwrap; every invocation must retain the host-side seccomp gate.
+
+    Even direct compatibility probes must not silently drop the filter.
+    """
     if not arguments:
         raise AgentSandboxError("sandbox argv is empty")
     result = list(arguments)
-    result[0] = str(require_bwrap())
+    if result[:5] == [
+        SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+        _HOST_UNIX_DENY_LAUNCH_SOURCE,
+    ]:
+        if len(result) < 7:
+            raise AgentSandboxError("AF_UNIX sandbox launcher has no bwrap arguments")
+        result[5] = str(require_bwrap())
+    else:
+        # A malformed launcher cannot be interpreted as a bare bwrap command.
+        if result[0] == SANDBOX_LAUNCH_PYTHON:
+            raise AgentSandboxError("unrecognized AF_UNIX sandbox launcher")
+        result = [
+            SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+            _HOST_UNIX_DENY_LAUNCH_SOURCE, str(require_bwrap()), *result[1:],
+        ]
+    if len(_HOST_UNIX_DENY_LAUNCH_SOURCE.encode("utf-8")) >= 4096:
+        raise AgentSandboxError("AF_UNIX launcher exceeds the systemd argument limit")
     return result
 
 
@@ -1231,7 +1338,10 @@ def minimal_sandbox_argv(
             *command,
         ]
     )
-    return arguments
+    return [
+        SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+        _HOST_UNIX_DENY_LAUNCH_SOURCE, *arguments,
+    ]
 
 
 def _append_tail(buffer: bytearray, chunk: bytes, limit: int = TAIL_BYTES) -> None:
