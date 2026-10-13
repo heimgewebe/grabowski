@@ -205,6 +205,9 @@ class CodexTaskCommandSecurityTests(unittest.TestCase):
             patch.object(tasks, "_validate_command", return_value=command),
             patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 130}),
             patch.object(tasks, "_require_direct_codex_filesystem_sandbox"),
+            # The historical pre-fix record is synthetic; isolate only its creation.
+            # Resume below runs the real Codex filesystem guard unpatched.
+            patch.object(tasks, "_task_sandboxed_command_argv", side_effect=lambda _record, command: command),
             patch.object(fixture.coding_agent_router, "coding_agent_pre_dispatch_admission", return_value=admitted),
             patch.object(tasks, "_dispatch", return_value=fixture._launcher()),
             patch.object(tasks.base, "_append_audit"),
