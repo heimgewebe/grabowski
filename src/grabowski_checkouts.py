@@ -469,6 +469,17 @@ def _database() -> sqlite3.Connection:
     if CHECKOUT_DB.is_symlink():
         raise PermissionError(f"Checkout database may not be a symlink: {CHECKOUT_DB}")
     connection = sqlite3.connect(CHECKOUT_DB, timeout=10)
+    try:
+        return _initialize_checkout_database_connection(connection)
+    except BaseException:
+        # _database() has not returned: caller-side closing() cannot run.
+        connection.close()
+        raise
+
+
+def _initialize_checkout_database_connection(
+    connection: sqlite3.Connection,
+) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
@@ -622,14 +633,9 @@ def _database() -> sqlite3.Connection:
             "INSERT INTO metadata(key, value) VALUES('schema_version', '1')"
         )
     elif current["value"] != "1":
-        connection.close()
         raise RuntimeError("Unsupported checkout database schema")
     connection.commit()
-    try:
-        os.chmod(CHECKOUT_DB, 0o600)
-    except FileNotFoundError:
-        connection.close()
-        raise
+    os.chmod(CHECKOUT_DB, 0o600)
     return connection
 
 

@@ -6730,6 +6730,37 @@ class CheckoutLifecycleTests(unittest.TestCase):
             finally:
                 keeper.close()
 
+    def test_checkout_database_initializer_exception_closes_wal_with_live_traceback(self) -> None:
+        # Setup can fail after sqlite3.connect() has opened the WAL.
+        # The caller cannot use closing(_database()) when _database() raises.
+        warm = checkouts._database()
+        warm.close()
+        wal = Path(str(self.checkout_db) + "-wal")
+        shm = Path(str(self.checkout_db) + "-shm")
+        self.assertFalse(wal.exists())
+        self.assertFalse(shm.exists())
+        retained_traceback = None
+        with patch.object(
+            checkouts.os, "chmod",
+            side_effect=PermissionError("synthetic checkout initialization failure"),
+        ):
+            try:
+                checkouts._database()
+            except PermissionError as exc:
+                self.assertIn("synthetic checkout initialization failure", str(exc))
+                retained_traceback = exc.__traceback__
+            else:
+                self.fail("injected SQLite initializer failure must propagate")
+        self.assertIsNotNone(retained_traceback)
+        self.assertFalse(wal.exists(), "initializer must close WAL despite live traceback")
+        self.assertFalse(shm.exists(), "initializer must close SHM despite live traceback")
+        with checkouts._strict_inventory_readonly_scope():
+            reader = checkouts._readonly_connection(self.checkout_db)
+            self.assertIsNotNone(reader)
+            self.assertEqual(
+                0, reader.execute("SELECT COUNT(*) FROM lifecycle_bindings").fetchone()[0]
+            )
+
     def test_checkout_writer_exception_closes_wal_with_live_traceback(self) -> None:
         warm = checkouts._database()
         warm.close()
