@@ -16429,11 +16429,15 @@ def _runtime_deploy_local_mutation_evidence_valid(
     expected_order = {
         "grabowski_runtime_deploy_pending_unit_promotion": -1,
         "grabowski_runtime_deploy_stale_pending_reconciliation": 0,
-        "grabowski_runtime_deploy_origin_main_refresh": 1,
+        # Object import precedes the separate origin/main ref update. They
+        # can both occur in one legitimate schedule attempt and must preserve
+        # two individually checked, digest-bound mutation receipts. The two
+        # alternative refresh representations remain mutually exclusive.
         "grabowski_runtime_deploy_origin_main_fetch_effect": 1,
-        "grabowski_runtime_deploy_origin_main_refresh_effect": 1,
-        "grabowski_runtime_deploy_rootbroker_authority_effect": 2,
-        "grabowski_runtime_deploy_auto_source_effect": 3,
+        "grabowski_runtime_deploy_origin_main_refresh": 2,
+        "grabowski_runtime_deploy_origin_main_refresh_effect": 2,
+        "grabowski_runtime_deploy_rootbroker_authority_effect": 3,
+        "grabowski_runtime_deploy_auto_source_effect": 4,
     }
     observed_order: list[int] = []
     for effect in effects:

@@ -798,6 +798,93 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         release.assert_called_once()
         broker.assert_not_called()
 
+
+    def test_captain_combined_object_import_then_ref_refresh_is_not_lost(self) -> None:
+        """Two real source effects must remain separately authenticated and ordered."""
+        head = "b" * 40
+        canonical = "/home/alex/repos/grabowski"
+        resources = {
+            "canonical_repository": canonical,
+            "expected_head": head,
+            "previous_head": "a" * 40,
+            "previous_branch": "main",
+            "previous_origin_main": "c" * 40,
+            "owner_id": "runtime-deploy-ref:test",
+            "operation_resource_key": f"repo:{canonical}:operation:runtime-deploy-origin-main-refresh",
+            "canonical_resource_key": f"path:{canonical}",
+            "common_dir_resource_key": f"path:{canonical}/.git",
+            "objects_resource_key": f"path:{canonical}/.git/objects",
+            "origin_main_ref_resource_key": f"path:{canonical}/.git/refs/remotes/origin/main",
+        }
+
+        def signed(material: dict, *, digest: str = "evidence_sha256") -> dict:
+            return {**material, digest: grips.sha256_json(material)}
+
+        imported = signed({
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_origin_main_fetch_effect",
+            **resources,
+            "target_object": {"before_fetch_present": False, "after_fetch_commit": head},
+            "fetch": {"returncode": 0, "timed_out": False},
+            "public_github_main": {"before_fetch": head},
+            "effect_observed": True,
+        })
+        refreshed = signed({
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_origin_main_refresh_effect",
+            **resources,
+            "observed_origin_main": head,
+            "fetch": {"returncode": 0, "timed_out": False},
+            "update_ref": {
+                "returncode": 0, "timed_out": False, "reported_success": True
+            },
+            "public_github_main": {"before_fetch": head, "after_fetch": head},
+            "effect_observed": True,
+        })
+        legacy_refresh = dict(refreshed)
+        legacy_refresh["kind"] = "grabowski_runtime_deploy_origin_main_refresh"
+        legacy_refresh["public_github_main"] = {
+            "before_fetch": head, "after_fetch": head, "after_cas": head
+        }
+        legacy_refresh.pop("effect_observed")
+        legacy_refresh.pop("evidence_sha256")
+        legacy_refresh = signed(legacy_refresh, digest="receipt_sha256")
+
+        def valid(effects: list[dict]) -> bool:
+            bundle = signed({
+                "schema_version": 1,
+                "kind": "grabowski_runtime_deploy_local_mutation_bundle",
+                "effects": effects,
+            })
+            return grips._runtime_deploy_local_mutation_evidence_valid(
+                bundle, expected_job_prefix="grabowski-job-", expected_head=head
+            )
+
+        self.assertTrue(grips._runtime_deploy_origin_main_fetch_effect_evidence_valid(
+            imported, expected_head=head
+        ))
+        self.assertTrue(grips._runtime_deploy_origin_main_refresh_effect_evidence_valid(
+            refreshed, expected_head=head
+        ))
+        self.assertTrue(grips._runtime_deploy_origin_main_refresh_evidence_valid(
+            legacy_refresh, expected_head=head
+        ))
+        self.assertTrue(valid([imported, refreshed]))
+        self.assertTrue(valid([imported, legacy_refresh]))
+        self.assertFalse(valid([refreshed, imported]))
+        self.assertFalse(valid([imported, imported]))
+        self.assertFalse(valid([imported, refreshed, legacy_refresh]))
+        self.assertFalse(valid([imported, {**refreshed, "evidence_sha256": "0" * 64}]))
+        self.assertFalse(grips._runtime_deploy_local_mutation_evidence_valid(
+            signed({
+                "schema_version": 1,
+                "kind": "grabowski_runtime_deploy_local_mutation_bundle",
+                "effects": [imported, refreshed],
+            }),
+            expected_job_prefix="grabowski-job-",
+            expected_head="d" * 40,
+        ))
+
     def test_captain_runtime_deploy_marks_review_gate_blocked(self) -> None:
         # Exercise the Captain policy seam without import-order effects from
         # the old scheduler fixture's synthetic modules.
