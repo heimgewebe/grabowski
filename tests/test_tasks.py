@@ -6576,6 +6576,82 @@ class TaskTests(unittest.TestCase):
                 tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
             )
 
+    def test_reconcile_ready_rechecks_expiry_after_local_terminal_observation(self) -> None:
+        # The cache can expire while a bounded local systemd probe is running.
+        # A positive quiescence result must not revalidate an expired proof.
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        record = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?",
+                (record["task_id"],),
+            )
+        complete = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=complete),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as reader:
+            row = reader.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        stamp = json.loads(row[0])["reconciled_at_unix"]
+        clock = [stamp + tasks.TASK_RECONCILE_READY_MAX_AGE_SECONDS - 1]
+
+        def probe(_record: dict, **_kwargs: object) -> dict:
+            clock[0] = stamp + tasks.TASK_RECONCILE_READY_MAX_AGE_SECONDS + 1
+            return {
+                "state": "completed",
+                "properties": {
+                    "LoadState": "loaded", "ActiveState": "inactive",
+                    "SubState": "dead", "Result": "success",
+                },
+                "probe": {"returncode": 0, "timed_out": False},
+                "observer": {
+                    "kind": "bound-local-user-systemd-show-v1",
+                    "transport": "local",
+                },
+                "observed_at_unix": clock[0],
+            }
+
+        with (
+            patch.object(tasks, "_now", side_effect=lambda: clock[0]),
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(tasks, "_observe", side_effect=probe) as observed,
+            patch.object(
+                tasks, "_set_state",
+                side_effect=AssertionError("READ_ONLY must not change task state"),
+            ),
+            patch.object(
+                tasks, "_maintain_record_resources",
+                side_effect=AssertionError("READ_ONLY must not maintain leases"),
+            ),
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                result = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        observed.assert_called_once()
+        self.assertEqual("invalid_or_stale", result["status"])
+
     def test_reconcile_ready_preserves_quiescent_local_terminal_liveness(self) -> None:
         # A subsequent fix for restarted local units must still allow a truly
         # quiescent, locally observed terminal task to prove readiness. This

@@ -12193,6 +12193,10 @@ def _task_reconcile_ready_evidence_snapshot(
                 )
             if resource_now is None or resource_now["revision"] != proof["resource_revision"]:
                 return {"status": "stale"}
+        # External systemd probes can outlast the proof TTL. Recheck the
+        # proof age after all live observations and revision validations.
+        if not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS:
+            return {"status": "invalid_or_stale"}
         return {"status": "verified", "reconciled_at_unix": timestamp}
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, sqlite3.Error) as exc:
         return {"status": "unavailable", "error_type": type(exc).__name__}
