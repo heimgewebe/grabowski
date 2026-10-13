@@ -787,6 +787,103 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             lower_bound,
         )
 
+    def test_origin_main_renewal_requires_live_exact_lease_snapshots(self) -> None:
+        deploy = real_deploy
+        names = ("operation_key", "canonical_key", "common_dir_key",
+                 "objects_key", "origin_main_ref_key")
+        plan = {
+            "owner_id": "fixture:post-audit",
+            **{name: f"fixture:{name}" for name in names},
+        }
+        keys = [plan[name] for name in names]
+        expires = int(deploy.time.time()) + 120
+        prior = [
+            {
+                "resource_key": key, "owner_id": plan["owner_id"],
+                "acquired_at_unix": 1, "updated_at_unix": 2,
+                "expires_at_unix": expires, "metadata_sha256": "a" * 64,
+            }
+            for key in keys
+        ]
+        newer = [{**lease, "expires_at_unix": expires + 1800} for lease in prior]
+        resources = types.ModuleType("grabowski_resources")
+        resources.renew_resources = Mock(return_value={
+            "owner_id": plan["owner_id"], "snapshot_guarded": True,
+            "leases": newer,
+        })
+        with patch.dict(sys.modules, {"grabowski_resources": resources}):
+            renewal = deploy._renew_origin_main_refresh_resources(
+                plan, keys, {"leases": prior}
+            )
+        self.assertEqual(newer, renewal["leases"])
+        resources.renew_resources.assert_called_once_with(
+            plan["owner_id"], keys,
+            ttl_seconds=deploy.ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS,
+            expected_leases=prior,
+        )
+        for malformed in (
+            {"owner_id": plan["owner_id"], "snapshot_guarded": False,
+             "leases": newer},
+            {"owner_id": plan["owner_id"], "snapshot_guarded": True,
+             "leases": newer[:-1]},
+            {"owner_id": plan["owner_id"], "snapshot_guarded": True,
+             "leases": [{**lease, "expires_at_unix": 0} for lease in newer]},
+        ):
+            with (
+                self.subTest(malformed=malformed),
+                patch.object(resources, "renew_resources", return_value=malformed),
+                patch.dict(sys.modules, {"grabowski_resources": resources}),
+            ):
+                with self.assertRaises(deploy.DeploySchedulePreEffectRefusal):
+                    deploy._renew_origin_main_refresh_resources(
+                        plan, keys, {"leases": prior}
+                    )
+
+    def test_expired_origin_main_leases_block_git_before_fetch_after_audit(self) -> None:
+        deploy = real_deploy
+        expected = "b" * 40
+        repo = Path("/fixture/canonical")
+        snapshot = {
+            "canonical_repository": str(repo), "current_head": "a" * 40,
+            "current_branch": "main", "target_head": expected,
+            "origin_main": "c" * 40, "clean": True,
+            "shallow": False, "target_object_present": False,
+        }
+        fields = ("operation_key", "canonical_key", "common_dir_key",
+                  "objects_key", "origin_main_ref_key")
+        plan = {
+            "canonical_repository": repo, "owner_id": "fixture:after-audit",
+            **{key: f"fixture:{key}" for key in fields},
+        }
+        leases = [{"resource_key": plan[key]} for key in fields]
+        tracker: dict = {}
+        with (
+            patch.object(deploy, "_origin_main_refresh_plan", return_value=plan),
+            patch.object(deploy, "_acquire_origin_main_refresh_resources",
+                         return_value={"leases": leases}),
+            patch.object(deploy, "_lease_for_key",
+                         side_effect=lambda _acq, key: {"resource_key": key}),
+            patch.object(deploy, "_require_origin_main_refresh_checkout_certainty"),
+            patch.object(deploy, "_canonical_main_refresh_candidate", return_value=snapshot),
+            patch.object(deploy, "_git_result", return_value=self._git_success("sha1")),
+            patch.object(deploy, "_fresh_public_github_main", return_value=expected),
+            patch.object(deploy, "_append_deploy_audit") as audit,
+            patch.object(deploy, "_renew_origin_main_refresh_resources",
+                         side_effect=RuntimeError("Resource lease has expired")) as renew,
+            patch.object(deploy, "_mutating_git_result") as fetch,
+            patch.object(deploy, "_release_origin_main_refresh_resources",
+                         return_value={"released": leases}) as close,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Resource lease has expired"):
+                deploy._fetch_exact_release_admission_target(
+                    expected, snapshot, local_mutation_tracker=tracker
+                )
+        audit.assert_called_once()
+        renew.assert_called_once()
+        fetch.assert_not_called()
+        close.assert_called_once()
+        self.assertEqual({}, tracker)
+
     def test_exact_target_fetch_preserves_refs_and_oid_format(self) -> None:
         deploy = real_deploy
         repository = Path("/fixture/canonical")
@@ -842,6 +939,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                     patch.object(
                         deploy, "_fresh_public_github_main", return_value=expected,
                     ) as remote,
+                    patch.object(deploy, "_renew_origin_main_refresh_resources",
+                                 return_value={"leases": []}, create=True) as renew,
                     patch.object(deploy, "_append_deploy_audit") as audit,
                     patch.object(
                         deploy, "_mutating_git_result",
@@ -855,8 +954,9 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                     deploy._fetch_exact_release_admission_target(
                         expected, snapshot, local_mutation_tracker=state
                     )
-                self.assertEqual(2, remote.call_count)
+                self.assertEqual(3, remote.call_count)
                 self.assertEqual(2, audit.call_count)
+                renew.assert_called_once()
                 self.assertEqual("fetch", git_mutate.call_args.args[1])
                 self.assertIn("--no-write-fetch-head", git_mutate.call_args.args)
                 self.assertNotIn("update-ref", git_mutate.call_args.args)
@@ -912,6 +1012,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             patch.object(deploy, "_git_result", side_effect=read),
             patch.object(deploy, "_fresh_public_github_main",
                          return_value=expected),
+            patch.object(deploy, "_renew_origin_main_refresh_resources",
+                         return_value={"leases": []}, create=True) as renew,
             patch.object(deploy, "_append_deploy_audit") as audit,
             patch.object(deploy, "_mutating_git_result",
                          return_value=self._git_success("")),
@@ -1024,6 +1126,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                              return_value=self._git_success("sha1")),
                 patch.object(deploy, "_fresh_public_github_main",
                              return_value=expected),
+                patch.object(deploy, "_renew_origin_main_refresh_resources",
+                             return_value={"leases": []}, create=True) as renew,
                 patch.object(deploy, "_append_deploy_audit") as audit,
                 patch.object(deploy, "_mutating_git_result",
                              side_effect=error) as git_mutate,
@@ -1079,6 +1183,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                          return_value=self._git_success("sha1")),
             patch.object(deploy, "_fresh_public_github_main",
                          return_value=expected),
+            patch.object(deploy, "_renew_origin_main_refresh_resources",
+                         return_value={"leases": []}, create=True) as renew,
             patch.object(deploy, "_append_deploy_audit"),
             patch.object(deploy, "_mutating_git_result",
                          return_value=result),

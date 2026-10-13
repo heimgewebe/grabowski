@@ -3057,6 +3057,52 @@ def _require_origin_main_refresh_checkout_certainty(plan: dict[str, Any]) -> Non
             "protected-main ref refresh is blocked before mutation by checkout uncertainty"
         ) from exc
 
+def _renew_origin_main_refresh_resources(
+    plan: dict[str, Any],
+    resource_keys: list[str],
+    acquisition: dict[str, Any],
+) -> dict[str, Any]:
+    """Prove the exact ODB/ref lease generation remains live before Git writes.
+
+    Audit-lock contention can outlast the initial TTL. Renewal must be
+    snapshot-bound; a reclaimed or expired lease is a pre-fetch denial.
+    """
+    import grabowski_resources as resources
+
+    original = [_lease_for_key(acquisition, key) for key in resource_keys]
+    renewed = resources.renew_resources(
+        plan["owner_id"],
+        resource_keys,
+        ttl_seconds=ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS,
+        expected_leases=original,
+    )
+    if (
+        not isinstance(renewed, dict)
+        or renewed.get("snapshot_guarded") is not True
+        or renewed.get("owner_id") != plan["owner_id"]
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "protected object-import lease renewal is unproved"
+        )
+    leases = renewed.get("leases")
+    if (
+        not isinstance(leases, list)
+        or len(leases) != len(resource_keys)
+        or any(
+            not isinstance(lease, dict)
+            or lease.get("owner_id") != plan["owner_id"]
+            or type(lease.get("expires_at_unix")) is not int
+            or lease["expires_at_unix"] <= int(time.time())
+            for lease in leases
+        )
+        or {lease["resource_key"] for lease in leases} != set(resource_keys)
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "protected object-import renewed lease identity is invalid"
+        )
+    return renewed
+
+
 def _release_origin_main_refresh_resources(
     plan: dict[str, Any],
     resource_keys: list[str],
@@ -3194,6 +3240,18 @@ def _fetch_exact_release_admission_target(
             "public_github_main": public_before,
             "previous_origin_main": locked["origin_main"],
         })
+        # The audit append retries lock contention without a time bound. A
+        # lease acquired before that wait may have expired or been reclaimed:
+        # validate and renew its exact snapshots *after* the wait and before
+        # the first possibly effectful Git fetch. Finally must release the
+        # renewed, not the stale, generation.
+        acquisition = _renew_origin_main_refresh_resources(
+            plan, resource_keys, acquisition
+        )
+        if _fresh_public_github_main(expected_head) != expected_head:
+            raise DeploySchedulePreEffectRefusal(
+                "release admission object import public main drifted during audit wait"
+            )
         # Once a fetch begins its outcome can be uncertain even if the command
         # fails. Persist that distinction instead of calling it no effect.
         local_mutation_tracker["admission_target_fetch"] = {
