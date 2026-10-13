@@ -1305,42 +1305,34 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
 
 
 
-    def test_captain_missing_exact_public_target_defers_only_object_import(self) -> None:
-        """A Captain preview may only probe the exact OID via safe Git plumbing."""
+    def test_captain_missing_target_cannot_pass_review_or_launch_any_effect(self) -> None:
+        """Missing ancestry is not a provisional R3/Rootbroker authorization."""
         deploy = real_deploy
         expected = "b" * 40
-        absent = self._git_success("")
-        absent["returncode"] = 1
-        denial = deploy.DeploySchedulePreEffectRefusal(
+        denied = deploy.DeploySchedulePreEffectRefusal(
             "release admission blocked: source ancestry is unproved"
         )
         with (
-            patch.object(deploy, "_require_release_source_admission", side_effect=denial) as admit,
-            patch.object(deploy, "_git_result", return_value=absent) as git_read,
+            patch.object(deploy, "_require_release_source_admission", side_effect=denied) as admit,
+            patch.object(deploy, "_git_result") as git_read,
             patch.object(deploy, "_canonical_main_refresh_candidate") as porcelain,
-            patch.object(deploy, "_fresh_public_github_main", return_value=expected) as public,
+            patch.object(deploy, "_fresh_public_github_main") as public,
             patch.object(deploy, "_fetch_exact_release_admission_target") as fetch,
             patch.object(deploy.privileged, "ensure_rootbroker_authority") as rootbroker,
         ):
             gate = grips._captain_independent_review_gate(
                 {"expected_head": expected}, [{"action": "runtime-deploy"}],
             )
-        self.assertEqual("pass", gate["status"])
-        self.assertIsNone(gate["details"]["required"])
-        self.assertIs(gate["details"]["protected_import_pending"], True)
-        self.assertIs(gate["details"]["release_authorized"], False)
-        self.assertIs(gate["details"]["full_readmission_required"], True)
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn("source ancestry", str(gate.get("details")))
         admit.assert_called_once_with(expected)
-        git_read.assert_called_once_with(
-            deploy.CANONICAL_REPOSITORY,
-            "rev-parse", "--verify", "--quiet", f"{expected}^{{commit}}",
-        )
+        git_read.assert_not_called()
         porcelain.assert_not_called()
-        public.assert_called_once_with(expected)
+        public.assert_not_called()
         fetch.assert_not_called()
         rootbroker.assert_not_called()
 
-    def test_captain_missing_target_requires_exact_plumbing_and_public_main(self) -> None:
+    def test_captain_missing_target_rejects_even_ambiguous_plumbing_or_public_main(self) -> None:
         deploy = real_deploy
         expected = "b" * 40
         denied = deploy.DeploySchedulePreEffectRefusal(
@@ -1363,9 +1355,9 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             with (
                 self.subTest(case=label),
                 patch.object(deploy, "_require_release_source_admission", side_effect=denied),
-                patch.object(deploy, "_git_result", return_value=result),
+                patch.object(deploy, "_git_result", return_value=result) as git_read,
                 patch.object(deploy, "_canonical_main_refresh_candidate") as porcelain,
-                patch.object(deploy, "_fresh_public_github_main", return_value=remote),
+                patch.object(deploy, "_fresh_public_github_main", return_value=remote) as public,
                 patch.object(deploy, "_fetch_exact_release_admission_target") as fetch,
             ):
                 gate = grips._captain_independent_review_gate(
@@ -1374,6 +1366,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             self.assertEqual("blocked", gate["status"])
             porcelain.assert_not_called()
             fetch.assert_not_called()
+            git_read.assert_not_called()
+            public.assert_not_called()
 
     def test_source_diff_without_explicit_transport_completeness_blocks(self) -> None:
         deploy = real_deploy

@@ -13807,64 +13807,12 @@ def _captain_independent_review_gate(
             import grabowski_self_deploy as release_deploy
 
             expected_head = parameters.get("expected_head")
-            try:
-                release = release_deploy._require_release_source_admission(expected_head)
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                # The local ODB can lag behind authenticated public main. The
-                # scheduler's bounded lease-protected object import is the only
-                # allowed continuation; no source-changing release is admitted
-                # here, and the scheduler must redo the *whole* policy before
-                # any Rootbroker or dispatch effect.
-                if (
-                    type(exc) is not getattr(
-                        release_deploy, "DeploySchedulePreEffectRefusal", None
-                    )
-                    or str(exc) != "release admission blocked: source ancestry is unproved"
-                ):
-                    raise
-                if not _is_hex_sha(expected_head, lengths=(40, 64)):
-                    raise
-                # A Captain preflight must never call porcelain `git status`:
-                # repository clean/process filters can have side effects.
-                # Only bounded Git plumbing may establish that the *exact*
-                # public target commit is absent. The scheduler later checks
-                # checkout/ref/worktree identity under its own locks, imports
-                # the exact object if needed and re-runs all release gates.
-                probe = release_deploy._git_result(
-                    release_deploy.CANONICAL_REPOSITORY,
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    f"{expected_head}^{{commit}}",
-                )
-                if (
-                    not isinstance(probe, dict)
-                    or type(probe.get("returncode")) is not int
-                    or probe["returncode"] != 1
-                    or probe.get("timed_out") is not False
-                    or probe.get("stdout_truncated") is not False
-                    or probe.get("stderr_truncated") is not False
-                    or probe.get("stdout") != ""
-                    or probe.get("stderr") != ""
-                    or release_deploy._fresh_public_github_main(expected_head) != expected_head
-                ):
-                    raise release_deploy.DeploySchedulePreEffectRefusal(
-                        "release admission object import preflight identity drift"
-                    ) from exc
-                return _captain_gate(
-                    "independent-review-policy",
-                    "pass",
-                    "only a protected exact Git object import may proceed; "
-                    "critical release R3/CI admission is not yet established",
-                    {
-                        "required": None,
-                        "protected_import_pending": True,
-                        "release_authorized": False,
-                        "full_readmission_required": True,
-                        "release_source_status": "exact-public-main-object-pending",
-                        "target_head": expected_head,
-                    },
-                )
+            # A missing object or unproven ancestry is never an independent
+            # release-review PASS. Do not probe an unleased canonical ODB or
+            # let a delayed worker infer authority from provisional metadata.
+            # Exact object import remains a separate protected scheduler
+            # operation, not an authorized runtime deployment.
+            release = release_deploy._require_release_source_admission(expected_head)
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             return _captain_gate(
                 "independent-review-policy",
