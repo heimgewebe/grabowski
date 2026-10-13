@@ -16433,7 +16433,7 @@ def _runtime_deploy_local_mutation_evidence_valid(
         # can both occur in one legitimate schedule attempt and must preserve
         # two individually checked, digest-bound mutation receipts. The two
         # alternative refresh representations remain mutually exclusive.
-        "grabowski_runtime_deploy_origin_main_fetch_effect": 1,
+        "grabowski_runtime_deploy_origin_main_fetch_effect": -2,
         "grabowski_runtime_deploy_origin_main_refresh": 2,
         "grabowski_runtime_deploy_origin_main_refresh_effect": 2,
         "grabowski_runtime_deploy_rootbroker_authority_effect": 3,

@@ -5559,6 +5559,51 @@ def _recovered_auto_deploy_source_binding(
 
 
 
+def _release_documentation_raw_paths(raw_records: str) -> list[str]:
+    """Accept only complete NUL-delimited raw Git changes to plain documents."""
+    if raw_records and not raw_records.endswith("\x00"):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: source path boundary is incomplete"
+        )
+    frames = raw_records[:-1].split("\x00") if raw_records else []
+    if len(frames) % 2 or len(frames) > 8192:
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: source raw diff boundary is incomplete"
+        )
+    changed_paths: list[str] = []
+    for header, path in zip(frames[::2], frames[1::2], strict=True):
+        if (
+            not path or path.startswith("/") or "\ufffd" in path
+            or "<REDACTED>" in path or "\\" in path
+            or any(segment in {"", ".", ".."} for segment in path.split("/"))
+            or any(ord(char) < 32 or ord(char) == 127 for char in path)
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: source paths are ambiguous"
+            )
+        record = re.fullmatch(
+            r":([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}|[0-9a-f]{64}) "
+            r"([0-9a-f]{40}|[0-9a-f]{64}) ([ADM])",
+            header,
+        )
+        if record is None:
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: source raw modes are unproved"
+            )
+        old_mode, new_mode, old_oid, new_oid, change = record.groups()
+        safe_transition = {
+            "A": ("000000", "100644"),
+            "D": ("100644", "000000"),
+            "M": ("100644", "100644"),
+        }
+        if len(old_oid) != len(new_oid) or (old_mode, new_mode) != safe_transition[change]:
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: source modes are not plain documents"
+            )
+        changed_paths.append(path)
+    return changed_paths
+
+
 def _require_release_source_admission(expected_head: str) -> dict[str, Any]:
     """Read-only release admission; never infer an independent R3 from main.
 
@@ -5631,7 +5676,8 @@ def _require_release_source_admission(expected_head: str) -> dict[str, Any]:
         "--no-textconv",
         "--no-renames",
         "--ignore-submodules=none",
-        "--name-only",
+        "--raw",
+        "--no-abbrev",
         "-z",
         serving_head,
         expected_head,
@@ -5649,25 +5695,7 @@ def _require_release_source_admission(expected_head: str) -> dict[str, Any]:
         raise DeploySchedulePreEffectRefusal(
             "release admission blocked: complete source diff is unavailable"
         )
-    raw_paths = observed["stdout"]
-    if raw_paths and not raw_paths.endswith("\x00"):
-        raise DeploySchedulePreEffectRefusal(
-            "release admission blocked: source path boundary is incomplete"
-        )
-    changed_paths = raw_paths[:-1].split("\x00") if raw_paths else []
-    if any(
-        not path
-        or path.startswith("/")
-        or "\ufffd" in path
-        or "<REDACTED>" in path
-        or "\\" in path
-        or any(component in {"", ".", ".."} for component in path.split("/"))
-        or any(ord(character) < 32 or ord(character) == 127 for character in path)
-        for path in changed_paths
-    ):
-        raise DeploySchedulePreEffectRefusal(
-            "release admission blocked: source paths are ambiguous"
-        )
+    changed_paths = _release_documentation_raw_paths(observed["stdout"])
     # Only pure documentation delta is exempt; unknown files, test or CI
     # policy, executables, tools and runtime sources all fail closed.
     # Even inside docs/, executable or configuration files are not inherently
@@ -5922,18 +5950,16 @@ def _grabowski_runtime_deploy_schedule_impl(
                     local_mutation_evidence=combined_evidence,
                 ) from exc
             except DeploySchedulePreEffectRefusal as exc:
-                reconciliation = inflight_before_resolution.get(
-                    "stale_pending_reconciliation"
+                # Do not discard an earlier object-import or index mutation
+                # when a later protected ref refresh is refused before effect.
+                evidence = _tracked_runtime_deploy_local_mutation_evidence(
+                    local_mutation_tracker
                 )
-                if reconciliation is None:
+                if evidence is None:
                     raise
-                if not isinstance(reconciliation, dict):
-                    raise RuntimeError(
-                        "stale pending reconciliation evidence is malformed"
-                    ) from exc
                 raise DeploySchedulePreEffectRefusal(
                     str(exc),
-                    local_mutation_evidence=reconciliation,
+                    local_mutation_evidence=evidence,
                 ) from exc
             if not automatic_source_needed:
                 repository, runner, source_identity = _deployment_source_preflight(

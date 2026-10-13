@@ -194,6 +194,10 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         }
 
     @staticmethod
+    def _raw_change(path: str) -> str:
+        return f":100644 100644 {'a'*40} {'b'*40} M\x00{path}\x00"
+
+    @staticmethod
     def _deployed() -> dict[str, object]:
         return {
             "release_id": "existing-protected-release",
@@ -212,6 +216,136 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             "process_repo_head": "a" * 40,
         }
 
+    def test_docs_git_modes_must_be_plain_regular_files(self) -> None:
+        """A docs/*.md suffix cannot legalize an executable, symlink or gitlink."""
+        deploy = real_deploy
+        def raw(old: str, new: str, status: str) -> str:
+            return f":{old} {new} {'0'*40} {'a'*40} {status}\x00docs/guide.md\x00"
+        for before, after, status, allowed in (
+            ("000000", "100644", "A", True),
+            ("100644", "100644", "M", True),
+            ("100644", "000000", "D", True),
+            ("000000", "100755", "A", False),
+            ("000000", "120000", "A", False),
+            ("000000", "160000", "A", False),
+            ("100644", "100755", "M", False),
+            ("120000", "100644", "T", False),
+        ):
+            with (
+                self.subTest(before=before, after=after, status=status),
+                patch.object(deploy.base, "_deployment_metadata", return_value=self._deployed()),
+                patch.object(deploy.serving_process, "identity", return_value=self._serving()),
+                patch.object(deploy, "_git_result", side_effect=[
+                    self._git_success(""), self._git_success(raw(before, after, status)),
+                ]),
+            ):
+                if allowed:
+                    self.assertEqual(
+                        "non-runtime-documentation",
+                        deploy._require_release_source_admission("b"*40)["status"],
+                    )
+                else:
+                    with self.assertRaises(deploy.DeploySchedulePreEffectRefusal):
+                        deploy._require_release_source_admission("b"*40)
+
+    def test_import_effect_precedes_index_reconciliation_in_captain_bundle(self) -> None:
+        """The literal tracker emission order must be accepted, not forged."""
+        head = "b"*40
+        resources = {
+            "canonical_repository": "/fixture/canonical",
+            "expected_head": head, "previous_head": "a"*40,
+            "previous_branch": "main", "previous_origin_main": "c"*40,
+            "owner_id": "owner:fixture",
+            "operation_resource_key": "operation:test",
+            "canonical_resource_key": "path:/fixture/canonical",
+            "common_dir_resource_key": "path:/fixture/canonical/.git",
+            "objects_resource_key": "path:/fixture/canonical/.git/objects",
+            "origin_main_ref_resource_key": "path:/fixture/canonical/.git/refs/remotes/origin/main",
+        }
+        imported_material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_origin_main_fetch_effect",
+            **resources,
+            "target_object": {"before_fetch_present": False, "after_fetch_commit": head},
+            "fetch": {"returncode": 0, "timed_out": False},
+            "public_github_main": {"before_fetch": head},
+            "effect_observed": True,
+        }
+        imported = {**imported_material, "evidence_sha256": grips.sha256_json(imported_material)}
+        promotion = {"schema_version": 1, "kind": "grabowski_runtime_deploy_pending_unit_promotion"}
+        reconciliation = {"schema_version": 1, "kind": "grabowski_runtime_deploy_stale_pending_reconciliation"}
+        def accepts(effects):
+            material = {
+                "schema_version": 1,
+                "kind": "grabowski_runtime_deploy_local_mutation_bundle",
+                "effects": effects,
+            }
+            bundle = {**material, "evidence_sha256": grips.sha256_json(material)}
+            return grips._runtime_deploy_local_mutation_evidence_valid(
+                bundle, expected_head=head, expected_job_prefix="grabowski-job-"
+            )
+        with (
+            patch.object(grips, "_runtime_deploy_pending_unit_promotion_valid",
+                         side_effect=lambda evidence, **kwargs: isinstance(evidence, dict) and
+                         evidence.get("kind") == "grabowski_runtime_deploy_pending_unit_promotion"),
+            patch.object(grips, "_runtime_deploy_stale_pending_reconciliation_valid",
+                         side_effect=lambda evidence, **kwargs: isinstance(evidence, dict) and
+                         evidence.get("kind") == "grabowski_runtime_deploy_stale_pending_reconciliation"),
+        ):
+            self.assertTrue(accepts([imported, promotion]))
+            self.assertTrue(accepts([imported, reconciliation]))
+            self.assertTrue(accepts([imported, promotion, reconciliation]))
+            self.assertFalse(accepts([promotion, imported]))
+            self.assertFalse(accepts([imported, promotion, promotion]))
+
+    def test_import_evidence_survives_ref_refresh_preeffect_denial(self) -> None:
+        """An already completed object import is not lost on a later typed refusal."""
+        deploy = real_deploy
+        expected = "b"*40
+        imported = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_origin_main_fetch_effect",
+            "expected_head": expected,
+            "evidence_sha256": "a"*64,
+        }
+        reconciliation = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
+            "evidence_sha256": "c"*64,
+        }
+        tracker = {"admission_target_fetch": imported}
+        candidate = {
+            "origin_main": "c"*40,
+            "current_head": expected,
+            "current_branch": "main",
+            "canonical_repository": str(deploy.CANONICAL_REPOSITORY),
+        }
+        with (
+            patch.object(deploy, "_require_release_source_admission", return_value={}),
+            patch.object(deploy, "_deploy_schedule_lock", return_value=nullcontext()),
+            patch.object(deploy, "_fresh_public_github_main", return_value=expected),
+            patch.object(deploy, "_deployment_source_preflight",
+                         side_effect=RuntimeError("canonical source drift")),
+            patch.object(deploy, "_canonical_stale_main_snapshot",
+                         side_effect=RuntimeError("stale main")),
+            patch.object(deploy, "_canonical_main_refresh_candidate", return_value=candidate),
+            patch.object(deploy, "inflight_runtime_job_evidence", return_value={
+                "error": None, "inflight_units": [],
+                "stale_pending_reconciliation": reconciliation,
+            }),
+            patch.object(deploy, "_refresh_canonical_origin_main",
+                         side_effect=deploy.DeploySchedulePreEffectRefusal("ref locked")),
+            patch.object(deploy.privileged, "ensure_rootbroker_authority") as broker,
+        ):
+            with self.assertRaises(deploy.DeploySchedulePreEffectRefusal) as blocked:
+                deploy._grabowski_runtime_deploy_schedule_impl(
+                    expected, local_mutation_tracker=tracker
+                )
+        record = blocked.exception.local_mutation_evidence
+        self.assertEqual("grabowski_runtime_deploy_local_mutation_bundle", record["kind"])
+        self.assertEqual([imported, reconciliation], record["effects"])
+        broker.assert_not_called()
+
     def test_critical_source_change_requires_authentic_release_admission(self) -> None:
         import grabowski_self_deploy as deploy
         with (
@@ -222,7 +356,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 "_git_result",
                 side_effect=[
                     self._git_success(""),
-                    self._git_success("src/grabowski_agent_role.py\x00tests/test_agent_role_grok.py\x00"),
+                    self._git_success(self._raw_change('src/grabowski_agent_role.py') + self._raw_change('tests/test_agent_role_grok.py')),
                 ],
             ),
         ):
@@ -237,7 +371,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             patch.object(
                 deploy,
                 "_git_result",
-                side_effect=[self._git_success(""), self._git_success("docs/guide.md\x00")],
+                side_effect=[self._git_success(""), self._git_success(self._raw_change('docs/guide.md'))],
             ),
         ):
             record = deploy._require_release_source_admission("b" * 40)
@@ -1138,7 +1272,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 "_git_result",
                 side_effect=[
                     self._git_success(""),
-                    self._git_success("docs/../src/grabowski_agent_role.py\x00"),
+                    self._git_success(self._raw_change('docs/../src/grabowski_agent_role.py')),
                 ],
             ),
         ):
@@ -1173,7 +1307,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 "_git_result",
                 side_effect=[
                     self._git_success(""),
-                    self._git_success("docs/<REDACTED>\x00"),
+                    self._git_success(self._raw_change('docs/<REDACTED>')),
                 ],
             ),
         ):
@@ -1190,7 +1324,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 "_git_result",
                 side_effect=[
                     self._git_success(""),
-                    self._git_success("docs/run_deploy.sh\x00"),
+                    self._git_success(self._raw_change('docs/run_deploy.sh')),
                 ],
             ),
         ):
