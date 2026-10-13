@@ -1367,12 +1367,14 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         This proves the kernel boundary, not server task-admission authority.
         """
         import subprocess
+        import sys
         from pathlib import Path
         import grabowski_agent_role as agent_role
 
         tasks.agent_sandbox.require_bwrap()
-        runtime = Path(tasks.GRABOWSKI_RUNTIME_PYTHON)
-        self.assertTrue(runtime.is_file(), "runtime venv missing from target host")
+        # make test isolates HOME; the real selected Python runtime is not below it.
+        runtime = Path(sys.executable)
+        self.assertTrue(runtime.is_file(), "selected test runtime missing from target host")
 
         repo = self.root / "isolated-role-source"
         repo.mkdir()
