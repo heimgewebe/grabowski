@@ -6634,6 +6634,78 @@ def _effective_observed_state(record: dict[str, Any], observed_state: str) -> st
     return stored_state if _is_terminal_state(stored_state) else observed_state
 
 
+def _attested_local_revoked_task_unit(
+    record: dict[str, Any], *, post_stop: bool = False,
+) -> dict[str, Any]:
+    """Read an exact local task unit without treating a missing fleet as authority.
+
+    Stop-only recovery for a previously persisted literal local task. This
+    never authorizes a start, resume, network route, or a restored resource lease.
+    """
+    task_id = _validate_task_id(str(record["task_id"]))
+    attempt = record.get("attempt")
+    if (
+        record.get("host") != "local"
+        or _execution_backend(record) != "systemd-user"
+        or _systemd_scope(record) != "user"
+        or type(attempt) is not int
+        or attempt < 1
+        or _authoritative_unit(record) != _task_unit(task_id, attempt)
+    ):
+        raise RuntimeError("missing-fleet fallback lacks local task identity")
+    unit = _authoritative_unit(record)
+    description = operator._systemd_safe_description(
+        "task", unit, str(record["argv_sha256"]),
+    )
+    result = operator._run(
+        [
+            "systemctl", "--user", "show", unit, "--no-pager",
+            "--property=Id", "--property=Description",
+            "--property=LoadState", "--property=ActiveState",
+            "--property=SubState", "--property=MainPID",
+        ],
+        cwd=operator.HOME, timeout_seconds=30, max_output_bytes=8192,
+    )
+    if (
+        result.get("returncode") != 0
+        or result.get("outcome_unknown") is True
+        or not isinstance(result.get("stdout"), str)
+    ):
+        raise RuntimeError("missing-fleet local unit observation unavailable")
+    properties: dict[str, str] = {}
+    for line in result["stdout"].splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            properties[key] = value
+    disappeared = (
+        post_stop
+        and properties.get("LoadState") == "not-found"
+        and properties.get("ActiveState") == "inactive"
+        and properties.get("SubState") == "dead"
+        and properties.get("MainPID") == "0"
+    )
+    if (
+        properties.get("Id") != unit
+        or not disappeared
+        and (
+            properties.get("Description") != description
+            or properties.get("LoadState") != "loaded"
+        )
+    ):
+        raise RuntimeError("missing-fleet local unit is not the attested task")
+    stopped = (
+        properties.get("ActiveState") in {"inactive", "failed"}
+        and properties.get("SubState") in {"dead", "failed"}
+        and properties.get("MainPID") == "0"
+    )
+    return {
+        "state": "cancelled" if stopped else "running",
+        "properties": properties,
+        "observer": {"kind": "attested-local-systemd-stop-recovery-v1"},
+        "observed_at_unix": _now(),
+    }
+
+
 def _stop_task_after_lease_revocation(record: dict[str, Any]) -> dict[str, Any]:
     """Stop the authoritative systemd cgroup before treating a lost lease as inert.
 
@@ -6670,6 +6742,36 @@ def _stop_task_after_lease_revocation(record: dict[str, Any]) -> dict[str, Any]:
             observed = _observe(record)
     except Exception as exc:
         error = _redact_reason(f"{type(exc).__name__}: {exc}")
+        # Fleet configuration can disappear after an admitted local task has
+        # started. That must not leave a still-running cgroup uncontrolled.
+        # The alternate path requires the *exact* local unit description.
+        if isinstance(exc, RuntimeError) and str(exc).startswith("Fleet registry missing:"):
+            try:
+                before = _attested_local_revoked_task_unit(record)
+                if before["state"] == "running":
+                    result = operator._run_mutating_user_systemd_unit(
+                        _authoritative_unit(record), "stop",
+                        mutation_timeout_seconds=60,
+                        max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+                    )
+                    if (
+                        isinstance(result, dict)
+                        and result.get("returncode") == 0
+                        and result.get("outcome_unknown") is not True
+                    ):
+                        observed = _attested_local_revoked_task_unit(
+                            record, post_stop=True,
+                        )
+                        error = None
+                else:
+                    result = {"returncode": 0, "outcome_unknown": False}
+                    observed = before
+                    error = None
+            except Exception as fallback_exc:
+                error = _redact_reason(
+                    f"{type(exc).__name__}: {exc}; "
+                    f"local-stop-recovery={type(fallback_exc).__name__}: {fallback_exc}"
+                )
     properties = observed.get("properties") if isinstance(observed, dict) else None
     stop_verified = bool(
         isinstance(properties, dict)

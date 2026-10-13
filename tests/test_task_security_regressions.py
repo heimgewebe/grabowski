@@ -654,8 +654,13 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             self.skipTest("user systemd bus unavailable; run E2E on Heim-PC")
         identifier = uuid.uuid4().hex[:24]
         unit = tasks._task_unit(identifier, 1)
+        argv_digest = "a" * 64
+        description = tasks.operator._systemd_safe_description(
+            "task", unit, argv_digest,
+        )
         launched = subprocess.run(
-            ["systemd-run", "--user", "--unit=" + unit,
+            ["systemd-run", "--user", "--description=" + description,
+             "--unit=" + unit,
              "--property=Type=exec",
              "--property=KillMode=control-group",
              "--property=RuntimeMaxSec=12s",
@@ -681,14 +686,19 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             record = {
                 "task_id": identifier, "unit": unit,
                 "authoritative_unit": unit, "host": "local",
+                "attempt": 1, "argv_sha256": argv_digest,
                 "execution_backend": "systemd-user",
                 "systemd_scope": "user", "runtime_seconds": 12,
                 "lease_owner_id": f"task:{identifier}",
                 "resource_keys_json": tasks._canonical_json([key]),
             }
-            # The synthetic task is explicitly local, but make test gives
-            # this process an isolated HOME without a fleet registry.
-            with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            # Reproduce the real lost-registry failure, not an invented
+            # replacement fleet host. The already-active unit is attested
+            # through systemd's exact persisted task id and argv digest.
+            with patch.object(
+                tasks.fleet, "fleet_host",
+                side_effect=RuntimeError("Fleet registry missing: isolated test HOME"),
+            ):
                 maintenance = tasks._maintain_record_resources(record, "running")
             self.assertIsNotNone(maintenance)
             self.assertIs(maintenance["maintained"], False)
@@ -709,6 +719,37 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 ["systemctl", "--user", "stop", unit],
                 capture_output=True, text=True, timeout=15, check=False,
             )
+
+
+    def test_missing_fleet_wrong_local_unit_identity_never_stops(self) -> None:
+        task_id = "b" * 24
+        record = {
+            "task_id": task_id,
+            "unit": tasks._task_unit(task_id, 1),
+            "authoritative_unit": tasks._task_unit(task_id, 1),
+            "host": "local",
+            "attempt": 1,
+            "argv_sha256": "c" * 64,
+            "execution_backend": "systemd-user",
+            "systemd_scope": "user",
+        }
+        wrong = {
+            "returncode": 0,
+            "stdout": (
+                f"Id={record['unit']}\\n"
+                "Description=forged or unrelated task\\n"
+                "LoadState=loaded\\nActiveState=active\\n"
+                "SubState=running\\nMainPID=54321\\n"
+            ),
+        }
+        with patch.object(tasks.operator, "_run", return_value=wrong), patch.object(
+            tasks.operator, "_run_mutating_user_systemd_unit"
+        ) as stop:
+            with self.assertRaisesRegex(
+                RuntimeError, "not the attested task"
+            ):
+                tasks._attested_local_revoked_task_unit(record)
+        stop.assert_not_called()
 
 
     def test_revoked_running_task_lease_cannot_be_silently_reacquired(self) -> None:

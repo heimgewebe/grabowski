@@ -42,6 +42,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # The sandbox's AF_UNIX/io_uring regressions are *kernel* tests.
+      # Fail the runner if bubblewrap is absent; do not skip these tests.
+      - name: Install mandatory kernel sandbox dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap libseccomp2
+          test -x /usr/bin/bwrap
+          /usr/bin/bwrap --version
+
       - name: Install locked runtime dependencies
         run: >-
           python -m pip install --isolated --disable-pip-version-check --no-input
