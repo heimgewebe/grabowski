@@ -13824,12 +13824,28 @@ def _captain_independent_review_gate(
                     raise
                 if not _is_hex_sha(expected_head, lengths=(40, 64)):
                     raise
-                snapshot = release_deploy._canonical_main_refresh_candidate(expected_head)
+                # A Captain preflight must never call porcelain `git status`:
+                # repository clean/process filters can have side effects.
+                # Only bounded Git plumbing may establish that the *exact*
+                # public target commit is absent. The scheduler later checks
+                # checkout/ref/worktree identity under its own locks, imports
+                # the exact object if needed and re-runs all release gates.
+                probe = release_deploy._git_result(
+                    release_deploy.CANONICAL_REPOSITORY,
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    f"{expected_head}^{{commit}}",
+                )
                 if (
-                    not isinstance(snapshot, dict)
-                    or snapshot.get("canonical_repository") != str(release_deploy.CANONICAL_REPOSITORY)
-                    or snapshot.get("target_head") != expected_head
-                    or snapshot.get("target_object_present") is not False
+                    not isinstance(probe, dict)
+                    or type(probe.get("returncode")) is not int
+                    or probe["returncode"] != 1
+                    or probe.get("timed_out") is not False
+                    or probe.get("stdout_truncated") is not False
+                    or probe.get("stderr_truncated") is not False
+                    or probe.get("stdout") != ""
+                    or probe.get("stderr") != ""
                     or release_deploy._fresh_public_github_main(expected_head) != expected_head
                 ):
                     raise release_deploy.DeploySchedulePreEffectRefusal(

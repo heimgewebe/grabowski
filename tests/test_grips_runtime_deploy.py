@@ -315,6 +315,9 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         inflight.assert_not_called()
         rootbroker.assert_not_called()
 
+
+
+
     def test_missing_object_is_only_allowed_fetch_exception(self) -> None:
         deploy = real_deploy
         target = "b" * 40
@@ -545,6 +548,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 )
         plan.assert_not_called()
 
+
+
     def test_object_fetch_failure_is_ambiguity_not_release_success(self) -> None:
         deploy = real_deploy
         expected = "b" * 40
@@ -622,20 +627,18 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
 
 
     def test_captain_missing_exact_public_target_defers_only_object_import(self) -> None:
-        """Captain may schedule protected import, never claim an independent R3."""
+        """A Captain preview may only probe the exact OID via safe Git plumbing."""
         deploy = real_deploy
         expected = "b" * 40
-        snapshot = {
-            "canonical_repository": str(deploy.CANONICAL_REPOSITORY),
-            "target_head": expected,
-            "target_object_present": False,
-        }
+        absent = self._git_success("")
+        absent["returncode"] = 1
         denial = deploy.DeploySchedulePreEffectRefusal(
             "release admission blocked: source ancestry is unproved"
         )
         with (
             patch.object(deploy, "_require_release_source_admission", side_effect=denial) as admit,
-            patch.object(deploy, "_canonical_main_refresh_candidate", return_value=snapshot) as candidate,
+            patch.object(deploy, "_git_result", return_value=absent) as git_read,
+            patch.object(deploy, "_canonical_main_refresh_candidate") as porcelain,
             patch.object(deploy, "_fresh_public_github_main", return_value=expected) as public,
             patch.object(deploy, "_fetch_exact_release_admission_target") as fetch,
             patch.object(deploy.privileged, "ensure_rootbroker_authority") as rootbroker,
@@ -649,34 +652,40 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         self.assertIs(gate["details"]["release_authorized"], False)
         self.assertIs(gate["details"]["full_readmission_required"], True)
         admit.assert_called_once_with(expected)
-        candidate.assert_called_once_with(expected)
+        git_read.assert_called_once_with(
+            deploy.CANONICAL_REPOSITORY,
+            "rev-parse", "--verify", "--quiet", f"{expected}^{{commit}}",
+        )
+        porcelain.assert_not_called()
         public.assert_called_once_with(expected)
         fetch.assert_not_called()
         rootbroker.assert_not_called()
 
-    def test_captain_missing_target_deferred_path_fails_closed_on_any_drift(self) -> None:
+    def test_captain_missing_target_requires_exact_plumbing_and_public_main(self) -> None:
         deploy = real_deploy
         expected = "b" * 40
-        good = {
-            "canonical_repository": str(deploy.CANONICAL_REPOSITORY),
-            "target_head": expected,
-            "target_object_present": False,
-        }
-        denial = deploy.DeploySchedulePreEffectRefusal(
+        denied = deploy.DeploySchedulePreEffectRefusal(
             "release admission blocked: source ancestry is unproved"
         )
-        for snapshot, remote in (
-            ({**good, "target_object_present": True}, expected),
-            ({**good, "target_head": "c" * 40}, expected),
-            ({**good, "canonical_repository": "/tmp/untrusted"}, expected),
-            ({"target_object_present": False}, expected),
-            (None, expected),
-            (good, "c" * 40),
+        good = self._git_success("")
+        good["returncode"] = 1
+        cases = []
+        for key, value in (
+            ("returncode", 0), ("returncode", 2),
+            ("returncode", False), ("timed_out", True),
+            ("stdout", "spoof"), ("stderr", "object is unavailable"),
+            ("stdout_truncated", True), ("stderr_truncated", True),
         ):
+            altered = dict(good)
+            altered[key] = value
+            cases.append((key, altered, expected))
+        cases.append(("public-main-drift", good, "c" * 40))
+        for label, result, remote in cases:
             with (
-                self.subTest(snapshot=snapshot, remote=remote),
-                patch.object(deploy, "_require_release_source_admission", side_effect=denial),
-                patch.object(deploy, "_canonical_main_refresh_candidate", return_value=snapshot),
+                self.subTest(case=label),
+                patch.object(deploy, "_require_release_source_admission", side_effect=denied),
+                patch.object(deploy, "_git_result", return_value=result),
+                patch.object(deploy, "_canonical_main_refresh_candidate") as porcelain,
                 patch.object(deploy, "_fresh_public_github_main", return_value=remote),
                 patch.object(deploy, "_fetch_exact_release_admission_target") as fetch,
             ):
@@ -684,6 +693,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                     {"expected_head": expected}, [{"action": "runtime-deploy"}],
                 )
             self.assertEqual("blocked", gate["status"])
+            porcelain.assert_not_called()
             fetch.assert_not_called()
 
     def test_source_diff_without_explicit_transport_completeness_blocks(self) -> None:
