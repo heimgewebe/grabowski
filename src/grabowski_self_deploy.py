@@ -883,9 +883,15 @@ def _git_result(
     repository: Path,
     *arguments: str,
     max_output_bytes: int = 65_536,
+    c_locale: bool = False,
 ) -> dict[str, Any]:
+    command = read_surface._git_command(repository, *arguments)
+    if c_locale:
+        # Git diagnostics are localized. Use the stable C locale only when
+        # interpreting this exact fail-closed ancestry diagnostic.
+        command = ["/usr/bin/env", "LC_ALL=C", *command]
     return read_surface._run_read(
-        read_surface._git_command(repository, *arguments),
+        command,
         cwd=repository,
         timeout_seconds=30,
         max_output_bytes=max_output_bytes,
@@ -5743,7 +5749,8 @@ def _require_release_source_admission(expected_head: str) -> dict[str, Any]:
             "independent_review_required": False,
         }
     ancestor = _git_result(
-        CANONICAL_REPOSITORY, "merge-base", "--is-ancestor", serving_head, expected_head
+        CANONICAL_REPOSITORY, "merge-base", "--is-ancestor", serving_head, expected_head,
+        c_locale=True,
     )
     if (
         type(ancestor.get("returncode")) is not int

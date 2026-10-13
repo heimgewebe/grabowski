@@ -216,6 +216,29 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             "process_repo_head": "a" * 40,
         }
 
+    def test_release_ancestry_git_read_forces_c_locale_independent_of_host(self) -> None:
+        repository = Path("/fixture/canonical")
+        expected = "b" * 40
+        arguments = ("merge-base", "--is-ancestor", "a" * 40, expected)
+        with (
+            patch.dict("os.environ", {"LANG": "fr_FR.UTF-8", "LC_ALL": "fr_FR.UTF-8"}),
+            patch.object(
+                real_deploy.read_surface, "_run_read",
+                return_value=self._git_success(""),
+            ) as read,
+        ):
+            observed = real_deploy._git_result(
+                repository, *arguments, c_locale=True
+            )
+        self.assertEqual(observed["returncode"], 0)
+        read.assert_called_once_with(
+            ["/usr/bin/env", "LC_ALL=C",
+             *real_deploy.read_surface._git_command(repository, *arguments)],
+            cwd=repository,
+            timeout_seconds=30,
+            max_output_bytes=65_536,
+        )
+
     def test_only_exact_missing_target_with_present_serving_allows_import_path(self) -> None:
         """A failed merge-base never alone authorizes an ODB mutation."""
         deploy = real_deploy
@@ -258,6 +281,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 str(blocked.exception) == "release admission blocked: source ancestry is unproved",
                 eligible,
             )
+            self.assertEqual({"c_locale": True}, git.call_args_list[0].kwargs)
             if eligible:
                 self.assertEqual(3, git.call_count)
                 self.assertEqual(
