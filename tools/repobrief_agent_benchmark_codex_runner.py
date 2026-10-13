@@ -1199,16 +1199,20 @@ def validate_live_immutable_mounts(
     # multiple mounts at one path, with each new mount naming the covered
     # mount as parent. Select the unique top of that chain, independent of
     # mountinfo line order. Descendants of a covered mount are inaccessible.
-    records: dict[int, tuple[int, Path, Path, bytes, bool]] = {}
+    records: dict[int, tuple[int, Path, Path, bytes, bool, bytes]] = {}
     at_point: dict[Path, list[int]] = {}
     for line in mount_lines:
-        fields = line.split(b" - ", 1)[0].split()
+        sections = line.split(b" - ", 1)
+        fields = sections[0].split()
+        filesystem_fields = sections[1].split() if len(sections) == 2 else []
         if (
             len(fields) < 6
             or len(fields[0]) > 20
             or len(fields[1]) > 20
             or not fields[0].isdigit()
             or not fields[1].isdigit()
+            or len(filesystem_fields) < 3
+            or len(filesystem_fields[0]) > 128
         ):
             raise RunnerError("live Codex mountinfo is malformed")
         mount_id, parent_id = int(fields[0]), int(fields[1])
@@ -1225,6 +1229,7 @@ def validate_live_immutable_mounts(
             decode_mountinfo_field(fields[3]),
             fields[2],
             b"rw" in fields[5].split(b","),
+            filesystem_fields[0],
         )
         at_point.setdefault(point, []).append(mount_id)
     if Path("/") not in at_point:
@@ -1276,6 +1281,20 @@ def validate_live_immutable_mounts(
             raise RunnerError("live Codex mountinfo visible parent is missing")
         if parent_id == visible_at_point[nearest_visible_parent]:
             visible_at_point[point] = mount_id
+
+    # Union/overlay and opaque FUSE mounts have lower/upper backing directories
+    # that a mountpoint + synthetic-device tuple cannot authenticate. Even an
+    # apparently read-only view can be modified through an unrelated RW lower
+    # alias. Reject every *visible* such mount before deriving backing roots;
+    # covered/hidden mounts do not grant reachable paths in this namespace.
+    for visible_mount_id in visible_at_point.values():
+        filesystem_type = records[visible_mount_id][5]
+        if filesystem_type in {b"overlay", b"aufs", b"unionfs", b"fuse"} or (
+            filesystem_type.startswith(b"fuse.")
+        ):
+            raise RunnerError(
+                "live Codex union/overlay filesystem backing cannot be authenticated"
+            )
 
     mounts: list[tuple[Path, Path, bytes, bool]] = [
         (

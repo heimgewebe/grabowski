@@ -637,6 +637,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         protected_hardlink: bool = False,
         private_output_special: tuple[str, str] | None = None,
         device_policy_denied: bool = False,
+        opaque_union_filesystem: str | None = None,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -734,6 +735,8 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 *,
                 mount_root: Path | None = None,
                 device: str = "8:1",
+                filesystem_type: str = "ext4",
+                super_options: str | None = None,
             ) -> bytes:
                 # Real /proc/self/mountinfo identifies each mount uniquely.
                 # Stacking a second mount at the same path makes the covered
@@ -754,7 +757,8 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 physical_root = path if mount_root is None else mount_root
                 return (
                     f"{mount_id} {parent_id} {device} {physical_root} {path} "
-                    f"{options} - ext4 /dev/test {options}\n"
+                    f"{options} - {filesystem_type} /dev/test "
+                    f"{options if super_options is None else super_options}\n"
                 ).encode()
 
             mounts = [
@@ -844,6 +848,28 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                     else epoch / "frozen-source"
                 )
                 mounts.append(mount_line(source, "ro,relatime", mount_root=backing))
+            if opaque_union_filesystem is not None:
+                # Simulate a RO union source backed by a different physical RW device.
+                mounts.append(
+                    mount_line(
+                        source,
+                        "ro,relatime",
+                        device="0:65",
+                        mount_root=Path("/union-merged"),
+                        filesystem_type=opaque_union_filesystem,
+                        super_options="ro,lowerdir=/backing/protected-source",
+                    )
+                )
+                union_alias = Path(tmp) / "union-lower-rw-alias"
+                union_alias.mkdir()
+                mounts.append(
+                    mount_line(
+                        union_alias,
+                        "rw,relatime",
+                        mount_root=Path("/backing/protected-source"),
+                        device="8:7",
+                    )
+                )
             mounts.extend(
                 mount_line(
                     path,
@@ -985,6 +1011,18 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                     evidence_root=leaves["evidence"],
                     report_root=leaves["reports"],
                 )
+
+    def test_readonly_union_source_with_writable_lower_alias_is_rejected(self) -> None:
+        for filesystem_type in (
+            "overlay",
+            "aufs",
+            "unionfs",
+            "fuse.overlayfs",
+            "fuse.mergerfs",
+        ):
+            with self.subTest(filesystem_type=filesystem_type):
+                with self.assertRaisesRegex(runner.RunnerError, "union|overlay|opaque"):
+                    self._probe(opaque_union_filesystem=filesystem_type)
 
     def test_root_owned_device_policy_is_mandatory_for_mount_admission(self) -> None:
         with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
