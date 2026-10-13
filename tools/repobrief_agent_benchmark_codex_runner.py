@@ -1062,13 +1062,16 @@ def _assert_root_owned_device_policy() -> None:
                 "live Codex device isolation system manager evidence invalid"
             )
         actual[key] = value
+    # Empty multi-valued DeviceAllow is omitted by systemctl show, whereas
+    # additional permission lines (including duplicates) remain disallowed.
+    actual.setdefault("DeviceAllow", "")
     if actual != required:
         raise RunnerError("live Codex device isolation system device policy unsafe")
 
 
 def _assert_private_output_tree_scan(
     roots: Sequence[Path], *, reserved_entries: int = 0
-) -> None:
+) -> int:
     """Bound the real output tree and any deterministic pre-intent additions.
 
     The staged clone and generated .git are scanned before one-use identity
@@ -1105,6 +1108,7 @@ def _assert_private_output_tree_scan(
                         )
         except OSError as exc:
             raise RunnerError("live Codex private output scan unavailable") from exc
+    return entries_seen
 
 
 def _preintent_output_entry_reservation(
@@ -2346,7 +2350,7 @@ def create_checkout(
     source: Path,
     state_root: Path,
     *,
-    preallocate_check: Callable[[], None] | None = None,
+    preallocate_check: Callable[[int], None] | None = None,
 ) -> Path:
     """Prepare and validate a disposable clone before claiming one-use identity.
 
@@ -2424,7 +2428,19 @@ def create_checkout(
             if preallocate_check is None:
                 _assert_private_output_tree_scan((state_root,), reserved_entries=1)
             else:
-                preallocate_check()
+                future_pair_entries = 0
+                if request["condition"] == "baseline":
+                    # Fail before a non-retryable baseline one-shot if the
+                    # future treatment clone might exceed the output cap.
+                    # Count generated .git as well as tracked entries and
+                    # reserve a second clone, metadata drift and ledger files.
+                    staged_entries = _assert_private_output_tree_scan(
+                        (staged_checkout,)
+                    )
+                    future_pair_entries = 2 * (staged_entries + 2) + 16
+                    if future_pair_entries > 65536:
+                        raise RunnerError("paired clone budget exceeds output limit")
+                preallocate_check(future_pair_entries)
 
             try:
                 os.mkdir(workspace_name, 0o700, dir_fd=parent_fd)
@@ -8141,8 +8157,16 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         pending_output_entries = _preintent_output_entry_reservation(
             str(request["condition"]), dispatch_authorization.get("manifest")
         )
+        if request["condition"] == "baseline":
+            # Reserve treatment's bound manifest/runtime entries BEFORE
+            # baseline's irreversible provider call for this same pair.
+            pending_output_entries += _preintent_output_entry_reservation(
+                "treatment", dispatch_authorization["binding"].get("manifest")
+            )
 
-        def check_preallocation_mounts() -> None:
+        def check_preallocation_mounts(future_pair_entries: int = 0) -> None:
+            if type(future_pair_entries) is not int or future_pair_entries < 0:
+                raise RunnerError("paired clone headroom is invalid")
             validate_live_immutable_mounts(
                 source=source,
                 codex=Path(codex),
@@ -8157,7 +8181,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 transcript_root=args.transcript_root,
                 evidence_root=args.provider_evidence_root,
                 runtime_binding=dispatch_authorization["binding"],
-                pending_output_entries=pending_output_entries,
+                pending_output_entries=pending_output_entries + future_pair_entries,
             )
 
         preallocate_check = check_preallocation_mounts

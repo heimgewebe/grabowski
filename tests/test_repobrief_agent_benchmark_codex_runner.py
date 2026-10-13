@@ -931,6 +931,15 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
     def test_exact_root_owned_systemd_device_policy_is_accepted(self) -> None:
         self._probe()
 
+    def test_empty_device_allow_omitted_by_real_systemctl_is_accepted(self) -> None:
+        # systemctl show emits no DeviceAllow= line for an empty multi-value list.
+        properties = {k: v for k, v in self.PROPERTIES.items() if k != "DeviceAllow"}
+        self._probe(properties=properties)
+
+    def test_nonempty_device_allow_remains_rejected(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+            self._probe(properties={**self.PROPERTIES, "DeviceAllow": "/dev/sda rwm"})
+
     def test_user_scope_and_relative_cgroup_cannot_claim_root_policy(self) -> None:
         for cgroup in (
             b"0::/user.slice/user-1000.slice/user@1000.service\n",
@@ -973,7 +982,7 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
 
     def test_missing_or_duplicate_device_properties_are_rejected(self) -> None:
         without = dict(self.PROPERTIES)
-        del without["DeviceAllow"]
+        del without["PrivateDevices"]
         with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
             self._probe(properties=without)
 
@@ -2047,6 +2056,36 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         side_effect=runner.RunnerError("generated tree exceeds")
                     ),
                 )
+            self.assertFalse((state / "codex-workspaces" / workspace_name).exists())
+
+    def test_baseline_preallocates_treatment_clone_before_one_shot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            candidate = request(commit=commit)
+            candidate["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            workspace_name = hashlib.sha256(
+                candidate["workspace_id"].encode("utf-8")
+            ).hexdigest()
+            observed: list[int] = []
+
+            def assert_pair_headroom(pending_second_clone_entries: int) -> None:
+                observed.append(pending_second_clone_entries)
+                self.assertGreater(pending_second_clone_entries, 0)
+                raise runner.RunnerError("pair budget exceeded before first intent")
+
+            with self.assertRaisesRegex(
+                runner.RunnerError, "pair budget exceeded before first intent"
+            ):
+                runner.create_checkout(
+                    candidate, source, state, preallocate_check=assert_pair_headroom
+                )
+            self.assertEqual(len(observed), 1)
             self.assertFalse((state / "codex-workspaces" / workspace_name).exists())
 
     def test_private_output_scan_reserves_preintent_artifact_entries(self) -> None:
@@ -3433,6 +3472,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "binding": {},
             }
             with ExitStack() as stack:
+                # This test isolates another failure boundary; the real pair
+                # reservation contract is tested independently.
+                stack.enter_context(
+                    patch.object(
+                        runner, "_preintent_output_entry_reservation", return_value=4
+                    )
+                )
                 for name, value_to_return in (
                     ("validate_executable", "/opt/codex"),
                     ("validate_toolchain", "/usr/bin:/bin"),
@@ -3535,6 +3581,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 raise KeyboardInterrupt()
 
             with ExitStack() as stack:
+                # This test isolates another failure boundary; the real pair
+                # reservation contract is tested independently.
+                stack.enter_context(
+                    patch.object(
+                        runner, "_preintent_output_entry_reservation", return_value=4
+                    )
+                )
                 for name, return_value in (
                     ("validate_executable", "/opt/codex"),
                     ("validate_toolchain", "/usr/bin:/bin"),
@@ -10044,6 +10097,13 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 "manifest": None,
             }
             with ExitStack() as stack:
+                # This test isolates another failure boundary; the real pair
+                # reservation contract is tested independently.
+                stack.enter_context(
+                    patch.object(
+                        runner, "_preintent_output_entry_reservation", return_value=4
+                    )
+                )
                 for name, result in (
                     ("validate_executable", "/opt/codex"),
                     ("validate_toolchain", None),
