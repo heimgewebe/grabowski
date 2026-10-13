@@ -11023,8 +11023,14 @@ def grabowski_task_start(
 
 @_serialize_task_mutation
 def grabowski_task_status(task_id: str) -> dict[str, Any]:
-    """Observe one persistent task and refresh its recorded state."""
-    operator._require_operator_capability("durable_job")
+    """Observe one persistent task and refresh its recorded state.
+
+    Status may renew task leases, recover persisted terminalization and stop an
+    active cgroup on authority loss. It is a mutation, not a read-only probe.
+    """
+    operator._require_operator_mutation(
+        "durable_job", task_id=_validate_task_id(task_id),
+    )
     record = _row(task_id)
     observation = _observe(record)
     effective_state = _effective_observed_state(record, observation["state"])

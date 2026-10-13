@@ -1447,7 +1447,7 @@
       ],
       "id": "grabowski_task_status",
       "purpose": "Observe one persistent task and refresh its recorded state.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_status"

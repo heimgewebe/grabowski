@@ -727,6 +727,57 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             )
 
 
+    def test_kernel_user_systemd_ipaddressdeny_blocks_loopback(self) -> None:
+        """Kernel proof that a user task cannot talk to the host loopback.
+
+        Network E2E is run only when the user-systemd bus is available. The
+        synthetic listener and unit are ephemeral. An accepted TCP connect or
+        ignored AddressDeny is a RED security finding, never treated as pass.
+        """
+        import errno
+        import socket
+        import subprocess
+        import uuid
+
+        probe = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if probe.returncode != 0:
+            self.skipTest("target-host user-systemd bus unavailable")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            unit = f"grabowski-test-loopback-{uuid.uuid4().hex[:12]}.service"
+            source = (
+                "import errno,socket,sys\n"
+                "c=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n"
+                "code=c.connect_ex(('127.0.0.1',int(sys.argv[1])))\n"
+                "print('DENIED' if code in (errno.EPERM,errno.EACCES)"
+                " else 'BYPASS_'+str(code))\n"
+                "c.close()\n"
+            )
+            try:
+                result = subprocess.run(
+                    [
+                        "systemd-run", "--user", "--wait", "--pipe", "--collect",
+                        "--unit=" + unit, "--property=Type=exec",
+                        "--property=IPAddressDeny=localhost",
+                        "--", "/usr/bin/python3", "-I", "-c", source, str(port),
+                    ],
+                    capture_output=True, text=True, timeout=35, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("DENIED", result.stdout, result.stdout)
+                self.assertNotIn("BYPASS_", result.stdout, result.stdout)
+            finally:
+                subprocess.run(
+                    ["systemctl", "--user", "stop", unit],
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+
+
     def test_missing_fleet_wrong_local_unit_identity_never_stops(self) -> None:
         task_id = "b" * 24
         record = {
@@ -795,6 +846,38 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         root_stop.assert_not_called()
         dispatch.assert_not_called()
         self.assertFalse(tasks.resources.inspect_resources(keys))
+
+
+    def test_task_status_requires_mutation_gate_before_record_or_lease_access(self) -> None:
+        """A status read is a write-capable lease and lifecycle operation.
+
+        Kill-switch or audit-chain denial must occur before terminalization
+        recovery, active-lease renewal and any user-systemd observation.
+        """
+        task_id = "d" * 24
+        with patch.object(
+            tasks.operator, "_require_operator_mutation",
+            side_effect=PermissionError("status mutation blockade"),
+        ) as authorize, patch.object(
+            tasks, "_row"
+        ) as row, patch.object(
+            tasks, "_observe"
+        ) as observe, patch.object(
+            tasks.resources, "renew_resources"
+        ) as renew, patch.object(
+            tasks, "_set_state"
+        ) as persist:
+            with self.assertRaisesRegex(
+                PermissionError, "status mutation blockade"
+            ):
+                tasks.grabowski_task_status(task_id)
+        authorize.assert_called_once()
+        self.assertEqual(authorize.call_args.args, ("durable_job",))
+        self.assertEqual(authorize.call_args.kwargs["task_id"], task_id)
+        row.assert_not_called()
+        observe.assert_not_called()
+        renew.assert_not_called()
+        persist.assert_not_called()
 
 
     def test_revoked_running_task_lease_cannot_be_silently_reacquired(self) -> None:
@@ -2140,8 +2223,13 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         receipt_dir.mkdir(mode=0o700)
         external_receipt = receipt_dir / "receipt.json"
         sandbox_receipt = Path("/tmp/grabowski-scoped-role-receipt/receipt.json")
+        # Real isolated role execution cannot depend on the host's mutable
+        # PYTHONPATH or an editable package installation. CI uses a pinned
+        # checkout, so bind only its verified source directory read-only.
+        role_source = Path(agent_role.__file__).resolve(strict=True).parent
+        role_mount = Path("/opt/grabowski-test-role-code")
         command = [
-            str(runtime), "-m", "grabowski_agent_role",
+            str(runtime), str(role_mount / "grabowski_agent_role.py"),
             "--role", "tests", "--repository", str(repo),
             "--expected-head", head,
             "--expected-base-head", head,
@@ -2159,8 +2247,11 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             "workspace": repo,
             "command": command,
             "workspace_writable": False,
-            "extra_read_only": ((runtime_root, runtime_root),),
-            "extra_directories": tuple(parents),
+            "extra_read_only": (
+                (runtime_root, runtime_root),
+                (role_source, role_mount),
+            ),
+            "extra_directories": tuple(parents) + (role_mount.parent,),
         }
         # A role may write into its private /tmp, but without a host bind the
         # result disappears with the namespace: this is not a valid receipt.
