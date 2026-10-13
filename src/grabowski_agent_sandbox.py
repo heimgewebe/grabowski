@@ -911,6 +911,23 @@ def minimal_sandbox_argv(
     writable = _normalized_writable_paths(worktree, writable_paths)
     if not isinstance(mount_workspace, bool):
         raise AgentSandboxError("mount_workspace must be a boolean")
+    if mount_workspace:
+        # cwd is caller-selected, not evidence that an opaque child may read
+        # the operator's private HOME. Expose only a concrete checkout below
+        # HOME/repos; all other home descendants require a distinct verified
+        # authority route rather than a broad read-only mount.
+        try:
+            home = Path.home().resolve(strict=True)
+        except OSError as exc:
+            raise AgentSandboxError("operator home identity is unavailable") from exc
+        repositories = home / "repos"
+        if worktree.is_relative_to(home) and (
+            worktree == repositories
+            or not worktree.is_relative_to(repositories)
+        ):
+            raise AgentSandboxError(
+                "private operator home cannot be a visible task workspace"
+            )
     if not mount_workspace and (workspace_writable or writable or common is not None):
         raise AgentSandboxError("hidden workspace cannot be writable or expose Git metadata")
     adler_read_only, adler_directories = (

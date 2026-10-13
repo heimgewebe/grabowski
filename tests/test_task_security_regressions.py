@@ -1463,6 +1463,91 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         )
 
 
+    def test_opaque_task_cwd_must_not_reveal_private_home_subdirectory(self) -> None:
+        """Kernel check: a different cwd is not authority to read operator secrets.
+
+        The fixture changes only self-owned temporary files. Fail-closed
+        rejection and an isolated mount with no private source are both safe.
+        """
+        import subprocess
+        from pathlib import Path
+
+        tasks.agent_sandbox.require_bwrap()
+        home = self.root / "operator-home-private"
+        home.mkdir(mode=0o700)
+        private_dirs = (
+            home / ".ssh",
+            home / ".config" / "grabowski",
+            home / ".local" / "state" / "grabowski",
+        )
+        command_code = (
+            "from pathlib import Path\n"
+            "import sys\n"
+            "private=Path(sys.argv[1])\n"
+            "print('LEAKED' if private.is_file() and "
+            "private.read_text(encoding='utf-8')=='fixture-only' else 'HIDDEN')\n"
+        )
+        for private in private_dirs:
+            private.mkdir(parents=True, mode=0o700)
+            secret = private / "secret.txt"
+            secret.write_text("fixture-only", encoding="utf-8")
+            record = {
+                "task_id": "opaque-private-cwd",
+                "host": "local", "cwd": str(private),
+            }
+            with (
+                self.subTest(private=str(private)),
+                patch.object(tasks.operator, "HOME", home),
+                patch.object(Path, "home", return_value=home),
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(
+                    tasks, "_verified_task_effect_start",
+                    return_value={"effect_profile": "unknown"},
+                ),
+            ):
+                try:
+                    candidate = tasks._task_sandboxed_command_argv(
+                        record, ["/usr/bin/python3", "-I", "-c", command_code, str(secret)],
+                    )
+                except tasks.agent_sandbox.AgentSandboxError as exc:
+                    self.assertIn("private operator home", str(exc))
+                else:
+                    observed = subprocess.run(
+                        tasks.agent_sandbox.runtime_sandbox_argv(candidate),
+                        capture_output=True, text=True, check=False, timeout=20,
+                    )
+                    self.assertEqual(observed.returncode, 0, observed.stderr)
+                    self.assertEqual(observed.stdout.strip(), "HIDDEN")
+
+        # The repository collection root is not itself a bounded checkout;
+        # an exact checkout below it remains visible and read-only.
+        repositories = home / "repos"
+        checkout = repositories / "scoped-checkout"
+        checkout.mkdir(parents=True, mode=0o700)
+        with (
+            patch.object(tasks.operator, "HOME", home),
+            patch.object(Path, "home", return_value=home),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "private operator home",
+            ):
+                tasks._task_sandboxed_command_argv(
+                    {"task_id": "opaque-repos-root", "host": "local", "cwd": str(repositories)},
+                    ["/usr/bin/true"],
+                )
+            bounded = tasks._task_sandboxed_command_argv(
+                {"task_id": "opaque-checkout", "host": "local", "cwd": str(checkout)},
+                ["/usr/bin/true"],
+            )
+        mounts = [bounded[i:i + 3] for i in range(len(bounded) - 2)]
+        self.assertIn(["--ro-bind", str(checkout), str(checkout)], mounts)
+
+
     def test_external_role_receipt_is_an_isolated_kernel_mount(self) -> None:
         """A real read-only role can atomically publish only into a fresh
         private output sink outside its read-only Git checkout.
