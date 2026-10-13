@@ -925,6 +925,7 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             "host": "local",
             "cwd": str(self.root),
             "lease_owner_id": "task:bounded-write-test",
+            "runtime_seconds": 60,
             "argv_json": json.dumps(command),
         }
         lease = f"path:{allowed}"
@@ -937,7 +938,12 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             patch.object(tasks, "_record_resource_keys", return_value=[lease]),
             patch.object(
                 tasks.resources, "inspect_resources",
-                return_value={lease: {"owner_id": "task:bounded-write-test"}},
+                return_value={
+                    lease: {
+                        "owner_id": "task:bounded-write-test",
+                        "expires_at_unix": tasks._now() + 600,
+                    }
+                },
             ),
         ):
             sandbox = tasks._task_sandboxed_command_argv(record, command)
@@ -945,6 +951,21 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         self.assertEqual(sandbox[position + 1: position + 3], [str(allowed)] * 2)
         self.assertIn("--ro-bind", sandbox)
         self.assertNotIn("--bind", sandbox[position + 3:])
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_verified_task_effect_start",
+                         return_value={"effect_profile": "workspace_write"}),
+            patch.object(tasks, "_record_resource_keys", return_value=[lease]),
+            patch.object(tasks.resources, "inspect_resources", return_value={
+                lease: {
+                    "owner_id": "task:bounded-write-test",
+                    "expires_at_unix": tasks._now() + 30,
+                }
+            }),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "lease lifetime"):
+                tasks._task_sandboxed_command_argv(record, command)
 
         for live_owner in (None, "foreign:task"):
             with (
@@ -1066,6 +1087,28 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             marker.unlink()
             marker.write_text("gitdir: " + "x" * 4097, encoding="utf-8")
             self.assertIsNone(tasks._task_linked_git_common_dir(workspace))
+            # Git backlink inspection must never block when .git is swapped for a FIFO.
+            import os
+            import subprocess
+            import sys
+            from pathlib import Path
+
+            marker.unlink()
+            os.mkfifo(marker)
+            helper_probe = (
+                "import sys\n"
+                "from pathlib import Path\n"
+                "sys.dont_write_bytecode = True\n"
+                f"sys.path.insert(0, {str(Path(tasks.__file__).resolve().parent)!r})\n"
+                "import grabowski_tasks as tasks\n"
+                "print(tasks._task_linked_git_common_dir(Path(sys.argv[1])))\n"
+            )
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", helper_probe, str(workspace)],
+                capture_output=True, text=True, check=False, timeout=3,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "None")
 
 
     def test_nested_framework_writer_needs_a_scoped_outer_writable_mount(self) -> None:
@@ -1134,6 +1177,7 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             "host": "local",
             "cwd": str(repo),
             "lease_owner_id": "task:sandbox-writer-test",
+            "runtime_seconds": 60,
         }
         local = {"transport": "local", "target": "local"}
 
@@ -1169,7 +1213,12 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             patch.object(tasks, "_record_resource_keys", return_value=[lease]),
             patch.object(
                 tasks.resources, "inspect_resources",
-                return_value={lease: {"owner_id": "task:sandbox-writer-test"}},
+                return_value={
+                    lease: {
+                        "owner_id": "task:sandbox-writer-test",
+                        "expires_at_unix": tasks._now() + 600,
+                    },
+                },
             ),
         ):
             confined_writer = tasks._task_sandboxed_command_argv(record, writer)
@@ -1251,6 +1300,7 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             "host": "local",
             "cwd": str(repo),
             "lease_owner_id": "task:sandbox-role-test",
+            "runtime_seconds": 60,
         }
         local = {"transport": "local", "target": "local"}
 
@@ -1285,7 +1335,10 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             patch.object(
                 tasks.resources, "inspect_resources",
                 return_value={
-                    receipt_lease: {"owner_id": "task:sandbox-role-test"}
+                    receipt_lease: {
+                        "owner_id": "task:sandbox-role-test",
+                        "expires_at_unix": tasks._now() + 600,
+                    },
                 },
             ),
         ):

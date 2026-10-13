@@ -290,9 +290,17 @@ class TaskTests(unittest.TestCase):
         )
 
     def _staged_capture_argv(self, record: dict) -> list[str]:
-        """Stage the wrapper the way a local launch does, then build its argv."""
+        """Test output capture mechanics with synthetic rows, not task admission.
+
+        Source authority and kernel confinement are exercised independently in
+        test_task_security_regressions; these synthetic rows have no start anchor.
+        """
         tasks._stage_task_output_capture_script("local", transport="local")
-        return tasks._task_output_capture_argv(record)
+        with patch.object(
+            tasks, "_task_sandboxed_command_argv",
+            return_value=json.loads(record["argv_json"]),
+        ):
+            return tasks._task_output_capture_argv(record)
 
     def _start(
         self,
@@ -5688,7 +5696,15 @@ class TaskTests(unittest.TestCase):
         with tasks._database() as connection:
             connection.execute(
                 "UPDATE tasks SET launcher_json=? WHERE task_id=?",
-                (json.dumps({"retry_binding": {"source_task_id": "bad"}}), task_id),
+                (
+                    json.dumps(
+                        {
+                            **json.loads(tasks._row_raw(task_id)["launcher_json"]),
+                            "retry_binding": {"source_task_id": "bad"},
+                        }
+                    ),
+                    task_id,
+                ),
             )
             connection.commit()
         admitted = _missing_unit_observation(
@@ -13353,6 +13369,11 @@ class TaskTests(unittest.TestCase):
             ),
             patch.object(
                 tasks.bureau_runtime_refresh_executor,
+                "parse_executor_module_request",
+                return_value=fixture["request"],
+            ),
+            patch.object(
+                tasks.bureau_runtime_refresh_executor,
                 "load_bound_intent",
                 return_value=fixture["intent"],
             ),
@@ -13627,6 +13648,50 @@ class TaskTests(unittest.TestCase):
                 (tasks.BUREAU_RUNTIME_REFRESH_PRELAUNCH_JOURNAL_KEY_PREFIX + "%",),
             ).fetchall()
         self.assertEqual([], journals)
+
+    def test_runtime_refresh_executor_no_bypass_after_lease_or_binding_drift(self) -> None:
+        """The exemption requires exact persisted task identity and live unit-bound leases."""
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        tasks.resources.acquire_resources(
+            fixture["lease_owner"],
+            fixture["resource_keys"],
+            purpose="runtime refresh verified executor test",
+            ttl_seconds=1200,
+            metadata={
+                "approval_task_id": fixture["approval_task_id"],
+                "intent_sha256": fixture["intent_sha256"],
+            },
+        )
+        with self._runtime_refresh_start_environment(fixture):
+            started = tasks.grabowski_task_start(
+                "local", fixture["argv"], cwd=str(tasks.operator.HOME),
+                runtime_seconds=60, resume_policy="never",
+            )
+            self.assertEqual(started["task"]["state"], "running")
+            record = tasks._row_raw(str(started["task"]["task_id"]))
+            command = json.loads(record["argv_json"])
+            self.assertEqual(tasks._task_sandboxed_command_argv(record, command), command)
+
+            invalid_attempt = {**record, "attempt": 2}
+            with self.assertRaisesRegex(PermissionError, "original launch authority"):
+                tasks._task_sandboxed_command_argv(invalid_attempt, command)
+
+            launcher = json.loads(record["launcher_json"])
+            evidence = launcher["runtime_refresh_executor_lease_binding"]
+            launcher["runtime_refresh_executor_lease_binding"] = {
+                **evidence, "executor_unit": "grabowski-task-foreign-a1.service"
+            }
+            tampered_receipt = {
+                **record, "launcher_json": json.dumps(launcher),
+            }
+            with self.assertRaisesRegex(PermissionError, "persisted lease binding"):
+                tasks._task_sandboxed_command_argv(tampered_receipt, command)
+
+            tasks.resources.release_resources(
+                fixture["lease_owner"], fixture["resource_keys"],
+            )
+            with self.assertRaisesRegex(PermissionError, "missing live resource leases"):
+                tasks._task_sandboxed_command_argv(record, command)
 
     def test_runtime_refresh_task_server_acquires_missing_intent_leases(self) -> None:
         fixture = self._runtime_refresh_prelaunch_fixture()

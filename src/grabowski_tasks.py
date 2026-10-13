@@ -7016,7 +7016,7 @@ def _task_small_owned_git_file(path: Path) -> str:
     """Read one exact regular Git metadata file through a bounded O_NOFOLLOW fd."""
     if not hasattr(os, "O_NOFOLLOW"):
         raise OSError("Git backlink nofollow support is unavailable")
-    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         metadata = os.fstat(fd)
         if (
@@ -7069,6 +7069,102 @@ def _task_linked_git_common_dir(workspace: Path) -> Path | None:
         return None
 
 
+def _verified_runtime_refresh_executor_launch(
+    record: dict[str, Any], command: list[str]
+) -> None:
+    """Require the stored Bureau intent, exact task attempt and live unit-bound leases.
+
+    The executable module name establishes no authority. Only the server-issued
+    reserved request, its durable launch binding and matching live lease metadata
+    can admit this explicit host-write exception to the user namespace sandbox.
+    """
+    if not record.get("unit") and not record.get("authoritative_unit"):
+        raise PermissionError("Bureau executor task has no verified unit")
+    task_id = str(record["task_id"])
+    unit = _authoritative_unit(record)
+    if (
+        record.get("host") != "local"
+        or record.get("cwd") != str(operator.HOME)
+        or record.get("execution_backend") != "systemd-user"
+        or record.get("systemd_scope") != "user"
+        or record.get("resume_policy") != "never"
+        or type(record.get("attempt")) is not int
+        or record["attempt"] != 1
+        or record.get("lease_owner_id") != _lease_owner(task_id)
+        or record.get("argv_json") != _canonical_json(command)
+        or record.get("argv_sha256") != command_identity.argv_sha256(command)
+    ):
+        raise PermissionError("Bureau executor task has no verified original launch authority")
+    request = bureau_runtime_refresh_executor.parse_executor_module_request(command)
+    if command != bureau_runtime_refresh_executor.build_executor_command(
+        request, runtime_python=GRABOWSKI_RUNTIME_PYTHON
+    ):
+        raise PermissionError("Bureau executor command is not the server-issued command")
+    intent = bureau_runtime_refresh_executor.load_bound_intent(request)
+    approval = bureau_runtime_refresh_executor.validate_authority_execution_contract(
+        intent
+    )
+    expected = _runtime_refresh_prelaunch_lease_binding_request(
+        request, intent, approval, task_id, unit
+    )
+    try:
+        launcher = json.loads(record["launcher_json"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PermissionError("Bureau executor launch receipt is missing") from exc
+    if not isinstance(launcher, dict):
+        raise PermissionError("Bureau executor launch receipt is invalid")
+    binding = launcher.get("runtime_refresh_executor_lease_binding")
+    if not isinstance(binding, dict) or set(binding) != {
+        "schema_version", "kind", "intent_sha256", "request_sha256",
+        "binding_sha256", "binding_plan_sha256", "journal_sha256",
+        "executor_unit", "resource_count", "resource_keys_sha256",
+        "minimum_remaining_seconds", "evidence_sha256",
+    }:
+        raise PermissionError("Bureau executor has no persisted server lease binding")
+    material = {key: value for key, value in binding.items() if key != "evidence_sha256"}
+    if (
+        binding["schema_version"] != 1
+        or binding["kind"] != "grabowski_bureau_runtime_refresh_prelaunch_lease_binding"
+        or binding["evidence_sha256"] != _sha256_json(material)
+        or binding["intent_sha256"] != expected["intent_sha256"]
+        or binding["request_sha256"] != expected["request_sha256"]
+        or binding["executor_unit"] != unit
+        or binding["resource_count"] != len(expected["resource_keys"])
+        or binding["resource_keys_sha256"] != _sha256_json(expected["resource_keys"])
+        or binding["minimum_remaining_seconds"] != expected["minimum_remaining_seconds"]
+        or any(
+            not isinstance(binding[key], str) or SHA256.fullmatch(binding[key]) is None
+            for key in ("binding_sha256", "binding_plan_sha256", "journal_sha256")
+        )
+    ):
+        raise PermissionError("Bureau executor persisted lease binding has drifted")
+    keys = expected["resource_keys"]
+    if not 1 <= len(keys) <= 128:
+        raise PermissionError("Bureau executor has an unsupported resource scope")
+    with resources._database() as connection:
+        rows = connection.execute(
+            "SELECT * FROM leases WHERE resource_key IN ("
+            + ",".join("?" for _ in keys) + ") ORDER BY resource_key",
+            keys,
+        ).fetchall()
+    if len(rows) != len(keys):
+        raise PermissionError("Bureau executor is missing live resource leases")
+    minimum_expiry = _now() + int(record["runtime_seconds"]) + 10
+    for key, row in zip(keys, rows, strict=True):
+        metadata = resources._row_metadata(row)
+        _, observed_sha256 = resources._metadata(metadata)
+        if (
+            row["resource_key"] != key
+            or row["owner_id"] != expected["lease_owner"]
+            or row["expires_at_unix"] <= minimum_expiry
+            or row["metadata_sha256"] != observed_sha256
+            or metadata.get("intent_sha256") != expected["intent_sha256"]
+            or metadata.get("approval_task_id") != expected["lease_task_id"]
+            or metadata.get("executor_unit") != unit
+        ):
+            raise PermissionError("Bureau executor no longer holds its live unit-bound leases")
+
+
 def _task_sandboxed_command_argv(
     record: dict[str, Any], command: list[str]
 ) -> list[str]:
@@ -7092,15 +7188,17 @@ def _task_sandboxed_command_argv(
         return command
 
     if bureau_runtime_refresh_executor.is_executor_module_command(command):
-        # The reserved executor has its own server-verified intent and resource
-        # binding, not a user-selectable generic command exemption.
         if effect not in {"unknown", "host_write"}:
             raise RuntimeError("reserved executor has conflicting effect profile")
+        _verified_runtime_refresh_executor_launch(record, command)
         return command
     if effect not in {"read_only", "unknown", "workspace_write", "repository_write"}:
         raise RuntimeError("local task effect requires a verified sandbox route")
 
     workspace = Path(str(record["cwd"]))
+    hide_operator_home = workspace.resolve(strict=True) == operator.HOME.resolve(strict=True)
+    if hide_operator_home and effect in {"workspace_write", "repository_write"}:
+        raise RuntimeError("operator home cannot be a writable task workspace")
     writable_paths: list[Path] = []
     if effect in {"workspace_write", "repository_write"}:
         resource_keys = _record_resource_keys(record)
@@ -7118,6 +7216,18 @@ def _task_sandboxed_command_argv(
         active = resources.inspect_resources(write_keys)
         if any(active.get(key, {}).get("owner_id") != owner for key in write_keys):
             raise RuntimeError("workspace writer has missing or foreign path leases")
+        runtime_seconds = record.get("runtime_seconds")
+        if type(runtime_seconds) is not int or runtime_seconds <= 0:
+            raise RuntimeError("workspace writer has no bounded task runtime")
+        # Systemd runs at most RuntimeMaxSec, then needs 10s to stop the cgroup.
+        # Refuse mounts whose underlying live authority could expire earlier.
+        min_expiry = _now() + runtime_seconds + 10
+        if any(
+            type(active[key].get("expires_at_unix")) is not int
+            or active[key]["expires_at_unix"] <= min_expiry
+            for key in write_keys
+        ):
+            raise RuntimeError("workspace writer lease lifetime is shorter than runtime and stop grace")
 
     # Read-only dependencies are strictly selected by the server's own runtime
     # binary or an exact two-way linked-checkout backlink. Neither binding
@@ -7125,12 +7235,14 @@ def _task_sandboxed_command_argv(
     read_only: list[tuple[Path, Path]] = []
     external_directories: set[Path] = set()
     if command[0] == str(GRABOWSKI_RUNTIME_PYTHON):
+        if hide_operator_home:
+            raise RuntimeError("operator home task cannot expose a private Python runtime")
         runtime_root = GRABOWSKI_RUNTIME_PYTHON.parent.parent
         read_only.append((runtime_root, runtime_root))
         external_directories.update(
             parent for parent in runtime_root.parents if parent != Path("/")
         )
-    git_common_dir = _task_linked_git_common_dir(workspace)
+    git_common_dir = None if hide_operator_home else _task_linked_git_common_dir(workspace)
     if git_common_dir is not None:
         external_directories.update(
             parent for parent in git_common_dir.parents if parent != Path("/")
@@ -7143,6 +7255,7 @@ def _task_sandboxed_command_argv(
         workspace=workspace,
         command=command,
         workspace_writable=bool(writable_paths),
+        mount_workspace=not hide_operator_home,
         writable_paths=writable_paths,
         git_common_dir=git_common_dir,
         extra_read_only=read_only,
