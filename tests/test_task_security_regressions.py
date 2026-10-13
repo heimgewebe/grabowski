@@ -848,6 +848,102 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         self.assertFalse(tasks.resources.inspect_resources(keys))
 
 
+    def test_pending_terminalization_recovery_checks_per_task_scopes(self) -> None:
+        """A pending projection cannot commit under a targeted hard stop."""
+        task_id = self._start_claude()
+        record = tasks._row_raw(task_id)
+        scoped = {
+            "path": record["cwd"], "repo": record["cwd"],
+            "task_id": task_id, "owner_id": record["lease_owner_id"],
+            "service": tasks._authoritative_unit(record),
+            "host": record["host"],
+        }
+        page = {
+            "terminalizations": [{"task_id": task_id}],
+            "examined": 1,
+            "cycle_completed": True,
+            "cursor_after": None,
+            "high_water": None,
+        }
+        for field in scoped:
+            with self.subTest(blocked_scope=field):
+                checks = []
+                def require(capability, **kwargs):
+                    checks.append((capability, dict(kwargs)))
+                    if kwargs.get(field) == scoped[field]:
+                        raise PermissionError("blocked scoped terminalization")
+                with (
+                    patch.object(
+                        tasks.operator, "_require_operator_mutation",
+                        side_effect=require,
+                    ),
+                    patch.object(
+                        tasks, "_load_terminalization_recovery_cycle",
+                        return_value=None,
+                    ),
+                    patch.object(
+                        tasks.resources, "pending_task_terminalizations",
+                        return_value=page,
+                    ),
+                    patch.object(
+                        tasks, "_validate_terminalization_recovery_page",
+                    ),
+                    patch.object(
+                        tasks, "_save_terminalization_recovery_cycle",
+                    ),
+                    patch.object(
+                        tasks, "_apply_terminalization_projection",
+                        return_value={"task_id": task_id},
+                    ) as project,
+                ):
+                    result = tasks._recover_pending_task_terminalizations()
+                self.assertTrue(checks)
+                self.assertEqual(checks[0], ("durable_job", scoped))
+                self.assertEqual(result["recovered"], [])
+                self.assertEqual(result["failed"][0]["error_type"], "PermissionError")
+                project.assert_not_called()
+
+
+    def test_task_list_requires_mutation_gate_before_recovery(self) -> None:
+        """The historical READ_ONLY route replays terminalizations and cursor.
+
+        A kill-switch / invalid audit chain must refuse the normal task list
+        before any journal recovery, DB projection or state changes.
+        """
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=PermissionError("task-list blockade"),
+            ) as authorize,
+            patch.object(
+                tasks, "_recover_pending_task_terminalizations",
+            ) as recover,
+            patch.object(tasks, "_task_current_projection") as projection,
+        ):
+            with self.assertRaisesRegex(PermissionError, "task-list blockade"):
+                tasks.grabowski_task_list(limit=1)
+        authorize.assert_called_once()
+        self.assertEqual(authorize.call_args.args, ("durable_job",))
+        recover.assert_not_called()
+        projection.assert_not_called()
+
+    def test_task_list_schema_only_survives_mutation_blockade(self) -> None:
+        """A pure schema inventory is still safe without write authority."""
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=PermissionError("blockade"),
+            ) as authorize,
+            patch.object(
+                tasks, "_recover_pending_task_terminalizations",
+            ) as recover,
+        ):
+            result = tasks.grabowski_task_list(schema_only=True)
+        self.assertEqual(result["store"], "tasks")
+        self.assertIs(result["mutation_performed"], False)
+        authorize.assert_not_called()
+        recover.assert_not_called()
+
     def test_task_status_scoped_blockade_denies_before_lease_renewal(self) -> None:
         """A task-id-only preflight cannot match workspace/host hard stops.
 

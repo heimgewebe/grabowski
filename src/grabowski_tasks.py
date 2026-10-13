@@ -8463,6 +8463,20 @@ def _recover_pending_task_terminalizations(
     for terminalization in page["terminalizations"]:
         task_id = str(terminalization["task_id"])
         try:
+            # Recovery is a durable state mutation even when entered from
+            # task_list. An initial global mutation gate cannot match scoped
+            # path/owner/host/service hard stops. Bind it to the live row
+            # before any terminalization projection or lifecycle receipt.
+            task_record = _row_raw(task_id)
+            operator._require_operator_mutation(
+                "durable_job",
+                path=task_record["cwd"],
+                repo=task_record["cwd"],
+                task_id=task_record["task_id"],
+                owner_id=task_record.get("lease_owner_id"),
+                service=_authoritative_unit(task_record),
+                host=task_record["host"],
+            )
             updated = _apply_terminalization_projection(
                 terminalization,
                 recovered=True,
@@ -13663,6 +13677,10 @@ def grabowski_task_list(
                 "schema_only cannot be combined with task-list filters or projections"
             )
         return _task_schema_inventory()
+    # Normal listing can replay pending terminalization writes and persist its
+    # recovery cursor, even when callers intend to observe state only.
+    # A pure schema-only inventory above remains the only read-only route.
+    operator._require_operator_mutation("durable_job")
     if view == "managed_cargo_evidence":
         if state is not None or cursor is not None or fields is not None:
             raise ValueError(
