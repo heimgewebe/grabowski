@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 import stat
+import struct
 import sys
 import tempfile
 import time
@@ -545,12 +546,103 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
         )
         with (
             patch.object(runner, "_authenticated_procfs_cgroup", return_value=cgroup),
+            patch.object(
+                runner,
+                "_attest_root_system_manager_channels",
+                return_value=None,
+                create=True,
+            ),
             patch.object(runner.subprocess, "run", return_value=completion) as run,
         ):
             runner._assert_root_owned_device_policy()
         command = run.call_args.args[0]
         self.assertEqual(command[:3], ["/usr/bin/systemctl", "--system", "show"])
         self.assertIn(self.UNIT, command)
+
+    def test_system_manager_socket_identity_checked_before_policy_readback(
+        self,
+    ) -> None:
+        result = subprocess.CompletedProcess(
+            args=["/usr/bin/systemctl"],
+            returncode=0,
+            stdout="".join(
+                f"{key}={value}\n" for key, value in self.PROPERTIES.items()
+            ),
+            stderr="",
+        )
+        with (
+            patch.object(
+                runner, "_authenticated_procfs_cgroup", return_value=self.CGROUP
+            ),
+            patch.object(
+                runner,
+                "_attest_root_system_manager_channels",
+                side_effect=runner.RunnerError("system manager channel unavailable"),
+                create=True,
+            ),
+            patch.object(runner.subprocess, "run", return_value=result) as run,
+        ):
+            with self.assertRaisesRegex(runner.RunnerError, "system manager channel"):
+                runner._assert_root_owned_device_policy()
+            run.assert_not_called()
+
+    def test_system_manager_socket_peer_credentials_must_be_kernel_root(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        for peer, admitted in (
+            ((1, 0, 0), True),
+            ((2, 0, 0), False),
+            ((1, os.getuid(), os.getgid()), False),
+        ):
+            with self.subTest(peer=peer):
+                with (
+                    patch.object(runner.os, "lstat", return_value=root_socket) as lstat,
+                    patch.object(runner.socket, "socket") as socket_factory,
+                ):
+                    connection = socket_factory.return_value.__enter__.return_value
+                    connection.getsockopt.return_value = struct.pack("3i", *peer)
+                    if admitted:
+                        runner._attest_root_system_manager_channels()
+                        self.assertEqual(socket_factory.call_count, 2)
+                        self.assertEqual(lstat.call_count, 4)
+                    else:
+                        with self.assertRaisesRegex(
+                            runner.RunnerError,
+                            "system manager channel",
+                        ):
+                            runner._attest_root_system_manager_channels()
+                        self.assertEqual(socket_factory.call_count, 1)
+
+    def test_system_manager_socket_must_be_root_owned_and_stable(self) -> None:
+        for mode, owner in (
+            (stat.S_IFREG | 0o666, 0),
+            (stat.S_IFLNK | 0o777, 0),
+            (stat.S_IFSOCK | 0o666, os.getuid()),
+        ):
+            with self.subTest(mode=mode, owner=owner):
+                linked = os.stat_result((mode, 412, 27, 1, owner, 0, 0, 0, 0, 0))
+                with (
+                    patch.object(runner.os, "lstat", return_value=linked),
+                    patch.object(runner.socket, "socket") as socket_factory,
+                ):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "system manager channel",
+                    ):
+                        runner._attest_root_system_manager_channels()
+                    socket_factory.assert_not_called()
+        original = os.stat_result((stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0))
+        swapped = os.stat_result((stat.S_IFSOCK | 0o666, 413, 27, 1, 0, 0, 0, 0, 0, 0))
+        with (
+            patch.object(runner.os, "lstat", side_effect=(original, swapped)),
+            patch.object(runner.socket, "socket") as socket_factory,
+        ):
+            socket_factory.return_value.__enter__.return_value.getsockopt.return_value = struct.pack(
+                "3i", 1, 0, 0
+            )
+            with self.assertRaisesRegex(runner.RunnerError, "system manager channel"):
+                runner._attest_root_system_manager_channels()
 
     def test_exact_root_owned_systemd_device_policy_is_accepted(self) -> None:
         self._probe()
@@ -646,6 +738,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         shared_runtime_tmpfs_rw: bool = False,
         unrelated_local_rw: bool = False,
         root_backing_isolated: bool = False,
+        nested_readonly_binding: str | None = None,
         runtime_loader_bind: str | None = None,
         runtime_loader_alias_at: str | None = None,
         root_mount_rw: bool = False,
@@ -677,6 +770,8 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             else:
                 (source / ".git").mkdir()
             (source / "src").mkdir()
+            if nested_readonly_binding is not None:
+                (source / "vendor").mkdir()
             codex_root = Path(tmp) / "software" / "codex"
             (codex_root / "bin").mkdir(parents=True)
             (codex_root / "codex-path").mkdir()
@@ -699,6 +794,8 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             }
             for path in leaves.values():
                 path.mkdir(mode=0o700)
+            if nested_readonly_binding == "state":
+                (leaves["state"] / "vendor").mkdir()
             if private_output_special is not None:
                 leaf, kind = private_output_special
                 target = leaves[leaf] / "unsafe-special-entry"
@@ -981,6 +1078,34 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 )
                 for path in leaves.values()
             )
+            if nested_readonly_binding is not None:
+                if nested_readonly_binding == "tmp":
+                    mounts.append(
+                        mount_line(
+                            Path("/tmp"),
+                            "rw,relatime",
+                            mount_root=Path("/"),
+                            device="0:63",
+                            filesystem_type="tmpfs",
+                        )
+                    )
+                candidates = {
+                    "state": ("8:1", leaves["state"] / "vendor", "ext4"),
+                    "tmp": ("0:63", Path("/vendor"), "tmpfs"),
+                    "isolated": ("8:93", Path("/vendor"), "ext4"),
+                }
+                if nested_readonly_binding not in candidates:
+                    raise AssertionError("unknown nested mount case")
+                device, backing, filesystem_type = candidates[nested_readonly_binding]
+                mounts.append(
+                    mount_line(
+                        source / "vendor",
+                        "ro,relatime",
+                        mount_root=backing,
+                        device=device,
+                        filesystem_type=filesystem_type,
+                    )
+                )
             if extra_rw:
                 unexpected = home / extra_rw
                 unexpected.mkdir(parents=True, exist_ok=True)
@@ -1226,6 +1351,22 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         for runtime_path in ("/bin", "/sbin", "/lib", "/lib64"):
             with self.subTest(runtime=runtime_path):
                 self._probe(runtime_loader_bind=runtime_path)
+
+    def test_nested_readonly_source_binding_with_writable_backing_is_denied(
+        self,
+    ) -> None:
+        for backing in ("state", "tmp"):
+            with self.subTest(backing=backing):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "writable output contains protected mount backing|"
+                    "writable alias of protected input mount|"
+                    "unexpected writable mount sharing protected filesystem",
+                ):
+                    self._probe(nested_readonly_binding=backing)
+
+    def test_independent_nested_readonly_source_binding_is_accepted(self) -> None:
+        self._probe(nested_readonly_binding="isolated")
 
     def test_codex_executable_and_bundled_rg_writable_backing_aliases_are_rejected(
         self,

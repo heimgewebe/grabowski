@@ -30,6 +30,8 @@ import signal
 import shlex
 import shutil
 import stat
+import socket
+import struct
 import subprocess
 import tempfile
 import sys
@@ -861,6 +863,37 @@ def _authenticated_procfs_cgroup() -> bytes:
             os.close(descriptor)
 
 
+def _attest_root_system_manager_channels() -> None:
+    """Reject impostor manager sockets before trusting systemctl output.
+
+    Kernel SO_PEERCRED is independent of systemctl's plain-text properties.
+    A read-only socket bind remains connectable, so its mount flags alone
+    cannot authenticate a root service that reports device isolation.
+    """
+    for channel in ("/run/systemd/private", "/run/dbus/system_bus_socket"):
+        try:
+            before = os.lstat(channel)
+            if not stat.S_ISSOCK(before.st_mode) or before.st_uid != 0:
+                raise RunnerError("live Codex system manager channel is untrusted")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer_socket:
+                peer_socket.settimeout(2)
+                peer_socket.connect(channel)
+                credentials = peer_socket.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+                )
+                manager_identity = struct.unpack("3i", credentials)
+            after = os.lstat(channel)
+        except (OSError, struct.error) as exc:
+            raise RunnerError("live Codex system manager channel unavailable") from exc
+        if manager_identity != (1, 0, 0) or (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_uid,
+        ) != (after.st_dev, after.st_ino, after.st_mode, after.st_uid):
+            raise RunnerError("live Codex system manager channel is untrusted")
+
+
 def _assert_root_owned_device_policy() -> None:
     """Bind raw-device denial to the kernel process cgroup and root systemd.
 
@@ -912,6 +945,7 @@ def _assert_root_owned_device_policy() -> None:
         "--no-pager",
         *(f"--property={name}" for name in sorted(required)),
     ]
+    _attest_root_system_manager_channels()
     try:
         completed = subprocess.run(
             argv,
@@ -1444,6 +1478,17 @@ def validate_live_immutable_mounts(
     }
 
     allowed_outputs = set(outputs.values())
+    # All visible read-only mounts inside immutable paths have their own backing.
+    nested_ro_roots = protected_directories | {home, protected_targets["system tools"]}
+    for point, backing, device, writable in mounts:
+        if writable or any(
+            point == output or output in point.parents for output in allowed_outputs
+        ):
+            continue
+        if any(root == point or root in point.parents for root in nested_ro_roots):
+            label = f"nested protected mount {point}"
+            protected_targets[label] = point
+            protected_backings[label] = (device, backing)
     observed_writable_outputs: set[Path] = set()
     for mount, mount_root, device, writable in mounts:
         if not writable:
