@@ -291,6 +291,103 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         fetch.assert_not_called()
         broker.assert_not_called()
 
+    def test_authoritative_release_admission_is_fenced_by_exact_odb_leases(self) -> None:
+        """Actual in-lock policy read occurs between owner-bound lease acquire/closeout."""
+        deploy = real_deploy
+        expected = "b" * 40
+        repo = Path("/fixture/canonical")
+        kinds = ("operation_key", "canonical_key", "common_dir_key",
+                 "objects_key", "origin_main_ref_key")
+        plan = {
+            "canonical_repository": repo, "owner_id": "fixture:leased-admission",
+            **{kind: f"fixture:{kind}" for kind in kinds},
+        }
+        keys = [plan[kind] for kind in kinds]
+        leases = [{"resource_key": key} for key in keys]
+        snapshot = {
+            "canonical_repository": str(repo), "current_head": "a"*40,
+            "current_branch": "main", "target_head": expected,
+            "origin_main": "c"*40, "target_object_present": True,
+            "clean": True, "shallow": False,
+        }
+        admitted = {
+            "status": "non-runtime-documentation",
+            "target_repo_head": expected,
+            "serving_repo_head": "a"*40,
+            "independent_review_required": False,
+            "changed_path_count": 1,
+        }
+        for label, alternate, refusal in (
+            ("success", snapshot, False),
+            ("ref-drift", {**snapshot, "origin_main": "d"*40}, False),
+            ("policy-refusal", snapshot, True),
+            ("unbound-policy-result", snapshot, False),
+        ):
+            events: list[str] = []
+            def source_policy(head: str) -> dict:
+                self.assertEqual(expected, head)
+                events.append("admission")
+                if refusal:
+                    raise deploy.DeploySchedulePreEffectRefusal("source R3 denied")
+                if label == "unbound-policy-result":
+                    return {"status": "non-runtime-documentation"}
+                return admitted
+            def closeout(_plan, resource_keys, observed_leases) -> dict:
+                events.append("release")
+                self.assertEqual(keys, resource_keys)
+                self.assertEqual(leases, observed_leases)
+                return {"released": list(leases)}
+            with (
+                self.subTest(case=label),
+                patch.object(deploy, "_origin_main_refresh_plan", return_value=plan),
+                patch.object(deploy, "_acquire_origin_main_refresh_resources",
+                             return_value={"leases": leases}) as acquire,
+                patch.object(deploy, "_require_origin_main_refresh_checkout_certainty") as certain,
+                patch.object(deploy, "_canonical_main_refresh_candidate",
+                             side_effect=[snapshot, alternate]) as state,
+                patch.object(deploy, "_require_release_source_admission",
+                             side_effect=source_policy),
+                patch.object(deploy, "_release_origin_main_refresh_resources",
+                             side_effect=closeout) as close,
+            ):
+                if refusal or alternate is not snapshot or label == "unbound-policy-result":
+                    with self.assertRaises(deploy.DeploySchedulePreEffectRefusal):
+                        deploy._require_release_source_admission_under_lease(expected)
+                else:
+                    self.assertEqual(
+                        admitted, deploy._require_release_source_admission_under_lease(expected)
+                    )
+            acquire.assert_called_once_with(plan, expected)
+            certain.assert_called_once_with(plan)
+            self.assertEqual(1 if refusal or label == "unbound-policy-result" else 2, state.call_count)
+            close.assert_called_once()
+            self.assertEqual(["admission", "release"], events)
+
+    def test_scheduler_never_uses_early_approval_when_lease_readmission_denies(self) -> None:
+        deploy = real_deploy
+        expected = "b" * 40
+        with (
+            patch.object(deploy, "_require_release_source_admission",
+                         return_value={"status": "non-runtime-documentation"}) as early,
+            patch.object(deploy, "_deploy_schedule_lock", return_value=nullcontext()),
+            patch.object(deploy, "_require_release_source_admission_under_lease",
+                         side_effect=deploy.DeploySchedulePreEffectRefusal(
+                             "protected source lease unavailable"
+                         )) as protected,
+            patch.object(deploy, "_fresh_public_github_main") as public,
+            patch.object(deploy, "inflight_runtime_job_evidence") as inflight,
+            patch.object(deploy.privileged, "ensure_rootbroker_authority") as broker,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "protected source lease"):
+                deploy._grabowski_runtime_deploy_schedule_impl(
+                    expected, local_mutation_tracker={},
+                )
+        early.assert_called_once_with(expected)
+        protected.assert_called_once_with(expected)
+        public.assert_not_called()
+        inflight.assert_not_called()
+        broker.assert_not_called()
+
     def test_docs_git_modes_must_be_plain_regular_files(self) -> None:
         """A docs/*.md suffix cannot legalize an executable, symlink or gitlink."""
         deploy = real_deploy
@@ -438,6 +535,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             "canonical_repository": str(deploy.CANONICAL_REPOSITORY),
         }
         with (
+            patch.object(deploy, "_require_release_source_admission_under_lease",
+                         side_effect=lambda head: deploy._require_release_source_admission(head)),
             patch.object(deploy, "_require_release_source_admission", return_value={}),
             patch.object(deploy, "_deploy_schedule_lock", return_value=nullcontext()),
             patch.object(deploy, "_fresh_public_github_main", return_value=expected),
@@ -545,6 +644,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             raise RuntimeError("stop before any effect")
 
         with (
+            patch.object(deploy, "_require_release_source_admission_under_lease",
+                         side_effect=lambda head: deploy._require_release_source_admission(head)),
             patch.object(deploy, "_require_release_source_admission", side_effect=admit),
             patch.object(
                 deploy, "_protected_release_admission_target_snapshot",
@@ -602,6 +703,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             raise RuntimeError("stop before effect")
 
         with (
+            patch.object(deploy, "_require_release_source_admission_under_lease",
+                         side_effect=lambda head: deploy._require_release_source_admission(head)),
             patch.object(deploy, "_require_release_source_admission", side_effect=admission),
             patch.object(deploy, "_deploy_schedule_lock", side_effect=lock),
             patch.object(deploy, "_protected_release_admission_target_snapshot",
@@ -722,6 +825,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             raise RuntimeError("stop before any effect")
 
         with (
+            patch.object(deploy, "_require_release_source_admission_under_lease",
+                         side_effect=lambda head: deploy._require_release_source_admission(head)),
             patch.object(deploy, "_require_release_source_admission", side_effect=admission),
             patch.object(deploy, "_protected_release_admission_target_snapshot",
                          return_value=reobserved) as candidate,
@@ -757,6 +862,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         drifted = {**initial, "origin_main": "d" * 40,
                    "target_object_present": True}
         with (
+            patch.object(deploy, "_require_release_source_admission_under_lease",
+                         side_effect=lambda head: deploy._require_release_source_admission(head)),
             patch.object(deploy, "_require_release_source_admission",
                          side_effect=deploy.DeploySchedulePreEffectRefusal(
                              "release admission blocked: source ancestry is unproved"
@@ -790,6 +897,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             ("release admission blocked: serving process identity mismatch", None, False),
         ):
             with (
+                patch.object(deploy, "_require_release_source_admission_under_lease",
+                             side_effect=lambda head: deploy._require_release_source_admission(head)),
                 self.subTest(message=message),
                 patch.object(
                     deploy, "_require_release_source_admission",
@@ -959,6 +1068,121 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         close.assert_called_once()
         self.assertEqual({}, tracker)
 
+    def test_import_closeout_rejects_missing_duplicate_or_unbound_lease_keys(self) -> None:
+        """A post-fetch closeout cannot claim all resources were released by count alone."""
+        deploy = real_deploy
+        expected = "b" * 40
+        repository = Path("/fixture/canonical")
+        snapshot = {
+            "canonical_repository": str(repository), "current_head": "a"*40,
+            "current_branch": "main", "target_head": expected,
+            "origin_main": "c"*40, "clean": True,
+            "shallow": False, "target_object_present": False,
+        }
+        after = {**snapshot, "target_object_present": True}
+        kinds = ("operation_key", "canonical_key", "common_dir_key",
+                 "objects_key", "origin_main_ref_key")
+        plan = {
+            "canonical_repository": repository, "owner_id": "fixture:closeout",
+            **{kind: f"fixture:{kind}" for kind in kinds},
+        }
+        valid = [{"resource_key": plan[kind]} for kind in kinds]
+        for label, released in (
+            ("wrong-key", [{"resource_key": "foreign:lease"}, *valid[1:]]),
+            ("duplicate-key", [valid[0], valid[0], *valid[2:]]),
+            ("non-object", [None, *valid[1:]]),
+        ):
+            tracker: dict = {}
+            def git_read(repo_arg: Path, *args: str) -> dict:
+                self.assertEqual(repository, repo_arg)
+                if args == ("rev-parse", "--show-object-format"):
+                    return self._git_success("sha1")
+                if args == ("rev-parse", "--verify", f"{expected}^{{commit}}"):
+                    return self._git_success(expected)
+                self.fail(f"unknown read {args}")
+            with (
+                self.subTest(case=label),
+                patch.object(deploy, "_origin_main_refresh_plan", return_value=plan),
+                patch.object(deploy, "_acquire_origin_main_refresh_resources",
+                             return_value={"leases": valid}),
+                patch.object(deploy, "_lease_for_key",
+                             side_effect=lambda _acq, key: {"resource_key": key}),
+                patch.object(deploy, "_require_origin_main_refresh_checkout_certainty"),
+                patch.object(deploy, "_canonical_main_refresh_candidate",
+                             side_effect=[snapshot, snapshot, after]),
+                patch.object(deploy, "_git_result", side_effect=git_read),
+                patch.object(deploy, "_fresh_public_github_main", return_value=expected),
+                patch.object(deploy, "_append_deploy_audit"),
+                patch.object(deploy, "_renew_origin_main_refresh_resources",
+                             return_value={"leases": valid}),
+                patch.object(deploy, "_mutating_git_result",
+                             return_value=self._git_success("")) as fetch,
+                patch.object(deploy, "_release_origin_main_refresh_resources",
+                             return_value={"released": released}) as close,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "lease closeout incomplete"):
+                    deploy._fetch_exact_release_admission_target(
+                        expected, snapshot, local_mutation_tracker=tracker,
+                    )
+            fetch.assert_called_once()
+            close.assert_called_once()
+            self.assertEqual(
+                "grabowski_runtime_deploy_origin_main_fetch_effect",
+                tracker["admission_target_fetch"]["kind"],
+            )
+
+    def test_audit_wait_rechecks_checkout_and_ref_after_lease_renewal(self) -> None:
+        """A renewed lease alone does not authenticate the old checkout snapshot."""
+        deploy = real_deploy
+        expected = "b" * 40
+        repo = Path("/fixture/canonical")
+        initial = {
+            "canonical_repository": str(repo), "current_head": "a"*40,
+            "current_branch": "main", "target_head": expected,
+            "origin_main": "c"*40, "clean": True, "shallow": False,
+            "target_object_present": False,
+        }
+        drifted = {**initial, "origin_main": "d"*40}
+        fields = ("operation_key", "canonical_key", "common_dir_key",
+                  "objects_key", "origin_main_ref_key")
+        plan = {
+            "canonical_repository": repo, "owner_id": "fixture:audit-ref-drift",
+            **{key: f"fixture:{key}" for key in fields},
+        }
+        leases = [{"resource_key": plan[key]} for key in fields]
+        tracker: dict = {}
+        with (
+            patch.object(deploy, "_origin_main_refresh_plan", return_value=plan),
+            patch.object(deploy, "_acquire_origin_main_refresh_resources",
+                         return_value={"leases": leases}),
+            patch.object(deploy, "_lease_for_key",
+                         side_effect=lambda _acq, key: {"resource_key": key}),
+            patch.object(deploy, "_require_origin_main_refresh_checkout_certainty") as certain,
+            patch.object(deploy, "_canonical_main_refresh_candidate",
+                         side_effect=[initial, drifted]) as checkout,
+            patch.object(deploy, "_git_result", return_value=self._git_success("sha1")),
+            patch.object(deploy, "_fresh_public_github_main", return_value=expected),
+            patch.object(deploy, "_append_deploy_audit") as audit,
+            patch.object(deploy, "_renew_origin_main_refresh_resources",
+                         return_value={"leases": leases}) as renew,
+            patch.object(deploy, "_mutating_git_result") as fetch,
+            patch.object(deploy, "_release_origin_main_refresh_resources",
+                         return_value={"released": leases}) as close,
+        ):
+            with self.assertRaisesRegex(
+                deploy.DeploySchedulePreEffectRefusal, "checkout/ref identity drifted"
+            ):
+                deploy._fetch_exact_release_admission_target(
+                    expected, initial, local_mutation_tracker=tracker,
+                )
+        self.assertEqual(2, certain.call_count)
+        self.assertEqual(2, checkout.call_count)
+        audit.assert_called_once()
+        renew.assert_called_once()
+        fetch.assert_not_called()
+        close.assert_called_once()
+        self.assertEqual({}, tracker)
+
     def test_exact_target_fetch_preserves_refs_and_oid_format(self) -> None:
         deploy = real_deploy
         repository = Path("/fixture/canonical")
@@ -1008,7 +1232,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                     patch.object(deploy, "_require_origin_main_refresh_checkout_certainty"),
                     patch.object(
                         deploy, "_canonical_main_refresh_candidate",
-                        side_effect=[snapshot, after],
+                        side_effect=[snapshot, snapshot, after],
                     ),
                     patch.object(deploy, "_git_result", side_effect=git_read),
                     patch.object(
@@ -1083,7 +1307,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                          side_effect=lambda _acq, key: {"resource_key": key}),
             patch.object(deploy, "_require_origin_main_refresh_checkout_certainty"),
             patch.object(deploy, "_canonical_main_refresh_candidate",
-                         side_effect=[initial, drifted]),
+                         side_effect=[initial, initial, drifted]),
             patch.object(deploy, "_git_result", side_effect=read),
             patch.object(deploy, "_fresh_public_github_main",
                          return_value=expected),
@@ -1131,6 +1355,8 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             }
 
         with (
+            patch.object(deploy, "_require_release_source_admission_under_lease",
+                         side_effect=lambda head: deploy._require_release_source_admission(head)),
             patch.object(deploy, "_require_release_source_admission", side_effect=admission),
             patch.object(deploy, "_protected_release_admission_target_snapshot",
                          return_value={"target_object_present": False}),
@@ -1459,6 +1685,67 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
         self.assertTrue(typed["mutation_outcome_unknown"])
         self.assertFalse(typed["local_mutation_observed"])
         self.assertEqual(evidence, typed["local_mutation_uncertainty_evidence"])
+
+    def test_captain_admission_only_passes_explicit_bound_document_or_serving_proof(self) -> None:
+        """A helper's arbitrary success-shaped return is never R3 authority."""
+        deploy = real_deploy
+        head = "b" * 40
+        serving = "a" * 40
+        valid_docs = {
+            "status": "non-runtime-documentation",
+            "serving_repo_head": serving,
+            "target_repo_head": head,
+            "changed_path_count": 1,
+            "independent_review_required": False,
+        }
+        valid_serving = {
+            "status": "already-serving-exact-source",
+            "serving_repo_head": head,
+            "target_repo_head": head,
+            "independent_review_required": False,
+        }
+        cases = [
+            ("valid-docs", valid_docs, True),
+            ("valid-serving", valid_serving, True),
+            ("empty", {}, False),
+            ("unknown-status", {**valid_docs, "status": "provisional"}, False),
+            ("required-r3", {**valid_docs, "independent_review_required": True}, False),
+            ("missing-review-flag", {k:v for k,v in valid_docs.items()
+                                     if k != "independent_review_required"}, False),
+            ("target-spoof", {**valid_docs, "target_repo_head": "c"*40}, False),
+            ("invalid-count", {**valid_docs, "changed_path_count": True}, False),
+            ("not-same-serving", {**valid_serving, "serving_repo_head": serving}, False),
+            ("non-object", ["unexpected"], False),
+        ]
+        for label, returned, permitted in cases:
+            with (
+                self.subTest(case=label),
+                patch.object(deploy, "_require_release_source_admission",
+                             return_value=returned),
+            ):
+                gate = grips._captain_independent_review_gate(
+                    {"expected_head": head}, [{"action": "runtime-deploy"}],
+                )
+            self.assertEqual("pass" if permitted else "blocked", gate["status"])
+            if permitted:
+                self.assertIs(gate["details"]["required"], False)
+
+    def test_captain_release_admission_unexpected_exception_fails_closed(self) -> None:
+        deploy = real_deploy
+        for error in (ImportError("provider unavailable"),
+                      AttributeError("source identity missing"),
+                      KeyError("required field missing")):
+            with (
+                self.subTest(exception=type(error).__name__),
+                patch.object(deploy, "_require_release_source_admission",
+                             side_effect=error),
+                patch.object(deploy.privileged, "ensure_rootbroker_authority") as broker,
+            ):
+                gate = grips._captain_independent_review_gate(
+                    {"expected_head": "b"*40}, [{"action": "runtime-deploy"}],
+                )
+            self.assertEqual("blocked", gate["status"])
+            broker.assert_not_called()
 
     def test_captain_runtime_deploy_marks_review_gate_blocked(self) -> None:
         # Exercise the Captain policy seam without import-order effects from

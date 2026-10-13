@@ -13813,18 +13813,53 @@ def _captain_independent_review_gate(
             # Exact object import remains a separate protected scheduler
             # operation, not an authorized runtime deployment.
             release = release_deploy._require_release_source_admission(expected_head)
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        except Exception as exc:
+            # Missing source dependencies, schema drift and unexpected policy
+            # errors must fail closed just like an explicit release refusal.
             return _captain_gate(
                 "independent-review-policy",
                 "blocked",
                 "runtime release review admission was not proven",
-                [f"release_admission_blocked:{type(exc).__name__}: {exc}"],
+                [f"release_admission_blocked:{type(exc).__name__}: {str(exc)[:256]}"],
+            )
+        status = release.get("status") if isinstance(release, dict) else None
+        bound_target = (
+            isinstance(expected_head, str)
+            and _is_hex_sha(expected_head, lengths=(40,))
+            and isinstance(release, dict)
+            and release.get("target_repo_head") == expected_head
+            and release.get("independent_review_required") is False
+        )
+        bound_serving = (
+            bound_target
+            and _is_hex_sha(release.get("serving_repo_head"), lengths=(40,))
+        )
+        valid_status = (
+            (
+                status == "already-serving-exact-source"
+                and bound_serving
+                and release.get("serving_repo_head") == expected_head
+            )
+            or (
+                status == "non-runtime-documentation"
+                and bound_serving
+                and release.get("serving_repo_head") != expected_head
+                and type(release.get("changed_path_count")) is int
+                and 0 <= release["changed_path_count"] <= 8192
+            )
+        )
+        if not valid_status:
+            return _captain_gate(
+                "independent-review-policy",
+                "blocked",
+                "runtime release source admission result is incomplete or unbound",
+                ["runtime_deploy_release_admission_result_invalid"],
             )
         return _captain_gate(
             "independent-review-policy",
             "pass",
             "unchanged or documentation-only runtime source; R3 not implied",
-            {"required": False, "release_source_status": release.get("status")},
+            {"required": False, "release_source_status": status},
         )
     targets = [
         action.get("target")

@@ -3252,6 +3252,23 @@ def _fetch_exact_release_admission_target(
             raise DeploySchedulePreEffectRefusal(
                 "release admission object import public main drifted during audit wait"
             )
+        # An unbounded audit-lock wait may have outlived the source snapshot
+        # even when the exact resource leases were safely renewed. Re-check
+        # checkout/ref/target under their renewed leases before Git mutates
+        # the ODB or an uncertainty receipt records previous origin/main.
+        _require_origin_main_refresh_checkout_certainty(plan)
+        observed_after_audit = _canonical_main_refresh_candidate(
+            expected_head, plan["owner_id"]
+        )
+        if (
+            _canonical_main_refresh_state(observed_after_audit)
+            != _canonical_main_refresh_state(initial_snapshot)
+            or observed_after_audit.get("target_object_present") is not False
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission object import checkout/ref identity drifted during audit wait"
+            )
+        locked = observed_after_audit
         # Once a fetch begins its outcome can be uncertain even if the command
         # fails. Persist that distinction instead of calling it no effect.
         local_mutation_tracker["admission_target_fetch"] = {
@@ -3338,9 +3355,12 @@ def _fetch_exact_release_admission_target(
         release = _release_origin_main_refresh_resources(
             plan, resource_keys, leases
         )
+        released = release.get("released") if isinstance(release, dict) else None
         if (
-            not isinstance(release.get("released"), list)
-            or len(release["released"]) != len(resource_keys)
+            not isinstance(released, list)
+            or len(released) != len(resource_keys)
+            or not all(isinstance(item, dict) for item in released)
+            or {item.get("resource_key") for item in released} != set(resource_keys)
         ):
             raise RuntimeError(
                 "release admission object import lease closeout incomplete"
@@ -5831,6 +5851,87 @@ def _require_release_source_admission(expected_head: str) -> dict[str, Any]:
 
 
 
+def _require_release_source_admission_under_lease(
+    expected_head: str,
+) -> dict[str, Any]:
+    """Re-admit the runtime source under exact ODB/ref/checkout writer leases.
+
+    The early scheduler probe is only a fail-closed hint. This is the
+    authoritative decision before any index, origin/main, Rootbroker, or
+    job-dispatch effects; a concurrent Git writer cannot change the source
+    resolution during the check.
+    """
+    plan = _origin_main_refresh_plan(expected_head)
+    resource_keys = [
+        plan["operation_key"], plan["canonical_key"], plan["common_dir_key"],
+        plan["objects_key"], plan["origin_main_ref_key"],
+    ]
+    acquisition = _acquire_origin_main_refresh_resources(plan, expected_head)
+    try:
+        for key in resource_keys:
+            _lease_for_key(acquisition, key)
+        _require_origin_main_refresh_checkout_certainty(plan)
+        before = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if (
+            not isinstance(before, dict)
+            or before.get("canonical_repository") != str(plan["canonical_repository"])
+            or before.get("target_head") != expected_head
+            or before.get("target_object_present") is not True
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission refused: protected target identity is unproved"
+            )
+        admitted = _require_release_source_admission(expected_head)
+        # A non-exception result is not itself authorization. The caller may
+        # proceed only with one of the helper's two exact source identities.
+        if (
+            not isinstance(admitted, dict)
+            or admitted.get("target_repo_head") != expected_head
+            or admitted.get("independent_review_required") is not False
+            or (
+                admitted.get("status") == "already-serving-exact-source"
+                and admitted.get("serving_repo_head") != expected_head
+            )
+            or (
+                admitted.get("status") == "non-runtime-documentation"
+                and (
+                    admitted.get("serving_repo_head") == expected_head
+                    or type(admitted.get("changed_path_count")) is not int
+                    or not 0 <= admitted["changed_path_count"] <= 8192
+                )
+            )
+            or admitted.get("status") not in {
+                "already-serving-exact-source", "non-runtime-documentation"
+            }
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission refused: protected policy result is unbound"
+            )
+        after = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if (
+            not isinstance(after, dict)
+            or _canonical_main_refresh_state(before) != _canonical_main_refresh_state(after)
+            or after.get("target_object_present") is not True
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission refused: checkout/ref/ODB identity drifted"
+            )
+        return admitted
+    finally:
+        leases = [_lease_for_key(acquisition, key) for key in resource_keys]
+        release = _release_origin_main_refresh_resources(plan, resource_keys, leases)
+        released = release.get("released") if isinstance(release, dict) else None
+        if (
+            not isinstance(released, list)
+            or len(released) != len(resource_keys)
+            or not all(isinstance(item, dict) for item in released)
+            or {item.get("resource_key") for item in released} != set(resource_keys)
+        ):
+            raise RuntimeError(
+                "release admission protected source lease closeout incomplete"
+            )
+
+
 def _protected_release_admission_target_snapshot(
     expected_head: str,
 ) -> dict[str, Any]:
@@ -5915,7 +6016,7 @@ def _grabowski_runtime_deploy_schedule_impl(
         # Re-admit even when another scheduler imported the exact object.
         # Mandatory re-admission under the lock even when an earlier read
         # succeeded. No index, Git-ref, Rootbroker, or dispatch effect precedes it.
-        _require_release_source_admission(expected_head)
+        _require_release_source_admission_under_lease(expected_head)
         public_github_main_before = _fresh_public_github_main(expected_head)
         if public_github_main_before != expected_head:
             raise RuntimeError(
