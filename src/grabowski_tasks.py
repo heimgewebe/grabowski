@@ -6718,6 +6718,17 @@ def _stop_task_after_lease_revocation(record: dict[str, Any]) -> dict[str, Any]:
     error: str | None = None
     try:
         unit = _authoritative_unit(record)
+        # This function is reachable from task_status. Observation alone is
+        # not stop authority. A blockade or invalid audit MUST prohibit the
+        # dispatch and leave an explicitly uncertain task outcome.
+        operator._require_operator_mutation(
+            "durable_job",
+            path=(record.get("cwd") if isinstance(record.get("cwd"), str) else None),
+            task_id=_validate_task_id(str(record["task_id"])),
+            owner_id=str(record.get("lease_owner_id") or _lease_owner(record["task_id"])),
+            service=unit,
+            host=str(record["host"]),
+        )
         if _is_root_systemd_backend(record):
             result = privileged.root_task_systemd_request(
                 _root_task_payload(record, "stop"), timeout_seconds=60,
@@ -13986,7 +13997,8 @@ async def _grabowski_task_start_tool(
     )
 
 
-@mcp.tool(name="grabowski_task_status", annotations=READ_ONLY)
+# Task status can stop a revoked unit; advertise its actual effect class.
+@mcp.tool(name="grabowski_task_status", annotations=MUTATING)
 async def _grabowski_task_status_tool(task_id: str) -> dict[str, Any]:
     """Observe one persistent task and refresh its recorded state."""
     operator._require_operator_capability("durable_job")

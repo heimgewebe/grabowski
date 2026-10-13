@@ -698,8 +698,14 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             with patch.object(
                 tasks.fleet, "fleet_host",
                 side_effect=RuntimeError("Fleet registry missing: isolated test HOME"),
-            ):
+            ), patch.object(
+                tasks.operator, "_require_operator_mutation",
+                wraps=tasks.operator._require_operator_mutation,
+            ) as authorize:
                 maintenance = tasks._maintain_record_resources(record, "running")
+            authorize.assert_called_once()
+            self.assertEqual(authorize.call_args.args, ("durable_job",))
+            self.assertEqual(authorize.call_args.kwargs["service"], unit)
             self.assertIsNotNone(maintenance)
             self.assertIs(maintenance["maintained"], False)
             self.assertIs(maintenance["stop_verified"], True, maintenance)
@@ -750,6 +756,45 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             ):
                 tasks._attested_local_revoked_task_unit(record)
         stop.assert_not_called()
+
+
+    def test_revoked_task_stop_fails_closed_under_operator_blockade(self) -> None:
+        """Read-only observation may not bypass mutation/audit safety gates."""
+        task_id = self._start_claude()
+        record = tasks._row_raw(task_id)
+        keys = tasks._record_resource_keys(record)
+        self.assertTrue(keys)
+        tasks.resources.release_resources(
+            str(record["lease_owner_id"]), keys
+        )
+        with patch.object(
+            tasks.operator, "_require_operator_mutation",
+            side_effect=PermissionError("test blockade denies mutation"),
+        ) as authorize, patch.object(
+            tasks.operator, "_run_mutating_user_systemd_unit"
+        ) as stop, patch.object(
+            tasks.privileged, "root_task_systemd_request"
+        ) as root_stop, patch.object(
+            tasks, "_dispatch"
+        ) as dispatch:
+            maintenance = tasks._maintain_record_resources(record, "running")
+        self.assertIsNotNone(maintenance)
+        assert maintenance is not None
+        self.assertFalse(maintenance["maintained"])
+        self.assertEqual(maintenance["mode"], "revoked_stop_unverified")
+        self.assertEqual(maintenance["state_override"], "outcome_unknown")
+        self.assertFalse(maintenance["stop_verified"])
+        self.assertIn("blockade denies mutation", maintenance["stop_error"])
+        authorize.assert_called_once()
+        self.assertEqual(authorize.call_args.args, ("durable_job",))
+        self.assertEqual(authorize.call_args.kwargs["task_id"], task_id)
+        self.assertEqual(
+            authorize.call_args.kwargs["service"], record["unit"]
+        )
+        stop.assert_not_called()
+        root_stop.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertFalse(tasks.resources.inspect_resources(keys))
 
 
     def test_revoked_running_task_lease_cannot_be_silently_reacquired(self) -> None:
