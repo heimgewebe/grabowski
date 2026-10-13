@@ -1565,6 +1565,7 @@ class TaskSecurityRegressionTests(unittest.TestCase):
 
         misplaced = state / "not-private"
         misplaced.mkdir(mode=0o755)
+        misplaced.chmod(0o755)  # umask=0077 must not turn this negative fixture private.
         with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
             tasks.agent_sandbox.minimal_sandbox_argv(
                 **kwargs,
@@ -1747,6 +1748,43 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                         **options,
                     )
                 self.assertEqual(private.read_text(encoding="utf-8"), "unchanged")
+
+
+    def test_writable_scope_rejects_cross_device_root_alias(self) -> None:
+        """A bounded lease does not attest a mounted alias beneath its workspace."""
+        import os
+        from pathlib import Path
+
+        workspace = self.root / "device-boundary-workspace"
+        workspace.mkdir()
+        allowed = workspace / "allowed"
+        allowed.mkdir()
+        original_stat = Path.stat
+
+        def mounted_root_stat(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+            observed = original_stat(path, *args, **kwargs)
+            if path != allowed:
+                return observed
+            fields = list(observed)
+            fields[2] = int(observed.st_dev) + 1
+            return os.stat_result(fields)
+
+        kwargs = {
+            "workspace": workspace,
+            "command": ["/usr/bin/true"],
+            "workspace_writable": True,
+            "writable_paths": (allowed,),
+        }
+        normal = tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
+        self.assertIn(
+            ["--bind", str(allowed), str(allowed)],
+            [normal[i:i + 3] for i in range(len(normal) - 2)],
+        )
+        with patch.object(Path, "stat", mounted_root_stat):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "filesystem boundary"
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
 
 
     def test_git_metadata_must_not_be_a_bounded_writable_path(self) -> None:

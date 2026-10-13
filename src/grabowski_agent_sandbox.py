@@ -808,6 +808,7 @@ def _adler_inbox_sandbox_binding(worktree: Path) -> tuple[tuple[tuple[Path, Path
 
 def _normalized_writable_paths(worktree: Path, values: Iterable[Path]) -> list[Path]:
     candidates: list[Path] = []
+    workspace_device = worktree.stat().st_dev
     for value in values:
         target = _safe_existing_path(value, "writable_path")
         try:
@@ -819,6 +820,10 @@ def _normalized_writable_paths(worktree: Path, values: Iterable[Path]) -> list[P
         if target == worktree:
             raise AgentSandboxError("whole-workspace writable bind is not allowed")
         metadata = target.stat()
+        if metadata.st_dev != workspace_device:
+            raise AgentSandboxError(
+                f"writable path root crosses a filesystem boundary: {target}"
+            )
         if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
             raise AgentSandboxError(f"writable path must be a regular file or directory: {target}")
         candidates.append(target)
