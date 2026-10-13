@@ -6552,6 +6552,115 @@ class TaskTests(unittest.TestCase):
         persist.assert_not_called()
         renew.assert_not_called()
 
+    def test_reconcile_ready_accepts_quiescent_cancelled_local_unit(self) -> None:
+        # Systemd reports the unit outcome, not Grabowski's historical
+        # cancellation label. A settled cancellation is safe only with fresh
+        # positive quiescence; neither cache nor a new active unit qualifies.
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='cancelled' WHERE task_id=?",
+                (task["task_id"],),
+            )
+        cycle = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=cycle),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        observed = {
+            "state": "completed",
+            "properties": {
+                "LoadState": "loaded", "ActiveState": "inactive",
+                "SubState": "dead", "Result": "success",
+                "ExecMainStatus": "0",
+            },
+            "probe": {"returncode": 0, "timed_out": False},
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1", "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(tasks, "_observe", return_value=observed) as probe,
+            patch.object(
+                tasks, "_set_state",
+                side_effect=AssertionError("READ_ONLY must never mutate task state"),
+            ) as write,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                self.assertEqual(
+                    "verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+                )
+            with patch.object(
+                tasks, "_observe",
+                return_value={
+                    **observed, "state": "running",
+                    "properties": {
+                        **observed["properties"],
+                        "ActiveState": "active", "SubState": "running",
+                    },
+                },
+            ):
+                with tasks._task_readonly_snapshot() as reader:
+                    self.assertNotEqual(
+                        "verified",
+                        tasks._task_reconcile_ready_evidence_snapshot(reader)["status"],
+                    )
+        probe.assert_called_once()
+        write.assert_not_called()
+
+    def test_rootbroker_cancelled_terminal_needs_coherent_positive_unit(self) -> None:
+        record = {
+            **self._start()["task"],
+            "state": "cancelled",
+            "execution_backend": "systemd-root-broker",
+            "systemd_scope": "system",
+        }
+        unit = tasks._authoritative_unit(record)
+        observed = {
+            "state": "completed",
+            "properties": {
+                "LoadState": "loaded", "ActiveState": "inactive",
+                "SubState": "dead", "Result": "success",
+                "ExecMainCode": "1", "ExecMainStatus": "0",
+                "Id": unit, "Names": unit, "InvocationID": "a" * 32,
+            },
+            "probe": {"returncode": 0, "outcome_unknown": False},
+            "observer": {"kind": "root-systemd-broker-show-v1"},
+            "observed_at_unix": tasks._now(),
+        }
+        self.assertTrue(tasks._task_reconcile_ready_rootbroker_terminal_observed(record, observed))
+        self.assertFalse(tasks._task_reconcile_ready_rootbroker_terminal_observed(
+            record, {**observed, "properties": {
+                **observed["properties"], "ActiveState": "active",
+            }}
+        ))
+        self.assertFalse(tasks._task_reconcile_ready_rootbroker_terminal_observed(
+            record, {**observed, "properties": {
+                **observed["properties"], "InvocationID": "",
+            }}
+        ))
+
     def test_reconcile_ready_does_not_verify_restarted_local_terminal_user_unit(self) -> None:
         # A local unit can restart after a valid quiescence proof without any
         # change to task/resource SQLite revisions. READ_ONLY must not elevate

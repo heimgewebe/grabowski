@@ -11597,6 +11597,19 @@ def _task_reconcile_ready_privileged_rows(
             connection.set_progress_handler(None, 0)
     return records
 
+def _task_reconcile_ready_observed_terminal_state(
+    record: dict[str, Any], observed: dict[str, Any],
+) -> str | None:
+    """Use Systemd terminal truth; cancellation is persisted policy, not a unit result."""
+    observed_state = observed.get("state")
+    if observed_state not in {"completed", "failed", "signalled", "timed_out"}:
+        return None
+    persisted_state = record.get("state")
+    if persisted_state == "cancelled" or persisted_state == observed_state:
+        return str(observed_state)
+    return None
+
+
 def _task_reconcile_ready_rootbroker_terminal_observed(
     record: dict[str, Any], observed: Any,
 ) -> bool:
@@ -11636,8 +11649,10 @@ def _task_reconcile_ready_rootbroker_terminal_observed(
         return False
     if props.get("SubState") not in {"dead", "failed"}:
         return False
-    state = str(record.get("state"))
-    if observed.get("state") != state:
+    observed_state = _task_reconcile_ready_observed_terminal_state(
+        record, observed
+    )
+    if observed_state is None:
         return False
     allowed_results = {
         "completed": {"success"},
@@ -11645,9 +11660,9 @@ def _task_reconcile_ready_rootbroker_terminal_observed(
         "signalled": {"signal", "core-dump"},
         "timed_out": {"timeout"},
     }
-    if props.get("Result") not in allowed_results.get(state, set()):
+    if props.get("Result") not in allowed_results.get(observed_state, set()):
         return False
-    if state == "completed":
+    if observed_state == "completed":
         return (
             props.get("ActiveState") == "inactive"
             and props.get("SubState") == "dead"
@@ -12013,8 +12028,7 @@ def _task_reconcile_ready_local_terminal_observed(
         props.get("LoadState") != "loaded"
         or props.get("ActiveState") not in {"inactive", "failed"}
         or props.get("SubState") not in {"dead", "failed"}
-        or not _is_terminal_state(str(observed.get("state")))
-        or observed.get("state") != record["state"]
+        or _task_reconcile_ready_observed_terminal_state(record, observed) is None
     ):
         return False
     unit = _authoritative_unit(record)
@@ -12029,7 +12043,8 @@ def _task_reconcile_ready_local_terminal_observed(
         "signalled": {"signal", "core-dump"},
         "timed_out": {"timeout"},
     }
-    return result in allowed.get(str(record["state"]), set())
+    observed_state = _task_reconcile_ready_observed_terminal_state(record, observed)
+    return result in allowed.get(observed_state, set())
 
 
 def _task_reconcile_ready_evidence_snapshot(
