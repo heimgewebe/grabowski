@@ -1773,6 +1773,7 @@ def _tracked_runtime_deploy_local_mutation_evidence(
 ) -> dict[str, Any] | None:
     effects: list[dict[str, Any]] = []
     for key in (
+        "admission_target_fetch",
         "deploy_index_mutation",
         "stale_pending_reconciliation",
         "origin_main_refresh",
@@ -3105,6 +3106,170 @@ def _origin_main_fetch_effect_evidence(
         **material,
         "evidence_sha256": _source_identity_sha256(material),
     }
+
+
+
+def _fetch_exact_release_admission_target(
+    expected_head: str,
+    initial_snapshot: dict[str, Any],
+    *,
+    local_mutation_tracker: dict[str, Any],
+) -> None:
+    """Import only an exact public-main object before ancestry admission.
+
+    Caller holds the schedule lock. This operation never moves a Git ref,
+    grants release authority, or schedules a job. The ordinary independent
+    release policy must be re-evaluated after the protected object import.
+    """
+    if (
+        not isinstance(expected_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None
+        or initial_snapshot.get("target_head") != expected_head
+        or initial_snapshot.get("target_object_present") is not False
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission object import requires an exact missing target"
+        )
+    plan = _origin_main_refresh_plan(expected_head)
+    canonical = plan["canonical_repository"]
+    if initial_snapshot.get("canonical_repository") != str(canonical):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission object import canonical repository mismatch"
+        )
+    resource_keys = [
+        plan["operation_key"],
+        plan["canonical_key"],
+        plan["common_dir_key"],
+        plan["objects_key"],
+        plan["origin_main_ref_key"],
+    ]
+    acquisition = _acquire_origin_main_refresh_resources(plan, expected_head)
+    try:
+        expected_leases = [
+            _lease_for_key(acquisition, resource_key)
+            for resource_key in resource_keys
+        ]
+        _require_origin_main_refresh_checkout_certainty(plan)
+        locked = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if (
+            _canonical_main_refresh_state(locked)
+            != _canonical_main_refresh_state(initial_snapshot)
+            or locked.get("target_object_present") is not False
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission object import checkout or target drifted before fetch"
+            )
+        object_format = _required_stdout(
+            _git_result(canonical, "rev-parse", "--show-object-format"),
+            "canonical object format",
+        )
+        if (
+            (object_format == "sha1" and len(expected_head) != 40)
+            or (object_format == "sha256" and len(expected_head) != 64)
+            or object_format not in {"sha1", "sha256"}
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission object import object format differs from target OID"
+            )
+        public_before = _fresh_public_github_main(expected_head)
+        if public_before != expected_head:
+            raise DeploySchedulePreEffectRefusal(
+                "release admission object import public main drifted before fetch"
+            )
+        _append_deploy_audit({
+            "timestamp_unix": int(time.time()),
+            "operation": "runtime-deploy-admission-target-fetch-intent",
+            "expected_head": expected_head,
+            "public_github_main": public_before,
+            "previous_origin_main": locked["origin_main"],
+        })
+        # Once a fetch begins its outcome can be uncertain even if the command
+        # fails. Persist that distinction instead of calling it no effect.
+        local_mutation_tracker["admission_target_fetch"] = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_admission_target_fetch_attempt",
+            "expected_head": expected_head,
+            "previous_origin_main": locked["origin_main"],
+            "operation_resource_key": plan["operation_key"],
+            "status": "outcome_unknown",
+            "effect_may_have_started": True,
+        }
+        result = _mutating_git_result(
+            canonical,
+            "fetch",
+            "--no-auto-maintenance",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-recurse-submodules",
+            PUBLIC_GITHUB_REPOSITORY_URL,
+            PUBLIC_GITHUB_MAIN_REF,
+        )
+        if (
+            type(result.get("returncode")) is not int
+            or result["returncode"] != 0
+            or result.get("timed_out") is not False
+            or result.get("stdout_truncated") is not False
+            or result.get("stderr_truncated") is not False
+        ):
+            raise RuntimeError("exact protected-main admission object fetch failed")
+        observed_head = _required_stdout(
+            _git_result(canonical, "rev-parse", "--verify", f"{expected_head}^{{commit}}"),
+            "fetched admission target commit",
+        )
+        if observed_head != expected_head:
+            raise RuntimeError("fetched admission target commit does not match public main")
+        local_mutation_tracker["admission_target_fetch"] = (
+            _origin_main_fetch_effect_evidence(
+                plan=plan,
+                pre_fetch_snapshot=locked,
+                expected_head=expected_head,
+                resolved_target=observed_head,
+                fetch_result=result,
+                public_before_fetch=public_before,
+            )
+        )
+        after = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if (
+            _canonical_main_refresh_state(after)
+            != _canonical_main_refresh_state(initial_snapshot)
+            or after.get("target_object_present") is not True
+        ):
+            raise RuntimeError(
+                "release admission object fetch altered canonical checkout or remote ref"
+            )
+        public_after = _fresh_public_github_main(expected_head)
+        if public_after != expected_head:
+            raise RuntimeError(
+                "release admission object fetch public main drifted after fetch"
+            )
+        _append_deploy_audit({
+            "timestamp_unix": int(time.time()),
+            "operation": "runtime-deploy-admission-target-fetched",
+            "expected_head": expected_head,
+            "object_format": object_format,
+            "public_github_main": public_after,
+            "evidence_sha256": local_mutation_tracker["admission_target_fetch"][
+                "evidence_sha256"
+            ],
+            "origin_main_unchanged": True,
+        })
+    finally:
+        # Never retain the ref/ODB leases after this admission-only operation.
+        # Any incomplete release is a hard failure, never a reason to dispatch.
+        leases = [
+            _lease_for_key(acquisition, resource_key)
+            for resource_key in resource_keys
+        ]
+        release = _release_origin_main_refresh_resources(
+            plan, resource_keys, leases
+        )
+        if (
+            not isinstance(release.get("released"), list)
+            or len(release["released"]) != len(resource_keys)
+        ):
+            raise RuntimeError(
+                "release admission object import lease closeout incomplete"
+            )
 
 
 def _origin_main_refresh_effect_evidence(
@@ -5526,8 +5691,26 @@ def _grabowski_runtime_deploy_schedule_impl(
     local_mutation_tracker: dict[str, Any],
 ) -> dict[str, Any]:
     """Implement one source-identity-bound self-deployment schedule attempt."""
-    _require_release_source_admission(expected_head)
+    # Preserve the early pre-effect denial. Only an explicitly missing target
+    # object can defer the ancestry portion into the protected schedule lock.
+    admission_snapshot: dict[str, Any] | None = None
+    try:
+        _require_release_source_admission(expected_head)
+    except DeploySchedulePreEffectRefusal as exc:
+        if str(exc) != "release admission blocked: source ancestry is unproved":
+            raise
+        admission_snapshot = _canonical_main_refresh_candidate(expected_head)
+        if admission_snapshot.get("target_object_present") is not False:
+            raise
     with _deploy_schedule_lock():
+        if admission_snapshot is not None:
+            _fetch_exact_release_admission_target(
+                expected_head, admission_snapshot,
+                local_mutation_tracker=local_mutation_tracker,
+            )
+        # Mandatory re-admission under the lock even when an earlier read
+        # succeeded. No index, Git-ref, Rootbroker, or dispatch effect precedes it.
+        _require_release_source_admission(expected_head)
         public_github_main_before = _fresh_public_github_main(expected_head)
         if public_github_main_before != expected_head:
             raise RuntimeError(
