@@ -1387,11 +1387,20 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 "release review admission missing: independent R3 required"
             )
 
+        completed_import = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_origin_main_fetch_effect",
+            "expected_head": expected,
+            "status": "mocked-completed-object-import",
+        }
+        completed_import = {
+            **completed_import,
+            "evidence_sha256": deploy._source_identity_sha256(completed_import),
+        }
+
         def fetch(head: str, snapshot: dict, *, local_mutation_tracker: dict) -> None:
             calls.append("fetch")
-            local_mutation_tracker["admission_target_fetch"] = {
-                "kind": "mocked-object-effect-not-a-review-pass"
-            }
+            local_mutation_tracker["admission_target_fetch"] = completed_import
 
         with (
             patch.object(deploy, "_require_release_source_admission_under_lease",
@@ -1405,13 +1414,71 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             patch.object(deploy, "inflight_runtime_job_evidence") as index,
             patch.object(deploy.privileged, "ensure_rootbroker_authority") as broker,
         ):
-            with self.assertRaisesRegex(RuntimeError, "independent R3"):
+            with self.assertRaisesRegex(RuntimeError, "independent R3") as raised:
                 deploy._grabowski_runtime_deploy_schedule_impl(
                     expected, local_mutation_tracker={}
                 )
+        self.assertEqual(
+            completed_import, raised.exception.local_mutation_evidence
+        )
         self.assertEqual(["admission", "fetch", "admission"], calls)
         remote.assert_not_called()
         index.assert_not_called()
+        broker.assert_not_called()
+
+    def test_direct_scheduler_failed_fetch_preserves_digest_bound_unknown_outcome(self) -> None:
+        """An uncertain Git object fetch is not a pre-effect no-op."""
+        deploy = real_deploy
+        expected = "b" * 40
+        uncertain = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_admission_target_fetch_attempt",
+            "expected_head": expected,
+            "previous_origin_main": "a" * 40,
+            "operation_resource_key": (
+                "repo:/fixture/canonical:operation:runtime-deploy-origin-main-refresh"
+            ),
+            "status": "outcome_unknown",
+            "effect_may_have_started": True,
+        }
+
+        def failed_fetch(head: str, snapshot: dict, *, local_mutation_tracker: dict) -> None:
+            self.assertEqual(head, expected)
+            local_mutation_tracker["admission_target_fetch"] = uncertain
+            raise RuntimeError("exact protected-main admission object fetch failed")
+
+        with (
+            patch.object(
+                deploy, "_require_release_source_admission",
+                side_effect=deploy.DeploySchedulePreEffectRefusal(
+                    "release admission blocked: source ancestry is unproved"
+                ),
+            ),
+            patch.object(
+                deploy, "_protected_release_admission_target_snapshot",
+                return_value={"target_object_present": False},
+            ),
+            patch.object(deploy, "_deploy_schedule_lock", return_value=nullcontext()),
+            patch.object(deploy, "_fetch_exact_release_admission_target",
+                         side_effect=failed_fetch),
+            patch.object(deploy, "_fresh_public_github_main") as remote,
+            patch.object(deploy.privileged, "ensure_rootbroker_authority") as broker,
+        ):
+            with self.assertRaises(
+                deploy.DeployScheduleFailureAfterLocalMutation
+            ) as raised:
+                deploy._grabowski_runtime_deploy_schedule_impl(
+                    expected, local_mutation_tracker={}
+                )
+        expected_evidence = {
+            **uncertain,
+            "evidence_sha256": deploy._source_identity_sha256(uncertain),
+        }
+        self.assertEqual(
+            expected_evidence, raised.exception.local_mutation_evidence
+        )
+        self.assertIn("object fetch failed", str(raised.exception))
+        remote.assert_not_called()
         broker.assert_not_called()
 
     def test_wrong_oid_width_blocks_before_fetch(self) -> None:

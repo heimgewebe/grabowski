@@ -6021,26 +6021,53 @@ def _grabowski_runtime_deploy_schedule_impl(
             raise
         needs_target_object_admission = True
     with _deploy_schedule_lock():
-        if needs_target_object_admission:
-            # A lock waiter must not read a prior importer's live source
-            # leases. Acquire our own ODB/checkout leases before any status
-            # check that may execute repository-configured filters.
-            snapshot = _protected_release_admission_target_snapshot(expected_head)
-            if snapshot["target_object_present"] is False:
-                _fetch_exact_release_admission_target(
-                    expected_head, snapshot,
-                    local_mutation_tracker=local_mutation_tracker,
+        try:
+            if needs_target_object_admission:
+                # A lock waiter must not read a prior importer's live source
+                # leases. Acquire our own ODB/checkout leases before any status
+                # check that may execute repository-configured filters.
+                snapshot = _protected_release_admission_target_snapshot(expected_head)
+                if snapshot["target_object_present"] is False:
+                    _fetch_exact_release_admission_target(
+                        expected_head, snapshot,
+                        local_mutation_tracker=local_mutation_tracker,
+                    )
+            # Re-admit even when another scheduler imported the exact object.
+            # Mandatory re-admission under the lock even when an earlier read
+            # succeeded. No index, Git-ref, Rootbroker, or dispatch effect precedes it.
+            _require_release_source_admission_under_lease(expected_head)
+            public_github_main_before = _fresh_public_github_main(expected_head)
+            if public_github_main_before != expected_head:
+                raise RuntimeError(
+                    "fresh public GitHub main differs from deployment target: "
+                    f"expected {expected_head}, found {public_github_main_before}"
                 )
-        # Re-admit even when another scheduler imported the exact object.
-        # Mandatory re-admission under the lock even when an earlier read
-        # succeeded. No index, Git-ref, Rootbroker, or dispatch effect precedes it.
-        _require_release_source_admission_under_lease(expected_head)
-        public_github_main_before = _fresh_public_github_main(expected_head)
-        if public_github_main_before != expected_head:
-            raise RuntimeError(
-                "fresh public GitHub main differs from deployment target: "
-                f"expected {expected_head}, found {public_github_main_before}"
+        except DeploySchedulePreEffectRefusal as exc:
+            # An R3/source refusal after an ODB import is still a refusal,
+            # but no longer a mutation-free one. Preserve the committed fetch
+            # receipt without allowing Rootbroker or job dispatch to run.
+            evidence = _tracked_runtime_deploy_local_mutation_evidence(
+                local_mutation_tracker
             )
+            if evidence is None or exc.local_mutation_evidence is not None:
+                raise
+            raise DeploySchedulePreEffectRefusal(
+                str(exc), local_mutation_evidence=evidence
+            ) from exc
+        except DeployScheduleFailureAfterLocalMutation:
+            raise
+        except Exception as exc:
+            # A timed-out or failed Git process may have mutated the ODB.
+            # The direct scheduler seam must expose the digest-bound unknown
+            # outcome, not rely on the public wrapper to recover provenance.
+            evidence = _tracked_runtime_deploy_local_mutation_evidence(
+                local_mutation_tracker
+            )
+            if evidence is None:
+                raise
+            raise DeployScheduleFailureAfterLocalMutation(
+                str(exc), local_mutation_evidence=evidence
+            ) from exc
         automatic_source: dict[str, Any] | None = None
         automatic_source_binding: dict[str, Any] | None = None
         automatic_source_needed = False
