@@ -953,10 +953,20 @@ def validate_live_immutable_mounts(
     try:
         user_ids = os.getresuid()
         group_ids = os.getresgid()
+        supplementary_groups = os.getgroups()
     except (AttributeError, OSError) as exc:
         raise RunnerError("live Codex kernel execution identity unavailable") from exc
-    if user_ids != (os.geteuid(),) * 3 or group_ids != (os.getegid(),) * 3:
+    if (
+        user_ids != (os.geteuid(),) * 3
+        or group_ids != (os.getegid(),) * 3
+        or os.getegid() == 0
+    ):
         raise RunnerError("live Codex execution identity is unsafe")
+    # NoNewPrivs and dropping effective capabilities do not revoke group access
+    # to privileged Unix sockets such as Docker's. An inherited supplementary
+    # group may therefore delegate raw mount or filesystem writes to a daemon.
+    if any(gid != os.getegid() for gid in supplementary_groups):
+        raise RunnerError("live Codex supplementary groups are unsafe")
     try:
         status_bytes, mount_info = _authenticated_procfs_evidence()
         status = status_bytes.decode("ascii")
@@ -1282,18 +1292,51 @@ def validate_live_immutable_mounts(
         if parent_id == visible_at_point[nearest_visible_parent]:
             visible_at_point[point] = mount_id
 
-    # Union/overlay and opaque FUSE mounts have lower/upper backing directories
-    # that a mountpoint + synthetic-device tuple cannot authenticate. Even an
-    # apparently read-only view can be modified through an unrelated RW lower
-    # alias. Reject every *visible* such mount before deriving backing roots;
-    # covered/hidden mounts do not grant reachable paths in this namespace.
+    # A synthetic device/root does not describe union lower/upper directories,
+    # FUSE userspace backings or remotely mutable/clustered filesystems.  Even a
+    # read-only local mount cannot make those underlying bytes immutable.
+    # Allow only known local inode or kernel-virtual filesystem types; any new
+    # or opaque filesystem must be explicitly security-reviewed before use.
+    # Covered mounts are excluded because only visible mounts grant access.
+    transparent_filesystems = frozenset(
+        {
+            b"ext2",
+            b"ext3",
+            b"ext4",
+            b"xfs",
+            b"btrfs",
+            b"f2fs",
+            b"zfs",
+            b"vfat",
+            b"exfat",
+            b"squashfs",
+            b"erofs",
+            b"iso9660",
+            b"tmpfs",
+            b"ramfs",
+            b"devtmpfs",
+            b"devpts",
+            b"proc",
+            b"sysfs",
+            b"cgroup2",
+            b"nsfs",
+            b"bpf",
+            b"fusectl",
+            b"efivarfs",
+            b"securityfs",
+            b"pstore",
+            b"debugfs",
+            b"tracefs",
+            b"configfs",
+            b"hugetlbfs",
+            b"mqueue",
+            b"binfmt_misc",
+        }
+    )
     for visible_mount_id in visible_at_point.values():
-        filesystem_type = records[visible_mount_id][5]
-        if filesystem_type in {b"overlay", b"aufs", b"unionfs", b"fuse"} or (
-            filesystem_type.startswith(b"fuse.")
-        ):
+        if records[visible_mount_id][5] not in transparent_filesystems:
             raise RunnerError(
-                "live Codex union/overlay filesystem backing cannot be authenticated"
+                "live Codex mount filesystem backing cannot be authenticated"
             )
 
     mounts: list[tuple[Path, Path, bytes, bool]] = [
@@ -1336,8 +1379,9 @@ def validate_live_immutable_mounts(
     # The mountpoint alone is not a source identity: a writable bind at
     # /tmp/alias could expose immutable source inodes even while their original
     # pathname remains read-only. Compare device + filesystem-relative mount
-    # roots for every protected input; ignore only the filesystem-wide root,
-    # whose ST_RDONLY flag was checked above, and the exact four outputs.
+    # roots for every protected input. Keep the filesystem-wide root backing
+    # separately: legitimate output leaves may share its device, whereas an
+    # additional writable mount exposing that device must never be accepted.
     def backing_identity(target: Path) -> tuple[bytes, Path]:
         ancestors = [
             (mount, mount_root, device)
@@ -1349,6 +1393,9 @@ def validate_live_immutable_mounts(
         mount, mount_root, device = max(ancestors, key=lambda x: len(x[0].parts))
         return device, mount_root / target.relative_to(mount)
 
+    filesystem_root_device, filesystem_root_backing = backing_identity(
+        protected_targets["filesystem root"]
+    )
     protected_backings = {
         label: backing_identity(target)
         for label, target in protected_targets.items()
@@ -1425,6 +1472,11 @@ def validate_live_immutable_mounts(
                 )
             observed_writable_outputs.add(mount)
             continue
+        # Bind-remounting / somewhere else is unsafe even if every narrower
+        # protected path lives on a separate read-only filesystem. Reject the
+        # root backing before comparing the other immutable input roots.
+        if device == filesystem_root_device and mount_root == filesystem_root_backing:
+            raise RunnerError("live Codex has a writable alias of filesystem root")
         if mount == home or home in mount.parents:
             # No writable submount of HOME may be an accidental or malicious
             # alias to original plans, sources, credentials or repo metadata.
@@ -1451,12 +1503,33 @@ def validate_live_immutable_mounts(
         # A hard link outside all four outputs can still write a protected
         # inode whenever any other RW mount exposes the same filesystem.
         # Unrelated tmpfs and virtual mounts cannot hard-link across devices.
-        if any(
+        if device == filesystem_root_device or any(
             device == protected_device
             for protected_device, _ in protected_backings.values()
         ):
             raise RunnerError(
                 "live Codex unexpected writable mount sharing protected filesystem"
+            )
+        # Another writable persistent filesystem may reach protected storage
+        # through an opaque block backing even when its mount device differs.
+        # The four checked output leaves are the sole persistent RW mounts;
+        # unrelated memory-backed/kernel virtual mounts are handled separately.
+        if records[visible_at_point[mount]][5] in {
+            b"ext2",
+            b"ext3",
+            b"ext4",
+            b"xfs",
+            b"btrfs",
+            b"f2fs",
+            b"zfs",
+            b"vfat",
+            b"exfat",
+            b"squashfs",
+            b"erofs",
+            b"iso9660",
+        }:
+            raise RunnerError(
+                "live Codex unexpected writable persistent filesystem mount"
             )
     if observed_writable_outputs != allowed_outputs:
         raise RunnerError("live Codex private writable output mounts are missing")

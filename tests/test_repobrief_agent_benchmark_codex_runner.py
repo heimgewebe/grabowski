@@ -627,6 +627,8 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         stacked_source_visible_first: bool = False,
         hidden_codex_before_parent_mount: bool = False,
         unrelated_tmpfs_rw: bool = False,
+        unrelated_local_rw: bool = False,
+        root_backing_isolated: bool = False,
         root_mount_rw: bool = False,
         output_below_protected_backing: bool = False,
         output_epoch_in_source: bool = False,
@@ -638,6 +640,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         private_output_special: tuple[str, str] | None = None,
         device_policy_denied: bool = False,
         opaque_union_filesystem: str | None = None,
+        supplementary_groups: tuple[int, ...] = (),
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
@@ -773,8 +776,21 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                         if output_below_protected_backing
                         else None
                     ),
+                    device="8:22" if root_backing_isolated else "8:1",
                 ),
             ]
+            if root_backing_isolated:
+                # Isolate every non-root protected inode from the root device.
+                # Otherwise the existing HOME/source alias check masks this P1.
+                mounts.extend(
+                    (
+                        mount_line(Path("/usr"), "ro,relatime", device="8:31"),
+                        mount_line(Path("/etc"), "ro,relatime", device="8:32"),
+                        mount_line(
+                            Path(runner.__file__).parent, "ro,relatime", device="8:33"
+                        ),
+                    )
+                )
             if hidden_codex_before_parent_mount:
                 # A bind at the executable pathname is covered by a later
                 # RO mount of its parent directory; its backing is invisible.
@@ -874,6 +890,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 mount_line(
                     path,
                     "rw,relatime",
+                    device="8:22" if root_backing_isolated else "8:1",
                     mount_root=(
                         Path("/backing/repo") / path.relative_to(home)
                         if output_below_protected_backing
@@ -916,7 +933,19 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             if unrelated_tmpfs_rw:
                 ephemeral = Path(tmp) / "ephemeral"
                 ephemeral.mkdir()
-                mounts.append(mount_line(ephemeral, "rw,relatime", device="0:44"))
+                mounts.append(
+                    mount_line(
+                        ephemeral, "rw,relatime", device="0:44", filesystem_type="tmpfs"
+                    )
+                )
+            if unrelated_local_rw:
+                foreign = Path(tmp) / "foreign-local-rw"
+                foreign.mkdir()
+                mounts.append(
+                    mount_line(
+                        foreign, "rw,relatime", device="8:77", filesystem_type="ext4"
+                    )
+                )
             if outside_home_rw:
                 writable_child = request_root / "nested"
                 writable_child.mkdir()
@@ -988,6 +1017,9 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 ),
                 patch.object(runner.os, "getuid", return_value=actual_uid),
                 patch.object(runner.os, "geteuid", return_value=actual_uid),
+                patch.object(
+                    runner.os, "getgroups", return_value=list(supplementary_groups)
+                ),
                 patch.object(runner.os, "statvfs", side_effect=statvfs),
                 patch.object(runner.os.path, "samefile", side_effect=samefile),
                 patch.object(
@@ -1019,10 +1051,33 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             "unionfs",
             "fuse.overlayfs",
             "fuse.mergerfs",
+            "fuseblk",
+            "nfs",
+            "nfs4",
+            "cifs",
+            "smb3",
+            "ceph",
+            "9p",
+            "virtiofs",
+            "gfs2",
+            "unknown-fs",
         ):
             with self.subTest(filesystem_type=filesystem_type):
-                with self.assertRaisesRegex(runner.RunnerError, "union|overlay|opaque"):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "union|overlay|opaque|filesystem"
+                ):
                     self._probe(opaque_union_filesystem=filesystem_type)
+
+    def test_privileged_supplementary_groups_block_codex_admission(self) -> None:
+        primary_gid = os.getegid()
+        for inherited in ((0,), (primary_gid, 0), (primary_gid, 9999)):
+            with self.subTest(groups=inherited):
+                with self.assertRaisesRegex(runner.RunnerError, "supplementary"):
+                    self._probe(supplementary_groups=inherited)
+
+    def test_empty_or_primary_only_supplementary_groups_are_accepted(self) -> None:
+        self._probe(supplementary_groups=())
+        self._probe(supplementary_groups=(os.getegid(),))
 
     def test_root_owned_device_policy_is_mandatory_for_mount_admission(self) -> None:
         with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
@@ -1075,6 +1130,10 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
 
     def test_unrelated_tmpfs_cannot_alias_protected_storage(self) -> None:
         self._probe(unrelated_tmpfs_rw=True)
+
+    def test_extra_writable_local_filesystem_is_rejected(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "writable.*filesystem"):
+            self._probe(unrelated_local_rw=True)
 
     def test_writable_filesystem_root_mount_is_rejected(self) -> None:
         with self.assertRaisesRegex(
@@ -1233,10 +1292,14 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             self._probe(outside_protected_alias_rw=True)
 
     def test_writable_filesystem_root_alias_outside_home_blocks_admission(self) -> None:
-        with self.assertRaisesRegex(
-            runner.RunnerError, "writable alias of protected input mount"
-        ):
-            self._probe(outside_root_alias_rw=True)
+        for isolated in (False, True):
+            with self.subTest(root_backing_isolated=isolated):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "writable alias of filesystem root"
+                ):
+                    self._probe(
+                        outside_root_alias_rw=True, root_backing_isolated=isolated
+                    )
 
     def test_output_epoch_cannot_overlap_historical_source(self) -> None:
         with self.assertRaisesRegex(
