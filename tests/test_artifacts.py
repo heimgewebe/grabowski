@@ -63,10 +63,17 @@ class ArtifactTests(unittest.TestCase):
         self.root_patch = patch.object(
             artifacts.base, "_roots", return_value=(self.root,)
         )
+        # Exercise the real hash-chain appender without touching or contending
+        # with the live operator's audit log during artifact publication tests.
+        self.audit_patch = patch.object(
+            artifacts.base, "AUDIT_LOG", self.root / "write-audit.jsonl"
+        )
         self.resource_patch.start()
         self.root_patch.start()
+        self.audit_patch.start()
 
     def tearDown(self) -> None:
+        self.audit_patch.stop()
         self.root_patch.stop()
         self.resource_patch.stop()
         self.temporary.cleanup()
