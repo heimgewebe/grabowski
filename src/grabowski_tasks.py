@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timezone
 import fcntl
 import functools
@@ -2631,7 +2631,7 @@ def _reconcile_runtime_refresh_prelaunch_acquisition_journals(
             continue
         released_keys: list[str] = []
         if release_safe:
-            with resources._database() as resource_connection:
+            with closing(resources._database()) as resource_connection:
                 placeholders = ",".join("?" for _ in journal["resource_keys"])
                 lease_rows = resource_connection.execute(
                     f"SELECT * FROM leases WHERE resource_key IN ({placeholders}) ORDER BY resource_key",
@@ -5729,8 +5729,18 @@ def _task_lease_ttl(record: dict[str, Any], state: str) -> int:
 
 
 def _effective_observed_state(record: dict[str, Any], observed_state: str) -> str:
-    """Preserve authoritative terminal truth before lease maintenance."""
+    """Preserve historical terminal truth without masking live observations."""
     stored_state = str(record["state"])
+    # An observed running local user unit must not be hidden by stale terminal
+    # history. Do not project privileged or uncertain observations as running:
+    # that would incorrectly reacquire leases for terminalized Rootbroker tasks.
+    if (
+        _is_terminal_state(stored_state)
+        and _execution_backend(record) == "systemd-user"
+        and _systemd_scope(record) == "user"
+        and observed_state == "running"
+    ):
+        return observed_state
     return stored_state if _is_terminal_state(stored_state) else observed_state
 
 
@@ -10841,7 +10851,8 @@ def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
     active_refresh_page = _reconcile_active_refresh_page(active_refresh_limit)
     active_refresh_rows = active_refresh_page["rows"]
     active_refresh_ids = {str(row["task_id"]) for row in active_refresh_rows}
-    active_refresh_examined = len(active_refresh_rows)
+    # Filtered-out active rows still consumed scan work and shared capacity.
+    active_refresh_examined = int(active_refresh_page["examined"])
     fair_limit = limit - active_refresh_examined
     # Validate persisted terminal recovery truth before either phase can
     # observe or mutate task state, even when the task phase has first turn.
@@ -10919,7 +10930,7 @@ def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
         "active_refresh": {
             "limit": active_refresh_limit,
             "examined": int(active_refresh_page["examined"]),
-            "selected": active_refresh_examined,
+            "selected": len(active_refresh_rows),
             "cursor_before": active_refresh_page["cursor_before"],
             "cursor_after": active_refresh_page["cursor_after"],
             "cycle_completed": active_refresh_page["cycle_completed"],
@@ -11925,6 +11936,102 @@ def _publish_task_reconcile_ready_evidence(
                 )
 
 
+
+# READ_ONLY never trusts a cached terminal task row as live process truth.
+# Bound the terminal-row stream and the number of potentially running units
+# that may be examined by local systemctl without dispatch or lease mutation.
+TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT = 32
+
+
+def _task_reconcile_ready_local_terminal_rows(
+    connection: sqlite3.Connection,
+) -> list[dict[str, Any]]:
+    projection = _task_current_projection(readiness_bounded=True)
+    bindings = projection.get("archived_task_bindings")
+    if not isinstance(bindings, dict) or len(bindings) > TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT:
+        raise RuntimeError("Readiness archived task bindings exceed safety budget")
+    # An archived row may only be excluded when its exact archive identity is
+    # still valid. Otherwise its systemd unit could be silently ignored.
+    _projected_task_state_counts(connection, projection)
+    terminal_states = tuple(TASK_STATE_PROJECTIONS["terminal"])
+    placeholders = ",".join("?" for _ in terminal_states)
+    scan_limit = (
+        TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT
+        + TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT
+    )
+    cursor = connection.execute(
+        f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
+        "ORDER BY task_id LIMIT ?",
+        (*terminal_states, scan_limit + 1),
+    )
+    selected: list[dict[str, Any]] = []
+    try:
+        for examined, raw in enumerate(cursor, start=1):
+            if examined > scan_limit:
+                raise RuntimeError("Local terminal readiness scan budget exceeded")
+            record = dict(raw)
+            current = lifecycle_projection.bounded_current_task_projection(
+                [_task_archive_record(record)], projection=projection,
+            )
+            if not current or _is_root_systemd_backend(record):
+                continue
+            if _execution_backend(record) != "systemd-user" or _systemd_scope(record) != "user":
+                raise RuntimeError("Local terminal task has unsupported systemd authority")
+            selected.append(record)
+            if len(selected) > TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT:
+                raise RuntimeError("Local terminal readiness observation budget exceeded")
+    finally:
+        cursor.close()
+    return selected
+
+
+def _task_reconcile_ready_local_terminal_observed(
+    record: dict[str, Any], observed: Any,
+) -> bool:
+    if not isinstance(observed, dict):
+        return False
+    observer, probe, props = (
+        observed.get("observer"), observed.get("probe"), observed.get("properties")
+    )
+    if (
+        not isinstance(observer, dict)
+        or observer.get("kind") != "bound-local-user-systemd-show-v1"
+        or observer.get("transport") != "local"
+        or not isinstance(probe, dict)
+        or type(probe.get("returncode")) is not int
+        or probe["returncode"] != 0
+        or probe.get("timed_out")
+        or probe.get("outcome_unknown")
+        or not isinstance(props, dict)
+    ):
+        return False
+    seen_at = observed.get("observed_at_unix")
+    now = _now()
+    if type(seen_at) is not int or not 0 <= now - seen_at <= 30:
+        return False
+    if (
+        props.get("LoadState") != "loaded"
+        or props.get("ActiveState") not in {"inactive", "failed"}
+        or props.get("SubState") not in {"dead", "failed"}
+        or not _is_terminal_state(str(observed.get("state")))
+        or observed.get("state") != record["state"]
+    ):
+        return False
+    unit = _authoritative_unit(record)
+    if "Id" in props and props["Id"] != unit:
+        return False
+    if "Names" in props and unit not in str(props["Names"]).split():
+        return False
+    result = props.get("Result")
+    allowed = {
+        "completed": {"success"},
+        "failed": {"exit-code", "resources", "protocol", "watchdog"},
+        "signalled": {"signal", "core-dump"},
+        "timed_out": {"timeout"},
+    }
+    return result in allowed.get(str(record["state"]), set())
+
+
 def _task_reconcile_ready_evidence_snapshot(
     task_connection: sqlite3.Connection,
 ) -> dict[str, Any]:
@@ -12008,6 +12115,38 @@ def _task_reconcile_ready_evidence_snapshot(
                 "reconciled_at_unix": timestamp,
                 "privileged_task_count": len(privileged_records),
             }
+        # A terminal SQLite row can become live again without changing any
+        # stored revision. Bind each retained local user-systemd unit to a
+        # fresh, strictly non-dispatching read-only observation.
+        local_terminal_records = _task_reconcile_ready_local_terminal_rows(
+            task_connection
+        )
+        for record in local_terminal_records:
+            _, target, _ = _resolve_task_dispatch_host(str(record["host"]))
+            if target.get("transport") != "local":
+                return {"status": "local_terminal_transport_unverified"}
+            observed = _observe(record, bound_local_user=True)
+            if not _task_reconcile_ready_local_terminal_observed(record, observed):
+                return {"status": "local_terminal_live_unverified"}
+        if local_terminal_records:
+            # External probes run after the first SQLite snapshot; a resume
+            # during the probe must not be certified using an old task row.
+            with _task_readonly_snapshot() as fresh:
+                for record in local_terminal_records:
+                    row = fresh.execute(
+                        "SELECT * FROM tasks WHERE task_id=?", (record["task_id"],)
+                    ).fetchone()
+                    if row is None or dict(row) != record:
+                        return {"status": "local_terminal_task_changed"}
+                current_revision = _task_reconcile_revision_contract(fresh)
+            if current_revision["revision"] != proof["task_revision"]:
+                return {"status": "stale"}
+            with resources._resource_readonly_snapshot() as latest_resource:
+                resource_now = resources._resource_reconcile_revision_contract(
+                    latest_resource
+                )
+            if resource_now is None or resource_now["revision"] != proof["resource_revision"]:
+                return {"status": "stale"}
         return {"status": "verified", "reconciled_at_unix": timestamp}
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, sqlite3.Error) as exc:
         return {"status": "unavailable", "error_type": type(exc).__name__}

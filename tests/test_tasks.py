@@ -6475,6 +6475,149 @@ class TaskTests(unittest.TestCase):
                 tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
             )
 
+    def test_reconcile_ready_preserves_quiescent_local_terminal_liveness(self) -> None:
+        # A subsequent fix for restarted local units must still allow a truly
+        # quiescent, locally observed terminal task to prove readiness. This
+        # complements the negative live-restart test below.
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        record = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?",
+                (record["task_id"],),
+            )
+        complete = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=complete),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        observed = {
+            "state": "completed",
+            "properties": {
+                "LoadState": "loaded",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+                "Result": "success",
+            },
+            "probe": {"returncode": 0, "timed_out": False},
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1",
+                "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(tasks, "_observe", return_value=observed),
+            patch.object(
+                tasks, "_dispatch",
+                side_effect=AssertionError("READ_ONLY readiness must not dispatch Fleet"),
+            ) as dispatch,
+            patch.object(
+                tasks.privileged, "root_task_systemd_request",
+                side_effect=AssertionError("READ_ONLY readiness must not invoke Rootbroker"),
+            ) as broker,
+            patch.object(
+                tasks, "_set_state",
+                side_effect=AssertionError("READ_ONLY readiness must not change task state"),
+            ) as persist,
+            patch.object(
+                tasks, "_maintain_record_resources",
+                side_effect=AssertionError("READ_ONLY readiness must not change leases"),
+            ) as renew,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("verified", status["status"])
+        dispatch.assert_not_called()
+        broker.assert_not_called()
+        persist.assert_not_called()
+        renew.assert_not_called()
+
+    def test_reconcile_ready_does_not_verify_restarted_local_terminal_user_unit(self) -> None:
+        # A local unit can restart after a valid quiescence proof without any
+        # change to task/resource SQLite revisions. READ_ONLY must not elevate
+        # the persisted terminal row to current execution readiness.
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        record = self._start()["task"]
+        task_id = record["task_id"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?", (task_id,)
+            )
+        complete = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=complete),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        live = {
+            "state": "running",
+            "properties": {"LoadState": "loaded", "ActiveState": "active"},
+            "probe": {"returncode": 0, "timed_out": False},
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1",
+                "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(tasks, "_observe", return_value=live) as observe,
+            patch.object(
+                tasks, "_set_state",
+                side_effect=AssertionError("READ_ONLY must not persist state"),
+            ) as persist,
+            patch.object(
+                tasks, "_maintain_record_resources",
+                side_effect=AssertionError("READ_ONLY must not change leases"),
+            ) as renew,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                snapshot = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertNotEqual(
+            "verified", snapshot["status"],
+            "a cached terminal row cannot certify a restarted local unit",
+        )
+        observe.assert_called_once()
+        persist.assert_not_called()
+        renew.assert_not_called()
+
     def test_reconcile_ready_proof_rejects_persisted_rootbroker_terminal_without_live_truth(self) -> None:
         with tasks._database_connection():
             pass
@@ -6747,9 +6890,9 @@ class TaskTests(unittest.TestCase):
                 tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
             )
 
-        # Positive control: after the very same task is terminal, an authorized
-        # complete cycle must publish a verified proof. A broken resource
-        # snapshot must not be able to make the negative assertions pass.
+        # Positive control: the completed cycle only becomes VERIFIED after
+        # one fresh, bound local user-systemd quiescence observation. Merely
+        # changing the SQLite row cannot certify an externally restarted unit.
         with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute(
                 "UPDATE tasks SET state='completed' WHERE task_id=?",
@@ -6761,11 +6904,32 @@ class TaskTests(unittest.TestCase):
             patch.object(tasks.base, "_append_audit"),
         ):
             tasks._task_reconcile_refresh_after_guard("")
-        with tasks._task_readonly_snapshot() as connection:
-            self.assertEqual(
-                "verified",
-                tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
-            )
+        quiescent_observation = {
+            "state": "completed",
+            "properties": {
+                "LoadState": "loaded", "ActiveState": "inactive",
+                "SubState": "dead", "Result": "success",
+            },
+            "probe": {"returncode": 0, "timed_out": False},
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1",
+                "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(tasks, "_observe", return_value=quiescent_observation) as probe,
+        ):
+            with tasks._task_readonly_snapshot() as connection:
+                self.assertEqual(
+                    "verified",
+                    tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
+                )
+        probe.assert_called_once()
 
     def test_task_reconcile_revision_token_changes_only_for_candidate_rows(self) -> None:
         started = self._start(
@@ -8228,6 +8392,39 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual([], [item for item in recovery if item["failed"]])
         self.assertTrue(recovery[-1]["cycle_completed"])
+
+    def test_reconcile_budget_counts_fresh_filtered_active_rows(self) -> None:
+        created = [self._start()["task"] for _ in range(12)]
+        terminal_ids = [str(record["task_id"]) for record in created[:10]]
+        active_ids = [str(record["task_id"]) for record in created[10:]]
+        now = tasks._now()
+        with sqlite3.connect(self.database) as connection:
+            connection.executemany(
+                "UPDATE tasks SET state='failed' WHERE task_id=?",
+                [(task_id,) for task_id in terminal_ids],
+            )
+            connection.executemany(
+                "UPDATE tasks SET updated_at_unix=?, runtime_seconds=? WHERE task_id=?",
+                [(now - 300, 3600, task_id) for task_id in active_ids],
+            )
+            connection.commit()
+        # SQL examined both stale-looking active rows, but their live
+        # observation is fresh so neither remains in the selected list.
+        with patch.object(
+            tasks, "_task_has_fresh_active_observation", return_value=True
+        ):
+            batch = tasks._reconcile_candidate_batch(10)
+        self.assertEqual(2, batch["active_refresh"]["examined"])
+        self.assertEqual(0, batch["active_refresh"]["selected"])
+        self.assertEqual(8, batch["task_examined"])
+        self.assertEqual(
+            batch["active_refresh"]["examined"]
+            + batch["task_examined"]
+            + batch["terminalization_recovery"]["examined"],
+            batch["total_examined"],
+        )
+        self.assertEqual(10, batch["total_examined_limit"])
+        self.assertEqual(10, batch["total_examined"])
 
     def test_reconcile_refresh_reserves_stale_active_before_terminal_history(self) -> None:
         terminal_ids: list[str] = []
@@ -10240,6 +10437,47 @@ class TaskTests(unittest.TestCase):
         self.assertIsNone(result["last_observation"])
         persist.assert_not_called()
         renew.assert_not_called()
+
+    def test_task_peek_live_running_unit_cannot_be_masked_by_terminal_history(self) -> None:
+        created = self._start()["task"]
+        task_id = created["task_id"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?", (task_id,)
+            )
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local", "target": "local", "enabled": True}, False),
+            ),
+            patch.object(
+                tasks, "_observe",
+                return_value={
+                    "state": "running",
+                    "properties": {"LoadState": "loaded", "ActiveState": "active"},
+                    "probe": {"returncode": 0, "timed_out": False},
+                    "observer": {"kind": "bound-local-user-systemd-show-v1", "transport": "local"},
+                },
+            ) as probe,
+            patch.object(
+                tasks, "_set_state",
+                side_effect=AssertionError("READ_ONLY peek cannot persist state"),
+            ) as persist,
+            patch.object(
+                tasks, "_maintain_record_resources",
+                side_effect=AssertionError("READ_ONLY peek cannot renew lease"),
+            ) as renew,
+        ):
+            public = tasks.grabowski_task_peek(task_id)
+        probe.assert_called_once()
+        persist.assert_not_called()
+        renew.assert_not_called()
+        self.assertEqual("completed", public["persisted_state"])
+        self.assertFalse(
+            tasks._is_terminal_state(public["state"]),
+            "persisted terminal history cannot mask an observed live user unit",
+        )
+        self.assertTrue(public["reconcile_required"])
 
     def test_remote_task_peek_never_launches_effectful_ssh(self) -> None:
         created = self._start(host="remote")["task"]
@@ -14413,6 +14651,43 @@ class TaskTests(unittest.TestCase):
             [None] * len(fixture["resource_keys"]),
             [tasks.resources.inspect_resource(key) for key in fixture["resource_keys"]],
         )
+
+    def test_runtime_refresh_orphan_acquisition_exception_closes_resource_wal(
+        self,
+    ) -> None:
+        fixture = self._runtime_refresh_prelaunch_fixture()
+        task_id = "6" * 24
+        unit = f"grabowski-task-{task_id}-a1.service"
+        request = tasks._runtime_refresh_prelaunch_lease_binding_request(
+            fixture["request"], fixture["intent"], fixture["authority"], task_id, unit
+        )
+        journal = tasks._runtime_refresh_prelaunch_acquisition_journal(request)
+        tasks._persist_runtime_refresh_prelaunch_acquisition_journal(journal)
+        acquisition = tasks._acquire_missing_runtime_refresh_prelaunch_leases(
+            request, fixture["intent"]
+        )
+        self.assertIsNotNone(acquisition)
+        wal = Path(str(self.resource_database) + "-wal")
+        shm = Path(str(self.resource_database) + "-shm")
+        self.assertFalse(wal.exists())
+        self.assertFalse(shm.exists())
+        retained_traceback = None
+        with patch.object(
+            tasks.resources, "_row_metadata",
+            side_effect=RuntimeError("synthetic prelaunch resource metadata failure"),
+        ):
+            try:
+                tasks._reconcile_runtime_refresh_prelaunch_acquisition_journals(
+                    fixture["resource_keys"]
+                )
+            except RuntimeError as exc:
+                self.assertIn("synthetic prelaunch resource metadata failure", str(exc))
+                retained_traceback = exc.__traceback__
+            else:
+                self.fail("injected prelaunch recovery failure must propagate")
+        self.assertIsNotNone(retained_traceback)
+        self.assertFalse(wal.exists(), "prelaunch recovery must close resource WAL")
+        self.assertFalse(shm.exists(), "prelaunch recovery must close resource SHM")
 
     def test_runtime_refresh_orphan_server_acquisition_recovers_after_binding_journal(
         self,
