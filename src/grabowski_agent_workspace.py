@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from datetime import datetime, timezone
 import errno
 import fcntl
@@ -6919,7 +6919,7 @@ def _release_failed_workspace_checkout_lifecycle(manifest: dict[str, Any]) -> bo
         for value in (created_at_unix, updated_at_unix)
     ):
         return False
-    with checkouts._database() as connection:
+    with closing(checkouts._database()) as connection, connection:
         row = connection.execute(
             """
             SELECT owner_id, created_at_unix, updated_at_unix,

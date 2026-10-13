@@ -6774,6 +6774,65 @@ class CheckoutLifecycleTests(unittest.TestCase):
                 0, reader.execute("SELECT COUNT(*) FROM lifecycle_bindings").fetchone()[0]
             )
 
+    def test_checkout_writer_contexts_close_across_modules(self) -> None:
+        import ast
+
+        minimum_closed = {
+            "grabowski_checkouts.py": 19,
+            "grabowski_agent_workspace.py": 1,
+            "grabowski_checkout_identity.py": 4,
+            "grabowski_checkout_terminal_reconciliation.py": 1,
+            "grabowski_self_deploy.py": 1,
+        }
+        source_root = Path(__file__).resolve().parents[1] / "src"
+
+        def is_checkout_database_call(node: ast.AST, module: str) -> bool:
+            if not isinstance(node, ast.Call) or node.args or node.keywords:
+                return False
+            callee = node.func
+            if module == "grabowski_checkouts.py":
+                return isinstance(callee, ast.Name) and callee.id == "_database"
+            if not isinstance(callee, ast.Attribute) or callee.attr != "_database":
+                return False
+            if module == "grabowski_checkout_identity.py":
+                owner = callee.value
+                return (
+                    isinstance(owner, ast.Call)
+                    and isinstance(owner.func, ast.Name)
+                    and owner.func.id == "_checkouts"
+                    and not owner.args
+                    and not owner.keywords
+                )
+            return isinstance(callee.value, ast.Name) and callee.value.id == "checkouts"
+
+        for module, minimum in minimum_closed.items():
+            with self.subTest(module=module):
+                parsed = ast.parse((source_root / module).read_text(encoding="utf-8"))
+                unsafe_lines: list[int] = []
+                closed = 0
+                for scope in ast.walk(parsed):
+                    if not isinstance(scope, (ast.With, ast.AsyncWith)):
+                        continue
+                    for item in scope.items:
+                        expr = item.context_expr
+                        if is_checkout_database_call(expr, module):
+                            unsafe_lines.append(expr.lineno)
+                        if (
+                            isinstance(expr, ast.Call)
+                            and isinstance(expr.func, ast.Name)
+                            and expr.func.id == "closing"
+                            and len(expr.args) == 1
+                            and is_checkout_database_call(expr.args[0], module)
+                        ):
+                            closed += 1
+                self.assertEqual(
+                    [], unsafe_lines,
+                    "SQLite transaction contexts do not close checkout connections",
+                )
+                self.assertGreaterEqual(
+                    closed, minimum, "expected explicit checkout writer closures disappeared"
+                )
+
     def test_public_checkout_summary_quiescent_store_still_reports_capacity(self) -> None:
         import grabowski_read_surface as read_surface
 

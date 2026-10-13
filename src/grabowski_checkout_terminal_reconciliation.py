@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 import hashlib
 import json
 import os
@@ -1266,7 +1266,7 @@ def apply(
             if current.get("preview_sha256") != preview_sha256:
                 raise RuntimeError("terminal reconciliation changed after lease acquisition")
             applied_at = checkouts._now()
-            with checkouts._database() as connection:
+            with closing(checkouts._database()) as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
                 commit_bound = _bind_preview(
                     _preview_state(key, ignore_lease_owner=operation_owner),
