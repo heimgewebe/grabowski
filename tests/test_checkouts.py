@@ -6730,6 +6730,50 @@ class CheckoutLifecycleTests(unittest.TestCase):
             finally:
                 keeper.close()
 
+    def test_checkout_writer_exception_closes_wal_with_live_traceback(self) -> None:
+        warm = checkouts._database()
+        warm.close()
+        wal = Path(str(self.checkout_db) + "-wal")
+        shm = Path(str(self.checkout_db) + "-shm")
+        self.assertFalse(wal.exists())
+        self.assertFalse(shm.exists())
+
+        retained_traceback = None
+        with patch.object(
+            checkouts, "_active_creation_count",
+            side_effect=RuntimeError("synthetic checkout writer exception"),
+        ):
+            try:
+                checkouts._reserve_checkout_lifecycle(
+                    repo_common_dir=checkouts._git_common_dir(self.repo),
+                    repo_path=self.repo,
+                    checkout_path=self.checkout,
+                    owner_id="owner-a",
+                    purpose="exception closure regression",
+                    source_kind="work_lane",
+                    source_id="test-lane",
+                    artifact_class="implementation-worktree",
+                    retention_until_unix=int(time.time()) + 3600,
+                    expected_head=self.head,
+                    expected_branch="topic",
+                )
+            except RuntimeError as exc:
+                self.assertIn("synthetic checkout writer exception", str(exc))
+                retained_traceback = exc.__traceback__
+            else:
+                self.fail("injected checkout writer error must propagate")
+        self.assertIsNotNone(retained_traceback)
+        # A referenced traceback keeps the writer frame alive. A committed or
+        # rolled-back SQLite context manager alone does not close its handle.
+        self.assertFalse(wal.exists(), "writer must close WAL despite live traceback")
+        self.assertFalse(shm.exists(), "writer must close SHM despite live traceback")
+        with checkouts._strict_inventory_readonly_scope():
+            reader = checkouts._readonly_connection(self.checkout_db)
+            self.assertIsNotNone(reader)
+            self.assertEqual(
+                0, reader.execute("SELECT COUNT(*) FROM lifecycle_bindings").fetchone()[0]
+            )
+
     def test_public_checkout_summary_quiescent_store_still_reports_capacity(self) -> None:
         import grabowski_read_surface as read_surface
 

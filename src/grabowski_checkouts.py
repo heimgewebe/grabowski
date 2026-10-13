@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import fcntl
@@ -1071,7 +1071,7 @@ def _reserve_checkout_lifecycle(
     branch = _expected_branch(expected_branch)
     checkout_key = _checkout_key(common_dir, checkout)
     now = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         existing = connection.execute(
             "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
@@ -1189,7 +1189,7 @@ def _release_checkout_lifecycle_exact(binding: dict[str, Any]) -> bool:
         return False
     if not all(isinstance(value, int) and not isinstance(value, bool) for value in required[2:]):
         return False
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         deleted = connection.execute(
             """
             DELETE FROM lifecycle_bindings
@@ -1213,7 +1213,7 @@ def _mark_checkout_completed_retained(
     head = _validate_git_object_id(expected_head, "expected_head")
     branch = _expected_branch(expected_branch)
     now = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
@@ -1328,7 +1328,7 @@ def _mark_checkout_archived(
     expected_head: str,
     expected_branch: str | None,
 ) -> dict[str, Any] | None:
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         lifecycle = _mark_checkout_archived_in_connection(
             connection,
@@ -1374,7 +1374,7 @@ def _release_retention_exact(retention: dict[str, Any]) -> bool:
         for value in required[2:]
     ):
         return False
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         deleted = connection.execute(
             """
             DELETE FROM retention
@@ -1433,7 +1433,7 @@ def _latest_archives(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
 
 def _load_archive(archive_id: str) -> dict[str, Any]:
     identifier = _validate_archive_id(archive_id)
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         row = connection.execute(
             "SELECT * FROM archives WHERE archive_id=?",
             (identifier,),
@@ -1444,7 +1444,7 @@ def _load_archive(archive_id: str) -> dict[str, Any]:
 
 
 def _latest_archive_for_key(checkout_key: str) -> dict[str, Any] | None:
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         rows = connection.execute(
             """
             SELECT * FROM archives
@@ -1539,7 +1539,7 @@ def _upsert_retention(
     expected_head: str | None,
     expected_branch: str | None,
 ) -> dict[str, Any]:
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         retention = _upsert_retention_in_connection(
             connection,
             checkout_key=checkout_key,
@@ -1714,7 +1714,7 @@ def _persist_checkout_operation_uncertainty(
     evidence_sha256 = _sha256_json(evidence_value)
     fence_id = uuid.uuid4().hex
     created = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         active_rows = connection.execute(
             "SELECT * FROM operation_uncertainty WHERE cleared_at_unix IS NULL"
@@ -1774,7 +1774,7 @@ def _clear_checkout_operation_uncertainty(
         "cleared_at_unix": _now(),
     }
     clearance_sha256 = _sha256_json(clearance)
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             "SELECT * FROM operation_uncertainty WHERE fence_id=?",
@@ -3088,7 +3088,7 @@ def _complete_partial_archive(
         completed = _now()
         checkout_key = str(evidence["checkout_key"])
         with _operation_lock():
-            with _database() as connection:
+            with closing(_database()) as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
                 current_fence = connection.execute(
                     "SELECT * FROM operation_uncertainty WHERE fence_id=?",
@@ -3506,7 +3506,7 @@ def _persist_checkout_operation_intent(
     }
     intent_sha256 = _sha256_json(intent)
     created_at_unix = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         fence_row = connection.execute(
             "SELECT * FROM operation_uncertainty WHERE fence_id=?",
@@ -4481,7 +4481,7 @@ def _cleanup_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
     ):
         applied = _now()
         with _operation_lock():
-            with _database() as connection:
+            with closing(_database()) as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
                 current_dry = connection.execute(
                     "SELECT * FROM dry_runs WHERE plan_id=?", (plan_id,)
@@ -6687,7 +6687,7 @@ def _binding_identity_rebind_apply(
         target_repo_path = planned["target_identity"]["repo_path"]
         target_head = planned["target_identity"]["expected_head"]
         target_branch = planned["target_identity"]["expected_branch"]
-        with _operation_lock(), _database() as connection:
+        with _operation_lock(), closing(_database()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             lifecycle_row = connection.execute(
                 "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
@@ -7121,7 +7121,7 @@ def checkout_owner_handoff_apply(
         if current["snapshot_sha256"] != snapshot_sha256:
             raise RuntimeError("Checkout owner handoff snapshot changed after lease acquisition")
         applied_at = _now()
-        with _operation_lock(), _database() as connection:
+        with _operation_lock(), closing(_database()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             lifecycle_row = connection.execute(
                 "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
@@ -7682,7 +7682,7 @@ def grabowski_checkout_archive(
         manifest_path = manifest_dir / "manifest.json"
         _write_json_evidence(manifest_path, manifest)
         created = _now()
-        with _database() as connection:
+        with closing(_database()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             lifecycle_row = connection.execute(
                 "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
@@ -7936,7 +7936,7 @@ def _persist_dry_run(plan: dict[str, Any]) -> dict[str, Any]:
     plan_id = uuid.uuid4().hex[:24]
     created = _now()
     expires = created + DRY_RUN_TTL_SECONDS
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute(
             """
             INSERT INTO dry_runs(
@@ -7961,7 +7961,7 @@ def _persist_dry_run(plan: dict[str, Any]) -> dict[str, Any]:
 
 def _load_dry_run(plan_id: str) -> dict[str, Any]:
     identifier = _validate_plan_id(plan_id)
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         row = connection.execute(
             "SELECT * FROM dry_runs WHERE plan_id=?",
             (identifier,),
@@ -8132,7 +8132,7 @@ def grabowski_checkout_cleanup(
         _release_checkout_resources(lease)
         raise
     applied = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute(
             "UPDATE dry_runs SET applied_at_unix=? WHERE plan_id=?",
             (applied, plan_id),
