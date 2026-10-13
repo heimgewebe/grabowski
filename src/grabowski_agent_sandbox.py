@@ -926,9 +926,12 @@ def minimal_sandbox_argv(
         except OSError as exc:
             raise AgentSandboxError("operator home identity is unavailable") from exc
         repositories = home / "repos"
-        if worktree.is_relative_to(home) and (
-            worktree == repositories
-            or not worktree.is_relative_to(repositories)
+        if home.is_relative_to(worktree) or (
+            worktree.is_relative_to(home)
+            and (
+                worktree == repositories
+                or not worktree.is_relative_to(repositories)
+            )
         ):
             raise AgentSandboxError(
                 "private operator home cannot be a visible task workspace"

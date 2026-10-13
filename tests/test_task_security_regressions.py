@@ -1463,6 +1463,66 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         )
 
 
+    def test_opaque_parent_cwd_cannot_expose_entire_operator_home(self) -> None:
+        """Actual kernel probe for workspace ancestor mounts, including root.
+
+        A caller-selected parent directory must not be able to expose HOME as
+        part of a larger read-only workspace. Synthetic secrets only.
+        """
+        import subprocess
+        from pathlib import Path
+
+        tasks.agent_sandbox.require_bwrap()
+        home = self.root / "private-operator-home-below-cwd"
+        home.mkdir(mode=0o700)
+        secret = home / "private.txt"
+        secret.write_text("owned-test-secret", encoding="utf-8")
+        code = (
+            "from pathlib import Path\n"
+            "import sys\n"
+            "secret=Path(sys.argv[1])\n"
+            "print('LEAKED' if secret.is_file() and "
+            "secret.read_text(encoding='utf-8')=='owned-test-secret' else 'HIDDEN')\n"
+        )
+        record = {
+            "task_id": "opaque-home-parent",
+            "host": "local", "cwd": str(self.root),
+        }
+        with (
+            patch.object(tasks.operator, "HOME", home),
+            patch.object(Path, "home", return_value=home),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            try:
+                candidate = tasks._task_sandboxed_command_argv(
+                    record, ["/usr/bin/python3", "-I", "-c", code, str(secret)],
+                )
+            except tasks.agent_sandbox.AgentSandboxError as exc:
+                self.assertIn("private operator home", str(exc))
+            else:
+                observed = subprocess.run(
+                    tasks.agent_sandbox.runtime_sandbox_argv(candidate),
+                    capture_output=True, text=True, check=False, timeout=20,
+                )
+                self.assertEqual(observed.returncode, 0, observed.stderr)
+                self.assertEqual(observed.stdout.strip(), "HIDDEN")
+
+        # Do not bind the real host root in a test. Its policy denial must be
+        # verified before kernel execution, using only a synthetic home.
+        with patch.object(Path, "home", return_value=home):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "private operator home",
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(
+                    workspace=Path("/"),
+                    command=["/usr/bin/true"], workspace_writable=False,
+                )
+
+
     def test_opaque_task_cwd_must_not_reveal_private_home_subdirectory(self) -> None:
         """Kernel check: a different cwd is not authority to read operator secrets.
 
