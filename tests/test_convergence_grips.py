@@ -170,7 +170,16 @@ class DeploySourceSurfaceTests(unittest.TestCase):
             "status_tool": "grabowski_job_status",
             "logs_tool": "grabowski_job_logs",
         }
+        # Deliberately synthetic authorized-release fixture; the real
+        # high-critical R3 gate is not relaxed by this unit test.
         with patch.object(
+            grips, "_captain_independent_review_gate",
+            return_value={
+                "id": "independent-review-policy",
+                "status": "pass",
+                "reason": "synthetic test fixture only",
+            },
+        ), patch.object(
             grips, "_runtime_deploy_self_preflight", return_value=preflight
         ) as check, patch.object(
             grips, "_runtime_deploy_self_schedule", return_value=schedule

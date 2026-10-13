@@ -462,7 +462,21 @@ class RuntimeDeployScheduleObserverTests(unittest.TestCase):
             client_id = CLIENT_ID
 
         fixed_uuid = Mock(hex="abcdef012345ffffffffffffffffffff")
+        # This legacy scenario exercises scheduler/observer failure handling
+        # under a synthetic, already-admitted release; do not weaken the
+        # real release-origin gate tested in test_grips_runtime_deploy.py.
         with patch.object(
+            SELF_DEPLOY, "_require_release_source_admission",
+            return_value={
+                "status": "already-serving-exact-source",
+                "serving_repo_head": expected,
+                "target_repo_head": expected,
+                "independent_review_required": False,
+            },
+        ), patch.object(
+            SELF_DEPLOY, "_require_release_source_admission_under_lease",
+            side_effect=lambda head: SELF_DEPLOY._require_release_source_admission(head),
+        ), patch.object(
             SELF_DEPLOY,
             "_deployment_source_preflight",
             return_value=(repo, runner, identity),

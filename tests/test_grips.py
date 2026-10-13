@@ -14566,7 +14566,15 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             grips, "_runtime_deploy_self_schedule_source_preflight", return_value=preflight
         ), patch.object(
             grips, "_runtime_deploy_self_expected_argv_sha256", return_value=expected_argv_sha256
-        ) as hash_check:
+        ) as hash_check, patch.object(
+            grips,
+            "_captain_independent_review_gate",
+            return_value={
+                "id": "independent-review-policy",
+                "status": "pass",
+                "reason": "synthetic already-authorized source fixture",
+            },
+        ):
             result = grips.grip_run(
                 "captain-run",
                 parameters,
@@ -14692,7 +14700,14 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             grips,
             "_runtime_deploy_self_expected_argv_sha256",
             return_value=expected_argv_sha256,
-        ) as hash_check:
+        ) as hash_check, patch.object(
+            grips, "_captain_independent_review_gate",
+            return_value={
+                "id": "independent-review-policy",
+                "status": "pass",
+                "reason": "synthetic exact-source review-authorized fixture only",
+            },
+        ):
             result = grips.grip_run(
                 "captain-run",
                 parameters,
@@ -14777,6 +14792,13 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             grips, "_runtime_deploy_self_schedule_source_preflight", return_value=preflight
         ), patch.object(
             grips, "_runtime_deploy_self_expected_argv_sha256", return_value="d" * 64
+        ), patch.object(
+            grips, "_captain_independent_review_gate",
+            return_value={
+                "id": "independent-review-policy",
+                "status": "pass",
+                "reason": "synthetic exact-source review-authorized fixture only",
+            },
         ):
             result = grips.grip_run(
                 "captain-run",
@@ -14830,6 +14852,13 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         }
         with patch.object(grips, "_runtime_deploy_self_preflight", return_value=preflight), patch.object(
             grips, "_runtime_deploy_self_schedule", side_effect=RuntimeError("audit append failed after job start")
+        ), patch.object(
+            grips, "_captain_independent_review_gate",
+            return_value={
+                "id": "independent-review-policy",
+                "status": "pass",
+                "reason": "synthetic exact-source review-authorized fixture only",
+            },
         ):
             result = grips.grip_run(
                 "captain-run",
@@ -14953,15 +14982,18 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
             "ready": True,
         }
-        reconciliation = {
+        reconciliation_material = {
             "schema_version": 1,
             "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
-            "unit": "grabowski-job-stale000001",
+            "unit": "grabowski-job-abcdef012345",
             "dispatch_outcome": "not_started",
             "deploy_index_updated": True,
             "audit_recorded": True,
             "index_updated_at_unix": 1,
-            "evidence_sha256": "a" * 64,
+        }
+        reconciliation = {
+            **reconciliation_material,
+            "evidence_sha256": grips.sha256_json(reconciliation_material),
         }
         with patch.object(
             grips, "_runtime_deploy_self_preflight", return_value=preflight
@@ -17428,7 +17460,11 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         for action in actions:
             result = self.run_captain(captain_parameters([action]))
             self.assertEqual("pass", self.gate(result, "target-bound")["status"])
-            self.assertEqual("ready_for_manual_captain_decision", result["output"]["gate_decision"])
+            if action["action"] == "runtime-deploy":
+                self.assertEqual("blocked", result["output"]["gate_decision"])
+                self.assertEqual("blocked", self.gate(result, "independent-review-policy")["status"])
+            else:
+                self.assertEqual("ready_for_manual_captain_decision", result["output"]["gate_decision"])
             self.assertEqual("blocked", result["output"]["decision"])
 
     def test_does_not_establish_lists_safety_non_claims(self) -> None:

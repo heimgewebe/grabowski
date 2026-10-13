@@ -337,6 +337,26 @@ def _unpersisted_outcome_unknown_blue_green_result(
 
 class SelfDeployToolTests(unittest.TestCase):
     def setUp(self) -> None:
+        # These legacy tests exercise scheduler effects under synthetic task
+        # identities; adversarial release-admission cases are in
+        # test_grips_runtime_deploy.py and intentionally use the real check.
+        admission_patch = patch.object(
+            SELF_DEPLOY,
+            "_require_release_source_admission",
+            return_value={"status": "synthetic-test-fixture-only"},
+        )
+        admission_patch.start()
+        self.addCleanup(admission_patch.stop)
+        # These synthetic scheduler-effect tests intentionally replace the
+        # entire release admission seam. Dedicated independent tests exercise
+        # the real lease-bound wrapper and its exact closeout semantics.
+        lease_admission_patch = patch.object(
+            SELF_DEPLOY,
+            "_require_release_source_admission_under_lease",
+            side_effect=lambda head: SELF_DEPLOY._require_release_source_admission(head),
+        )
+        lease_admission_patch.start()
+        self.addCleanup(lease_admission_patch.stop)
         guard_patch = patch.object(
             SELF_DEPLOY,
             "_require_auto_deploy_source_mutation_leases",
