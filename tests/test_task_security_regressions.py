@@ -2253,14 +2253,32 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             ),
             "extra_directories": tuple(parents) + (role_mount.parent,),
         }
+        # The production writer checkout is outside HOME=/tmp, but this
+        # disposable test repository resides beneath /tmp. Give the synthetic
+        # outer role an equally private, disjoint HOME so the inner sandbox
+        # still enforces the actual worktree/receipt kernel boundaries.
+        # This is test-only environment modeling, never a runtime exemption.
+        def fixture_home(argv: list[str]) -> list[str]:
+            separator = argv.index("--")
+            return [
+                *argv[:separator],
+                "--setenv", "HOME", "/tmp/grabowski-fixture-home",
+                *argv[separator:],
+            ]
+
         # A role may write into its private /tmp, but without a host bind the
         # result disappears with the namespace: this is not a valid receipt.
-        no_host_receipt = tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
+        no_host_receipt = fixture_home(
+            tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
+        )
         ephemeral = subprocess.run(
             tasks.agent_sandbox.runtime_sandbox_argv(no_host_receipt),
             capture_output=True, text=True, timeout=40, check=False,
         )
-        self.assertEqual(ephemeral.returncode, 0, ephemeral.stderr)
+        # A generic read-only task may not act as an implicit trusted role:
+        # the inner wrapper sees the outer RO checkout as a mount boundary.
+        self.assertNotEqual(ephemeral.returncode, 0, ephemeral.stderr)
+        self.assertIn("mount boundary", ephemeral.stderr)
         self.assertFalse(external_receipt.exists())
 
         bounded = tasks.agent_sandbox.minimal_sandbox_argv(
@@ -2274,10 +2292,27 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             [bounded[index:index + 3] for index in range(len(bounded) - 2)],
         )
         completed = subprocess.run(
-            tasks.agent_sandbox.runtime_sandbox_argv(bounded),
+            tasks.agent_sandbox.runtime_sandbox_argv(fixture_home(bounded)),
             capture_output=True, text=True, timeout=40, check=False,
         )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("mount boundary", completed.stderr)
+        self.assertFalse(external_receipt.exists())
+
+        # Separately, the exact trusted wrapper can apply its own inner
+        # immutable checkout sandbox, then atomically emit an authorized
+        # private host receipt. This does NOT provide task-start permission:
+        # a server-side intent/lease must still authorize such a route.
+        trusted = [
+            str(runtime), str(role_source / "grabowski_agent_role.py"),
+            *command[2:],
+        ]
+        trusted[trusted.index("--output") + 1] = str(external_receipt)
+        inner = subprocess.run(
+            trusted,
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        self.assertEqual(inner.returncode, 0, inner.stderr)
         self.assertTrue(external_receipt.is_file())
         payload = json.loads(external_receipt.read_text(encoding="utf-8"))
         self.assertEqual(payload["role"], "tests")
