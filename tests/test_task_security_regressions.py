@@ -413,13 +413,19 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             ),
         ):
             captured = tasks._task_output_capture_argv(record)
+        sandbox = tasks.agent_sandbox
         expected_prefix = [
-            tasks.agent_sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
-            tasks.agent_sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
-            str(tasks.agent_sandbox.require_bwrap()),
+            sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S",
+            str(sandbox._host_seccomp_launcher_path()),
+            str(sandbox.require_bwrap()),
         ]
-        self.assertEqual(captured[5:11], expected_prefix)
-        self.assertLess(len(captured[9].encode("utf-8")), 4096)
+        self.assertEqual(captured[5:10], expected_prefix)
+        self.assertNotIn("-c", captured)
+        self.assertLess(len(captured[8].encode("utf-8")), 4096)
+        self.assertEqual(
+            sandbox._host_seccomp_launcher_path().read_text(),
+            sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
+        )
         with patch.object(tasks, "_task_output_capture_argv", return_value=captured):
             command = tasks._launch_argv(record, include_managed_runtime=False)
         self.assertEqual(
@@ -434,15 +440,43 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         resolved = str(sandbox.require_bwrap())
         argv = sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
         self.assertEqual(
-            argv[:6],
-            [sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
-             sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE, resolved],
+            argv[:5],
+            [sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S",
+             str(sandbox._host_seccomp_launcher_path()), resolved],
         )
-        self.assertEqual(argv[6:], ["--version"])
+        self.assertEqual(argv[5:], ["--version"])
         with self.assertRaisesRegex(sandbox.AgentSandboxError, "unrecognized"):
             sandbox.runtime_sandbox_argv(
                 [sandbox.SANDBOX_LAUNCH_PYTHON, "-c", "print('bypass')"]
             )
+
+    def test_seccomp_script_is_private_content_addressed_and_tamper_fails_closed(self) -> None:
+        """The host launcher is staged privately and never trusts a changed file."""
+        import hashlib
+        import os
+        import stat
+
+        sandbox = tasks.agent_sandbox
+        with patch.object(sandbox.Path, "home", return_value=self.root):
+            script = sandbox._host_seccomp_launcher_path()
+            self.assertEqual(
+                script.name,
+                "seccomp-" + hashlib.sha256(
+                    sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE.encode("utf-8")
+                ).hexdigest() + ".py",
+            )
+            self.assertEqual(script.read_text(), sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE)
+            self.assertEqual(stat.S_IMODE(script.lstat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(script.parent.lstat().st_mode), 0o700)
+            self.assertEqual(sandbox._host_seccomp_launcher_path(), script)
+            script.write_text("raise SystemExit(0)\n")
+            with self.assertRaisesRegex(sandbox.AgentSandboxError, "identity drifted"):
+                sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
+            script.unlink()
+            os.symlink(self.root / "foreign.py", script)
+            with self.assertRaisesRegex(sandbox.AgentSandboxError, "cannot be staged"):
+                sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
+
 
     def test_kernel_seccomp_inherits_into_exec_and_blocks_raw_socket_bypass(self) -> None:
         """A second exec and high-domain-bit raw syscalls keep the kernel ban."""
@@ -485,6 +519,48 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         self.assertEqual(outcome["errno"], 1)
         self.assertTrue(outcome["child_denied"], outcome)
 
+    def test_kernel_sandbox_blocks_io_uring_async_socket_escape(self) -> None:
+        """AF_UNIX socket() filtering must also deny io_uring async socket IO.
+
+        Linux 5.19+ can create sockets via IORING_OP_SOCKET without making a
+        socket syscall. Forbid a new ring so the syscall filter is not bypassed.
+        This probes the actual kernel rather than a mocked wrapper string.
+        """
+        import os
+        import subprocess
+
+        if os.uname().machine not in {"x86_64", "aarch64"}:
+            self.skipTest("io_uring_setup syscall 425 requires a known Linux ABI")
+        directory = self.root / "seccomp-io-uring"
+        directory.mkdir()
+        payload = (
+            "import ctypes,json,os\n"
+            "libc=ctypes.CDLL(None,use_errno=True)\n"
+            "params=ctypes.create_string_buffer(256)\n"
+            "ret=libc.syscall(ctypes.c_long(425),ctypes.c_uint(2),ctypes.byref(params))\n"
+            "errno=ctypes.get_errno()\n"
+            "if ret>=0: os.close(ret)\n"
+            "print(json.dumps({'ret':ret,'errno':errno}))\n"
+        )
+        record = {"task_id": "opaque-io-uring", "host": "local", "cwd": str(directory)}
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_verified_task_effect_start",
+                         return_value={"effect_profile": "unknown"}),
+        ):
+            child = tasks._task_sandboxed_command_argv(
+                record, ["/usr/bin/python3", "-I", "-c", payload],
+            )
+        result = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(child),
+            capture_output=True, text=True, check=False, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout.strip())
+        self.assertEqual(data["ret"], -1, data)
+        self.assertEqual(data["errno"], 1, data)
+
+
     def test_unavailable_seccomp_library_fails_closed_before_exec(self) -> None:
         """Fault-injected libseccomp absence may not reach bubblewrap or child."""
         import subprocess
@@ -497,17 +573,142 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             workspace_writable=False,
         )
         argv = sandbox.runtime_sandbox_argv(candidate)
-        # Change only the synthetic launcher source for this negative test.
-        missing = argv[4].replace(
-            "libseccomp.so.2", "pr1386-deliberately-missing-seccomp.so.2"
+        # A separate, explicitly test-only Python script proves the fail-closed
+        # behavior without weakening the production digest-bound path.
+        fake = self.root / "absent-libseccomp-probe.py"
+        fake.write_text(
+            sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE.replace(
+                "libseccomp.so.2", "pr1386-deliberately-missing-seccomp.so.2"
+            )
         )
-        self.assertNotEqual(missing, argv[4])
-        argv[4] = missing
+        argv[3] = str(fake)
         result = subprocess.run(
             argv, capture_output=True, text=True, timeout=20, check=False,
         )
         self.assertEqual(result.returncode, 125, result.stderr)
         self.assertIn("AF_UNIX sandbox enforcement unavailable", result.stderr)
+        # Untrusted replacement of the trusted script argument is rejected
+        # before the real launcher is dispatched.
+        with self.assertRaisesRegex(sandbox.AgentSandboxError, "unrecognized"):
+            sandbox.runtime_sandbox_argv(argv)
+
+
+    def test_kernel_untrusted_child_denies_io_uring_setup(self) -> None:
+        """io_uring can submit socket operations outside syscall seccomp gates.
+
+        This synthetic kernel-level regression tests setup denial while keeping
+        AF_INET socket creation usable for remote model APIs. No outside host
+        sockets or filesystem state are touched.
+        """
+        import subprocess
+
+        sandbox = tasks.agent_sandbox
+        sandbox.require_bwrap()
+        directory = self.root / "untrusted-io-uring"
+        directory.mkdir()
+        code = (
+            "import ctypes,os,socket,json\n"
+            "tcp=socket.socket(socket.AF_INET,socket.SOCK_STREAM);tcp.close()\n"
+            "libc=ctypes.CDLL(None,use_errno=True)\n"
+            "fd=libc.syscall(ctypes.c_long(425),ctypes.c_uint(2),"
+            "ctypes.create_string_buffer(256))\n"
+            "err=ctypes.get_errno()\n"
+            "print(json.dumps({'fd':fd,'errno':err,'inet':'ALLOWED'}))\n"
+            "fd>=0 and os.close(fd)\n"
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_verified_task_effect_start",
+                         return_value={"effect_profile": "unknown"}),
+        ):
+            sandbox_argv = tasks._task_sandboxed_command_argv(
+                {"task_id": "untrusted-ring", "host": "local", "cwd": str(directory)},
+                ["/usr/bin/python3", "-I", "-c", code],
+            )
+        result = subprocess.run(
+            sandbox.runtime_sandbox_argv(sandbox_argv),
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcome = json.loads(result.stdout.strip())
+        self.assertEqual(outcome["inet"], "ALLOWED")
+        self.assertEqual(outcome["fd"], -1, outcome)
+        self.assertEqual(outcome["errno"], 1, outcome)
+
+
+    def test_real_systemd_revoked_lease_stops_live_cgroup(self) -> None:
+        """An actual, still-running user-systemd task must stop on lease loss.
+
+        This starts only a bounded synthetic sleep process. Verify the unit
+        was active before losing authority, then inactive/dead after stop.
+        No mock, production unit, or shared filesystem marker is involved.
+        """
+        import subprocess
+        import uuid
+
+        available = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if available.returncode != 0:
+            self.skipTest("user systemd bus unavailable; run E2E on Heim-PC")
+        identifier = uuid.uuid4().hex[:24]
+        unit = tasks._task_unit(identifier, 1)
+        launched = subprocess.run(
+            ["systemd-run", "--user", "--unit=" + unit,
+             "--property=Type=exec",
+             "--property=KillMode=control-group",
+             "--property=RuntimeMaxSec=12s",
+             "--", "/usr/bin/sleep", "12"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        try:
+            deadline = time.monotonic() + 4
+            pre_active = False
+            while time.monotonic() < deadline:
+                observed = subprocess.run(
+                    ["systemctl", "--user", "show", unit,
+                     "--property=ActiveState", "--property=SubState"],
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+                if "ActiveState=active\n" in observed.stdout:
+                    pre_active = True
+                    break
+                time.sleep(0.05)
+            self.assertTrue(pre_active, "synthetic unit was never running")
+            key = f"path:{self.root / 'revoked-writer-scope'}"
+            record = {
+                "task_id": identifier, "unit": unit,
+                "authoritative_unit": unit, "host": "local",
+                "execution_backend": "systemd-user",
+                "systemd_scope": "user", "runtime_seconds": 12,
+                "lease_owner_id": f"task:{identifier}",
+                "resource_keys_json": tasks._canonical_json([key]),
+            }
+            # The synthetic task is explicitly local, but make test gives
+            # this process an isolated HOME without a fleet registry.
+            with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+                maintenance = tasks._maintain_record_resources(record, "running")
+            self.assertIsNotNone(maintenance)
+            self.assertIs(maintenance["maintained"], False)
+            self.assertIs(maintenance["stop_verified"], True, maintenance)
+            self.assertEqual(maintenance["state_override"], "cancelled")
+            after = subprocess.run(
+                ["systemctl", "--user", "show", unit,
+                 "--property=ActiveState", "--property=SubState",
+                 "--property=MainPID"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            self.assertIn("ActiveState=inactive\n", after.stdout)
+            self.assertIn("SubState=dead\n", after.stdout)
+            self.assertIn("MainPID=0\n", after.stdout)
+            self.assertIsNone(tasks.resources.inspect_resource(key))
+        finally:
+            subprocess.run(
+                ["systemctl", "--user", "stop", unit],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
 
 
     def test_revoked_running_task_lease_cannot_be_silently_reacquired(self) -> None:
@@ -550,7 +751,12 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             patch.object(tasks.base, "_append_audit"),
         ):
             status = tasks.grabowski_task_status(task_id)
-        regrant.assert_not_called()
+        # Stopping a revoked task may itself acquire a narrow service-unit
+        # lease. Only reacquisition of the *revoked writable task keys* is
+        # forbidden; a stop-control lease is not a renewed writer grant.
+        for call in regrant.call_args_list:
+            acquired_keys = call.args[1] if len(call.args) > 1 else []
+            self.assertTrue(set(acquired_keys).isdisjoint(keys), acquired_keys)
         maintenance = status["lease_maintenance"]
         self.assertIsInstance(maintenance, dict)
         self.assertIs(maintenance["maintained"], False)

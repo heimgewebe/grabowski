@@ -72,22 +72,33 @@ try:
     lib.seccomp_init.restype = ctypes.c_void_p
     lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
     lib.seccomp_syscall_resolve_name.restype = ctypes.c_int
-    lib.seccomp_rule_add.argtypes = [
-        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint, _ArgCmp
+    lib.seccomp_rule_add_array.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int,
+        ctypes.c_uint, ctypes.POINTER(_ArgCmp),
     ]
-    lib.seccomp_rule_add.restype = ctypes.c_int
+    lib.seccomp_rule_add_array.restype = ctypes.c_int
     lib.seccomp_load.argtypes = [ctypes.c_void_p]
     lib.seccomp_load.restype = ctypes.c_int
     ctx = lib.seccomp_init(0x7fff0000)
     syscall = lib.seccomp_syscall_resolve_name(b"socket")
     # SCMP_CMP_MASKED_EQ checks the low 32 bits; a malicious raw syscall may
     # otherwise set high bits that Linux discards when casting domain to int.
+    rule = _ArgCmp(0, 7, 0xffffffff, 1)
     if (not ctx or syscall < 0
-            or lib.seccomp_rule_add(
-                ctx, 0x00050001, syscall, 1,
-                _ArgCmp(0, 7, 0xffffffff, 1)
+            or lib.seccomp_rule_add_array(
+                ctx, 0x00050001, syscall, 1, ctypes.byref(rule)
             ) != 0):
         raise RuntimeError("AF_UNIX seccomp rule unavailable")
+    # A process can create sockets asynchronously through IORING_OP_SOCKET
+    # without invoking socket(2). Prevent new io_uring rings and attempts to
+    # operate inherited rings: otherwise the AF_UNIX rule is bypassable.
+    for name in (b"io_uring_setup", b"io_uring_enter", b"io_uring_register"):
+        syscall = lib.seccomp_syscall_resolve_name(name)
+        if (syscall < 0
+                or lib.seccomp_rule_add_array(
+                    ctx, 0x00050001, syscall, 0, None
+                ) != 0):
+            raise RuntimeError("async socket seccomp rule unavailable")
     if ctypes.CDLL(None).prctl(38, 1, 0, 0, 0) != 0:
         raise RuntimeError("no_new_privs unavailable")
     if lib.seccomp_load(ctx) != 0:
@@ -100,6 +111,75 @@ except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
 
 os.execv(sys.argv[1], sys.argv[1:])
 """
+
+
+def _host_seccomp_launcher_path() -> Path:
+    """Stage one private, content-addressed launcher before systemd dispatch.
+
+    Unlike python -c, a short script path survives systemd unit reloads and
+    does not violate its single-argument 4096-byte persistence limit. The
+    trusted operator must create and verify this file *before* starting bwrap;
+    a missing, foreign, symlinked or tampered script fails closed.
+    """
+    content = _HOST_UNIX_DENY_LAUNCH_SOURCE.encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    root = Path.home() / ".local/state/grabowski/task-sandbox-launchers"
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = root.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise AgentSandboxError("sandbox launcher root is not owner-private")
+        path = root / f"seccomp-{digest}.py"
+        try:
+            descriptor = os.open(
+                path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except FileNotFoundError:
+            descriptor, temporary = tempfile.mkstemp(
+                dir=root, prefix=".seccomp-", suffix=".tmp",
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            except BaseException:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                raise
+            descriptor = os.open(
+                path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size != len(content)
+                or os.read(descriptor, len(content) + 1) != content
+            ):
+                raise AgentSandboxError("sandbox launcher script identity drifted")
+        finally:
+            os.close(descriptor)
+        if len(str(path).encode("utf-8")) >= 4096:
+            raise AgentSandboxError("sandbox launcher path exceeds systemd limit")
+        return path
+    except OSError as exc:
+        raise AgentSandboxError("trusted sandbox launcher cannot be staged") from exc
 
 
 TAIL_BYTES = 12000
@@ -580,32 +660,24 @@ def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def runtime_sandbox_argv(arguments: list[str]) -> list[str]:
-    """Resolve bwrap; every invocation must retain the host-side seccomp gate.
+    """Resolve bwrap while retaining one verified kernel-filtered script.
 
-    Even direct compatibility probes must not silently drop the filter.
+    No direct bwrap compatibility call may silently bypass the filter.
     """
     if not arguments:
         raise AgentSandboxError("sandbox argv is empty")
     result = list(arguments)
-    if result[:5] == [
-        SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
-        _HOST_UNIX_DENY_LAUNCH_SOURCE,
-    ]:
-        if len(result) < 7:
-            raise AgentSandboxError("AF_UNIX sandbox launcher has no bwrap arguments")
-        result[5] = str(require_bwrap())
+    script = str(_host_seccomp_launcher_path())
+    prefix = [SANDBOX_LAUNCH_PYTHON, "-I", "-S"]
+    if result[:3] == prefix:
+        if len(result) < 5 or result[3] != script:
+            raise AgentSandboxError("unrecognized AF_UNIX sandbox launcher")
+        result[4] = str(require_bwrap())
     else:
-        # A malformed launcher cannot be interpreted as a bare bwrap command.
         if result[0] == SANDBOX_LAUNCH_PYTHON:
             raise AgentSandboxError("unrecognized AF_UNIX sandbox launcher")
-        result = [
-            SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
-            _HOST_UNIX_DENY_LAUNCH_SOURCE, str(require_bwrap()), *result[1:],
-        ]
-    if len(_HOST_UNIX_DENY_LAUNCH_SOURCE.encode("utf-8")) >= 4096:
-        raise AgentSandboxError("AF_UNIX launcher exceeds the systemd argument limit")
+        result = [*prefix, script, str(require_bwrap()), *result[1:]]
     return result
-
 
 @dataclass(frozen=True)
 class BoundedCapture:
@@ -1339,8 +1411,8 @@ def minimal_sandbox_argv(
         ]
     )
     return [
-        SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
-        _HOST_UNIX_DENY_LAUNCH_SOURCE, *arguments,
+        SANDBOX_LAUNCH_PYTHON, "-I", "-S",
+        str(_host_seccomp_launcher_path()), *arguments,
     ]
 
 

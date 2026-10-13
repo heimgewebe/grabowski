@@ -6634,6 +6634,78 @@ def _effective_observed_state(record: dict[str, Any], observed_state: str) -> st
     return stored_state if _is_terminal_state(stored_state) else observed_state
 
 
+def _stop_task_after_lease_revocation(record: dict[str, Any]) -> dict[str, Any]:
+    """Stop the authoritative systemd cgroup before treating a lost lease as inert.
+
+    A running process cannot regain write authority through a status read.
+    Neither a stop request nor a reported state alone is proof: require the
+    actual unit to have left the active/deactivating states after the stop.
+    """
+    result: dict[str, Any] | None = None
+    observed: dict[str, Any] | None = None
+    error: str | None = None
+    try:
+        unit = _authoritative_unit(record)
+        if _is_root_systemd_backend(record):
+            result = privileged.root_task_systemd_request(
+                _root_task_payload(record, "stop"), timeout_seconds=60,
+            )
+        else:
+            host, target, _ = _resolve_task_dispatch_host(str(record["host"]))
+            if target["transport"] == "local":
+                result = operator._run_mutating_user_systemd_unit(
+                    unit, "stop", mutation_timeout_seconds=60,
+                    max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+                )
+            else:
+                result = _dispatch(
+                    host, ["systemctl", "--user", "stop", unit],
+                    timeout_seconds=60,
+                )
+        if (
+            isinstance(result, dict)
+            and result.get("returncode") == 0
+            and result.get("outcome_unknown") is not True
+        ):
+            observed = _observe(record)
+    except Exception as exc:
+        error = _redact_reason(f"{type(exc).__name__}: {exc}")
+    properties = observed.get("properties") if isinstance(observed, dict) else None
+    stop_verified = bool(
+        isinstance(properties, dict)
+        and properties.get("ActiveState") in {"inactive", "failed"}
+        and properties.get("SubState") in {"dead", "failed"}
+        and observed.get("state") not in {"running", "outcome_unknown"}
+    )
+    return {
+        "stop_verified": stop_verified,
+        "state_override": "cancelled" if stop_verified else "outcome_unknown",
+        "stop_returncode": result.get("returncode") if isinstance(result, dict) else None,
+        "stop_outcome_unknown": (
+            result.get("outcome_unknown") if isinstance(result, dict) else None
+        ),
+        "post_stop_active_state": (
+            properties.get("ActiveState") if isinstance(properties, dict) else None
+        ),
+        "post_stop_sub_state": (
+            properties.get("SubState") if isinstance(properties, dict) else None
+        ),
+        "stop_error": error,
+    }
+
+
+def _enforced_lease_state(
+    observed_state: str, maintenance: dict[str, Any] | None,
+) -> str:
+    """Use explicit cgroup-stop proof or preserve outcome uncertainty."""
+    if isinstance(maintenance, dict) and maintenance.get("maintained") is False:
+        override = maintenance.get("state_override")
+        if override in {"cancelled", "outcome_unknown"}:
+            return str(override)
+        return "outcome_unknown"
+    return observed_state
+
+
 @_serialize_task_mutation
 def _maintain_record_resources(
     record: dict[str, Any],
@@ -6654,58 +6726,24 @@ def _maintain_record_resources(
             "mode": "renewed",
             "expires_at_unix": (
                 min(int(item["expires_at_unix"]) for item in leases)
-                if leases
-                else None
+                if leases else None
             ),
         }
-    except (resources.ResourceLeaseMissing, resources.ResourceLeaseExpired):
-        # A lease may be missing or have expired between observations. Reacquire
-        # only when the resource is still free; a foreign owner remains a hard
-        # conflict.
-        try:
-            repository_resource = _task_repository_resource(keys)
-            implicit_workspace_resource = _record_implicit_workspace_resource(
-                record, repository_resource
-            )
-            repository_scope_manifest = _record_repository_scope_manifest(
-                record, repository_resource
-            )
-            acquired = resources.acquire_resources(
-                owner,
-                keys,
-                purpose=f"persistent task {record['task_id']}",
-                ttl_seconds=ttl,
-                metadata=_task_lease_metadata(
-                    task_id=str(record["task_id"]),
-                    host=str(record["host"]),
-                    attempt=int(record["attempt"]),
-                    repository_resource=repository_resource,
-                    implicit_workspace_resource=implicit_workspace_resource,
-                    repository_scope_manifest=repository_scope_manifest,
-                    recovered_after_expiry=True,
-                ),
-                _preserve_live_same_owner=True,
-            )
-        except Exception as exc:
-            return {
-                "maintained": False,
-                "mode": "failed",
-                "error": _redact_reason(f"{type(exc).__name__}: {exc}"),
-            }
-        return {
-            "maintained": True,
-            "mode": "reconciled" if acquired.get("preserved") else "reacquired",
-            "expires_at_unix": acquired.get("expires_at_unix"),
-        }
     except Exception as exc:
-        # Ownership drift is evidence, not a reason to hide task status. Keep
-        # the task observable and surface the lease failure explicitly.
+        # Revocation, expiry, foreign takeover or unavailable authority must
+        # never be silently healed for a possibly still-running unit. Only
+        # explicit, separately authenticated recovery may acquire a new grant.
+        stop = _stop_task_after_lease_revocation(record)
         return {
             "maintained": False,
-            "mode": "failed",
+            "mode": (
+                "revoked_stopped"
+                if stop["stop_verified"]
+                else "revoked_stop_unverified"
+            ),
             "error": _redact_reason(f"{type(exc).__name__}: {exc}"),
+            **stop,
         }
-
 
 def _validate_command(argv: list[str]) -> list[str]:
     command = operator._validate_argv(argv, cwd=operator.HOME)
@@ -10787,6 +10825,14 @@ def grabowski_task_start(
                 "Bureau runtime-refresh launch produced an unsupported journal state"
             )
     lease_maintenance = _maintain_record_resources(stored, state)
+    revised_state = _enforced_lease_state(state, lease_maintenance)
+    if revised_state != state:
+        stored = _set_state(
+            task_id, revised_state,
+            observation={"lease_maintenance": lease_maintenance,
+                         "pre_revocation_state": state},
+        )
+        state = revised_state
     audit = {
         "timestamp_unix": _now(),
         "operation": "task-start",
@@ -10872,6 +10918,9 @@ def grabowski_task_status(task_id: str) -> dict[str, Any]:
     lease_maintenance = _maintain_record_resources(record, effective_state)
     if lease_maintenance is not None:
         observation["lease_maintenance"] = lease_maintenance
+        observation["state"] = _enforced_lease_state(
+            observation["state"], lease_maintenance,
+        )
     stored = _set_state(
         task_id,
         observation["state"],
@@ -11049,6 +11098,7 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
     lease_maintenance = _maintain_record_resources(record, effective_state)
     if lease_maintenance is not None:
         cancel_observation["lease_maintenance"] = lease_maintenance
+        state = _enforced_lease_state(state, lease_maintenance)
     stored = _set_state(task_id, state, observation=cancel_observation)
     audit = {
         "timestamp_unix": _now(),
@@ -11354,6 +11404,14 @@ def grabowski_task_resume(
         attempt=attempt,
     )
     lease_maintenance = _maintain_record_resources(stored, state)
+    revised_state = _enforced_lease_state(state, lease_maintenance)
+    if revised_state != state:
+        stored = _set_state(
+            task_id, revised_state,
+            observation={"lease_maintenance": lease_maintenance,
+                         "pre_revocation_state": state},
+        )
+        state = revised_state
     audit = {
         "timestamp_unix": _now(),
         "operation": "task-resume",
@@ -12949,6 +13007,9 @@ def _reconcile_tasks_refresh_locked(
         lease_maintenance = _maintain_record_resources(record, effective_state)
         if lease_maintenance is not None:
             observation["lease_maintenance"] = lease_maintenance
+            observation["state"] = _enforced_lease_state(
+                observation["state"], lease_maintenance,
+            )
         stored = _set_state(
             record["task_id"],
             observation["state"],
@@ -13170,6 +13231,9 @@ def reconcile_tasks_resume(
         lease_maintenance = _maintain_record_resources(record, effective_state)
         if lease_maintenance is not None:
             observation["lease_maintenance"] = lease_maintenance
+            observation["state"] = _enforced_lease_state(
+                observation["state"], lease_maintenance,
+            )
         stored = _set_state(
             record["task_id"],
             observation["state"],

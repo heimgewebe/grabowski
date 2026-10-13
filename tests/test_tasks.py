@@ -470,7 +470,9 @@ class TaskTests(unittest.TestCase):
                 {tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY: 1}
             ),
         }
-        argv = tasks._task_output_capture_argv(record)
+        # This fixture tests capture argument persistence, not re-admission
+        # of a fabricated task row with no immutable start authority.
+        argv = self._staged_capture_argv(record)
         for argument in argv:
             self.assertLess(
                 len(argument.encode("utf-8")),
@@ -1560,13 +1562,12 @@ class TaskTests(unittest.TestCase):
         separator = launch.index("--")
         self.assertEqual(command, task["argv"])
         self.assertEqual(command_identity.argv_sha256(command), task["argv_sha256"])
-        capture = tasks._task_output_capture_argv(
-            {
-                "task_id": task["task_id"],
-                "attempt": task["attempt"],
-                "argv_json": json.dumps(command),
-            }
-        )
+        # Read the actual persisted start-bound row rather than a forged
+        # record lacking host/cwd/argv evidence; do not bypass preflight.
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            capture = tasks._task_output_capture_argv(
+                tasks._row_raw(str(task["task_id"]))
+            )
         self.assertEqual(
             command_identity.systemd_escape_argv(capture),
             launch[separator + 1 :],
@@ -2592,7 +2593,7 @@ class TaskTests(unittest.TestCase):
             tasks, "_validate_command", return_value=argv
         ), patch.object(
             tasks, "_dispatch", return_value=_launcher()
-        ), patch.object(
+        ), patch.object(tasks, "_launch", return_value=_launcher()), patch.object(
             tasks.base, "_append_audit"
         ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
@@ -2679,7 +2680,7 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks, "_launch", return_value=_launcher()), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
         ), patch.object(
             coding_agent_router, "coding_agent_pre_dispatch_admission", return_value=admitted
@@ -2733,7 +2734,7 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks, "_launch", return_value=_launcher()), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
         ), patch.object(
             coding_agent_router, "coding_agent_pre_dispatch_admission", return_value=admitted
@@ -2814,7 +2815,7 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks, "_launch", return_value=_launcher()), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
         ), patch.object(
             coding_agent_router, "coding_agent_pre_dispatch_admission",
@@ -2864,7 +2865,7 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks, "_launch", return_value=_launcher()), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
         ), patch.object(
             coding_agent_router, "coding_agent_pre_dispatch_admission", return_value=admitted
@@ -2910,7 +2911,7 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks, "_launch", return_value=_launcher()), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
         ), patch.object(
             coding_agent_router, "coding_agent_pre_dispatch_admission",
@@ -2966,7 +2967,7 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks, "_launch", return_value=_launcher()), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
         ), patch.object(
             coding_agent_router, "coding_agent_pre_dispatch_admission",
@@ -3012,7 +3013,7 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks, "_launch", return_value=_launcher()), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
         ), patch.object(
             coding_agent_router, "coding_agent_pre_dispatch_admission",
@@ -3066,7 +3067,7 @@ class TaskTests(unittest.TestCase):
         }
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks, "_launch", return_value=_launcher()), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 147}
         ), patch.object(
             coding_agent_router, "coding_agent_pre_dispatch_admission",
@@ -3321,7 +3322,7 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(rows[missing_key]["attempt"], 2)
         self.assertIs(rows[missing_key]["recovered_after_expiry"], True)
 
-    def test_maintenance_reconciles_mixed_live_and_missing_leases(self) -> None:
+    def test_maintenance_rejects_mixed_live_and_revoked_leases(self) -> None:
         live_key = "component:task-maintain-mixed-live"
         missing_key = "component:task-maintain-mixed-missing"
         started = self._start(resource_keys=[live_key, missing_key])
@@ -3331,35 +3332,26 @@ class TaskTests(unittest.TestCase):
         self.assertIsNotNone(live_before)
         tasks.resources.release_resources(owner, [missing_key])
 
-        result = tasks._maintain_record_resources(
-            tasks._row_raw(task_id), "running"
-        )
+        # A live task must not silently reacquire the missing half of its scope.
+        with patch.object(
+            tasks, "_stop_task_after_lease_revocation",
+            return_value={"stop_verified": False, "state_override": "outcome_unknown"},
+        ) as stop:
+            result = tasks._maintain_record_resources(
+                tasks._row_raw(task_id), "running"
+            )
         self.assertIsNotNone(result)
         assert result is not None
-        self.assertTrue(result["maintained"])
-        self.assertEqual(result["mode"], "reconciled")
+        self.assertFalse(result["maintained"])
+        self.assertEqual(result["mode"], "revoked_stop_unverified")
+        self.assertEqual(result["state_override"], "outcome_unknown")
+        stop.assert_called_once()
         live_after = tasks.resources.inspect_resource(live_key)
-        missing_after = tasks.resources.inspect_resource(missing_key)
+        self.assertIsNone(tasks.resources.inspect_resource(missing_key))
         self.assertIsNotNone(live_after)
-        self.assertIsNotNone(missing_after)
         assert live_before is not None and live_after is not None
-        self.assertEqual(
-            live_after["acquired_at_unix"], live_before["acquired_at_unix"]
-        )
-        self.assertEqual(
-            live_after["metadata_sha256"], live_before["metadata_sha256"]
-        )
-        with sqlite3.connect(self.resource_database) as connection:
-            rows = {
-                row[0]: json.loads(row[1])
-                for row in connection.execute(
-                    "SELECT resource_key, metadata_json FROM leases "
-                    "WHERE resource_key IN (?, ?)",
-                    (live_key, missing_key),
-                ).fetchall()
-            }
-        self.assertNotIn("recovered_after_expiry", rows[live_key])
-        self.assertIs(rows[missing_key]["recovered_after_expiry"], True)
+        self.assertEqual(live_after["acquired_at_unix"], live_before["acquired_at_unix"])
+        self.assertEqual(live_after["metadata_sha256"], live_before["metadata_sha256"])
 
     def test_completed_observation_blocks_direct_resume_before_launch(self) -> None:
         started = self._start()
@@ -3888,7 +3880,7 @@ class TaskTests(unittest.TestCase):
             self.assertIsNone(terminal_readback["lease_maintenance"])
             self.assertIsNone(tasks.resources.inspect_resource(resource_key))
 
-    def test_unknown_root_task_reacquires_expired_free_lease(self) -> None:
+    def test_unknown_root_task_does_not_reacquire_expired_lease(self) -> None:
         unknown = _launcher(returncode=1)
         unknown["outcome_unknown"] = True
         unknown["root_truth_observable"] = False
@@ -3899,22 +3891,15 @@ class TaskTests(unittest.TestCase):
         )
         resource_key = "service:root-task-expired-lease-test"
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
-            tasks.recovery,
-            "recovery_status",
-            return_value={
-                "ready_for_user_power_worker": True,
-                "checked_at_unix": 204,
-            },
+            tasks.recovery, "recovery_status",
+            return_value={"ready_for_user_power_worker": True, "checked_at_unix": 204},
         ), patch.object(
-            tasks.privileged,
-            "root_task_systemd_request",
+            tasks.privileged, "root_task_systemd_request",
             side_effect=[unknown, running],
         ), patch.object(tasks.base, "_append_audit"):
             started = tasks.grabowski_task_start(
-                "local",
-                ["/usr/local/bin/sleep-heimserver"],
-                cwd=str(self.root),
-                runtime_seconds=300,
+                "local", ["/usr/local/bin/sleep-heimserver"],
+                cwd=str(self.root), runtime_seconds=300,
                 resource_keys=[resource_key],
             )
             with sqlite3.connect(self.resource_database) as connection:
@@ -3923,16 +3908,13 @@ class TaskTests(unittest.TestCase):
                     (resource_key,),
                 )
                 connection.commit()
-
             with patch.object(tasks, "_set_state", wraps=tasks._set_state) as set_state:
                 status = tasks.grabowski_task_status(started["task"]["task_id"])
 
         self.assertEqual(1, set_state.call_count)
-        self.assertEqual(status["state"], "running")
-        self.assertEqual(status["lease_maintenance"]["mode"], "reacquired")
-        lease = tasks.resources.inspect_resource(resource_key)
-        self.assertIsNotNone(lease)
-        self.assertEqual(lease["owner_id"], started["task"]["lease_owner_id"])
+        self.assertEqual(status["state"], "outcome_unknown")
+        self.assertEqual(status["lease_maintenance"]["mode"], "revoked_stop_unverified")
+        self.assertIsNone(tasks.resources.inspect_resource(resource_key))
 
     @_legacy_direct_codex_lease_fixture
     def test_coding_agent_pre_dispatch_denial_has_no_launch_persistence_or_resource_lease(self) -> None:
@@ -4015,7 +3997,7 @@ class TaskTests(unittest.TestCase):
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks, "_launch", return_value=_launcher()), patch.object(
             tasks.base, "_append_audit"
         ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 150}
@@ -4240,7 +4222,7 @@ class TaskTests(unittest.TestCase):
         workspace_key = f"repo:{self.root}"
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks, "_launch", return_value=_launcher()), patch.object(
             tasks.base, "_append_audit"
         ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 154}
@@ -4328,13 +4310,17 @@ class TaskTests(unittest.TestCase):
             ), patch.object(
                 tasks, "_dispatch", return_value=_launcher()
             ) as dispatch, patch.object(
+                tasks, "_launch", return_value=_launcher()
+            ) as launch, patch.object(
                 tasks, "_require_recovery_gate", return_value={"checked_at_unix": 158}
             ):
                 result = tasks.grabowski_task_start(
                     "local", argv, cwd=str(scratch), runtime_seconds=60
                 )
 
-            dispatch.assert_called_once()
+            # The fixture mocks the synthetic launch, never the real dispatcher.
+            dispatch.assert_not_called()
+            launch.assert_called_once()
             classification = result["task_effect_classification"]
             self.assertEqual(classification["effect_profile"], "workspace_write")
             self.assertEqual(classification["agent_executable"], "codex")
@@ -4883,26 +4869,21 @@ class TaskTests(unittest.TestCase):
 
 
     @_legacy_direct_codex_lease_fixture
-    def test_expired_implicit_repository_lease_reacquires_complete_scope(self) -> None:
+    def test_expired_implicit_repository_lease_does_not_reacquire(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
-        running = _launcher()
-        running["stdout"] = (
-            "LoadState=loaded\nActiveState=active\nSubState=running\n"
-            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
-        )
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
         ), patch.object(
-            tasks, "_dispatch", side_effect=[_launcher(), running]
+            tasks, "_launch", return_value=_launcher()
         ), patch.object(tasks.base, "_append_audit"), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 161}
         ), patch.object(
-            tasks, "_workspace_scope_identity",
-            side_effect=[("a" * 40, "main"), ("b" * 40, "feat/changed")],
+            tasks, "_workspace_scope_identity", return_value=("a" * 40, "main")
         ) as identity:
             started = tasks.grabowski_task_start(
                 "local", argv, cwd=str(self.root), runtime_seconds=60
             )
+            task_id = str(started["task"]["task_id"])
             key = f"repo:{self.root}"
             empty_json, empty_sha256 = tasks.resources._metadata({})
             with sqlite3.connect(self.resource_database) as connection:
@@ -4912,56 +4893,61 @@ class TaskTests(unittest.TestCase):
                     (empty_json, empty_sha256, key),
                 )
                 connection.commit()
-            status = tasks.grabowski_task_status(started["task"]["task_id"])
+            running = {
+                "state": "running",
+                "properties": {
+                    "ActiveState": "active", "SubState": "running",
+                },
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": tasks._now(),
+            }
+            with patch.object(
+                tasks, "_observe", return_value=running
+            ), patch.object(
+                tasks, "_stop_task_after_lease_revocation",
+                return_value={"stop_verified": True, "state_override": "cancelled"},
+            ) as stop:
+                status = tasks.grabowski_task_status(task_id)
 
-        self.assertEqual(status["lease_maintenance"]["mode"], "reacquired")
-        with sqlite3.connect(self.resource_database) as connection:
-            metadata = json.loads(
-                connection.execute(
-                    "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
-                ).fetchone()[0]
-            )
-        self.assertIs(metadata["scope_manifest_complete"], True)
-        self.assertIs(metadata["recovered_after_expiry"], True)
-        self.assertEqual(metadata["implicit_workspace_resource_key"], key)
-        self.assertEqual(metadata["scope_manifest"]["repository"], str(self.root))
-        self.assertEqual(metadata["scope_manifest"]["paths"], [str(self.root)])
-        self.assertEqual(metadata["scope_manifest"]["head"], "a" * 40)
-        self.assertEqual(metadata["scope_manifest"]["branch"], "main")
+        # A running process may lose its lease only with verified cgroup stop;
+        # persisted scope identity is recovery evidence, never a new grant.
+        self.assertEqual(status["state"], "cancelled")
+        self.assertEqual(status["lease_maintenance"]["mode"], "revoked_stopped")
+        stop.assert_called_once()
+        self.assertIsNone(tasks.resources.inspect_resource(key))
         self.assertEqual(identity.call_count, 1)
         with sqlite3.connect(self.database) as connection:
-            stored = json.loads(connection.execute(
+            persisted = json.loads(connection.execute(
                 "SELECT repository_scope_manifest_json FROM tasks WHERE task_id=?",
-                (started["task"]["task_id"],),
+                (task_id,),
             ).fetchone()[0])
-        self.assertEqual(stored, metadata["scope_manifest"])
+        self.assertEqual(persisted["repository"], str(self.root))
+        self.assertEqual(persisted["paths"], [str(self.root)])
+        self.assertEqual(persisted["head"], "a" * 40)
+        self.assertEqual(persisted["branch"], "main")
 
     @_legacy_direct_codex_lease_fixture
-    def test_schema4_task_recovers_manifest_from_expired_lease_metadata(self) -> None:
+    def test_schema4_task_does_not_recover_expired_lease_from_metadata(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
-        running = _launcher()
-        running["stdout"] = (
-            "LoadState=loaded\nActiveState=active\nSubState=running\n"
-            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
-        )
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
         ), patch.object(
-            tasks, "_dispatch", side_effect=[_launcher(), running]
+            tasks, "_launch", return_value=_launcher()
         ), patch.object(tasks.base, "_append_audit"), patch.object(
-            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 164}
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 161}
         ), patch.object(
-            tasks, "_workspace_scope_identity",
-            side_effect=[("c" * 40, "main"), ("d" * 40, "feat/changed")],
+            tasks, "_workspace_scope_identity", return_value=("a" * 40, "main")
         ) as identity:
             started = tasks.grabowski_task_start(
                 "local", argv, cwd=str(self.root), runtime_seconds=60
             )
+            task_id = str(started["task"]["task_id"])
             key = f"repo:{self.root}"
             with sqlite3.connect(self.database) as connection:
                 connection.execute(
                     "UPDATE tasks SET repository_scope_manifest_json=NULL WHERE task_id=?",
-                    (started["task"]["task_id"],),
+                    (task_id,),
                 )
                 connection.commit()
             with sqlite3.connect(self.resource_database) as connection:
@@ -4970,55 +4956,93 @@ class TaskTests(unittest.TestCase):
                     (key,),
                 )
                 connection.commit()
-            status = tasks.grabowski_task_status(started["task"]["task_id"])
+            running = {
+                "state": "running",
+                "properties": {
+                    "ActiveState": "active", "SubState": "running",
+                },
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": tasks._now(),
+            }
+            with patch.object(
+                tasks, "_observe", return_value=running
+            ), patch.object(
+                tasks, "_stop_task_after_lease_revocation",
+                return_value={"stop_verified": True, "state_override": "cancelled"},
+            ) as stop:
+                status = tasks.grabowski_task_status(task_id)
 
-        self.assertEqual(status["lease_maintenance"]["mode"], "reacquired")
-        with sqlite3.connect(self.resource_database) as connection:
-            metadata = json.loads(connection.execute(
-                "SELECT metadata_json FROM leases WHERE resource_key=?", (key,)
-            ).fetchone()[0])
-        self.assertEqual(metadata["scope_manifest"]["head"], "c" * 40)
-        self.assertEqual(metadata["scope_manifest"]["branch"], "main")
+        # A running process may lose its lease only with verified cgroup stop;
+        # persisted scope identity is recovery evidence, never a new grant.
+        self.assertEqual(status["state"], "cancelled")
+        self.assertEqual(status["lease_maintenance"]["mode"], "revoked_stopped")
+        stop.assert_called_once()
+        self.assertIsNone(tasks.resources.inspect_resource(key))
         self.assertEqual(identity.call_count, 1)
+        with sqlite3.connect(self.database) as connection:
+            stored = connection.execute(
+                "SELECT repository_scope_manifest_json FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()[0]
+        self.assertIsNone(stored)
 
     @_legacy_direct_codex_lease_fixture
-    def test_legacy_task_without_scope_evidence_fails_closed_on_reacquire(self) -> None:
+    def test_legacy_task_without_scope_evidence_fails_closed_on_revocation(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
-        running = _launcher()
-        running["stdout"] = (
-            "LoadState=loaded\nActiveState=active\nSubState=running\n"
-            "Result=success\nExecMainCode=0\nExecMainStatus=0\n"
-        )
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
         ), patch.object(
-            tasks, "_dispatch", side_effect=[_launcher(), running]
+            tasks, "_launch", return_value=_launcher()
         ), patch.object(tasks.base, "_append_audit"), patch.object(
-            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 165}
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 161}
         ), patch.object(
-            tasks, "_workspace_scope_identity",
-            side_effect=[("e" * 40, "main"), ("f" * 40, "feat/changed")],
+            tasks, "_workspace_scope_identity", return_value=("a" * 40, "main")
         ) as identity:
             started = tasks.grabowski_task_start(
                 "local", argv, cwd=str(self.root), runtime_seconds=60
             )
+            task_id = str(started["task"]["task_id"])
             key = f"repo:{self.root}"
             with sqlite3.connect(self.database) as connection:
                 connection.execute(
                     "UPDATE tasks SET repository_scope_manifest_json=NULL WHERE task_id=?",
-                    (started["task"]["task_id"],),
+                    (task_id,),
                 )
                 connection.commit()
             with sqlite3.connect(self.resource_database) as connection:
                 connection.execute("DELETE FROM leases WHERE resource_key=?", (key,))
                 connection.commit()
-            status = tasks.grabowski_task_status(started["task"]["task_id"])
+            running = {
+                "state": "running",
+                "properties": {
+                    "ActiveState": "active", "SubState": "running",
+                },
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": tasks._now(),
+            }
+            with patch.object(
+                tasks, "_observe", return_value=running
+            ), patch.object(
+                tasks, "_stop_task_after_lease_revocation",
+                return_value={"stop_verified": True, "state_override": "cancelled"},
+            ) as stop:
+                status = tasks.grabowski_task_status(task_id)
 
-        self.assertFalse(status["lease_maintenance"]["maintained"])
-        self.assertEqual(status["lease_maintenance"]["mode"], "failed")
-        self.assertIn("scope manifest evidence is required", status["lease_maintenance"]["error"])
+        # A running process may lose its lease only with verified cgroup stop;
+        # persisted scope identity is recovery evidence, never a new grant.
+        self.assertEqual(status["state"], "cancelled")
+        self.assertEqual(status["lease_maintenance"]["mode"], "revoked_stopped")
+        stop.assert_called_once()
         self.assertIsNone(tasks.resources.inspect_resource(key))
         self.assertEqual(identity.call_count, 1)
+        with sqlite3.connect(self.database) as connection:
+            stored = connection.execute(
+                "SELECT repository_scope_manifest_json FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()[0]
+        self.assertIsNone(stored)
 
     def test_explicit_repository_task_scope_is_attested(self) -> None:
         key = f"repo:{self.root}"
@@ -5128,7 +5152,7 @@ class TaskTests(unittest.TestCase):
             tasks, "_validate_command", return_value=argv
         ), patch.object(tasks, "_observe", return_value=active_observation) as observe, patch.object(
             tasks, "_dispatch", return_value=_launcher()
-        ) as dispatch, patch.object(
+        ), patch.object(tasks, "_launch", return_value=_launcher()) as dispatch, patch.object(
             tasks.base, "_append_audit"
         ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 151}
@@ -5152,7 +5176,7 @@ class TaskTests(unittest.TestCase):
         with (
             patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
             patch.object(tasks, "_validate_command", return_value=argv),
-            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks, "_launch", return_value=_launcher()),
             patch.object(tasks.base, "_append_audit"),
             patch.object(
                 tasks, "_require_recovery_gate", return_value={"checked_at_unix": 151}
@@ -5212,7 +5236,7 @@ class TaskTests(unittest.TestCase):
         workspace = f"repo:{self.root}"
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch, patch.object(
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(tasks, "_launch", return_value=_launcher()) as dispatch, patch.object(
             tasks.base, "_append_audit"
         ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 152}
@@ -12176,7 +12200,7 @@ class TaskTests(unittest.TestCase):
                 tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
             ),
             self.assertRaisesRegex(
-                RuntimeError, "active execution resource lease maintenance failed"
+                RuntimeError, "unchanged terminal task retry blocked"
             ),
         ):
             tasks.grabowski_task_start(**common)
