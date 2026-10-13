@@ -614,6 +614,53 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                             runner._attest_root_system_manager_channels()
                         self.assertEqual(socket_factory.call_count, 1)
 
+    def test_root_owned_independent_dbus_broker_peer_is_accepted(self) -> None:
+        # Systemd's private channel is PID 1, but its system D-Bus broker may
+        # be an independently managed root process with a different PID.
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket) as lstat,
+            patch.object(runner.socket, "socket") as socket_factory,
+        ):
+            connection = socket_factory.return_value.__enter__.return_value
+            connection.getsockopt.side_effect = (
+                struct.pack("3i", 1, 0, 0),
+                struct.pack("3i", 321, 0, 0),
+            )
+            runner._attest_root_system_manager_channels()
+            self.assertEqual(socket_factory.call_count, 2)
+            self.assertEqual(lstat.call_count, 4)
+            self.assertEqual(
+                [call.args[0] for call in connection.connect.call_args_list],
+                ["/run/systemd/private", "/run/dbus/system_bus_socket"],
+            )
+
+    def test_root_manager_rejects_forged_or_invalid_dbus_broker_peer(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        for peer in (
+            (321, os.getuid(), os.getgid()),
+            (321, 0, 2000),
+            (0, 0, 0),
+        ):
+            with self.subTest(peer=peer):
+                with (
+                    patch.object(runner.os, "lstat", return_value=root_socket),
+                    patch.object(runner.socket, "socket") as socket_factory,
+                ):
+                    socket_factory.return_value.__enter__.return_value.getsockopt.side_effect = (
+                        struct.pack("3i", 1, 0, 0),
+                        struct.pack("3i", *peer),
+                    )
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "system manager channel",
+                    ):
+                        runner._attest_root_system_manager_channels()
+
     def test_system_manager_socket_must_be_root_owned_and_stable(self) -> None:
         for mode, owner in (
             (stat.S_IFREG | 0o666, 0),
