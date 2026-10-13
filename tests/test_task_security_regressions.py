@@ -1777,6 +1777,106 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             ):
                 tasks.agent_sandbox.minimal_sandbox_argv(**args)
 
+    def test_read_only_workspace_must_not_expose_live_host_unix_socket(self) -> None:
+        """A ro-bind does not itself grant safe read-only IPC semantics."""
+        import socket
+        import subprocess
+
+        tasks.agent_sandbox.require_bwrap()
+        workspace = self.root / "synthetic-local-socket-workspace"
+        workspace.mkdir()
+        endpoint = workspace / "private-control.sock"
+        program = (
+            "import socket,sys\n"
+            "sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n"
+            "try:\n"
+            " sock.connect(sys.argv[1])\n"
+            " sock.sendall(b'SYNTHETIC-ONLY')\n"
+            " print('CONNECTED')\n"
+            "except OSError:\n"
+            " print('BLOCKED')\n"
+            "finally:\n"
+            " sock.close()\n"
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(endpoint))
+            listener.listen(1)
+            try:
+                argv = tasks.agent_sandbox.minimal_sandbox_argv(
+                    workspace=workspace,
+                    command=["/usr/bin/python3", "-I", "-c", program, str(endpoint)],
+                    workspace_writable=False,
+                )
+            except tasks.agent_sandbox.AgentSandboxError as exc:
+                self.assertIn("IPC", str(exc))
+                return
+            result = subprocess.run(
+                tasks.agent_sandbox.runtime_sandbox_argv(argv),
+                capture_output=True, text=True, check=False, timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if result.stdout.strip() == "CONNECTED":
+                listener.settimeout(2)
+                with listener.accept()[0] as client:
+                    self.assertEqual(client.recv(64), b"SYNTHETIC-ONLY")
+            self.assertEqual(result.stdout.strip(), "BLOCKED")
+
+
+    def test_read_only_dependencies_must_not_expose_host_ipc(self) -> None:
+        """Git metadata and extra read-only directories are also host mounts."""
+        import os
+        from pathlib import Path
+
+        workspace = self.root / "ipc-dependency-workspace"
+        workspace.mkdir()
+        common = self.root / "synthetic-git-common"
+        common.mkdir()
+        auxiliary = self.root / "synthetic-readonly-runtime"
+        auxiliary.mkdir()
+        for directory, option in (
+            (common, {"git_common_dir": common}),
+            (auxiliary, {"extra_read_only": ((auxiliary, auxiliary),)}),
+        ):
+            with self.subTest(source=str(directory)):
+                endpoint = directory / "hidden-control.fifo"
+                os.mkfifo(endpoint, mode=0o600)
+                with self.assertRaisesRegex(
+                    tasks.agent_sandbox.AgentSandboxError, "IPC",
+                ):
+                    tasks.agent_sandbox.minimal_sandbox_argv(
+                        workspace=workspace,
+                        command=["/usr/bin/true"], workspace_writable=False,
+                        **option,
+                    )
+                endpoint.unlink()
+
+        nested = workspace / "nested"
+        nested.mkdir()
+        os.mkfifo(nested / "hidden-control.fifo", mode=0o600)
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "IPC",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=workspace,
+                command=["/usr/bin/true"], workspace_writable=False,
+            )
+
+
+    def test_read_only_ipc_scan_budget_fails_closed(self) -> None:
+        """A huge caller-selected tree cannot bypass bounded prelaunch checks."""
+        workspace = self.root / "readonly-budget"
+        workspace.mkdir()
+        (workspace / "regular.txt").write_text("safe", encoding="utf-8")
+        with patch.object(tasks.agent_sandbox, "MAX_READ_ONLY_SCOPE_ENTRIES", 0):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "entry budget",
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(
+                    workspace=workspace,
+                    command=["/usr/bin/true"], workspace_writable=False,
+                )
+
+
     def test_real_kernel_same_device_receipt_mount_alias_denied(self) -> None:
         """Reject a host receipt sink that is a same-device bind-mount alias."""
         import subprocess

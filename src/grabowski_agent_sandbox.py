@@ -16,6 +16,7 @@ from typing import Iterable
 BWRAP = Path(os.environ.get("GRABOWSKI_BWRAP_BIN", "/usr/bin/bwrap"))
 TAIL_BYTES = 12000
 MAX_WRITABLE_SCOPE_ENTRIES = 100_000
+MAX_READ_ONLY_SCOPE_ENTRIES = 100_000
 MAX_MOUNTINFO_BYTES = 1_048_576
 MAX_MOUNTINFO_ENTRIES = 4096
 _GIT_COMMAND_CONFIG = (
@@ -618,6 +619,50 @@ def _validate_writable_tree(target: Path) -> None:
             raise AgentSandboxError(f"writable path is not stable: {directory}") from exc
 
 
+def _reject_exposed_host_ipc_tree(worktree: Path) -> None:
+    """Never ro-bind an arbitrary cwd containing live host IPC/device nodes.
+
+    A read-only VFS mount still permits AF_UNIX connect and FIFO I/O. Inspect
+    the full tree with a bounded budget; skip symlink targets because they do
+    not add host mounts by themselves. Missing or unstable entries fail closed.
+    This check does not replace server-owned task/role authority or remove the
+    remaining same-UID path-replacement race before bwrap executes.
+    """
+    pending = [worktree]
+    entries_seen = 0
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    entries_seen += 1
+                    if entries_seen > MAX_READ_ONLY_SCOPE_ENTRIES:
+                        raise AgentSandboxError(
+                            "read-only workspace IPC inspection exceeds its entry budget"
+                        )
+                    try:
+                        metadata = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise AgentSandboxError(
+                            f"read-only workspace IPC entry is not stable: {entry.path}"
+                        ) from exc
+                    if stat.S_ISDIR(metadata.st_mode):
+                        pending.append(Path(entry.path))
+                    elif not (
+                        stat.S_ISREG(metadata.st_mode)
+                        or stat.S_ISLNK(metadata.st_mode)
+                    ):
+                        raise AgentSandboxError(
+                            f"read-only workspace exposes a host IPC or device entry: {entry.path}"
+                        )
+        except AgentSandboxError:
+            raise
+        except OSError as exc:
+            raise AgentSandboxError(
+                f"read-only workspace IPC inspection failed: {directory}"
+            ) from exc
+
+
 def _grosser_adler_inbox_root() -> Path:
     configured = os.environ.get("GROSSER_ADLER_STATE_ROOT")
     if configured:
@@ -938,6 +983,10 @@ def minimal_sandbox_argv(
             )
     if not mount_workspace and (workspace_writable or writable or common is not None):
         raise AgentSandboxError("hidden workspace cannot be writable or expose Git metadata")
+    if mount_workspace:
+        _reject_exposed_host_ipc_tree(worktree)
+    if common is not None and not common.is_relative_to(worktree):
+        _reject_exposed_host_ipc_tree(common)
     adler_read_only, adler_directories = (
         _adler_inbox_sandbox_binding(worktree) if mount_workspace else ((), ())
     )
@@ -1001,6 +1050,8 @@ def minimal_sandbox_argv(
         read_only_sources.add(common)
     for source_value, target_value in (*adler_read_only, *tuple(extra_read_only)):
         source = _safe_existing_path(source_value, "extra_read_only source")
+        if source.is_dir() and not source.is_relative_to(worktree):
+            _reject_exposed_host_ipc_tree(source)
         if not mount_workspace and (
             source == worktree
             or source.is_relative_to(worktree)
