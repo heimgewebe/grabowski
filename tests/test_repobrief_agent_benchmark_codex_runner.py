@@ -1845,6 +1845,91 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 )
             self.assertFalse((state / "codex-workspaces" / workspace_name).exists())
 
+    def test_private_output_scan_reserves_preintent_artifact_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "source.txt").write_text("x", encoding="utf-8")
+            (root / "subdir").mkdir()
+            runner._assert_private_output_tree_scan((root,))
+            # Two existing entries plus the reserved future entries exceed
+            # 65,536 although the current tree by itself is still admissible.
+            with self.assertRaisesRegex(
+                runner.RunnerError, "scan entry budget exceeded"
+            ):
+                runner._assert_private_output_tree_scan((root,), reserved_entries=65535)
+            with self.assertRaisesRegex(
+                runner.RunnerError, "reserved output entries are invalid"
+            ):
+                runner._assert_private_output_tree_scan((root,), reserved_entries=-1)
+
+    def test_preintent_headroom_counts_nested_manifest_artifacts(self) -> None:
+        self.assertEqual(
+            runner._preintent_output_entry_reservation("baseline", None), 4
+        )
+        expected_manifest = {
+            "path": "/bundle/manifest.json",
+            "sha256": "a" * 64,
+        }
+        manifest_files = [
+            (Path("a/one"), Path("/source/a/one"), 10, "0" * 64),
+            (Path("a/two"), Path("/source/a/two"), 10, "1" * 64),
+            (Path("b/c/three"), Path("/source/b/c/three"), 10, "2" * 64),
+        ]
+        with (
+            patch.object(
+                runner,
+                "_runtime_file_snapshot",
+                return_value=(dict(expected_manifest), b"manifest"),
+            ) as snapshot,
+            patch.object(
+                runner,
+                "_manifest_artifact_paths",
+                return_value=manifest_files,
+            ) as manifest_paths,
+        ):
+            self.assertEqual(
+                runner._preintent_output_entry_reservation(
+                    "treatment", expected_manifest
+                ),
+                # schema + runtime home + proxy + manifest stage plus the
+                # three staged artifacts and three distinct nested folders.
+                4 + 4 + 3 + 3 + 3,
+            )
+            snapshot.assert_called_once()
+            manifest_paths.assert_called_once()
+        with self.assertRaisesRegex(
+            runner.RunnerError, "pre-intent manifest binding is missing"
+        ):
+            runner._preintent_output_entry_reservation("treatment", None)
+
+    def test_preintent_rejects_deep_manifest_artifact_before_workspace(self) -> None:
+        # The staged bundle lives two directory levels below state_root.
+        # A relative file with 32 components creates a parent at depth 33,
+        # which the final output scanner rejects after one-use reservation.
+        binding = {"path": "/bundle/manifest.json", "sha256": "a" * 64}
+        valid = Path(*(["nested"] * 30 + ["artifact.dat"]))
+        too_deep = Path(*(["nested"] * 31 + ["artifact.dat"]))
+        with (
+            patch.object(
+                runner,
+                "_runtime_file_snapshot",
+                return_value=(dict(binding), b"manifest"),
+            ),
+            patch.object(runner, "_manifest_artifact_paths") as artifacts,
+        ):
+            artifacts.return_value = [(valid, Path("/bundle") / valid, 1, "b" * 64)]
+            self.assertGreater(
+                runner._preintent_output_entry_reservation("treatment", binding),
+                0,
+            )
+            artifacts.return_value = [
+                (too_deep, Path("/bundle") / too_deep, 1, "b" * 64)
+            ]
+            with self.assertRaisesRegex(
+                runner.RunnerError, "manifest artifact tree depth"
+            ):
+                runner._preintent_output_entry_reservation("treatment", binding)
+
     def test_create_checkout_regular_tracked_files_remain_usable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -9631,6 +9716,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                         ("stage_repoground_manifest", {"path": str(manifest)}),
                         ("_rebind_staged_manifest_authorization", []),
                         ("build_command", ["codex"]),
+                        ("_preintent_output_entry_reservation", 12),
                         ("provider_env", {}),
                         ("cleanup_codex_home", None),
                         ("cleanup_staged_mcp_proxy", None),

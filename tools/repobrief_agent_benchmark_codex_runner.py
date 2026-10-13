@@ -992,12 +992,17 @@ def _assert_root_owned_device_policy() -> None:
         raise RunnerError("live Codex device isolation system device policy unsafe")
 
 
-def _assert_private_output_tree_scan(roots: Sequence[Path]) -> None:
-    """Enforce the same private-output scan budget before and after cloning.
+def _assert_private_output_tree_scan(
+    roots: Sequence[Path], *, reserved_entries: int = 0
+) -> None:
+    """Bound the real output tree and any deterministic pre-intent additions.
 
-    The preallocation caller uses this against staged Git objects and tracked
-    paths. No final one-use workspace is claimed if .git exceeds the limits.
+    The staged clone and generated .git are scanned before one-use identity
+    allocation; reserved_entries accounts for future schema and runtime
+    artifacts that are written before the provider intent can be persisted.
     """
+    if type(reserved_entries) is not int or not 0 <= reserved_entries <= 65536:
+        raise RunnerError("live Codex reserved output entries are invalid")
     entries_seen = 0
     pending = [(path, 0) for path in roots]
     while pending:
@@ -1008,7 +1013,7 @@ def _assert_private_output_tree_scan(roots: Sequence[Path]) -> None:
             with os.scandir(directory) as entries:
                 for entry in entries:
                     entries_seen += 1
-                    if entries_seen > 65536:
+                    if entries_seen + reserved_entries > 65536:
                         raise RunnerError(
                             "live Codex private output scan entry budget exceeded"
                         )
@@ -1028,6 +1033,46 @@ def _assert_private_output_tree_scan(roots: Sequence[Path]) -> None:
             raise RunnerError("live Codex private output scan unavailable") from exc
 
 
+def _preintent_output_entry_reservation(
+    condition: str, expected_manifest: Mapping[str, Any] | None
+) -> int:
+    """Reserve every known entry added after the clone scan, before intent.
+
+    The final workspace directory replaces the disposable staging directory,
+    so the rename itself does not grow the scan. The answer schema adds one
+    file, and Codex's runtime home adds its parent, session directory, and
+    auth.json. Treatment additionally stages its two proxy source files and
+    the complete, bounded manifest artifact hierarchy in private leaves.
+    Actual artifact paths, not only their count, determine nested directories.
+    """
+    reservation = 4  # answer-schema.json + codex-runtime/session/auth.json
+    if condition == "baseline":
+        return reservation
+    if condition != "treatment" or not isinstance(expected_manifest, Mapping):
+        raise RunnerError("pre-intent manifest binding is missing")
+    manifest = Path(str(expected_manifest.get("path"))).expanduser()
+    current, raw = _runtime_file_snapshot(
+        manifest, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
+    )
+    if canonical(current) != canonical(dict(expected_manifest)):
+        raise RunnerError("pre-intent manifest binding changed")
+    artifacts = _manifest_artifact_paths(manifest, raw)
+    nested_directories: set[tuple[str, ...]] = set()
+    for relative, _candidate, _size, _sha256 in artifacts:
+        # A staged artifact sits beneath state_root/runtime-dir/stage-dir.
+        # More than 31 pathname components creates a parent directory
+        # deeper than the exact post-allocation scan's depth-32 ceiling.
+        if len(relative.parts) > 31:
+            raise RunnerError(
+                "pre-intent manifest artifact tree depth exceeds scan limit"
+            )
+        for depth in range(1, len(relative.parts)):
+            nested_directories.add(relative.parts[:depth])
+    # codex-mcp-proxy-runtime/stage/two files; then
+    # repoground-manifest-runtime/bundle/manifest plus artifacts and parents.
+    return reservation + 4 + 3 + len(artifacts) + len(nested_directories)
+
+
 def validate_live_immutable_mounts(
     *,
     source: Path,
@@ -1040,6 +1085,7 @@ def validate_live_immutable_mounts(
     evidence_root: Path,
     report_root: Path | None = None,
     runtime_binding: Mapping[str, Any] | None = None,
+    pending_output_entries: int = 0,
 ) -> None:
     """Fail closed on writable input or nested mount, without provider/ledger effects."""
     if sys.platform != "linux" or not hasattr(os, "ST_RDONLY"):
@@ -1139,7 +1185,9 @@ def validate_live_immutable_mounts(
         if not writable:
             raise RunnerError(f"live Codex {name} output is read-only")
 
-    _assert_private_output_tree_scan(tuple(outputs.values()))
+    _assert_private_output_tree_scan(
+        tuple(outputs.values()), reserved_entries=pending_output_entries
+    )
 
     source_path = resolved(source, "source")
     git_marker = source_path / ".git"
@@ -2300,7 +2348,7 @@ def create_checkout(
             # Check generated .git objects and the full output tree while only
             # a disposable staging checkout exists. No one-use ID is held yet.
             if preallocate_check is None:
-                _assert_private_output_tree_scan((state_root,))
+                _assert_private_output_tree_scan((state_root,), reserved_entries=1)
             else:
                 preallocate_check()
 
@@ -8016,6 +8064,9 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
     preallocate_check: Callable[[], None] | None = None
     if dispatch_authorization is not None:
         assert codex is not None
+        pending_output_entries = _preintent_output_entry_reservation(
+            str(request["condition"]), dispatch_authorization.get("manifest")
+        )
 
         def check_preallocation_mounts() -> None:
             validate_live_immutable_mounts(
@@ -8032,6 +8083,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 transcript_root=args.transcript_root,
                 evidence_root=args.provider_evidence_root,
                 runtime_binding=dispatch_authorization["binding"],
+                pending_output_entries=pending_output_entries,
             )
 
         preallocate_check = check_preallocation_mounts
