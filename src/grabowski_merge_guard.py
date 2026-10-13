@@ -22,6 +22,8 @@ from grabowski_pr_diff import (
     canonicalize_github_pr_diff_identity,
     github_pr_diff_identity_sha256,
     github_pr_diff_identity_sha256_v1,
+    bound_local_pr_git_diff,
+    BoundLocalDiffError,
 )
 
 
@@ -81,6 +83,76 @@ _MERGE_GUARD_MAX_DIFF_BYTES = 32 * 1024 * 1024
 _MERGE_GUARD_BINARY_DIFF_RE = re.compile(
     rb"(?m)^(?:GIT binary patch|Binary files [^\r\n]+ and [^\r\n]+ differ)\r?$"
 )
+
+def _merge_guard_mbox_patch_matches_diff(
+    patch_bytes: bytes, diff_bytes: bytes, expected_head: str
+) -> bool:
+    """Require mail-wrapped per-commit diffs to equal the live cumulative diff.
+
+    Mail headers and exact terminal format-patch footers may be removed;
+    file hunks, blob identities, and binary payload bytes remain significant.
+    """
+    if (
+        not patch_bytes
+        or not diff_bytes
+        or len(patch_bytes) > _MERGE_GUARD_MAX_DIFF_BYTES
+        or len(diff_bytes) > _MERGE_GUARD_MAX_DIFF_BYTES
+        or _SHA40_RE.fullmatch(expected_head) is None
+    ):
+        return False
+    boundaries = list(re.finditer(
+        rb"(?m)^From (?P<sha>[0-9a-f]{40}) Mon Sep 17 00:00:00 2001\r?$",
+        patch_bytes,
+    ))
+    if (
+        not boundaries
+        or boundaries[0].start() != 0
+        or len(boundaries) > 250
+        or boundaries[-1].group("sha") != expected_head.encode("ascii")
+    ):
+        return False
+    sections: list[bytes] = []
+    for index, boundary in enumerate(boundaries):
+        end = boundaries[index + 1].start() if index + 1 < len(boundaries) else len(patch_bytes)
+        block = patch_bytes[boundary.end() + 1:end]
+        # Parse the mail header up to its first blank line. A standalone
+        # "---" or "diff --git" in the commit message is not a trusted
+        # format-patch delimiter; it must not hide a forged diff.
+        header_end = re.search(rb"\r?\n\r?\n", block)
+        if header_end is None or header_end.start() > 64 * 1024:
+            return False
+        headers = block[:header_end.start()].splitlines()
+        if (
+            not headers
+            or not headers[0].startswith(b"From: ")
+            or not any(line.startswith(b"Subject: ") for line in headers)
+            or any(
+                re.fullmatch(
+                    rb"(?:[A-Za-z0-9-]{1,64}:[^\r\n]*|[ \t][^\r\n]*)",
+                    line,
+                ) is None
+                for line in headers
+            )
+        ):
+            return False
+        body = block[header_end.end():]
+        diff_start = re.search(rb"(?m)^diff --git ", body)
+        if diff_start is None:
+            return False
+        section = body[diff_start.start():]
+        # Git format-patch may append a version trailer after the final hunk.
+        # Only the exact terminal signature is ignored; all patch bytes
+        # otherwise remain significant in the cumulative diff comparison.
+        footer = re.search(
+            rb"(?m)^-- \r?\n[0-9][A-Za-z0-9.+-]{0,127}\r?\n(?:\r?\n)*\Z",
+            section,
+        )
+        if footer is not None:
+            section = section[:footer.start()]
+        sections.append(section.rstrip(b"\n") + b"\n")
+    return b"".join(sections) == diff_bytes.rstrip(b"\n") + b"\n"
+
+
 _MERGE_GUARD_REPLAY_PARAMETERS = frozenset({"merge_lease_snapshot", "merge_guard_receipt"})
 _CODEX_REVIEW_ACTORS = frozenset({
     "chatgpt-codex-connector",
@@ -1289,8 +1361,10 @@ def _merge_guard_git_environment() -> dict[str, str]:
         "HOME": str(Path.home()),
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_ATTR_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
         "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": "/dev/null",
         "GIT_TERMINAL_PROMPT": "0",
         "LC_ALL": "C",
     }
@@ -1351,6 +1425,22 @@ def _merge_guard_commit_probe(
     return result["returncode"] == 0, info
 
 
+def _merge_guard_shallow_state(repo_path: Path) -> tuple[bool | None, list[str]]:
+    """Probe full-history availability using the same isolated Git environment."""
+    try:
+        result = _merge_guard_local_git_bytes(
+            repo_path, ["rev-parse", "--is-shallow-repository"]
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, [f"merge_guard_shallow_probe_exception:{type(exc).__name__}"]
+    if result["returncode"] != 0:
+        return None, ["merge_guard_shallow_probe_failed"]
+    value = result["stdout_bytes"].strip()
+    if value not in {b"true", b"false"}:
+        return None, ["merge_guard_shallow_probe_invalid"]
+    return value == b"true", []
+
+
 def _merge_guard_ensure_pr_objects(
     repo_path: Path,
     *,
@@ -1382,7 +1472,13 @@ def _merge_guard_ensure_pr_objects(
     base_present, base_probe = _merge_guard_commit_probe(repo_path, base_sha)
     head_present, head_probe = _merge_guard_commit_probe(repo_path, head_sha)
     receipt["before"] = {"base": base_probe, "head": head_probe}
-    if base_present and head_present:
+    shallow_before, shallow_errors = _merge_guard_shallow_state(repo_path)
+    if shallow_errors:
+        return receipt, shallow_errors
+    receipt["shallow_before"] = shallow_before
+    receipt["unshallow_attempted"] = bool(shallow_before)
+    if base_present and head_present and not shallow_before:
+        receipt["shallow_after"] = False
         receipt["available"] = True
         return receipt, []
 
@@ -1396,6 +1492,7 @@ def _merge_guard_ensure_pr_objects(
         "-c",
         "protocol.file.allow=never",
         "fetch",
+        *(["--unshallow"] if shallow_before else []),
         "--no-tags",
         "--no-write-fetch-head",
         "--no-recurse-submodules",
@@ -1421,6 +1518,13 @@ def _merge_guard_ensure_pr_objects(
     if fetched["returncode"] != 0:
         return receipt, ["merge_guard_pr_object_fetch_failed"]
 
+    shallow_after, shallow_errors = _merge_guard_shallow_state(repo_path)
+    receipt["shallow_after"] = shallow_after
+    if shallow_errors:
+        return receipt, shallow_errors
+    if shallow_after:
+        return receipt, ["merge_guard_pr_history_still_shallow_after_fetch"]
+
     base_present, base_probe = _merge_guard_commit_probe(repo_path, base_sha)
     head_present, head_probe = _merge_guard_commit_probe(repo_path, head_sha)
     receipt["after"] = {"base": base_probe, "head": head_probe}
@@ -1435,6 +1539,26 @@ def _merge_guard_ensure_pr_objects(
 
 def _merge_guard_diff_contains_binary_metadata(diff_bytes: bytes) -> bool:
     return _MERGE_GUARD_BINARY_DIFF_RE.search(diff_bytes) is not None
+
+
+def _merge_guard_unique_merge_base(
+    repo_path: Path, *, base_sha: str, head_sha: str
+) -> tuple[str | None, list[str]]:
+    """Bind the local PR diff to its unique GitHub-compatible merge base."""
+    try:
+        result = _merge_guard_local_git_bytes(
+            repo_path, ["merge-base", "--all", base_sha, head_sha]
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, [f"merge_guard_local_merge_base_exception:{type(exc).__name__}"]
+    if result["returncode"] != 0:
+        return None, ["merge_guard_local_merge_base_failed"]
+    values = result["stdout_bytes"].splitlines()
+    if len(values) != 1 or _SHA40_RE.fullmatch(
+        values[0].decode("ascii", errors="replace")
+    ) is None:
+        return None, ["merge_guard_local_merge_base_missing_or_ambiguous"]
+    return values[0].decode("ascii"), []
 
 
 def _merge_guard_local_changed_paths(
@@ -1452,6 +1576,12 @@ def _merge_guard_local_changed_paths(
         or _SHA40_RE.fullmatch(head_sha) is None
     ):
         return [], info, ["merge_guard_local_changed_paths_revision_invalid"]
+    merge_base, merge_base_errors = _merge_guard_unique_merge_base(
+        repo_path, base_sha=base_sha, head_sha=head_sha
+    )
+    if merge_base_errors or merge_base is None:
+        return [], info, merge_base_errors
+    info["merge_base_sha"] = merge_base
     try:
         result = _merge_guard_local_git_bytes(
             repo_path,
@@ -1462,7 +1592,8 @@ def _merge_guard_local_changed_paths(
                 "--no-ext-diff",
                 "--no-textconv",
                 "--no-renames",
-                base_sha,
+                "--ignore-submodules=none",
+                merge_base,
                 head_sha,
                 "--",
             ],
@@ -1524,24 +1655,21 @@ def _merge_guard_local_diff_bytes(
         or _SHA40_RE.fullmatch(head_sha) is None
     ):
         return b"", info, ["merge_guard_local_diff_revision_invalid"]
+    merge_base, merge_base_errors = _merge_guard_unique_merge_base(
+        repo_path, base_sha=base_sha, head_sha=head_sha
+    )
+    if merge_base_errors or merge_base is None:
+        return b"", info, merge_base_errors
+    info["merge_base_sha"] = merge_base
     try:
-        result = _merge_guard_local_git_bytes(
-            repo_path,
-            [
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-renames",
-                "--no-color",
-                base_sha,
-                head_sha,
-                "--",
-            ],
-            timeout=60,
+        bounded = bound_local_pr_git_diff(
+            repo_path, merge_base=merge_base, head=head_sha,
+            timeout=60, max_diff_bytes=_MERGE_GUARD_MAX_DIFF_BYTES,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, BoundLocalDiffError) as exc:
         info["error_class"] = type(exc).__name__
         return b"", info, [f"merge_guard_local_diff_exception:{type(exc).__name__}"]
+    result = {"returncode": 0, "stdout_bytes": bounded, "stderr_bytes": b""}
     stdout = result["stdout_bytes"]
     stderr = result["stderr_bytes"]
     info.update(
@@ -1571,16 +1699,148 @@ def _merge_guard_local_diff_bytes(
     return stdout, info, []
 
 
+def _merge_guard_legacy_local_review_diff_identity(
+    repo_path: Path,
+    *,
+    base_sha: str,
+    head_sha: str,
+    expected_sha256: str,
+    provider_diff: bytes,
+    changed_paths: list[str],
+) -> tuple[bool, dict[str, Any]]:
+    """Prove that a legacy raw committed Git review diff equals live GitHub hunks.
+
+    Legacy reviewers hash the exact binary no-external-diff committed diff,
+    not GitHub's canonical representation. Accept only identical canonical
+    hunks and changed paths at the exact bound Git commit pair.
+    """
+    evidence: dict[str, Any] = {
+        "source": "exact-local-committed-review-diff",
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "status": "not_proven",
+    }
+    if (
+        not isinstance(provider_diff, bytes)
+        or not provider_diff
+        or len(provider_diff) > _MERGE_GUARD_MAX_DIFF_BYTES
+        or not isinstance(base_sha, str)
+        or not isinstance(head_sha, str)
+        or not isinstance(expected_sha256, str)
+        or _SHA40_RE.fullmatch(base_sha) is None
+        or _SHA40_RE.fullmatch(head_sha) is None
+        or _SHA256_RE.fullmatch(expected_sha256) is None
+        or not changed_paths
+        or len(changed_paths) > _MERGE_GUARD_MAX_CHANGED_PATHS
+        or _merge_guard_diff_contains_binary_metadata(provider_diff)
+    ):
+        evidence["reason"] = "invalid_or_unsupported_input"
+        return False, evidence
+
+    for label, sha in (("base", base_sha), ("head", head_sha)):
+        available, probe = _merge_guard_commit_probe(repo_path, sha)
+        evidence[f"{label}_object"] = probe
+        if not available:
+            evidence["reason"] = f"{label}_commit_object_missing"
+            return False, evidence
+
+    try:
+        merge_base_result = _merge_guard_local_git_bytes(
+            repo_path, ["merge-base", "--all", base_sha, head_sha]
+        )
+        merge_bases = merge_base_result["stdout_bytes"].splitlines()
+        # The review runner uses BASE...HEAD. Do not require BASE itself
+        # to be an ancestor: GitHub PR heads normally diverge from main.
+        # Multiple merge bases are ambiguous; fail closed rather than
+        # guessing which tree to compare with the exact reviewed patch.
+        if merge_base_result["returncode"] != 0 or len(merge_bases) != 1:
+            evidence["reason"] = "unique_merge_base_unavailable"
+            return False, evidence
+        try:
+            common_ancestor = merge_bases[0].decode("ascii")
+        except UnicodeDecodeError:
+            evidence["reason"] = "unique_merge_base_invalid"
+            return False, evidence
+        if _SHA40_RE.fullmatch(common_ancestor) is None:
+            evidence["reason"] = "unique_merge_base_invalid"
+            return False, evidence
+        evidence["common_ancestor_sha"] = common_ancestor
+        evidence["base_is_ancestor"] = common_ancestor == base_sha
+
+        local_paths, path_receipt, path_errors = _merge_guard_local_changed_paths(
+            repo_path, base_sha=common_ancestor, head_sha=head_sha
+        )
+        evidence["local_paths"] = path_receipt
+        evidence["changed_paths_match"] = not path_errors and local_paths == changed_paths
+        if not evidence["changed_paths_match"]:
+            evidence["reason"] = "changed_paths_mismatch"
+            return False, evidence
+
+        local_result = _merge_guard_local_git_bytes(
+            repo_path,
+            # Historic review receipts hash the default 3-context Git diff.
+            # Pin it explicitly: repository diff.context must not change the proof.
+            # Keep the original default Git review-byte format despite later
+            # local config changes. Full-index would invalidate signed receipts.
+            [
+                "-c", "diff.noprefix=false", "-c", "core.abbrev=auto",
+                "diff", "--binary", "--no-ext-diff", "--no-textconv",
+                "--no-color", "--unified=3", f"{base_sha}...{head_sha}",
+            ],
+            timeout=60,
+        )
+        local_diff = local_result["stdout_bytes"]
+        if (
+            local_result["returncode"] != 0
+            or not local_diff
+            or len(local_diff) > _MERGE_GUARD_MAX_DIFF_BYTES
+            or _merge_guard_diff_contains_binary_metadata(local_diff)
+        ):
+            evidence["reason"] = "local_diff_unavailable_or_unsupported"
+            return False, evidence
+
+        local_digest = hashlib.sha256(local_diff).hexdigest()
+        local_canonical_digest = github_pr_diff_identity_sha256(local_diff)
+        provider_canonical_digest = github_pr_diff_identity_sha256(provider_diff)
+        evidence.update({
+            "local_raw_sha256": local_digest,
+            "local_canonical_sha256": local_canonical_digest,
+            "provider_canonical_sha256": provider_canonical_digest,
+            "local_diff_bytes": len(local_diff),
+            "raw_digest_matches_review": local_digest == expected_sha256,
+            "canonical_hunks_match": local_canonical_digest == provider_canonical_digest,
+        })
+        if local_digest != expected_sha256 or local_canonical_digest != provider_canonical_digest:
+            evidence["reason"] = "review_digest_or_canonical_hunks_mismatch"
+            return False, evidence
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+        evidence["reason"] = f"local_evidence_unavailable:{type(exc).__name__}"
+        return False, evidence
+    evidence["status"] = "proven"
+    return True, evidence
+
+
 def _merge_guard_github_diff_too_large(
     info: dict[str, Any], *, changed_files: int
 ) -> bool:
-    if changed_files <= _MERGE_GUARD_GITHUB_DIFF_MAX_FILES or info.get("returncode") == 0:
+    if type(changed_files) is not int or changed_files < 0 or info.get("returncode") == 0:
         return False
     message = f"{info.get('stderr', '')}\n{info.get('stdout', '')}"
-    return (
+    if "HTTP 406" not in message or any(
+        marker in message for marker in ("HTTP 401", "HTTP 403", "HTTP 429")
+    ):
+        return False
+    # REST gh CLI 20k-line errors omit GraphQL's PullRequest.diff marker.
+    # Accept only the exact HTTP 406 line-limit diagnostic, not generic 406s.
+    line_limit = re.search(
+        r"HTTP 406: (?:Sorry, )?the diff exceeded the maximum number of lines \(20000\)",
+        message,
+    ) is not None
+    file_limit = changed_files > _MERGE_GUARD_GITHUB_DIFF_MAX_FILES and (
         "PullRequest.diff too_large" in message
         or "diff exceeded the maximum number of files" in message
     )
+    return line_limit or file_limit
 
 
 def _merge_guard_github_file_records(
@@ -5068,6 +5328,66 @@ class CaptainMergeGuardRunner:
         else:
             binding_diff_sha256 = canonical_live_diff_sha256
             diff_identity_mode = "unmatched"
+        # A completed independent review may bind GitHub's per-commit
+        # "--patch" mbox instead of the default cumulative PR diff. Admit
+        # its digest only after proving byte-for-byte equivalent file hunks
+        # against the live default diff at this exact head/base.
+        patch_diff_sha256 = None
+        if diff_identity_mode == "unmatched" and provider_raw_identity_available:
+            patch_args = [*diff_args, "--patch"]
+            try:
+                patch_raw = self.github_runner(self.repo_path, patch_args)
+                patch_info = _merge_guard_result_info(patch_raw)
+                patch_stdout = (
+                    patch_info["stdout_bytes"]
+                    if isinstance(patch_info.get("stdout_bytes"), bytes)
+                    else patch_info["stdout"].encode("utf-8")
+                )
+                patch_proven_equivalent = (
+                    patch_info["returncode"] == 0
+                    and _merge_guard_mbox_patch_matches_diff(
+                        patch_stdout, raw_live_diff_bytes, expected_head
+                    )
+                )
+                patch_digest = (
+                    github_pr_diff_identity_sha256(patch_stdout)
+                    if patch_info["returncode"] == 0
+                    and len(patch_stdout) <= _MERGE_GUARD_MAX_DIFF_BYTES
+                    else None
+                )
+                self.receipt["live_patch_diff"] = {
+                    "command": ["gh", *patch_args],
+                    "returncode": patch_info["returncode"],
+                    "stdout_sha256": hashlib.sha256(patch_stdout).hexdigest(),
+                    "canonical_sha256": patch_digest,
+                    "proven_equivalent": patch_proven_equivalent,
+                }
+                if patch_proven_equivalent:
+                    patch_diff_sha256 = patch_digest
+                    if expected_diff == patch_digest:
+                        binding_diff_sha256 = patch_digest
+                        diff_identity_mode = "mbox-patch-proven-equivalent"
+            except Exception as exc:
+                self.receipt["live_patch_diff"] = {
+                    "command": ["gh", *patch_args],
+                    "error": f"{type(exc).__name__}",
+                    "proven_equivalent": False,
+                }
+        # Legacy immutable reviewers may bind raw local Git diff bytes, not
+        # GitHub's rendering. Admit them only after exact local/remote proof.
+        if diff_identity_mode == "unmatched" and provider_raw_identity_available:
+            local_equivalent, local_evidence = _merge_guard_legacy_local_review_diff_identity(
+                self.repo_path,
+                base_sha=base_sha,
+                head_sha=expected_head,
+                expected_sha256=expected_diff,
+                provider_diff=raw_live_diff_bytes,
+                changed_paths=changed_paths,
+            )
+            self.receipt["local_review_diff_equivalence"] = local_evidence
+            if local_equivalent:
+                binding_diff_sha256 = expected_diff
+                diff_identity_mode = "local-review-diff-proven-equivalent"
         diff_canonicalization = diff_source
         if live_diff_bytes != raw_live_diff_bytes:
             diff_canonicalization += "+" + GITHUB_PR_DIFF_IDENTITY_CANONICALIZATION
@@ -5106,6 +5426,7 @@ class CaptainMergeGuardRunner:
             "canonical_diff_sha256": canonical_live_diff_sha256,
             "previous_canonical_diff_sha256": previous_canonical_live_diff_sha256,
             "raw_diff_sha256": raw_live_diff_sha256,
+            "patch_diff_sha256": patch_diff_sha256,
             "diff_identity_mode": diff_identity_mode,
             "execution_intent_sha256": self.execution_intent_sha256,
             "changed_paths": changed_paths,

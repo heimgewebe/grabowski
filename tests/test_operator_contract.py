@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -3052,6 +3053,108 @@ class OperatorContractTests(unittest.TestCase):
                 job["scope"]["started_at_unix_ns"],
             )
 
+    def test_v2_job_start_rejects_invalid_real_git_before_attempt_registration(self) -> None:
+        """The public job launcher must reject bad role bindings before recording an attempt."""
+        import grabowski_agent_role as agent_role
+
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repository"
+            repo.mkdir()
+            state = root / "state"
+            jobs = state / "jobs"
+            locks = state / "decision-review-locks"
+
+            def git(*arguments: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *arguments],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.name", "Review Test")
+            git("config", "user.email", "review-test@example.invalid")
+            (repo / "source.py").write_text("before\n", encoding="utf-8")
+            git("add", "source.py")
+            git("commit", "-qm", "base")
+            base = git("rev-parse", "HEAD")
+            (repo / "source.py").write_text("after\n", encoding="utf-8")
+            git("add", "source.py")
+            git("commit", "-qm", "head")
+            head = git("rev-parse", "HEAD")
+            actual_head, workspace_sha, dirty = agent_role.current_binding(repo, base)
+            raw_sha = hashlib.sha256(agent_role.committed_diff(repo, base, head)).hexdigest()
+            self.assertEqual(actual_head, head)
+            self.assertFalse(dirty)
+            self.assertNotEqual(raw_sha, workspace_sha)
+
+            binding = {
+                "schema_version": 1,
+                "kind": operator.decision_reviews.BINDING_KIND,
+                "repo": "heimgewebe/grabowski",
+                "pr": 1444,
+                "head_sha": head,
+                "base_sha": base,
+                "diff_sha256": "f" * 64,
+                "slot": "independent-gemini",
+            }
+            argv = [
+                operator.decision_reviews.REVIEW_ROLE_PYTHON,
+                "-I", "-m", operator.decision_reviews.REVIEW_ROLE_MODULE,
+                "--role", "review",
+                "--repository", str(repo),
+                "--expected-head", head,
+                "--expected-base-head", base,
+                "--expected-diff-sha256", workspace_sha,
+                "--expected-dirty", "false",
+                "--output", str(root / "unused-output.json"),
+                "--", "agy", "--model", "gemini-3.1-pro-high",
+                "Review the bound immutable committed diff",
+            ]
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(
+                operator.decision_reviews, "LOCKS_ROOT", locks
+            ), patch.object(
+                operator, "_run", side_effect=AssertionError("provider launch forbidden")
+            ) as launch:
+                def rejected(fingerprint: str, *, unavailable: bool = False) -> None:
+                    command = list(argv)
+                    command[command.index("--expected-diff-sha256") + 1] = fingerprint
+                    if unavailable:
+                        with patch(
+                            "grabowski_agent_role.current_binding",
+                            side_effect=RuntimeError("Git readback unavailable"),
+                        ):
+                            with self.assertRaisesRegex(ValueError, "prelaunch.*unavailable"):
+                                operator.grabowski_job_start(
+                                    command, cwd=str(repo), runtime_seconds=60,
+                                    decision_review_binding=binding,
+                                )
+                    else:
+                        with self.assertRaisesRegex(ValueError, "prelaunch.*identity"):
+                            operator.grabowski_job_start(
+                                command, cwd=str(repo), runtime_seconds=60,
+                                decision_review_binding=binding,
+                            )
+                    # The coordination lock is legitimate, but a decision
+                    # attempt must not acquire a job origin/order/role receipt.
+                    self.assertFalse(list(jobs.glob("grabowski-job-*/metadata.json")))
+                    self.assertFalse(list(jobs.glob("grabowski-job-*/review-role-attempt.json")))
+                    self.assertFalse(list((state / "decision-review-order").glob("*.json")))
+                    launch.assert_not_called()
+
+                rejected(raw_sha)  # A raw committed Git diff is not the role fingerprint.
+                (repo / "untracked.txt").write_text("dirty", encoding="utf-8")
+                rejected(workspace_sha)
+                (repo / "untracked.txt").unlink()
+                (repo / "source.py").write_text("newer\n", encoding="utf-8")
+                git("add", "source.py")
+                git("commit", "-qm", "new head")
+                rejected(workspace_sha)
+                rejected(workspace_sha, unavailable=True)
+
     def test_job_start_origin_binds_server_derived_independent_reviewer_provenance(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -3122,9 +3225,10 @@ class OperatorContractTests(unittest.TestCase):
                 operator, "JOBS_DIR", jobs
             ), patch.object(
                 operator.decision_reviews, "LOCKS_ROOT", locks
-            ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
-                operator, "_run", return_value=launcher
-            ):
+            ), patch("grabowski_agent_role.current_binding",
+                     return_value=("a" * 40, "e" * 64, False)), patch.object(
+                operator.uuid, "uuid4", return_value=fake_uuid
+            ), patch.object(operator, "_run", return_value=launcher) as run_mock:
                 job = operator.grabowski_job_start(
                     argv,
                     cwd=str(cwd),
@@ -3133,6 +3237,17 @@ class OperatorContractTests(unittest.TestCase):
                 )
 
             provenance = job["scope"]["decision_review_provenance"]
+            expected_path = jobs / job["unit"] / operator.decision_reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+            self.assertEqual(provenance["schema_version"], 2)
+            self.assertEqual(job["scope"]["decision_review_attempt_epoch"], 2)
+            self.assertEqual(provenance["attempt_unit"], job["unit"])
+            self.assertEqual(provenance["role_receipt_path"], str(expected_path))
+            self.assertNotEqual(provenance["role_receipt_path"], str(output))
+            self.assertEqual(job["argv"][job["argv"].index("--output") + 1], str(expected_path))
+            self.assertIn(
+                f"--setenv=GRABOWSKI_REVIEW_ATTEMPT_UNIT={job['unit']}",
+                run_mock.call_args.args[0],
+            )
             self.assertEqual(provenance["kind"], "grabowski_decision_review_provenance")
             self.assertEqual(provenance["role"], "review")
             self.assertEqual(
@@ -3156,6 +3271,121 @@ class OperatorContractTests(unittest.TestCase):
                 provenance,
                 persisted["origin"]["scope"]["decision_review_provenance"],
             )
+
+
+    def test_two_review_jobs_with_one_supplied_output_get_distinct_receipts(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            jobs = state / "jobs"
+            locks = state / "decision-review-locks"
+            cwd = root / "cwd"
+            cwd.mkdir(mode=0o700)
+            binding = {
+                "schema_version": 1,
+                "kind": operator.decision_reviews.BINDING_KIND,
+                "repo": "heimgewebe/vibe-lab",
+                "pr": 350,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+                "diff_sha256": "c" * 64,
+                "slot": "independent-grok-review",
+            }
+            argv = [
+                operator.decision_reviews.REVIEW_ROLE_PYTHON,
+                "-I", "-m", operator.decision_reviews.REVIEW_ROLE_MODULE,
+                "--role", "review", "--repository", str(cwd),
+                "--expected-head", "a" * 40, "--expected-base-head", "b" * 40,
+                "--expected-diff-sha256", "e" * 64,
+                "--expected-dirty", "false",
+                "--output", str(root / "shared-legacy-output.json"),
+                "--", "grok", "--model", "grok-4.6", "Review frozen revision",
+            ]
+            launched = {
+                "returncode": 0,
+                "stdout": "started",
+                "stderr": "",
+                "argv": [],
+                "argv_sha256": "0" * 64,
+                "command": "systemd-run",
+                "cwd": str(root),
+                "timed_out": False,
+                "duration_seconds": 0.01,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+            counter = iter(range(1, 100))
+            def next_uuid():
+                return types.SimpleNamespace(hex=f"{next(counter):012x}" + ("f" * 20))
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator.decision_reviews, "LOCKS_ROOT", locks), patch(
+                "grabowski_agent_role.current_binding",
+                return_value=("a" * 40, "e" * 64, False),
+            ), patch.object(
+                operator.uuid, "uuid4", side_effect=next_uuid
+            ), patch.object(operator, "_run", return_value=launched):
+                first = operator.grabowski_job_start(
+                    argv, cwd=str(cwd), runtime_seconds=60, decision_review_binding=binding
+                )
+                second = operator.grabowski_job_start(
+                    argv, cwd=str(cwd), runtime_seconds=60, decision_review_binding=binding
+                )
+            self.assertNotEqual(first["unit"], second["unit"])
+            self.assertNotEqual(first["origin_sha256"], second["origin_sha256"])
+            self.assertNotEqual(
+                first["scope"]["decision_review_provenance"]["role_receipt_path"],
+                second["scope"]["decision_review_provenance"]["role_receipt_path"],
+            )
+            for job in (first, second):
+                path = jobs / job["unit"] / operator.decision_reviews.REVIEW_ROLE_ATTEMPT_RECEIPT_NAME
+                self.assertEqual(
+                    job["scope"]["decision_review_provenance"]["role_receipt_path"], str(path)
+                )
+                self.assertEqual(job["argv"][job["argv"].index("--output") + 1], str(path))
+                self.assertEqual(job["scope"]["decision_review_provenance"]["attempt_unit"], job["unit"])
+                persisted = json.loads(Path(job["metadata_path"]).read_text(encoding="utf-8"))
+                self.assertEqual(persisted["origin_sha256"], job["origin_sha256"])
+
+
+    def test_noncanonical_review_module_cannot_create_job_directory(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state, jobs, cwd = root / "state", root / "state/jobs", root / "cwd"
+            cwd.mkdir(mode=0o700)
+            binding = {
+                "schema_version": 1,
+                "kind": operator.decision_reviews.BINDING_KIND,
+                "repo": "heimgewebe/vibe-lab",
+                "pr": 350,
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
+                "diff_sha256": "c" * 64,
+                "slot": "independent-reviewer",
+            }
+            alternate = [
+                "/opt/immutable-release/.venv/bin/python",
+                "-I", "-m", "grabowski_agent_role",
+                "--role", "review", "--output", str(root / "shared.json"),
+            ]
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(
+                operator, "_validate_argv", return_value=alternate
+            ), patch.object(
+                operator.uuid, "uuid4",
+                return_value=types.SimpleNamespace(hex="a11111111111" + "f" * 20),
+            ), patch.object(
+                operator, "_run", side_effect=AssertionError("must not launch")
+            ):
+                with self.assertRaisesRegex(ValueError, "noncanonical"):
+                    operator._start_job(
+                        alternate, cwd=str(cwd), runtime_seconds=60,
+                        decision_review_binding=binding,
+                    )
+            self.assertEqual(list(jobs.glob("grabowski-job-*")), [])
 
     def test_broad_github_wrapper_blocks_merge_bypass_paths(self) -> None:
         operator = _load_operator_module()

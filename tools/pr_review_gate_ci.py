@@ -14,6 +14,17 @@ import sys
 import tempfile
 from typing import Any, Callable
 
+# Run against trusted default-branch evaluator code, never a PR checkout.
+_MODULE_SRC = Path(__file__).resolve().parents[1] / "src"
+if str(_MODULE_SRC) not in sys.path:
+    sys.path.insert(0, str(_MODULE_SRC))
+from grabowski_pr_diff import (  # noqa: E402
+    BoundLocalDiffError,
+    _bounded_git_capture,
+    bound_local_pr_git_diff,
+    local_pr_git_environment,
+)
+
 try:
     import pr_review_gate as gate
     import review_evidence_schemas as evidence_schemas
@@ -650,15 +661,205 @@ def load_live_pr(repo_name: str, pr_number: int) -> dict[str, Any]:
     )
 
 
-def current_diff_sha256s(repo_name: str, pr_number: int) -> tuple[str, ...]:
-    diff = _run_bytes(["gh", "pr", "diff", str(pr_number), "--repo", repo_name])
-    return tuple(
-        dict.fromkeys(
-            (
-                gate.github_pr_diff_identity_sha256(diff),
-                gate.github_pr_diff_identity_sha256_v1(diff),
-            )
+def _known_pr_diff_limit_error(message: str, *, changed_files: Any) -> bool:
+    """Only GitHub's known 406 line/file limit can use local identity."""
+    if type(changed_files) is not int or changed_files < 0:
+        return False
+    if "HTTP 406" not in message or any(
+        marker in message for marker in ("HTTP 401", "HTTP 403", "HTTP 429")
+    ):
+        return False
+    line_cap = re.search(
+        r"HTTP 406: (?:Sorry, )?the diff exceeded the maximum number of lines \(20000\)",
+        message,
+    ) is not None
+    file_cap = changed_files > gate.GITHUB_PR_DIFF_MAX_FILES and any(
+        (marker.decode("utf-8") if isinstance(marker, bytes) else marker) in message
+        for marker in gate.GITHUB_PR_DIFF_TOO_LARGE_MARKERS
+    )
+    return line_cap or file_cap
+
+
+def _trusted_revision_git(repo: Path, *argv: str, limit: int = 1024 * 1024) -> bytes:
+    """Read pinned Git objects with no inherited config, helpers or subprocess hooks."""
+    try:
+        return _bounded_git_capture(
+            ["git", "-C", str(repo), "-c", "core.pager=cat", *argv],
+            cwd=str(repo),
+            env=local_pr_git_environment(),
+            stdout_limit=limit,
+            timeout=COMMAND_TIMEOUT_SECONDS,
         )
+    except (OSError, BoundLocalDiffError, subprocess.SubprocessError) as exc:
+        raise CiEvidenceError("exact local PR object check unavailable") from exc
+
+
+def _fetch_exact_review_objects(
+    repo: Path, repo_name: str, pr_number: int,
+    *, base: str, head: str, base_ref: str,
+) -> None:
+    """Import only SHA-checkable remote Git objects into the trusted checkout."""
+    if (
+        _normalize_repo(repo_name) != repo_name
+        or not isinstance(base_ref, str)
+        or not base_ref or len(base_ref) > 256
+    ):
+        raise CiEvidenceError("untrusted PR Git ref")
+    _trusted_revision_git(repo, "check-ref-format", f"refs/heads/{base_ref}", limit=8192)
+    token = os.environ.get("GH_TOKEN")
+    if not token:
+        raise CiEvidenceError("GitHub token unavailable for pinned PR objects")
+    env = local_pr_git_environment()
+    env["GH_TOKEN"] = token
+    remote = f"https://github.com/{repo_name}.git"
+    args = [
+        "git", "-C", str(repo),
+        "-c", "protocol.file.allow=never",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "credential.helper=",
+        "-c", "credential.helper=!gh auth git-credential",
+        "fetch", "--no-tags", "--no-write-fetch-head",
+        "--no-recurse-submodules", "--",
+        remote,
+        f"refs/heads/{base_ref}:refs/review-evidence/base",
+        f"refs/pull/{pr_number}/head:refs/review-evidence/head",
+    ]
+    try:
+        _bounded_git_capture(
+            args, cwd=str(repo), env=env, stdout_limit=8192, timeout=75,
+        )
+    except (BoundLocalDiffError, OSError, subprocess.SubprocessError) as exc:
+        raise CiEvidenceError("cannot fetch exact GitHub PR objects") from exc
+    current_head = _trusted_revision_git(
+        repo, "rev-parse", "refs/review-evidence/head", limit=8192
+    ).strip()
+    if current_head != head.encode("ascii"):
+        raise CiEvidenceError("fetched PR head is not the pinned head")
+    _trusted_revision_git(
+        repo, "merge-base", "--is-ancestor", base,
+        "refs/review-evidence/base", limit=8192,
+    )
+
+
+def _bound_oversized_diff(repo_name: str, pr_number: int) -> bytes:
+    """Prove a complete provider-sized diff from immutable PR commits.
+
+    Only runs on the *trusted* default-branch checkout prepared by the
+    issue_comment workflow. No PR file is checked out or executed.
+    """
+    pr = load_live_pr(repo_name, pr_number)
+    base = _normalize_git_sha(pr.get("baseRefOid"))
+    head = _normalize_git_sha(pr.get("headRefOid"))
+    count = pr.get("changedFiles")
+    if (
+        pr.get("state") != "OPEN"
+        or base is None or head is None
+        or type(count) is not int or not 0 < count <= 3000
+    ):
+        raise CiEvidenceError("local PR fallback requires exact open head/base and file count")
+    repo = Path.cwd().resolve()
+    if _trusted_revision_git(repo, "rev-parse", "--is-shallow-repository").strip() != b"false":
+        raise CiEvidenceError("local PR fallback requires complete Git history")
+    try:
+        _trusted_revision_git(repo, "cat-file", "-e", f"{base}^{{commit}}", limit=8192)
+        _trusted_revision_git(repo, "cat-file", "-e", f"{head}^{{commit}}", limit=8192)
+    except CiEvidenceError:
+        _fetch_exact_review_objects(
+            repo, repo_name, pr_number, base=base, head=head,
+            base_ref=pr.get("baseRefName"),
+        )
+        _trusted_revision_git(repo, "cat-file", "-e", f"{base}^{{commit}}", limit=8192)
+        _trusted_revision_git(repo, "cat-file", "-e", f"{head}^{{commit}}", limit=8192)
+    merge_bases = _trusted_revision_git(
+        repo, "merge-base", "--all", base, head, limit=8192
+    ).splitlines()
+    if len(merge_bases) != 1 or GIT_SHA_RE.fullmatch(
+        merge_bases[0].decode("ascii", errors="replace")
+    ) is None:
+        raise CiEvidenceError("local PR fallback requires exactly one merge base")
+    merge_base = merge_bases[0].decode("ascii")
+
+    try:
+        rest_files = gate._load_pull_file_evidence(
+            repo, repo_slug=repo_name, pr=pr_number
+        )
+        expected = gate._complete_pr_diff_paths({
+            "pullFilesEvidenceComplete": True, "files": rest_files
+        })
+    except (RuntimeError, ValueError) as exc:
+        raise CiEvidenceError("complete GitHub file evidence unavailable") from exc
+    if (
+        not isinstance(rest_files, list)
+        or len(rest_files) != count
+        or expected is None
+    ):
+        raise CiEvidenceError("GitHub file evidence does not cover the complete PR")
+    gh_files = pr.get("files")
+    # gh pr view may cap this snapshot at 100; compare only when complete.
+    if isinstance(gh_files, list) and len(gh_files) == count:
+        graphql_paths = [item.get("path") for item in gh_files if isinstance(item, dict)]
+        rest_paths = [item.get("path") for item in rest_files]
+        if len(graphql_paths) != count or sorted(graphql_paths) != sorted(rest_paths):
+            raise CiEvidenceError("GitHub REST and GraphQL file evidence drifted")
+
+    names = _trusted_revision_git(
+        repo, "diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv",
+        "--no-renames", "--ignore-submodules=none", "--no-color",
+        merge_base, head, "--",
+    )
+    try:
+        actual = sorted(name.decode("utf-8") for name in names.split(b"\0") if name)
+    except UnicodeDecodeError as exc:
+        raise CiEvidenceError("local PR fallback has non-UTF8 paths") from exc
+    if len(actual) != len(set(actual)) or actual != expected:
+        raise CiEvidenceError("local and GitHub changed paths or modes disagree")
+    try:
+        diff = bound_local_pr_git_diff(
+            repo, merge_base=merge_base, head=head,
+            max_diff_bytes=32 * 1024 * 1024,
+        )
+    except (BoundLocalDiffError, OSError, subprocess.SubprocessError) as exc:
+        raise CiEvidenceError("trusted local PR diff could not be proven") from exc
+    if not diff:
+        raise CiEvidenceError("trusted local PR diff is empty")
+    updated = load_live_pr(repo_name, pr_number)
+    if any(updated.get(key) != pr.get(key) for key in (
+        "headRefOid", "baseRefOid", "changedFiles", "state"
+    )):
+        raise CiEvidenceError("PR changed during local diff readback")
+    return diff
+
+
+def current_diff_sha256s(repo_name: str, pr_number: int) -> tuple[str, ...]:
+    try:
+        diff = _run_bytes(["gh", "pr", "diff", str(pr_number), "--repo", repo_name])
+    except CiEvidenceError as exc:
+        # Even the metadata read is conditional on a plausible GitHub 406.
+        # No fallback, extra API traffic or trust downgrade for arbitrary errors.
+        message = str(exc)
+        if (
+            "HTTP 406" not in message
+            or any(code in message for code in ("HTTP 401", "HTTP 403", "HTTP 429"))
+            or "the diff exceeded the maximum number of lines (20000)" not in message
+            and not any(
+                (m.decode("utf-8") if isinstance(m, bytes) else m) in message
+                for m in gate.GITHUB_PR_DIFF_TOO_LARGE_MARKERS
+            )
+        ):
+            raise
+        view = load_live_pr(repo_name, pr_number)
+        if not _known_pr_diff_limit_error(
+            str(exc), changed_files=view.get("changedFiles")
+        ):
+            raise
+        diff = _bound_oversized_diff(repo_name, pr_number)
+    if not diff:
+        raise CiEvidenceError("current PR diff is empty")
+    return tuple(
+        dict.fromkeys((
+            gate.github_pr_diff_identity_sha256(diff),
+            gate.github_pr_diff_identity_sha256_v1(diff),
+        ))
     )
 
 

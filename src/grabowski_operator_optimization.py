@@ -105,6 +105,24 @@ def _safe_call(
     return payload
 
 
+def _runtime_integrity_diagnostic() -> dict[str, Any]:
+    """Read explicit integrity diagnosis, never substitute dispatch liveness."""
+    base = importlib.import_module("grabowski_mcp")
+    status = base.grabowski_status(view="minimal")
+    if not isinstance(status, dict) or type(status.get("healthy")) is not bool:
+        raise ValueError("runtime integrity diagnostic returned an invalid status")
+    runtime = status.get("runtime")
+    if not isinstance(runtime, dict):
+        raise ValueError("runtime integrity diagnostic omitted runtime identity")
+    return {
+        "healthy": status["healthy"],
+        "release_id": runtime.get("release_id"),
+        "repo_head": runtime.get("repo_head"),
+        "integrity_evaluated": True,
+        "diagnostic_surface": "grabowski_status",
+    }
+
+
 def _resolve_providers(
     health_provider: Provider | None,
     audit_provider: Provider | None,
@@ -114,7 +132,7 @@ def _resolve_providers(
 ) -> tuple[Provider, Provider, Provider, Provider, Provider]:
     if health_provider is None or audit_provider is None:
         read_surface = importlib.import_module("grabowski_read_surface")
-        health_provider = health_provider or read_surface.grabowski_runtime_health
+        health_provider = health_provider or _runtime_integrity_diagnostic
         audit_provider = audit_provider or read_surface.grabowski_audit_projection
     if friction_provider is None or outcome_provider is None:
         friction = importlib.import_module("grabowski_friction")
@@ -374,6 +392,15 @@ def _collect_sources(
         current_work_provider,
     ) = providers
     health = _safe_call("runtime_health", health_provider, warnings)
+    if isinstance(health, dict) and (
+        health.get("integrity_evaluated") is False
+        or health.get("health_scope") == "mcp_tool_dispatch"
+    ):
+        warnings.append({
+            "code": "runtime_integrity_not_evaluated",
+            "source": "runtime_health",
+        })
+        health = None
     audit = _safe_call(
         "audit_projection",
         lambda: audit_provider(view="minimal", top_limit=top_limit),

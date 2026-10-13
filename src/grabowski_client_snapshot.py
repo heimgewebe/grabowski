@@ -118,9 +118,16 @@ REPOSKOP_RETIREMENT_NONCLAIMS = (
     "consumer_zero_outside_the_observed_chatgpt_surface",
 )
 AUTO_REFRESH_CLIENT_ID = "grabowski-tunnel-watchdog-observer-v1"
+_SNAPSHOT_OBSERVER_USER_INTENT = "Keep an authentic MCP connector snapshot current for safe deployments"
+_SNAPSHOT_STATUS_ARGUMENTS = {
+    "view": "minimal",
+    "reason": "Verify the running MCP release and observed tool catalog",
+    "user_intent": _SNAPSHOT_OBSERVER_USER_INTENT,
+}
 OBSERVATION_SCOPE_EXTERNAL_CLIENT = "external_client_declared"
 OBSERVATION_SCOPE_SERVER_LOOPBACK = "server_loopback_watchdog"
 AUTO_REFRESH_MCP_URL = "http://127.0.0.1:18181/mcp"
+_SIGNED_SNAPSHOT_INGRESS_MCP_URL = "http://127.0.0.1:18180/mcp"
 AUTO_REFRESH_CONNECTOR_TOKEN_PATH = (
     Path.home() / ".local/state/grabowski/transport-connectors/primary.token"
 )
@@ -6098,7 +6105,7 @@ def probe_runtime_readiness(
                 )
                 status_result = await client.call_tool(
                     "grabowski_status",
-                    {"view": "minimal"},
+                    dict(_SNAPSHOT_STATUS_ARGUMENTS),
                     meta={"client_id": AUTO_REFRESH_CLIENT_ID},
                 )
                 status = _mcp_tool_payload(
@@ -6200,7 +6207,12 @@ async def _observe_and_bind_snapshot(
     except ImportError as exc:
         raise ClientSnapshotError("MCP client runtime is unavailable") from exc
 
-    mcp_url = _validate_loopback_mcp_url(mcp_url)
+    # Watchdog mcp_url asserts the expected Blue endpoint; live observation
+    # uses the already signed ingress authority for authenticated writes.
+    _validate_loopback_mcp_url(mcp_url)
+    signed_endpoint = _validate_runtime_probe_mcp_url(
+        _SIGNED_SNAPSHOT_INGRESS_MCP_URL, auth_mode="ingress"
+    )
     if (
         not isinstance(connector_capability, str)
         or _TRANSPORT_CONNECTOR_TOKEN_RE.fullmatch(connector_capability) is None
@@ -6209,9 +6221,9 @@ async def _observe_and_bind_snapshot(
 
     async def observe() -> dict[str, Any]:
         async with streamablehttp_client(
-            mcp_url,
+            signed_endpoint,
             headers={
-                TRANSPORT_CONNECTOR_CAPABILITY_HEADER: connector_capability,
+                TRANSPORT_INGRESS_AUTH_HEADER: connector_capability,
             },
         ) as (read_stream, write_stream, _):
             async with ClientSession(read_stream, write_stream) as client:
@@ -6228,7 +6240,7 @@ async def _observe_and_bind_snapshot(
                 request_meta = {"client_id": AUTO_REFRESH_CLIENT_ID}
                 status_result = await client.call_tool(
                     "grabowski_status",
-                    {"view": "minimal"},
+                    dict(_SNAPSHOT_STATUS_ARGUMENTS),
                     meta=request_meta,
                 )
                 status = _mcp_tool_payload(status_result, label="grabowski_status")
@@ -6264,126 +6276,16 @@ async def _observe_and_bind_snapshot(
                     "parameters": declaration,
                     "profile": "operator",
                     "allow_mutation": True,
+                    "reason": "Bind the exact authenticated connector tool observation",
+                    "user_intent": _SNAPSHOT_OBSERVER_USER_INTENT,
                 }
-                transport_begin_result = await client.call_tool(
-                    "grip_run",
-                    {
-                        "name": "transport-roundtrip",
-                        "parameters": {
-                            "action": "begin",
-                            "target_tool_name": "grip_run",
-                            "target_arguments": bind_arguments,
-                        },
-                        "profile": "operator",
-                        "allow_mutation": True,
-                    },
-                    meta=request_meta,
+                # Signed ingress verifies the full public tool argument carrier.
+                # Requiring the legacy roundtrip as well creates an impossible
+                # digest mismatch after reason/user_intent metadata is stripped.
+                bind_result = await client.call_tool(
+                    "grip_run", bind_arguments, meta=request_meta
                 )
-                transport_begin = _mcp_tool_payload(
-                    transport_begin_result,
-                    label="transport roundtrip begin grip",
-                )
-                transport_begin_output = transport_begin.get("output")
-                if (
-                    transport_begin.get("status") != "passed"
-                    or not isinstance(transport_begin_output, dict)
-                ):
-                    raise ClientSnapshotError(
-                        "transport roundtrip begin did not return a valid receipt"
-                    )
-                transport_verification_receipt_sha256 = (
-                    transport_begin_output.get(
-                        "verification_receipt_sha256"
-                    )
-                )
-                bind_result: Any | None = None
-                if (
-                    transport_begin_output.get("state") == "verified"
-                    and transport_begin_output.get("mutation_gate_open") is True
-                    and isinstance(
-                        transport_verification_receipt_sha256, str
-                    )
-                    and _SHA256_RE.fullmatch(
-                        transport_verification_receipt_sha256
-                    )
-                    is not None
-                ):
-                    pass
-                else:
-                    challenge_receipt_sha256 = (
-                        transport_begin_output.get(
-                            "challenge_receipt_sha256"
-                        )
-                    )
-                    if (
-                        transport_begin_output.get("state")
-                        != "challenge_pending"
-                        or not isinstance(challenge_receipt_sha256, str)
-                        or _SHA256_RE.fullmatch(
-                            challenge_receipt_sha256
-                        )
-                        is None
-                    ):
-                        raise ClientSnapshotError(
-                            "transport roundtrip begin did not return a valid challenge"
-                        )
-                    transport_execute_result = await client.call_tool(
-                        "grip_run",
-                        {
-                            "name": "transport-roundtrip",
-                            "parameters": {
-                                "action": "execute",
-                                "challenge_receipt_sha256": (
-                                    challenge_receipt_sha256
-                                ),
-                                "target_tool_name": "grip_run",
-                                "target_arguments": bind_arguments,
-                            },
-                            "profile": "operator",
-                            "allow_mutation": True,
-                        },
-                        meta=request_meta,
-                    )
-                    transport_execute = _mcp_tool_payload(
-                        transport_execute_result,
-                        label="transport roundtrip execute grip",
-                    )
-                    transport_execute_output = transport_execute.get("output")
-                    transport_verification_receipt_sha256 = (
-                        transport_execute_output.get(
-                            "verification_receipt_sha256"
-                        )
-                        if isinstance(transport_execute_output, dict)
-                        else None
-                    )
-                    if (
-                        transport_execute.get("status") != "passed"
-                        or not isinstance(transport_execute_output, dict)
-                        or transport_execute_output.get("state") != "executed"
-                        or transport_execute_output.get("target_error") is not None
-                        or not isinstance(
-                            transport_verification_receipt_sha256, str
-                        )
-                        or _SHA256_RE.fullmatch(
-                            transport_verification_receipt_sha256
-                        )
-                        is None
-                        or not isinstance(
-                            transport_execute_output.get("target_result"), dict
-                        )
-                    ):
-                        raise ClientSnapshotError(
-                            "transport roundtrip execution did not execute the snapshot bind"
-                        )
-                    bind_result = transport_execute_output["target_result"]
-                # Exactly the arguments the verification was bound to; any
-                # deviation would be refused by the gate.
-                if bind_result is None:
-                    bind_result = await client.call_tool(
-                        "grip_run",
-                        bind_arguments,
-                        meta=request_meta,
-                    )
+                transport_verification_receipt_sha256 = None
                 grip = _mcp_tool_payload(bind_result, label="connector-snapshot-bind grip")
                 output = grip.get("output")
                 if (
@@ -6410,6 +6312,7 @@ async def _observe_and_bind_snapshot(
                         "artifact_sha256"
                     ],
                     "schema_contract_matches": True,
+                    "binding_route": "signed_ingress",
                 }
 
     try:
@@ -6871,6 +6774,25 @@ def _auto_refresh_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _bounded_exception_types(error: Exception) -> list[str]:
+    """Expose only bounded error class names, never exception messages or tokens."""
+    names: list[str] = []
+    pending: list[BaseException] = [error]
+    while pending and len(names) < 8:
+        current = pending.pop(0)
+        name = type(current).__name__
+        names.append(
+            name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) else "UnknownError"
+        )
+        children = getattr(current, "exceptions", ())
+        if isinstance(children, (tuple, list)):
+            pending.extend(
+                child for child in children[:8]
+                if isinstance(child, BaseException)
+            )
+    return names
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _auto_refresh_parser().parse_args(argv)
     try:
@@ -6963,7 +6885,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(
             json.dumps(
-                {"state": "error", "reason": type(exc).__name__},
+                {"state": "error", "reason": type(exc).__name__, "exception_types": _bounded_exception_types(exc)},
                 sort_keys=True,
                 separators=(",", ":"),
             ),

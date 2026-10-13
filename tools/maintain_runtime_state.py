@@ -23,8 +23,11 @@ RECEIPT_ROOT = STATE_ROOT / "retention-receipts"
 TASK_DB = STATE_ROOT / "tasks.sqlite3"
 WORKER_DB = STATE_ROOT / "workers" / "workers.sqlite3"
 RESOURCE_DB = STATE_ROOT / "resources.sqlite3"
-JOB_NAME = re.compile(r"grabowski-job-[0-9a-f]{12}\Z")
-JOB_UNIT = re.compile(r"grabowski-job-[0-9a-f]{12}\.service\Z")
+# Match grabowski_job_origin.UNIT_RE without importing the packaged runtime:
+# this standalone retention tool also runs before a runtime environment exists.
+JOB_ID_SUFFIX = r"(?:[0-9a-f]{12}|rgpm-[0-9a-f]{16}-[0-9]{2})"
+JOB_NAME = re.compile(rf"grabowski-job-{JOB_ID_SUFFIX}\Z")
+JOB_UNIT = re.compile(rf"grabowski-job-{JOB_ID_SUFFIX}\.service\Z")
 TASK_UNIT = re.compile(r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\Z")
 WORKER_UNIT = re.compile(
     r"grabowski-(browser|gui)-worker-([0-9a-f]{20})\.service\Z"

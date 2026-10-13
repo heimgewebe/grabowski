@@ -1,0 +1,13 @@
+[Unit]
+Description=Run RepoGround post-merge follow-up reconciliation
+After=grabowski-operator.service
+
+[Timer]
+OnActiveSec=15s
+OnUnitInactiveSec=1min
+AccuracySec=5s
+Persistent=true
+Unit=grabowski-repoground-post-merge-reconcile.service
+
+[Install]
+WantedBy=timers.target
