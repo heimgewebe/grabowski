@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import shlex
+import subprocess
+import tempfile
 import sys
 import types
 from typing import get_args
@@ -132,6 +134,55 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertTrue(read_surface.REMOTE_READ.idempotentHint)
         self.assertTrue(read_surface.REMOTE_READ.openWorldHint)
 
+    def test_git_replace_cannot_spoof_commit_tree_or_release_diff(self) -> None:
+        """Replaced commit can hide runtime changes unless source reads disable it."""
+        with tempfile.TemporaryDirectory(prefix="grabowski-release-git-replace-") as folder:
+            repo = Path(folder)
+
+            def git(*argv: str, environment: dict[str, str] | None = None) -> str:
+                result = subprocess.run(
+                    ["git", "-C", str(repo), *argv],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=15,
+                    env=environment,
+                )
+                return result.stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.name", "Git Replace Test")
+            git("config", "user.email", "git-replace@invalid.example")
+            (repo / "docs").mkdir()
+            (repo / "docs/guide.md").write_text("stable docs\n")
+            git("add", "--", "docs/guide.md")
+            git("commit", "-qm", "documentation")
+            source_base = git("rev-parse", "HEAD")
+            (repo / "src").mkdir()
+            (repo / "src/runtime.py").write_text("SOURCE_CHANGED = True\n")
+            git("add", "--", "src/runtime.py")
+            git("commit", "-qm", "runtime change")
+            source_target = git("rev-parse", "HEAD")
+            git("replace", source_target, source_base)
+
+            unsound = dict(os.environ)
+            unsound.pop("GIT_NO_REPLACE_OBJECTS", None)
+            safe = read_surface._read_environment()
+            self.assertEqual(safe["GIT_NO_REPLACE_OBJECTS"], "1")
+
+            self.assertEqual(
+                "", git("diff", "--name-only", source_base, source_target, environment=unsound)
+            )
+            self.assertEqual(
+                "src/runtime.py",
+                git("diff", "--name-only", source_base, source_target, environment=safe),
+            )
+            self.assertNotEqual(
+                git("show", "--no-patch", "--format=%T", source_target, environment=unsound),
+                git("show", "--no-patch", "--format=%T", source_target, environment=safe),
+            )
+
     def test_git_command_disables_external_helpers(self) -> None:
         repo = Path("/tmp/repository")
         argv = read_surface._git_command(repo, "status", "--short")
@@ -143,12 +194,14 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(argv[-2:], ["status", "--short"])
 
     def test_read_environment_disables_prompts_and_pagers(self) -> None:
-        with patch.object(read_surface.operator, "_safe_environment", return_value={"GIT_EXTERNAL_DIFF": "evil", "GIT_ASKPASS": "evil", "PAGER": "evil", "PATH": os.environ.get("PATH", "")}):
+        with patch.object(read_surface.operator, "_safe_environment", return_value={"GIT_EXTERNAL_DIFF": "evil", "GIT_ASKPASS": "evil", "GIT_NO_REPLACE_OBJECTS": "0", "GIT_NO_LAZY_FETCH": "0", "PAGER": "evil", "PATH": os.environ.get("PATH", "")}):
             environment = read_surface._read_environment()
         self.assertNotIn("GIT_EXTERNAL_DIFF", environment)
         self.assertNotIn("GIT_ASKPASS", environment)
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(environment["GIT_OPTIONAL_LOCKS"], "0")
+        self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(environment["GIT_NO_LAZY_FETCH"], "1")
         self.assertEqual(environment["GIT_PAGER"], "cat")
         self.assertEqual(environment["GH_PROMPT_DISABLED"], "1")
 
