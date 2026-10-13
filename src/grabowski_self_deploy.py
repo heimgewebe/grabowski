@@ -1788,6 +1788,14 @@ def _tracked_runtime_deploy_local_mutation_evidence(
             continue
         if not isinstance(value, dict):
             raise RuntimeError(f"tracked local mutation evidence {key} is malformed")
+        if (
+            key == "admission_target_fetch"
+            and value.get("kind") == "grabowski_runtime_deploy_admission_target_fetch_attempt"
+        ):
+            # Preserve the exact uncertain subprocess target and operation
+            # without manufacturing an observed successful Git effect.
+            original = {k: v for k, v in value.items() if k != "evidence_sha256"}
+            value = {**original, "evidence_sha256": _source_identity_sha256(original)}
         effects.append(dict(value))
     if not effects:
         return None
@@ -3206,7 +3214,7 @@ def _fetch_exact_release_admission_target(
                 "--no-write-fetch-head",
                 "--no-recurse-submodules",
                 PUBLIC_GITHUB_REPOSITORY_URL,
-                PUBLIC_GITHUB_MAIN_REF,
+                expected_head,
             )
         except DeploySchedulePreEffectRefusal:
             # The exact operator preflight failed before Git process launch.

@@ -16493,6 +16493,39 @@ def _runtime_deploy_local_mutation_evidence_valid(
     return evidence.get("evidence_sha256") == sha256_json(material)
 
 
+def _runtime_deploy_local_mutation_uncertainty_evidence_valid(
+    evidence: Any, *, expected_job_prefix: str, expected_head: str,
+) -> bool:
+    """Recognize a hash-bound possible Git effect without claiming it succeeded."""
+    del expected_job_prefix
+    fields = {
+        "schema_version", "kind", "expected_head", "previous_origin_main",
+        "operation_resource_key", "status", "effect_may_have_started",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    material = {k: v for k, v in evidence.items() if k != "evidence_sha256"}
+    resource = evidence.get("operation_resource_key")
+    return bool(
+        type(evidence.get("schema_version")) is int
+        and evidence["schema_version"] == 1
+        and evidence.get("kind") == "grabowski_runtime_deploy_admission_target_fetch_attempt"
+        and evidence.get("expected_head") == expected_head
+        and isinstance(expected_head, str)
+        and re.fullmatch(r"[0-9a-f]{40}", expected_head) is not None
+        and isinstance(evidence.get("previous_origin_main"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", evidence["previous_origin_main"]) is not None
+        and isinstance(resource, str)
+        and resource.startswith("repo:/")
+        and resource.endswith(":operation:runtime-deploy-origin-main-refresh")
+        and len(resource) <= 4096
+        and evidence.get("status") == "outcome_unknown"
+        and evidence.get("effect_may_have_started") is True
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
+
+
 def _runtime_deploy_schedule_errors(
     schedule: Any,
     *,
@@ -16652,9 +16685,24 @@ def _run_captain_runtime_deploy(
         if local_mutation_evidence is None:
             execution_result["execution_invoked"] = False
             execution_result["execution_attempted"] = False
-        else:
+        elif _runtime_deploy_local_mutation_evidence_valid(
+            local_mutation_evidence,
+            expected_job_prefix=str(preflight.get("job_prefix") or ""),
+            expected_head=expected_head,
+        ):
             execution_result["local_mutation_observed"] = True
-            execution_result["local_mutation_evidence"] = local_mutation_evidence
+            execution_result["local_mutation_evidence"] = dict(local_mutation_evidence)
+        else:
+            execution_result["local_mutation_outcome_unknown"] = True
+            execution_result["mutation_outcome_unknown"] = True
+            if _runtime_deploy_local_mutation_uncertainty_evidence_valid(
+                local_mutation_evidence,
+                expected_job_prefix=str(preflight.get("job_prefix") or ""),
+                expected_head=expected_head,
+            ):
+                execution_result["local_mutation_uncertainty_evidence"] = dict(
+                    local_mutation_evidence
+                )
         execution_result["pre_effect_refusal"] = True
         execution_result["definitely_not_scheduled"] = True
         execution_result["verification_error"] = (
@@ -16674,6 +16722,14 @@ def _run_captain_runtime_deploy(
         ):
             execution_result["local_mutation_observed"] = True
             execution_result["local_mutation_evidence"] = dict(
+                local_mutation_evidence
+            )
+        elif _runtime_deploy_local_mutation_uncertainty_evidence_valid(
+            local_mutation_evidence,
+            expected_job_prefix=expected_job_prefix,
+            expected_head=expected_head,
+        ):
+            execution_result["local_mutation_uncertainty_evidence"] = dict(
                 local_mutation_evidence
             )
         execution_result["mutation_outcome_unknown"] = True

@@ -248,6 +248,48 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                     with self.assertRaises(deploy.DeploySchedulePreEffectRefusal):
                         deploy._require_release_source_admission("b"*40)
 
+    def test_real_git_replace_ref_cannot_make_runtime_change_documentation_only(self) -> None:
+        """Exercise the actual self-deploy Git read path, not only its helper."""
+        import subprocess
+        import tempfile
+
+        deploy = real_deploy
+        with tempfile.TemporaryDirectory(prefix="grabowski-release-replace-admission-") as folder:
+            canonical = Path(folder)
+
+            def git(*args: str) -> str:
+                completed = subprocess.run(
+                    ["git", "-C", str(canonical), *args],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    check=True, timeout=15,
+                )
+                return completed.stdout.decode("utf-8").strip()
+
+            git("init", "-q")
+            git("config", "user.name", "Release Admission Test")
+            git("config", "user.email", "admission@invalid.example")
+            (canonical / "docs").mkdir()
+            (canonical / "docs/guide.md").write_text("stable\\n")
+            git("add", "--", "docs/guide.md")
+            git("commit", "-qm", "base")
+            base_head = git("rev-parse", "HEAD")
+            (canonical / "src").mkdir()
+            (canonical / "src/runtime.py").write_text("SOURCE_CHANGED = True\\n")
+            git("add", "--", "src/runtime.py")
+            git("commit", "-qm", "runtime change")
+            expected_head = git("rev-parse", "HEAD")
+            git("replace", expected_head, base_head)
+
+            manifest = {**self._deployed(), "repo_head": base_head}
+            process = {**self._serving(), "process_repo_head": base_head}
+            with (
+                patch.object(deploy, "CANONICAL_REPOSITORY", canonical),
+                patch.object(deploy.base, "_deployment_metadata", return_value=manifest),
+                patch.object(deploy.serving_process, "identity", return_value=process),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed runtime/policy sources"):
+                    deploy._require_release_source_admission(expected_head)
+
     def test_import_effect_precedes_index_reconciliation_in_captain_bundle(self) -> None:
         """The literal tracker emission order must be accepted, not forged."""
         head = "b"*40
@@ -818,6 +860,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                 self.assertEqual("fetch", git_mutate.call_args.args[1])
                 self.assertIn("--no-write-fetch-head", git_mutate.call_args.args)
                 self.assertNotIn("update-ref", git_mutate.call_args.args)
+                self.assertEqual(expected, git_mutate.call_args.args[-1])
                 release.assert_called_once()
                 self.assertEqual(
                     expected, state["admission_target_fetch"]["expected_head"]
@@ -1140,6 +1183,101 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             expected_job_prefix="grabowski-job-",
             expected_head="d" * 40,
         ))
+
+    def test_failed_fetch_retains_digest_bound_uncertainty_in_captain_receipt(self) -> None:
+        """A started-but-failed object import is not a success or contextless unknown."""
+        expected = "b" * 40
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_admission_target_fetch_attempt",
+            "expected_head": expected,
+            "previous_origin_main": "c" * 40,
+            "operation_resource_key":
+                "repo:/home/alex/repos/grabowski:operation:runtime-deploy-origin-main-refresh",
+            "status": "outcome_unknown",
+            "effect_may_have_started": True,
+        }
+        evidence = {**material, "evidence_sha256": grips.sha256_json(material)}
+        self.assertEqual(
+            evidence, real_deploy._tracked_runtime_deploy_local_mutation_evidence(
+                {"admission_target_fetch": material}
+            ),
+        )
+        self.assertTrue(grips._runtime_deploy_local_mutation_uncertainty_evidence_valid(
+            evidence, expected_head=expected, expected_job_prefix="grabowski-job-"
+        ))
+        self.assertFalse(grips._runtime_deploy_local_mutation_evidence_valid(
+            evidence, expected_head=expected, expected_job_prefix="grabowski-job-"
+        ))
+        error = RuntimeError("Git fetch outcome unknown")
+        error.local_mutation_evidence = evidence
+        action = {"target": {
+            "adapter": "grabowski-self", "service": "grabowski-mcp",
+            "runtime_target": "heim-pc",
+        }}
+        with (
+            patch.object(grips, "_runtime_deploy_expected_head", return_value=expected),
+            patch.object(grips, "_runtime_deploy_delay_seconds", return_value=8),
+            patch.object(grips, "_runtime_deploy_source_parameters", return_value=(None, None)),
+            patch.object(grips, "_captain_runtime_deploy_target_errors", return_value=[]),
+            patch.object(grips, "_runtime_deploy_self_preflight",
+                         return_value={"ready": True, "job_prefix": "grabowski-job-"}),
+            patch.object(grips, "_runtime_deploy_self_schedule", side_effect=error),
+        ):
+            result = grips._run_captain_runtime_deploy(action, {})
+        self.assertTrue(result["mutation_outcome_unknown"])
+        self.assertTrue(result["local_mutation_outcome_unknown"])
+        self.assertFalse(result["local_mutation_observed"])
+        self.assertEqual(evidence, result["local_mutation_uncertainty_evidence"])
+        self.assertFalse(result["verification_passed"])
+        invalid = {**evidence, "evidence_sha256": "0" * 64}
+        self.assertFalse(grips._runtime_deploy_local_mutation_uncertainty_evidence_valid(
+            invalid, expected_head=expected, expected_job_prefix="grabowski-job-"
+        ))
+
+        for changed in (
+            {"status": "completed"},
+            {"effect_may_have_started": False},
+            {"previous_origin_main": "invalid"},
+            {"operation_resource_key": "path:/unscoped"},
+            {"expected_head": "d" * 40},
+            {"schema_version": True},
+            {"kind": "different-outcome-kind"},
+            {"unexpected": "field"},
+        ):
+            material_bad = {**material, **changed}
+            alleged = {
+                **material_bad,
+                "evidence_sha256": grips.sha256_json(material_bad),
+            }
+            with self.subTest(changed=changed):
+                self.assertFalse(
+                    grips._runtime_deploy_local_mutation_uncertainty_evidence_valid(
+                        alleged,
+                        expected_head=expected,
+                        expected_job_prefix="grabowski-job-",
+                    )
+                )
+
+        denied = grips.RuntimeDeployPreEffectRefusal(
+            "ref refresh refused after uncertain fetch",
+            local_mutation_evidence=evidence,
+        )
+        with (
+            patch.object(grips, "_runtime_deploy_expected_head", return_value=expected),
+            patch.object(grips, "_runtime_deploy_delay_seconds", return_value=8),
+            patch.object(grips, "_runtime_deploy_source_parameters", return_value=(None, None)),
+            patch.object(grips, "_captain_runtime_deploy_target_errors", return_value=[]),
+            patch.object(grips, "_runtime_deploy_self_preflight",
+                         return_value={"ready": True, "job_prefix": "grabowski-job-"}),
+            patch.object(grips, "_runtime_deploy_self_schedule", side_effect=denied),
+        ):
+            typed = grips._run_captain_runtime_deploy(action, {})
+        self.assertTrue(typed["pre_effect_refusal"])
+        self.assertTrue(typed["local_mutation_outcome_unknown"])
+        self.assertTrue(typed["mutation_outcome_unknown"])
+        self.assertFalse(typed["local_mutation_observed"])
+        self.assertEqual(evidence, typed["local_mutation_uncertainty_evidence"])
 
     def test_captain_runtime_deploy_marks_review_gate_blocked(self) -> None:
         # Exercise the Captain policy seam without import-order effects from
