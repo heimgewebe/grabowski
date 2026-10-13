@@ -1074,6 +1074,16 @@ def minimal_sandbox_argv(
         source_info = source.stat()
         if stat.S_IMODE(source_info.st_mode) & 0o700 != 0o700:
             raise AgentSandboxError("external receipt directory requires owner rwx")
+        # An empty private-looking sink may be a bind mount onto an unrelated
+        # host directory (including another bind on the same device). Treat
+        # every nested mount boundary as foreign writable authority.
+        if any(
+            mount == source or mount.is_relative_to(source)
+            for mount in _kernel_mount_points()
+        ):
+            raise AgentSandboxError(
+                "external receipt directory includes a kernel mount boundary"
+            )
         try:
             with os.scandir(source) as entries:
                 if next(entries, None) is not None:

@@ -1538,6 +1538,105 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             )
 
 
+    def test_external_receipt_directory_rejects_kernel_mount_alias(self) -> None:
+        """A private-looking receipt dir may be a bind alias to other host state.
+
+        The mount-root and nested-mount probes are synthetic; the following
+        Linux test checks the actual kernel mountinfo representation.
+        """
+        from pathlib import Path
+
+        workspace = self.root / "receipt-mount-alias-source"
+        workspace.mkdir()
+        receipt = self.root / "receipt-mount-alias-sink"
+        receipt.mkdir(mode=0o700)
+        args = {
+            "workspace": workspace,
+            "command": ["/usr/bin/true"],
+            "workspace_writable": False,
+            "extra_read_write_directories": (
+                (receipt, Path("/tmp/grabowski-scoped-receipt")),
+            ),
+        }
+        for mounted in (receipt, receipt / "nested-mount"):
+            with self.subTest(mounted=str(mounted)), patch.object(
+                tasks.agent_sandbox, "_kernel_mount_points",
+                return_value=frozenset({mounted}),
+            ):
+                with self.assertRaisesRegex(
+                    tasks.agent_sandbox.AgentSandboxError, "mount boundary",
+                ):
+                    tasks.agent_sandbox.minimal_sandbox_argv(**args)
+
+        # Read-only tasks do not require mountinfo; writable host sinks do.
+        with patch.object(
+            tasks.agent_sandbox, "_kernel_mount_points",
+            side_effect=tasks.agent_sandbox.AgentSandboxError("mountinfo unavailable"),
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=workspace, command=["/usr/bin/true"],
+                workspace_writable=False,
+            )
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "mountinfo unavailable",
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(**args)
+
+    def test_real_kernel_same_device_receipt_mount_alias_denied(self) -> None:
+        """Reject a host receipt sink that is a same-device bind-mount alias."""
+        import subprocess
+        from pathlib import Path
+
+        tasks.agent_sandbox.require_bwrap()
+        workspace = self.root / "receipt-kernel-source"
+        workspace.mkdir()
+        receipt = self.root / "receipt-kernel-sink"
+        receipt.mkdir(mode=0o700)
+        outside = self.root / "other-private-empty"
+        outside.mkdir(mode=0o700)
+        self.assertEqual(receipt.stat().st_dev, outside.stat().st_dev)
+        sandbox_file = Path(tasks.agent_sandbox.__file__).resolve(strict=True)
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.dont_write_bytecode = True\n"
+            "sys.path.insert(0, '/opt')\n"
+            "import grabowski_agent_sandbox as sandbox\n"
+            "try:\n"
+            " sandbox.minimal_sandbox_argv(\n"
+            "  workspace=Path('/mnt/receipt-kernel-source'),\n"
+            "  command=['/usr/bin/true'], workspace_writable=False,\n"
+            "  extra_read_write_directories=[(\n"
+            "   Path('/mnt/receipt-kernel-sink'),\n"
+            "   Path('/tmp/grabowski-scoped-receipt'))],\n"
+            " )\n"
+            "except sandbox.AgentSandboxError:\n"
+            " print('REJECTED')\n"
+            "else:\n"
+            " print('ACCEPTED')\n"
+        )
+        outer = [
+            str(tasks.agent_sandbox.require_bwrap()),
+            "--die-with-parent", "--new-session",
+            "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            "--cap-drop", "ALL",
+            "--ro-bind", "/usr", "/usr",
+            "--symlink", "usr/bin", "/bin",
+            "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib64", "/lib64",
+            "--proc", "/proc", "--dev", "/dev",
+            "--ro-bind", str(self.root), "/mnt",
+            "--bind", str(outside), "/mnt/receipt-kernel-sink",
+            "--ro-bind", str(sandbox_file), "/opt/grabowski_agent_sandbox.py",
+            "--", "/usr/bin/python3", "-I", "-c", script,
+        ]
+        checked = subprocess.run(
+            outer, capture_output=True, text=True, check=False, timeout=40,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(checked.stdout.strip(), "REJECTED")
+
+
     def test_external_receipt_bind_rejects_unsafe_source_or_target(self) -> None:
         """Fail closed on forged external RW sinks and overlapping mounts."""
         from pathlib import Path
