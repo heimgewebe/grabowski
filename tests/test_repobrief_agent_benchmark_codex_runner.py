@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -586,15 +587,24 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                 runner._assert_root_owned_device_policy()
             run.assert_not_called()
 
-    def test_system_manager_socket_peer_credentials_must_be_kernel_root(self) -> None:
+    def test_system_manager_socket_peer_credentials_reject_same_uid_forgery(
+        self,
+    ) -> None:
         root_socket = os.stat_result(
             (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
         )
+        # A root-installed broker may legitimately serve as messagebus/dbus.
+        # A fake same-DynamicUser peer must never inherit that trust.
+        broker_uid, broker_gid = os.geteuid() + 200, os.getegid() + 200
         for peer, admitted in (
             ((1, 0, 0), True),
             ((2, 0, 0), True),
+            ((321, broker_uid, broker_gid), True),
             ((0, 0, 0), False),
-            ((1, os.getuid(), os.getgid()), False),
+            ((321, os.geteuid(), os.getegid()), False),
+            ((321, os.geteuid(), broker_gid), False),
+            ((321, broker_uid, os.getegid()), False),
+            ((321, 0, 2000), False),
         ):
             with self.subTest(peer=peer):
                 with (
@@ -1763,6 +1773,76 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "unsupported tracked Git tree entry",
             ):
                 runner.create_checkout(candidate, source, state)
+            self.assertFalse((state / "codex-workspaces" / workspace_name).exists())
+
+    def test_create_checkout_rejects_oversized_tracked_tree_before_one_shot(
+        self,
+    ) -> None:
+        # The 65,536-entry private-output scan supersedes the old 100,000 limit.
+        payload = b"".join(
+            b"100644 blob " + b"a" * 40 + f"\tfile{i:05d}".encode() + b"\0"
+            for i in range(65_537)
+        )
+        stream = mock.Mock()
+        stream.read1.side_effect = [payload, b""]
+        process = mock.Mock(stdout=stream)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with patch.object(runner.subprocess, "Popen", return_value=process):
+            with self.assertRaisesRegex(runner.RunnerError, "too many entries"):
+                runner._assert_checkout_tree_has_regular_blobs(
+                    Path("/unused"), "a" * 40
+                )
+
+    def test_create_checkout_rejects_deep_tracked_tree_before_one_shot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, _ = repository(root)
+            deep = source.joinpath("src", *("nested" for _ in range(35)), "leaf.txt")
+            deep.parent.mkdir(parents=True)
+            deep.write_text("safe file but excessive depth\n", encoding="utf-8")
+            git(["add", "src"], source)
+            git(["commit", "-m", "deep tree"], source)
+            commit = git(["rev-parse", "HEAD"], source)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            candidate = request(commit=commit)
+            candidate["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            workspace_name = hashlib.sha256(
+                candidate["workspace_id"].encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(runner.RunnerError, "tree depth"):
+                runner.create_checkout(candidate, source, state)
+            self.assertFalse((state / "codex-workspaces" / workspace_name).exists())
+
+    def test_generated_git_metadata_is_checked_before_one_shot_reservation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            candidate = request(commit=commit)
+            candidate["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            workspace_name = hashlib.sha256(
+                candidate["workspace_id"].encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(runner.RunnerError, "generated tree exceeds"):
+                runner.create_checkout(
+                    candidate,
+                    source,
+                    state,
+                    preallocate_check=mock.Mock(
+                        side_effect=runner.RunnerError("generated tree exceeds")
+                    ),
+                )
             self.assertFalse((state / "codex-workspaces" / workspace_name).exists())
 
     def test_create_checkout_regular_tracked_files_remain_usable(self) -> None:

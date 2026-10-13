@@ -869,7 +869,10 @@ def _attest_root_system_manager_channels() -> None:
     The root systemd private socket is often mode 0700 and unavailable to
     DynamicUser. We must never connect to it from this unprivileged runner.
     The accessible system bus socket must be root-owned and served by a
-    kernel-attested root UID/GID peer; RO socket binds are still connectable.
+    kernel-attested peer distinct from this DynamicUser. Valid distro system
+    buses may drop their UID/GID to a messagebus/dbus service account; the
+    root-owned socket inode and read-only mount boundary anchor the service,
+    not an assumption that its post-start peer credentials remain root.
     A same-UID fake bus is rejected even if its systemctl output claims an
     isolated service.
     """
@@ -890,8 +893,10 @@ def _attest_root_system_manager_channels() -> None:
         raise RunnerError("live Codex system manager channel unavailable") from exc
     if (
         peer_pid <= 0
-        or peer_uid != 0
-        or peer_gid != 0
+        or peer_uid < 0
+        or peer_gid < 0
+        or (peer_uid == 0) != (peer_gid == 0)
+        or (peer_uid != 0 and (peer_uid == os.geteuid() or peer_gid == os.getegid()))
         or (
             before.st_dev,
             before.st_ino,
@@ -985,6 +990,42 @@ def _assert_root_owned_device_policy() -> None:
         actual[key] = value
     if actual != required:
         raise RunnerError("live Codex device isolation system device policy unsafe")
+
+
+def _assert_private_output_tree_scan(roots: Sequence[Path]) -> None:
+    """Enforce the same private-output scan budget before and after cloning.
+
+    The preallocation caller uses this against staged Git objects and tracked
+    paths. No final one-use workspace is claimed if .git exceeds the limits.
+    """
+    entries_seen = 0
+    pending = [(path, 0) for path in roots]
+    while pending:
+        directory, depth = pending.pop()
+        if depth > 32:
+            raise RunnerError("live Codex private output scan depth exceeded")
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    entries_seen += 1
+                    if entries_seen > 65536:
+                        raise RunnerError(
+                            "live Codex private output scan entry budget exceeded"
+                        )
+                    metadata = entry.stat(follow_symlinks=False)
+                    if stat.S_ISREG(metadata.st_mode):
+                        if metadata.st_nlink != 1:
+                            raise RunnerError(
+                                "live Codex private output contains hardlinked regular file"
+                            )
+                    elif stat.S_ISDIR(metadata.st_mode):
+                        pending.append((Path(entry.path), depth + 1))
+                    else:
+                        raise RunnerError(
+                            "live Codex private output contains special file"
+                        )
+        except OSError as exc:
+            raise RunnerError("live Codex private output scan unavailable") from exc
 
 
 def validate_live_immutable_mounts(
@@ -1098,40 +1139,7 @@ def validate_live_immutable_mounts(
         if not writable:
             raise RunnerError(f"live Codex {name} output is read-only")
 
-    # A pre-existing hard link in an RW leaf can modify a protected inode
-    # through a second pathname even when the source mount remains RO.
-    # The runner creates isolated Git clones with --no-hardlinks; bounded
-    # readback also admits ordinary existing ledger/session files.
-    entries_seen = 0
-    pending = [(path, 0) for path in outputs.values()]
-    while pending:
-        directory, depth = pending.pop()
-        if depth > 32:
-            raise RunnerError("live Codex private output scan depth exceeded")
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    entries_seen += 1
-                    if entries_seen > 65536:
-                        raise RunnerError(
-                            "live Codex private output scan entry budget exceeded"
-                        )
-                    metadata = entry.stat(follow_symlinks=False)
-                    if stat.S_ISREG(metadata.st_mode):
-                        if metadata.st_nlink != 1:
-                            raise RunnerError(
-                                "live Codex private output contains hardlinked regular file"
-                            )
-                    elif stat.S_ISDIR(metadata.st_mode):
-                        pending.append((Path(entry.path), depth + 1))
-                    else:
-                        # A device, socket, FIFO or symlink in any writable
-                        # output may bypass the read-only mount protection.
-                        raise RunnerError(
-                            "live Codex private output contains special file"
-                        )
-        except OSError as exc:
-            raise RunnerError("live Codex private output scan unavailable") from exc
+    _assert_private_output_tree_scan(tuple(outputs.values()))
 
     source_path = resolved(source, "source")
     git_marker = source_path / ".git"
@@ -2141,11 +2149,11 @@ def close_provider_evidence_plan(plan: Mapping[str, Any]) -> None:
 
 
 def _assert_checkout_tree_has_regular_blobs(source: Path, commit: str) -> None:
-    """Reject tracked links and gitlinks before a one-use checkout is created.
+    """Reject unbounded Git trees before cloning or consuming a one-use ID.
 
-    Stream Git's NUL-framed tree listing under fixed limits. A checkout may be
-    read-only for the model yet live inside a writable private state root; a
-    tracked symlink there must never reach the later output-special-file scan.
+    Reserve downstream scan capacity for Git's generated object database.
+    Every resulting tree directory, not merely its regular blobs, consumes
+    private-output scan budget. The staged clone receives a second exact scan.
     """
     try:
         process = subprocess.Popen(
@@ -2161,7 +2169,8 @@ def _assert_checkout_tree_has_regular_blobs(source: Path, commit: str) -> None:
             raise RunnerError("benchmark source Git tree stream is unavailable")
         remainder = b""
         total_bytes = 0
-        total_entries = 0
+        total_files = 0
+        directories: set[tuple[bytes, ...]] = set()
         while chunk := process.stdout.read1(64 * 1024):
             total_bytes += len(chunk)
             if total_bytes > 16 * 1024 * 1024:
@@ -2171,15 +2180,33 @@ def _assert_checkout_tree_has_regular_blobs(source: Path, commit: str) -> None:
             *records, remainder = (remainder + chunk).split(bytes((0,)))
             if len(remainder) > 8192:
                 raise RunnerError("benchmark source Git tree entry exceeds byte budget")
-            total_entries += len(records)
-            if total_entries > 100_000:
-                raise RunnerError("benchmark source Git tree has too many entries")
             for record in records:
                 if not (
                     record.startswith(b"100644 blob ")
                     or record.startswith(b"100755 blob ")
                 ):
                     raise RunnerError("unsupported tracked Git tree entry")
+                _metadata, separator, relative = record.partition(b"\t")
+                segments = relative.split(b"/")
+                if (
+                    not separator
+                    or len(record) > 8192
+                    or any(part in (b"", b".", b"..") for part in segments)
+                ):
+                    raise RunnerError("benchmark source Git tree entry is invalid")
+                # state/codex-workspaces/one-use-id/repo adds three levels to
+                # each tracked subdirectory; the scan denies depth > 32.
+                if len(segments) > 30:
+                    raise RunnerError(
+                        "benchmark source Git tree depth exceeds scan limit"
+                    )
+                total_files += 1
+                if total_files > 65536:
+                    raise RunnerError("benchmark source Git tree has too many entries")
+                for length in range(1, len(segments)):
+                    directories.add(tuple(segments[:length]))
+                if total_files + len(directories) > 65536:
+                    raise RunnerError("benchmark source Git tree has too many entries")
         if remainder or process.wait() != 0:
             raise RunnerError("benchmark source Git tree inspection was incomplete")
     except BaseException:
@@ -2192,8 +2219,18 @@ def _assert_checkout_tree_has_regular_blobs(source: Path, commit: str) -> None:
             process.stdout.close()
 
 
-def create_checkout(request: Mapping[str, Any], source: Path, state_root: Path) -> Path:
-    # Validate the fixed tree before allocating this one-shot workspace ID.
+def create_checkout(
+    request: Mapping[str, Any],
+    source: Path,
+    state_root: Path,
+    *,
+    preallocate_check: Callable[[], None] | None = None,
+) -> Path:
+    """Prepare and validate a disposable clone before claiming one-use identity.
+
+    A Git clone generates .git files outside the tracked tree. Prove the exact
+    output scan on the staged clone before reserving the final workspace name.
+    """
     scenario = base.validated_setup(request)
     commit = str(request["repository"]["commit"])
     if base._run_checked(
@@ -2205,62 +2242,91 @@ def create_checkout(request: Mapping[str, Any], source: Path, state_root: Path) 
     _assert_checkout_tree_has_regular_blobs(source, commit)
     workspace_id = str(request["workspace_id"])
     workspace_name = hashlib.sha256(workspace_id.encode("utf-8")).hexdigest()
+    checkout_name = "source" if scenario == "dirty" else "repo"
     parent_path, parent_fd = _open_private_directory(state_root / "codex-workspaces")
+    staging_name = "preflight-" + sha_bytes(os.urandom(32))[:24]
+    staging_path = parent_path / staging_name
     try:
+        os.mkdir(staging_name, 0o700, dir_fd=parent_fd)
         try:
-            os.mkdir(workspace_name, 0o700, dir_fd=parent_fd)
-        except FileExistsError as exc:
-            raise RunnerError("Codex workspace identity was already used") from exc
-        child_fd = os.open(workspace_name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
-        try:
-            child = os.fstat(child_fd)
-            if child.st_uid != os.geteuid() or stat.S_IMODE(child.st_mode) != 0o700:
-                raise RunnerError("Codex workspace directory is unsafe")
+            staged_checkout = staging_path / checkout_name
+            base._run_checked(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "clone",
+                    "--no-hardlinks",
+                    "--no-checkout",
+                    "--",
+                    str(source),
+                    str(staged_checkout),
+                ]
+            )
+            base._run_checked(
+                [
+                    "git",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "checkout",
+                    "--detach",
+                    commit,
+                ],
+                cwd=staged_checkout,
+            )
+            if (
+                base._run_checked(["git", "rev-parse", "HEAD"], cwd=staged_checkout)
+                != commit
+            ):
+                raise RunnerError("isolated Codex checkout HEAD mismatch")
+            if base._run_checked(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=staged_checkout,
+            ):
+                raise RunnerError(
+                    "isolated Codex checkout is dirty before fixture setup"
+                )
+            base.apply_checkout_setup(request, staged_checkout)
+            if base._run_checked(
+                ["git", "rev-parse", "HEAD"], cwd=source
+            ) != commit or base._run_checked(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=source,
+            ):
+                raise RunnerError(
+                    "benchmark source checkout changed during fixture setup"
+                )
+
+            # Check generated .git objects and the full output tree while only
+            # a disposable staging checkout exists. No one-use ID is held yet.
+            if preallocate_check is None:
+                _assert_private_output_tree_scan((state_root,))
+            else:
+                preallocate_check()
+
+            try:
+                os.mkdir(workspace_name, 0o700, dir_fd=parent_fd)
+            except FileExistsError as exc:
+                raise RunnerError("Codex workspace identity was already used") from exc
+            child_fd = os.open(workspace_name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            try:
+                child = os.fstat(child_fd)
+                if child.st_uid != os.geteuid() or stat.S_IMODE(child.st_mode) != 0o700:
+                    raise RunnerError("Codex workspace directory is unsafe")
+            finally:
+                os.close(child_fd)
+            workspace = parent_path / workspace_name
+            checkout = workspace / checkout_name
+            os.rename(staged_checkout, checkout)
+            os.fsync(parent_fd)
+            _directory_fd_matches(parent_path, parent_fd)
+            return checkout
         finally:
-            os.close(child_fd)
-        os.fsync(parent_fd)
-        _directory_fd_matches(parent_path, parent_fd)
+            # Only a private disposable clone is removed here. A final
+            # one-use workspace, once allocated, is never silently deleted.
+            shutil.rmtree(staging_path)
     finally:
         os.close(parent_fd)
-    workspace = parent_path / workspace_name
-    checkout = workspace / ("source" if scenario == "dirty" else "repo")
-    if base._run_checked(
-        ["git", "rev-parse", "HEAD"], cwd=source
-    ) != commit or base._run_checked(
-        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
-    ):
-        raise RunnerError("benchmark source checkout is not clean at requested commit")
-    base._run_checked(
-        [
-            "git",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "clone",
-            "--no-hardlinks",
-            "--no-checkout",
-            "--",
-            str(source),
-            str(checkout),
-        ]
-    )
-    base._run_checked(
-        ["git", "-c", "core.hooksPath=/dev/null", "checkout", "--detach", commit],
-        cwd=checkout,
-    )
-    if base._run_checked(["git", "rev-parse", "HEAD"], cwd=checkout) != commit:
-        raise RunnerError("isolated Codex checkout HEAD mismatch")
-    if base._run_checked(
-        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=checkout
-    ):
-        raise RunnerError("isolated Codex checkout is dirty before fixture setup")
-    base.apply_checkout_setup(request, checkout)
-    if base._run_checked(
-        ["git", "rev-parse", "HEAD"], cwd=source
-    ) != commit or base._run_checked(
-        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
-    ):
-        raise RunnerError("benchmark source checkout changed during fixture setup")
-    return checkout
 
 
 def prompt_for(request: Mapping[str, Any]) -> str:
@@ -7947,23 +8013,29 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
     # A changed mount namespace must fail without even consuming a workspace
     # or creating provider evidence. The second check immediately before the
     # irreversible intent remains authoritative against later mount drift.
+    preallocate_check: Callable[[], None] | None = None
     if dispatch_authorization is not None:
         assert codex is not None
-        validate_live_immutable_mounts(
-            source=source,
-            codex=Path(codex),
-            request_root=args.request_root,
-            repository_map=args.repository_map,
-            manifest=(
-                Path(request["repobrief"]["manifest"])
-                if request["condition"] == "treatment"
-                else None
-            ),
-            state_root=args.state_root,
-            transcript_root=args.transcript_root,
-            evidence_root=args.provider_evidence_root,
-            runtime_binding=dispatch_authorization["binding"],
-        )
+
+        def check_preallocation_mounts() -> None:
+            validate_live_immutable_mounts(
+                source=source,
+                codex=Path(codex),
+                request_root=args.request_root,
+                repository_map=args.repository_map,
+                manifest=(
+                    Path(request["repobrief"]["manifest"])
+                    if request["condition"] == "treatment"
+                    else None
+                ),
+                state_root=args.state_root,
+                transcript_root=args.transcript_root,
+                evidence_root=args.provider_evidence_root,
+                runtime_binding=dispatch_authorization["binding"],
+            )
+
+        preallocate_check = check_preallocation_mounts
+        preallocate_check()
         # Even the non-inferential Codex login-status call executes the Codex
         # binary. The kernel write boundary must hold before any such process.
         assert codex is not None
@@ -7975,7 +8047,9 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         request, args.transcript_root, args.provider_evidence_root
     )
     try:
-        checkout = create_checkout(request, source, args.state_root)
+        checkout = create_checkout(
+            request, source, args.state_root, preallocate_check=preallocate_check
+        )
         scenario_before = base.attest_checkout_setup(request, checkout)
         schema = checkout.parent / "answer-schema.json"
         write_schema(schema)
