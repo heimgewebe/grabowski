@@ -5732,8 +5732,54 @@ def _require_release_source_admission(expected_head: str) -> dict[str, Any]:
         or ancestor.get("stdout_truncated") is not False
         or ancestor.get("stderr_truncated") is not False
     ):
+        # Only this exact, complete Git diagnosis can trigger the protected
+        # missing-target path. A missing *serving* commit, unrelated history,
+        # timed-out read or corrupt repository must never authorize Git fetch.
+        target_missing_diagnosis = (
+            type(ancestor.get("returncode")) is int
+            and ancestor["returncode"] == 128
+            and ancestor.get("timed_out") is False
+            and ancestor.get("stdout_truncated") is False
+            and ancestor.get("stderr_truncated") is False
+            and ancestor.get("stdout") == ""
+            and ancestor.get("stderr") in {
+                f"fatal: Not a valid commit name {expected_head}",
+                f"fatal: Not a valid commit name {expected_head}\n",
+            }
+        )
+        if target_missing_diagnosis:
+            serving_object = _git_result(
+                CANONICAL_REPOSITORY,
+                "rev-parse", "--verify", "--quiet", f"{serving_head}^{{commit}}",
+            )
+            target_object = _git_result(
+                CANONICAL_REPOSITORY,
+                "rev-parse", "--verify", "--quiet", f"{expected_head}^{{commit}}",
+            )
+            serving_present = (
+                type(serving_object.get("returncode")) is int
+                and serving_object["returncode"] == 0
+                and serving_object.get("timed_out") is False
+                and serving_object.get("stdout_truncated") is False
+                and serving_object.get("stderr_truncated") is False
+                and serving_object.get("stderr") == ""
+                and serving_object.get("stdout") in {serving_head, serving_head + "\n"}
+            )
+            target_absent = (
+                type(target_object.get("returncode")) is int
+                and target_object["returncode"] == 1
+                and target_object.get("timed_out") is False
+                and target_object.get("stdout_truncated") is False
+                and target_object.get("stderr_truncated") is False
+                and target_object.get("stdout") == ""
+                and target_object.get("stderr") == ""
+            )
+            if serving_present and target_absent:
+                raise DeploySchedulePreEffectRefusal(
+                    "release admission blocked: source ancestry is unproved"
+                )
         raise DeploySchedulePreEffectRefusal(
-            "release admission blocked: source ancestry is unproved"
+            "release admission blocked: ancestor check failed"
         )
     observed = _git_result(
         CANONICAL_REPOSITORY,

@@ -216,6 +216,81 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             "process_repo_head": "a" * 40,
         }
 
+    def test_only_exact_missing_target_with_present_serving_allows_import_path(self) -> None:
+        """A failed merge-base never alone authorizes an ODB mutation."""
+        deploy = real_deploy
+        expected = "b" * 40
+        serving = "a" * 40
+        ancestor_missing_target = {
+            **self._git_success(""),
+            "returncode": 128,
+            "stderr": f"fatal: Not a valid commit name {expected}\n",
+        }
+        serving_present = self._git_success(serving + "\n")
+        missing = {**self._git_success(""), "returncode": 1}
+        cases = (
+            ("target-absent", ancestor_missing_target, serving_present, missing, True),
+            ("serving-absent", ancestor_missing_target, missing, missing, False),
+            ("serving-wrong-oid", ancestor_missing_target,
+             self._git_success("c" * 40 + "\n"), missing, False),
+            ("target-present", ancestor_missing_target, serving_present,
+             self._git_success(expected + "\n"), False),
+            ("unrelated-git-error", {**ancestor_missing_target,
+             "stderr": "fatal: corrupt pack index\n"}, serving_present, missing, False),
+            ("not-ancestor", {**ancestor_missing_target,
+             "returncode": 1, "stderr": ""}, serving_present, missing, False),
+            ("timed-out", {**ancestor_missing_target,
+             "timed_out": True}, serving_present, missing, False),
+            ("truncated", {**ancestor_missing_target,
+             "stderr_truncated": True}, serving_present, missing, False),
+        )
+        for label, ancestor, observed_serving, observed_target, eligible in cases:
+            with (
+                self.subTest(case=label),
+                patch.object(deploy.base, "_deployment_metadata", return_value=self._deployed()),
+                patch.object(deploy.serving_process, "identity", return_value=self._serving()),
+                patch.object(deploy, "_git_result",
+                             side_effect=[ancestor, observed_serving, observed_target]) as git,
+            ):
+                with self.assertRaises(deploy.DeploySchedulePreEffectRefusal) as blocked:
+                    deploy._require_release_source_admission(expected)
+            self.assertEqual(
+                str(blocked.exception) == "release admission blocked: source ancestry is unproved",
+                eligible,
+            )
+            if eligible:
+                self.assertEqual(3, git.call_count)
+                self.assertEqual(
+                    ("rev-parse", "--verify", "--quiet", f"{serving}^{{commit}}"),
+                    git.call_args_list[1].args[1:],
+                )
+                self.assertEqual(
+                    ("rev-parse", "--verify", "--quiet", f"{expected}^{{commit}}"),
+                    git.call_args_list[2].args[1:],
+                )
+
+    def test_other_ancestry_error_is_never_a_scheduler_fetch_permission(self) -> None:
+        deploy = real_deploy
+        with (
+            patch.object(deploy, "_require_release_source_admission",
+                         side_effect=deploy.DeploySchedulePreEffectRefusal(
+                             "release admission blocked: ancestor check failed"
+                         )),
+            patch.object(deploy, "_deploy_schedule_lock") as lock,
+            patch.object(deploy, "_protected_release_admission_target_snapshot") as snapshot,
+            patch.object(deploy, "_fetch_exact_release_admission_target") as fetch,
+            patch.object(deploy.privileged, "ensure_rootbroker_authority") as broker,
+        ):
+            with self.assertRaisesRegex(deploy.DeploySchedulePreEffectRefusal,
+                                        "ancestor check failed"):
+                deploy._grabowski_runtime_deploy_schedule_impl(
+                    "b" * 40, local_mutation_tracker={}
+                )
+        lock.assert_not_called()
+        snapshot.assert_not_called()
+        fetch.assert_not_called()
+        broker.assert_not_called()
+
     def test_docs_git_modes_must_be_plain_regular_files(self) -> None:
         """A docs/*.md suffix cannot legalize an executable, symlink or gitlink."""
         deploy = real_deploy
@@ -1496,7 +1571,7 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             patch.object(deploy.serving_process, "identity", return_value=self._serving()),
             patch.object(deploy, "_git_result", side_effect=[ancestor]) as read,
         ):
-            with self.assertRaisesRegex(RuntimeError, "source ancestry"):
+            with self.assertRaisesRegex(RuntimeError, "ancestor check failed"):
                 deploy._require_release_source_admission("b" * 40)
         read.assert_called_once()
 
