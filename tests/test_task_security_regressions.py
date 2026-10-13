@@ -320,6 +320,41 @@ class TaskSecurityRegressionTests(unittest.TestCase):
 
 
 
+    def test_untrusted_task_unit_must_restrict_host_abstract_unix_sockets(self) -> None:
+        """Bubblewrap alone shares host network-namespace AF_UNIX abstract IPC.
+
+        Kernel proof on this host: a synthetic local abstract socket accepts
+        data from a ro-bound bwrap child even with --unshare-ipc. The outer
+        systemd task unit must deny AF_UNIX socket creation while preserving
+        AF_INET/AF_INET6 for legitimate remote APIs. This checks launch policy,
+        not an independent runtime systemd security attestation.
+        """
+        identifier = "a" * 24
+        argv = ["/usr/bin/true"]
+        record = {
+            "task_id": identifier,
+            "host": "local",
+            "unit": tasks._task_unit(identifier, 1),
+            "authoritative_unit": tasks._task_unit(identifier, 1),
+            "argv_json": tasks._canonical_json(argv),
+            "argv_sha256": tasks.command_identity.argv_sha256(argv),
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "cpu_weight": 100,
+            "io_weight": 100,
+            "memory_max_bytes": None,
+        }
+        with patch.object(
+            tasks, "_task_output_capture_argv", return_value=["/usr/bin/true"]
+        ):
+            command = tasks._launch_argv(record, include_managed_runtime=False)
+        self.assertEqual(
+            command.count("--property=RestrictAddressFamilies=AF_INET AF_INET6"),
+            1,
+        )
+        self.assertNotIn("--property=RestrictAddressFamilies=AF_UNIX", command)
+
+
     def test_revoked_running_task_lease_cannot_be_silently_reacquired(self) -> None:
         """A current unit observation is not authority to restore a lost lease.
 
