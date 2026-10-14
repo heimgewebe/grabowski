@@ -1637,6 +1637,49 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         finally:
             writer.close()
 
+    def test_wal_snapshot_closes_sqlite_child_before_releasing_wal(self) -> None:
+        """A successful bounded WAL read should close its helper normally."""
+        import sqlite3
+        import subprocess
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute(
+                "INSERT INTO metadata(key,value) VALUES (?, ?)",
+                ("wal_child_graceful_exit_probe", "ready"),
+            )
+            self.assertTrue(tasks.Path(str(database) + "-wal").exists())
+            started = []
+            actual_popen = subprocess.Popen
+
+            def track_launch(*argv, **kwargs):
+                process = actual_popen(*argv, **kwargs)
+                started.append(process)
+                return process
+
+            with patch.object(
+                tasks.resources.sqlite_store.subprocess, "Popen",
+                side_effect=track_launch,
+            ):
+                with tasks.resources.sqlite_store.preauthorization_readonly_sqlite(
+                    database,
+                    error_type=tasks.resources.ResourceSchemaInventoryChanged,
+                ) as connection:
+                    row = connection.execute(
+                        "SELECT value FROM metadata WHERE key=?",
+                        ("wal_child_graceful_exit_probe",),
+                    ).fetchone()
+                    self.assertEqual(row[0], "ready")
+            self.assertEqual(len(started), 1)
+            self.assertEqual(
+                started[0].returncode, 0,
+                "a successful reader must close normally, not by SIGKILL",
+            )
+        finally:
+            writer.close()
+
     def test_wal_snapshot_preserves_scoped_authorization_denial(self) -> None:
         """A caller's path/service PermissionError must not turn into an inventory retry."""
         import sqlite3

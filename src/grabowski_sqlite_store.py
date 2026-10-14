@@ -464,18 +464,27 @@ def preauthorization_readonly_sqlite(
         raise _changed(error_type, INVENTORY_CHANGED_MESSAGE, cause=exc)
     finally:
         if process is not None:
+            # Allow the bounded read-only child to finish SQLite cleanup after
+            # stdin EOF. On a stalled child, retain the existing kill boundary.
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
             if process.poll() is None:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=2)
+                    process.wait(timeout=1)
                 except subprocess.TimeoutExpired:
-                    pass
-            for stream in (process.stdin, process.stdout):
-                if stream is not None:
-                    stream.close()
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
+            if process.stdout is not None:
+                process.stdout.close()
         for descriptor in reversed(descriptors):
             os.close(descriptor)
         if identities:
