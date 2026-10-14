@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
+import hashlib
+import json
+import subprocess
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -2039,6 +2043,232 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "release review admission missing"):
                 deploy._require_release_source_admission("b" * 40)
 
+
+
+    def test_public_main_readback_validates_exact_git_oid_width(self) -> None:
+        import grabowski_self_deploy as deploy
+        for width in (40, 64):
+            with self.subTest(valid_width=width):
+                head = "a" * width
+                body = json.dumps({
+                    "ref": deploy.PUBLIC_GITHUB_MAIN_REF,
+                    "object": {"type": "commit", "sha": head},
+                }).encode()
+                completed = types.SimpleNamespace(
+                    returncode=0, stdout=body, stderr=b""
+                )
+                with patch.object(deploy.subprocess, "run", return_value=completed):
+                    self.assertEqual(head, deploy._fresh_public_github_main(head))
+        for expected, observed in (
+            ("a" * 64, "b" * 40),
+            ("a" * 40, "b" * 64),
+            ("a" * 64, "b" * 63),
+        ):
+            with self.subTest(expected=len(expected), observed=len(observed)):
+                body = json.dumps({
+                    "ref": deploy.PUBLIC_GITHUB_MAIN_REF,
+                    "object": {"type": "commit", "sha": observed},
+                }).encode()
+                completed = types.SimpleNamespace(
+                    returncode=0, stdout=body, stderr=b""
+                )
+                with patch.object(deploy.subprocess, "run", return_value=completed):
+                    with self.assertRaisesRegex(RuntimeError, "invalid commit"):
+                        deploy._fresh_public_github_main(expected)
+        with patch.object(deploy.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "full Git"):
+                deploy._fresh_public_github_main("a" * 63)
+        run.assert_not_called()
+
+    def test_sha256_documentation_exemption_checks_full_git_raw_mode_oids(self) -> None:
+        deploy = real_deploy
+        metadata = self._deployed()
+        process = self._serving()
+        metadata["repo_head"] = "a" * 64
+        process["process_repo_head"] = "a" * 64
+        raw = ":100644 100644 " + "1" * 64 + " " + "2" * 64 + " M\x00docs/guide.md\x00"
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=metadata),
+            patch.object(deploy.serving_process, "identity", return_value=process),
+            patch.object(deploy, "_git_result", side_effect=[
+                self._git_success(""),
+                self._git_success(raw),
+            ]) as git,
+        ):
+            result = deploy._require_release_source_admission("b" * 64)
+        self.assertEqual("non-runtime-documentation", result["status"])
+        self.assertEqual(2, git.call_count)
+        self.assertIn("--no-abbrev", git.call_args_list[1].args)
+        self.assertNotIn("--abbrev=40", git.call_args_list[1].args)
+
+    def test_sha256_documentation_exemption_rejects_mixed_raw_mode_oids(self) -> None:
+        deploy = real_deploy
+        metadata = self._deployed()
+        process = self._serving()
+        metadata["repo_head"] = "a" * 64
+        process["process_repo_head"] = "a" * 64
+        for old_oid, new_oid in (
+            ("1" * 40, "2" * 64),
+            ("1" * 40, "2" * 40),  # internally consistent, but not the SHA256 repository
+        ):
+            with self.subTest(widths=(len(old_oid), len(new_oid))):
+                raw = f":100644 100644 {old_oid} {new_oid} M\x00docs/guide.md\x00"
+                with (
+                    patch.object(deploy.base, "_deployment_metadata", return_value=metadata),
+                    patch.object(deploy.serving_process, "identity", return_value=process),
+                    patch.object(deploy, "_git_result", side_effect=[
+                        self._git_success(""),
+                        self._git_success(raw),
+                    ]),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "source Git object formats differ"):
+                        deploy._require_release_source_admission("b" * 64)
+
+    def test_documentation_exemption_rejects_unexpected_git_stderr(self) -> None:
+        """Even a plausible complete raw-doc diff cannot suppress stderr evidence."""
+        deploy = real_deploy
+        for width in (40, 64):
+            with self.subTest(oid_width=width):
+                metadata = self._deployed()
+                process = self._serving()
+                metadata["repo_head"] = "a" * width
+                process["process_repo_head"] = "a" * width
+                raw = (
+                    ":100644 100644 " + "1" * width + " " + "2" * width
+                    + " M\x00docs/guide.md\x00"
+                )
+                observed = {**self._git_success(raw), "stderr": "unexpected git warning"}
+                with (
+                    patch.object(deploy.base, "_deployment_metadata", return_value=metadata),
+                    patch.object(deploy.serving_process, "identity", return_value=process),
+                    patch.object(deploy, "_git_result", side_effect=[
+                        self._git_success(""), observed,
+                    ]),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "complete source diff"):
+                        deploy._require_release_source_admission("b" * width)
+
+    def test_source_admission_rejects_inconsistent_git_object_formats_before_git(self) -> None:
+        deploy = real_deploy
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=self._deployed()),
+            patch.object(deploy.serving_process, "identity", return_value=self._serving()),
+            patch.object(deploy, "_git_result") as git,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "object formats"):
+                deploy._require_release_source_admission("b" * 64)
+        git.assert_not_called()
+        for width in (41, 52, 63, 65):
+            with self.subTest(width=width), patch.object(deploy, "_git_result") as git:
+                with self.assertRaisesRegex(RuntimeError, "exact target head"):
+                    deploy._require_release_source_admission("b" * width)
+                git.assert_not_called()
+
+    def test_sha256_critical_release_review_receives_full_tree_oids(self) -> None:
+        import grabowski_release_admission as review
+        deploy = real_deploy
+        metadata = self._deployed()
+        process = self._serving()
+        metadata["repo_head"] = "a" * 64
+        process["process_repo_head"] = "a" * 64
+        raw = ":100644 100644 " + "1" * 64 + " " + "2" * 64 + " M\x00src/a.py\x00"
+        synthetic = {"status": "synthetic-review-callback-not-release-authority"}
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=metadata),
+            patch.object(deploy.serving_process, "identity", return_value=process),
+            patch.object(deploy, "_git_result", side_effect=[
+                self._git_success(""),
+                self._git_success(raw),
+                self._git_success(raw),
+                self._git_success("1" * 64 + "\n"),
+                self._git_success("2" * 64 + "\n"),
+            ]) as git,
+            patch.object(review, "validate_release", return_value=synthetic) as validate,
+        ):
+            self.assertIs(synthetic, deploy._require_release_source_admission(
+                "b" * 64, release_review_pr=1480, captain_preview=True,
+            ))
+        self.assertEqual("a" * 64, validate.call_args.kwargs["serving_head"])
+        self.assertEqual("b" * 64, validate.call_args.kwargs["target_head"])
+        self.assertEqual("1" * 64, validate.call_args.kwargs["serving_tree"])
+        self.assertEqual("2" * 64, validate.call_args.kwargs["target_tree"])
+        self.assertEqual(hashlib.sha256(raw.encode()).hexdigest(), validate.call_args.kwargs["diff_sha256"])
+        self.assertIn("--no-abbrev", git.call_args_list[1].args)
+        self.assertIn("--abbrev=64", git.call_args_list[2].args)
+        self.assertNotIn("--abbrev=40", git.call_args_list[2].args)
+
+    def test_sha256_critical_release_rejects_mixed_tree_before_review(self) -> None:
+        import grabowski_release_admission as review
+        deploy = real_deploy
+        metadata = self._deployed()
+        process = self._serving()
+        metadata["repo_head"] = "a" * 64
+        process["process_repo_head"] = "a" * 64
+        raw = ":100644 100644 " + "1" * 64 + " " + "2" * 64 + " M\x00src/a.py\x00"
+        with (
+            patch.object(deploy.base, "_deployment_metadata", return_value=metadata),
+            patch.object(deploy.serving_process, "identity", return_value=process),
+            patch.object(deploy, "_git_result", side_effect=[
+                self._git_success(""),
+                self._git_success(raw),
+                self._git_success(raw),
+                self._git_success("1" * 40 + "\n"),
+            ]),
+            patch.object(review, "validate_release") as validate,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exact source tree unavailable"):
+                deploy._require_release_source_admission(
+                    "b" * 64, release_review_pr=1480, captain_preview=True,
+                )
+        validate.assert_not_called()
+
+    def test_git_raw_abbrev64_keeps_native_sha1_and_sha256_object_width(self) -> None:
+        deploy = real_deploy
+        with tempfile.TemporaryDirectory() as directory:
+            for object_format, width in (("sha1", 40), ("sha256", 64)):
+                with self.subTest(object_format=object_format):
+                    repo = Path(directory) / object_format
+                    repo.mkdir()
+                    subprocess.run(
+                        ["git", "init", "--quiet", f"--object-format={object_format}", str(repo)],
+                        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    )
+                    def git(*args: str) -> bytes:
+                        result = subprocess.run(
+                            [
+                                "git", "-c", "core.hooksPath=/dev/null",
+                                "-c", "user.name=OID Test",
+                                "-c", "user.email=oid@example.org",
+                                "-C", str(repo), *args,
+                            ],
+                            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        )
+                        return result.stdout
+
+                    doc = repo / "docs" / "guide.md"
+                    doc.parent.mkdir()
+                    doc.write_text("before\n", encoding="utf-8")
+                    git("add", "--", "docs/guide.md")
+                    git("commit", "--quiet", "-m", "first")
+                    base = git("rev-parse", "HEAD").decode().strip()
+                    doc.write_text("after\n", encoding="utf-8")
+                    git("add", "--", "docs/guide.md")
+                    git("commit", "--quiet", "-m", "second")
+                    head = git("rev-parse", "HEAD").decode().strip()
+                    output = git(
+                        "diff", "--raw", "--abbrev=64", "-z",
+                        base, head, "--", "docs/guide.md",
+                    ).decode()
+                    header, path, _empty = output.split("\x00")
+                    self.assertEqual("docs/guide.md", path)
+                    parts = header.split()
+                    self.assertEqual(5, len(parts))
+                    self.assertEqual("M", parts[4])
+                    self.assertEqual(width, len(parts[2]))
+                    self.assertEqual(width, len(parts[3]))
+                    self.assertTrue(
+                        deploy._same_git_oid_format(parts[2], parts[3], base, head)
+                    )
 
 
 if __name__ == "__main__":

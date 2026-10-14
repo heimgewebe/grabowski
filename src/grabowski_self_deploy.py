@@ -47,6 +47,14 @@ DEPLOY_MUTATING = ToolAnnotations(
 )
 
 OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def _same_git_oid_format(*values: str) -> bool:
+    """Accept only complete lowercase Git object IDs of one SHA-1/256 format."""
+    return bool(values) and all(
+        isinstance(value, str) and OBJECT_ID_RE.fullmatch(value) is not None
+        for value in values
+    ) and len({len(value) for value in values}) == 1
 ExpectedHead = Annotated[
     str,
     Field(
@@ -5510,8 +5518,8 @@ def _deployment_schedule_preflight(
 
 
 def _fresh_public_github_main(expected_head: str) -> str:
-    if re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
-        raise ValueError("public GitHub main verification requires one full SHA-1 commit id")
+    if not isinstance(expected_head, str) or OBJECT_ID_RE.fullmatch(expected_head) is None:
+        raise ValueError("public GitHub main verification requires one full Git object ID")
 
     argv = [
         "/usr/bin/python3",
@@ -5561,7 +5569,7 @@ def _fresh_public_github_main(expected_head: str) -> str:
     if not isinstance(target, dict) or target.get("type") != "commit":
         raise RuntimeError("fresh public GitHub main lookup returned an invalid object")
     head = target.get("sha")
-    if not isinstance(head, str) or re.fullmatch(r"[0-9a-f]{40}", head) is None:
+    if not _same_git_oid_format(head, expected_head):
         raise RuntimeError("fresh public GitHub main lookup returned an invalid commit")
     return head
 
@@ -5667,7 +5675,7 @@ def _recovered_auto_deploy_source_binding(
 
 
 
-def _release_documentation_raw_paths(raw_records: str) -> list[str]:
+def _release_documentation_raw_paths(raw_records: str, *, expected_head: str) -> list[str]:
     """Accept only complete NUL-delimited raw Git changes to plain documents."""
     if raw_records and not raw_records.endswith("\x00"):
         raise DeploySchedulePreEffectRefusal(
@@ -5704,7 +5712,11 @@ def _release_documentation_raw_paths(raw_records: str) -> list[str]:
             "D": ("100644", "000000"),
             "M": ("100644", "100644"),
         }
-        if len(old_oid) != len(new_oid) or (old_mode, new_mode) != safe_transition[change]:
+        if not _same_git_oid_format(old_oid, new_oid, expected_head):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: source Git object formats differ"
+            )
+        if (old_mode, new_mode) != safe_transition[change]:
             raise DeploySchedulePreEffectRefusal(
                 "release admission blocked: source modes are not plain documents"
             )
@@ -5751,7 +5763,7 @@ def _require_release_source_admission(
     only critical-release authority is an ephemeral accepted Captain action,
     whose exact review/CI/serving evidence is re-read before effects.
     """
-    if not isinstance(expected_head, str) or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
+    if not isinstance(expected_head, str) or OBJECT_ID_RE.fullmatch(expected_head) is None:
         raise DeploySchedulePreEffectRefusal("release admission blocked: exact target head is invalid")
     deployment = base._deployment_metadata()
     if (
@@ -5769,12 +5781,16 @@ def _require_release_source_admission(
     release_id = deployment.get("release_id")
     if (
         not isinstance(serving_head, str)
-        or re.fullmatch(r"[0-9a-f]{40}", serving_head) is None
+        or OBJECT_ID_RE.fullmatch(serving_head) is None
         or not isinstance(release_id, str)
         or not release_id
     ):
         raise DeploySchedulePreEffectRefusal(
             "release admission blocked: serving source identity is missing"
+        )
+    if not _same_git_oid_format(serving_head, expected_head):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: serving/target Git object formats differ"
         )
     process = serving_process.identity(
         current_release_id=release_id,
@@ -5877,12 +5893,13 @@ def _require_release_source_admission(
         or observed.get("timed_out") is not False
         or observed.get("stdout_truncated") is not False
         or observed.get("stderr_truncated") is not False
+        or observed.get("stderr") != ""
         or not isinstance(observed.get("stdout"), str)
     ):
         raise DeploySchedulePreEffectRefusal(
             "release admission blocked: complete source diff is unavailable"
         )
-    changed_paths = _release_documentation_raw_paths(observed["stdout"])
+    changed_paths = _release_documentation_raw_paths(observed["stdout"], expected_head=expected_head)
     # Only pure documentation delta is exempt; unknown files, test or CI
     # policy, executables, tools and runtime sources all fail closed.
     # Even inside docs/, executable or configuration files are not inherently
@@ -5922,7 +5939,8 @@ def _require_release_source_admission(
                 or result.get("stderr_truncated") is not False
                 or result.get("stderr") != ""
                 or not isinstance(result.get("stdout"), str)
-                or re.fullmatch(r"[0-9a-f]{40}\n?", result["stdout"]) is None
+                or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\n?", result["stdout"]) is None
+                or not _same_git_oid_format(result["stdout"].strip(), expected_head)
             ):
                 raise DeploySchedulePreEffectRefusal(
                     "release admission blocked: exact source tree unavailable"
@@ -5933,7 +5951,7 @@ def _require_release_source_admission(
             CANONICAL_REPOSITORY,
             "diff", "--no-ext-diff", "--no-textconv",
             "--no-renames", "--ignore-submodules=none",
-            "--raw", "--abbrev=40", "-z",
+            "--raw", "--abbrev=64", "-z",
             serving_head, expected_head, "--",
             max_output_bytes=262_144,
         )
@@ -5978,9 +5996,8 @@ def _require_release_source_admission(
                 "release review admission blocked: Captain-to-dispatch identity drift"
             )
         return reviewed
-    # _release_documentation_raw_paths already verified every changed
-    # entry's complete Git raw header, exact OID width, regular-file mode
-    # transition and unambiguous path before the documentation exemption.
+    # The already-verified canonical raw diff binds full-width Git objects,
+    # their object format to expected_head, and exact plain-document modes.
     return {
         "status": "non-runtime-documentation",
         "serving_repo_head": serving_head,
