@@ -467,7 +467,15 @@ class RuntimeDeployScheduleObserverTests(unittest.TestCase):
         # real release-origin gate tested in test_grips_runtime_deploy.py.
         with patch.object(
             SELF_DEPLOY, "_require_release_source_admission",
-            return_value={"status": "synthetic-test-fixture-only"},
+            return_value={
+                "status": "already-serving-exact-source",
+                "serving_repo_head": expected,
+                "target_repo_head": expected,
+                "independent_review_required": False,
+            },
+        ), patch.object(
+            SELF_DEPLOY, "_require_release_source_admission_under_lease",
+            side_effect=lambda head: SELF_DEPLOY._require_release_source_admission(head),
         ), patch.object(
             SELF_DEPLOY,
             "_deployment_source_preflight",
