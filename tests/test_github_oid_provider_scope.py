@@ -127,6 +127,9 @@ def _supports_native_sha256(root: Path) -> bool:
         "HOME": str(root), "XDG_CONFIG_HOME": str(root),
         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_TERMINAL_PROMPT": "0",
+        # Git diagnostics are parsed below: translated stderr must not turn
+        # unsupported native SHA-256 support into an unexpected test failure.
+        "LC_ALL": "C",
     })
     result = subprocess.run(
         ["git", "-c", "core.hooksPath=/dev/null", "init", "--quiet",
@@ -159,6 +162,18 @@ class GitHubOidProviderBoundaryTests(unittest.TestCase):
         self.sha256 = "a" * 64
         self.assertEqual(40, len(self.sha1))
         self.assertEqual(64, len(self.sha256))
+
+    def test_sha256_capability_probe_uses_c_locale_for_git_errors(self) -> None:
+        root = Path(self.temp.name)
+        unsupported = subprocess.CompletedProcess(
+            args=["git", "init"], returncode=129, stdout=b"",
+            stderr=b"error: unknown option object-format=sha256\\n",
+        )
+        with patch.dict(os.environ, {"LANG": "de_DE.UTF-8", "LC_ALL": "de_DE.UTF-8"}):
+            with patch("subprocess.run", return_value=unsupported) as runner:
+                self.assertFalse(_supports_native_sha256(root))
+        self.assertEqual("C", runner.call_args.kwargs["env"]["LC_ALL"])
+        self.assertEqual(15, runner.call_args.kwargs["timeout"])
 
     def test_native_sha1_commit_ignores_inherited_git_environment(self) -> None:
         root = Path(self.temp.name)
