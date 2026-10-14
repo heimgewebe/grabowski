@@ -4,7 +4,10 @@ No synthetic review PASS in these tests grants real deployment authority.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import subprocess
+import tempfile
 import sys
 import unittest
 from unittest.mock import patch
@@ -54,6 +57,79 @@ class ScheduledGitObjectIdLengthTests(unittest.TestCase):
 
 
 class DelayedRuntimeEffectAdmissionTests(unittest.TestCase):
+    def test_worker_git_environment_neutralizes_git_odb_and_config_injections(self):
+        """A delayed worker must not inherit alternate object stores, replace refs, or Git config."""
+        injected = {
+            "GIT_NO_REPLACE_OBJECTS": "0",
+            "GIT_NO_LAZY_FETCH": "0",
+            "GIT_DIR": "/tmp/foreign-git-dir",
+            "GIT_WORK_TREE": "/tmp/foreign-git-tree",
+            "GIT_COMMON_DIR": "/tmp/foreign-common",
+            "GIT_INDEX_FILE": "/tmp/foreign-index",
+            "GIT_OBJECT_DIRECTORY": "/tmp/foreign-odb",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/tmp/foreign-alternate",
+            "GIT_NAMESPACE": "foreign",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_0": "foreign-fsmonitor",
+            "GIT_CONFIG_PARAMETERS": "'core.fsmonitor=foreign'",
+            "GIT_TRACE": "/tmp/foreign-git-trace",
+        }
+        for name in ("git_environment", "child_environment", "_validation_environment"):
+            with self.subTest(builder=name), patch.dict(os.environ, injected):
+                actual = (
+                    worker._validation_environment(Path("/tmp/synthetic-validation"))
+                    if name == "_validation_environment"
+                    else getattr(worker, name)()
+                )
+                self.assertEqual("1", actual.get("GIT_NO_REPLACE_OBJECTS"))
+                self.assertEqual("1", actual.get("GIT_NO_LAZY_FETCH"))
+                self.assertEqual("0", actual.get("GIT_OPTIONAL_LOCKS"))
+                for key in injected:
+                    if key not in {"GIT_NO_REPLACE_OBJECTS", "GIT_NO_LAZY_FETCH"}:
+                        self.assertNotIn(key, actual, f"{name} forwarded {key}")
+
+    def test_real_git_replace_ref_does_not_hide_runtime_change_from_worker(self):
+        """Exercise actual git diff, not only a patched subprocess object."""
+        with tempfile.TemporaryDirectory(prefix="grabowski-delayed-worker-git-") as dirname:
+            repo = Path(dirname)
+            clean_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(repo)}
+
+            def git(*argv: str) -> str:
+                result = subprocess.run(
+                    ["git", "-C", str(repo), *argv], check=True, timeout=12,
+                    capture_output=True, text=True, env=clean_env,
+                )
+                return result.stdout.strip()
+
+            git("init", "-q")
+            (repo / "docs").mkdir()
+            (repo / "docs" / "guide.md").write_text("stable\n", encoding="utf-8")
+            git("add", "--", "docs/guide.md")
+            git("-c", "user.name=Worker Fixture", "-c", "user.email=worker@invalid.example",
+                "commit", "-qm", "original")
+            original = git("rev-parse", "HEAD")
+            (repo / "src").mkdir()
+            (repo / "src" / "runtime.py").write_text("SOURCE_CHANGED = True\n", encoding="utf-8")
+            git("add", "--", "src/runtime.py")
+            git("-c", "user.name=Worker Fixture", "-c", "user.email=worker@invalid.example",
+                "commit", "-qm", "runtime change")
+            changed = git("rev-parse", "HEAD")
+            git("replace", changed, original)
+            self.assertEqual(
+                "",
+                subprocess.run(
+                    ["git", "-C", str(repo), "diff", "--name-only", original, changed],
+                    capture_output=True, text=True, check=True, env=clean_env, timeout=12,
+                ).stdout.strip(),
+            )
+            with patch.dict(os.environ, clean_env, clear=True):
+                observed = worker.run_capture(
+                    ["git", "-C", str(repo), "diff", "--name-only", original, changed],
+                    cwd=repo,
+                )
+            self.assertEqual("src/runtime.py", observed)
+
     def test_unchanged_serving_source_requires_authoritative_readback(self):
         with patch.object(worker.deploy_dual, "observe_authoritative_routing", return_value=active()):
             result = worker.require_effect_time_release_admission(
