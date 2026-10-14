@@ -524,7 +524,7 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "build_release") as build_release,
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "passen nicht zusammen"):
-                    deploy_runtime.deploy(ROOT, runtime, profile, timeout_seconds=1)
+                    deploy_runtime.deploy(ROOT, runtime, profile, timeout_seconds=1, expected_head="a" * 40)
             build_release.assert_not_called()
             self.assertFalse((root / deploy_runtime.RELEASES_DIR_NAME).exists())
 
@@ -1144,7 +1144,7 @@ class DeployRuntimeTests(unittest.TestCase):
                         ROOT,
                         runtime,
                         root / "profile.yaml",
-                        timeout_seconds=1,
+                        timeout_seconds=1, expected_head="a" * 40,
                     )
             capture_pointer.assert_not_called()
 
@@ -1312,7 +1312,7 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "wait_until_ready", return_value=deploy_runtime.ReadinessResult(True, {}, "live", "ready", 123)),
                 patch.object(deploy_runtime, "verify_runtime_identity", return_value={"process": {"pid": 200}, "manifest": {}}),
             ):
-                deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
+                deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1, expected_head="a" * 40)
             self.assertEqual(runtime.resolve(), new_release.resolve())
 
     def test_legacy_migration_rolls_back_to_exact_directory(self) -> None:
@@ -1436,7 +1436,7 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "wait_until_ready", return_value=deploy_runtime.ReadinessResult(True, {}, "live", "ready", 123)),
                 patch.object(deploy_runtime, "verify_runtime_identity", return_value={"process": {"pid": 200}, "manifest": {}}),
             ):
-                deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
+                deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1, expected_head="a" * 40)
             self.assertEqual(runtime.resolve(), new_release.resolve())
 
     def test_stop_failure_and_active_service_keeps_pointer(self) -> None:
@@ -1463,7 +1463,7 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "run", side_effect=lambda argv, **kwargs: self._completed(argv, 1)),
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackabbruch"):
-                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
+                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1, expected_head="a" * 40)
             self.assertEqual(runtime.resolve(), old_release.resolve())
 
     def test_pre_pointer_activation_failure_recovers_old_runtime(self) -> None:
@@ -1498,7 +1498,7 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "verify_running_profile_entrypoint", return_value={"pid": 200}) as verify_previous,
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackzustand"):
-                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
+                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1, expected_head="a" * 40)
             self.assertEqual(runtime.resolve(), old_release.resolve())
             wait_ready.assert_called()
             verify_previous.assert_called_once_with(live_entrypoint)
@@ -1533,7 +1533,7 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "wait_until_ready", return_value=deploy_runtime.ReadinessResult(True, {}, "live", "ready", 123)),
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackzustand"):
-                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
+                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1, expected_head="a" * 40)
             self.assertEqual(runtime.resolve(), old_release.resolve())
 
     def test_process_identity_failure_triggers_rollback(self) -> None:
@@ -1562,7 +1562,7 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "verify_runtime_identity", side_effect=deploy_runtime.DeployError("identity mismatch")),
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackzustand"):
-                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
+                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1, expected_head="a" * 40)
             self.assertEqual(runtime.resolve(), old_release.resolve())
 
     def test_rollback_stop_timeout_preserves_original_error(self) -> None:
@@ -2131,7 +2131,7 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "activate_pointer") as activate_pointer,
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackzustand"):
-                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
+                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1, expected_head="a" * 40)
             self.assertEqual(verify_snapshot.call_count, 2)
             activate_pointer.assert_not_called()
             self.assertEqual(runtime.resolve(), old_release.resolve())
@@ -2174,7 +2174,7 @@ class DeployRuntimeTests(unittest.TestCase):
                 patch.object(deploy_runtime, "activate_pointer") as activate_pointer,
             ):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Rollbackzustand"):
-                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1)
+                    deploy_runtime.deploy(ROOT, runtime, root / "profile.yaml", timeout_seconds=1, expected_head="a" * 40)
             self.assertEqual(verify_profile.call_count, 2)
             activate_pointer.assert_not_called()
             self.assertEqual(runtime.resolve(), old_release.resolve())

@@ -5452,6 +5452,155 @@ def preflight_url(
     return snapshot, runtime, topology
 
 
+# Emergency bootstrap is NOT an alternate user-controlled release lane. The
+# independent rootbroker starts one pinned helper as a root-owned SYSTEM unit:
+#   grabowski-runtime-bootstrap-<head[:12]>-<24-hex-execution-id>.service
+# Its user-execute process is the direct parent of this dual-deployer process.
+# All evidence below comes from procfs/system cgroups and root-owned disk
+# identity, not argv/environment values supplied to the deployer itself.
+ROOT_BOOTSTRAP_HELPER = Path("/usr/local/libexec/grabowski-runtime-bootstrap-recover")
+ROOT_BOOTSTRAP_DEPLOY_UID = 1000
+ROOT_BOOTSTRAP_DEPLOY_GID = 1000
+ROOT_BOOTSTRAP_MAX_PROC_BYTES = 4096
+
+
+def _bootstrap_recovery_proc_bytes(path: str) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        identity = os.fstat(descriptor)
+        if not statmod.S_ISREG(identity.st_mode) or identity.st_nlink != 1:
+            core.fail("bootstrap recovery origin procfs identity is unsafe")
+        raw = os.read(descriptor, ROOT_BOOTSTRAP_MAX_PROC_BYTES + 1)
+    except OSError as exc:
+        core.fail(
+            "bootstrap recovery origin procfs read is unavailable",
+            phase="bootstrap-recovery-origin", details={"error": type(exc).__name__},
+        )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not raw or len(raw) > ROOT_BOOTSTRAP_MAX_PROC_BYTES:
+        core.fail("bootstrap recovery origin procfs record is invalid")
+    return raw
+
+
+def _bootstrap_recovery_cgroup() -> str:
+    try:
+        return _bootstrap_recovery_proc_bytes("/proc/self/cgroup").decode("utf-8")
+    except UnicodeDecodeError:
+        core.fail("bootstrap recovery origin self cgroup is not UTF-8")
+
+
+def _bootstrap_recovery_parent_cgroup(parent_pid: int) -> str:
+    try:
+        return _bootstrap_recovery_proc_bytes(
+            f"/proc/{parent_pid}/cgroup"
+        ).decode("utf-8")
+    except UnicodeDecodeError:
+        core.fail("bootstrap recovery origin parent cgroup is not UTF-8")
+
+
+def _bootstrap_recovery_parent_argv(parent_pid: int) -> tuple[str, ...]:
+    raw = _bootstrap_recovery_proc_bytes(f"/proc/{parent_pid}/cmdline")
+    if not raw.endswith(b"\x00") or raw.count(b"\x00") != 7:
+        core.fail("bootstrap recovery origin parent argv is incomplete")
+    try:
+        parts = tuple(part.decode("utf-8") for part in raw[:-1].split(b"\x00"))
+    except UnicodeDecodeError:
+        core.fail("bootstrap recovery origin parent argv is not UTF-8")
+    if len(parts) != 7 or any(not part for part in parts):
+        core.fail("bootstrap recovery origin parent argv is invalid")
+    return parts
+
+
+def _bootstrap_recovery_parent_executable(parent_pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{parent_pid}/exe")
+    except OSError as exc:
+        core.fail(
+            "bootstrap recovery origin parent executable is unobservable",
+            phase="bootstrap-recovery-origin", details={"error": type(exc).__name__},
+        )
+
+
+def _root_bootstrap_helper_owned() -> bool:
+    for path in (ROOT_BOOTSTRAP_HELPER, *ROOT_BOOTSTRAP_HELPER.parents):
+        try:
+            info = path.lstat()
+        except OSError:
+            return False
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            return False
+        if path == ROOT_BOOTSTRAP_HELPER:
+            if (
+                not statmod.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or not (info.st_mode & 0o111)
+            ):
+                return False
+        elif not statmod.S_ISDIR(info.st_mode):
+            return False
+    return True
+
+
+def require_root_broker_bootstrap_origin(*, expected_head: str) -> None:
+    """Reject arbitrary --bootstrap-recovery callers before a deployment effect.
+
+    Only a user process whose *kernel cgroup* is the rootbroker-started
+    SYSTEM unit, and whose actual direct parent is the root-owned helper
+    user-execute for the whole exact target HEAD and execution ID, may use
+    this emergency-only recovery exception. It never grants a new normal
+    release or supersedes source review/Captain policy.
+    """
+    if (
+        not isinstance(expected_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None
+        or (
+            os.getuid(), os.geteuid(), os.getgid(), os.getegid()
+        ) != (
+            ROOT_BOOTSTRAP_DEPLOY_UID, ROOT_BOOTSTRAP_DEPLOY_UID,
+            ROOT_BOOTSTRAP_DEPLOY_GID, ROOT_BOOTSTRAP_DEPLOY_GID,
+        )
+        or not _root_bootstrap_helper_owned()
+    ):
+        core.fail("bootstrap recovery origin must be the rootbroker system unit")
+    unit = re.fullmatch(
+        rf"0::/system\.slice/grabowski-runtime-bootstrap-"
+        rf"{expected_head[:12]}-([0-9a-f]{{24}})\.service\n?",
+        _bootstrap_recovery_cgroup(),
+    )
+    if unit is None:
+        core.fail("bootstrap recovery origin is not a matched root system unit")
+    parent_pid = os.getppid()
+    if (
+        type(parent_pid) is not int
+        or parent_pid <= 1
+        or _bootstrap_recovery_parent_cgroup(parent_pid)
+        != _bootstrap_recovery_cgroup()
+        or re.fullmatch(
+            r"/usr/bin/python3(?:\.[0-9]{1,2})?",
+            _bootstrap_recovery_parent_executable(parent_pid),
+        ) is None
+    ):
+        core.fail("bootstrap recovery origin parent is outside the trusted system unit")
+    argv = _bootstrap_recovery_parent_argv(parent_pid)
+    if (
+        Path(argv[0]).name not in {
+            "python3", "python3.10", "python3.11", "python3.12", "python3.13"
+        }
+        or argv[1] != str(ROOT_BOOTSTRAP_HELPER)
+        or argv[2:] != (
+            "user-execute", "--expected-head", expected_head,
+            "--execution-id", unit.group(1),
+        )
+    ):
+        core.fail("bootstrap recovery origin parent argv does not bind exact target")
+
+
 def preflight_bootstrap_recovery_url(
     repo: Path,
     runtime: Path,
@@ -5489,12 +5638,15 @@ def deploy_url(
     expected_head: str | None = None,
     bootstrap_recovery: bool = False,
 ) -> None:
+    # Callers of this low-level effect primitive must bind an exact source
+    # before touching runtime files, even if they bypass the public CLI.
+    if (
+        not isinstance(expected_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None
+    ):
+        core.fail("Direct deployment requires valid exact expected_head", phase="expected-head")
     if bootstrap_recovery:
-        if expected_head is None:
-            core.fail(
-                "Bootstrap recovery requires expected_head",
-                phase="bootstrap-recovery-contract",
-            )
+        require_root_broker_bootstrap_origin(expected_head=expected_head)
         (
             snapshot,
             runtime,
@@ -5537,6 +5689,7 @@ def deploy_url(
             runtime,
             profile_path,
             timeout_seconds=timeout_seconds,
+            expected_head=expected_head,
         )
         return
 
@@ -10141,6 +10294,8 @@ def main() -> int:
             raise ValueError(
                 "--bootstrap-recovery requires --apply and --expected-head"
             )
+        if bootstrap_recovery:
+            require_root_broker_bootstrap_origin(expected_head=expected_head)
         if args.apply and expected_head is None:
             raise ValueError("productive --apply requires an exact --expected-head")
         if args.apply and lock_file != core.DEFAULT_LOCK_FILE:
