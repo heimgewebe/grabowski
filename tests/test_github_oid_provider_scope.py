@@ -10,6 +10,7 @@ provider-specific limitation; they do not assert end-to-end SHA-256 support.
 from __future__ import annotations
 
 from pathlib import Path
+import importlib
 import os
 import subprocess
 import sys
@@ -44,12 +45,17 @@ if "mcp" not in sys.modules:
     fake_types = types.ModuleType("mcp.types")
     fake_fastmcp.FastMCP = _FakeFastMCP
     fake_types.ToolAnnotations = _FakeToolAnnotations
-    sys.modules["mcp"] = fake_mcp
-    sys.modules["mcp.server"] = fake_server
-    sys.modules["mcp.server.fastmcp"] = fake_fastmcp
-    sys.modules["mcp.types"] = fake_types
-
-import grabowski_grips as grips
+    # Keep module substitutes scoped to this import. They must not poison
+    # sys.modules for other test modules sharing this Python interpreter.
+    with patch.dict(sys.modules, {
+        "mcp": fake_mcp,
+        "mcp.server": fake_server,
+        "mcp.server.fastmcp": fake_fastmcp,
+        "mcp.types": fake_types,
+    }):
+        grips = importlib.import_module("grabowski_grips")
+else:
+    grips = importlib.import_module("grabowski_grips")
 
 
 def _native_commit(directory: Path, object_format: str) -> str:
@@ -88,34 +94,64 @@ def _native_commit(directory: Path, object_format: str) -> str:
     ).stdout.strip()
 
 
+def _poisoned_git_environment(root: Path) -> dict[str, str]:
+    return {
+        "GIT_DIR": str(root / "foreign.git"),
+        "GIT_WORK_TREE": str(root / "foreign-worktree"),
+        "GIT_INDEX_FILE": str(root / "foreign-index"),
+        "GIT_OBJECT_DIRECTORY": str(root / "foreign-objects"),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.hooksPath",
+        "GIT_CONFIG_VALUE_0": str(root / "untrusted-hooks"),
+        "GIT_CONFIG_GLOBAL": str(root / "untrusted-global-config"),
+    }
+
+
+def _supports_native_sha256(root: Path) -> bool:
+    # Probe only inside an isolated, disposable directory. Native SHA-1 and
+    # the synthetic SHA-256 provider-width checks must remain runnable even
+    # when the installed Git has no experimental SHA-256 repository support.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update({
+        "HOME": str(root), "XDG_CONFIG_HOME": str(root),
+        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    result = subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", "init", "--quiet",
+         "--object-format=sha256", str(root / "sha256-capability")],
+        capture_output=True, timeout=15, env=env, check=False,
+    )
+    return result.returncode == 0
+
+
 class GitHubOidProviderBoundaryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="grabowski-gh-oid-boundary-")
         self.addCleanup(self.temp.cleanup)
         folder = Path(self.temp.name)
         self.sha1 = _native_commit(folder / "sha1", "sha1")
-        self.sha256 = _native_commit(folder / "sha256", "sha256")
+        # The boundary tests validate object-ID width, not repository format.
+        self.sha256 = "a" * 64
         self.assertEqual(40, len(self.sha1))
         self.assertEqual(64, len(self.sha256))
 
-    def test_native_commit_ignores_inherited_git_environment(self) -> None:
+    def test_native_sha1_commit_ignores_inherited_git_environment(self) -> None:
         root = Path(self.temp.name)
-        poisoned = {
-            "GIT_DIR": str(root / "foreign.git"),
-            "GIT_WORK_TREE": str(root / "foreign-worktree"),
-            "GIT_INDEX_FILE": str(root / "foreign-index"),
-            "GIT_OBJECT_DIRECTORY": str(root / "foreign-objects"),
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "core.hooksPath",
-            "GIT_CONFIG_VALUE_0": str(root / "untrusted-hooks"),
-            "GIT_CONFIG_GLOBAL": str(root / "untrusted-global-config"),
-        }
-        # All paths remain disposable. A broken fixture must never point at a
-        # real checkout during this negative test.
+        poisoned = _poisoned_git_environment(root)
         with patch.dict(os.environ, poisoned):
             sha1 = _native_commit(root / "env-sha1", "sha1")
-            sha256 = _native_commit(root / "env-sha256", "sha256")
         self.assertEqual(40, len(sha1))
+        for key in ("GIT_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"):
+            self.assertFalse(Path(poisoned[key]).exists())
+
+    def test_native_sha256_commit_ignores_inherited_git_environment(self) -> None:
+        root = Path(self.temp.name)
+        if not _supports_native_sha256(root):
+            self.skipTest("installed Git does not support native SHA-256 repositories")
+        poisoned = _poisoned_git_environment(root)
+        with patch.dict(os.environ, poisoned):
+            sha256 = _native_commit(root / "env-sha256", "sha256")
         self.assertEqual(64, len(sha256))
         for key in ("GIT_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"):
             self.assertFalse(Path(poisoned[key]).exists())
