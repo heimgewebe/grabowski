@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import socket
 import subprocess
 import time
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import deploy_runtime as core
+import deploy_runtime_dual as dual
 import grabowski_transport_ingress as ingress
 
 MCP_SERVICE = "kleiner-maulwurf-mcp.service"
@@ -244,7 +246,19 @@ def _verify_pointer_before_activation(state: CutoverState) -> None:
         _fail("runtime pointer changed after service stop; refusing activation")
 
 
+def _require_source_effect_admission(expected_head: str) -> None:
+    """Gate every callable release-build/cutover seam inside the real flock.
+
+    A syntactically valid expected_head or user-owned ContextVar cannot grant a
+    new source release. Until protected Captain/R3/CI issuer verification is
+    implemented, only the authoritative already-serving source can proceed.
+    """
+    core.require_canonical_deployment_lock_held()
+    dual.require_locked_release_source_admission(expected_head=expected_head)
+
+
 def _prepare_deploy(repo: Path, expected_head: str) -> CutoverState:
+    _require_source_effect_admission(expected_head)
     repo = repo.expanduser().resolve(strict=True)
     runtime = core.require_runtime_replaceable(CANONICAL_RUNTIME)
     selector_path = CANONICAL_SELECTOR
@@ -403,6 +417,7 @@ def _verify_rollback(state: CutoverState) -> None:
 
 
 def _run_cutover(state: CutoverState, *, timeout_seconds: int) -> dict[str, Any]:
+    _require_source_effect_admission(state.snapshot.repo_head)
     # This check is deliberately outside the rollback block: failure here means
     # no cutover effect started, so recovery must not stop or rewrite anything.
     _verify_pre_cutover_preimage(state)
@@ -478,11 +493,13 @@ def deploy(
 ) -> dict[str, Any]:
     if timeout_seconds < 1 or timeout_seconds > 120:
         _fail("timeout must be between 1 and 120 seconds")
-    if len(expected_head) != 40 or any(
-        c not in "0123456789abcdef" for c in expected_head
+    if (
+        not isinstance(expected_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None
     ):
-        _fail("expected head must be an exact lowercase 40-character commit SHA")
+        _fail("expected head must be an exact lowercase Git object ID")
     with core.deployment_lock(core.DEFAULT_LOCK_FILE):
+        _require_source_effect_admission(expected_head)
         state = _prepare_deploy(repo, expected_head)
         return _run_cutover(state, timeout_seconds=timeout_seconds)
 
