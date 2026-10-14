@@ -4163,7 +4163,9 @@ def pending_task_terminalizations_exist(
         raise ValueError("cursor requires high_water")
     if after is not None and after > boundary:
         raise ValueError("cursor cannot be greater than high_water")
-    with _database() as connection:
+    with _pending_terminalization_readonly_connection() as connection:
+        if connection is None:
+            return False
         if boundary is None:
             return (
                 connection.execute(

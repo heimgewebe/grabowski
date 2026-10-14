@@ -1228,6 +1228,52 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             list(database.parent.glob(f"{database.name}.schema-*.backup")),
         )
 
+    def test_resource_pending_existence_probe_preserves_current_wal_and_mode(self) -> None:
+        """Reconcile eligibility reads may not chmod or enable WAL."""
+        import sqlite3
+        import stat
+        from contextlib import closing
+
+        self.fixtures._prepare_pending_terminalization()
+        database = self.fixtures.resource_database
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(
+                "delete", connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+            )
+        self.assertFalse(tasks.Path(f"{database}-wal").exists())
+        database.chmod(0o640)
+        before = database.read_bytes()
+        try:
+            self.assertTrue(tasks.resources.pending_task_terminalizations_exist())
+            self.assertEqual(before, database.read_bytes())
+            self.assertEqual(0o640, stat.S_IMODE(database.stat().st_mode))
+            self.assertFalse(tasks.Path(f"{database}-wal").exists())
+        finally:
+            database.chmod(0o600)
+
+    def test_resource_pending_existence_probe_preserves_legacy_schema(self) -> None:
+        """Reconcile existence reads cannot silently migrate resource v2."""
+        import sqlite3
+        from contextlib import closing
+
+        self.fixtures._prepare_pending_terminalization()
+        database = self.fixtures.resource_database
+        with closing(sqlite3.connect(database)) as connection:
+            for index in (
+                "task_terminalizations_pending_idx",
+                "task_authority_adoptions_expiry_idx",
+            ):
+                connection.execute(f"DROP INDEX IF EXISTS {index}")
+            connection.execute(
+                "UPDATE metadata SET value='2' WHERE key='schema_version'"
+            )
+            connection.commit()
+        before = database.read_bytes()
+        self.assertTrue(tasks.resources.pending_task_terminalizations_exist())
+        with tasks.resources._resource_inventory_readonly_sqlite(database) as connection:
+            self.assertEqual("2", tasks.resources._resource_schema_version(connection))
+        self.assertEqual(before, database.read_bytes())
+
     def test_recovery_batch_preflights_later_denial_before_earlier_projection(self) -> None:
         """A second blocked task must not permit the first task's durable effects."""
         pending = [
