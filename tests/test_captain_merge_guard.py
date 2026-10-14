@@ -1746,6 +1746,7 @@ class _ScriptedPrHeadCasGit:
         base_before: str = _CAS_BASE,
         base_after: str | None = None,
         head_after: str | None = None,
+        origin_url: str = "git@github.com:heimgewebe/infra.git",
         push_urls: tuple[str, ...] = ("git@github.com:heimgewebe/infra.git",),
     ) -> None:
         self.push_returncode = push_returncode
@@ -1757,6 +1758,7 @@ class _ScriptedPrHeadCasGit:
         self.base_after = base_after
         self.head_after = head_after
         self.push_urls = push_urls
+        self.origin_url = origin_url
         self.calls = []
         self.pushed = False
         self.base_reads = 0
@@ -1773,7 +1775,7 @@ class _ScriptedPrHeadCasGit:
         if args == ["remote", "get-url", "origin"]:
             return {
                 "returncode": 0,
-                "stdout": "git@github.com:heimgewebe/infra.git\n",
+                "stdout": self.origin_url + "\n",
                 "stderr": "",
             }
         if args == ["remote", "get-url", "--push", "--all", "origin"]:
@@ -1869,6 +1871,48 @@ class ExactPrHeadConvergenceCasTests(unittest.TestCase):
             github_runner=_AuthenticatedUserGh(),
             git_runner=git,
         )
+
+    def test_org_scoped_github_ssh_login_keeps_exact_head_cas(self) -> None:
+        url = "org-236528253@github.com:heimgewebe/infra.git"
+        git = _ScriptedPrHeadCasGit(origin_url=url, push_urls=(url,))
+        result, evidence = self.run_cas(git)
+        self.assertEqual(0, result["returncode"])
+        self.assertEqual("pushed_and_read_back", evidence["status"])
+        self.assertTrue(any(call[:2] == ("push", "--porcelain") for call in git.calls))
+
+    def test_org_scoped_github_ssh_login_rejects_push_principal_drift(self) -> None:
+        url = "org-236528253@github.com:heimgewebe/infra.git"
+        git = _ScriptedPrHeadCasGit(
+            origin_url=url,
+            push_urls=("git@github.com:heimgewebe/infra.git",),
+        )
+        with self.assertRaisesRegex(RuntimeError, "SSH principal drift"):
+            self.run_cas(git)
+        self.assertFalse(any(call[:1] == ("push",) for call in git.calls))
+
+    def test_org_scoped_github_ssh_login_rejects_other_org_identity(self) -> None:
+        url = "org-236528253@github.com:heimgewebe/infra.git"
+        git = _ScriptedPrHeadCasGit(
+            origin_url=url,
+            push_urls=("org-999999999@github.com:heimgewebe/infra.git",),
+        )
+        with self.assertRaisesRegex(RuntimeError, "SSH principal drift"):
+            self.run_cas(git)
+        self.assertFalse(any(call[:1] == ("push",) for call in git.calls))
+
+    def test_org_scoped_github_ssh_login_rejects_invalid_origin(self) -> None:
+        for url in (
+            "org-anything@github.com:heimgewebe/infra.git",
+            "org-236528253@github.com.evil:heimgewebe/infra.git",
+            "ssh://org-236528253@github.com:2222/heimgewebe/infra.git",
+            "org-236528253@github.com:heimgewebe/infra.git?bad=1",
+            "https://github.com/heimgewebe/infra.git",
+        ):
+            with self.subTest(url=url):
+                git = _ScriptedPrHeadCasGit(origin_url=url)
+                with self.assertRaisesRegex(RuntimeError, "origin|SSH"):
+                    self.run_cas(git)
+                self.assertFalse(any(call[:1] == ("push",) for call in git.calls))
 
     def test_exact_pr_head_cas_binds_exact_base_content_and_old_head_without_base_mutation(
         self,
