@@ -20,8 +20,22 @@ REQUIRED_CI_CHECKS = ("validate (3.10)", "validate (3.12)")
 CANONICAL_WORKFLOW_PATH = ".github/workflows/validate.yml"
 MAX_GITHUB_ITEMS = 1_000
 GITHUB_PAGE_SIZE = 100
-_SHA40 = re.compile(r"[0-9a-f]{40}\Z")
+_GIT_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _same_git_object_format(*values: Any) -> bool:
+    """Only full Git SHA-1 or SHA-256 OIDs of one consistent format.
+
+    This validates syntax and object-format agreement, not existence,
+    independent review, protected issuer identity or release authority.
+    """
+    return (
+        bool(values)
+        and all(isinstance(value, str) and _GIT_OID.fullmatch(value)
+                for value in values)
+        and len({len(value) for value in values}) == 1
+    )
 
 
 class ReleaseAdmissionDenied(RuntimeError):
@@ -116,7 +130,7 @@ def _github_inventory(path: str, key: str) -> list[dict[str, Any]]:
 
 def _fresh_github_checks(target_head: str) -> dict[str, Any]:
     """Bind green checks to the actual canonical workflow, run, job and suite."""
-    if not isinstance(target_head, str) or not _SHA40.fullmatch(target_head):
+    if not _same_git_object_format(target_head):
         raise ReleaseAdmissionDenied("release target commit is invalid")
     prefix = f"/repos/{REPOSITORY}"
     workflow, link = _github_json(f"{prefix}/actions/workflows/validate.yml")
@@ -253,8 +267,7 @@ def validate_independent_release_review(
     exact serving/head/diff identities; a generic PASS never counts.
     """
     if (
-        not isinstance(serving_head, str) or not _SHA40.fullmatch(serving_head)
-        or not isinstance(target_head, str) or not _SHA40.fullmatch(target_head)
+        not _same_git_object_format(serving_head, target_head)
         or not isinstance(diff_sha256, str) or not _SHA256.fullmatch(diff_sha256)
         or type(review_pr) is not int or review_pr <= 0
     ):
@@ -307,9 +320,10 @@ def validate_release(
     serving_tree: str, target_tree: str, diff_sha256: str, review_pr: int,
 ) -> dict[str, Any]:
     """Recompute all external evidence on each authorization/dispatch check."""
-    for value in (serving_head, target_head, serving_tree, target_tree):
-        if not isinstance(value, str) or not _SHA40.fullmatch(value):
-            raise ReleaseAdmissionDenied("release source/tree identity is invalid")
+    if not _same_git_object_format(
+        serving_head, target_head, serving_tree, target_tree
+    ):
+        raise ReleaseAdmissionDenied("release source/tree identity is invalid")
     if not isinstance(serving_release_id, str) or not serving_release_id.strip():
         raise ReleaseAdmissionDenied("serving release ID is invalid")
     if not isinstance(diff_sha256, str) or not _SHA256.fullmatch(diff_sha256):

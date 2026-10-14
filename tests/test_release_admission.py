@@ -48,13 +48,13 @@ def _reconciliation(*, proven: int = 1, status: str = "settled",
 class AuthoritativeCIReadTests(unittest.TestCase):
     """GitHub-owned, actual workflow/run/job/check provenance, not just names."""
 
-    def fixture(self):
+    def fixture(self, *, target_head: str = TARGET):
         prefix = f"/repos/{admission.REPOSITORY}"
         workflow_id, run_id, suite_id = 301891383, 800, 900
         identity = {
             "id": run_id, "workflow_id": workflow_id,
             "path": admission.CANONICAL_WORKFLOW_PATH,
-            "head_sha": TARGET, "run_number": 42,
+            "head_sha": target_head, "run_number": 42,
             "run_attempt": 1, "check_suite_id": suite_id,
             "event": "push", "head_branch": "main",
             "repository": {"full_name": admission.REPOSITORY},
@@ -64,7 +64,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         jobs = [
             {
                 "name": name, "id": check_id, "run_id": run_id,
-                "run_attempt": 1, "head_sha": TARGET,
+                "run_attempt": 1, "head_sha": target_head,
                 "status": "completed", "conclusion": "success",
                 "check_run_url": f"https://{admission.GITHUB_HOST}{prefix}/check-runs/{check_id}",
             }
@@ -72,17 +72,17 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         ]
         checks = [
             {
-                **_ci_result(job["name"], job["id"]),
+                **_ci_result(job["name"], job["id"], sha=target_head),
                 "check_suite": {"id": suite_id},
             }
             for job in jobs
         ]
         paths = {
             "workflow": f"{prefix}/actions/workflows/validate.yml",
-            "runs": f"{prefix}/actions/workflows/{workflow_id}/runs?head_sha={TARGET}&per_page=100&page=1",
+            "runs": f"{prefix}/actions/workflows/{workflow_id}/runs?head_sha={target_head}&per_page=100&page=1",
             "run": f"{prefix}/actions/runs/{run_id}",
             "jobs": f"{prefix}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page=1",
-            "checks": f"{prefix}/commits/{TARGET}/check-runs?filter=all&per_page=100&page=1",
+            "checks": f"{prefix}/commits/{target_head}/check-runs?filter=all&per_page=100&page=1",
         }
         pages = {
             paths["workflow"]: {
@@ -96,7 +96,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         }
         return paths, pages
 
-    def query(self, pages, *, http_codes=None, links=None):
+    def query(self, pages, *, target_head: str = TARGET, http_codes=None, links=None):
         current = {"path": None}
         requests = []
         connection = Mock()
@@ -139,7 +139,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         connection.request.side_effect = request
         connection.getresponse.side_effect = response
         with patch.object(admission.http.client, "HTTPSConnection", return_value=connection):
-            value = admission._fresh_github_checks(TARGET)
+            value = admission._fresh_github_checks(target_head)
         return value, requests
 
     def test_accepts_full_canonical_green_workflow_and_jobs(self):
@@ -394,6 +394,99 @@ class DecisionBoundReleaseReviewTests(unittest.TestCase):
         self.assertEqual("authenticated-post-merge-r3-ci", result["status"])
         self.assertIn("Captain runtime-deploy decision", result["does_not_establish"])
         self.assertIn("historical pre-merge review authorization", result["does_not_establish"])
+
+
+class GitObjectWidthContractTests(unittest.TestCase):
+    """Syntax-only compatibility, never a substitute for protected R3/Captain."""
+
+    def test_exact_sha256_target_is_forwarded_to_real_check_origin_contract(self) -> None:
+        # Exercise the full canonical workflow/run/job/check provenance on SHA-256.
+        # A same-name check-run inventory alone must never be sufficient.
+        target = "b" * 64
+        canonical = AuthoritativeCIReadTests()
+        paths, pages = canonical.fixture(target_head=target)
+        result, requests = canonical.query(pages, target_head=target)
+        self.assertEqual(target, result["checks"][0]["head_sha"])
+        self.assertEqual(target, result["workflow"]["head_sha"])
+        self.assertIn(paths["runs"], requests)
+        self.assertNotIn(paths["checks"], requests)
+        self.assertEqual([
+            f"/repos/{admission.REPOSITORY}/check-runs/101",
+            f"/repos/{admission.REPOSITORY}/check-runs/102",
+        ], requests[-2:])
+
+    def test_sha256_foreign_workflow_fails_closed_despite_green_named_checks(self) -> None:
+        target = "b" * 64
+        canonical = AuthoritativeCIReadTests()
+        paths, pages = canonical.fixture(target_head=target)
+        pages[paths["workflow"]]["path"] = ".github/workflows/fake-validate.yml"
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "workflow identity"):
+            canonical.query(pages, target_head=target)
+
+    def test_incomplete_and_wrongcase_git_ids_reject_before_github_lookup(self) -> None:
+        with patch.object(admission.http.client, "HTTPSConnection") as connection:
+            for head in ("b" * 39, "b" * 41, "b" * 52, "b" * 63,
+                         "b" * 65, "B" * 40, "B" * 64):
+                with self.subTest(length=len(head), case=head[:1]):
+                    with self.assertRaises(admission.ReleaseAdmissionDenied):
+                        admission._fresh_github_checks(head)
+        connection.assert_not_called()
+
+    def test_exact_sha256_review_namespace_is_not_an_automatic_pass(self) -> None:
+        target = "b" * 64
+        serving = "a" * 64
+        decisions = types.ModuleType("grabowski_decision_reviews")
+        merge_guard = types.ModuleType("grabowski_merge_guard")
+        decisions.reconcile = Mock(return_value=_reconciliation(head=target, base=serving))
+        merge_guard.independent_review_reconciliation_summary = Mock(
+            return_value={"pass_count": 1, "admissible_slots": ["synthetic-only"],
+                          "errors": []})
+        with patch.dict(sys.modules, {
+            "grabowski_decision_reviews": decisions,
+            "grabowski_merge_guard": merge_guard,
+        }):
+            result = admission.validate_independent_release_review(
+                serving_head=serving, target_head=target,
+                diff_sha256=DIFF, review_pr=1452)
+        self.assertEqual(1, result["independent_pass_count"])
+        self.assertEqual(target, decisions.reconcile.call_args.kwargs["head_sha"])
+
+    def test_mixed_git_object_formats_deny_before_any_external_review(self) -> None:
+        with (
+            patch.object(admission, "validate_independent_release_review") as review,
+            patch.object(admission, "_fresh_github_checks") as ci,
+        ):
+            for serving, target, source_tree, target_tree in (
+                ("a" * 40, "b" * 64, "1" * 40, "2" * 64),
+                ("a" * 64, "b" * 64, "1" * 40, "2" * 64),
+                ("a" * 64, "b" * 64, "1" * 64, "2" * 40),
+                ("a" * 64, "b" * 63, "1" * 64, "2" * 64),
+            ):
+                with self.subTest(lengths=(len(serving), len(target),
+                                           len(source_tree), len(target_tree))):
+                    with self.assertRaises(admission.ReleaseAdmissionDenied):
+                        admission.validate_release(
+                            serving_head=serving, target_head=target,
+                            serving_release_id="test-only", serving_tree=source_tree,
+                            target_tree=target_tree, diff_sha256=DIFF, review_pr=1452)
+        review.assert_not_called()
+        ci.assert_not_called()
+
+    def test_matching_sha256_tree_ids_are_only_a_syntactic_admission(self) -> None:
+        with (
+            patch.object(admission, "validate_independent_release_review",
+                         return_value={"synthetic-only": True}) as review,
+            patch.object(admission, "_fresh_github_checks",
+                         return_value={"checks": [], "checks_sha256": "e" * 64}) as ci,
+        ):
+            response = admission.validate_release(
+                serving_head="a" * 64, target_head="b" * 64,
+                serving_release_id="test-only", serving_tree="1" * 64,
+                target_tree="2" * 64, diff_sha256=DIFF, review_pr=1452)
+        self.assertEqual("b" * 64, response["target_head"])
+        self.assertIn("Captain runtime-deploy decision", response["does_not_establish"])
+        review.assert_called_once()
+        ci.assert_called_once_with("b" * 64)
 
 
 class DirectSchedulerDenialTests(unittest.TestCase):
