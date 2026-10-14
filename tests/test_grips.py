@@ -14982,15 +14982,18 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "target": {"service": "grabowski-mcp", "runtime_target": "heim-pc"},
             "ready": True,
         }
-        reconciliation = {
+        reconciliation_material = {
             "schema_version": 1,
             "kind": "grabowski_runtime_deploy_stale_pending_reconciliation",
-            "unit": "grabowski-job-stale000001",
+            "unit": "grabowski-job-abcdef012345",
             "dispatch_outcome": "not_started",
             "deploy_index_updated": True,
             "audit_recorded": True,
             "index_updated_at_unix": 1,
-            "evidence_sha256": "a" * 64,
+        }
+        reconciliation = {
+            **reconciliation_material,
+            "evidence_sha256": grips.sha256_json(reconciliation_material),
         }
         with patch.object(
             grips, "_runtime_deploy_self_preflight", return_value=preflight
