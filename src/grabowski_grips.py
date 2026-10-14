@@ -13804,37 +13804,102 @@ def _captain_independent_review_gate(
                 ["runtime_deploy_admission_target_count_invalid"],
             )
         try:
-            from grabowski_self_deploy import _require_release_source_admission
+            import grabowski_self_deploy as release_deploy
 
-            release = _require_release_source_admission(
-                parameters.get("expected_head"),
+            expected_head = parameters.get("expected_head")
+            # Never infer R3 from an absent Git object. This preview is a
+            # policy check, not scheduling or effect-time authorization.
+            release = release_deploy._require_release_source_admission(
+                expected_head,
                 release_review_pr=parameters.get("release_review_pr"),
                 captain_preview=True,
             )
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        except Exception as exc:
+            # Unexpected dependency or Git errors must also fail closed.
             return _captain_gate(
                 "independent-review-policy",
                 "blocked",
                 "runtime release review admission was not proven",
-                [f"release_admission_blocked:{type(exc).__name__}: {exc}"],
+                [f"release_admission_blocked:{type(exc).__name__}: {str(exc)[:256]}"],
             )
-        release_review_required = release.get("independent_review_required") is True
+        status = release.get("status") if isinstance(release, dict) else None
+        if status == "authenticated-post-merge-r3-ci":
+            review_pr = parameters.get("release_review_pr")
+            valid_release = (
+                isinstance(expected_head, str)
+                and _is_hex_sha(expected_head, lengths=(40,))
+                and isinstance(release, dict)
+                and release.get("target_head") == expected_head
+                and _is_hex_sha(release.get("serving_head"), lengths=(40,))
+                and release.get("serving_head") != expected_head
+                and isinstance(release.get("serving_release_id"), str)
+                and bool(release["serving_release_id"])
+                and release.get("independent_review_required") is True
+                and _is_hex_sha(
+                    release.get("release_review_identity_sha256"), lengths=(64,)
+                )
+                and type(review_pr) is int
+                and review_pr > 0
+                and isinstance(release.get("review"), dict)
+                and release["review"].get("review_pr") == review_pr
+            )
+            if not valid_release:
+                return _captain_gate(
+                    "independent-review-policy",
+                    "blocked",
+                    "authenticated runtime release review identity is incomplete or unbound",
+                    ["runtime_deploy_release_admission_result_invalid"],
+                )
+            return _captain_gate(
+                "independent-review-policy",
+                "pass",
+                "post-merge whole-release R3 and target CI provenance authenticated; "
+                "Captain authorization still separately required",
+                {
+                    "required": True,
+                    "release_source_status": status,
+                    "release_review_identity_sha256": release[
+                        "release_review_identity_sha256"
+                    ],
+                },
+            )
+        bound_target = (
+            isinstance(expected_head, str)
+            and _is_hex_sha(expected_head, lengths=(40,))
+            and isinstance(release, dict)
+            and release.get("target_repo_head") == expected_head
+            and release.get("independent_review_required") is False
+        )
+        bound_serving = (
+            bound_target
+            and _is_hex_sha(release.get("serving_repo_head"), lengths=(40,))
+        )
+        valid_status = (
+            (
+                status == "already-serving-exact-source"
+                and bound_serving
+                and release.get("serving_repo_head") == expected_head
+            )
+            or (
+                status == "non-runtime-documentation"
+                and bound_serving
+                and release.get("serving_repo_head") != expected_head
+                and type(release.get("changed_path_count")) is int
+                and 0 <= release["changed_path_count"] <= 8192
+            )
+        )
+        if not valid_status:
+            return _captain_gate(
+                "independent-review-policy",
+                "blocked",
+                "runtime release source admission result is incomplete or unbound",
+                ["runtime_deploy_release_admission_result_invalid"],
+            )
         return _captain_gate(
             "independent-review-policy",
             "pass",
-            (
-                "post-merge whole-release R3 and target CI provenance authenticated; "
-                "Captain authorization still separately required"
-                if release_review_required
-                else "unchanged or documentation-only runtime source; R3 not implied"
-            ),
-            {
-                "required": release_review_required,
-                "release_source_status": release.get("status"),
-                "release_review_identity_sha256": release.get(
-                    "release_review_identity_sha256"
-                ),
-            },
+            "unchanged or documentation-only runtime source; R3 not implied",
+            {"required": False, "release_source_status": status},
         )
     targets = [
         action.get("target")
@@ -16082,7 +16147,10 @@ def _runtime_deploy_origin_main_fetch_effect_evidence_valid(
     )
     return bool(
         evidence.get("schema_version") == 1
-        and evidence.get("kind") == "grabowski_runtime_deploy_origin_main_fetch_effect"
+        and evidence.get("kind") in {
+            "grabowski_runtime_deploy_origin_main_fetch_effect",
+            "grabowski_runtime_deploy_origin_main_refresh_fetch_effect",
+        }
         and evidence.get("expected_head") == expected_head
         and evidence.get("effect_observed") is True
         and isinstance(evidence.get("canonical_repository"), str)
@@ -16387,11 +16455,19 @@ def _runtime_deploy_local_mutation_evidence_valid(
     expected_order = {
         "grabowski_runtime_deploy_pending_unit_promotion": -1,
         "grabowski_runtime_deploy_stale_pending_reconciliation": 0,
-        "grabowski_runtime_deploy_origin_main_refresh": 1,
-        "grabowski_runtime_deploy_origin_main_fetch_effect": 1,
-        "grabowski_runtime_deploy_origin_main_refresh_effect": 1,
-        "grabowski_runtime_deploy_rootbroker_authority_effect": 2,
-        "grabowski_runtime_deploy_auto_source_effect": 3,
+        # Object import precedes the separate origin/main ref update. They
+        # can both occur in one legitimate schedule attempt and must preserve
+        # two individually checked, digest-bound mutation receipts. The two
+        # alternative refresh representations remain mutually exclusive.
+        "grabowski_runtime_deploy_origin_main_fetch_effect": -2,
+        # A target object can disappear after early admission leases close.
+        # Ref-refresh may then legitimately import the same OID only after
+        # pending-unit promotion / stale index reconciliation.
+        "grabowski_runtime_deploy_origin_main_refresh_fetch_effect": 1,
+        "grabowski_runtime_deploy_origin_main_refresh": 2,
+        "grabowski_runtime_deploy_origin_main_refresh_effect": 2,
+        "grabowski_runtime_deploy_rootbroker_authority_effect": 3,
+        "grabowski_runtime_deploy_auto_source_effect": 4,
     }
     observed_order: list[int] = []
     for effect in effects:
@@ -16415,7 +16491,10 @@ def _runtime_deploy_local_mutation_evidence_valid(
                 effect,
                 expected_head=expected_head,
             )
-        elif kind == "grabowski_runtime_deploy_origin_main_fetch_effect":
+        elif kind in {
+            "grabowski_runtime_deploy_origin_main_fetch_effect",
+            "grabowski_runtime_deploy_origin_main_refresh_fetch_effect",
+        }:
             valid = _runtime_deploy_origin_main_fetch_effect_evidence_valid(
                 effect,
                 expected_head=expected_head,
@@ -16445,6 +16524,39 @@ def _runtime_deploy_local_mutation_evidence_valid(
         if key != "evidence_sha256"
     }
     return evidence.get("evidence_sha256") == sha256_json(material)
+
+
+def _runtime_deploy_local_mutation_uncertainty_evidence_valid(
+    evidence: Any, *, expected_job_prefix: str, expected_head: str,
+) -> bool:
+    """Recognize a hash-bound possible Git effect without claiming it succeeded."""
+    del expected_job_prefix
+    fields = {
+        "schema_version", "kind", "expected_head", "previous_origin_main",
+        "operation_resource_key", "status", "effect_may_have_started",
+        "evidence_sha256",
+    }
+    if not isinstance(evidence, dict) or set(evidence) != fields:
+        return False
+    material = {k: v for k, v in evidence.items() if k != "evidence_sha256"}
+    resource = evidence.get("operation_resource_key")
+    return bool(
+        type(evidence.get("schema_version")) is int
+        and evidence["schema_version"] == 1
+        and evidence.get("kind") == "grabowski_runtime_deploy_admission_target_fetch_attempt"
+        and evidence.get("expected_head") == expected_head
+        and isinstance(expected_head, str)
+        and re.fullmatch(r"[0-9a-f]{40}", expected_head) is not None
+        and isinstance(evidence.get("previous_origin_main"), str)
+        and re.fullmatch(r"[0-9a-f]{40}", evidence["previous_origin_main"]) is not None
+        and isinstance(resource, str)
+        and resource.startswith("repo:/")
+        and resource.endswith(":operation:runtime-deploy-origin-main-refresh")
+        and len(resource) <= 4096
+        and evidence.get("status") == "outcome_unknown"
+        and evidence.get("effect_may_have_started") is True
+        and evidence.get("evidence_sha256") == sha256_json(material)
+    )
 
 
 def _runtime_deploy_schedule_errors(
@@ -16619,9 +16731,24 @@ def _run_captain_runtime_deploy(
         if local_mutation_evidence is None:
             execution_result["execution_invoked"] = False
             execution_result["execution_attempted"] = False
-        else:
+        elif _runtime_deploy_local_mutation_evidence_valid(
+            local_mutation_evidence,
+            expected_job_prefix=str(preflight.get("job_prefix") or ""),
+            expected_head=expected_head,
+        ):
             execution_result["local_mutation_observed"] = True
-            execution_result["local_mutation_evidence"] = local_mutation_evidence
+            execution_result["local_mutation_evidence"] = dict(local_mutation_evidence)
+        else:
+            execution_result["local_mutation_outcome_unknown"] = True
+            execution_result["mutation_outcome_unknown"] = True
+            if _runtime_deploy_local_mutation_uncertainty_evidence_valid(
+                local_mutation_evidence,
+                expected_job_prefix=str(preflight.get("job_prefix") or ""),
+                expected_head=expected_head,
+            ):
+                execution_result["local_mutation_uncertainty_evidence"] = dict(
+                    local_mutation_evidence
+                )
         execution_result["pre_effect_refusal"] = True
         execution_result["definitely_not_scheduled"] = True
         execution_result["verification_error"] = (
@@ -16641,6 +16768,14 @@ def _run_captain_runtime_deploy(
         ):
             execution_result["local_mutation_observed"] = True
             execution_result["local_mutation_evidence"] = dict(
+                local_mutation_evidence
+            )
+        elif _runtime_deploy_local_mutation_uncertainty_evidence_valid(
+            local_mutation_evidence,
+            expected_job_prefix=expected_job_prefix,
+            expected_head=expected_head,
+        ):
+            execution_result["local_mutation_uncertainty_evidence"] = dict(
                 local_mutation_evidence
             )
         execution_result["mutation_outcome_unknown"] = True

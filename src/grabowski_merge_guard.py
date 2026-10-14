@@ -3280,6 +3280,47 @@ def _github_actor_identity(value: Any) -> str:
     return _github_actor(value).removesuffix("[bot]")
 
 
+def _verified_decision_review_diff_aliases(
+    bindings: dict[str, Any],
+    live_diff: dict[str, Any] | None,
+) -> list[str] | None:
+    """Accept only identities re-derived from the current live PR diff.
+
+    Decision-bound reviews may sign GitHub's raw provider bytes even when the
+    Captain action and self-review sign the canonicalized equivalent.  Neither
+    a caller-provided alias nor a local fallback establishes those raw bytes.
+    """
+    aliases = [
+        str(bindings["canonical_diff_sha256"]),
+        str(bindings["previous_canonical_diff_sha256"]),
+    ]
+    provider = (
+        live_diff.get("provider_attempt")
+        if isinstance(live_diff, dict) else None
+    )
+    raw_sha = bindings.get("raw_diff_sha256")
+    if (
+        isinstance(provider, dict)
+        and isinstance(raw_sha, str)
+        and _SHA256_RE.fullmatch(raw_sha) is not None
+        and bindings.get("diff_identity_mode") == "canonical"
+        and live_diff.get("source") in {
+            "raw-command-bytes",
+            "utf8-runner-text-exact-fallback",
+        }
+        and live_diff.get("returncode") == 0
+        and provider.get("returncode") == 0
+        and provider.get("stdout_sha256") == raw_sha
+        and live_diff.get("raw_sha256") == raw_sha
+        and live_diff.get("sha256") == bindings.get("canonical_diff_sha256")
+    ):
+        aliases.append(raw_sha)
+    return [
+        digest for digest in dict.fromkeys(aliases)
+        if digest != str(bindings["diff_sha256"])
+    ] or None
+
+
 class CaptainMergeGuardRunner:
     def __init__(
         self,
@@ -5784,19 +5825,9 @@ class CaptainMergeGuardRunner:
         # TOCTOU: a reviewer cannot become decision-bound between reconciliation
         # and the merge call and then be omitted from this decision.
         with decision_reviews.decision_review_lock(decision_binding):
-            equivalent_review_diff_sha256s = [
-                str(bindings["canonical_diff_sha256"]),
-                str(bindings["previous_canonical_diff_sha256"]),
-            ]
-            if bindings.get("diff_identity_mode") == "raw-current-provider-compat":
-                equivalent_review_diff_sha256s.append(
-                    str(bindings["raw_diff_sha256"])
-                )
-            equivalent_review_diff_sha256s = [
-                digest
-                for digest in dict.fromkeys(equivalent_review_diff_sha256s)
-                if digest != str(bindings["diff_sha256"])
-            ] or None
+            equivalent_review_diff_sha256s = _verified_decision_review_diff_aliases(
+                bindings, self.receipt.get("live_diff")
+            )
             decision_reconciliation = decision_reviews.reconcile(
                 repo=str(bindings["repository"]),
                 pr=int(bindings["pull_request"]),

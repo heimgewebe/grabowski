@@ -46,72 +46,282 @@ def _reconciliation(*, proven: int = 1, status: str = "settled",
 
 
 class AuthoritativeCIReadTests(unittest.TestCase):
-    def query(self, checks: list[dict], *, status: int = 200, link: str = ""):
-        response = Mock()
-        response.status = status
-        response.getheader.return_value = link
-        response.read.return_value = json.dumps({
-            "total_count": len(checks), "check_runs": checks,
-        }).encode()
+    """GitHub-owned, actual workflow/run/job/check provenance, not just names."""
+
+    def fixture(self):
+        prefix = f"/repos/{admission.REPOSITORY}"
+        workflow_id, run_id, suite_id = 301891383, 800, 900
+        identity = {
+            "id": run_id, "workflow_id": workflow_id,
+            "path": admission.CANONICAL_WORKFLOW_PATH,
+            "head_sha": TARGET, "run_number": 42,
+            "run_attempt": 1, "check_suite_id": suite_id,
+            "event": "push", "head_branch": "main",
+            "repository": {"full_name": admission.REPOSITORY},
+            "head_repository": {"full_name": admission.REPOSITORY},
+            "status": "completed", "conclusion": "success",
+        }
+        jobs = [
+            {
+                "name": name, "id": check_id, "run_id": run_id,
+                "run_attempt": 1, "head_sha": TARGET,
+                "status": "completed", "conclusion": "success",
+                "check_run_url": f"https://{admission.GITHUB_HOST}{prefix}/check-runs/{check_id}",
+            }
+            for name, check_id in zip(admission.REQUIRED_CI_CHECKS, (101, 102), strict=True)
+        ]
+        checks = [
+            {
+                **_ci_result(job["name"], job["id"]),
+                "check_suite": {"id": suite_id},
+            }
+            for job in jobs
+        ]
+        paths = {
+            "workflow": f"{prefix}/actions/workflows/validate.yml",
+            "runs": f"{prefix}/actions/workflows/{workflow_id}/runs?head_sha={TARGET}&per_page=100&page=1",
+            "run": f"{prefix}/actions/runs/{run_id}",
+            "jobs": f"{prefix}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page=1",
+            "checks": f"{prefix}/commits/{TARGET}/check-runs?filter=all&per_page=100&page=1",
+        }
+        pages = {
+            paths["workflow"]: {
+                "id": workflow_id, "path": admission.CANONICAL_WORKFLOW_PATH,
+                "state": "active",
+            },
+            paths["runs"]: {"total_count": 1, "workflow_runs": [identity.copy()]},
+            paths["run"]: identity.copy(),
+            paths["jobs"]: {"total_count": len(jobs), "jobs": jobs},
+            paths["checks"]: {"total_count": len(checks), "check_runs": checks},
+        }
+        return paths, pages
+
+    def query(self, pages, *, http_codes=None, links=None):
+        current = {"path": None}
+        requests = []
         connection = Mock()
-        connection.getresponse.return_value = response
+
+        def request(method, path, *, headers):
+            self.assertEqual("GET", method)
+            self.assertTrue(path.startswith(f"/repos/{admission.REPOSITORY}/"))
+            current["path"] = path
+            requests.append(path)
+
+        def response():
+            path = current["path"]
+            self.assertIsNotNone(path)
+            payload = pages.get(path)
+            if payload is None and "/check-runs/" in path:
+                # The implementation must read each canonical Actions job's
+                # exact check-run ID, never all same-name commit checks.
+                check_id = int(path.rsplit("/", 1)[-1])
+                inventory = [
+                    value["check_runs"]
+                    for key, value in pages.items()
+                    if "/commits/" in key and "/check-runs?" in key
+                ]
+                checks = [
+                    check for entries in inventory for check in entries
+                    if check["id"] == check_id
+                ]
+                if len(checks) == 1:
+                    payload = checks[0]
+            if payload is None:
+                raise AssertionError(f"Unexpected GitHub endpoint: {path}")
+            result = Mock()
+            result.status = (http_codes or {}).get(path, 200)
+            result.read.return_value = json.dumps(payload).encode("utf-8")
+            result.getheader.side_effect = lambda name, default="": (
+                (links or {}).get(path, "") if name == "Link" else default
+            )
+            return result
+
+        connection.request.side_effect = request
+        connection.getresponse.side_effect = response
         with patch.object(admission.http.client, "HTTPSConnection", return_value=connection):
-            return admission._fresh_github_checks(TARGET)
+            value = admission._fresh_github_checks(TARGET)
+        return value, requests
 
-    def test_accepts_server_observed_exact_green_checks(self):
-        result = self.query([
-            _ci_result("validate (3.10)", 100),
-            _ci_result("validate (3.12)", 101),
-            _ci_result("CodeQL", 200),
-        ])
+    def test_accepts_full_canonical_green_workflow_and_jobs(self):
+        paths, pages = self.fixture()
+        result, requests = self.query(pages)
         self.assertEqual(2, len(result["checks"]))
-        self.assertEqual("validate (3.10)", result["checks"][0]["name"])
+        self.assertEqual(101, result["checks"][0]["id"])
+        self.assertEqual(301891383, result["checks"][0]["workflow_id"])
+        self.assertEqual(800, result["workflow"]["run_id"])
         self.assertEqual(64, len(result["checks_sha256"]))
+        self.assertNotIn(paths["checks"], requests)
+        self.assertEqual([
+            f"/repos/{admission.REPOSITORY}/check-runs/101",
+            f"/repos/{admission.REPOSITORY}/check-runs/102",
+        ], requests[-2:])
+        self.assertEqual(6, len(requests))
 
-    def test_newer_failure_cannot_be_hidden_by_earlier_pass(self):
-        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "not green"):
-            self.query([
-                _ci_result("validate (3.10)", 100),
-                _ci_result("validate (3.10)", 103, conclusion="failure"),
-                _ci_result("validate (3.12)", 101),
-            ])
-
-    def test_failed_older_rerun_can_be_superseded_by_new_green(self):
-        record = self.query([
-            _ci_result("validate (3.10)", 100, conclusion="failure"),
-            _ci_result("validate (3.10)", 104),
-            _ci_result("validate (3.12)", 105),
+    def test_newer_green_foreign_workflow_cannot_override_failed_canonical(self):
+        paths, pages = self.fixture()
+        pages[paths["run"]]["conclusion"] = "failure"
+        pages[paths["runs"]]["workflow_runs"][0]["conclusion"] = "failure"
+        pages[paths["checks"]]["check_runs"].extend([
+            {**_ci_result(name, i), "check_suite": {"id": 9999}}
+            for i, name in enumerate(admission.REQUIRED_CI_CHECKS, start=9900)
         ])
-        self.assertEqual(104, record["checks"][0]["id"])
+        pages[paths["checks"]]["total_count"] = 4
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "canonical Validate run.*green"):
+            self.query(pages)
 
-    def test_spoofed_provider_blocks(self):
-        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "origin"):
-            self.query([
-                _ci_result("validate (3.10)", 100, app="third-party"),
-                _ci_result("validate (3.12)", 101),
-            ])
+    def test_same_name_foreign_actions_check_cannot_fill_missing_canonical_job(self):
+        paths, pages = self.fixture()
+        pages[paths["jobs"]]["jobs"].pop(0)
+        pages[paths["jobs"]]["total_count"] = 1
+        pages[paths["checks"]]["check_runs"].append({
+            **_ci_result(admission.REQUIRED_CI_CHECKS[0], 1100),
+            "check_suite": {"id": 9999},
+        })
+        pages[paths["checks"]]["total_count"] = 3
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "canonical Validate jobs are missing"):
+            self.query(pages)
 
-    def test_stale_commit_blocks(self):
-        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "commit mismatch"):
-            self.query([
-                _ci_result("validate (3.10)", 100, sha=SERVING),
-                _ci_result("validate (3.12)", 101),
-            ])
+    def test_other_workflow_path_cannot_claim_validate_identity(self):
+        paths, pages = self.fixture()
+        pages[paths["workflow"]]["path"] = ".github/workflows/fake-validate.yml"
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "workflow identity"):
+            self.query(pages)
 
-    def test_missing_required_check_blocks(self):
-        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "missing"):
-            self.query([_ci_result("validate (3.10)", 100)])
+    def test_run_from_wrong_workflow_path_blocks(self):
+        paths, pages = self.fixture()
+        pages[paths["runs"]]["workflow_runs"][0]["path"] = ".github/workflows/other.yml"
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "run origin"):
+            self.query(pages)
 
-    def test_truncated_page_blocks(self):
-        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "paginated"):
-            self.query([
-                _ci_result("validate (3.10)", 100),
-                _ci_result("validate (3.12)", 101),
-            ], link='<https://api.github.com/test?page=2>; rel="next"')
+    def test_only_push_event_is_admissible(self):
+        paths, pages = self.fixture()
+        pages[paths["runs"]]["workflow_runs"][0]["event"] = "pull_request"
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "push run is missing"):
+            self.query(pages)
+
+    def test_other_branch_or_repository_same_sha_cannot_count_as_main_push(self):
+        for key, value in (
+            ("head_branch", "integration"),
+            ("repository", {"full_name": "attacker/fork"}),
+            ("head_repository", {"full_name": "attacker/fork"}),
+        ):
+            with self.subTest(key):
+                paths, pages = self.fixture()
+                pages[paths["runs"]]["workflow_runs"][0][key] = value
+                with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "push run is missing"):
+                    self.query(pages)
+
+    def test_foreign_branch_newer_run_cannot_hide_canonical_main(self):
+        paths, pages = self.fixture()
+        foreign = dict(pages[paths["runs"]]["workflow_runs"][0])
+        foreign["id"] = 900
+        foreign["run_number"] = 43
+        foreign["head_branch"] = "dev"
+        pages[paths["runs"]]["workflow_runs"].append(foreign)
+        pages[paths["runs"]]["total_count"] = 2
+        result, _ = self.query(pages)
+        self.assertEqual(800, result["workflow"]["run_id"])
+        self.assertEqual("main", result["workflow"]["head_branch"])
+
+    def test_run_detail_main_branch_drift_blocks(self):
+        paths, pages = self.fixture()
+        pages[paths["run"]]["head_branch"] = "other"
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "not authenticated green"):
+            self.query(pages)
+
+    def test_wrong_commit_and_check_suite_fail_closed(self):
+        for modified, value, fragment in [
+            ("head_sha", SERVING, "provenance"),
+            ("check_suite", {"id": 7777}, "provenance"),
+            ("app", {"slug": "third-party"}, "provenance"),
+            ("check_run_url", "https://api.github.com/other", "provenance"),
+        ]:
+            with self.subTest(modified):
+                paths, pages = self.fixture()
+                if modified == "check_run_url":
+                    pages[paths["jobs"]]["jobs"][0][modified] = value
+                else:
+                    pages[paths["checks"]]["check_runs"][0][modified] = value
+                with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, fragment):
+                    self.query(pages)
+
+    def test_latest_canonical_job_failure_is_not_overridden_by_old_green(self):
+        paths, pages = self.fixture()
+        pages[paths["jobs"]]["jobs"][0]["conclusion"] = "failure"
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "not green"):
+            self.query(pages)
+
+    @staticmethod
+    def two_page_jobs(paths, pages):
+        # Two required jobs plus exactly enough irrelevant jobs to force page 2.
+        jobs = pages[paths["jobs"]]["jobs"]
+        jobs.extend({"id": i + 500, "name": "irrelevant"} for i in
+                    range(admission.GITHUB_PAGE_SIZE - 1))
+        page_size = admission.GITHUB_PAGE_SIZE
+        pages[paths["jobs"]]["total_count"] = len(jobs)
+        pages[paths["jobs"]]["jobs"] = jobs[:page_size]
+        next_path = paths["jobs"].replace("&page=1", "&page=2")
+        pages[next_path] = {
+            "total_count": len(jobs), "jobs": jobs[page_size:],
+        }
+        return next_path
+
+    def test_incomplete_inventory_and_missing_pagination_are_blocked(self):
+        paths, pages = self.fixture()
+        pages[paths["jobs"]]["total_count"] = admission.GITHUB_PAGE_SIZE + 1
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "pagination incomplete"):
+            self.query(pages)
+        paths, pages = self.fixture()
+        self.two_page_jobs(paths, pages)
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "pagination link mismatch"):
+            self.query(pages)
+
+    def test_legitimate_second_page_is_checked_not_silently_ignored(self):
+        paths, pages = self.fixture()
+        second = self.two_page_jobs(paths, pages)
+        link = f'<https://{admission.GITHUB_HOST}{second}>; rel="next"'
+        result, requests = self.query(pages, links={paths["jobs"]: link})
+        self.assertEqual(2, len(result["checks"]))
+        self.assertIn(second, requests)
+
+    def test_replayed_page_id_and_cross_origin_link_fail_closed(self):
+        paths, pages = self.fixture()
+        second = self.two_page_jobs(paths, pages)
+        pages[second]["jobs"] = [pages[paths["jobs"]]["jobs"][0]]
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "destination"):
+            self.query(pages, links={paths["jobs"]:
+                f'<https://evil.invalid{second}>; rel="next"'})
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "duplicate"):
+            self.query(pages, links={paths["jobs"]:
+                f'<https://{admission.GITHUB_HOST}{second}>; rel="next"'})
+
+    def test_later_legitimate_rerun_can_supersede_failed_previous_attempt(self):
+        paths, pages = self.fixture()
+        pages[paths["run"]]["run_attempt"] = 2
+        pages[paths["runs"]]["workflow_runs"][0]["run_attempt"] = 2
+        for job in pages[paths["jobs"]]["jobs"]:
+            job["run_attempt"] = 2
+        old = {
+            **pages[paths["jobs"]]["jobs"][0],
+            "id": 99, "run_attempt": 1, "conclusion": "failure",
+            "check_run_url": f"https://{admission.GITHUB_HOST}/repos/{admission.REPOSITORY}/check-runs/99",
+        }
+        pages[paths["jobs"]]["jobs"].append(old)
+        pages[paths["jobs"]]["total_count"] = 3
+        pages[paths["checks"]]["check_runs"].append({
+            **_ci_result(old["name"], old["id"], conclusion="failure"),
+            "check_suite": {"id": 900},
+        })
+        pages[paths["checks"]]["total_count"] = 3
+        result, _ = self.query(pages)
+        self.assertEqual(2, result["workflow"]["run_attempt"])
+        self.assertEqual(101, result["checks"][0]["id"])
 
     def test_http_failure_blocks(self):
+        paths, pages = self.fixture()
         with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "HTTP 403"):
-            self.query([], status=403)
+            self.query(pages, http_codes={paths["workflow"]: 403})
+
 
 
 class DecisionBoundReleaseReviewTests(unittest.TestCase):
@@ -208,7 +418,7 @@ class DirectSchedulerDenialTests(unittest.TestCase):
             patch.object(deploy.base, "_deployment_metadata", return_value=blue),
             patch.object(deploy.serving_process, "identity", return_value=process),
             patch.object(deploy, "_git_result", side_effect=[
-                git_output(""), git_output("src/grabowski_self_deploy.py\x00")
+                git_output(""), git_output(":100644 100644 " + "a"*40 + " " + "b"*40 + " M\x00src/grabowski_self_deploy.py\x00")
             ]) as read,
         ):
             with self.assertRaisesRegex(RuntimeError, "Captain release action"):
@@ -256,11 +466,10 @@ class DirectSchedulerDenialTests(unittest.TestCase):
             patch.object(deploy.base, "_deployment_metadata", return_value=blue),
             patch.object(deploy.serving_process, "identity", return_value=process),
             patch.object(deploy, "_git_result", side_effect=[
-                git_output(""), git_output("docs/guide.md\x00"),
-                git_output(raw_symlink),
+                git_output(""), git_output(raw_symlink),
             ]),
         ):
-            with self.assertRaisesRegex(RuntimeError, "document.*mode|plain.*documentation"):
+            with self.assertRaisesRegex(RuntimeError, "raw modes|modes are not plain documents"):
                 deploy._require_release_source_admission(TARGET)
 
 
@@ -313,7 +522,7 @@ class RealGitDocumentationModeTests(unittest.TestCase):
                 patch.object(deploy.serving_process, "identity", return_value=identity),
             ):
                 if symlink:
-                    with self.assertRaisesRegex(RuntimeError, "non-plain documentation|documentation Git mode"):
+                    with self.assertRaisesRegex(RuntimeError, "raw modes|documentation Git mode"):
                         deploy._require_release_source_admission(target)
                 else:
                     result = deploy._require_release_source_admission(target)
