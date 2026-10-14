@@ -63,8 +63,8 @@ class ArtifactTests(unittest.TestCase):
         self.root_patch = patch.object(
             artifacts.base, "_roots", return_value=(self.root,)
         )
-        # Exercise the real audit append and rollback code, but never append
-        # unit-test records to the live, globally shared production audit.
+        # Exercise the real hash-chain appender without touching or contending
+        # with the live operator's audit log during artifact publication tests.
         self.audit_patch = patch.object(
             artifacts.base, "AUDIT_LOG", self.root / "write-audit.jsonl"
         )

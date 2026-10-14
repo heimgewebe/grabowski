@@ -11,11 +11,15 @@ import http.client
 import json
 import re
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 REPOSITORY = "heimgewebe/grabowski"
 GITHUB_HOST = "api.github.com"
 CHECK_BYTES_LIMIT = 262_144
 REQUIRED_CI_CHECKS = ("validate (3.10)", "validate (3.12)")
+CANONICAL_WORKFLOW_PATH = ".github/workflows/validate.yml"
+MAX_GITHUB_ITEMS = 1_000
+GITHUB_PAGE_SIZE = 100
 _GIT_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -44,27 +48,22 @@ def _sha256_json(value: Any) -> str:
     ).hexdigest()
 
 
-def _fresh_github_checks(target_head: str) -> dict[str, Any]:
-    """Read exact target-commit checks from GitHub, not caller CI declarations."""
-    if not _same_git_object_format(target_head):
-        raise ReleaseAdmissionDenied("release target commit is invalid")
-    path = f"/repos/{REPOSITORY}/commits/{target_head}/check-runs?per_page=100"
+def _github_json(path: str) -> tuple[dict[str, Any], str]:
+    """Bounded HTTPS read; responses, including pagination, are untrusted until checked."""
     conn = http.client.HTTPSConnection(GITHUB_HOST, timeout=15)
     try:
         conn.request(
             "GET", path,
             headers={
                 "Accept": "application/vnd.github+json",
-                "User-Agent": "grabowski-release-admission/1",
+                "User-Agent": "grabowski-release-admission/2",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
         response = conn.getresponse()
         if response.status != 200:
             raise ReleaseAdmissionDenied(f"authoritative CI lookup HTTP {response.status}")
-        pagination = response.getheader("Link", "")
-        if pagination and 'rel="next"' in pagination:
-            raise ReleaseAdmissionDenied("authoritative CI check list is paginated")
+        link = response.getheader("Link", "") or ""
         payload = response.read(CHECK_BYTES_LIMIT + 1)
     except (OSError, TimeoutError, http.client.HTTPException) as exc:
         raise ReleaseAdmissionDenied("authoritative CI lookup failed") from exc
@@ -76,47 +75,185 @@ def _fresh_github_checks(target_head: str) -> dict[str, Any]:
         data = json.loads(payload.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
         raise ReleaseAdmissionDenied("authoritative CI payload is invalid") from exc
-    if not isinstance(data, dict):
-        raise ReleaseAdmissionDenied("authoritative CI result is invalid")
-    checks = data.get("check_runs")
-    total = data.get("total_count")
+    if not isinstance(data, dict) or not isinstance(link, str):
+        raise ReleaseAdmissionDenied("authoritative CI result is malformed")
+    return data, link
+
+
+def _github_inventory(path: str, key: str) -> list[dict[str, Any]]:
+    """Read all pages, fail closed on changed counts, missing pages and unsafe links."""
+    collected: list[dict[str, Any]] = []
+    observed_ids: set[int] = set()
+    total: int | None = None
+    for page in range(1, MAX_GITHUB_ITEMS // GITHUB_PAGE_SIZE + 1):
+        suffix = "&" if "?" in path else "?"
+        page_path = f"{path}{suffix}per_page={GITHUB_PAGE_SIZE}&page={page}"
+        data, link = _github_json(page_path)
+        items = data.get(key)
+        count = data.get("total_count")
+        if (
+            type(count) is not int or count < 0 or count > MAX_GITHUB_ITEMS
+            or not isinstance(items, list) or len(items) > GITHUB_PAGE_SIZE
+            or (total is not None and count != total)
+        ):
+            raise ReleaseAdmissionDenied("authoritative CI inventory incomplete")
+        total = count
+        expected = min(GITHUB_PAGE_SIZE, total - len(collected))
+        if len(items) != expected:
+            raise ReleaseAdmissionDenied("authoritative CI pagination incomplete")
+        for item in items:
+            item_id = item.get("id") if isinstance(item, dict) else None
+            if type(item_id) is not int or item_id <= 0 or item_id in observed_ids:
+                raise ReleaseAdmissionDenied("authoritative CI page has invalid or duplicate IDs")
+            observed_ids.add(item_id)
+            collected.append(item)
+        more = len(collected) < total
+        links = re.findall(r'<([^>]+)>;\s*rel="next"', link)
+        if more != bool(links) or len(links) > 1:
+            raise ReleaseAdmissionDenied("authoritative CI pagination link mismatch")
+        if more:
+            next_url = urlsplit(links[0])
+            current_url = urlsplit(f"https://{GITHUB_HOST}{path}")
+            current_query = parse_qs(current_url.query)
+            current_query.update({"per_page": [str(GITHUB_PAGE_SIZE)], "page": [str(page + 1)]})
+            if (
+                next_url.scheme != "https" or next_url.netloc != GITHUB_HOST
+                or next_url.path != current_url.path
+                or parse_qs(next_url.query) != current_query
+                or next_url.fragment
+            ):
+                raise ReleaseAdmissionDenied("authoritative CI pagination destination mismatch")
+        else:
+            return collected
+    raise ReleaseAdmissionDenied("authoritative CI pagination exceeds bound")
+
+
+def _fresh_github_checks(target_head: str) -> dict[str, Any]:
+    """Bind green checks to the actual canonical workflow, run, job and suite."""
+    if not _same_git_object_format(target_head):
+        raise ReleaseAdmissionDenied("release target commit is invalid")
+    prefix = f"/repos/{REPOSITORY}"
+    workflow, link = _github_json(f"{prefix}/actions/workflows/validate.yml")
+    workflow_id = workflow.get("id")
     if (
-        not isinstance(checks, list) or type(total) is not int
-        or total != len(checks) or total > 100
+        link or type(workflow_id) is not int or workflow_id <= 0
+        or workflow.get("path") != CANONICAL_WORKFLOW_PATH
+        or workflow.get("state") != "active"
     ):
-        raise ReleaseAdmissionDenied("authoritative CI inventory incomplete")
-    latest: dict[str, dict[str, Any]] = {}
-    for check in checks:
-        if not isinstance(check, dict):
-            raise ReleaseAdmissionDenied("authoritative CI contains malformed check")
-        name = check.get("name")
+        raise ReleaseAdmissionDenied("canonical Validate workflow identity is invalid")
+
+    runs = _github_inventory(
+        f"{prefix}/actions/workflows/{workflow_id}/runs?head_sha={target_head}",
+        "workflow_runs",
+    )
+    matching: list[dict[str, Any]] = []
+    for run in runs:
+        if (
+            run.get("workflow_id") != workflow_id
+            or run.get("path") != CANONICAL_WORKFLOW_PATH
+            or run.get("head_sha") != target_head
+        ):
+            raise ReleaseAdmissionDenied("canonical Validate run origin or commit mismatch")
+        if (
+            run.get("event") == "push"
+            and run.get("head_branch") == "main"
+            and isinstance(run.get("repository"), dict)
+            and run["repository"].get("full_name") == REPOSITORY
+            and isinstance(run.get("head_repository"), dict)
+            and run["head_repository"].get("full_name") == REPOSITORY
+        ):
+            matching.append(run)
+    if not matching:
+        raise ReleaseAdmissionDenied("canonical Validate push run is missing")
+    def order(run: dict[str, Any]) -> tuple[int, int]:
+        number, run_id = run.get("run_number"), run.get("id")
+        if type(number) is not int or number <= 0 or type(run_id) is not int:
+            raise ReleaseAdmissionDenied("canonical Validate run ordering is invalid")
+        return number, run_id
+    latest = max(matching, key=order)
+    run_id = latest["id"]
+    run, link = _github_json(f"{prefix}/actions/runs/{run_id}")
+    attempt, suite_id = run.get("run_attempt"), run.get("check_suite_id")
+    if (
+        link or run.get("id") != run_id
+        or run.get("workflow_id") != workflow_id
+        or run.get("path") != CANONICAL_WORKFLOW_PATH
+        or run.get("event") != "push"
+        or run.get("head_branch") != "main"
+        or not isinstance(run.get("repository"), dict)
+        or run["repository"].get("full_name") != REPOSITORY
+        or not isinstance(run.get("head_repository"), dict)
+        or run["head_repository"].get("full_name") != REPOSITORY
+        or run.get("head_sha") != target_head
+        or run.get("run_number") != latest.get("run_number")
+        or type(attempt) is not int or attempt <= 0
+        or attempt != latest.get("run_attempt")
+        or type(suite_id) is not int or suite_id <= 0
+        or suite_id != latest.get("check_suite_id")
+        or run.get("status") != "completed"
+        or run.get("conclusion") != "success"
+    ):
+        raise ReleaseAdmissionDenied("current canonical Validate run is not authenticated green")
+
+    jobs = _github_inventory(f"{prefix}/actions/runs/{run_id}/jobs?filter=all", "jobs")
+    selected: dict[str, dict[str, Any]] = {}
+    for job in jobs:
+        name = job.get("name")
         if name not in REQUIRED_CI_CHECKS:
             continue
-        app = check.get("app")
-        run_id = check.get("id")
+        job_attempt = job.get("run_attempt")
         if (
-            not isinstance(app, dict) or app.get("slug") != "github-actions"
-            or type(run_id) is not int or run_id <= 0
-            or check.get("head_sha") != target_head
+            job.get("run_id") != run_id
+            or job.get("head_sha") != target_head
+            or type(job_attempt) is not int or not 1 <= job_attempt <= attempt
         ):
-            raise ReleaseAdmissionDenied("required CI origin or commit mismatch")
-        previous = latest.get(name)
-        if previous is None or run_id > previous["id"]:
-            latest[name] = {
-                "name": name, "id": run_id, "status": check.get("status"),
-                "conclusion": check.get("conclusion"), "head_sha": target_head,
-            }
-        elif run_id == previous["id"]:
-            raise ReleaseAdmissionDenied("duplicate required CI identity")
-    if set(latest) != set(REQUIRED_CI_CHECKS):
-        raise ReleaseAdmissionDenied("required target-commit CI checks are missing")
-    if any(
-        check["status"] != "completed" or check["conclusion"] != "success"
-        for check in latest.values()
-    ):
-        raise ReleaseAdmissionDenied("required target-commit CI is not green")
-    ordered = [latest[name] for name in REQUIRED_CI_CHECKS]
-    return {"checks": ordered, "checks_sha256": _sha256_json(ordered)}
+            raise ReleaseAdmissionDenied("canonical Validate job binding is invalid")
+        previous = selected.get(name)
+        if previous is None or job_attempt > previous["run_attempt"]:
+            selected[name] = job
+        elif job_attempt == previous["run_attempt"]:
+            raise ReleaseAdmissionDenied("duplicate canonical Validate job identity")
+    if set(selected) != set(REQUIRED_CI_CHECKS):
+        raise ReleaseAdmissionDenied("required canonical Validate jobs are missing")
+
+    ordered = []
+    for name in REQUIRED_CI_CHECKS:
+        job = selected[name]
+        check_id = job["id"]
+        # The job ID is the Check-Run ID. Fetch it directly rather than
+        # enumerating unrelated checks on a busy commit (possibly >1,000).
+        check, link = _github_json(f"{prefix}/check-runs/{check_id}")
+        suite = check.get("check_suite") if isinstance(check, dict) else None
+        app = check.get("app") if isinstance(check, dict) else None
+        if (
+            job.get("check_run_url") != f"https://{GITHUB_HOST}{prefix}/check-runs/{check_id}"
+            or link or check.get("id") != check_id
+            or job.get("status") != "completed" or job.get("conclusion") != "success"
+            or not isinstance(check, dict)
+            or check.get("name") != name
+            or check.get("head_sha") != target_head
+            or check.get("status") != "completed" or check.get("conclusion") != "success"
+            or not isinstance(app, dict) or app.get("slug") != "github-actions"
+            or not isinstance(suite, dict) or suite.get("id") != suite_id
+        ):
+            raise ReleaseAdmissionDenied("required canonical Validate job/check provenance is not green")
+        ordered.append({
+            "name": name, "id": check_id, "head_sha": target_head,
+            "status": "completed", "conclusion": "success",
+            "workflow_id": workflow_id, "run_id": run_id,
+            "run_attempt": job["run_attempt"], "check_suite_id": suite_id,
+        })
+    workflow_identity = {
+        "id": workflow_id, "path": CANONICAL_WORKFLOW_PATH,
+        "run_id": run_id, "run_attempt": attempt,
+        "check_suite_id": suite_id, "event": "push", "head_branch": "main",
+        "head_repository": REPOSITORY, "head_sha": target_head,
+    }
+    return {
+        "checks": ordered,
+        "workflow": workflow_identity,
+        "checks_sha256": _sha256_json({"workflow": workflow_identity, "checks": ordered}),
+    }
 
 
 def validate_independent_release_review(
