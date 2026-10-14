@@ -849,7 +849,7 @@ class TaskSecurityRegressionTests(unittest.TestCase):
 
 
     def test_pending_terminalization_recovery_checks_per_task_scopes(self) -> None:
-        """A pending projection cannot commit under a targeted hard stop."""
+        """A targeted hard stop aborts recovery before any cursor or state writes."""
         task_id = self._start_claude()
         record = tasks._row_raw(task_id)
         scoped = {
@@ -868,40 +868,30 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         for field in scoped:
             with self.subTest(blocked_scope=field):
                 checks = []
+
                 def require(capability, **kwargs):
                     checks.append((capability, dict(kwargs)))
                     if kwargs.get(field) == scoped[field]:
                         raise PermissionError("blocked scoped terminalization")
+
                 with (
                     patch.object(
                         tasks.operator, "_require_operator_mutation",
                         side_effect=require,
                     ),
-                    patch.object(
-                        tasks, "_load_terminalization_recovery_cycle",
-                        return_value=None,
-                    ),
-                    patch.object(
-                        tasks.resources, "pending_task_terminalizations",
-                        return_value=page,
-                    ),
-                    patch.object(
-                        tasks, "_validate_terminalization_recovery_page",
-                    ),
-                    patch.object(
-                        tasks, "_save_terminalization_recovery_cycle",
-                    ),
-                    patch.object(
-                        tasks, "_apply_terminalization_projection",
-                        return_value={"task_id": task_id},
-                    ) as project,
+                    patch.object(tasks, "_load_terminalization_recovery_cycle", return_value=None),
+                    patch.object(tasks.resources, "pending_task_terminalizations", return_value=page),
+                    patch.object(tasks, "_validate_terminalization_recovery_page"),
+                    patch.object(tasks, "_save_terminalization_recovery_cycle") as save,
+                    patch.object(tasks, "_apply_terminalization_projection", return_value={"task_id": task_id}) as project,
+                    self.assertRaisesRegex(PermissionError, "blocked scoped terminalization"),
                 ):
-                    result = tasks._recover_pending_task_terminalizations()
+                    tasks._recover_pending_task_terminalizations()
                 self.assertTrue(checks)
                 self.assertEqual(checks[0], ("durable_job", scoped))
-                self.assertEqual(result["recovered"], [])
-                self.assertEqual(result["failed"][0]["error_type"], "PermissionError")
                 project.assert_not_called()
+                save.assert_not_called()
+
 
 
     def test_task_list_requires_mutation_gate_before_recovery(self) -> None:
@@ -1132,7 +1122,7 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         renew.assert_not_called()
 
     def test_pending_terminalization_recovery_uses_effective_legacy_owner(self) -> None:
-        """A legacy terminalization may not release a blocked effective owner."""
+        """Legacy NULL owner denial must fail closed before any cursor update."""
         task_id = self._start_claude()
         with tasks._database_connection() as connection:
             connection.execute("UPDATE tasks SET lease_owner_id=NULL WHERE task_id=?", (task_id,))
@@ -1152,13 +1142,82 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             patch.object(tasks, "_load_terminalization_recovery_cycle", return_value=None),
             patch.object(tasks.resources, "pending_task_terminalizations", return_value=page),
             patch.object(tasks, "_validate_terminalization_recovery_page"),
-            patch.object(tasks, "_save_terminalization_recovery_cycle"),
+            patch.object(tasks, "_save_terminalization_recovery_cycle") as save,
             patch.object(tasks, "_apply_terminalization_projection") as project,
+            self.assertRaisesRegex(PermissionError, "legacy recovery owner blocked"),
         ):
-            result = tasks._recover_pending_task_terminalizations()
-        self.assertEqual([], result["recovered"])
-        self.assertEqual("PermissionError", result["failed"][0]["error_type"])
+            tasks._recover_pending_task_terminalizations()
         project.assert_not_called()
+        save.assert_not_called()
+
+
+    def test_recovery_cursor_legacy_store_is_readonly_before_scoped_gate(self) -> None:
+        """Blocked legacy task-list must not migrate after denied cursor lookup."""
+        task_id, _ = self.fixtures._create_task_schema_version("2")
+        database = self.fixtures.database
+        before = database.read_bytes()
+        observed_versions = []
+        page = {
+            "terminalizations": [{"task_id": task_id}],
+            "examined": 1, "cycle_completed": True,
+            "cursor_after": None, "high_water": None,
+        }
+
+        def require(capability, **context):
+            if context.get("task_id") == task_id and context.get("path") == str(self.root):
+                with tasks._inventory_readonly_sqlite(database) as connection:
+                    version = tasks._task_schema_version(connection)
+                observed_versions.append(version)
+                if version != "2":
+                    raise AssertionError("recovery cursor migrated legacy task before scope gate")
+                raise PermissionError("legacy task recovery scoped blockade")
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation", side_effect=require),
+            patch.object(tasks.resources, "pending_task_terminalizations", return_value=page),
+            patch.object(tasks, "_validate_terminalization_recovery_page"),
+            patch.object(tasks, "_task_current_projection") as project_list,
+            patch.object(tasks, "_apply_terminalization_projection") as project,
+            self.assertRaisesRegex(PermissionError, "legacy task recovery scoped blockade"),
+        ):
+            tasks.grabowski_task_list(limit=1)
+        self.assertEqual(["2"], observed_versions)
+        project.assert_not_called()
+        project_list.assert_not_called()
+        self.assertEqual(before, database.read_bytes())
+        with tasks._inventory_readonly_sqlite(database) as connection:
+            self.assertEqual("2", tasks._task_schema_version(connection))
+        self.assertEqual([], self.fixtures._task_migration_backups())
+
+
+    def test_recovery_cursor_read_does_not_initialize_missing_store(self) -> None:
+        """A cursor lookup is not authority to create task database metadata."""
+        database = self.fixtures.database
+        self.assertFalse(database.exists())
+        self.assertIsNone(tasks._load_terminalization_recovery_cycle())
+        self.assertFalse(database.exists())
+
+    def test_recovery_cursor_read_does_not_repair_current_store_wal_or_mode(self) -> None:
+        """Even current-schema read may not chmod or recreate WAL before scoped checks."""
+        import sqlite3
+        import stat
+
+        self._start_claude()
+        database = tasks.TASK_DB
+        with sqlite3.connect(database) as connection:
+            self.assertEqual("delete", connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0])
+        self.assertFalse(tasks.Path(f"{database}-wal").exists())
+        database.chmod(0o640)
+        before = database.read_bytes()
+        try:
+            self.assertIsNone(tasks._load_terminalization_recovery_cycle())
+            self.assertEqual(before, database.read_bytes())
+            self.assertEqual(0o640, stat.S_IMODE(database.stat().st_mode))
+            self.assertFalse(tasks.Path(f"{database}-wal").exists())
+            with sqlite3.connect(database) as connection:
+                self.assertEqual("delete", connection.execute("PRAGMA journal_mode").fetchone()[0])
+        finally:
+            database.chmod(0o600)
 
     def test_revoked_running_task_lease_cannot_be_silently_reacquired(self) -> None:
         """A current unit observation is not authority to restore a lost lease.

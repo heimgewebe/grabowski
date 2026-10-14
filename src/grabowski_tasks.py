@@ -8334,11 +8334,37 @@ def _terminalization_recovery_position(
 
 
 def _load_terminalization_recovery_cycle() -> dict[str, Any] | None:
-    with _database_connection() as connection:
-        row = connection.execute(
-            "SELECT value FROM metadata WHERE key=?",
-            (TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,),
-        ).fetchone()
+    # The cursor is needed before per-task path/owner/host/service admission.
+    # _database() is NOT a read-only operation: it may initialize or migrate
+    # the store, create WAL/index metadata and chmod the database. Never open
+    # it while selecting tasks whose scoped mutation authority is unknown.
+    if TASK_DB.parent.is_symlink():
+        raise PermissionError("Task state directory may not be a symlink")
+    try:
+        database_status = TASK_DB.lstat()
+    except FileNotFoundError:
+        return None
+    if TASK_DB.is_symlink():
+        raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
+    if not stat.S_ISREG(database_status.st_mode):
+        raise PermissionError("Task database must be a regular file")
+    if database_status.st_size == 0:
+        return None
+    try:
+        with _inventory_readonly_sqlite(TASK_DB) as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,),
+            ).fetchone()
+    except sqlite3.DatabaseError as exc:
+        detail = str(exc).lower()
+        if "locked" in detail or "busy" in detail:
+            raise RuntimeError(
+                "Task database is busy; retry after the active writer completes"
+            ) from exc
+        raise RuntimeError(
+            "Task database is corrupt; restore a verified backup before retrying"
+        ) from exc
     if row is None:
         return None
     try:
@@ -8486,21 +8512,21 @@ def _recover_pending_task_terminalizations(
     failed: list[dict[str, str]] = []
     for terminalization in page["terminalizations"]:
         task_id = str(terminalization["task_id"])
+        # A denied or unresolvable scope must abort before cursor persistence
+        # or the subsequent task-list store read. Catching this denial as a
+        # per-item recovery failure would still migrate/chmod/create WAL in
+        # _save_terminalization_recovery_cycle(), bypassing the scoped stop.
+        task_record = _row_scope_identity_readonly(task_id)
+        operator._require_operator_mutation(
+            "durable_job",
+            path=task_record["cwd"],
+            repo=task_record["cwd"],
+            task_id=task_record["task_id"],
+            owner_id=task_record.get("lease_owner_id") or _lease_owner(task_id),
+            service=_authoritative_unit(task_record),
+            host=task_record["host"],
+        )
         try:
-            # Recovery is a durable state mutation even when entered from
-            # task_list. An initial global mutation gate cannot match scoped
-            # path/owner/host/service hard stops. Bind it to the live row
-            # before any terminalization projection or lifecycle receipt.
-            task_record = _row_scope_identity_readonly(task_id)
-            operator._require_operator_mutation(
-                "durable_job",
-                path=task_record["cwd"],
-                repo=task_record["cwd"],
-                task_id=task_record["task_id"],
-                owner_id=task_record.get("lease_owner_id") or _lease_owner(task_id),
-                service=_authoritative_unit(task_record),
-                host=task_record["host"],
-            )
             updated = _apply_terminalization_projection(
                 terminalization,
                 recovered=True,
