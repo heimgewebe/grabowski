@@ -276,7 +276,21 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
         }
         failure = RuntimeError("operator audit unavailable")
         failure.authority_result = authority
+        # This legacy scenario exercises scheduler/observer failure handling
+        # under a synthetic, already-admitted release; do not weaken the
+        # real release-origin gate tested in test_grips_runtime_deploy.py.
         with patch.object(
+            SELF_DEPLOY, "_require_release_source_admission",
+            return_value={
+                "status": "already-serving-exact-source",
+                "serving_repo_head": expected,
+                "target_repo_head": expected,
+                "independent_review_required": False,
+            },
+        ), patch.object(
+            SELF_DEPLOY, "_require_release_source_admission_under_lease",
+            side_effect=lambda head: SELF_DEPLOY._require_release_source_admission(head),
+        ), patch.object(
             SELF_DEPLOY,
             "_deployment_source_preflight",
             return_value=(repo, runner, identity),
@@ -425,7 +439,21 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
             "attested_head": expected,
             "effect_started": False,
         }
+        # This legacy scenario exercises scheduler/observer failure handling
+        # under a synthetic, already-admitted release; do not weaken the
+        # real release-origin gate tested in test_grips_runtime_deploy.py.
         with patch.object(
+            SELF_DEPLOY, "_require_release_source_admission",
+            return_value={
+                "status": "already-serving-exact-source",
+                "serving_repo_head": expected,
+                "target_repo_head": expected,
+                "independent_review_required": False,
+            },
+        ), patch.object(
+            SELF_DEPLOY, "_require_release_source_admission_under_lease",
+            side_effect=lambda head: SELF_DEPLOY._require_release_source_admission(head),
+        ), patch.object(
             SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical
         ), patch.object(
             SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
@@ -828,7 +856,7 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
         evidence = raised.exception.local_mutation_evidence
         self.assertEqual(
             evidence["kind"],
-            "grabowski_runtime_deploy_origin_main_fetch_effect",
+            "grabowski_runtime_deploy_origin_main_refresh_fetch_effect",
         )
         self.assertEqual(
             evidence["target_object"],
@@ -1066,7 +1094,21 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
             "origin_main": "b" * 40,
             "clean": True,
         }
+        # This legacy scenario exercises scheduler/observer failure handling
+        # under a synthetic, already-admitted release; do not weaken the
+        # real release-origin gate tested in test_grips_runtime_deploy.py.
         with patch.object(
+            SELF_DEPLOY, "_require_release_source_admission",
+            return_value={
+                "status": "already-serving-exact-source",
+                "serving_repo_head": expected,
+                "target_repo_head": expected,
+                "independent_review_required": False,
+            },
+        ), patch.object(
+            SELF_DEPLOY, "_require_release_source_admission_under_lease",
+            side_effect=lambda head: SELF_DEPLOY._require_release_source_admission(head),
+        ), patch.object(
             SELF_DEPLOY,
             "_deployment_source_preflight",
             side_effect=[RuntimeError("canonical source needs refresh")],
