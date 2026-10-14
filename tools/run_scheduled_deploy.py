@@ -237,12 +237,34 @@ def emit(phase: str, **fields: Any) -> None:
     print(json.dumps({"timestamp_unix": int(time.time()), "phase": phase, **fields}, ensure_ascii=False, sort_keys=True), flush=True)
 
 
-def git_environment() -> dict[str, str]:
-    environment = dict(os.environ)
-    environment.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat", "PAGER": "cat", "NO_COLOR": "1"})
-    for key in ("GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_ASKPASS", "SSH_ASKPASS"):
-        environment.pop(key, None)
+def _hermetic_git_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Bind all worker Git reads and validation children to their checkout.
+
+    Inherited Git variables can redirect the index/object store, inject
+    configuration, apply replacement commits or trigger lazy network reads.
+    Even read-only preflight and validation must not trust that ambient state.
+    This is Git-process isolation, *not* Captain or release authorization.
+    """
+    for key in tuple(environment):
+        if key.startswith("GIT_"):
+            environment.pop(key, None)
+    environment.pop("SSH_ASKPASS", None)
+    environment.update({
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+        "NO_COLOR": "1",
+    })
     return environment
+
+
+def git_environment() -> dict[str, str]:
+    return _hermetic_git_environment(dict(os.environ))
 
 
 def child_environment() -> dict[str, str]:
@@ -947,16 +969,7 @@ def wait_for_deployment_window(
 
 
 def _validation_environment(validation_root: Path) -> dict[str, str]:
-    environment = deploy_core.pip_env()
-    environment.update(
-        {
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_PAGER": "cat",
-            "PAGER": "cat",
-            "NO_COLOR": "1",
-        }
-    )
+    environment = _hermetic_git_environment(deploy_core.pip_env())
     for key in (
         "GIT_EXTERNAL_DIFF",
         "GIT_DIFF_OPTS",
