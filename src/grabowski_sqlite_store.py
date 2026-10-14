@@ -639,7 +639,6 @@ def inventory_native_wal_readonly_sqlite(
                 connection.close()
 
 
-
 def sqlite_integrity(
     connection: sqlite3.Connection,
     label: str,
