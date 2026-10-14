@@ -135,157 +135,6 @@ def readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
         connection.close()
 
 
-@contextmanager
-def inventory_readonly_sqlite(
-    path: Path,
-    *,
-    temporary_prefix: str,
-    error_type: type[ChangedError],
-    message: str = INVENTORY_CHANGED_MESSAGE,
-) -> Iterator[sqlite3.Connection]:
-    wal_path = Path(str(path) + "-wal")
-    wal_present = wal_path.exists() or wal_path.is_symlink()
-    if not wal_present:
-        before_identity = file_identity(path)
-        connection = sqlite3.connect(
-            path.absolute().as_uri() + "?mode=ro&immutable=1",
-            uri=True,
-            timeout=1,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only=ON")
-        try:
-            yield connection
-        finally:
-            connection.close()
-            assert_identity(
-                path,
-                before_identity,
-                error_type=error_type,
-                message=message,
-            )
-            if wal_path.exists() or wal_path.is_symlink():
-                raise _changed(error_type, message)
-        return
-
-    with tempfile.TemporaryDirectory(prefix=temporary_prefix) as temporary_directory:
-        snapshot = Path(temporary_directory) / path.name
-        snapshot_wal = Path(str(snapshot) + "-wal")
-        database_identity = copy_regular_file(
-            path,
-            snapshot,
-            error_type=error_type,
-            message=message,
-        )
-        wal_identity = copy_regular_file(
-            wal_path,
-            snapshot_wal,
-            error_type=error_type,
-            message=message,
-        )
-        connection = sqlite3.connect(snapshot, timeout=1)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only=ON")
-        try:
-            yield connection
-        finally:
-            connection.close()
-            assert_identity(
-                path,
-                database_identity,
-                error_type=error_type,
-                message=message,
-            )
-            assert_identity(
-                wal_path,
-                wal_identity,
-                error_type=error_type,
-                message=message,
-            )
-
-
-@contextmanager
-def inventory_native_wal_readonly_sqlite(
-    path: Path,
-    *,
-    error_type: type[ChangedError],
-    message: str = INVENTORY_CHANGED_MESSAGE,
-) -> Iterator[sqlite3.Connection]:
-    """Read one SQLite WAL transaction, never copy moving WAL bytes.
-
-    Only internal checkout admission uses this mode. A pinned SQLite read
-    transaction gives a consistent table image while legitimate WAL writers
-    continue. All source filenames must already exist as ordinary, singly
-    linked files inside a private directory; SQLite must not create -shm.
-    This is not a same-UID hostile-path-swap or privileged issuer boundary.
-    """
-    path = path.absolute()
-    directory = path.parent
-    wal = Path(str(path) + "-wal")
-    shm = Path(str(path) + "-shm")
-
-    def identity(file: Path, *, directory_entry: bool = False) -> tuple[int, int, int, int]:
-        try:
-            info = os.lstat(file)
-        except OSError as exc:
-            raise _changed(error_type, message, cause=exc)
-        correct_type = (
-            stat.S_ISDIR(info.st_mode)
-            if directory_entry
-            else stat.S_ISREG(info.st_mode)
-        )
-        if (
-            not correct_type
-            or info.st_uid != os.geteuid()
-            or info.st_mode & 0o022
-            or (not directory_entry and info.st_nlink != 1)
-        ):
-            raise _changed(error_type, message)
-        return (info.st_dev, info.st_ino, info.st_uid, info.st_nlink)
-
-    if directory.resolve(strict=True) != directory:
-        raise _changed(error_type, message)
-    original = {
-        directory: identity(directory, directory_entry=True),
-        path: identity(path),
-        wal: identity(wal),
-        shm: identity(shm),
-    }
-
-    def assert_origin() -> None:
-        for filename, expected in original.items():
-            if identity(
-                filename, directory_entry=(filename == directory),
-            ) != expected:
-                raise _changed(error_type, message)
-
-    connection: sqlite3.Connection | None = None
-    try:
-        connection = sqlite3.connect(
-            path.as_uri() + "?mode=ro", uri=True, timeout=1,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only=ON")
-        connection.execute("PRAGMA trusted_schema=OFF")
-        if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
-            raise _changed(error_type, message)
-        assert_origin()
-        connection.execute("BEGIN")
-        # BEGIN is lazy: read sqlite_master now to pin one WAL snapshot before
-        # returning control to the caller's multi-statement inventory.
-        connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
-        yield connection
-        assert_origin()
-    except sqlite3.Error as exc:
-        raise _changed(error_type, message, cause=exc)
-    finally:
-        if connection is not None:
-            try:
-                connection.rollback()
-            finally:
-                connection.close()
-
-
 # Pre-admission inspection is not permitted to create a host WAL/SHM/tempfile.
 # SQLite parsing, schema evaluation, and all queries remain in the constrained
 # child. No SQL from the inspected database is ever executed by the host.
@@ -637,6 +486,157 @@ def preauthorization_readonly_sqlite(
             observed = os.lstat(path.parent)
             if (observed.st_dev, observed.st_ino) != parent_identity:
                 raise _changed(error_type, INVENTORY_CHANGED_MESSAGE)
+
+
+@contextmanager
+def inventory_readonly_sqlite(
+    path: Path,
+    *,
+    temporary_prefix: str,
+    error_type: type[ChangedError],
+    message: str = INVENTORY_CHANGED_MESSAGE,
+) -> Iterator[sqlite3.Connection]:
+    wal_path = Path(str(path) + "-wal")
+    wal_present = wal_path.exists() or wal_path.is_symlink()
+    if not wal_present:
+        before_identity = file_identity(path)
+        connection = sqlite3.connect(
+            path.absolute().as_uri() + "?mode=ro&immutable=1",
+            uri=True,
+            timeout=1,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        try:
+            yield connection
+        finally:
+            connection.close()
+            assert_identity(
+                path,
+                before_identity,
+                error_type=error_type,
+                message=message,
+            )
+            if wal_path.exists() or wal_path.is_symlink():
+                raise _changed(error_type, message)
+        return
+
+    with tempfile.TemporaryDirectory(prefix=temporary_prefix) as temporary_directory:
+        snapshot = Path(temporary_directory) / path.name
+        snapshot_wal = Path(str(snapshot) + "-wal")
+        database_identity = copy_regular_file(
+            path,
+            snapshot,
+            error_type=error_type,
+            message=message,
+        )
+        wal_identity = copy_regular_file(
+            wal_path,
+            snapshot_wal,
+            error_type=error_type,
+            message=message,
+        )
+        connection = sqlite3.connect(snapshot, timeout=1)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        try:
+            yield connection
+        finally:
+            connection.close()
+            assert_identity(
+                path,
+                database_identity,
+                error_type=error_type,
+                message=message,
+            )
+            assert_identity(
+                wal_path,
+                wal_identity,
+                error_type=error_type,
+                message=message,
+            )
+
+
+@contextmanager
+def inventory_native_wal_readonly_sqlite(
+    path: Path,
+    *,
+    error_type: type[ChangedError],
+    message: str = INVENTORY_CHANGED_MESSAGE,
+) -> Iterator[sqlite3.Connection]:
+    """Read one SQLite WAL transaction, never copy moving WAL bytes.
+
+    Only internal checkout admission uses this mode. A pinned SQLite read
+    transaction gives a consistent table image while legitimate WAL writers
+    continue. All source filenames must already exist as ordinary, singly
+    linked files inside a private directory; SQLite must not create -shm.
+    This is not a same-UID hostile-path-swap or privileged issuer boundary.
+    """
+    path = path.absolute()
+    directory = path.parent
+    wal = Path(str(path) + "-wal")
+    shm = Path(str(path) + "-shm")
+
+    def identity(file: Path, *, directory_entry: bool = False) -> tuple[int, int, int, int]:
+        try:
+            info = os.lstat(file)
+        except OSError as exc:
+            raise _changed(error_type, message, cause=exc)
+        correct_type = (
+            stat.S_ISDIR(info.st_mode)
+            if directory_entry
+            else stat.S_ISREG(info.st_mode)
+        )
+        if (
+            not correct_type
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022
+            or (not directory_entry and info.st_nlink != 1)
+        ):
+            raise _changed(error_type, message)
+        return (info.st_dev, info.st_ino, info.st_uid, info.st_nlink)
+
+    if directory.resolve(strict=True) != directory:
+        raise _changed(error_type, message)
+    original = {
+        directory: identity(directory, directory_entry=True),
+        path: identity(path),
+        wal: identity(wal),
+        shm: identity(shm),
+    }
+
+    def assert_origin() -> None:
+        for filename, expected in original.items():
+            if identity(
+                filename, directory_entry=(filename == directory),
+            ) != expected:
+                raise _changed(error_type, message)
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            path.as_uri() + "?mode=ro", uri=True, timeout=1,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA trusted_schema=OFF")
+        if connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+            raise _changed(error_type, message)
+        assert_origin()
+        connection.execute("BEGIN")
+        # BEGIN is lazy: read sqlite_master now to pin one WAL snapshot before
+        # returning control to the caller's multi-statement inventory.
+        connection.execute("SELECT name FROM sqlite_master LIMIT 1").fetchall()
+        yield connection
+        assert_origin()
+    except sqlite3.Error as exc:
+        raise _changed(error_type, message, cause=exc)
+    finally:
+        if connection is not None:
+            try:
+                connection.rollback()
+            finally:
+                connection.close()
 
 
 
