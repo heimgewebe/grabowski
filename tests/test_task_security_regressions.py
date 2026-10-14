@@ -1274,6 +1274,98 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             self.assertEqual("2", tasks.resources._resource_schema_version(connection))
         self.assertEqual(before, database.read_bytes())
 
+    def test_recovery_projection_service_scopes_are_authorized_before_write(self) -> None:
+        """Recovery cannot project a successor unit blocked by a service hard stop."""
+        transition = self.fixtures._prepare_pending_terminalization()
+        task_id = str(transition["task_id"])
+        record = tasks._row_raw(task_id)
+        current_unit = tasks._authoritative_unit(record)
+        successor_unit = tasks._task_unit(task_id, int(record["attempt"]) + 1)
+        self.assertNotEqual(successor_unit, current_unit)
+        for changed_field in ("unit", "authoritative_unit"):
+            with self.subTest(projected_field=changed_field):
+                projected = dict(transition["task_projection"])
+                projected[changed_field] = successor_unit
+                page = {
+                    "terminalizations": [{**transition, "task_projection": projected}],
+                    "examined": 1,
+                    "cycle_completed": True,
+                    "cursor_after": None,
+                    "high_water": None,
+                }
+                checked = []
+
+                def authorize(_capability, **context):
+                    checked.append(context.get("service"))
+                    if context.get("service") == successor_unit:
+                        raise PermissionError("projected service blockade")
+
+                with (
+                    patch.object(tasks.operator, "_require_operator_mutation", side_effect=authorize),
+                    patch.object(tasks.resources, "pending_task_terminalizations", return_value=page),
+                    patch.object(tasks, "_save_terminalization_recovery_cycle") as save,
+                    patch.object(tasks, "_apply_terminalization_projection") as project,
+                    self.assertRaisesRegex(PermissionError, "projected service blockade"),
+                ):
+                    tasks._recover_pending_task_terminalizations(limit=1)
+                self.assertIn(current_unit, checked)
+                self.assertIn(successor_unit, checked)
+                project.assert_not_called()
+                save.assert_not_called()
+
+    def test_pending_resource_wal_preflight_does_not_create_host_tempfiles(self) -> None:
+        """A scoped-denied WAL page must be read with zero host temp snapshots."""
+        import sqlite3
+        from unittest.mock import patch
+
+        pending = self.fixtures._prepare_pending_terminalization()
+        task_id = str(pending["task_id"])
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            self.assertEqual(
+                "wal", writer.execute("PRAGMA journal_mode").fetchone()[0]
+            )
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                ("wal_reader_kernel_probe", "snapshot"),
+            )
+            wal = tasks.Path(str(database) + "-wal")
+            self.assertTrue(wal.exists())
+            self.assertGreater(wal.stat().st_size, 32)
+            before = {
+                path.name: (path.stat().st_mode, path.stat().st_size,
+                            path.stat().st_mtime_ns, path.read_bytes())
+                for path in database.parent.iterdir() if path.is_file()
+            }
+
+            def deny_scope(_capability, **context):
+                if context.get("task_id") == task_id:
+                    raise PermissionError("resource WAL pending scope blocked")
+
+            with (
+                patch.object(
+                    tasks.resources.sqlite_store.tempfile, "TemporaryDirectory",
+                    side_effect=AssertionError("unauthorized host tempfile created"),
+                ),
+                patch.object(
+                    tasks.operator, "_require_operator_mutation",
+                    side_effect=deny_scope,
+                ),
+                self.assertRaisesRegex(
+                    PermissionError, "resource WAL pending scope blocked"
+                ),
+            ):
+                tasks._recover_pending_task_terminalizations(limit=1)
+            after = {
+                path.name: (path.stat().st_mode, path.stat().st_size,
+                            path.stat().st_mtime_ns, path.read_bytes())
+                for path in database.parent.iterdir() if path.is_file()
+            }
+            self.assertEqual(before, after)
+        finally:
+            writer.close()
+
     def test_recovery_batch_preflights_later_denial_before_earlier_projection(self) -> None:
         """A second blocked task must not permit the first task's durable effects."""
         pending = [
@@ -1308,6 +1400,169 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 tasks.resources.task_terminalization_record(task_id)["phase"],
             )
 
+
+    def test_pending_resource_wal_snapshot_includes_uncheckpointed_task_journal(self) -> None:
+        """A zero-host-write snapshot must not silently ignore valid WAL-only rows."""
+        import sqlite3
+
+        self._start_claude()  # Initialize current resource schema and checkpoint it.
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            self.assertEqual("wal", writer.execute("PRAGMA journal_mode").fetchone()[0])
+            self.assertGreaterEqual(writer.execute("SELECT COUNT(*) FROM metadata").fetchone()[0], 1)
+            pending = self.fixtures._prepare_pending_terminalization()
+            task_id = str(pending["task_id"])
+            wal = tasks.Path(str(database) + "-wal")
+            self.assertTrue(wal.exists())
+            self.assertGreater(wal.stat().st_size, 32)
+
+            with sqlite3.connect(
+                database.absolute().as_uri() + "?mode=ro&immutable=1",
+                uri=True,
+            ) as stale:
+                self.assertIsNone(
+                    stale.execute(
+                        "SELECT task_id FROM task_terminalizations WHERE task_id=?",
+                        (task_id,),
+                    ).fetchone(),
+                    "positive fixture must really contain an uncheckpointed WAL row",
+                )
+            with patch.object(
+                tasks.resources.sqlite_store.tempfile,
+                "TemporaryDirectory",
+                side_effect=AssertionError("WAL snapshot wrote to host tmp"),
+            ):
+                page = tasks.resources.pending_task_terminalizations(limit=10)
+            self.assertIn(task_id, [row["task_id"] for row in page["terminalizations"]])
+        finally:
+            writer.close()
+
+    def test_missing_wal_kernel_sandbox_fails_closed_without_store_mutation(self) -> None:
+        """No bwrap means denial; a pre-gate WAL read may not silently fall back."""
+        import sqlite3
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                ("wal_missing_bwrap_probe", "1"),
+            )
+            self.assertTrue(tasks.Path(str(database) + "-wal").exists())
+            before = database.read_bytes()
+            with patch.object(
+                tasks.resources.sqlite_store.subprocess,
+                "Popen",
+                side_effect=FileNotFoundError("fake bwrap missing"),
+            ):
+                with self.assertRaises(tasks.resources.ResourceSchemaInventoryChanged):
+                    tasks.resources.pending_task_terminalizations(limit=1)
+            self.assertEqual(before, database.read_bytes())
+        finally:
+            writer.close()
+
+    def test_wal_snapshot_helper_uses_private_network_and_file_only_mounts(self) -> None:
+        """The actual helper launch exposes no host network or DB siblings."""
+        import sqlite3
+        import subprocess
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                ("wal_helper_kernel_isolation_probe", "1"),
+            )
+            original_popen = subprocess.Popen
+            with patch.object(
+                tasks.resources.sqlite_store.subprocess,
+                "Popen", wraps=original_popen,
+            ) as launch:
+                tasks.resources.pending_task_terminalizations(limit=1)
+            self.assertTrue(launch.called)
+            argv = launch.call_args.args[0]
+            self.assertIn("--unshare-net", argv)
+            self.assertIn("--tmpfs", argv)
+            self.assertIn("/snapshot", argv)
+            self.assertNotIn(str(database.parent.absolute()), argv)
+            self.assertIn(str(database.absolute()), argv)
+            self.assertIn(str(tasks.Path(str(database) + "-wal").absolute()), argv)
+            self.assertEqual(argv[-1], "/snapshot/input.db")
+        finally:
+            writer.close()
+
+    def test_wal_snapshot_output_limit_fails_closed(self) -> None:
+        """Even an oversized valid SQLite dump may not escape the output cap."""
+        import sqlite3
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                ("wal_helper_oversized_probe", "x" * 4096),
+            )
+            before = database.read_bytes()
+            with patch.object(
+                tasks.resources.sqlite_store,
+                "_PREAUTH_WAL_MAX_DUMP_BYTES", 256,
+            ):
+                with self.assertRaises(tasks.resources.ResourceSchemaInventoryChanged):
+                    tasks.resources.pending_task_terminalizations(limit=1)
+            self.assertEqual(before, database.read_bytes())
+        finally:
+            writer.close()
+
+    def test_task_wal_cursor_and_scope_preflight_never_copy_to_host_tmp(self) -> None:
+        """Both task recovery cursor and status identity must read WAL without host writes."""
+        import sqlite3
+
+        task_id = self._start_claude()
+        database = self.fixtures.database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            self.assertEqual("wal", writer.execute("PRAGMA journal_mode").fetchone()[0])
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                ("task_wal_kernel_snapshot_probe", "1"),
+            )
+            wal = tasks.Path(str(database) + "-wal")
+            self.assertTrue(wal.exists())
+            self.assertGreater(wal.stat().st_size, 32)
+            before = {
+                path.name: (path.stat().st_size, path.stat().st_mtime_ns, path.read_bytes())
+                for path in database.parent.iterdir() if path.is_file()
+            }
+
+            def deny(_capability, **scope):
+                if scope.get("task_id") == task_id and scope.get("path") == str(self.root):
+                    raise PermissionError("WAL task status scoped blockade")
+
+            with patch.object(
+                tasks.sqlite_store.tempfile,
+                "TemporaryDirectory",
+                side_effect=AssertionError("preauthorization task WAL host tmp write"),
+            ):
+                self.assertIsNone(tasks._load_terminalization_recovery_cycle())
+                with (
+                    patch.object(tasks.operator, "_require_operator_mutation", side_effect=deny),
+                    self.assertRaisesRegex(
+                        PermissionError, "WAL task status scoped blockade"
+                    ),
+                ):
+                    tasks.grabowski_task_status(task_id)
+            after = {
+                path.name: (path.stat().st_size, path.stat().st_mtime_ns, path.read_bytes())
+                for path in database.parent.iterdir() if path.is_file()
+            }
+            self.assertEqual(before, after)
+        finally:
+            writer.close()
 
     def test_recovery_cursor_legacy_store_is_readonly_before_scoped_gate(self) -> None:
         """Blocked legacy task-list must not migrate after denied cursor lookup."""

@@ -4034,7 +4034,9 @@ def _pending_terminalization_readonly_connection() -> Iterator[sqlite3.Connectio
         yield None
         return
     try:
-        with _resource_inventory_readonly_sqlite(RESOURCE_DB) as connection:
+        with sqlite_store.preauthorization_readonly_sqlite(
+            RESOURCE_DB, error_type=ResourceSchemaInventoryChanged
+        ) as connection:
             version = _resource_schema_version(connection)
             if version == "1":
                 # Schema 1 has no terminalization journal. Inspect its actual

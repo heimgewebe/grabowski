@@ -8128,7 +8128,8 @@ def _row_scope_identity_readonly(task_id: str) -> dict[str, Any]:
 
     _row_raw uses _database(), which may migrate the schema, create WAL and
     indexes, or chmod files before a scoped blockade has been checked. The
-    inventory reader uses immutable read-only access (or a verified WAL copy)
+    authority reader uses immutable access or an isolated read-only WAL
+    snapshot without any host temporary files
     and rejects changed source identities without opening a write connection.
     """
     identifier = _validate_task_id(task_id)
@@ -8136,7 +8137,9 @@ def _row_scope_identity_readonly(task_id: str) -> dict[str, Any]:
         raise PermissionError(f"Task state directory may not be a symlink: {TASK_DB.parent}")
     if TASK_DB.is_symlink():
         raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
-    with _inventory_readonly_sqlite(TASK_DB) as connection:
+    with sqlite_store.preauthorization_readonly_sqlite(
+        TASK_DB, error_type=TaskSchemaInventoryChanged
+    ) as connection:
         row = connection.execute(
             "SELECT * FROM tasks WHERE task_id=?", (identifier,)
         ).fetchone()
@@ -8351,7 +8354,9 @@ def _load_terminalization_recovery_cycle() -> dict[str, Any] | None:
     if database_status.st_size == 0:
         return None
     try:
-        with _inventory_readonly_sqlite(TASK_DB) as connection:
+        with sqlite_store.preauthorization_readonly_sqlite(
+            TASK_DB, error_type=TaskSchemaInventoryChanged
+        ) as connection:
             row = connection.execute(
                 "SELECT value FROM metadata WHERE key=?",
                 (TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,),
@@ -8515,15 +8520,35 @@ def _recover_pending_task_terminalizations(
     for terminalization in page["terminalizations"]:
         task_id = str(terminalization["task_id"])
         task_record = _row_scope_identity_readonly(task_id)
+        # Deny the already-persisted scope before inspecting any untrusted
+        # projection. A denied identity must win over malformed journal data.
+        persisted_service = _authoritative_unit(task_record)
+        admission = {
+            "path": task_record["cwd"],
+            "repo": task_record["cwd"],
+            "task_id": task_record["task_id"],
+            "owner_id": task_record.get("lease_owner_id") or _lease_owner(task_id),
+            "host": task_record["host"],
+        }
         operator._require_operator_mutation(
-            "durable_job",
-            path=task_record["cwd"],
-            repo=task_record["cwd"],
-            task_id=task_record["task_id"],
-            owner_id=task_record.get("lease_owner_id") or _lease_owner(task_id),
-            service=_authoritative_unit(task_record),
-            host=task_record["host"],
+            "durable_job", service=persisted_service, **admission
         )
+        projection = terminalization.get("task_projection")
+        if not isinstance(projection, dict) or projection.get("task_id") != task_id:
+            raise RuntimeError("Task terminalization projection identity is invalid")
+        # A crashed resume may project a successor unit. Authorize both its
+        # unit and authoritative_unit before the first page-wide mutation.
+        projected_services = (
+            _validate_unit(projection["unit"]),
+            _validate_unit(projection["authoritative_unit"]),
+        )
+        checked_services = {persisted_service}
+        for service in projected_services:
+            if service not in checked_services:
+                checked_services.add(service)
+                operator._require_operator_mutation(
+                    "durable_job", service=service, **admission
+                )
     recovered: list[str] = []
     failed: list[dict[str, str]] = []
     for terminalization in page["terminalizations"]:
