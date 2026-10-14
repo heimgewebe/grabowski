@@ -313,9 +313,15 @@ def authorize_pair(
         repobrief.get("manifest"), str
     ):
         raise core.PreflightError("live Codex treatment manifest is unavailable")
+    # Resolve launcher aliases before the mount gate; the provider binding
+    # is checked again afterwards and must name this same canonical target.
+    try:
+        resolved_codex = Path(codex_command).resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise core.PreflightError("live Codex launcher resolution failed") from exc
     codex_runner.validate_live_immutable_mounts(
         source=source,
-        codex=Path(codex_command),
+        codex=resolved_codex,
         request_root=request_root,
         repository_map=repository_map,
         manifest=Path(repobrief["manifest"]),
@@ -327,6 +333,10 @@ def authorize_pair(
     provider_binding = _validated_codex_provider_binding(
         codex_command, codex_command_sha256
     )
+    if provider_binding.get("codex", {}).get("path") != str(resolved_codex):
+        raise core.PreflightError(
+            "live Codex launcher identity changed after mount check"
+        )
     return core.authorize_dispatch(
         pair_id=pair_id,
         request_root=request_root,

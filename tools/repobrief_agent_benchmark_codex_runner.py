@@ -48,6 +48,94 @@ ENTRYPOINT_BOOTSTRAP_NAME = "repobrief_agent_benchmark_source_bootstrap.py"
 ENTRYPOINT_BOOTSTRAP_PATH = Path(__file__).with_name(ENTRYPOINT_BOOTSTRAP_NAME)
 MCP_PROXY_PYTHON_LINK = Path("/usr/bin/python3")
 
+# Immutable inline child bootstrap. Only the provider subprocess receives this
+# inheritable kernel syscall filter; the trusted runner may still attest root
+# systemd through the authenticated system bus before irreversible dispatch.
+_UNIX_SOCKET_DENY_CHILD_PROGRAM = """# This isolated Python process installs seccomp before exec'ing Codex.
+# An RO filesystem bind does NOT prevent connecting to a privileged Unix socket.
+import ctypes
+import errno
+import os
+import socket
+import stat
+import sys
+
+def deny_unix():
+    library = "/lib/x86_64-linux-gnu/libseccomp.so.2"
+    binary = os.path.realpath(library)
+    info = os.stat(binary)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or
+            (stat.S_IMODE(info.st_mode) & 0o022)):
+        raise RuntimeError("untrusted kernel socket filter library")
+    seccomp = ctypes.CDLL(library, use_errno=True)
+    class Compare(ctypes.Structure):
+        _fields_ = [
+            ("arg", ctypes.c_uint), ("op", ctypes.c_int),
+            ("datum_a", ctypes.c_ulonglong), ("datum_b", ctypes.c_ulonglong),
+        ]
+    seccomp.seccomp_init.argtypes = [ctypes.c_uint32]
+    seccomp.seccomp_init.restype = ctypes.c_void_p
+    seccomp.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    seccomp.seccomp_syscall_resolve_name.restype = ctypes.c_int
+    seccomp.seccomp_rule_add.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint,
+    ]
+    seccomp.seccomp_rule_add.restype = ctypes.c_int
+    seccomp.seccomp_load.argtypes = [ctypes.c_void_p]
+    seccomp.seccomp_load.restype = ctypes.c_int
+    seccomp.seccomp_release.argtypes = [ctypes.c_void_p]
+    context = seccomp.seccomp_init(0x7fff0000)  # SCMP_ACT_ALLOW
+    if not context:
+        raise RuntimeError("unable to allocate kernel socket filter")
+    try:
+        error_action = 0x00050000 | errno.EPERM  # SCMP_ACT_ERRNO(EPERM)
+        for name in (b"socket", b"socketpair"):
+            syscall = seccomp.seccomp_syscall_resolve_name(name)
+            if syscall < 0 or seccomp.seccomp_rule_add(
+                context, error_action, syscall, 1,
+                Compare(0, 4, socket.AF_UNIX, 0),  # SCMP_CMP_EQ(arg0)
+            ) != 0:
+                raise RuntimeError("unable to deny Unix socket creation")
+        # io_uring can submit socket/connect ops without the socket syscall.
+        for name in (b"io_uring_setup", b"io_uring_enter", b"io_uring_register"):
+            syscall = seccomp.seccomp_syscall_resolve_name(name)
+            if syscall < 0 or seccomp.seccomp_rule_add(
+                context, error_action, syscall, 0,
+            ) != 0:
+                raise RuntimeError("unable to deny io_uring socket bypass")
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.argtypes = [
+            ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.c_ulong, ctypes.c_ulong,
+        ]
+        libc.prctl.restype = ctypes.c_int
+        if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
+            raise RuntimeError("kernel no-new-privileges unavailable")
+        if seccomp.seccomp_load(context) != 0:
+            raise RuntimeError("kernel Unix socket filter unavailable")
+    finally:
+        seccomp.seccomp_release(context)
+    # Verify effective kernel behavior before invoking any Codex bytes.
+    for create in (
+        lambda: socket.socket(socket.AF_UNIX, socket.SOCK_STREAM),
+        lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM),
+    ):
+        try:
+            created = create()
+        except OSError as exc:
+            if exc.errno != errno.EPERM:
+                raise RuntimeError("kernel Unix socket filter not enforced") from exc
+        else:
+            for item in created if isinstance(created, tuple) else (created,):
+                item.close()
+            raise RuntimeError("kernel Unix socket filter not enforced")
+
+if not sys.argv[1:] or not os.path.isabs(sys.argv[1]):
+    raise RuntimeError("Codex child executable must be absolute")
+deny_unix()
+os.execve(sys.argv[1], sys.argv[1:], os.environ)
+"""
+
 
 def _open_absolute_regular_nofollow(path: Path, *, label: str) -> int:
     requested = path.expanduser()
@@ -741,6 +829,24 @@ def _validated_mcp_proxy_python(
     return validated
 
 
+def _unix_socket_restricted_codex_argv(command: Sequence[str]) -> list[str]:
+    """Wrap an authorized Codex executable with a fail-closed seccomp exec.
+
+    A DynamicUser and read-only mounts cannot prevent privileged AF_UNIX RPC.
+    The root-owned Python interpreter applies a kernel-enforced, exec-inherited
+    AF_UNIX and io_uring denial before Codex (or its descendants) run.
+    """
+    if (
+        not command
+        or not isinstance(command[0], str)
+        or not Path(command[0]).is_absolute()
+        or any(not isinstance(argument, str) for argument in command)
+    ):
+        raise RunnerError("Codex socket isolation command is invalid")
+    python = _validated_mcp_proxy_python()
+    return [python, "-I", "-c", _UNIX_SOCKET_DENY_CHILD_PROGRAM, *command]
+
+
 def validate_toolchain(codex: str) -> str:
     bundled_rg = Path(codex).parent.parent / "codex-path" / "rg"
     _validate_support_executable(bundled_rg, require_read_only_mount=True)
@@ -1028,6 +1134,74 @@ def _attest_pid1_system_bus_origin(socket_stat: os.stat_result) -> None:
         raise RunnerError("live Codex system bus socket bind origin is untrusted")
 
 
+def _assert_initial_kernel_namespaces() -> None:
+    """Reject synthetic root-systemd evidence from unprivileged namespaces.
+
+    Genuine procfs alone does not imply the host's initial user, PID or cgroup
+    namespaces. Read each kernel namespace symlink through an O_PATH FD bound
+    to the exact authenticated procfs mount, preventing mount aliases and
+    readlink path replacement. Linux initial namespace inodes are fixed.
+    /proc/1/ns may be inaccessible under ptrace/hidepid; it is not required.
+    """
+    expected = {
+        "user": "user:[4026531837]",
+        "pid": "pid:[4026531836]",
+        "cgroup": "cgroup:[4026531835]",
+    }
+    if not hasattr(os, "O_PATH"):
+        raise RunnerError("live Codex initial namespaces cannot be authenticated")
+    descriptors: list[int] = []
+    try:
+        directories = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        files = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        proc = os.open("/proc", directories)
+        descriptors.append(proc)
+        own_process = os.open(
+            "self", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=proc
+        )
+        descriptors.append(own_process)
+        namespace_directory = os.open("ns", directories, dir_fd=own_process)
+        descriptors.append(namespace_directory)
+        mount_identity = _kernel_procfs_mount_id(proc)
+        for descriptor in (own_process, namespace_directory):
+            if _kernel_procfs_mount_id(descriptor) != mount_identity:
+                raise RunnerError("live Codex initial namespace procfs is untrusted")
+        for namespace, required_link in expected.items():
+            link_fd = os.open(
+                namespace,
+                os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=namespace_directory,
+            )
+            descriptors.append(link_fd)
+            if (
+                _kernel_procfs_mount_id(link_fd) != mount_identity
+                or not stat.S_ISLNK(os.fstat(link_fd).st_mode)
+                or os.readlink("", dir_fd=link_fd) != required_link
+            ):
+                raise RunnerError("live Codex initial namespace identity is untrusted")
+        for filename in ("uid_map", "gid_map"):
+            map_fd = os.open(filename, files, dir_fd=own_process)
+            descriptors.append(map_fd)
+            if _kernel_procfs_mount_id(map_fd) != mount_identity or not stat.S_ISREG(
+                os.fstat(map_fd).st_mode
+            ):
+                raise RunnerError("live Codex initial user namespace map is untrusted")
+            value = os.read(map_fd, 128)
+            if (
+                value.split() != [b"0", b"0", b"4294967295"]
+                or not value.endswith(b"\n")
+                or os.read(map_fd, 1)
+            ):
+                raise RunnerError("live Codex initial user namespace map is untrusted")
+    except RunnerError:
+        raise
+    except (OSError, AttributeError, ValueError) as exc:
+        raise RunnerError("live Codex initial namespace evidence unavailable") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def _attest_root_system_manager_channels() -> None:
     """Authenticate the accessible root-owned system bus before systemctl.
 
@@ -1039,6 +1213,7 @@ def _attest_root_system_manager_channels() -> None:
     /init.scope; any other peer must belong to an exact system D-Bus unit.
     Arbitrary root or nonroot broker impostors fail before systemctl is called.
     """
+    _assert_initial_kernel_namespaces()
     channel = "/run/dbus/system_bus_socket"
     try:
         before = os.lstat(channel)
@@ -1298,6 +1473,7 @@ def validate_live_immutable_mounts(
     """Fail closed on writable input or nested mount, without provider/ledger effects."""
     if sys.platform != "linux" or not hasattr(os, "ST_RDONLY"):
         raise RunnerError("live Codex mount isolation requires Linux")
+    _assert_initial_kernel_namespaces()
     if os.getuid() != os.geteuid() or os.geteuid() == 0:
         raise RunnerError("live Codex must have an unprivileged unchanged UID")
     # A saved root UID/GID can be restored by an unprivileged process even with
@@ -2131,7 +2307,7 @@ def validate_chatgpt_subscription(codex: str) -> bytes:
             environment = provider_env(codex=codex, codex_home=snapshot_home)
             try:
                 completed = subprocess.run(
-                    [codex, "login", "status"],
+                    _unix_socket_restricted_codex_argv([codex, "login", "status"]),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -8451,7 +8627,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     intent_persisted_callback=mark_dispatch_intent_recorded,
                 )
                 capture = run_bounded(
-                    command,
+                    _unix_socket_restricted_codex_argv(command),
                     cwd=checkout,
                     timeout_seconds=int(request["budgets"]["wall_seconds"]),
                     stdin_data=(prompt_for(request) + "\n").encode("utf-8"),

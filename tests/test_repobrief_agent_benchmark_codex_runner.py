@@ -527,6 +527,121 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
         "GID": str(os.getegid()),
     }
 
+    def test_initial_namespace_kernel_attestation_accepts_host_when_initial(
+        self,
+    ) -> None:
+        expected = {
+            "user": "user:[4026531837]",
+            "pid": "pid:[4026531836]",
+            "cgroup": "cgroup:[4026531835]",
+        }
+        if any(
+            os.readlink(f"/proc/self/ns/{name}") != identity
+            for name, identity in expected.items()
+        ):
+            self.skipTest("running in a noninitial CI namespace")
+        runner._assert_initial_kernel_namespaces()
+
+    def test_initial_namespace_rejects_nested_user_pid_and_cgroup(self) -> None:
+        original = runner.os.readlink
+        for namespace in ("user", "pid", "cgroup"):
+            with self.subTest(namespace=namespace):
+
+                def changed(path: str, *, dir_fd: int | None = None) -> str:
+                    actual = original(path, dir_fd=dir_fd)
+                    if path == "" and actual.startswith(namespace + ":["):
+                        return namespace + ":[4026539999]"
+                    return actual
+
+                with patch.object(runner.os, "readlink", side_effect=changed):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "initial namespace identity"
+                    ):
+                        runner._assert_initial_kernel_namespaces()
+
+    def test_initial_namespace_rejects_nested_uid_and_gid_maps(self) -> None:
+        original = runner.os.read
+        for changed_map in (1, 2):
+            seen = 0
+
+            def changed(fd: int, length: int) -> bytes:
+                nonlocal seen
+                result = original(fd, length)
+                if b"4294967295" in result:
+                    seen += 1
+                    if seen == changed_map:
+                        return b"         0       1000          1\n"
+                return result
+
+            with self.subTest(changed_map=changed_map):
+                with patch.object(runner.os, "read", side_effect=changed):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "initial user namespace map"
+                    ):
+                        runner._assert_initial_kernel_namespaces()
+
+    def test_initial_namespace_rejects_procfs_symlink_mount_substitution(self) -> None:
+        original = runner._kernel_procfs_mount_id
+        observed = 0
+
+        def mismatched_mount(fd: int) -> int:
+            nonlocal observed
+            observed += 1
+            actual = original(fd)
+            return actual + 1 if observed == 4 else actual
+
+        with patch.object(
+            runner, "_kernel_procfs_mount_id", side_effect=mismatched_mount
+        ):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "initial namespace identity"
+            ):
+                runner._assert_initial_kernel_namespaces()
+
+    def test_untrusted_namespace_blocks_system_bus_before_socket_open(self) -> None:
+        with (
+            patch.object(
+                runner,
+                "_assert_initial_kernel_namespaces",
+                side_effect=runner.RunnerError("initial namespace untrusted"),
+            ),
+            patch.object(runner.socket, "socket") as peer_socket,
+            patch.object(runner.os, "lstat") as lstat,
+        ):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "initial namespace untrusted"
+            ):
+                runner._attest_root_system_manager_channels()
+            peer_socket.assert_not_called()
+            lstat.assert_not_called()
+
+    def test_untrusted_namespace_blocks_mount_admission_before_procfs_read(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                runner,
+                "_assert_initial_kernel_namespaces",
+                side_effect=runner.RunnerError("initial namespace untrusted"),
+            ),
+            patch.object(runner, "_authenticated_procfs_evidence") as evidence,
+        ):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "initial namespace untrusted"
+            ):
+                runner.validate_live_immutable_mounts(
+                    source=Path("/source"),
+                    codex=Path("/codex"),
+                    request_root=Path("/requests"),
+                    repository_map=Path("/map.json"),
+                    manifest=Path("/manifest.json"),
+                    state_root=Path("/state"),
+                    transcript_root=Path("/transcript"),
+                    evidence_root=Path("/evidence"),
+                    report_root=Path("/report"),
+                )
+            evidence.assert_not_called()
+
     def _probe(
         self,
         *,
@@ -2805,6 +2920,97 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         ):
             runner._assert_authorized_chatgpt_auth(b"credential-B", expected)
 
+    def test_unix_socket_seccomp_blocks_rpc_to_accessible_privileged_socket(
+        self,
+    ) -> None:
+        # Even a mode-0666 daemon socket on a RO bind mount can delegate
+        # writes: the kernel filter must deny socket() before connect().
+        with tempfile.TemporaryDirectory() as temporary:
+            socket_path = Path(temporary) / "privileged-daemon.sock"
+            with runner.socket.socket(
+                runner.socket.AF_UNIX, runner.socket.SOCK_STREAM
+            ) as server:
+                server.bind(str(socket_path))
+                socket_path.chmod(0o666)
+                server.listen(1)
+                child = (
+                    "import socket,errno,subprocess,sys\n"
+                    "for make in (lambda:socket.socket(socket.AF_UNIX,socket.SOCK_STREAM),"
+                    "lambda:socket.socketpair(socket.AF_UNIX,socket.SOCK_STREAM)):\n"
+                    " try:make();raise RuntimeError('UNIX socket was permitted')\n"
+                    " except OSError as e:assert e.errno==errno.EPERM\n"
+                    "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.close()\n"
+                    "p=subprocess.run([sys.executable,'-c',"
+                    "'import socket;socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)'],"
+                    "capture_output=True,timeout=4)\n"
+                    "assert p.returncode!=0 and b'Operation not permitted' in p.stderr\n"
+                    "print('UNIX_DENIED_INET_ALLOWED_CHILD_DENIED')\n"
+                )
+                command = runner._unix_socket_restricted_codex_argv(
+                    [sys.executable, "-I", "-c", child, str(socket_path)]
+                )
+                completed = subprocess.run(
+                    command, capture_output=True, timeout=12, check=False
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn(
+                    b"UNIX_DENIED_INET_ALLOWED_CHILD_DENIED", completed.stdout
+                )
+                server.settimeout(0.1)
+                with self.assertRaises(runner.socket.timeout):
+                    server.accept()
+
+    def test_unix_socket_seccomp_fails_before_child_exec_when_library_missing(
+        self,
+    ) -> None:
+        bad_program = runner._UNIX_SOCKET_DENY_CHILD_PROGRAM.replace(
+            "/lib/x86_64-linux-gnu/libseccomp.so.2",
+            "/unavailable/deny-socket-libseccomp.so.2",
+        )
+        self.assertNotEqual(bad_program, runner._UNIX_SOCKET_DENY_CHILD_PROGRAM)
+        with patch.object(runner, "_UNIX_SOCKET_DENY_CHILD_PROGRAM", bad_program):
+            command = runner._unix_socket_restricted_codex_argv(
+                [sys.executable, "-I", "-c", "print('CHILD_EXECUTED')"]
+            )
+        completed = subprocess.run(
+            command, capture_output=True, timeout=10, check=False
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn(b"CHILD_EXECUTED", completed.stdout)
+
+    def test_unix_socket_seccomp_rejects_unqualified_exec_command(self) -> None:
+        for value in ([], ["codex"], ["relative/codex", "login", "status"]):
+            with self.subTest(command=value):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "socket isolation command is invalid"
+                ):
+                    runner._unix_socket_restricted_codex_argv(value)
+
+    def test_codex_login_status_always_runs_under_kernel_socket_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            credential_dir = home / ".codex"
+            credential_dir.mkdir(parents=True)
+            (credential_dir / "auth.json").write_bytes(b"credential-bytes")
+            (credential_dir / "auth.json").chmod(0o600)
+            status = subprocess.CompletedProcess(
+                [], 0, stdout=b"Logged in using ChatGPT\n", stderr=b""
+            )
+            with (
+                patch.object(
+                    runner,
+                    "provider_env",
+                    return_value={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                ),
+                patch.object(runner.subprocess, "run", return_value=status) as call,
+            ):
+                runner.validate_chatgpt_subscription("/opt/codex")
+            launched = call.call_args.args[0]
+            self.assertEqual(launched[:2], [runner._validated_mcp_proxy_python(), "-I"])
+            self.assertEqual(launched[-3:], ["/opt/codex", "login", "status"])
+            self.assertEqual(launched[2], "-c")
+            self.assertEqual(launched[3], runner._UNIX_SOCKET_DENY_CHILD_PROGRAM)
+
     def test_chatgpt_subscription_gate_rejects_other_login_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary) / "home"
@@ -3839,7 +4045,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     ("prepare_provider_evidence", {"plan": True}),
                     ("create_checkout", checkout),
                     ("stage_codex_home", codex_home),
-                    ("build_command", ["codex"]),
+                    ("build_command", ["/opt/codex"]),
                     ("provider_env", {}),
                     ("cleanup_codex_home", None),
                 ):
@@ -10215,7 +10421,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                         ("stage_mcp_proxy", {"path": str(root / "proxy.py")}),
                         ("stage_repoground_manifest", {"path": str(manifest)}),
                         ("_rebind_staged_manifest_authorization", []),
-                        ("build_command", ["codex"]),
+                        ("build_command", ["/opt/codex"]),
                         ("_preintent_output_entry_reservation", 12),
                         ("provider_env", {}),
                         ("cleanup_codex_home", None),
@@ -10355,7 +10561,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                     ("prepare_provider_evidence", {"plan": True}),
                     ("create_checkout", checkout),
                     ("stage_codex_home", codex_home),
-                    ("build_command", ["codex"]),
+                    ("build_command", ["/opt/codex"]),
                     ("provider_env", {}),
                     ("cleanup_codex_home", None),
                 ):

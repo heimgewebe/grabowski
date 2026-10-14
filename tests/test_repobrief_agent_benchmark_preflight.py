@@ -1969,6 +1969,103 @@ class CodexProductionAuthorizationTests(unittest.TestCase):
             provider_binding.assert_not_called()
             self.assertFalse(state_root.exists())
 
+    def test_live_preflight_mounts_bind_resolved_codex_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _baseline, _treatment = self._codex_pair(environment)
+            binary = root / "vendor" / "bin" / "codex"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            launcher = root / "codex-launcher"
+            launcher.symlink_to(binary)
+            with (
+                mock.patch.object(
+                    codex_preflight,
+                    "_validated_codex_provider_binding",
+                    return_value={"codex": {"path": str(binary)}},
+                ) as provider,
+                mock.patch.object(
+                    codex_preflight.core,
+                    "authorize_dispatch",
+                    return_value={"kind": "fixture-no-dispatch"},
+                ) as dispatch,
+            ):
+                result = codex_preflight.authorize_pair(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=root / "state",
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=root / "reports" / "preflight.json",
+                    codex_command=str(launcher),
+                    codex_command_sha256="a" * 64,
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+            self.assertEqual(result["kind"], "fixture-no-dispatch")
+            self.assertEqual(
+                codex_preflight.codex_runner.validate_live_immutable_mounts.call_args.kwargs[
+                    "codex"
+                ],
+                binary,
+            )
+            provider.assert_called_once()
+            dispatch.assert_called_once()
+
+    def test_live_preflight_rejects_codex_launcher_swap_before_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            environment = support.fixture_environment(root)
+            pair_id, _baseline, _treatment = self._codex_pair(environment)
+            binary = root / "vendor" / "bin" / "codex"
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            replacement = root / "other-codex"
+            replacement.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            launcher = root / "codex-launcher"
+            launcher.symlink_to(binary)
+
+            def change_target(_command: str, _sha: str) -> dict:
+                launcher.unlink()
+                launcher.symlink_to(replacement)
+                return {"codex": {"path": str(replacement)}}
+
+            with (
+                mock.patch.object(
+                    codex_preflight,
+                    "_validated_codex_provider_binding",
+                    side_effect=change_target,
+                ) as provider,
+                mock.patch.object(
+                    codex_preflight.core, "authorize_dispatch"
+                ) as dispatch,
+                self.assertRaisesRegex(
+                    codex_preflight.core.PreflightError,
+                    "launcher identity changed",
+                ),
+            ):
+                codex_preflight.authorize_pair(
+                    pair_id=pair_id,
+                    request_root=environment["request_root"],
+                    repository_map=environment["repository_map"],
+                    state_root=root / "state",
+                    transcript_root=root / "transcripts",
+                    evidence_root=root / "evidence",
+                    report_out=root / "reports" / "preflight.json",
+                    codex_command=str(launcher),
+                    codex_command_sha256="a" * 64,
+                    max_cost_usd=support.Decimal("1.00"),
+                    validator_command=codex_preflight.core._command_array(
+                        environment["validator_command"]
+                    ),
+                )
+            provider.assert_called_once()
+            dispatch.assert_not_called()
+
     @staticmethod
     def _codex_pair(environment: dict) -> tuple[str, dict, dict]:
         pair_id = f"{support.TASKSET}:{support.CASE}:r2"
