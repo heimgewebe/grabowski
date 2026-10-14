@@ -614,14 +614,22 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                         "_authenticated_live_broker_cgroup",
                         return_value=broker_cgroup,
                     ) as kernel_cgroup,
+                    patch.object(
+                        runner, "_attest_pid1_system_bus_origin"
+                    ) as bus_origin,
                 ):
                     connection = socket_factory.return_value.__enter__.return_value
                     connection.getsockopt.return_value = struct.pack("3i", *peer)
+                    connection.getpeername.return_value = "/run/dbus/system_bus_socket"
                     if admitted:
                         runner._attest_root_system_manager_channels()
                         self.assertEqual(socket_factory.call_count, 1)
                         self.assertEqual(lstat.call_count, 2)
                         kernel_cgroup.assert_called_once_with(connection, peer[0])
+                        if peer[0] == 1:
+                            bus_origin.assert_called_once_with(root_socket)
+                        else:
+                            bus_origin.assert_not_called()
                     else:
                         with self.assertRaisesRegex(
                             runner.RunnerError, "system manager channel"
@@ -649,6 +657,147 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                 runner._attest_root_system_manager_channels()
             kernel_cgroup.assert_called_once_with(connection, 321)
 
+    def test_root_pid1_rejects_foreign_activated_socket_alias(self) -> None:
+        # SO_PEERCRED and SO_PEERPIDFD still identify PID 1 when systemd
+        # passed a completely unrelated activated listener to a fake broker.
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket),
+            patch.object(runner.socket, "socket") as factory,
+            patch.object(
+                runner,
+                "_authenticated_live_broker_cgroup",
+                return_value=b"0::/init.scope\n",
+            ) as cgroup,
+        ):
+            peer_socket = factory.return_value.__enter__.return_value
+            peer_socket.getsockopt.return_value = struct.pack("3i", 1, 0, 0)
+            peer_socket.getpeername.return_value = "/run/other-service.sock"
+            with self.assertRaisesRegex(runner.RunnerError, "system manager channel"):
+                runner._attest_root_system_manager_channels()
+            cgroup.assert_not_called()
+
+    def test_root_pid1_accepts_real_bound_system_bus_socket(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket),
+            patch.object(runner.socket, "socket") as factory,
+            patch.object(
+                runner,
+                "_authenticated_live_broker_cgroup",
+                return_value=b"0::/init.scope\n",
+            ) as cgroup,
+            patch.object(runner, "_attest_pid1_system_bus_origin") as origin,
+        ):
+            peer_socket = factory.return_value.__enter__.return_value
+            peer_socket.getsockopt.return_value = struct.pack("3i", 1, 0, 0)
+            peer_socket.getpeername.return_value = "/run/dbus/system_bus_socket"
+            runner._attest_root_system_manager_channels()
+            cgroup.assert_called_once_with(peer_socket, 1)
+            origin.assert_called_once_with(root_socket)
+
+    def test_root_pid1_mount_origin_rejects_foreign_systemd_socket(self) -> None:
+        # getpeername reports the same bus path and SO_PEERCRED reports PID 1;
+        # kernel mountinfo must still expose a different activated listener.
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        host = b"31 33 0:27 / /run rw,nosuid - tmpfs tmpfs rw\n"
+        safe = host + (
+            b"99 31 0:27 /dbus/system_bus_socket "
+            b"/run/dbus/system_bus_socket ro - tmpfs tmpfs rw\n"
+        )
+        foreign = host + (
+            b"99 31 0:27 /other-service.sock "
+            b"/run/dbus/system_bus_socket ro - tmpfs tmpfs rw\n"
+        )
+        different_fs = host + (
+            b"99 31 0:99 /dbus/system_bus_socket "
+            b"/run/dbus/system_bus_socket ro - tmpfs tmpfs rw\n"
+        )
+        with patch.object(runner, "_authenticated_pid1_mountinfo", return_value=host):
+            for mountinfo in (host, safe):
+                with (
+                    self.subTest(mountinfo=mountinfo),
+                    patch.object(
+                        runner,
+                        "_authenticated_procfs_evidence",
+                        return_value=(b"status", mountinfo),
+                    ),
+                ):
+                    runner._attest_pid1_system_bus_origin(root_socket)
+            for mountinfo in (foreign, different_fs):
+                with (
+                    self.subTest(mountinfo=mountinfo),
+                    patch.object(
+                        runner,
+                        "_authenticated_procfs_evidence",
+                        return_value=(b"status", mountinfo),
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "socket bind origin"
+                    ):
+                        runner._attest_pid1_system_bus_origin(root_socket)
+
+    def test_root_pid1_mount_origin_rejects_wrong_host_unit_layout(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        wrong_host = (
+            b"31 33 0:27 / /run rw - tmpfs tmpfs rw\n"
+            b"99 31 0:27 /other-service.sock "
+            b"/run/dbus/system_bus_socket ro - tmpfs tmpfs rw\n"
+        )
+        with (
+            patch.object(
+                runner, "_authenticated_pid1_mountinfo", return_value=wrong_host
+            ),
+            patch.object(
+                runner,
+                "_authenticated_procfs_evidence",
+                return_value=(b"status", wrong_host),
+            ),
+        ):
+            with self.assertRaisesRegex(runner.RunnerError, "host system bus"):
+                runner._attest_pid1_system_bus_origin(root_socket)
+
+    def test_root_pid1_forged_bus_is_rejected_before_systemctl_policy(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        host = b"31 33 0:27 / /run rw - tmpfs tmpfs rw\n"
+        forged = host + (
+            b"99 31 0:27 /activated-attacker.sock "
+            b"/run/dbus/system_bus_socket ro - tmpfs tmpfs rw\n"
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket),
+            patch.object(runner.socket, "socket") as socket_factory,
+            patch.object(
+                runner,
+                "_authenticated_live_broker_cgroup",
+                return_value=b"0::/init.scope\n",
+            ),
+            patch.object(runner, "_authenticated_pid1_mountinfo", return_value=host),
+            patch.object(
+                runner,
+                "_authenticated_procfs_evidence",
+                return_value=(b"status", forged),
+            ),
+            patch.object(runner.subprocess, "run") as policy_read,
+        ):
+            peer = socket_factory.return_value.__enter__.return_value
+            peer.getsockopt.return_value = struct.pack("3i", 1, 0, 0)
+            peer.getpeername.return_value = "/run/dbus/system_bus_socket"
+            with self.assertRaisesRegex(runner.RunnerError, "socket bind origin"):
+                runner._attest_root_system_manager_channels()
+            policy_read.assert_not_called()
+
     def test_root_pid1_only_accepts_verified_init_scope(self) -> None:
         root_socket = os.stat_result(
             (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
@@ -672,6 +821,7 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
                 ):
                     peer_socket = factory.return_value.__enter__.return_value
                     peer_socket.getsockopt.return_value = struct.pack("3i", 1, 0, 0)
+                    peer_socket.getpeername.return_value = "/run/dbus/system_bus_socket"
                     with self.assertRaisesRegex(
                         runner.RunnerError, "system manager channel"
                     ):
@@ -1991,21 +2141,114 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
     def test_create_checkout_rejects_oversized_tracked_tree_before_one_shot(
         self,
     ) -> None:
-        # The 65,536-entry private-output scan supersedes the old 100,000 limit.
         payload = b"".join(
             b"100644 blob " + b"a" * 40 + f"\tfile{i:05d}".encode() + b"\0"
             for i in range(65_537)
         )
         stream = mock.Mock()
-        stream.read1.side_effect = [payload, b""]
+        stream.fileno.return_value = 91
         process = mock.Mock(stdout=stream)
         process.poll.return_value = 0
         process.wait.return_value = 0
-        with patch.object(runner.subprocess, "Popen", return_value=process):
+        with (
+            patch.object(runner.subprocess, "Popen", return_value=process) as popen,
+            patch.object(runner.os, "set_blocking") as nonblocking,
+            patch.object(runner.os, "read", side_effect=[payload, b""]),
+            patch.object(runner.selectors, "DefaultSelector") as selector_factory,
+        ):
+            selector = selector_factory.return_value.__enter__.return_value
+            selector.select.return_value = [(None, None)]
             with self.assertRaisesRegex(runner.RunnerError, "too many entries"):
                 runner._assert_checkout_tree_has_regular_blobs(
                     Path("/unused"), "a" * 40
                 )
+        self.assertEqual(popen.call_args.kwargs["env"]["GIT_NO_LAZY_FETCH"], "1")
+        nonblocking.assert_called_once_with(91, False)
+        stream.close.assert_called_once()
+
+    def test_checkout_tree_scan_succeeds_for_local_complete_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source, commit = repository(Path(temporary))
+            runner._assert_checkout_tree_has_regular_blobs(source, commit)
+
+    def test_checkout_tree_scan_missing_promisor_tree_never_lazy_fetches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            remote = root / "remote.git"
+            completed = subprocess.run(
+                ["git", "clone", "--bare", "-q", str(source), str(remote)],
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            git(["remote", "add", "origin", str(remote)], source)
+            tree = git(["rev-parse", "HEAD^{tree}"], source)
+            tree_object = source / ".git" / "objects" / tree[:2] / tree[2:]
+            self.assertTrue(tree_object.is_file())
+            tree_object.unlink()
+            marker = root / "uploadpack-executed"
+            uploadpack = root / "uploadpack-wrapper"
+            uploadpack.write_text(
+                f'#!/bin/sh\nprintf executed > {str(marker)!r}\nexec git-upload-pack "$@"\n',
+                encoding="utf-8",
+            )
+            uploadpack.chmod(0o700)
+            git(["config", "remote.origin.promisor", "true"], source)
+            git(["config", "remote.origin.partialclonefilter", "blob:none"], source)
+            git(["config", "remote.origin.uploadpack", str(uploadpack)], source)
+            with self.assertRaisesRegex(runner.RunnerError, "incomplete"):
+                runner._assert_checkout_tree_has_regular_blobs(source, commit)
+            self.assertFalse(
+                marker.exists(), "local tree scan contacted promisor remote"
+            )
+            self.assertFalse(tree_object.exists())
+
+    def test_checkout_tree_scan_deadline_kills_and_reaps_stalled_git(self) -> None:
+        stream = mock.Mock()
+        stream.fileno.return_value = 92
+        process = mock.Mock(stdout=stream)
+        process.poll.return_value = None
+        process.wait.return_value = -9
+        with (
+            patch.object(runner.subprocess, "Popen", return_value=process),
+            patch.object(runner.os, "set_blocking"),
+            patch.object(runner.selectors, "DefaultSelector") as selector_factory,
+        ):
+            selector_factory.return_value.__enter__.return_value.select.return_value = []
+            with self.assertRaisesRegex(runner.RunnerError, "timed out"):
+                runner._assert_checkout_tree_has_regular_blobs(
+                    Path("/unused"), "a" * 40
+                )
+        process.kill.assert_called_once()
+        process.wait.assert_called_once_with(timeout=5)
+        stream.close.assert_called_once()
+
+    def test_checkout_tree_scan_rejects_truncated_stream(self) -> None:
+        stream = mock.Mock()
+        stream.fileno.return_value = 93
+        process = mock.Mock(stdout=stream)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with (
+            patch.object(runner.subprocess, "Popen", return_value=process),
+            patch.object(runner.os, "set_blocking"),
+            patch.object(
+                runner.os,
+                "read",
+                side_effect=[b"100644 blob " + b"a" * 40 + b"\tunfinished", b""],
+            ),
+            patch.object(runner.selectors, "DefaultSelector") as selector_factory,
+        ):
+            selector_factory.return_value.__enter__.return_value.select.return_value = [
+                (None, None)
+            ]
+            with self.assertRaisesRegex(runner.RunnerError, "incomplete"):
+                runner._assert_checkout_tree_has_regular_blobs(
+                    Path("/unused"), "a" * 40
+                )
+        stream.close.assert_called_once()
 
     def test_create_checkout_rejects_deep_tracked_tree_before_one_shot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

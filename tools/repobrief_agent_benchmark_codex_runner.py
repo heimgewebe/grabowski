@@ -915,6 +915,119 @@ def _authenticated_live_broker_cgroup(
         os.close(pidfd)
 
 
+def _authenticated_pid1_mountinfo() -> bytes:
+    """Read PID 1's host mount namespace directly from genuine kernel procfs."""
+    descriptors: list[int] = []
+    try:
+        directories = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        files = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        proc = os.open("/proc", directories)
+        descriptors.append(proc)
+        pid1 = os.open("1", directories, dir_fd=proc)
+        descriptors.append(pid1)
+        mountinfo = os.open("mountinfo", files, dir_fd=pid1)
+        descriptors.append(mountinfo)
+        if len(
+            {_kernel_procfs_mount_id(fd) for fd in descriptors}
+        ) != 1 or not stat.S_ISREG(os.fstat(mountinfo).st_mode):
+            raise RunnerError("live Codex PID 1 mountinfo is untrusted")
+        chunks = bytearray()
+        while len(chunks) <= 4 * 1024 * 1024:
+            chunk = os.read(mountinfo, min(65536, 4 * 1024 * 1024 + 1 - len(chunks)))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        if not chunks or len(chunks) > 4 * 1024 * 1024:
+            raise RunnerError("live Codex PID 1 mountinfo is unbounded")
+        return bytes(chunks)
+    except OSError as exc:
+        raise RunnerError("live Codex PID 1 mountinfo unavailable") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _system_bus_mount_origins(
+    mountinfo: bytes,
+) -> list[tuple[bytes, bytes, bytes, bytes]]:
+    """Derive backing filesystem and original path for every /run bus mount.
+
+    Include *all* matching /run ancestor/bus mounts, including covered ones:
+    an opaque later ancestor bind must never conceal a foreign socket source.
+    The only relevant canonical bus path is ASCII without mountinfo escapes.
+    """
+    if not mountinfo or len(mountinfo) > 4 * 1024 * 1024:
+        raise RunnerError("live Codex system bus mountinfo is unbounded")
+    lines = mountinfo.splitlines()
+    if len(lines) > 8192:
+        raise RunnerError("live Codex system bus mountinfo is unbounded")
+    channel = b"/run/dbus/system_bus_socket"
+    allowed_points = {
+        b"/run",
+        b"/run/dbus",
+        channel,
+    }
+    origins: list[tuple[bytes, bytes, bytes, bytes]] = []
+    for line in lines:
+        pre, separator, post = line.partition(b" - ")
+        fields = pre.split()
+        fs_fields = post.split()
+        if not separator or len(fields) < 6 or len(fs_fields) < 3:
+            raise RunnerError("live Codex system bus mountinfo is malformed")
+        point = fields[4]
+        if point not in allowed_points:
+            continue
+        device, root, filesystem = fields[2], fields[3], fs_fields[0]
+        suffix = channel[len(point) :]
+        if (
+            not re.fullmatch(rb"[0-9]+:[0-9]+", device)
+            or not root.startswith(b"/")
+            or b"\\" in root
+            or b"\0" in root
+            or b"/../" in root
+            or b"/./" in root
+            or filesystem not in {b"tmpfs", b"ramfs"}
+        ):
+            raise RunnerError("live Codex system bus mount origin is unsafe")
+        origin = posixpath.normpath(root.rstrip(b"/") + suffix)
+        origins.append((point, device, origin, filesystem))
+    if not origins:
+        raise RunnerError("live Codex system bus mount origin is missing")
+    return origins
+
+
+def _attest_pid1_system_bus_origin(socket_stat: os.stat_result) -> None:
+    """Prove a PID-1-created listener has the host system-bus inode backing.
+
+    The peer's sun_path text is not sufficient: the same pathname can name a
+    different filesystem socket in another mount namespace. Compare the
+    immutable kernel-reported mount source to the *real PID 1 namespace*.
+    Never consume systemctl policy from a substituted activated listener.
+    """
+    _, local_mounts = _authenticated_procfs_evidence()
+    host_origins = _system_bus_mount_origins(_authenticated_pid1_mountinfo())
+    local_origins = _system_bus_mount_origins(local_mounts)
+    host = max(host_origins, key=lambda item: len(item[0]))
+    if (
+        host[0] != b"/run"
+        or host[2] != b"/dbus/system_bus_socket"
+        or any(origin[0] == host[0] and origin != host for origin in host_origins)
+    ):
+        # This safety policy deliberately supports only the normal root-owned
+        # systemd /run socket layout; unfamiliar host layouts fail closed.
+        raise RunnerError("live Codex host system bus socket origin is untrusted")
+    expected = (host[1], host[2], host[3])
+    if (
+        f"{os.major(socket_stat.st_dev)}:{os.minor(socket_stat.st_dev)}".encode()
+        != host[1]
+        or any(
+            (device, origin, filesystem) != expected
+            for _, device, origin, filesystem in local_origins
+        )
+    ):
+        raise RunnerError("live Codex system bus socket bind origin is untrusted")
+
+
 def _attest_root_system_manager_channels() -> None:
     """Authenticate the accessible root-owned system bus before systemctl.
 
@@ -957,6 +1070,21 @@ def _attest_root_system_manager_channels() -> None:
                 != (after.st_dev, after.st_ino, after.st_mode, after.st_uid)
             ):
                 raise RunnerError("live Codex system manager channel is untrusted")
+            if peer_uid == 0 and peer_pid == 1:
+                # SO_PEERCRED and SO_PEERPIDFD identify socket-activating
+                # systemd, not necessarily the eventual service.  A foreign
+                # activated socket bind-mounted onto the bus path retains its
+                # original kernel sun_path, so reject the alias here.
+                try:
+                    listener_name = peer_socket.getpeername()
+                except OSError as exc:
+                    raise RunnerError(
+                        "live Codex system manager channel listener unavailable"
+                    ) from exc
+                if type(listener_name) is not str or listener_name != channel:
+                    raise RunnerError(
+                        "live Codex system manager channel listener is untrusted"
+                    )
             # A root-owned socket can still be served by an arbitrary UID-0
             # process. Bind *every* peer to its live pidfd and kernel cgroup,
             # including root peers, before trusting any systemd property.
@@ -978,6 +1106,8 @@ def _attest_root_system_manager_channels() -> None:
                 }
             if peer_cgroup not in trusted_cgroups:
                 raise RunnerError("live Codex system manager channel is untrusted")
+            if peer_uid == 0 and peer_pid == 1:
+                _attest_pid1_system_bus_origin(before)
     except (OSError, struct.error) as exc:
         raise RunnerError("live Codex system manager channel unavailable") from exc
 
@@ -2277,19 +2407,20 @@ def close_provider_evidence_plan(plan: Mapping[str, Any]) -> None:
 def _assert_checkout_tree_has_regular_blobs(source: Path, commit: str) -> None:
     """Reject unbounded Git trees before cloning or consuming a one-use ID.
 
-    Reserve downstream scan capacity for Git's generated object database.
-    Every resulting tree directory, not merely its regular blobs, consumes
-    private-output scan budget. The staged clone receives a second exact scan.
+    Do not let partial-clone promisor remotes fetch missing objects; scanning
+    must remain local, streaming, bounded in bytes, entries and wall time.
     """
     try:
         process = subprocess.Popen(
             ["git", "ls-tree", "-r", "--full-tree", "-z", commit],
             cwd=source,
+            env=base._git_environment(),
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
     except OSError as exc:
         raise RunnerError("benchmark source Git tree cannot be inspected") from exc
+    deadline = time.monotonic() + 30
     try:
         if process.stdout is None:
             raise RunnerError("benchmark source Git tree stream is unavailable")
@@ -2297,48 +2428,80 @@ def _assert_checkout_tree_has_regular_blobs(source: Path, commit: str) -> None:
         total_bytes = 0
         total_files = 0
         directories: set[tuple[bytes, ...]] = set()
-        while chunk := process.stdout.read1(64 * 1024):
-            total_bytes += len(chunk)
-            if total_bytes > 16 * 1024 * 1024:
-                raise RunnerError(
-                    "benchmark source Git tree listing exceeds byte budget"
-                )
-            *records, remainder = (remainder + chunk).split(bytes((0,)))
-            if len(remainder) > 8192:
-                raise RunnerError("benchmark source Git tree entry exceeds byte budget")
-            for record in records:
-                if not (
-                    record.startswith(b"100644 blob ")
-                    or record.startswith(b"100755 blob ")
-                ):
-                    raise RunnerError("unsupported tracked Git tree entry")
-                _metadata, separator, relative = record.partition(b"\t")
-                segments = relative.split(b"/")
-                if (
-                    not separator
-                    or len(record) > 8192
-                    or any(part in (b"", b".", b"..") for part in segments)
-                ):
-                    raise RunnerError("benchmark source Git tree entry is invalid")
-                # state/codex-workspaces/one-use-id/repo adds three levels to
-                # each tracked subdirectory; the scan denies depth > 32.
-                if len(segments) > 30:
+        # read1() can block indefinitely when a promisor process or inherited
+        # pipe remains open. A nonblocking pipe and selector bound the *entire*
+        # scan, including EOF and the final process reaping.
+        os.set_blocking(process.stdout.fileno(), False)
+        with selectors.DefaultSelector() as stream_selector:
+            stream_selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not stream_selector.select(timeout=remaining):
+                    raise RunnerError("benchmark source Git tree inspection timed out")
+                try:
+                    chunk = os.read(process.stdout.fileno(), 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > 16 * 1024 * 1024:
                     raise RunnerError(
-                        "benchmark source Git tree depth exceeds scan limit"
+                        "benchmark source Git tree listing exceeds byte budget"
                     )
-                total_files += 1
-                if total_files > 65536:
-                    raise RunnerError("benchmark source Git tree has too many entries")
-                for length in range(1, len(segments)):
-                    directories.add(tuple(segments[:length]))
-                if total_files + len(directories) > 65536:
-                    raise RunnerError("benchmark source Git tree has too many entries")
-        if remainder or process.wait() != 0:
+                *records, remainder = (remainder + chunk).split(bytes((0,)))
+                if len(remainder) > 8192:
+                    raise RunnerError(
+                        "benchmark source Git tree entry exceeds byte budget"
+                    )
+                for record in records:
+                    if not (
+                        record.startswith(b"100644 blob ")
+                        or record.startswith(b"100755 blob ")
+                    ):
+                        raise RunnerError("unsupported tracked Git tree entry")
+                    _metadata, separator, relative = record.partition(b"\t")
+                    segments = relative.split(b"/")
+                    if (
+                        not separator
+                        or len(record) > 8192
+                        or any(part in (b"", b".", b"..") for part in segments)
+                    ):
+                        raise RunnerError("benchmark source Git tree entry is invalid")
+                    if len(segments) > 30:
+                        raise RunnerError(
+                            "benchmark source Git tree depth exceeds scan limit"
+                        )
+                    total_files += 1
+                    if total_files > 65536:
+                        raise RunnerError(
+                            "benchmark source Git tree has too many entries"
+                        )
+                    for length in range(1, len(segments)):
+                        directories.add(tuple(segments[:length]))
+                    if total_files + len(directories) > 65536:
+                        raise RunnerError(
+                            "benchmark source Git tree has too many entries"
+                        )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RunnerError("benchmark source Git tree inspection timed out")
+        try:
+            exit_code = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise RunnerError("benchmark source Git tree inspection timed out") from exc
+        if remainder or exit_code != 0:
             raise RunnerError("benchmark source Git tree inspection was incomplete")
     except BaseException:
-        if process.poll() is None:
-            process.kill()
-        process.wait()
+        try:
+            if process.poll() is None:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise RunnerError("benchmark source Git tree cleanup timed out") from exc
         raise
     finally:
         if process.stdout is not None:
