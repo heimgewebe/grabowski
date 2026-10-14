@@ -59,14 +59,51 @@ import os
 import socket
 import stat
 import sys
+import sysconfig
+
+# Search only deterministic system library directories, never an environment
+# influenced dynamic loader search path or a relative library name.
+_SECCOMP_TRUSTED_LIBRARY_ROOTS = ("/usr/lib", "/usr/lib64", "/lib", "/lib64")
+
+def trusted_seccomp_library():
+    multiarch = sysconfig.get_config_var("MULTIARCH")
+    if not isinstance(multiarch, str) or not multiarch or not all(
+        char.isascii() and (char.isalnum() or char in "_+.-")
+        for char in multiarch
+    ) or multiarch in (".", "..") or ".." in multiarch:
+        multiarch = None
+    directories = (
+        [os.path.join(root, multiarch) for root in _SECCOMP_TRUSTED_LIBRARY_ROOTS]
+        if multiarch else []
+    ) + list(_SECCOMP_TRUSTED_LIBRARY_ROOTS)
+    for directory in dict.fromkeys(directories):
+        requested = os.path.join(directory, "libseccomp.so.2")
+        if not os.path.lexists(requested):
+            continue
+        binary = os.path.realpath(requested)
+        if not any(
+            binary.startswith(root + os.sep)
+            for root in _SECCOMP_TRUSTED_LIBRARY_ROOTS
+        ):
+            raise RuntimeError("untrusted kernel socket filter library location")
+        current = os.sep
+        for part in binary.split(os.sep)[1:-1]:
+            current = os.path.join(current, part)
+            info = os.lstat(current)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or (
+                stat.S_IMODE(info.st_mode) & 0o022
+            ):
+                raise RuntimeError("untrusted kernel socket filter directory")
+        info = os.lstat(binary)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or (
+            stat.S_IMODE(info.st_mode) & 0o022
+        ):
+            raise RuntimeError("untrusted kernel socket filter library")
+        return binary
+    raise RuntimeError("trusted kernel socket filter library unavailable")
 
 def deny_unix():
-    library = "/lib/x86_64-linux-gnu/libseccomp.so.2"
-    binary = os.path.realpath(library)
-    info = os.stat(binary)
-    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or
-            (stat.S_IMODE(info.st_mode) & 0o022)):
-        raise RuntimeError("untrusted kernel socket filter library")
+    library = trusted_seccomp_library()
     seccomp = ctypes.CDLL(library, use_errno=True)
     class Compare(ctypes.Structure):
         _fields_ = [
@@ -89,13 +126,29 @@ def deny_unix():
         raise RuntimeError("unable to allocate kernel socket filter")
     try:
         error_action = 0x00050000 | errno.EPERM  # SCMP_ACT_ERRNO(EPERM)
-        for name in (b"socket", b"socketpair"):
-            syscall = seccomp.seccomp_syscall_resolve_name(name)
-            if syscall < 0 or seccomp.seccomp_rule_add(
-                context, error_action, syscall, 1,
-                Compare(0, 4, socket.AF_UNIX, 0),  # SCMP_CMP_EQ(arg0)
+        # Never allow creating a new AF_UNIX endpoint that could connect
+        # to an accessible privileged daemon. Kernel syscall int arguments
+        # are truncated AFTER seccomp sees the raw 64-bit registers.
+        unix_socket = seccomp.seccomp_syscall_resolve_name(b"socket")
+        if unix_socket < 0 or seccomp.seccomp_rule_add(
+            context, error_action, unix_socket, 1,
+            Compare(0, 7, 0xffffffff, socket.AF_UNIX),
+        ) != 0:
+            raise RuntimeError("unable to deny Unix socket creation")
+        # Tokio needs anonymous, already-connected SOCK_STREAM socketpairs
+        # for its internal wakeup channel. Such a stream cannot reconnect
+        # to a filesystem socket. Reject every other AF_UNIX socketpair type
+        # by denying each way the low type nibble differs from SOCK_STREAM.
+        unix_pair = seccomp.seccomp_syscall_resolve_name(b"socketpair")
+        if unix_pair < 0:
+            raise RuntimeError("unable to identify Unix socketpair syscall")
+        for mask, bits in ((1, 0), (2, 2), (4, 4), (8, 8)):
+            if seccomp.seccomp_rule_add(
+                context, error_action, unix_pair, 2,
+                Compare(0, 7, 0xffffffff, socket.AF_UNIX),
+                Compare(1, 7, mask, bits),
             ) != 0:
-                raise RuntimeError("unable to deny Unix socket creation")
+                raise RuntimeError("unable to restrict Unix socketpairs")
         # io_uring can submit socket/connect ops without the socket syscall.
         for name in (b"io_uring_setup", b"io_uring_enter", b"io_uring_register"):
             syscall = seccomp.seccomp_syscall_resolve_name(name)
@@ -118,7 +171,8 @@ def deny_unix():
     # Verify effective kernel behavior before invoking any Codex bytes.
     for create in (
         lambda: socket.socket(socket.AF_UNIX, socket.SOCK_STREAM),
-        lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM),
+        lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM),
+        lambda: socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET),
     ):
         try:
             created = create()
@@ -129,6 +183,13 @@ def deny_unix():
             for item in created if isinstance(created, tuple) else (created,):
                 item.close()
             raise RuntimeError("kernel Unix socket filter not enforced")
+    try:
+        pair = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError as exc:
+        raise RuntimeError("anonymous UnixStream wakeup channel unavailable") from exc
+    else:
+        for item in pair:
+            item.close()
 
 if not sys.argv[1:] or not os.path.isabs(sys.argv[1]):
     raise RuntimeError("Codex child executable must be absolute")

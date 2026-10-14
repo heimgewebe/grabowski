@@ -1395,6 +1395,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
             real_read_bytes = Path.read_bytes
             real_samefile = os.path.samefile
             real_resolve = Path.resolve
+            real_lstat = Path.lstat
 
             def resolve(path: Path, *args, **kwargs):
                 # The test host may be usr-merged; emulate a distinct visible
@@ -1772,8 +1773,35 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 return real_samefile(left, right)
 
             actual_uid = os.getuid()
+            actual_gid = os.getgid()
+            fixture_uid = actual_uid if actual_uid != 0 else 65534
+
+            def fixture_lstat(path: Path, *args, **kwargs):
+                result = real_lstat(path, *args, **kwargs)
+                if actual_uid == 0 and Path(path) in leaves.values():
+                    values = list(result)
+                    values[4] = fixture_uid  # st_uid in os.stat_result
+                    return os.stat_result(values)
+                return result
+
+            # Normalize an ordinary privileged CI host to an unprivileged
+            # synthetic identity without hiding injected saved-root slots.
+            observed_resuid = os.getresuid()
+            observed_resgid = os.getresgid()
+            if observed_resuid == (actual_uid,) * 3:
+                observed_resuid = (fixture_uid,) * 3
+            expected_gid = primary_gid if primary_gid is not None else fixture_uid
+            synthetic_resgid = (
+                observed_resgid
+                if observed_resgid != (actual_gid,) * 3
+                else (expected_gid,) * 3
+            )
             with (
+                # Kernel namespace provenance is tested separately. Synthetic
+                # mount evidence must not depend on the CI container namespace.
+                patch.object(runner, "_assert_initial_kernel_namespaces"),
                 patch.object(runner.Path, "home", return_value=home),
+                patch.object(runner.Path, "lstat", new=fixture_lstat),
                 patch.object(runner.Path, "resolve", new=resolve),
                 patch.object(runner.Path, "read_text", new=read_text),
                 patch.object(runner.Path, "read_bytes", new=read_bytes),
@@ -1782,29 +1810,24 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                     "_authenticated_procfs_evidence",
                     side_effect=authenticated_procfs,
                 ),
-                patch.object(runner.os, "getuid", return_value=actual_uid),
-                patch.object(runner.os, "geteuid", return_value=actual_uid),
+                patch.object(runner.os, "getuid", return_value=fixture_uid),
+                patch.object(runner.os, "geteuid", return_value=fixture_uid),
+                patch.object(runner.os, "getresuid", return_value=observed_resuid),
                 patch.object(
                     runner.os,
                     "getgid",
                     return_value=primary_gid
                     if primary_gid is not None
-                    else os.getgid(),
+                    else fixture_uid,
                 ),
                 patch.object(
                     runner.os,
                     "getegid",
                     return_value=primary_gid
                     if primary_gid is not None
-                    else os.getegid(),
+                    else fixture_uid,
                 ),
-                patch.object(
-                    runner.os,
-                    "getresgid",
-                    return_value=(primary_gid,) * 3
-                    if primary_gid is not None
-                    else os.getresgid(),
-                ),
+                patch.object(runner.os, "getresgid", return_value=synthetic_resgid),
                 patch.object(
                     runner.os, "getgroups", return_value=list(supplementary_groups)
                 ),
@@ -1857,7 +1880,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                     self._probe(opaque_union_filesystem=filesystem_type)
 
     def test_privileged_supplementary_groups_block_codex_admission(self) -> None:
-        primary_gid = os.getegid()
+        primary_gid = os.getuid() or 65534
         for inherited in ((0,), (primary_gid, 0), (primary_gid, 9999)):
             with self.subTest(groups=inherited):
                 with self.assertRaisesRegex(runner.RunnerError, "supplementary"):
@@ -1865,7 +1888,7 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
 
     def test_empty_or_primary_only_supplementary_groups_are_accepted(self) -> None:
         self._probe(supplementary_groups=())
-        self._probe(supplementary_groups=(os.getegid(),))
+        self._probe(supplementary_groups=(os.getuid() or 65534,))
 
     def test_privileged_primary_group_cannot_pass_with_no_supplementary_groups(
         self,
@@ -2051,8 +2074,29 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
         self.assertIn(b"NoNewPrivs:", status_bytes)
         self.assertIn(b" - ", mounts_bytes)
 
+    def test_root_ci_host_does_not_skip_synthetic_mount_security(self) -> None:
+        # Privileged CI environments must exercise the same mount tests,
+        # including failures for saved UID/GID zero, without using real root.
+        with (
+            patch.object(runner.os, "getuid", return_value=0),
+            patch.object(runner.os, "getgid", return_value=0),
+            patch.object(runner.os, "getresuid", return_value=(0, 0, 0)),
+            patch.object(runner.os, "getresgid", return_value=(0, 0, 0)),
+        ):
+            self._probe()
+            with patch.object(runner.os, "getresuid", return_value=(65534, 65534, 0)):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "execution identity is unsafe"
+                ):
+                    self._probe()
+            with patch.object(runner.os, "getresgid", return_value=(65534, 65534, 0)):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "execution identity is unsafe"
+                ):
+                    self._probe()
+
     def test_saved_root_uid_cannot_pass_unprivileged_admission(self) -> None:
-        user = os.getuid()
+        user = os.getuid() or 65534
         self.assertNotEqual(user, 0)
         with patch.object(runner.os, "getresuid", return_value=(user, user, 0)):
             with self.assertRaisesRegex(
@@ -2061,8 +2105,8 @@ class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
                 self._probe()
 
     def test_saved_root_gid_cannot_pass_unprivileged_admission(self) -> None:
-        group = os.getgid()
-        self.assertNotEqual(os.getuid(), 0)
+        group = os.getgid() or 65534
+        self.assertNotEqual(group, 0)
         with patch.object(runner.os, "getresgid", return_value=(group, group, 0)):
             with self.assertRaisesRegex(
                 runner.RunnerError, "execution identity is unsafe"
@@ -2936,9 +2980,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 child = (
                     "import socket,errno,subprocess,sys\n"
                     "for make in (lambda:socket.socket(socket.AF_UNIX,socket.SOCK_STREAM),"
-                    "lambda:socket.socketpair(socket.AF_UNIX,socket.SOCK_STREAM)):\n"
-                    " try:make();raise RuntimeError('UNIX socket was permitted')\n"
+                    "lambda:socket.socketpair(socket.AF_UNIX,socket.SOCK_DGRAM),"
+                    "lambda:socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)):\n"
+                    " try:make();raise RuntimeError('external UNIX socket was permitted')\n"
                     " except OSError as e:assert e.errno==errno.EPERM\n"
+                    "a,b=socket.socketpair(socket.AF_UNIX,socket.SOCK_STREAM)\n"
+                    "a.close();b.close()\n"
                     "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.close()\n"
                     "p=subprocess.run([sys.executable,'-c',"
                     "'import socket;socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)'],"
@@ -2964,8 +3011,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self,
     ) -> None:
         bad_program = runner._UNIX_SOCKET_DENY_CHILD_PROGRAM.replace(
-            "/lib/x86_64-linux-gnu/libseccomp.so.2",
-            "/unavailable/deny-socket-libseccomp.so.2",
+            '_SECCOMP_TRUSTED_LIBRARY_ROOTS = ("/usr/lib", "/usr/lib64", "/lib", "/lib64")',
+            '_SECCOMP_TRUSTED_LIBRARY_ROOTS = ("/unavailable",)',
         )
         self.assertNotEqual(bad_program, runner._UNIX_SOCKET_DENY_CHILD_PROGRAM)
         with patch.object(runner, "_UNIX_SOCKET_DENY_CHILD_PROGRAM", bad_program):
@@ -2977,6 +3024,29 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertNotIn(b"CHILD_EXECUTED", completed.stdout)
+
+    def test_unix_socket_seccomp_rejects_library_under_writable_parent(
+        self,
+    ) -> None:
+        # A caller-controlled library search root must not become trusted
+        # merely because a file with the expected soname exists.
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "libseccomp.so.2").write_bytes(b"malicious ELF")
+            bad_program = runner._UNIX_SOCKET_DENY_CHILD_PROGRAM.replace(
+                '_SECCOMP_TRUSTED_LIBRARY_ROOTS = ("/usr/lib", "/usr/lib64", "/lib", "/lib64")',
+                f"_SECCOMP_TRUSTED_LIBRARY_ROOTS = ({directory!r},)",
+            )
+            self.assertNotEqual(bad_program, runner._UNIX_SOCKET_DENY_CHILD_PROGRAM)
+            with patch.object(runner, "_UNIX_SOCKET_DENY_CHILD_PROGRAM", bad_program):
+                command = runner._unix_socket_restricted_codex_argv(
+                    [sys.executable, "-I", "-c", "print('CHILD_EXECUTED')"]
+                )
+            completed = subprocess.run(
+                command, capture_output=True, timeout=10, check=False
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertNotIn(b"CHILD_EXECUTED", completed.stdout)
+            self.assertIn(b"untrusted kernel socket filter", completed.stderr)
 
     def test_unix_socket_seccomp_rejects_unqualified_exec_command(self) -> None:
         for value in ([], ["codex"], ["relative/codex", "login", "status"]):
