@@ -63,7 +63,10 @@ CANONICAL_REPOSITORY = Path.home() / "repos/grabowski"
 AUTO_DEPLOY_SOURCE_ROOT = Path.home() / "repos" / ".grabowski-deploy-worktrees"
 AUTO_DEPLOY_SOURCE_PREFIX = "auto-current-main"
 AUTO_DEPLOY_SOURCE_LEASE_TTL_SECONDS = 7_200
-ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS = 300
+# Object import and protected-main ref refresh perform multiple separately
+# bounded Git and public-main probes under the same path/ODB leases. Five
+# minutes can expire before the fetch and post-fetch readback finish.
+ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS = 1_800
 ORIGIN_MAIN_REFRESH_OPERATION = "runtime-deploy-origin-main-refresh"
 CANONICAL_OPERATOR_MODULE = "grabowski_operator"
 PUBLIC_GITHUB_REPOSITORY_URL = "https://github.com/heimgewebe/grabowski.git"
@@ -885,9 +888,15 @@ def _git_result(
     repository: Path,
     *arguments: str,
     max_output_bytes: int = 65_536,
+    c_locale: bool = False,
 ) -> dict[str, Any]:
+    command = read_surface._git_command(repository, *arguments)
+    if c_locale:
+        # Git diagnostics are localized. Use the stable C locale only when
+        # interpreting this exact fail-closed ancestry diagnostic.
+        command = ["/usr/bin/env", "LC_ALL=C", *command]
     return read_surface._run_read(
-        read_surface._git_command(repository, *arguments),
+        command,
         cwd=repository,
         timeout_seconds=30,
         max_output_bytes=max_output_bytes,
@@ -1778,6 +1787,7 @@ def _tracked_runtime_deploy_local_mutation_evidence(
 ) -> dict[str, Any] | None:
     effects: list[dict[str, Any]] = []
     for key in (
+        "admission_target_fetch",
         "deploy_index_mutation",
         "stale_pending_reconciliation",
         "origin_main_refresh",
@@ -1789,6 +1799,14 @@ def _tracked_runtime_deploy_local_mutation_evidence(
             continue
         if not isinstance(value, dict):
             raise RuntimeError(f"tracked local mutation evidence {key} is malformed")
+        if (
+            key == "admission_target_fetch"
+            and value.get("kind") == "grabowski_runtime_deploy_admission_target_fetch_attempt"
+        ):
+            # Preserve the exact uncertain subprocess target and operation
+            # without manufacturing an observed successful Git effect.
+            original = {k: v for k, v in value.items() if k != "evidence_sha256"}
+            value = {**original, "evidence_sha256": _source_identity_sha256(original)}
         effects.append(dict(value))
     if not effects:
         return None
@@ -3050,6 +3068,52 @@ def _require_origin_main_refresh_checkout_certainty(plan: dict[str, Any]) -> Non
             "protected-main ref refresh is blocked before mutation by checkout uncertainty"
         ) from exc
 
+def _renew_origin_main_refresh_resources(
+    plan: dict[str, Any],
+    resource_keys: list[str],
+    acquisition: dict[str, Any],
+) -> dict[str, Any]:
+    """Prove the exact ODB/ref lease generation remains live before Git writes.
+
+    Audit-lock contention can outlast the initial TTL. Renewal must be
+    snapshot-bound; a reclaimed or expired lease is a pre-fetch denial.
+    """
+    import grabowski_resources as resources
+
+    original = [_lease_for_key(acquisition, key) for key in resource_keys]
+    renewed = resources.renew_resources(
+        plan["owner_id"],
+        resource_keys,
+        ttl_seconds=ORIGIN_MAIN_REFRESH_LEASE_TTL_SECONDS,
+        expected_leases=original,
+    )
+    if (
+        not isinstance(renewed, dict)
+        or renewed.get("snapshot_guarded") is not True
+        or renewed.get("owner_id") != plan["owner_id"]
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "protected object-import lease renewal is unproved"
+        )
+    leases = renewed.get("leases")
+    if (
+        not isinstance(leases, list)
+        or len(leases) != len(resource_keys)
+        or any(
+            not isinstance(lease, dict)
+            or lease.get("owner_id") != plan["owner_id"]
+            or type(lease.get("expires_at_unix")) is not int
+            or lease["expires_at_unix"] <= int(time.time())
+            for lease in leases
+        )
+        or {lease["resource_key"] for lease in leases} != set(resource_keys)
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "protected object-import renewed lease identity is invalid"
+        )
+    return renewed
+
+
 def _release_origin_main_refresh_resources(
     plan: dict[str, Any],
     resource_keys: list[str],
@@ -3070,7 +3134,12 @@ def _origin_main_fetch_effect_evidence(
     resolved_target: str,
     fetch_result: dict[str, Any],
     public_before_fetch: str,
+    phase: str,
 ) -> dict[str, Any]:
+    # Only the two owner-controlled call sites can classify when this ODB
+    # mutation occurred; the phase is inside the digest-bound receipt.
+    if phase not in {"admission", "refresh"}:
+        raise RuntimeError("protected-main object import phase is invalid")
     if (
         pre_fetch_snapshot.get("target_object_present") is not False
         or resolved_target != expected_head
@@ -3083,7 +3152,11 @@ def _origin_main_fetch_effect_evidence(
         )
     material = {
         "schema_version": 1,
-        "kind": "grabowski_runtime_deploy_origin_main_fetch_effect",
+        "kind": (
+            "grabowski_runtime_deploy_origin_main_fetch_effect"
+            if phase == "admission"
+            else "grabowski_runtime_deploy_origin_main_refresh_fetch_effect"
+        ),
         "canonical_repository": str(plan["canonical_repository"]),
         "expected_head": expected_head,
         "previous_head": pre_fetch_snapshot["current_head"],
@@ -3110,6 +3183,209 @@ def _origin_main_fetch_effect_evidence(
         **material,
         "evidence_sha256": _source_identity_sha256(material),
     }
+
+
+
+def _fetch_exact_release_admission_target(
+    expected_head: str,
+    initial_snapshot: dict[str, Any],
+    *,
+    local_mutation_tracker: dict[str, Any],
+) -> None:
+    """Import only an exact public-main object before ancestry admission.
+
+    Caller holds the schedule lock. This operation never moves a Git ref,
+    grants release authority, or schedules a job. The ordinary independent
+    release policy must be re-evaluated after the protected object import.
+    """
+    if (
+        not isinstance(expected_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None
+        or initial_snapshot.get("target_head") != expected_head
+        or initial_snapshot.get("target_object_present") is not False
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission object import requires an exact missing target"
+        )
+    plan = _origin_main_refresh_plan(expected_head)
+    canonical = plan["canonical_repository"]
+    if initial_snapshot.get("canonical_repository") != str(canonical):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission object import canonical repository mismatch"
+        )
+    resource_keys = [
+        plan["operation_key"],
+        plan["canonical_key"],
+        plan["common_dir_key"],
+        plan["objects_key"],
+        plan["origin_main_ref_key"],
+    ]
+    acquisition = _acquire_origin_main_refresh_resources(plan, expected_head)
+    try:
+        expected_leases = [
+            _lease_for_key(acquisition, resource_key)
+            for resource_key in resource_keys
+        ]
+        _require_origin_main_refresh_checkout_certainty(plan)
+        locked = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if (
+            _canonical_main_refresh_state(locked)
+            != _canonical_main_refresh_state(initial_snapshot)
+            or locked.get("target_object_present") is not False
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission object import checkout or target drifted before fetch"
+            )
+        object_format = _required_stdout(
+            _git_result(canonical, "rev-parse", "--show-object-format"),
+            "canonical object format",
+        )
+        if (
+            (object_format == "sha1" and len(expected_head) != 40)
+            or (object_format == "sha256" and len(expected_head) != 64)
+            or object_format not in {"sha1", "sha256"}
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission object import object format differs from target OID"
+            )
+        public_before = _fresh_public_github_main(expected_head)
+        if public_before != expected_head:
+            raise DeploySchedulePreEffectRefusal(
+                "release admission object import public main drifted before fetch"
+            )
+        _append_deploy_audit({
+            "timestamp_unix": int(time.time()),
+            "operation": "runtime-deploy-admission-target-fetch-intent",
+            "expected_head": expected_head,
+            "public_github_main": public_before,
+            "previous_origin_main": locked["origin_main"],
+        })
+        # The audit append retries lock contention without a time bound. A
+        # lease acquired before that wait may have expired or been reclaimed:
+        # validate and renew its exact snapshots *after* the wait and before
+        # the first possibly effectful Git fetch. Finally must release the
+        # renewed, not the stale, generation.
+        acquisition = _renew_origin_main_refresh_resources(
+            plan, resource_keys, acquisition
+        )
+        if _fresh_public_github_main(expected_head) != expected_head:
+            raise DeploySchedulePreEffectRefusal(
+                "release admission object import public main drifted during audit wait"
+            )
+        # An unbounded audit-lock wait may have outlived the source snapshot
+        # even when the exact resource leases were safely renewed. Re-check
+        # checkout/ref/target under their renewed leases before Git mutates
+        # the ODB or an uncertainty receipt records previous origin/main.
+        _require_origin_main_refresh_checkout_certainty(plan)
+        observed_after_audit = _canonical_main_refresh_candidate(
+            expected_head, plan["owner_id"]
+        )
+        if (
+            _canonical_main_refresh_state(observed_after_audit)
+            != _canonical_main_refresh_state(initial_snapshot)
+            or observed_after_audit.get("target_object_present") is not False
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission object import checkout/ref identity drifted during audit wait"
+            )
+        locked = observed_after_audit
+        # Once a fetch begins its outcome can be uncertain even if the command
+        # fails. Persist that distinction instead of calling it no effect.
+        local_mutation_tracker["admission_target_fetch"] = {
+            "schema_version": 1,
+            "kind": "grabowski_runtime_deploy_admission_target_fetch_attempt",
+            "expected_head": expected_head,
+            "previous_origin_main": locked["origin_main"],
+            "operation_resource_key": plan["operation_key"],
+            "status": "outcome_unknown",
+            "effect_may_have_started": True,
+        }
+        try:
+            result = _mutating_git_result(
+                canonical,
+                "fetch",
+                "--no-auto-maintenance",
+                "--no-tags",
+                "--no-write-fetch-head",
+                "--no-recurse-submodules",
+                PUBLIC_GITHUB_REPOSITORY_URL,
+                expected_head,
+            )
+        except DeploySchedulePreEffectRefusal:
+            # The exact operator preflight failed before Git process launch.
+            # Do not misclassify a proven no-effect as an uncertain fetch.
+            local_mutation_tracker.pop("admission_target_fetch", None)
+            raise
+        if (
+            type(result.get("returncode")) is not int
+            or result["returncode"] != 0
+            or result.get("timed_out") is not False
+            or result.get("stdout_truncated") is not False
+            or result.get("stderr_truncated") is not False
+        ):
+            raise RuntimeError("exact protected-main admission object fetch failed")
+        observed_head = _required_stdout(
+            _git_result(canonical, "rev-parse", "--verify", f"{expected_head}^{{commit}}"),
+            "fetched admission target commit",
+        )
+        if observed_head != expected_head:
+            raise RuntimeError("fetched admission target commit does not match public main")
+        local_mutation_tracker["admission_target_fetch"] = (
+            _origin_main_fetch_effect_evidence(
+                plan=plan,
+                pre_fetch_snapshot=locked,
+                expected_head=expected_head,
+                resolved_target=observed_head,
+                fetch_result=result,
+                public_before_fetch=public_before,
+                phase="admission",
+            )
+        )
+        after = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if (
+            _canonical_main_refresh_state(after)
+            != _canonical_main_refresh_state(initial_snapshot)
+            or after.get("target_object_present") is not True
+        ):
+            raise RuntimeError(
+                "release admission object fetch altered canonical checkout or remote ref"
+            )
+        public_after = _fresh_public_github_main(expected_head)
+        if public_after != expected_head:
+            raise RuntimeError(
+                "release admission object fetch public main drifted after fetch"
+            )
+        _append_deploy_audit({
+            "timestamp_unix": int(time.time()),
+            "operation": "runtime-deploy-admission-target-fetched",
+            "expected_head": expected_head,
+            "object_format": object_format,
+            "public_github_main": public_after,
+            "evidence_sha256": local_mutation_tracker["admission_target_fetch"][
+                "evidence_sha256"
+            ],
+            "origin_main_unchanged": True,
+        })
+    finally:
+        # Never retain the ref/ODB leases after this admission-only operation.
+        # Any incomplete release is a hard failure, never a reason to dispatch.
+        leases = [
+            _lease_for_key(acquisition, resource_key)
+            for resource_key in resource_keys
+        ]
+        release = _release_origin_main_refresh_resources(
+            plan, resource_keys, leases
+        )
+        released = release.get("released") if isinstance(release, dict) else None
+        if (
+            not isinstance(released, list)
+            or len(released) != len(resource_keys)
+            or not all(isinstance(item, dict) for item in released)
+            or {item.get("resource_key") for item in released} != set(resource_keys)
+        ):
+            raise RuntimeError(
+                "release admission object import lease closeout incomplete"
+            )
 
 
 def _origin_main_refresh_effect_evidence(
@@ -3244,6 +3520,7 @@ def _refresh_canonical_origin_main(
                 resolved_target=resolved_target,
                 fetch_result=fetch_result,
                 public_before_fetch=public_before_fetch,
+                phase="refresh",
             )
         after_fetch = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
         if _canonical_main_refresh_state(after_fetch) != _canonical_main_refresh_state(
@@ -5390,6 +5667,52 @@ def _recovered_auto_deploy_source_binding(
 
 
 
+def _release_documentation_raw_paths(raw_records: str) -> list[str]:
+    """Accept only complete NUL-delimited raw Git changes to plain documents."""
+    if raw_records and not raw_records.endswith("\x00"):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: source path boundary is incomplete"
+        )
+    frames = raw_records[:-1].split("\x00") if raw_records else []
+    if len(frames) % 2 or len(frames) > 8192:
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: source raw diff boundary is incomplete"
+        )
+    changed_paths: list[str] = []
+    for header, path in zip(frames[::2], frames[1::2], strict=True):
+        if (
+            not path or path.startswith("/") or "\ufffd" in path
+            or "<REDACTED>" in path or "\\" in path
+            or any(segment in {"", ".", ".."} for segment in path.split("/"))
+            or any(ord(char) < 32 or ord(char) == 127 for char in path)
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: source paths are ambiguous"
+            )
+        record = re.fullmatch(
+            r":([0-7]{6}) ([0-7]{6}) ([0-9a-f]{40}|[0-9a-f]{64}) "
+            r"([0-9a-f]{40}|[0-9a-f]{64}) ([ADM])",
+            header,
+        )
+        if record is None:
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: source raw modes are unproved"
+            )
+        old_mode, new_mode, old_oid, new_oid, change = record.groups()
+        safe_transition = {
+            "A": ("000000", "100644"),
+            "D": ("100644", "000000"),
+            "M": ("100644", "100644"),
+        }
+        if len(old_oid) != len(new_oid) or (old_mode, new_mode) != safe_transition[change]:
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: source modes are not plain documents"
+            )
+        changed_paths.append(path)
+    return changed_paths
+
+
+
 @contextmanager
 def _captain_release_scope(
     expected_head: str, release_review_pr: int,
@@ -5474,7 +5797,8 @@ def _require_release_source_admission(
             "independent_review_required": False,
         }
     ancestor = _git_result(
-        CANONICAL_REPOSITORY, "merge-base", "--is-ancestor", serving_head, expected_head
+        CANONICAL_REPOSITORY, "merge-base", "--is-ancestor", serving_head, expected_head,
+        c_locale=True,
     )
     if (
         type(ancestor.get("returncode")) is not int
@@ -5483,8 +5807,54 @@ def _require_release_source_admission(
         or ancestor.get("stdout_truncated") is not False
         or ancestor.get("stderr_truncated") is not False
     ):
+        # Only this exact, complete Git diagnosis can trigger the protected
+        # missing-target path. A missing *serving* commit, unrelated history,
+        # timed-out read or corrupt repository must never authorize Git fetch.
+        target_missing_diagnosis = (
+            type(ancestor.get("returncode")) is int
+            and ancestor["returncode"] == 128
+            and ancestor.get("timed_out") is False
+            and ancestor.get("stdout_truncated") is False
+            and ancestor.get("stderr_truncated") is False
+            and ancestor.get("stdout") == ""
+            and ancestor.get("stderr") in {
+                f"fatal: Not a valid commit name {expected_head}",
+                f"fatal: Not a valid commit name {expected_head}\n",
+            }
+        )
+        if target_missing_diagnosis:
+            serving_object = _git_result(
+                CANONICAL_REPOSITORY,
+                "rev-parse", "--verify", "--quiet", f"{serving_head}^{{commit}}",
+            )
+            target_object = _git_result(
+                CANONICAL_REPOSITORY,
+                "rev-parse", "--verify", "--quiet", f"{expected_head}^{{commit}}",
+            )
+            serving_present = (
+                type(serving_object.get("returncode")) is int
+                and serving_object["returncode"] == 0
+                and serving_object.get("timed_out") is False
+                and serving_object.get("stdout_truncated") is False
+                and serving_object.get("stderr_truncated") is False
+                and serving_object.get("stderr") == ""
+                and serving_object.get("stdout") in {serving_head, serving_head + "\n"}
+            )
+            target_absent = (
+                type(target_object.get("returncode")) is int
+                and target_object["returncode"] == 1
+                and target_object.get("timed_out") is False
+                and target_object.get("stdout_truncated") is False
+                and target_object.get("stderr_truncated") is False
+                and target_object.get("stdout") == ""
+                and target_object.get("stderr") == ""
+            )
+            if serving_present and target_absent:
+                raise DeploySchedulePreEffectRefusal(
+                    "release admission blocked: source ancestry is unproved"
+                )
         raise DeploySchedulePreEffectRefusal(
-            "release admission blocked: source ancestry is unproved"
+            "release admission blocked: ancestor check failed"
         )
     observed = _git_result(
         CANONICAL_REPOSITORY,
@@ -5493,7 +5863,8 @@ def _require_release_source_admission(
         "--no-textconv",
         "--no-renames",
         "--ignore-submodules=none",
-        "--name-only",
+        "--raw",
+        "--no-abbrev",
         "-z",
         serving_head,
         expected_head,
@@ -5511,25 +5882,7 @@ def _require_release_source_admission(
         raise DeploySchedulePreEffectRefusal(
             "release admission blocked: complete source diff is unavailable"
         )
-    raw_paths = observed["stdout"]
-    if raw_paths and not raw_paths.endswith("\x00"):
-        raise DeploySchedulePreEffectRefusal(
-            "release admission blocked: source path boundary is incomplete"
-        )
-    changed_paths = raw_paths[:-1].split("\x00") if raw_paths else []
-    if any(
-        not path
-        or path.startswith("/")
-        or "\ufffd" in path
-        or "<REDACTED>" in path
-        or "\\" in path
-        or any(component in {"", ".", ".."} for component in path.split("/"))
-        or any(ord(character) < 32 or ord(character) == 127 for character in path)
-        for path in changed_paths
-    ):
-        raise DeploySchedulePreEffectRefusal(
-            "release admission blocked: source paths are ambiguous"
-        )
+    changed_paths = _release_documentation_raw_paths(observed["stdout"])
     # Only pure documentation delta is exempt; unknown files, test or CI
     # policy, executables, tools and runtime sources all fail closed.
     # Even inside docs/, executable or configuration files are not inherently
@@ -5625,67 +5978,9 @@ def _require_release_source_admission(
                 "release review admission blocked: Captain-to-dispatch identity drift"
             )
         return reviewed
-    # A docs/ extension is not enough to exempt a symlink, executable,
-    # gitlink, type-change or ambiguous Git entry. Verify exact Git object
-    # modes independently of the filename-only classifier.
-    document_diff = _git_result(
-        CANONICAL_REPOSITORY,
-        "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
-        "--ignore-submodules=none", "--raw", "--abbrev=40", "-z",
-        serving_head, expected_head, "--",
-        max_output_bytes=262_144,
-    )
-    if (
-        type(document_diff.get("returncode")) is not int
-        or document_diff["returncode"] != 0
-        or document_diff.get("timed_out") is not False
-        or document_diff.get("stdout_truncated") is not False
-        or document_diff.get("stderr_truncated") is not False
-        or document_diff.get("stderr") != ""
-        or not isinstance(document_diff.get("stdout"), str)
-        or "\ufffd" in document_diff["stdout"]
-        or "<REDACTED>" in document_diff["stdout"]
-    ):
-        raise DeploySchedulePreEffectRefusal(
-            "release admission blocked: complete documentation Git modes unavailable"
-        )
-    raw_document = document_diff["stdout"]
-    if raw_document and not raw_document.endswith("\x00"):
-        raise DeploySchedulePreEffectRefusal(
-            "release admission blocked: documentation Git mode boundary incomplete"
-        )
-    fields = raw_document[:-1].split("\x00") if raw_document else []
-    if len(fields) != 2 * len(changed_paths):
-        raise DeploySchedulePreEffectRefusal(
-            "release admission blocked: documentation Git mode inventory mismatch"
-        )
-    observed_doc_paths: list[str] = []
-    for index in range(0, len(fields), 2):
-        header, path = fields[index : index + 2]
-        match = re.fullmatch(
-            r":([0-7]{6}) ([0-7]{6}) [0-9a-f]{40} [0-9a-f]{40} ([AMD])",
-            header,
-        )
-        if match is None:
-            raise DeploySchedulePreEffectRefusal(
-                "release admission blocked: non-plain documentation change"
-            )
-        old_mode, new_mode, operation = match.groups()
-        if (
-            old_mode not in {"000000", "100644"}
-            or new_mode not in {"000000", "100644"}
-            or (operation == "A" and (old_mode, new_mode) != ("000000", "100644"))
-            or (operation == "D" and (old_mode, new_mode) != ("100644", "000000"))
-            or (operation == "M" and (old_mode, new_mode) != ("100644", "100644"))
-        ):
-            raise DeploySchedulePreEffectRefusal(
-                "release admission blocked: documentation Git mode is not plain"
-            )
-        observed_doc_paths.append(path)
-    if observed_doc_paths != changed_paths:
-        raise DeploySchedulePreEffectRefusal(
-            "release admission blocked: documentation source paths and Git modes disagree"
-        )
+    # _release_documentation_raw_paths already verified every changed
+    # entry's complete Git raw header, exact OID width, regular-file mode
+    # transition and unambiguous path before the documentation exemption.
     return {
         "status": "non-runtime-documentation",
         "serving_repo_head": serving_head,
@@ -5693,6 +5988,159 @@ def _require_release_source_admission(
         "changed_path_count": len(changed_paths),
         "independent_review_required": False,
     }
+
+
+
+def _require_release_source_admission_under_lease(
+    expected_head: str,
+) -> dict[str, Any]:
+    """Re-admit the runtime source under exact ODB/ref/checkout writer leases.
+
+    The early scheduler probe is only a fail-closed hint. This is the
+    authoritative decision before any index, origin/main, Rootbroker, or
+    job-dispatch effects; a concurrent Git writer cannot change the source
+    resolution during the check.
+    """
+    plan = _origin_main_refresh_plan(expected_head)
+    resource_keys = [
+        plan["operation_key"], plan["canonical_key"], plan["common_dir_key"],
+        plan["objects_key"], plan["origin_main_ref_key"],
+    ]
+    acquisition = _acquire_origin_main_refresh_resources(plan, expected_head)
+    try:
+        for key in resource_keys:
+            _lease_for_key(acquisition, key)
+        _require_origin_main_refresh_checkout_certainty(plan)
+        before = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if (
+            not isinstance(before, dict)
+            or before.get("canonical_repository") != str(plan["canonical_repository"])
+            or before.get("target_head") != expected_head
+            or before.get("target_object_present") is not True
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission refused: protected target identity is unproved"
+            )
+        admitted = _require_release_source_admission(expected_head)
+        # A non-exception result is not itself authorization. The caller may
+        # proceed only with one of the helper's two exact source identities.
+        # Exempt identities remain fully source-bound. An authenticated
+        # non-documentary source change must instead be re-admitted by the
+        # server under the exact current Captain release scope. Neither a
+        # PR number nor a local ContextVar alone can grant this status.
+        exempt = (
+            isinstance(admitted, dict)
+            and admitted.get("target_repo_head") == expected_head
+            and admitted.get("independent_review_required") is False
+            and (
+                (
+                    admitted.get("status") == "already-serving-exact-source"
+                    and admitted.get("serving_repo_head") == expected_head
+                )
+                or (
+                    admitted.get("status") == "non-runtime-documentation"
+                    and admitted.get("serving_repo_head") != expected_head
+                    and type(admitted.get("changed_path_count")) is int
+                    and 0 <= admitted["changed_path_count"] <= 8192
+                )
+            )
+        )
+        positive = (
+            isinstance(admitted, dict)
+            and admitted.get("status") == "authenticated-post-merge-r3-ci"
+            and admitted.get("target_head") == expected_head
+            and admitted.get("independent_review_required") is True
+            and isinstance(admitted.get("release_review_identity_sha256"), str)
+            and re.fullmatch(
+                r"[0-9a-f]{64}", admitted["release_review_identity_sha256"]
+            ) is not None
+            and isinstance(admitted.get("serving_head"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", admitted["serving_head"]) is not None
+            and admitted.get("serving_head") != expected_head
+            and isinstance(admitted.get("serving_release_id"), str)
+            and bool(admitted["serving_release_id"])
+            and isinstance(admitted.get("review"), dict)
+            and type(admitted["review"].get("review_pr")) is int
+            and admitted["review"]["review_pr"] > 0
+        )
+        if not (exempt or positive):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission refused: protected policy result is unbound"
+            )
+        after = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if (
+            not isinstance(after, dict)
+            or _canonical_main_refresh_state(before) != _canonical_main_refresh_state(after)
+            or after.get("target_object_present") is not True
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission refused: checkout/ref/ODB identity drifted"
+            )
+        return admitted
+    finally:
+        leases = [_lease_for_key(acquisition, key) for key in resource_keys]
+        release = _release_origin_main_refresh_resources(plan, resource_keys, leases)
+        released = release.get("released") if isinstance(release, dict) else None
+        if (
+            not isinstance(released, list)
+            or len(released) != len(resource_keys)
+            or not all(isinstance(item, dict) for item in released)
+            or {item.get("resource_key") for item in released} != set(resource_keys)
+        ):
+            raise RuntimeError(
+                "release admission protected source lease closeout incomplete"
+            )
+
+
+def _protected_release_admission_target_snapshot(
+    expected_head: str,
+) -> dict[str, Any]:
+    """Inspect the missing public-main target only under ODB/checkout leases.
+
+    Porcelain status can invoke repository-configured process/clean filters;
+    even a preflight must never run it as an uncoordinated read. The caller
+    holds the scheduler lock. The eventual object import independently
+    reacquires these resources and revalidates the snapshot before effects.
+    """
+    plan = _origin_main_refresh_plan(expected_head)
+    resource_keys = [
+        plan["operation_key"],
+        plan["canonical_key"],
+        plan["common_dir_key"],
+        plan["objects_key"],
+        plan["origin_main_ref_key"],
+    ]
+    acquisition = _acquire_origin_main_refresh_resources(plan, expected_head)
+    try:
+        for key in resource_keys:
+            _lease_for_key(acquisition, key)
+        _require_origin_main_refresh_checkout_certainty(plan)
+        snapshot = _canonical_main_refresh_candidate(expected_head, plan["owner_id"])
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("canonical_repository") != str(plan["canonical_repository"])
+            or snapshot.get("target_head") != expected_head
+            or type(snapshot.get("target_object_present")) is not bool
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "protected release admission target snapshot identity is invalid"
+            )
+        return snapshot
+    finally:
+        leases = [
+            _lease_for_key(acquisition, key) for key in resource_keys
+        ]
+        result = _release_origin_main_refresh_resources(plan, resource_keys, leases)
+        released = result.get("released") if isinstance(result, dict) else None
+        if (
+            not isinstance(released, list)
+            or len(released) != len(resource_keys)
+            or not all(isinstance(item, dict) for item in released)
+            or {item.get("resource_key") for item in released} != set(resource_keys)
+        ):
+            raise RuntimeError(
+                "protected release admission snapshot lease closeout incomplete"
+            )
 
 
 def _grabowski_runtime_deploy_schedule_impl(
@@ -5705,17 +6153,63 @@ def _grabowski_runtime_deploy_schedule_impl(
     local_mutation_tracker: dict[str, Any],
 ) -> dict[str, Any]:
     """Implement one source-identity-bound self-deployment schedule attempt."""
-    _require_release_source_admission(expected_head)
-    with _deploy_schedule_lock():
-        # Re-read serving identity and authenticated review after taking the
-        # cooperating scheduler lock, never rely on a stale Captain preview.
+    # Preserve the early pre-effect denial. Only an explicitly missing target
+    # object can defer the ancestry portion into the protected schedule lock.
+    needs_target_object_admission = False
+    try:
         _require_release_source_admission(expected_head)
-        public_github_main_before = _fresh_public_github_main(expected_head)
-        if public_github_main_before != expected_head:
-            raise RuntimeError(
-                "fresh public GitHub main differs from deployment target: "
-                f"expected {expected_head}, found {public_github_main_before}"
+    except DeploySchedulePreEffectRefusal as exc:
+        if str(exc) != "release admission blocked: source ancestry is unproved":
+            raise
+        needs_target_object_admission = True
+    with _deploy_schedule_lock():
+        try:
+            if needs_target_object_admission:
+                # A lock waiter must not read a prior importer's live source
+                # leases. Acquire our own ODB/checkout leases before any status
+                # check that may execute repository-configured filters.
+                snapshot = _protected_release_admission_target_snapshot(expected_head)
+                if snapshot["target_object_present"] is False:
+                    _fetch_exact_release_admission_target(
+                        expected_head, snapshot,
+                        local_mutation_tracker=local_mutation_tracker,
+                    )
+            # Re-admit even when another scheduler imported the exact object.
+            # Mandatory re-admission under the lock even when an earlier read
+            # succeeded. No index, Git-ref, Rootbroker, or dispatch effect precedes it.
+            _require_release_source_admission_under_lease(expected_head)
+            public_github_main_before = _fresh_public_github_main(expected_head)
+            if public_github_main_before != expected_head:
+                raise RuntimeError(
+                    "fresh public GitHub main differs from deployment target: "
+                    f"expected {expected_head}, found {public_github_main_before}"
+                )
+        except DeploySchedulePreEffectRefusal as exc:
+            # An R3/source refusal after an ODB import is still a refusal,
+            # but no longer a mutation-free one. Preserve the committed fetch
+            # receipt without allowing Rootbroker or job dispatch to run.
+            evidence = _tracked_runtime_deploy_local_mutation_evidence(
+                local_mutation_tracker
             )
+            if evidence is None or exc.local_mutation_evidence is not None:
+                raise
+            raise DeploySchedulePreEffectRefusal(
+                str(exc), local_mutation_evidence=evidence
+            ) from exc
+        except DeployScheduleFailureAfterLocalMutation:
+            raise
+        except Exception as exc:
+            # A timed-out or failed Git process may have mutated the ODB.
+            # The direct scheduler seam must expose the digest-bound unknown
+            # outcome, not rely on the public wrapper to recover provenance.
+            evidence = _tracked_runtime_deploy_local_mutation_evidence(
+                local_mutation_tracker
+            )
+            if evidence is None:
+                raise
+            raise DeployScheduleFailureAfterLocalMutation(
+                str(exc), local_mutation_evidence=evidence
+            ) from exc
         automatic_source: dict[str, Any] | None = None
         automatic_source_binding: dict[str, Any] | None = None
         automatic_source_needed = False
@@ -5856,18 +6350,16 @@ def _grabowski_runtime_deploy_schedule_impl(
                     local_mutation_evidence=combined_evidence,
                 ) from exc
             except DeploySchedulePreEffectRefusal as exc:
-                reconciliation = inflight_before_resolution.get(
-                    "stale_pending_reconciliation"
+                # Do not discard an earlier object-import or index mutation
+                # when a later protected ref refresh is refused before effect.
+                evidence = _tracked_runtime_deploy_local_mutation_evidence(
+                    local_mutation_tracker
                 )
-                if reconciliation is None:
+                if evidence is None:
                     raise
-                if not isinstance(reconciliation, dict):
-                    raise RuntimeError(
-                        "stale pending reconciliation evidence is malformed"
-                    ) from exc
                 raise DeploySchedulePreEffectRefusal(
                     str(exc),
-                    local_mutation_evidence=reconciliation,
+                    local_mutation_evidence=evidence,
                 ) from exc
             if not automatic_source_needed:
                 repository, runner, source_identity = _deployment_source_preflight(
