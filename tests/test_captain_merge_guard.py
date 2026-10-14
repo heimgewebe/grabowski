@@ -459,6 +459,77 @@ class CaptainLargePrMergeGuardTests(unittest.TestCase):
         )
         self.assertEqual(runner.receipt["live_diff"]["identity_mode"], "canonical")
 
+    def test_live_canonical_pr_diff_accepts_exact_raw_provider_review_alias(self) -> None:
+        gh = _RenamePrGh()
+        gh.diff_text = (
+            "diff --git a/new-name.txt b/new-name.txt\n"
+            "index 123456789abcdef..abcdef0123456789 100644\n"
+            "--- a/new-name.txt\n"
+            "+++ b/new-name.txt\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        canonical = merge_guard.github_pr_diff_identity_sha256(gh.diff_text.encode())
+        raw = hashlib.sha256(gh.diff_text.encode()).hexdigest()
+        self.assertNotEqual(raw, canonical)
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.action = {"target": {"repo": "heimgewebe/commonworld", "pr": 212, "base": "main"}}
+        runner.parameters = {
+            "expected_head": gh.head_sha,
+            "expected_base_sha": gh.base_sha,
+            "diff_sha256": canonical,
+        }
+        runner.static_errors = []
+        runner.repo_path = Path.cwd()
+        runner.github_runner = gh
+        runner.receipt = {}
+        runner.execution_intent_sha256 = "1" * 64
+        runner._revalidate_codex_review = lambda _bindings, phase: []
+        bindings, errors = runner._live_bindings()
+        self.assertEqual(errors, [])
+        self.assertIsNotNone(bindings)
+        assert bindings is not None
+        aliases = merge_guard._verified_decision_review_diff_aliases(
+            bindings, runner.receipt["live_diff"]
+        )
+        self.assertIn(raw, aliases)
+        self.assertNotIn(canonical, aliases)
+        # The earlier v1-canonical action preserves its existing alias set.
+        previous_bindings = {
+            **bindings,
+            "diff_identity_mode": "canonical-v1-compat",
+            "diff_sha256": bindings["previous_canonical_diff_sha256"],
+        }
+        self.assertNotIn(
+            raw,
+            merge_guard._verified_decision_review_diff_aliases(
+                previous_bindings, runner.receipt["live_diff"]
+            ) or [],
+        )
+
+        # An unproven or unavailable provider representation must never
+        # become a permission to attach foreign decision reviews.
+        for change in (
+            {"returncode": 1},
+            {"source": "local-bound-git-diff-after-github-too-large"},
+            {"source": "untrusted-caller"},
+            {"raw_sha256": "f" * 64},
+            {"sha256": "e" * 64},
+            {"raw_sha256": None},
+            {"provider_attempt": None},
+            {"provider_attempt": {"returncode": 0, "stdout_sha256": "0" * 64}},
+            {"provider_attempt": {"returncode": 1, "stdout_sha256": raw}},
+        ):
+            with self.subTest(change=change):
+                untrusted = {**runner.receipt["live_diff"], **change}
+                self.assertNotIn(
+                    raw,
+                    merge_guard._verified_decision_review_diff_aliases(
+                        bindings, untrusted
+                    ) or [],
+                )
+
 
     def test_local_legacy_review_diff_requires_bound_objects_paths_and_same_hunks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
