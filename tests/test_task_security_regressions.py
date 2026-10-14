@@ -1151,6 +1151,118 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         save.assert_not_called()
 
 
+    def test_pending_resource_page_rejects_scoped_blockade_before_wal_and_chmod(self) -> None:
+        """Resource page read may not repair the store before task scope is allowed."""
+        import sqlite3
+        import stat
+
+        pending = self.fixtures._prepare_pending_terminalization()
+        task_id = str(pending["task_id"])
+        database = self.fixtures.resource_database
+        with sqlite3.connect(database) as connection:
+            self.assertEqual(
+                "delete", connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+            )
+        self.assertFalse(tasks.Path(f"{database}-wal").exists())
+        database.chmod(0o640)
+        before = database.read_bytes()
+
+        def require(_capability, **scope):
+            if scope.get("task_id") == task_id and scope.get("path") == str(self.root):
+                raise PermissionError("resource page scoped blockade")
+
+        try:
+            with patch.object(
+                tasks.operator, "_require_operator_mutation", side_effect=require
+            ):
+                with self.assertRaisesRegex(
+                    PermissionError, "resource page scoped blockade"
+                ):
+                    tasks._recover_pending_task_terminalizations(limit=1)
+            self.assertEqual(before, database.read_bytes())
+            self.assertEqual(0o640, stat.S_IMODE(database.stat().st_mode))
+            self.assertFalse(tasks.Path(f"{database}-wal").exists())
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(
+                    "delete", connection.execute("PRAGMA journal_mode").fetchone()[0]
+                )
+        finally:
+            database.chmod(0o600)
+
+    def test_pending_resource_page_legacy_schema_denied_without_migration(self) -> None:
+        """A v2 resource store may not become v3 before blocked task admission."""
+        import sqlite3
+        from contextlib import closing
+
+        pending = self.fixtures._prepare_pending_terminalization()
+        task_id = str(pending["task_id"])
+        database = self.fixtures.resource_database
+        with closing(sqlite3.connect(database)) as connection:
+            for index in (
+                "task_terminalizations_pending_idx",
+                "task_authority_adoptions_expiry_idx",
+            ):
+                connection.execute(f"DROP INDEX IF EXISTS {index}")
+            connection.execute(
+                "UPDATE metadata SET value='2' WHERE key='schema_version'"
+            )
+            connection.commit()
+        before = database.read_bytes()
+
+        def require(_capability, **scope):
+            if scope.get("task_id") == task_id and scope.get("path") == str(self.root):
+                raise PermissionError("legacy resources scoped blockade")
+
+        with patch.object(
+            tasks.operator, "_require_operator_mutation", side_effect=require
+        ):
+            with self.assertRaisesRegex(
+                PermissionError, "legacy resources scoped blockade"
+            ):
+                tasks._recover_pending_task_terminalizations(limit=1)
+        with tasks.resources._resource_inventory_readonly_sqlite(database) as connection:
+            self.assertEqual("2", tasks.resources._resource_schema_version(connection))
+        self.assertEqual(before, database.read_bytes())
+        self.assertEqual(
+            [],
+            list(database.parent.glob(f"{database.name}.schema-*.backup")),
+        )
+
+    def test_recovery_batch_preflights_later_denial_before_earlier_projection(self) -> None:
+        """A second blocked task must not permit the first task's durable effects."""
+        pending = [
+            self.fixtures._prepare_pending_terminalization(
+                prepared_at_unix=100 + index
+            )
+            for index in range(2)
+        ]
+        ids = [str(item["task_id"]) for item in pending]
+        before = {task_id: tasks._row_raw(task_id) for task_id in ids}
+        blocked = ids[1]
+        admission_order = []
+
+        def require(_capability, **scope):
+            if scope.get("path") == str(self.root):
+                admission_order.append(scope["task_id"])
+                if scope["task_id"] == blocked:
+                    raise PermissionError("second page task scoped blockade")
+
+        with patch.object(
+            tasks.operator, "_require_operator_mutation", side_effect=require
+        ):
+            with self.assertRaisesRegex(
+                PermissionError, "second page task scoped blockade"
+            ):
+                tasks._recover_pending_task_terminalizations(limit=2)
+        self.assertEqual(ids, admission_order)
+        for task_id in ids:
+            self.assertEqual(before[task_id], tasks._row_raw(task_id))
+            self.assertEqual(
+                "leases_revoked",
+                tasks.resources.task_terminalization_record(task_id)["phase"],
+            )
+
+
     def test_recovery_cursor_legacy_store_is_readonly_before_scoped_gate(self) -> None:
         """Blocked legacy task-list must not migrate after denied cursor lookup."""
         task_id, _ = self.fixtures._create_task_schema_version("2")

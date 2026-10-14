@@ -8508,14 +8508,12 @@ def _recover_pending_task_terminalizations(
         cursor_before=cursor_before,
         high_water=high_water,
     )
-    recovered: list[str] = []
-    failed: list[dict[str, str]] = []
+    # Preflight the *entire* page before its first projection. In a mixed
+    # allowed/blocked batch, committing an early task would violate the
+    # later task's scoped hard-stop even if the cursor itself were untouched.
+    # Any scope or identity failure aborts the batch with no projection writes.
     for terminalization in page["terminalizations"]:
         task_id = str(terminalization["task_id"])
-        # A denied or unresolvable scope must abort before cursor persistence
-        # or the subsequent task-list store read. Catching this denial as a
-        # per-item recovery failure would still migrate/chmod/create WAL in
-        # _save_terminalization_recovery_cycle(), bypassing the scoped stop.
         task_record = _row_scope_identity_readonly(task_id)
         operator._require_operator_mutation(
             "durable_job",
@@ -8526,6 +8524,10 @@ def _recover_pending_task_terminalizations(
             service=_authoritative_unit(task_record),
             host=task_record["host"],
         )
+    recovered: list[str] = []
+    failed: list[dict[str, str]] = []
+    for terminalization in page["terminalizations"]:
+        task_id = str(terminalization["task_id"])
         try:
             updated = _apply_terminalization_projection(
                 terminalization,
