@@ -6,10 +6,12 @@ They do not produce, forge, or accept any independent R3/Captain authorization.
 from __future__ import annotations
 
 import argparse
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -306,6 +308,7 @@ class EffectTimeCentralAdmissionTests(unittest.TestCase):
                 return_value="/usr/bin/python3.10",
             ),
             patch.object(dual, "_root_bootstrap_helper_owned", return_value=True),
+            patch.object(dual, "_require_rootbroker_systemd_mainpid"),
         ):
             with (
                 patch.object(dual, "_bootstrap_recovery_cgroup", return_value=trusted),
@@ -358,6 +361,75 @@ class EffectTimeCentralAdmissionTests(unittest.TestCase):
                 with self.assertRaisesRegex(dual.core.DeployError, "bootstrap.*origin"):
                     dual.require_root_broker_bootstrap_origin(expected_head=TARGET)
 
+    def test_bootstrap_origin_rejects_forged_parent_inside_real_system_cgroup(self):
+        """Same-UID argv inside an authentic unit is not systemd MainPID proof."""
+        nonce = "3" * 24
+        unit = f"grabowski-runtime-bootstrap-{TARGET[:12]}-{nonce}.service"
+        group = f"/system.slice/{unit}"
+        cgroup = f"0::{group}\n"
+        parent_pid = 4242
+        parent = (
+            "/usr/bin/python3", str(dual.ROOT_BOOTSTRAP_HELPER),
+            "user-execute", "--expected-head", TARGET,
+            "--execution-id", nonce,
+        )
+        correct = {
+            "Id": unit, "LoadState": "loaded", "ActiveState": "active",
+            "Transient": "yes", "Type": "exec",
+            "MainPID": str(parent_pid), "ControlGroup": group,
+        }
+        cases = {
+            "other-main-pid": {"MainPID": "4243"},
+            "not-transient": {"Transient": "no"},
+            "inactive": {"ActiveState": "inactive"},
+            "other-cgroup": {"ControlGroup": "/user.slice/other"},
+            "other-unit": {"Id": "other.service"},
+            "other-unit-type": {"Type": "simple"},
+            "missing-main-pid": {"MainPID": ""},
+        }
+        with (
+            patch.object(dual.os, "getuid", return_value=1000),
+            patch.object(dual.os, "geteuid", return_value=1000),
+            patch.object(dual.os, "getgid", return_value=1000),
+            patch.object(dual.os, "getegid", return_value=1000),
+            patch.object(dual.os, "getppid", return_value=parent_pid),
+            patch.object(dual, "_root_bootstrap_helper_owned", return_value=True),
+            patch.object(dual, "_bootstrap_recovery_cgroup", return_value=cgroup),
+            patch.object(dual, "_bootstrap_recovery_parent_cgroup", return_value=cgroup),
+            patch.object(dual, "_bootstrap_recovery_parent_executable", return_value="/usr/bin/python3.10"),
+            patch.object(dual, "_bootstrap_recovery_parent_argv", return_value=parent),
+        ):
+            for label, changed in cases.items():
+                observed = {**correct, **changed}
+                payload = "".join(f"{key}={value}\n" for key, value in observed.items())
+                with self.subTest(case=label):
+                    with patch.object(
+                        dual.core, "run",
+                        return_value=SimpleNamespace(returncode=0, stdout=payload),
+                    ) as show:
+                        with self.assertRaisesRegex(dual.core.DeployError, "bootstrap.*origin"):
+                            dual.require_root_broker_bootstrap_origin(expected_head=TARGET)
+                    show.assert_called_once()
+            valid_payload = "".join(f"{key}={value}\n" for key, value in correct.items())
+            with patch.object(
+                dual.core, "run",
+                return_value=SimpleNamespace(returncode=0, stdout=valid_payload),
+            ) as show:
+                self.assertIsNone(
+                    dual.require_root_broker_bootstrap_origin(expected_head=TARGET)
+                )
+            show.assert_called_once()
+            self.assertEqual(
+                {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+                show.call_args.kwargs.get("env"),
+                "systemd manager authentication must not inherit same-UID DBus environment",
+            )
+            with patch.object(
+                dual.core, "run", return_value=SimpleNamespace(returncode=1, stdout=""),
+            ):
+                with self.assertRaisesRegex(dual.core.DeployError, "bootstrap.*origin"):
+                    dual.require_root_broker_bootstrap_origin(expected_head=TARGET)
+
     def test_rootbroker_bootstrap_sha256_head_requires_full_parent_binding(self):
         """A 64-hex source cannot be exchanged for another with its prefix."""
         head, nonce = "c" * 64, "4" * 24
@@ -376,6 +448,7 @@ class EffectTimeCentralAdmissionTests(unittest.TestCase):
             patch.object(dual.os, "getgid", return_value=1000),
             patch.object(dual.os, "getegid", return_value=1000),
             patch.object(dual, "_root_bootstrap_helper_owned", return_value=True),
+            patch.object(dual, "_require_rootbroker_systemd_mainpid"),
             patch.object(dual, "_bootstrap_recovery_cgroup", return_value=cgroup),
             patch.object(dual, "_bootstrap_recovery_parent_cgroup", return_value=cgroup),
             patch.object(
@@ -399,6 +472,119 @@ class EffectTimeCentralAdmissionTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(dual.core.DeployError, "bootstrap.*origin"):
                     dual.require_root_broker_bootstrap_origin(expected_head=head)
+
+    def test_kernel_fd_lock_context_cannot_be_claimed_outside_exact_lock(self):
+        """Actual temp flock readback: not a Captain/R3 grant or production lock."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "deploy.lock"
+            other = root / "other.lock"
+            with patch.object(dual.core, "DEFAULT_LOCK_FILE", target):
+                with self.assertRaisesRegex(dual.core.DeployError, "canonical deployment lock"):
+                    dual.core.require_canonical_deployment_lock_held()
+                # Negative fixture: a manually invented ContextVar entry and a
+                # real inode/FD do NOT establish kernel flock ownership.
+                fd = os.open(target, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+                try:
+                    info = os.fstat(fd)
+                    token = dual.core._ACTIVE_DEPLOYMENT_LOCK.set((
+                        os.getpid(), fd, info.st_dev, info.st_ino, str(target),
+                    ))
+                    try:
+                        with self.assertRaisesRegex(
+                            dual.core.DeployError, "canonical deployment lock"
+                        ):
+                            dual.core.require_canonical_deployment_lock_held()
+                    finally:
+                        dual.core._ACTIVE_DEPLOYMENT_LOCK.reset(token)
+                finally:
+                    os.close(fd)
+                with dual.core.deployment_lock(other, state_root=root):
+                    with self.assertRaisesRegex(dual.core.DeployError, "canonical deployment lock"):
+                        dual.core.require_canonical_deployment_lock_held()
+                with dual.core.deployment_lock(target, state_root=root):
+                    self.assertIsNone(dual.core.require_canonical_deployment_lock_held())
+                with self.assertRaisesRegex(dual.core.DeployError, "canonical deployment lock"):
+                    dual.core.require_canonical_deployment_lock_held()
+
+    def test_core_direct_same_source_without_lock_has_no_effect(self):
+        """Even an already-serving commit needs the canonical effect-time lock."""
+        with (
+            patch.object(dual, "observe_authoritative_routing", return_value=routing(SERVING)),
+            patch.object(dual.core, "snapshot_from_git") as snapshot,
+            patch.object(dual.core, "build_release") as build,
+        ):
+            with self.assertRaisesRegex(dual.core.DeployError, "canonical deployment lock"):
+                dual.core.deploy(
+                    Path("/synthetic"), Path("/synthetic/runtime"),
+                    Path("/synthetic/profile"), timeout_seconds=1,
+                    expected_head=SERVING,
+                )
+        snapshot.assert_not_called()
+        build.assert_not_called()
+
+    def test_dual_direct_same_source_without_lock_has_no_effect(self):
+        with (
+            patch.object(dual, "observe_authoritative_routing", return_value=routing(SERVING)),
+            patch.object(dual, "preflight_url") as preflight,
+            patch.object(dual.core, "build_release") as build,
+        ):
+            with self.assertRaisesRegex(dual.core.DeployError, "canonical deployment lock"):
+                dual.deploy_url(
+                    Path("/synthetic"), Path("/synthetic/runtime"),
+                    Path("/synthetic/profile"), timeout_seconds=1,
+                    expected_head=SERVING,
+                )
+        preflight.assert_not_called()
+        build.assert_not_called()
+
+    def test_direct_green_prepare_without_lock_has_no_effect(self):
+        with (
+            patch.object(dual, "preflight_url") as preflight,
+            patch.object(dual.core, "build_release") as build,
+        ):
+            with self.assertRaisesRegex(dual.core.DeployError, "canonical deployment lock"):
+                dual.prepare_production_blue_green_runtime(
+                    Path("/synthetic"), Path("/synthetic/runtime"),
+                    Path("/synthetic/profile"), timeout_seconds=1,
+                    expected_head=SERVING, cutover_id="direct-outside-lock",
+                )
+        preflight.assert_not_called()
+        build.assert_not_called()
+
+    def test_core_direct_valid_but_nonserving_head_rejected_before_snapshot(self):
+        """A valid Git ID must not itself authorize low-level release effects."""
+        with (
+            patch.object(dual.core, "require_canonical_deployment_lock_held"),
+            patch.object(dual, "observe_authoritative_routing", return_value=routing(SERVING)),
+            patch.object(dual.core, "snapshot_from_git") as snapshot,
+            patch.object(dual.core, "build_release") as build,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "release admission"):
+                dual.core.deploy(
+                    Path("/synthetic"), Path("/synthetic/runtime"),
+                    Path("/synthetic/profile"), timeout_seconds=1,
+                    expected_head=TARGET,
+                )
+        snapshot.assert_not_called()
+        build.assert_not_called()
+
+    def test_callable_dual_deploy_refuses_valid_nonserving_head_pre_preflight(self):
+        """A direct deploy_url() caller may not bypass the main() lock guard."""
+        with (
+            patch.object(dual.core, "require_canonical_deployment_lock_held"),
+            patch.object(dual, "observe_authoritative_routing", return_value=routing(SERVING)),
+            patch.object(dual, "preflight_url", side_effect=AssertionError("preflight reached")) as preflight,
+            patch.object(dual.core, "build_release") as build,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "release admission"):
+                dual.deploy_url(
+                    Path("/synthetic"), Path("/synthetic/runtime"),
+                    Path("/synthetic/profile"), timeout_seconds=1,
+                    expected_head=TARGET,
+                )
+        preflight.assert_not_called()
+        build.assert_not_called()
 
     def test_core_deploy_without_explicit_expected_head_has_no_effect(self):
         """No direct core.deploy bypass via the optional None source identity."""
@@ -431,6 +617,8 @@ class EffectTimeCentralAdmissionTests(unittest.TestCase):
     def test_blue_green_prepare_refuses_mismatched_repo_snapshot_before_build(self):
         """Grok source-drift P1: A serving source cannot build Git target B."""
         with (
+            patch.object(dual.core, "require_canonical_deployment_lock_held"),
+            patch.object(dual, "require_locked_release_source_admission"),
             patch.object(
                 dual.core, "snapshot_from_git",
                 return_value=SimpleNamespace(repo_head=TARGET),
@@ -449,6 +637,9 @@ class EffectTimeCentralAdmissionTests(unittest.TestCase):
 
     def test_direct_deploy_url_refuses_mismatched_repo_snapshot_before_build(self):
         with (
+            patch.object(dual.core, "require_canonical_deployment_lock_held"),
+            # Verify snapshot drift independently of the outer admission gate.
+            patch.object(dual, "require_locked_release_source_admission"),
             patch.object(
                 dual.core, "snapshot_from_git",
                 return_value=SimpleNamespace(repo_head=TARGET),

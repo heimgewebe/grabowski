@@ -3737,6 +3737,13 @@ class DeploymentSequenceTests(unittest.TestCase):
                 return_value={"supported": False, "reason": "legacy-test-runtime"},
             ),
             mock.patch.object(dual, "release_operator_deployment_admission"),
+            # These unit tests begin after source admission; a synthetic
+            # callback is not a review, Captain grant, or release permission.
+            mock.patch.object(
+                dual, "require_locked_release_source_admission",
+                return_value={"status": "synthetic-only-not-release-authority"},
+            ),
+            mock.patch.object(dual.core, "require_canonical_deployment_lock_held"),
         ]
         for patcher in self._admission_patchers:
             patcher.start()

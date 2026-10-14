@@ -1108,6 +1108,9 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             "observation_scope": client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
         }
         with (
+            # This is a post-admission fixture only: not a Captain or R3 grant.
+            mock.patch.object(dual.core, "require_canonical_deployment_lock_held"),
+            mock.patch.object(dual, "require_locked_release_source_admission"),
             mock.patch.object(
                 dual,
                 "preflight_url",
@@ -1198,6 +1201,9 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             "observation_scope": client_snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
         }
         with (
+            # This is a post-admission fixture only: not a Captain or R3 grant.
+            mock.patch.object(dual.core, "require_canonical_deployment_lock_held"),
+            mock.patch.object(dual, "require_locked_release_source_admission"),
             mock.patch.object(
                 dual,
                 "preflight_url",
@@ -1536,6 +1542,9 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             "observation_scope": client_snapshot.OBSERVATION_SCOPE_SERVER_LOOPBACK,
         }
         with (
+            # This is a post-admission fixture only: not a Captain or R3 grant.
+            mock.patch.object(dual.core, "require_canonical_deployment_lock_held"),
+            mock.patch.object(dual, "require_locked_release_source_admission"),
             mock.patch.object(
                 dual,
                 "preflight_url",
@@ -1727,6 +1736,9 @@ class ProductionPreflightHardeningTests(unittest.TestCase):
             "schema_observable": True,
         }
         with (
+            # This is a post-admission fixture only: not a Captain or R3 grant.
+            mock.patch.object(dual.core, "require_canonical_deployment_lock_held"),
+            mock.patch.object(dual, "require_locked_release_source_admission"),
             mock.patch.object(
                 dual,
                 "preflight_url",

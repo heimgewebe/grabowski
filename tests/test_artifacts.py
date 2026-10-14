@@ -701,6 +701,8 @@ class ArtifactTests(unittest.TestCase):
                 "git-diff.v1", str(repository), base_commit, head_commit
             )
         self.assertEqual(result["repository"], "other-owner/other-repository")
+        # Publication succeeded only after a real append in the private audit.
+        self.assertGreater((self.root / "write-audit.jsonl").stat().st_size, 0)
 
     def test_text_artifact_requires_canonical_origin_identity(self) -> None:
         repository, base_commit, head_commit = self._repository_with_two_commits()

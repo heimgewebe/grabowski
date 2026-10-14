@@ -52,6 +52,22 @@ def _build_result(*args, **kwargs):
 
 
 class DeployRuntimeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # These are synthetic post-admission rollback/activation tests.
+        # Source-changing direct-call negatives live in the dedicated
+        # release-effect-boundary tests and do not use this mock.
+        synthetic_admission = patch.object(
+            dual, "require_locked_release_source_admission",
+            return_value={"status": "synthetic-only-not-release-authority"},
+        )
+        synthetic_admission.start()
+        self.addCleanup(synthetic_admission.stop)
+        synthetic_lock = patch.object(
+            deploy_runtime, "require_canonical_deployment_lock_held"
+        )
+        synthetic_lock.start()
+        self.addCleanup(synthetic_lock.stop)
+
     def _contract(self, module: str = "grabowski_mcp") -> deploy_runtime.RuntimeContract:
         return deploy_runtime.RuntimeContract(
             schema_version=1,
@@ -2504,6 +2520,8 @@ class LegacyProductiveApplyAdmissionTests(unittest.TestCase):
 
     def test_git_head_drift_between_locked_admission_and_effect_blocks_build(self):
         with (
+            patch.object(deploy_runtime, "require_canonical_deployment_lock_held"),
+            patch.object(dual, "require_locked_release_source_admission"),
             patch.object(
                 deploy_runtime, "snapshot_from_git",
                 return_value=types.SimpleNamespace(repo_head=self.TARGET),
