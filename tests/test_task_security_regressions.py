@@ -1026,6 +1026,140 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         persist.assert_not_called()
 
 
+
+    def test_task_status_scoped_blockade_cannot_migrate_legacy_store(self) -> None:
+        """The scope identity read must not upgrade an old DB before denial."""
+        task_id, _ = self.fixtures._create_task_schema_version("2")
+        database = self.fixtures.database
+        before_bytes = database.read_bytes()
+        before_names = sorted(p.name for p in database.parent.iterdir() if p.name != "tasks.mutation.lock")
+
+        def deny_scoped(capability, **context):
+            if context.get("path") == str(self.root):
+                raise PermissionError("legacy store scoped blockade")
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation", side_effect=deny_scoped),
+            patch.object(tasks, "_row") as recover,
+            patch.object(tasks, "_observe") as observe,
+        ):
+            with self.assertRaisesRegex(PermissionError, "legacy store scoped blockade"):
+                tasks.grabowski_task_status(task_id)
+        recover.assert_not_called()
+        observe.assert_not_called()
+        self.assertEqual(before_bytes, database.read_bytes())
+        self.assertEqual(before_names, sorted(p.name for p in database.parent.iterdir() if p.name != "tasks.mutation.lock"))
+        with tasks._inventory_readonly_sqlite(database) as connection:
+            self.assertEqual("2", tasks._task_schema_version(connection))
+        self.assertEqual([], self.fixtures._task_migration_backups())
+
+    def test_task_status_scoped_blockade_cannot_repair_permissions_or_wal(self) -> None:
+        """Even a current DB may be modified by _database journal/chmod setup."""
+        import sqlite3
+        import stat
+
+        task_id = self._start_claude()
+        record = tasks._row_raw(task_id)
+        database = tasks.TASK_DB
+        with sqlite3.connect(database) as connection:
+            self.assertEqual("delete", connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0])
+        self.assertFalse(tasks.Path(f"{database}-wal").exists())
+        database.chmod(0o640)
+        before_bytes = database.read_bytes()
+
+        def deny_scoped(capability, **context):
+            if context.get("path") == record["cwd"]:
+                raise PermissionError("current store scoped blockade")
+
+        try:
+            with (
+                patch.object(tasks.operator, "_require_operator_mutation", side_effect=deny_scoped),
+                patch.object(tasks, "_row") as recover,
+                patch.object(tasks, "_observe") as observe,
+            ):
+                with self.assertRaisesRegex(PermissionError, "current store scoped blockade"):
+                    tasks.grabowski_task_status(task_id)
+            recover.assert_not_called()
+            observe.assert_not_called()
+            self.assertEqual(0o640, stat.S_IMODE(database.stat().st_mode))
+            self.assertEqual(before_bytes, database.read_bytes())
+            self.assertFalse(tasks.Path(f"{database}-wal").exists())
+            with sqlite3.connect(database) as connection:
+                self.assertEqual("delete", connection.execute("PRAGMA journal_mode").fetchone()[0])
+        finally:
+            database.chmod(0o600)
+
+    def test_task_status_identity_probe_rejects_symlinked_database(self) -> None:
+        """Read-only identity probes must retain the database path trust checks."""
+        task_id = self._start_claude()
+        database = tasks.TASK_DB
+        target = database.with_name(database.name + ".untrusted")
+        database.rename(target)
+        database.symlink_to(target)
+        before_bytes = target.read_bytes()
+        try:
+            with patch.object(tasks, "_observe") as observe:
+                with self.assertRaises(PermissionError):
+                    tasks.grabowski_task_status(task_id)
+            observe.assert_not_called()
+            self.assertEqual(before_bytes, target.read_bytes())
+        finally:
+            database.unlink()
+            target.rename(database)
+
+    def test_task_status_uses_effective_legacy_owner_for_scope_gate(self) -> None:
+        """NULL persisted owner must not bypass owner-scoped mutation blocks."""
+        task_id = self._start_claude()
+        with tasks._database_connection() as connection:
+            connection.execute("UPDATE tasks SET lease_owner_id=NULL WHERE task_id=?", (task_id,))
+        expected_owner = tasks._lease_owner(task_id)
+        self.assertIsNone(tasks._row_raw(task_id)["lease_owner_id"])
+
+        def deny_owner(capability, **context):
+            if context.get("owner_id") == expected_owner:
+                raise PermissionError("effective legacy owner blocked")
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation", side_effect=deny_owner),
+            patch.object(tasks, "_row") as recover,
+            patch.object(tasks, "_observe") as observe,
+            patch.object(tasks.resources, "renew_resources") as renew,
+        ):
+            with self.assertRaisesRegex(PermissionError, "effective legacy owner blocked"):
+                tasks.grabowski_task_status(task_id)
+        recover.assert_not_called()
+        observe.assert_not_called()
+        renew.assert_not_called()
+
+    def test_pending_terminalization_recovery_uses_effective_legacy_owner(self) -> None:
+        """A legacy terminalization may not release a blocked effective owner."""
+        task_id = self._start_claude()
+        with tasks._database_connection() as connection:
+            connection.execute("UPDATE tasks SET lease_owner_id=NULL WHERE task_id=?", (task_id,))
+        effective_owner = tasks._lease_owner(task_id)
+        page = {
+            "terminalizations": [{"task_id": task_id}],
+            "examined": 1, "cycle_completed": True,
+            "cursor_after": None, "high_water": None,
+        }
+
+        def deny_owner(capability, **context):
+            if context.get("owner_id") == effective_owner:
+                raise PermissionError("legacy recovery owner blocked")
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation", side_effect=deny_owner),
+            patch.object(tasks, "_load_terminalization_recovery_cycle", return_value=None),
+            patch.object(tasks.resources, "pending_task_terminalizations", return_value=page),
+            patch.object(tasks, "_validate_terminalization_recovery_page"),
+            patch.object(tasks, "_save_terminalization_recovery_cycle"),
+            patch.object(tasks, "_apply_terminalization_projection") as project,
+        ):
+            result = tasks._recover_pending_task_terminalizations()
+        self.assertEqual([], result["recovered"])
+        self.assertEqual("PermissionError", result["failed"][0]["error_type"])
+        project.assert_not_called()
+
     def test_revoked_running_task_lease_cannot_be_silently_reacquired(self) -> None:
         """A current unit observation is not authority to restore a lost lease.
 

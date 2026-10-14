@@ -8122,6 +8122,30 @@ def _row_raw(task_id: str) -> dict[str, Any]:
     return dict(row)
 
 
+
+def _row_scope_identity_readonly(task_id: str) -> dict[str, Any]:
+    """Read mutation-gate scope without touching the authoritative task store.
+
+    _row_raw uses _database(), which may migrate the schema, create WAL and
+    indexes, or chmod files before a scoped blockade has been checked. The
+    inventory reader uses immutable read-only access (or a verified WAL copy)
+    and rejects changed source identities without opening a write connection.
+    """
+    identifier = _validate_task_id(task_id)
+    if TASK_DB.parent.is_symlink():
+        raise PermissionError(f"Task state directory may not be a symlink: {TASK_DB.parent}")
+    if TASK_DB.is_symlink():
+        raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
+    with _inventory_readonly_sqlite(TASK_DB) as connection:
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (identifier,)
+        ).fetchone()
+        record = dict(row) if row is not None else None
+    if record is None:
+        raise ValueError(f"Unknown task: {identifier}")
+    return record
+
+
 def _terminal_projection(
     record: dict[str, Any],
     state: str,
@@ -8467,13 +8491,13 @@ def _recover_pending_task_terminalizations(
             # task_list. An initial global mutation gate cannot match scoped
             # path/owner/host/service hard stops. Bind it to the live row
             # before any terminalization projection or lifecycle receipt.
-            task_record = _row_raw(task_id)
+            task_record = _row_scope_identity_readonly(task_id)
             operator._require_operator_mutation(
                 "durable_job",
                 path=task_record["cwd"],
                 repo=task_record["cwd"],
                 task_id=task_record["task_id"],
-                owner_id=task_record.get("lease_owner_id"),
+                owner_id=task_record.get("lease_owner_id") or _lease_owner(task_id),
                 service=_authoritative_unit(task_record),
                 host=task_record["host"],
             )
@@ -11054,12 +11078,12 @@ def grabowski_task_status(task_id: str) -> dict[str, Any]:
             path=record["cwd"],
             repo=record["cwd"],
             task_id=record["task_id"],
-            owner_id=record.get("lease_owner_id"),
+            owner_id=record.get("lease_owner_id") or _lease_owner(record["task_id"]),
             service=_authoritative_unit(record),
             host=record["host"],
         )
 
-    require_scoped(_row_raw(task_id))
+    require_scoped(_row_scope_identity_readonly(task_id))
     record = _row(task_id)
     require_scoped(record)
     observation = _observe(record)
