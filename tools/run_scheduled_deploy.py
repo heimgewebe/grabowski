@@ -640,6 +640,32 @@ def _git_prefix(repo: Path) -> list[str]:
     ]
 
 
+def _reject_repository_git_filters(repo: Path) -> None:
+    """Reject configured external filters before any Git status/diff can execute them.
+
+    A repository-local filter.<driver>.clean or .process can execute arbitrary
+    commands even during a purportedly read-only "git status" or "git diff".
+    Git's own config reader is used with inherited config and Git env disabled;
+    no Git worktree comparison may run before this gate. Unknown config output
+    and failure also block.
+    """
+    command = [
+        *_git_prefix(repo), "config", "--includes", "--get-regexp",
+        r"^filter\..*\.(clean|smudge|process|required)$",
+    ]
+    try:
+        result = subprocess.run(
+            command, cwd=repo, env=git_environment(), capture_output=True,
+            text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
+        raise RuntimeError("source repository Git filter audit unavailable") from exc
+    if result.returncode == 0:
+        raise RuntimeError("source repository has executable Git filter configuration")
+    if result.returncode != 1 or result.stdout or result.stderr:
+        raise RuntimeError("source repository Git filter audit unavailable")
+
+
 def _git_common_directory(repo: Path) -> Path:
     raw = run_capture(
         [*_git_prefix(repo), "rev-parse", "--git-common-dir"],
@@ -678,6 +704,9 @@ def verify_repository(
     )
     if source_common != canonical_common:
         raise RuntimeError("source repository does not share the canonical Git common directory")
+    _reject_repository_git_filters(source)
+    if source != canonical:
+        _reject_repository_git_filters(canonical)
     expected_kind = "canonical-main" if source == canonical else "detached-worktree"
     if source_kind != expected_kind:
         raise RuntimeError(
