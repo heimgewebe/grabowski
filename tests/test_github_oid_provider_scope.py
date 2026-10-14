@@ -45,15 +45,26 @@ if "mcp" not in sys.modules:
     fake_types = types.ModuleType("mcp.types")
     fake_fastmcp.FastMCP = _FakeFastMCP
     fake_types.ToolAnnotations = _FakeToolAnnotations
-    # Keep module substitutes scoped to this import. They must not poison
-    # sys.modules for other test modules sharing this Python interpreter.
-    with patch.dict(sys.modules, {
+    # Restore ONLY the four fake module entries. patch.dict(sys.modules)
+    # rolls back transitive imports too, leaving duplicate module/class
+    # identities when another test imports grabowski_grips afterwards.
+    substitutes = {
         "mcp": fake_mcp,
         "mcp.server": fake_server,
         "mcp.server.fastmcp": fake_fastmcp,
         "mcp.types": fake_types,
-    }):
+    }
+    absent = object()
+    originals = {key: sys.modules.get(key, absent) for key in substitutes}
+    try:
+        sys.modules.update(substitutes)
         grips = importlib.import_module("grabowski_grips")
+    finally:
+        for key, prior in originals.items():
+            if prior is absent:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = prior
 else:
     grips = importlib.import_module("grabowski_grips")
 
@@ -122,10 +133,23 @@ def _supports_native_sha256(root: Path) -> bool:
          "--object-format=sha256", str(root / "sha256-capability")],
         capture_output=True, timeout=15, env=env, check=False,
     )
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True
+    error = result.stderr.decode("utf-8", errors="replace").lower()
+    unsupported = (
+        "unknown option", "unrecognized option", "unknown hash algorithm",
+        "invalid object format", "unsupported object format",
+        "unsupported hash algorithm",
+    )
+    if any(marker in error for marker in unsupported):
+        return False
+    raise RuntimeError(f"SHA-256 Git capability probe failed unexpectedly: {error[:512]}")
 
 
 class GitHubOidProviderBoundaryTests(unittest.TestCase):
+    def test_grips_import_keeps_canonical_module_registered(self) -> None:
+        self.assertIs(sys.modules.get("grabowski_grips"), grips)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="grabowski-gh-oid-boundary-")
         self.addCleanup(self.temp.cleanup)
