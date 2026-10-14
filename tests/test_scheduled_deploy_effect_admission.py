@@ -118,6 +118,67 @@ class DelayedRuntimeEffectAdmissionTests(unittest.TestCase):
                 )
             self.assertEqual("src/runtime.py", observed)
 
+    def test_repo_local_clean_filter_is_rejected_before_git_diff_executes_it(self):
+        """A read-only Git diff can execute a repository-owned clean filter."""
+        with tempfile.TemporaryDirectory(prefix="grabowski-worker-filter-") as dirname:
+            root = Path(dirname)
+            repo = root / "source"
+            repo.mkdir()
+            marker = root / "filter-executed"
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                   "HOME": str(root), "GIT_CONFIG_NOSYSTEM": "1",
+                   "GIT_CONFIG_GLOBAL": os.devnull}
+
+            def git(*argv: str) -> str:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *argv],
+                    capture_output=True, text=True, check=True, timeout=12, env=env,
+                ).stdout.strip()
+
+            git("init", "-q", "-b", "main")
+            git("config", "user.name", "Filter Fixture")
+            git("config", "user.email", "filter@invalid.example")
+            tracked = repo / "tracked.txt"
+            tracked.write_text("original\n", encoding="utf-8")
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=proof\n", encoding="utf-8"
+            )
+            git("add", "--", "tracked.txt", ".gitattributes")
+            git("commit", "-qm", "safe baseline")
+            head = git("rev-parse", "HEAD")
+            git("update-ref", "refs/remotes/origin/main", head)
+            git("config", "filter.proof.clean",
+                f"sh -c 'printf executed > {marker}; cat'")
+            tracked.write_text("changed\n", encoding="utf-8")
+
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "executable Git filter"):
+                    worker.verify_repository(repo, repo, "canonical-main", head)
+            self.assertFalse(marker.exists(), "worker executed repository-owned clean filter")
+
+            # The adversarial fixture must be discriminating: direct Git
+            # diff still runs the marker-writing filter in this fixture.
+            git("diff", "--", "tracked.txt")
+            self.assertTrue(marker.exists(), "test fixture did not activate clean filter through git diff")
+
+    def test_repo_local_process_filter_configuration_fails_closed(self):
+        """Registered process filters are unsafe even without invoking status."""
+        with tempfile.TemporaryDirectory(prefix="grabowski-worker-process-") as dirname:
+            repo = Path(dirname)
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                   "HOME": str(repo), "GIT_CONFIG_NOSYSTEM": "1",
+                   "GIT_CONFIG_GLOBAL": os.devnull}
+            subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"],
+                           check=True, capture_output=True, env=env, timeout=12)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "filter.untrusted.process",
+                 "sh -c 'exit 99'"],
+                check=True, capture_output=True, env=env, timeout=12,
+            )
+            with patch.dict(os.environ, env, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "executable Git filter"):
+                    worker._reject_repository_git_filters(repo)
+
     def test_unchanged_serving_source_requires_authoritative_readback(self):
         with patch.object(worker.deploy_dual, "observe_authoritative_routing", return_value=active()):
             result = worker.require_effect_time_release_admission(
