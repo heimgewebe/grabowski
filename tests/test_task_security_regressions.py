@@ -1489,9 +1489,179 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             self.assertIn("--tmpfs", argv)
             self.assertIn("/snapshot", argv)
             self.assertNotIn(str(database.parent.absolute()), argv)
-            self.assertIn(str(database.absolute()), argv)
-            self.assertIn(str(tasks.Path(str(database) + "-wal").absolute()), argv)
-            self.assertEqual(argv[-1], "/snapshot/input.db")
+            self.assertNotIn(str(database.absolute()), argv)
+            self.assertNotIn(str(tasks.Path(str(database) + "-wal").absolute()), argv)
+            inherited = launch.call_args.kwargs["pass_fds"]
+            self.assertEqual(len(inherited), 2)
+            self.assertIn(f"/proc/self/fd/{inherited[0]}", argv)
+            self.assertIn(f"/proc/self/fd/{inherited[1]}", argv)
+            self.assertIn("/snapshot/input.db", argv)
+            self.assertIn("/snapshot/input.db-wal", argv)
+            # The only host DB authority passed to bwrap is two pinned FDs.
+        finally:
+            writer.close()
+
+    def test_wal_source_identity_is_pinned_across_same_uid_path_swap(self) -> None:
+        """Bwrap must consume validated FDs, not spoofed pathname replacements."""
+        import os
+        import sqlite3
+        import subprocess
+        import time
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        wal = tasks.Path(str(database) + "-wal")
+        foreign = database.with_name("foreign-p1.sqlite3")
+        foreign_wal = tasks.Path(str(foreign) + "-wal")
+        original_hold = database.with_name("held-source-p1.sqlite3")
+        original_wal_hold = tasks.Path(str(original_hold) + "-wal")
+
+        writer = sqlite3.connect(database, isolation_level=None)
+        attacker = None
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                ("wal_pinned_source_probe", "genuine"),
+            )
+            with sqlite3.connect(foreign) as clone:
+                writer.backup(clone)
+            attacker = sqlite3.connect(foreign, isolation_level=None)
+            attacker.execute("PRAGMA wal_autocheckpoint=0")
+            self.assertEqual(
+                attacker.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal"
+            )
+            attacker.execute(
+                "UPDATE metadata SET value=? WHERE key=?",
+                ("spoofed", "wal_pinned_source_probe"),
+            )
+            self.assertTrue(wal.exists())
+            self.assertTrue(foreign_wal.exists())
+            original_inode = database.stat().st_ino
+            foreign_inode = foreign.stat().st_ino
+            launch = subprocess.Popen
+            observed = []
+
+            def swap_while_bwrap_binds(argv, **kwargs):
+                passed = kwargs["pass_fds"]
+                self.assertEqual(len(passed), 2)
+                self.assertEqual(os.fstat(passed[0]).st_ino, original_inode)
+                self.assertNotEqual(os.fstat(passed[0]).st_ino, foreign_inode)
+                observed.append(tuple(passed))
+                os.replace(database, original_hold)
+                os.replace(wal, original_wal_hold)
+                os.replace(foreign, database)
+                os.replace(foreign_wal, wal)
+                try:
+                    child = launch(argv, **kwargs)
+                    time.sleep(0.1)
+                    return child
+                finally:
+                    os.replace(database, foreign)
+                    os.replace(wal, foreign_wal)
+                    os.replace(original_hold, database)
+                    os.replace(original_wal_hold, wal)
+
+            # The descriptor pins the genuine source. Rename also changes
+            # inode ctime, so the final identity gate MUST deny the snapshot.
+            with (
+                patch.object(
+                    tasks.resources.sqlite_store.subprocess,
+                    "Popen", side_effect=swap_while_bwrap_binds,
+                ),
+                self.assertRaises(tasks.resources.ResourceSchemaInventoryChanged),
+            ):
+                with tasks.resources.sqlite_store.preauthorization_readonly_sqlite(
+                    database,
+                    error_type=tasks.resources.ResourceSchemaInventoryChanged,
+                ) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT value FROM metadata WHERE key=?",
+                            ("wal_pinned_source_probe",),
+                        ).fetchone()[0],
+                        "genuine",
+                    )
+            self.assertEqual(len(observed), 1)
+            self.assertEqual(database.stat().st_ino, original_inode)
+        finally:
+            if attacker is not None:
+                attacker.close()
+            writer.close()
+
+    def test_wal_snapshot_never_replays_schema_expressions_in_operator(self) -> None:
+        """Compact malicious CHECK constraints may not execute in the main Python process."""
+        import sqlite3
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "CREATE TABLE hostile_check (value TEXT "
+                "CHECK(length(randomblob(1048576)) > 0))"
+            )
+            writer.execute("PRAGMA ignore_check_constraints=ON")
+            writer.execute("INSERT INTO hostile_check VALUES (?)", ("legitimate",))
+            writer.execute("PRAGMA ignore_check_constraints=OFF")
+            writer.execute(
+                "INSERT INTO metadata(key,value) VALUES (?,?)",
+                ("wal_pinned_ddl_probe", "legitimate"),
+            )
+            self.assertTrue(tasks.Path(str(database) + "-wal").exists())
+            real_connect = sqlite3.connect
+
+            # The old iterdump+executescript restores arbitrary expressions in
+            # the host, and therefore invokes sqlite3.connect(':memory:').
+            # Only the isolated child may construct/execute SQLite statements.
+            with patch.object(
+                tasks.resources.sqlite_store.sqlite3, "connect",
+                side_effect=AssertionError("untrusted SQL executed in host"),
+            ):
+                with tasks.resources.sqlite_store.preauthorization_readonly_sqlite(
+                    database,
+                    error_type=tasks.resources.ResourceSchemaInventoryChanged,
+                ) as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT value FROM hostile_check").fetchone()[0],
+                        "legitimate",
+                    )
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT value FROM metadata WHERE key=?",
+                            ("wal_pinned_ddl_probe",),
+                        ).fetchone()[0], "legitimate",
+                    )
+            self.assertIsNotNone(real_connect)
+        finally:
+            writer.close()
+
+    def test_wal_snapshot_preserves_scoped_authorization_denial(self) -> None:
+        """A caller's path/service PermissionError must not turn into an inventory retry."""
+        import sqlite3
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute(
+                "INSERT INTO metadata(key,value) VALUES (?,?)",
+                ("preauth_caller_denial_probe", "1"),
+            )
+            self.assertTrue(tasks.Path(str(database) + "-wal").exists())
+            with self.assertRaisesRegex(
+                PermissionError, "exact scoped authorization denied",
+            ):
+                with tasks.resources.sqlite_store.preauthorization_readonly_sqlite(
+                    database,
+                    error_type=tasks.resources.ResourceSchemaInventoryChanged,
+                ) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT value FROM metadata WHERE key=?",
+                        ("preauth_caller_denial_probe",),
+                    ).fetchone()[0], "1")
+                    raise PermissionError("exact scoped authorization denied")
         finally:
             writer.close()
 
