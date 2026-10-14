@@ -2079,37 +2079,98 @@ class GrokReviewRoleTests(unittest.TestCase):
                         review_diff=b"+change\n",
                     )
 
-    def test_sha256_native_committed_diff_rejects_mixed_widths(self) -> None:
+    @staticmethod
+    def _native_sha256_git_commits(directory: str) -> tuple[Path, str, str]:
+        """Create a disposable SHA-256 Git fixture without inherited Git scope."""
         import subprocess
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "native-sha256"
-            subprocess.run(
-                ["git", "init", "--quiet", "--object-format=sha256", str(repo)],
+
+        repo = Path(directory) / "native-sha256"
+        # Even git -C can follow inherited Git directories, indexes, object
+        # stores and config. Keep every subprocess wholly inside this root.
+        env = {
+            key: value for key, value in os.environ.items()
+            if not key.startswith("GIT_")
+        }
+        env.update({
+            "HOME": directory,
+            "XDG_CONFIG_HOME": directory,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_GRAFT_FILE": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        })
+        git_options = (
+            "-c", "commit.gpgsign=false",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "core.fsmonitor=false",
+        )
+        subprocess.run(
+            ["git", *git_options, "init", "--quiet", "--object-format=sha256", str(repo)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env, timeout=30,
+        )
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ["git", *git_options,
+                 "-c", "user.name=Review Test", "-c", "user.email=review@example.org",
+                 "-C", str(repo), *args],
                 check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
-            def git(*args: str) -> str:
-                return subprocess.run(
-                    ["git", "-c", "core.hooksPath=/dev/null",
-                     "-c", "user.name=Review Test", "-c", "user.email=review@example.org",
-                     "-C", str(repo), *args],
-                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                ).stdout.decode().strip()
-            file = repo / "src" / "change.txt"
-            file.parent.mkdir()
-            file.write_text("before\n", encoding="utf-8")
-            git("add", "src/change.txt")
-            git("commit", "-m", "before")
-            base = git("rev-parse", "HEAD")
-            file.write_text("after\n", encoding="utf-8")
-            git("add", "src/change.txt")
-            git("commit", "-m", "after")
-            head = git("rev-parse", "HEAD")
+                env=env, timeout=30,
+            ).stdout.decode().strip()
+
+        file = repo / "src" / "change.txt"
+        file.parent.mkdir()
+        file.write_text("before\n", encoding="utf-8")
+        git("add", "src/change.txt")
+        git("commit", "-m", "before")
+        base = git("rev-parse", "HEAD")
+        file.write_text("after\n", encoding="utf-8")
+        git("add", "src/change.txt")
+        git("commit", "-m", "after")
+        return repo, base, git("rev-parse", "HEAD")
+
+    def test_sha256_native_committed_diff_rejects_mixed_widths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, base, head = self._native_sha256_git_commits(directory)
             self.assertEqual((64, 64), (len(base), len(head)))
             self.assertIn(b"+after", role.committed_diff(repo, base, head))
             for bad in ("b" * 40, "b" * 63, "B" * 64):
                 with self.subTest(bad_len=len(bad), upper=bad[:1].isupper()):
                     with self.assertRaisesRegex(RuntimeError, "exact base and head"):
                         role.committed_diff(repo, base, bad)
+
+    def test_sha256_native_fixture_ignores_poisoned_git_environment(self) -> None:
+        # Exercise the fixture's subprocesses under deliberately hostile Git
+        # environment. Independently test role.committed_diff after restoring
+        # the real process environment; that is a distinct production contract.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            poisoned = {
+                "GIT_DIR": str(root / "foreign.git"),
+                "GIT_WORK_TREE": str(root / "foreign-worktree"),
+                "GIT_INDEX_FILE": str(root / "foreign.index"),
+                "GIT_OBJECT_DIRECTORY": str(root / "foreign-objects"),
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(root / "foreign-alternates"),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.hooksPath",
+                "GIT_CONFIG_VALUE_0": str(root / "foreign-hooks"),
+                "GIT_CONFIG_GLOBAL": str(root / "foreign-global-config"),
+                "GIT_CONFIG_NOSYSTEM": "0",
+                "GIT_TRACE": str(root / "foreign-trace"),
+            }
+            with mock.patch.dict(os.environ, poisoned):
+                repo, base, head = self._native_sha256_git_commits(directory)
+            self.assertEqual((64, 64), (len(base), len(head)))
+            self.assertIn(b"+after", role.committed_diff(repo, base, head))
+            for name in (
+                "foreign.git", "foreign-worktree", "foreign.index",
+                "foreign-objects", "foreign-alternates", "foreign-hooks",
+                "foreign-global-config", "foreign-trace",
+            ):
+                with self.subTest(path=name):
+                    self.assertFalse((root / name).exists())
 
     def test_sha256_review_main_passes_valid_bound_input_without_provider(self) -> None:
         from types import SimpleNamespace
