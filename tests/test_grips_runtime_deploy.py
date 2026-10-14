@@ -2124,6 +2124,30 @@ class RuntimeReleaseSourceAdmissionTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "source Git object formats differ"):
                         deploy._require_release_source_admission("b" * 64)
 
+    def test_documentation_exemption_rejects_unexpected_git_stderr(self) -> None:
+        """Even a plausible complete raw-doc diff cannot suppress stderr evidence."""
+        deploy = real_deploy
+        for width in (40, 64):
+            with self.subTest(oid_width=width):
+                metadata = self._deployed()
+                process = self._serving()
+                metadata["repo_head"] = "a" * width
+                process["process_repo_head"] = "a" * width
+                raw = (
+                    ":100644 100644 " + "1" * width + " " + "2" * width
+                    + " M\x00docs/guide.md\x00"
+                )
+                observed = {**self._git_success(raw), "stderr": "unexpected git warning"}
+                with (
+                    patch.object(deploy.base, "_deployment_metadata", return_value=metadata),
+                    patch.object(deploy.serving_process, "identity", return_value=process),
+                    patch.object(deploy, "_git_result", side_effect=[
+                        self._git_success(""), observed,
+                    ]),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "complete source diff"):
+                        deploy._require_release_source_admission("b" * width)
+
     def test_source_admission_rejects_inconsistent_git_object_formats_before_git(self) -> None:
         deploy = real_deploy
         with (

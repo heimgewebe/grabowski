@@ -5893,6 +5893,7 @@ def _require_release_source_admission(
         or observed.get("timed_out") is not False
         or observed.get("stdout_truncated") is not False
         or observed.get("stderr_truncated") is not False
+        or observed.get("stderr") != ""
         or not isinstance(observed.get("stdout"), str)
     ):
         raise DeploySchedulePreEffectRefusal(
