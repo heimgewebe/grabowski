@@ -415,17 +415,13 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             captured = tasks._task_output_capture_argv(record)
         sandbox = tasks.agent_sandbox
         expected_prefix = [
-            sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S",
-            str(sandbox._host_seccomp_launcher_path()),
+            sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+            sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
             str(sandbox.require_bwrap()),
         ]
-        self.assertEqual(captured[5:10], expected_prefix)
-        self.assertNotIn("-c", captured)
-        self.assertLess(len(captured[8].encode("utf-8")), 4096)
-        self.assertEqual(
-            sandbox._host_seccomp_launcher_path().read_text(),
-            sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
-        )
+        self.assertEqual(captured[5:11], expected_prefix)
+        self.assertLess(len(captured[9].encode("utf-8")), 4096)
+        self.assertEqual(captured[9], sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE)
         with patch.object(tasks, "_task_output_capture_argv", return_value=captured):
             command = tasks._launch_argv(record, include_managed_runtime=False)
         self.assertEqual(
@@ -434,17 +430,35 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         )
         self.assertNotIn("--property=RestrictAddressFamilies=AF_UNIX", command)
 
+    def test_seccomp_launcher_source_is_pinned_in_systemd_argv(self) -> None:
+        """Delayed exec must not reopen a same-UID replaceable script path."""
+        sandbox = tasks.agent_sandbox
+        argv = sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
+        self.assertEqual(
+            argv[:5],
+            [
+                sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+                sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
+            ],
+        )
+        self.assertEqual(argv[5:], [str(sandbox.require_bwrap()), "--version"])
+        self.assertLess(len(argv[4].encode("utf-8")), 4096)
+        with self.assertRaisesRegex(sandbox.AgentSandboxError, "unrecognized"):
+            sandbox.runtime_sandbox_argv(
+                [*argv[:4], "raise SystemExit(0)", *argv[5:]]
+            )
+
     def test_runtime_sandbox_rewraps_bare_bwrap_and_rejects_forged_launcher(self) -> None:
         """Legacy bare bwrap callers cannot drop the kernel filter by mistake."""
         sandbox = tasks.agent_sandbox
         resolved = str(sandbox.require_bwrap())
         argv = sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
         self.assertEqual(
-            argv[:5],
-            [sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S",
-             str(sandbox._host_seccomp_launcher_path()), resolved],
+            argv[:6],
+            [sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+             sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE, resolved],
         )
-        self.assertEqual(argv[5:], ["--version"])
+        self.assertEqual(argv[6:], ["--version"])
         with self.assertRaisesRegex(sandbox.AgentSandboxError, "unrecognized"):
             sandbox.runtime_sandbox_argv(
                 [sandbox.SANDBOX_LAUNCH_PYTHON, "-c", "print('bypass')"]
@@ -469,13 +483,23 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(script.lstat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(script.parent.lstat().st_mode), 0o700)
             self.assertEqual(sandbox._host_seccomp_launcher_path(), script)
+            expected = sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
             script.write_text("raise SystemExit(0)\n")
             with self.assertRaisesRegex(sandbox.AgentSandboxError, "identity drifted"):
-                sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
+                sandbox._host_seccomp_launcher_path()
+            # Delayed exec no longer opens this mutable path at all.
+            self.assertEqual(
+                sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"]),
+                expected,
+            )
             script.unlink()
             os.symlink(self.root / "foreign.py", script)
             with self.assertRaisesRegex(sandbox.AgentSandboxError, "cannot be staged"):
-                sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
+                sandbox._host_seccomp_launcher_path()
+            self.assertEqual(
+                sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"]),
+                expected,
+            )
 
 
     def test_kernel_seccomp_inherits_into_exec_and_blocks_raw_socket_bypass(self) -> None:
@@ -581,14 +605,14 @@ class TaskSecurityRegressionTests(unittest.TestCase):
                 "libseccomp.so.2", "pr1386-deliberately-missing-seccomp.so.2"
             )
         )
-        argv[3] = str(fake)
+        # Fault injection changes the *source bytes*, not a stale script path.
+        argv[4] = fake.read_text()
         result = subprocess.run(
             argv, capture_output=True, text=True, timeout=20, check=False,
         )
         self.assertEqual(result.returncode, 125, result.stderr)
         self.assertIn("AF_UNIX sandbox enforcement unavailable", result.stderr)
-        # Untrusted replacement of the trusted script argument is rejected
-        # before the real launcher is dispatched.
+        # A changed inline policy cannot impersonate the bound trusted source.
         with self.assertRaisesRegex(sandbox.AgentSandboxError, "unrecognized"):
             sandbox.runtime_sandbox_argv(argv)
 
@@ -1943,6 +1967,31 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             str(alias), "CARGO_TARGET_DIR=/tmp/project-codex/target",
             "cargo", "test"
         ])
+
+    def test_shell_alias_indirect_codex_is_denied(self) -> None:
+        """Shell aliases must not bypass coding-agent filesystem admission."""
+        commands = (
+            ["/bin/bash", "-O", "expand_aliases", "-c",
+             "alias x=codex\\nx exec prompt".replace("\\\\n", "\\n")],
+            ["/bin/bash", "-c",
+             "shopt -s expand_aliases; alias x='codex exec'; x prompt"],
+            ["/bin/bash", "-Oexpand_aliases", "-c",
+             "alias x='codex exec'; x prompt"],
+            ["/bin/bash", "-c", "alias x=codex; x exec prompt"],
+            ["/bin/bash", "-c", "unalias x; printf ok"],
+            ["/bin/bash", "-c", "shopt -s expand_aliases; printf ok"],
+            ["/bin/bash", "-O", "expand_aliases", "-c", "printf ok"],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Codex.*filesystem sandbox"
+                ):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+        # A harmless quoted word is data, not an alias definition.
+        tasks._require_direct_codex_filesystem_sandbox(
+            ["/bin/bash", "-c", "printf 'alias x=codex'"]
+        )
 
     def test_shell_builtin_prefixes_do_not_hide_codex(self) -> None:
         commands = (

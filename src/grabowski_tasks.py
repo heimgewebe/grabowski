@@ -4384,6 +4384,22 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                 shell_code = argv[index + 1]
                 break
         if shell_code is not None:
+            # Aliases are expanded by the shell before the inspected command
+            # positions execute. Even an alias inherited through shell startup
+            # can redirect a harmless-looking command into Codex. Do not
+            # authorize Bash alias-expansion options on this untrusted route.
+            for index, option in enumerate(argv[1:-1], 1):
+                if executable == "bash" and (
+                    option in {"-Oexpand_aliases", "+Oexpand_aliases"}
+                    or (
+                        option in {"-O", "+O"}
+                        and index + 1 < len(argv)
+                        and argv[index + 1] == "expand_aliases"
+                    )
+                ):
+                    raise RuntimeError(
+                        "Codex filesystem sandbox cannot verify shell alias expansion"
+                    )
             # Substitution executes a child even when the argument is quoted.
             for embedded in shell_embedded_sources(shell_code):
                 _require_direct_codex_filesystem_sandbox(["sh", "-c", embedded])
@@ -4426,6 +4442,12 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                         }:
                             offset += 1
                             continue
+                        if prefix in {"alias", "unalias", "shopt"}:
+                            # Alias definitions/changes and shopt expansion
+                            # options turn token-based inspection into a bypass.
+                            raise RuntimeError(
+                                "Codex filesystem sandbox cannot verify shell alias commands"
+                            )
                         if prefix in {"export", "declare", "typeset", "readonly", "local"}:
                             # Builtins can install hooks for later commands.
                             for assignment in segment[offset + 1:]:

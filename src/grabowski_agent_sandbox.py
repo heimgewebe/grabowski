@@ -113,13 +113,26 @@ os.execv(sys.argv[1], sys.argv[1:])
 """
 
 
-def _host_seccomp_launcher_path() -> Path:
-    """Stage one private, content-addressed launcher before systemd dispatch.
+def _host_seccomp_launcher_argv() -> list[str]:
+    """Bind exact trusted libseccomp code into the delayed-exec systemd argv.
 
-    Unlike python -c, a short script path survives systemd unit reloads and
-    does not violate its single-argument 4096-byte persistence limit. The
-    trusted operator must create and verify this file *before* starting bwrap;
-    a missing, foreign, symlinked or tampered script fails closed.
+    An owner-private script path can be replaced by a same-UID process after
+    validation but before asynchronous systemd exec. A literal Python -c
+    argument is part of the persisted command identity, not a re-opened file.
+    Enforce systemd's single-argument limit without a file-based fallback.
+    """
+    source = _HOST_UNIX_DENY_LAUNCH_SOURCE
+    if not source or chr(0) in source or len(source.encode("utf-8")) >= 4096:
+        raise AgentSandboxError("trusted seccomp source exceeds systemd argv limit")
+    return [SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c", source]
+
+
+def _host_seccomp_launcher_path() -> Path:
+    """Legacy private-script diagnostic; never used by a production launcher.
+
+    The active systemd/agent path uses _host_seccomp_launcher_argv instead.
+    This helper remains only for explicit compatibility/security diagnostics;
+    a mutable script path must never decide the executed seccomp policy.
     """
     content = _HOST_UNIX_DENY_LAUNCH_SOURCE.encode("utf-8")
     digest = hashlib.sha256(content).hexdigest()
@@ -660,23 +673,22 @@ def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def runtime_sandbox_argv(arguments: list[str]) -> list[str]:
-    """Resolve bwrap while retaining one verified kernel-filtered script.
+    """Resolve bwrap while binding vetted seccomp source into executable argv.
 
     No direct bwrap compatibility call may silently bypass the filter.
     """
     if not arguments:
         raise AgentSandboxError("sandbox argv is empty")
     result = list(arguments)
-    script = str(_host_seccomp_launcher_path())
-    prefix = [SANDBOX_LAUNCH_PYTHON, "-I", "-S"]
-    if result[:3] == prefix:
-        if len(result) < 5 or result[3] != script:
+    launcher = _host_seccomp_launcher_argv()
+    if result[:4] == launcher[:4]:
+        if len(result) < len(launcher) + 1 or result[:len(launcher)] != launcher:
             raise AgentSandboxError("unrecognized AF_UNIX sandbox launcher")
-        result[4] = str(require_bwrap())
+        result[len(launcher)] = str(require_bwrap())
     else:
         if result[0] == SANDBOX_LAUNCH_PYTHON:
             raise AgentSandboxError("unrecognized AF_UNIX sandbox launcher")
-        result = [*prefix, script, str(require_bwrap()), *result[1:]]
+        result = [*launcher, str(require_bwrap()), *result[1:]]
     return result
 
 @dataclass(frozen=True)
@@ -1410,10 +1422,7 @@ def minimal_sandbox_argv(
             *command,
         ]
     )
-    return [
-        SANDBOX_LAUNCH_PYTHON, "-I", "-S",
-        str(_host_seccomp_launcher_path()), *arguments,
-    ]
+    return [*_host_seccomp_launcher_argv(), *arguments]
 
 
 def _append_tail(buffer: bytearray, chunk: bytes, limit: int = TAIL_BYTES) -> None:

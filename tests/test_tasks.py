@@ -398,7 +398,23 @@ class TaskTests(unittest.TestCase):
                 str(tasks.TASK_OUTPUT_TAIL_BYTES),
             ],
         )
-        self.assertNotIn("-c", capture)
+        # The trusted seccomp filter is deliberately persisted via Python
+        # -c so no same-UID script pathname can drift before systemd exec.
+        # Keep the output-capture wrapper itself file-backed and require that
+        # the only inlined source is the exact server-owned security program.
+        self.assertNotIn("-c", capture[:5])
+        if selected["transport"] == "local":
+            self.assertEqual(
+                capture[5:10],
+                [
+                    tasks.agent_sandbox.SANDBOX_LAUNCH_PYTHON,
+                    "-I", "-S", "-c",
+                    tasks.agent_sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
+                ],
+            )
+            self.assertEqual(capture[10], str(tasks.agent_sandbox.require_bwrap()))
+        else:
+            self.assertNotIn("-c", capture)
         for argument in launch:
             self.assertLess(
                 len(argument.encode("utf-8")),

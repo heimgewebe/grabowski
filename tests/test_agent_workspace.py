@@ -6446,16 +6446,12 @@ class AgentWorkspaceTests(unittest.TestCase):
         with mock.patch.object(sandbox, "BWRAP", binary):
             argv = sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
         self.assertEqual(
-            argv[:4],
-            [sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S",
-             str(sandbox._host_seccomp_launcher_path())],
+            argv[:5],
+            [sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+             sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE],
         )
-        self.assertEqual(argv[4:], [str(binary.resolve()), "--version"])
-        self.assertEqual(
-            sandbox._host_seccomp_launcher_path().read_text(),
-            sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
-        )
-        self.assertLess(len(argv[3].encode("utf-8")), 4096)
+        self.assertEqual(argv[5:], [str(binary.resolve()), "--version"])
+        self.assertLess(len(argv[4].encode("utf-8")), 4096)
 
     def test_bounded_capture_does_not_wait_for_detached_pipe_holder(self) -> None:
         started = time.monotonic()
