@@ -7,6 +7,7 @@ import multiprocessing
 import threading
 import json
 import os
+import subprocess
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -361,6 +362,162 @@ class GrokReviewRoleTests(unittest.TestCase):
             self.assertEqual(receipt["receipt_sha256"], role.digest({
                 k: v for k, v in receipt.items() if k != "receipt_sha256"
             }))
+
+    def test_postflight_failures_seal_review_without_synthetic_pass(self) -> None:
+        # Regression for #1418: a real semantic review may precede the race.
+        finding = {
+            "severity": "P1", "path": "src/security.py", "line": 44,
+            "evidence": "A concrete authorization bypass exists",
+            "impact": "A protected effect could bypass admission",
+            "minimal_fix": "Bind effect-time authorization to the exact revision",
+        }
+        failures = (
+            FileNotFoundError(errno.ENOENT, "No such file or directory",
+                              str(ROOT / ".browser-semantic-test-disappeared")),
+            subprocess.CalledProcessError(1, ["git", "rev-parse", "HEAD"]),
+            subprocess.TimeoutExpired(["git", "rev-parse", "HEAD"], 30),
+        )
+        for (verdict, findings), failure in (
+            ((verdict, findings), error)
+            for verdict, findings in (("PASS", []), ("NEEDS_CHANGE", [finding]))
+            for error in failures
+        ):
+            with self.subTest(verdict=verdict, failure=type(failure).__name__), tempfile.TemporaryDirectory() as temporary:
+                unit = "grabowski-job-a11111111111"
+                directory = Path(temporary) / unit
+                directory.mkdir(mode=0o700)
+                output = directory / role.REVIEW_ATTEMPT_RECEIPT_NAME
+                head, base, diff = "a" * 40, "b" * 40, "c" * 64
+                document = json.dumps({"verdict": verdict, "findings": findings}).encode()
+                completed = SimpleNamespace(
+                    returncode=0,
+                    stdout_sha256=hashlib.sha256(document).hexdigest(),
+                    stderr_sha256=hashlib.sha256(b"").hexdigest(),
+                    stdout_bytes=len(document), stderr_bytes=0,
+                    stdout_tail="", stderr_tail="", output_limit_exceeded=False,
+                    stdout_content_exceeded=False, stdout_content=document,
+                )
+                environment = {
+                    "GRABOWSKI_REVIEW_ATTEMPT_UNIT": unit,
+                    "GRABOWSKI_JOB_UNIT": unit,
+                    "GRABOWSKI_JOB_ID": "a11111111111",
+                    "GRABOWSKI_JOB_ORIGIN_SHA256": "d" * 64,
+                    "GRABOWSKI_JOB_DIRECTORY": str(directory),
+                }
+                with (
+                    mock.patch.dict(os.environ, environment),
+                    mock.patch.object(
+                        role, "current_binding",
+                        side_effect=[(head, diff, False), failure],
+                    ),
+                    mock.patch.object(role, "committed_diff", return_value=b"frozen diff"),
+                    mock.patch.object(
+                        role, "_review_sandbox_argv",
+                        return_value=(["sandbox"], None, None),
+                    ),
+                    mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+                    mock.patch.object(role, "run_bounded_capture", return_value=completed),
+                    mock.patch.object(
+                        role, "toolchain_probe",
+                        side_effect=AssertionError("not a toolchain error"),
+                    ),
+                ):
+                    result = role.main([
+                        "--role", "review", "--repository", str(ROOT),
+                        "--expected-head", head, "--expected-base-head", base,
+                        "--expected-diff-sha256", diff, "--expected-dirty", "false",
+                        "--output", str(output), "--", "grok", "--model", "grok-4.6",
+                        "Review immutable source",
+                    ])
+                self.assertEqual(result, 125)
+                receipt = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["failure_classification"], "writer_binding_violation")
+                self.assertEqual(receipt["postflight_error_type"], type(failure).__name__)
+                self.assertIsNone(receipt["head_after"])
+                self.assertIsNone(receipt["diff_after"])
+                self.assertIsNone(receipt["worktree_dirty_after"])
+                self.assertEqual(receipt["verdict"], verdict)
+                self.assertEqual(receipt["findings"], findings)
+                self.assertEqual(receipt["review_attempt_unit"], unit)
+                self.assertEqual(receipt["review_attempt_origin_sha256"], "d" * 64)
+                self.assertEqual(
+                    receipt["receipt_sha256"],
+                    role.digest({key: val for key, val in receipt.items()
+                                 if key != "receipt_sha256"}),
+                )
+                with self.assertRaises(FileExistsError):
+                    role.write_receipt(output, {"verdict": "PASS"}, create_only=True)
+
+    def test_postflight_uncertainty_overrides_invalid_review_exit(self) -> None:
+        # Codex P2 on #1488: malformed or oversized provider output must
+        # never turn an unobservable postflight into exit code 126.
+        for error in (
+            FileNotFoundError(errno.ENOENT, "transient test file vanished"),
+            subprocess.TimeoutExpired(["git", "diff"], 30),
+        ):
+            for kind in ("malformed", "oversized"):
+                with self.subTest(error=type(error).__name__, kind=kind), tempfile.TemporaryDirectory() as temporary:
+                    unit = "grabowski-job-a11111111111"
+                    directory = Path(temporary) / unit
+                    directory.mkdir(mode=0o700)
+                    output = directory / role.REVIEW_ATTEMPT_RECEIPT_NAME
+                    head, base, diff = "a" * 40, "b" * 40, "c" * 64
+                    document = b'not a valid review JSON'
+                    oversize = kind == "oversized"
+                    completed = SimpleNamespace(
+                        returncode=0,
+                        stdout_sha256=hashlib.sha256(document).hexdigest(),
+                        stderr_sha256=hashlib.sha256(b"").hexdigest(),
+                        stdout_bytes=len(document), stderr_bytes=0,
+                        stdout_tail="", stderr_tail="",
+                        output_limit_exceeded=False,
+                        stdout_content_exceeded=oversize,
+                        stdout_content=None if oversize else document,
+                    )
+                    env = {
+                        "GRABOWSKI_REVIEW_ATTEMPT_UNIT": unit,
+                        "GRABOWSKI_JOB_UNIT": unit,
+                        "GRABOWSKI_JOB_ID": "a11111111111",
+                        "GRABOWSKI_JOB_ORIGIN_SHA256": "d" * 64,
+                        "GRABOWSKI_JOB_DIRECTORY": str(directory),
+                    }
+                    with (
+                        mock.patch.dict(os.environ, env),
+                        mock.patch.object(role, "current_binding",
+                                          side_effect=[(head, diff, False), error]),
+                        mock.patch.object(role, "committed_diff",
+                                          return_value=b"frozen diff"),
+                        mock.patch.object(role, "_review_sandbox_argv",
+                                          return_value=(["sandbox"], None, None)),
+                        mock.patch.object(role, "runtime_sandbox_argv",
+                                          return_value=["runtime"]),
+                        mock.patch.object(role, "run_bounded_capture",
+                                          return_value=completed),
+                        mock.patch.object(role, "toolchain_probe",
+                                          side_effect=AssertionError("never reclassify postflight")),
+                    ):
+                        returncode = role.main([
+                            "--role", "review", "--repository", str(ROOT),
+                            "--expected-head", head, "--expected-base-head", base,
+                            "--expected-diff-sha256", diff, "--expected-dirty", "false",
+                            "--output", str(output), "--", "grok", "--model", "grok-4.6",
+                            "Review exact frozen source",
+                        ])
+                    self.assertEqual(returncode, 125)
+                    receipt = json.loads(output.read_text(encoding="utf-8"))
+                    self.assertEqual(receipt["returncode"], 125)
+                    self.assertEqual(receipt["failure_classification"], "writer_binding_violation")
+                    self.assertEqual(receipt["error"], "read-only role postflight binding unobservable")
+                    self.assertEqual(receipt["postflight_error_type"], type(error).__name__)
+                    self.assertEqual(receipt["verdict"], "INVALID")
+                    self.assertEqual(receipt["findings"], [])
+                    self.assertTrue(receipt["review_output_error"])
+                    self.assertIsNone(receipt["head_after"])
+                    self.assertEqual(receipt["receipt_sha256"], role.digest({
+                        key: val for key, val in receipt.items() if key != "receipt_sha256"
+                    }))
+                    with self.assertRaises(FileExistsError):
+                        role.write_receipt(output, {"verdict": "PASS"}, create_only=True)
 
     def test_role_main_rejects_cross_attempt_environment_before_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
