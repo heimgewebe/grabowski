@@ -90,15 +90,32 @@ class RootSystemdLauncherTests(unittest.TestCase):
         self.assertEqual(
             p["InaccessiblePaths"].split(),
             [
-                "/run/user",
-                "/run/docker",
-                "/mnt/backup",
-                "/dev/hugepages",
-                "/var/lib/private",
+                "-/run/user",
+                "-/run/docker",
+                "-/mnt/backup",
+                "-/dev/hugepages",
+                "-/var/lib/private",
             ],
         )
         self.assertNotIn("StateDirectory", p)
         self.assertNotIn("StateDirectoryMode", p)
+
+    def test_optional_absent_host_paths_do_not_break_unit_setup(self) -> None:
+        # Missing host sockets/backups must not abort namespace setup. The
+        # persistent StateDirectory alias remains an essential LIVE mask.
+        for probe in (True, False):
+            with self.subTest(probe=probe):
+                p = self.props(
+                    launcher.unit_argv("optional", ["/usr/bin/true"], probe=probe)
+                )
+                masked = p["InaccessiblePaths"].split()
+                self.assertEqual(
+                    masked[:4],
+                    ["-/run/user", "-/run/docker", "-/mnt/backup", "-/dev/hugepages"],
+                )
+                self.assertEqual(
+                    masked[4], "-/var/lib/private" if probe else "/var/lib/private"
+                )
 
     def test_probe_only_four_writable_output_leaves(self) -> None:
         p = self.props(launcher.probe_argv("proof"))
@@ -165,7 +182,12 @@ class RootSystemdLauncherTests(unittest.TestCase):
         self.assertIn("unexpected writable mount(s)", program)
         self.assertIn('"only_expected_rw_mounts": len(actual_rw)', program)
 
-    def test_live_plan_uses_proven_physical_state_root_binding(self) -> None:
+    @patch.object(
+        launcher, "_frozen_bootstrap_program", return_value="frozen-test-only"
+    )
+    def test_live_plan_uses_proven_physical_state_root_binding(
+        self, _program: object
+    ) -> None:
         cmd = launcher.live_runner_plan(
             "live",
             Path("/usr/local/libexec/repobrief_agent_benchmark_codex_runner.py"),
@@ -212,7 +234,33 @@ class RootSystemdLauncherTests(unittest.TestCase):
         self.assertIn("--codex-command-sha256", cmd)
         self.assertNotIn("--allow-live-provider", cmd)
 
-    def test_live_plan_provider_optin_does_not_start_any_process(self) -> None:
+    def test_live_plan_uses_captured_immutable_bootstrap(self) -> None:
+        target = Path("/usr/local/libexec/repobrief_agent_benchmark_codex_runner.py")
+        code = "print('FROZEN_BOOTSTRAP')"
+        with patch.object(
+            launcher, "_frozen_bootstrap_program", return_value=code, create=True
+        ) as frozen:
+            cmd = launcher.live_runner_plan(
+                "boot",
+                target,
+                Path("/requests"),
+                Path("/map.json"),
+                Path("/usr/bin/codex"),
+                "a" * 64,
+            )
+        frozen.assert_called_once_with(target)
+        child = cmd[cmd.index("--") + 1 :]
+        self.assertEqual(child[:5], ["/usr/bin/python3", "-I", "-B", "-c", code])
+        self.assertEqual(child[5], str(target))
+        self.assertIn("--request-root", child)
+        self.assertNotIn("--allow-live-provider", child)
+
+    @patch.object(
+        launcher, "_frozen_bootstrap_program", return_value="frozen-test-only"
+    )
+    def test_live_plan_provider_optin_does_not_start_any_process(
+        self, _program: object
+    ) -> None:
         with patch.object(subprocess, "run") as subprocess_run:
             cmd = launcher.live_runner_plan(
                 "candidate",
@@ -247,6 +295,13 @@ class RootSystemdLauncherTests(unittest.TestCase):
             with self.subTest(change=change):
                 with self.assertRaises(launcher.LauncherError):
                     launcher.live_runner_plan(**{**params, **change})
+
+    def test_live_plan_requires_root_owned_staged_bootstrap(self) -> None:
+        # The plan helper must not embed arbitrary user-writable Python bytes.
+        with self.assertRaises(launcher.LauncherError):
+            launcher._frozen_bootstrap_program(
+                Path("/tmp/nonexistent/repobrief_agent_benchmark_codex_runner.py")
+            )
 
     def test_arbitrary_relative_executable_rejected(self) -> None:
         with self.assertRaises(launcher.LauncherError):

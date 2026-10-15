@@ -177,6 +177,17 @@ def deny_unix(block_network=False):
                 context, error_action, syscall, 0,
             ) != 0:
                 raise RuntimeError("unable to deny kernel process introspection")
+        # Untrusted Codex shares the trusted runner's UID. Even nondumpable
+        # parents accept same-UID SIGKILL after one-shot provider intent.
+        for name in (
+            b"kill", b"tkill", b"tgkill", b"rt_sigqueueinfo",
+            b"rt_tgsigqueueinfo", b"pidfd_send_signal",
+        ):
+            syscall = seccomp.seccomp_syscall_resolve_name(name)
+            if syscall < 0 or seccomp.seccomp_rule_add(
+                context, error_action, syscall, 0,
+            ) != 0:
+                raise RuntimeError("unable to deny provider-to-parent signals")
         libc = ctypes.CDLL(None, use_errno=True)
         libc.prctl.argtypes = [
             ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
@@ -3267,9 +3278,11 @@ def _assert_checkout_tree_has_regular_blobs(source: Path, commit: str) -> None:
         total_bytes = 0
         total_files = 0
         total_blob_bytes = 0
-        # Keep these identical to the isolated postflight readback bounds.
+        # Postflight shares a 2 GiB counter across both source and checkout
+        # reads, plus Git control files. Reject before reserving a one-use
+        # workspace, leaving 128 MiB for the fresh checkout's Git metadata.
         max_blob_bytes = 256 * 1024 * 1024
-        max_total_blob_bytes = 2 * 1024 * 1024 * 1024
+        max_total_blob_bytes = (2 * 1024 * 1024 * 1024 - 128 * 1024 * 1024) // 2
         directories: set[tuple[bytes, ...]] = set()
         # read1() can block indefinitely when a promisor process or inherited
         # pipe remains open. A nonblocking pipe and selector bound the *entire*

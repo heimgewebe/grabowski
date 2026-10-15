@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -59,6 +61,11 @@ def unit_argv(
         # Python's Path.resolve() sees all four real leaves below HOME.
         binds.append(f"/var/lib/private/{name}:{home}")
 
+    # A missing host-specific path is harmless; an unexpected existing one
+    # remains masked. The private StateDirectory alias is mandatory for live.
+    optional_masks = "-/run/user -/run/docker -/mnt/backup -/dev/hugepages"
+    private_alias_mask = "-/var/lib/private" if probe else "/var/lib/private"
+
     properties = [
         "Type=exec",
         "DynamicUser=yes",
@@ -80,7 +87,7 @@ def unit_argv(
         "RuntimeDirectoryMode=0700",
         f"BindPaths={' '.join(binds)}",
         f"ReadOnlyPaths=/run /run/{tmp} /run/{var} {home} {home}/repos /proc /sys",
-        "InaccessiblePaths=/run/user /run/docker /mnt/backup /dev/hugepages /var/lib/private",
+        f"InaccessiblePaths={optional_masks} {private_alias_mask}",
         f"ReadWritePaths={' '.join(outputs)}",
         f"TemporaryFileSystem={_TMPFS_SHM}",
         "ProtectKernelTunables=yes",
@@ -189,6 +196,86 @@ def probe_argv(run_id: str) -> list[str]:
     )
 
 
+def _frozen_bootstrap_program(runner: Path) -> str:
+    """Capture root-owned installed bootstrap bytes, never a developer source."""
+    bootstrap = runner.with_name("repobrief_agent_benchmark_source_bootstrap.py")
+
+    def trusted_source(path: Path, *, maximum: int) -> bytes:
+        if not path.is_absolute() or ".." in path.parts:
+            raise LauncherError("live source path is not canonical")
+        directories: list[int] = []
+        source: int | None = None
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+        try:
+            current = os.open("/", flags)
+            directories.append(current)
+            for component in path.parts[1:-1]:
+                current = os.open(component, flags, dir_fd=current)
+                directories.append(current)
+                info = os.fstat(current)
+                if info.st_uid != 0 or info.st_mode & 0o022:
+                    raise LauncherError(
+                        "live source parent is not root-owned immutable"
+                    )
+            source = os.open(
+                path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=current
+            )
+            before = os.fstat(source)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != 0
+                or before.st_mode & 0o022
+                or not 0 < before.st_size <= maximum
+            ):
+                raise LauncherError("live source is not root-owned immutable")
+            raw = bytearray()
+            while len(raw) <= maximum:
+                chunk = os.read(source, min(65536, maximum + 1 - len(raw)))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            after = os.fstat(source)
+            linked = os.stat(path.name, dir_fd=current, follow_symlinks=False)
+
+            def identity(x: os.stat_result) -> tuple[int, ...]:
+                return (
+                    x.st_dev,
+                    x.st_ino,
+                    x.st_mode,
+                    x.st_uid,
+                    x.st_size,
+                    x.st_mtime_ns,
+                    x.st_ctime_ns,
+                )
+
+            if (
+                len(raw) != before.st_size
+                or len(raw) > maximum
+                or identity(before) != identity(after)
+                or identity(before) != identity(linked)
+            ):
+                raise LauncherError("live source changed during immutable capture")
+            return bytes(raw)
+        except OSError as exc:
+            raise LauncherError("trusted staged live source unavailable") from exc
+        finally:
+            if source is not None:
+                os.close(source)
+            for fd in reversed(directories):
+                os.close(fd)
+
+    # Reject arbitrary owner-writable runner code before printing a live plan.
+    trusted_source(runner, maximum=16 * 1024 * 1024)
+    raw = trusted_source(bootstrap, maximum=1024 * 1024)
+    try:
+        program = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise LauncherError("installed bootstrap must be UTF-8") from exc
+    if not program or "\x00" in program:
+        raise LauncherError("installed bootstrap program is invalid")
+    return program
+
+
 def live_runner_plan(
     run_id: str,
     runner: Path,
@@ -216,6 +303,10 @@ def live_runner_plan(
     home = Path("/var/lib") / name
     runner_args = [
         "/usr/bin/python3",
+        "-I",
+        "-B",
+        "-c",
+        _frozen_bootstrap_program(runner),
         str(runner),
         "--request-root",
         str(request_root),

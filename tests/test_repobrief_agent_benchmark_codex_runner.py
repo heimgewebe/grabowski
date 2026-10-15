@@ -2337,6 +2337,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         cases = (
             ("one_oversized_blob", (max_file + 1,)),
             ("aggregate_over_2gib", (max_file,) * 9),
+            # Source and checkout each consume the shared 2 GiB readback budget.
+            ("double_read_exhausts_total_budget", (max_file,) * 4),
             ("unknown_size", ("-",)),
         )
         for label, sizes in cases:
@@ -3060,6 +3062,26 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 server.settimeout(0.1)
                 with self.assertRaises(runner.socket.timeout):
                     server.accept()
+
+    def test_untrusted_codex_cannot_signal_same_uid_trusted_parent(self) -> None:
+        # PR_SET_DUMPABLE=0 blocks ptrace, NOT signals from the same UID.
+        # A provider may otherwise SIGKILL the ledger writer after one-shot
+        # intent. Use signal 0 for a safe real-kernel permission probe.
+        child = (
+            "import errno,os\n"
+            "try: os.kill(os.getppid(), 0)\n"
+            "except OSError as exc: assert exc.errno == errno.EPERM, exc\n"
+            "else: raise RuntimeError('parent signal syscall permitted')\n"
+            "print('RAB_PARENT_SIGNALS_DENIED')\n"
+        )
+        command = runner._unix_socket_restricted_codex_argv(
+            [sys.executable, "-I", "-c", child]
+        )
+        completed = subprocess.run(
+            command, capture_output=True, timeout=12, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(b"RAB_PARENT_SIGNALS_DENIED", completed.stdout)
 
     def test_unix_socket_seccomp_fails_before_child_exec_when_library_missing(
         self,
