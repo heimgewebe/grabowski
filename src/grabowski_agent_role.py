@@ -15,17 +15,30 @@ from typing import Any
 
 from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
 
-SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
-SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
-GIT_OID = __import__("re").compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+SHA40 = __import__("re").compile(r"[0-9a-f]{40}\Z")
+SHA256 = __import__("re").compile(r"[0-9a-f]{64}\Z")
+GIT_OID = __import__("re").compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
-def _same_git_oid_format(*values: str) -> bool:
-    """Require complete lowercase Git OIDs of one SHA-1 or SHA-256 width."""
-    return bool(values) and all(
-        isinstance(value, str) and GIT_OID.fullmatch(value) is not None
+def _same_git_oid_format(*values: str, object_format: str) -> bool:
+    """Require complete lowercase OIDs of the authenticated Git storage format."""
+    width = {"sha1": 40, "sha256": 64}.get(object_format)
+    return width is not None and bool(values) and all(
+        isinstance(value, str)
+        and len(value) == width
+        and GIT_OID.fullmatch(value) is not None
         for value in values
-    ) and len({len(value) for value in values}) == 1
+    )
+
+
+def _repo_git_object_format(repo: Path) -> str:
+    """Read storage format through the guarded Git path, rejecting unknown output."""
+    response = git(repo, "rev-parse", "--show-object-format=storage")
+    if response == b"sha1\n":
+        return "sha1"
+    if response == b"sha256\n":
+        return "sha256"
+    raise RuntimeError("review repository has an unsupported Git object format")
 
 
 CREATE_ONLY_RECEIPT_LOCK_TIMEOUT_SECONDS = 6.0
@@ -180,7 +193,7 @@ def safe_untracked_file(root: Path, relative: PurePosixPath) -> Path:
 
 
 def committed_diff(repo: Path, base: str, head: str) -> bytes:
-    if not _same_git_oid_format(base, head):
+    if not _same_git_oid_format(base, head, object_format=_repo_git_object_format(repo)):
         raise RuntimeError("review diff requires exact base and head revisions")
     return git(
         repo,
@@ -673,9 +686,10 @@ def _grok_streaming_review_command(
     expected_head: str,
     expected_base_head: str,
     review_diff: bytes,
+    object_format: str,
 ) -> tuple[tuple[str, ...], bytes]:
     """Build one tool-less Grok review command and its exact stdin prompt bytes."""
-    if not _same_git_oid_format(expected_head, expected_base_head):
+    if not _same_git_oid_format(expected_head, expected_base_head, object_format=object_format):
         raise RuntimeError("Grok review requires exact bound head and base revisions")
     if len(review_diff) > MAX_GROK_REVIEW_INPUT_BYTES:
         raise RuntimeError(f"Grok review input exceeds {MAX_GROK_REVIEW_INPUT_BYTES} bytes")
@@ -957,6 +971,7 @@ def _claude_json_review_command(
     expected_base_head: str,
     review_diff: bytes,
     review_input_source: str = "committed_diff",
+    object_format: str,
 ) -> tuple[tuple[str, ...], bytes]:
     """Normalize a catalogue-bound Claude reviewer without changing its origin.
 
@@ -964,7 +979,7 @@ def _claude_json_review_command(
     job starts; execution-only flags are owned here, never by the review actor.
     The exact authenticated review input goes through bounded stdin, never argv.
     """
-    if not _same_git_oid_format(expected_head, expected_base_head):
+    if not _same_git_oid_format(expected_head, expected_base_head, object_format=object_format):
         raise RuntimeError("Claude review requires exact bound head and base revisions")
     if len(review_diff) > MAX_CLAUDE_REVIEW_INPUT_BYTES:
         raise RuntimeError("Claude review diff exceeds the bounded input limit")
@@ -1061,6 +1076,7 @@ def _review_sandbox_argv(
     expected_head: str,
     expected_base_head: str,
     review_diff: bytes,
+    object_format: str,
     review_input_source: str = "committed_diff",
 ) -> tuple[list[str], str | None, bytes | None]:
     executable_name = Path(command[0]).name
@@ -1084,6 +1100,7 @@ def _review_sandbox_argv(
             expected_base_head=expected_base_head,
             review_diff=review_diff,
             review_input_source=review_input_source,
+            object_format=object_format,
         )
         return (
             sandbox_argv(repo, list(actual), declared_command=command),
@@ -1098,6 +1115,7 @@ def _review_sandbox_argv(
         expected_head=expected_head,
         expected_base_head=expected_base_head,
         review_diff=review_diff,
+        object_format=object_format,
     )
     actual = tuple(
         str(GROK_REVIEW_PROMPT_TARGET) if item == "/dev/stdin" else item
@@ -1430,7 +1448,10 @@ def main(argv: list[str] | None = None) -> int:
     output = Path(args.output).resolve(strict=False)
     if (
         not command
-        or not _same_git_oid_format(args.expected_head, args.expected_base_head)
+        or not _same_git_oid_format(
+            args.expected_head, args.expected_base_head,
+            object_format=_repo_git_object_format(repo),
+        )
         or SHA256.fullmatch(args.expected_diff_sha256) is None
     ):
         parser.error("invalid command or binding")
@@ -1501,6 +1522,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_head=args.expected_head,
             expected_base_head=args.expected_base_head,
             review_diff=review_input or b"",
+            object_format=_repo_git_object_format(repo),
             review_input_source=review_input_source or "committed_diff",
         )
     else:

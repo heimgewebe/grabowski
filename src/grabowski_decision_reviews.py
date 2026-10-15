@@ -327,9 +327,9 @@ def normalize_binding(value: Any) -> dict[str, Any]:
     head_sha = value.get("head_sha")
     base_sha = value.get("base_sha")
     diff_sha256 = value.get("diff_sha256")
-    if not isinstance(head_sha, str) or _GIT_OID_RE.fullmatch(head_sha.lower()) is None:
+    if not isinstance(head_sha, str) or _GIT_OID_RE.fullmatch(head_sha) is None:
         raise ValueError("decision review head_sha must be an exact Git object ID")
-    if not isinstance(base_sha, str) or _GIT_OID_RE.fullmatch(base_sha.lower()) is None:
+    if not isinstance(base_sha, str) or _GIT_OID_RE.fullmatch(base_sha) is None:
         raise ValueError("decision review base_sha must be an exact Git object ID")
     if len(head_sha) != len(base_sha):
         raise ValueError("decision review head/base Git object formats differ")
@@ -344,8 +344,8 @@ def normalize_binding(value: Any) -> dict[str, Any]:
         "kind": BINDING_KIND,
         "repo": repo.strip().lower(),
         "pr": pr,
-        "head_sha": head_sha.lower(),
-        "base_sha": base_sha.lower(),
+        "head_sha": head_sha,
+        "base_sha": base_sha,
         "diff_sha256": diff_sha256.lower(),
         "slot": slot.strip().lower(),
     }

@@ -93,6 +93,7 @@ def _decision_review_order_key(scope: dict[str, Any]) -> str | None:
     repo = binding.get("repo")
     pr = binding.get("pr")
     head_sha = binding.get("head_sha")
+    base_sha = binding.get("base_sha")
     if (
         not isinstance(repo, str)
         or _DECISION_REVIEW_REPO_RE.fullmatch(repo.strip()) is None
@@ -100,13 +101,16 @@ def _decision_review_order_key(scope: dict[str, Any]) -> str | None:
         or not isinstance(pr, int)
         or pr <= 0
         or not isinstance(head_sha, str)
-        or _DECISION_REVIEW_GIT_OID_RE.fullmatch(head_sha.strip().lower()) is None
+        or _DECISION_REVIEW_GIT_OID_RE.fullmatch(head_sha) is None
+        or not isinstance(base_sha, str)
+        or _DECISION_REVIEW_GIT_OID_RE.fullmatch(base_sha) is None
+        or len(head_sha) != len(base_sha)
     ):
         raise ValueError("decision review binding is invalid for causal ordering")
     material = {
         "repo": repo.strip().lower(),
         "pr": pr,
-        "head_sha": head_sha.strip().lower(),
+        "head_sha": head_sha,
     }
     return hashlib.sha256(canonical_json_bytes(material)).hexdigest()
 

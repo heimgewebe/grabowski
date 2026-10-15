@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import grabowski_decision_reviews as reviews
+import grabowski_job_origin as origin
 
 
 def binding(head: str, base: str, *, digest: str = "c" * 64) -> dict:
@@ -57,6 +58,28 @@ class DecisionReviewGitObjectFormatTests(unittest.TestCase):
             with self.subTest(head_length=len(head), base_length=len(base)):
                 with self.assertRaises(ValueError):
                     reviews.normalize_binding(binding(head, base))
+
+    def test_review_binding_and_job_clock_reject_noncanonical_oid_aliases(self) -> None:
+        for width in (40, 64):
+            for mutation in (lambda oid: oid.upper(), lambda oid: oid + "\n", lambda oid: oid + "\r"):
+                for field in ("head_sha", "base_sha"):
+                    with self.subTest(width=width, field=field, mutation=mutation("a")):
+                        data = binding("a" * width, "b" * width)
+                        data[field] = mutation(data[field])
+                        with self.assertRaises(ValueError):
+                            reviews.normalize_binding(data)
+                        with self.assertRaises(ValueError):
+                            origin._decision_review_order_key(
+                                {"decision_bound_review": data}
+                            )
+
+    def test_job_clock_rejects_mixed_oid_formats(self) -> None:
+        for first, second in ((40, 64), (64, 40)):
+            with self.subTest(first=first, second=second):
+                with self.assertRaises(ValueError):
+                    origin._decision_review_order_key(
+                        {"decision_bound_review": binding("a" * first, "b" * second)}
+                    )
 
     def test_diff_digest_is_always_sha256_independent_of_git_format(self) -> None:
         for digest in ("c" * 40, "c" * 63, "c" * 65):
