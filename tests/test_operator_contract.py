@@ -2969,6 +2969,87 @@ class OperatorContractTests(unittest.TestCase):
             self.assertNotIn("mail", invoked)
             self.assertNotIn("notify-send", invoked)
 
+
+    def test_reserved_deploy_launcher_hermetic_python_cache_precedes_interpreter(self) -> None:
+        """The trusted scheduler sets cache isolation at systemd launch, not after import."""
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "cwd"
+            cwd.mkdir()
+            state = root / "state"
+            jobs = state / "jobs"
+            launcher = {
+                "returncode": 0, "stdout": "started", "stderr": "",
+                "argv": [], "argv_sha256": "0" * 64, "command": "systemd-run",
+                "cwd": str(root), "timed_out": False, "duration_seconds": 0.01,
+                "stdout_truncated": False, "stderr_truncated": False,
+            }
+            managed = {"XDG_RUNTIME_DIR": "/run/user/1000"}
+            with (
+                patch.object(operator, "STATE_DIR", state),
+                patch.object(operator, "JOBS_DIR", jobs),
+                patch.object(operator.uuid, "uuid4",
+                             return_value=types.SimpleNamespace(hex="a11111111111fabc")),
+                patch.object(operator, "_managed_runtime_environment", return_value=managed),
+                patch.object(operator, "_run", return_value=launcher) as run,
+            ):
+                job = operator._start_job(
+                    ["/usr/bin/python3", "-c", "print('scheduled-runtime-fixture')"],
+                    cwd=str(cwd), runtime_seconds=60,
+                    finalization_expected_head="a" * 40,
+                    allow_reserved_runtime_deploy=True,
+                )
+            self.assertEqual("launch_submitted", job["final_status"])
+            command = run.call_args_list[0].args[0]
+            separator = command.index("--")
+            bootstrap = command[:separator]
+            self.assertIn(
+                "--setenv=PYTHONPYCACHEPREFIX=/dev/null/grabowski-runtime-deploy",
+                bootstrap,
+            )
+            self.assertIn("--setenv=PYTHONPATH=", bootstrap)
+            self.assertIn("--setenv=PYTHONHOME=", bootstrap)
+            self.assertIn("--setenv=PYTHONNOUSERSITE=1", bootstrap)
+            self.assertEqual(
+                command[separator + 1:],
+                operator.command_identity.systemd_escape_argv(
+                    ["/usr/bin/python3", "-c", "print('scheduled-runtime-fixture')"]
+                ),
+            )
+
+    def test_runtime_worker_private_cache_prefix_rejects_valid_poisoned_pycache(self) -> None:
+        """Real Python imports demonstrate why -B alone is not source integrity."""
+        import marshal
+        import py_compile
+
+        with tempfile.TemporaryDirectory(prefix="grabowski-worker-pycache-") as tmp:
+            root = Path(tmp)
+            source = root / "worker_module.py"
+            source.write_text("VALUE = 'SOURCE'\n", encoding="utf-8")
+            bytecode = Path(py_compile.compile(str(source), doraise=True))
+            code = compile("VALUE = 'POISONED'\n", str(source), "exec")
+            bytecode.write_bytes(bytecode.read_bytes()[:16] + marshal.dumps(code))
+            environment = {"PATH": "/usr/bin:/bin", "HOME": str(root)}
+            command = [sys.executable, "-c", "import worker_module; print(worker_module.VALUE)"]
+
+            def imported(extra: dict[str, str]) -> str:
+                observed = subprocess.run(
+                    command, cwd=root, env={**environment, **extra},
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True,
+                )
+                return observed.stdout.strip()
+
+            self.assertEqual("POISONED", imported({}))
+            self.assertEqual("POISONED", imported({"PYTHONDONTWRITEBYTECODE": "1"}))
+            self.assertEqual(
+                "SOURCE",
+                imported({
+                    "PYTHONPYCACHEPREFIX": "/dev/null/grabowski-runtime-deploy",
+                    "PYTHONPATH": "", "PYTHONHOME": "", "PYTHONNOUSERSITE": "1",
+                }),
+            )
+
     def test_job_start_origin_binds_decision_review_registration(self) -> None:
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as tmp:

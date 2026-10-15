@@ -8303,6 +8303,16 @@ def _start_job(
         "GRABOWSKI_JOB_STDERR_PATH": finalization_contract["receipt_paths"]["stderr"],
         "GRABOWSKI_JOB_FINALIZATION_PATH": finalization_contract["receipt_paths"]["finalization"],
     }
+    if allow_reserved_runtime_deploy:
+        # Set before the interpreter starts, not from worker code after imports.
+        # A cache prefix beneath /dev/null cannot read checkout-local pyc.
+        # This alone does NOT exclude source-less .pyc or untrusted scripts.
+        environment.update({
+            "PYTHONPYCACHEPREFIX": "/dev/null/grabowski-runtime-deploy",
+            "PYTHONPATH": "",
+            "PYTHONHOME": "",
+            "PYTHONNOUSERSITE": "1",
+        })
     if (
         decision_review_binding is not None
         and scope.get("decision_review_provenance", {}).get("schema_version") == 2
