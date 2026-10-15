@@ -929,6 +929,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         )
         raw_diff = b"diff --git a/a.py b/a.py\n+interesting_but_untrusted\n"
         with (
+                mock.patch.object(role, "_repo_git_object_format", return_value="sha1"),
             mock.patch.object(role, "prepare_external_agent_command",
                               return_value=prepared) as prepare,
             mock.patch.object(role, "sandbox_argv",
@@ -982,6 +983,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         )
         frozen = b"diff --git a/a.py b/a.py\n+safe only\n"
         with (
+                mock.patch.object(role, "_repo_git_object_format", return_value="sha1"),
             mock.patch.object(role, "prepare_external_agent_command",
                               return_value=prepared) as prepare,
             mock.patch.object(role, "sandbox_argv",
@@ -1756,6 +1758,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             command=("/usr/bin/python3", "-I", "codex-launcher", "exec", "review this")
         )
         with (
+                mock.patch.object(role, "_repo_git_object_format", return_value="sha1"),
             mock.patch.object(
                 role, "prepare_external_agent_command", return_value=prepared
             ) as prepare,
@@ -1796,6 +1799,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             command=("/usr/bin/python3", "-I", "codex-launcher", "exec", "review this")
         )
         with (
+                mock.patch.object(role, "_repo_git_object_format", return_value="sha1"),
             mock.patch.object(
                 role, "prepare_external_agent_command", return_value=prepared
             ) as prepare,
@@ -1821,6 +1825,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                     command=("/usr/bin/python3", "-I", "codex-launcher", subcommand, "review this")
                 )
                 with (
+                        mock.patch.object(role, "_repo_git_object_format", return_value="sha1"),
                     mock.patch.object(
                         role, "prepare_external_agent_command", return_value=prepared
                     ) as prepare,
@@ -1984,6 +1989,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             command=("/opt/grabowski-external/grok", "--model", "grok-4.6", "-p", "review this")
         )
         with (
+                mock.patch.object(role, "_repo_git_object_format", return_value="sha1"),
             mock.patch.object(role, "prepare_external_agent_command", return_value=prepared),
             mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]) as sandbox_argv,
         ):
@@ -2208,6 +2214,112 @@ class GrokReviewRoleTests(unittest.TestCase):
             f"review document exceeds {role.MAX_REVIEW_JSON_BYTES} bytes",
         )
 
+
+    def test_oid_regexes_have_both_absolute_anchors(self) -> None:
+        # Pure .fullmatch() callers are safe, but future regex.search() users
+        # must not be able to reinterpret a SHA-256 suffix as SHA-1.
+        for pattern, width in (
+            (role.SHA40, 40),
+            (role.SHA256, 64),
+            (role.GIT_OID, 40),
+            (role.GIT_OID, 64),
+        ):
+            oid = "a" * width
+            with self.subTest(width=width, pattern=pattern.pattern):
+                self.assertIsNotNone(pattern.fullmatch(oid))
+                self.assertIsNone(pattern.search("prefix" + oid))
+                self.assertIsNone(pattern.search(oid + "\n"))
+
+    def test_object_format_probe_rejects_successful_git_with_stderr(self) -> None:
+        from types import SimpleNamespace
+        with mock.patch(
+            "subprocess.run",
+            return_value=SimpleNamespace(
+                returncode=0, stdout=b"sha1\n",
+                stderr=b"attacker-controlled Git diagnostic\n",
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stderr"):
+                role._repo_git_object_format(Path("/tmp/imaginary-checkout"))
+
+    def test_storage_format_probe_ignores_ambient_git_directory_redirects(self) -> None:
+        import subprocess
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            authentic = root / "authentic-sha256"
+            foreign = root / "foreign-sha1"
+            subprocess.run(
+                ["git", "init", "-q", "--object-format=sha256", str(authentic)],
+                check=True, capture_output=True, timeout=15,
+            )
+            subprocess.run(
+                ["git", "init", "-q", str(foreign)],
+                check=True, capture_output=True, timeout=15,
+            )
+            poisoned = {
+                "GIT_DIR": str(foreign / ".git"),
+                "GIT_WORK_TREE": str(foreign),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.hooksPath",
+                "GIT_CONFIG_VALUE_0": str(root / "attacker-hooks"),
+                "GIT_OBJECT_DIRECTORY": str(foreign / ".git" / "objects"),
+            }
+            with mock.patch.dict(os.environ, poisoned):
+                self.assertEqual("sha256", role._repo_git_object_format(authentic))
+            self.assertFalse((root / "attacker-hooks").exists())
+
+    def test_sha256_sandbox_refuses_spoofed_sha1_storage_format(self) -> None:
+        import subprocess
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw) / "sha256-repo"
+            subprocess.run(
+                ["git", "init", "--quiet", "--object-format=sha256", str(repo)],
+                check=True, capture_output=True, timeout=15,
+            )
+            with mock.patch.object(
+                role, "prepare_external_agent_command",
+                side_effect=AssertionError("must reject before launching provider"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "object format"):
+                    role._review_sandbox_argv(
+                        repo, ["grok", "-p", "Review exact diff"],
+                        expected_head="a" * 40, expected_base_head="b" * 40,
+                        review_diff=b"+change\n", object_format="sha1",
+                    )
+
+    def test_review_postflight_rejects_changed_storage_object_format(self) -> None:
+        from types import SimpleNamespace
+        head, base, fp = "a" * 40, "b" * 40, "c" * 64
+        result = SimpleNamespace(
+            returncode=0, stdout_sha256="d" * 64,
+            stderr_sha256="e" * 64, stdout_bytes=2, stderr_bytes=0,
+            stdout_tail="{}", stderr_tail="", output_limit_exceeded=False,
+            stdout_content_exceeded=False, stdout_content=b'{"verdict":"PASS","findings":[]}',
+        )
+        with (
+            mock.patch.object(role, "_repo_git_object_format",
+                              side_effect=["sha1", "sha256"]),
+            mock.patch.object(role, "current_binding",
+                              side_effect=[(head, fp, False), (head, fp, False)]),
+            mock.patch.object(role, "committed_diff", return_value=b"+change\n"),
+            mock.patch.object(role, "_review_sandbox_argv",
+                              return_value=(["sandbox"], None, None)),
+            mock.patch.object(role, "runtime_sandbox_argv",
+                              return_value=["sandbox-runtime"]),
+            mock.patch.object(role, "run_bounded_capture", return_value=result),
+            mock.patch.object(role, "write_receipt") as capture,
+        ):
+            outcome = role.main([
+                "--role", "review", "--repository", str(ROOT),
+                "--expected-head", head, "--expected-base-head", base,
+                "--expected-diff-sha256", fp, "--expected-dirty", "false",
+                "--output", "/tmp/storage-drift-test-receipt.json",
+                "--", "grok", "-p", "Review exact diff",
+            ])
+        self.assertEqual(125, outcome)
+        receipt = capture.call_args.args[1]
+        self.assertEqual("writer_binding_violation", receipt["failure_classification"])
+        self.assertIsNotNone(receipt.get("postflight_error_type"))
 
     def test_git_review_oids_accept_sha1_sha256_but_no_mixed_format(self) -> None:
         for width, storage in ((40, "sha1"), (64, "sha256")):

@@ -81,6 +81,32 @@ class DecisionReviewGitObjectFormatTests(unittest.TestCase):
                         {"decision_bound_review": binding("a" * first, "b" * second)}
                     )
 
+    def test_causal_review_clock_binds_base_and_diff_not_only_head(self) -> None:
+        for width in (40, 64):
+            current = binding("a" * width, "b" * width)
+            same = {**current, "slot": "independent-claude-review"}
+            other_base = {**current, "base_sha": "d" * width}
+            other_diff = {**current, "diff_sha256": "e" * 64}
+            key = origin._decision_review_order_key(
+                {"decision_bound_review": current}
+            )
+            with self.subTest(width=width):
+                self.assertEqual(key, origin._decision_review_order_key(
+                    {"decision_bound_review": same}
+                ))
+                self.assertNotEqual(key, origin._decision_review_order_key(
+                    {"decision_bound_review": other_base}
+                ))
+                self.assertNotEqual(key, origin._decision_review_order_key(
+                    {"decision_bound_review": other_diff}
+                ))
+                for malformed in ("C" * 64, "c" * 63, "c" * 64 + "\n"):
+                    with self.subTest(malformed_digest=malformed[:8]):
+                        with self.assertRaises(ValueError):
+                            origin._decision_review_order_key({
+                                "decision_bound_review": {**current, "diff_sha256": malformed}
+                            })
+
     def test_diff_digest_is_always_sha256_independent_of_git_format(self) -> None:
         for digest in ("c" * 40, "c" * 63, "c" * 65):
             with self.subTest(digest_length=len(digest)):

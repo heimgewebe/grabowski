@@ -2546,6 +2546,7 @@ class DecisionReviewReconciliationTests(unittest.TestCase):
                 self.assertIsNotNone(key)
                 expected = hashlib.sha256(job_origin.canonical_json_bytes({
                     "repo": REPO, "pr": PR, "head_sha": "a" * width,
+                    "base_sha": "b" * width, "diff_sha256": DIFF,
                 })).hexdigest()
                 self.assertEqual(expected, key)
                 keys[width] = key

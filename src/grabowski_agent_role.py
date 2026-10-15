@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 from pathlib import Path, PurePosixPath
 import stat
 import subprocess
@@ -15,9 +16,9 @@ from typing import Any
 
 from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
 
-SHA40 = __import__("re").compile(r"[0-9a-f]{40}\Z")
-SHA256 = __import__("re").compile(r"[0-9a-f]{64}\Z")
-GIT_OID = __import__("re").compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+SHA40 = __import__("re").compile(r"\A[0-9a-f]{40}\Z")
+SHA256 = __import__("re").compile(r"\A[0-9a-f]{64}\Z")
+GIT_OID = __import__("re").compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
 def _same_git_oid_format(*values: str, object_format: str) -> bool:
@@ -161,12 +162,34 @@ def digest(value: Any) -> str:
 
 
 def git(repo: Path, *args: str) -> bytes:
-    return subprocess.check_output(
-        ["git", "-C", str(repo), *args],
-        stderr=subprocess.STDOUT,
+    # The review source itself must not inherit Git scope/objects, executable
+    # search paths or dynamic-loader configuration from an untrusted caller.
+    # safe_git_environment() without an explicit base would copy ambient GIT_*.
+    controlled = safe_git_environment({
+        "HOME": pwd.getpwuid(os.geteuid()).pw_dir,
+        "PATH": "/usr/bin:/bin",
+    })
+    controlled.update({
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": "/dev/null",
+    })
+    # Never mix Git diagnostics into commit IDs or review diff bytes.
+    # The graft override is deliberately explicit and must not silently
+    # contaminate output with the Git deprecation advisory.
+    completed = subprocess.run(
+        [
+            "/usr/bin/git", "-c", "advice.graftFileDeprecated=false",
+            "-C", str(repo), *args,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         timeout=30,
-        env=safe_git_environment(),
+        env=controlled,
+        check=False,
     )
+    if completed.returncode != 0 or completed.stderr:
+        raise RuntimeError("review Git read failed or emitted stderr")
+    return completed.stdout
 
 
 def git_text(repo: Path, *args: str) -> str:
@@ -1079,6 +1102,17 @@ def _review_sandbox_argv(
     object_format: str,
     review_input_source: str = "committed_diff",
 ) -> tuple[list[str], str | None, bytes | None]:
+    # The caller's format label is never authority: compare it to Git's
+    # guarded, repository-local storage format before preparing any provider.
+    # Recheck in main() after provider execution to make mid-review changes fatal.
+    authenticated_format = _repo_git_object_format(repo)
+    if (
+        object_format != authenticated_format
+        or not _same_git_oid_format(
+            expected_head, expected_base_head, object_format=authenticated_format
+        )
+    ):
+        raise RuntimeError("review sandbox Git object format mismatch")
     executable_name = Path(command[0]).name
     if executable_name == "codex":
         normalized = _codex_review_command_for_headless_execution(command)
@@ -1446,11 +1480,12 @@ def main(argv: list[str] | None = None) -> int:
         command.pop(0)
     repo = Path(args.repository).resolve(strict=True)
     output = Path(args.output).resolve(strict=False)
+    bound_git_object_format = _repo_git_object_format(repo)
     if (
         not command
         or not _same_git_oid_format(
             args.expected_head, args.expected_base_head,
-            object_format=_repo_git_object_format(repo),
+            object_format=bound_git_object_format,
         )
         or SHA256.fullmatch(args.expected_diff_sha256) is None
     ):
@@ -1522,7 +1557,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_head=args.expected_head,
             expected_base_head=args.expected_base_head,
             review_diff=review_input or b"",
-            object_format=_repo_git_object_format(repo),
+            object_format=bound_git_object_format,
             review_input_source=review_input_source or "committed_diff",
         )
     else:
@@ -1547,8 +1582,12 @@ def main(argv: list[str] | None = None) -> int:
     # An unobservable postflight is always a binding violation, not a PASS or
     # a retryable pre-provider failure.
     postflight_error_type: str | None = None
+    after_git_object_format: str | None = None
     try:
         after_head, after_diff, after_dirty = current_binding(repo, args.expected_base_head)
+        after_git_object_format = _repo_git_object_format(repo)
+        if after_git_object_format != bound_git_object_format:
+            postflight_error_type = "GitObjectFormatDrift"
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         after_head, after_diff, after_dirty = None, None, None
         postflight_error_type = type(exc).__name__
@@ -1559,6 +1598,8 @@ def main(argv: list[str] | None = None) -> int:
         "expected_base_head": args.expected_base_head,
         "expected_diff_sha256": args.expected_diff_sha256,
         "expected_dirty": expected_dirty,
+        "git_object_format_before": bound_git_object_format,
+        "git_object_format_after": after_git_object_format,
         "head_before": before_head,
         "head_after": after_head,
         "diff_after": after_diff,

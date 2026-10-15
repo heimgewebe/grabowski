@@ -94,6 +94,7 @@ def _decision_review_order_key(scope: dict[str, Any]) -> str | None:
     pr = binding.get("pr")
     head_sha = binding.get("head_sha")
     base_sha = binding.get("base_sha")
+    diff_sha256 = binding.get("diff_sha256")
     if (
         not isinstance(repo, str)
         or _DECISION_REVIEW_REPO_RE.fullmatch(repo.strip()) is None
@@ -105,12 +106,20 @@ def _decision_review_order_key(scope: dict[str, Any]) -> str | None:
         or not isinstance(base_sha, str)
         or _DECISION_REVIEW_GIT_OID_RE.fullmatch(base_sha) is None
         or len(head_sha) != len(base_sha)
+        or not isinstance(diff_sha256, str)
+        or SHA256_RE.fullmatch(diff_sha256) is None
     ):
         raise ValueError("decision review binding is invalid for causal ordering")
+    # Bind the clock to the exact reviewed base/diff as well as HEAD.
+    # Different bases or diffs cannot influence each other's decision order.
+    # Leave out slot: independent providers of the *same* bound revision
+    # must still share the monotone causal clock.
     material = {
         "repo": repo.strip().lower(),
         "pr": pr,
         "head_sha": head_sha,
+        "base_sha": base_sha,
+        "diff_sha256": diff_sha256,
     }
     return hashlib.sha256(canonical_json_bytes(material)).hexdigest()
 
