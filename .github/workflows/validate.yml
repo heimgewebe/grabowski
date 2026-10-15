@@ -54,6 +54,25 @@ jobs:
           .venv/bin/python -m pip install --upgrade pip
           .venv/bin/python -m pip install -e .
 
+      - name: Install and verify required postflight OS sandbox
+        run: |
+          set -eu
+          # GitHub's Ubuntu image does not contractually include bwrap.
+          # Install the distribution-signed helper, never relax userns or AppArmor.
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          test -x /usr/bin/bwrap
+          test -f /usr/bin/bwrap
+          test ! -L /usr/bin/bwrap
+          test "$(stat -c %u /usr/bin/bwrap)" -eq 0
+          /usr/bin/bwrap --version
+          # Preserve the product's fail-closed read-only mount isolation:
+          # if userns/AppArmor blocks setup, fail CI rather than skip tests.
+          /usr/bin/bwrap --ro-bind / / \
+            --unshare-ipc --unshare-pid --die-with-parent --new-session \
+            --tmpfs /tmp --dev /dev --proc /proc --chdir / \
+            -- /usr/bin/true
+
       - name: Validate repository
         run: make validate
 
