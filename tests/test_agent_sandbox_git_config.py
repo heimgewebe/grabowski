@@ -46,11 +46,32 @@ class AgentSandboxGitConfigTests(unittest.TestCase):
                 workspace = root / ("writer" if writable else "reader")
                 workspace.mkdir()
                 environment = self.sandbox_environment(workspace, writable=writable)
-                self.assertEqual(environment["GIT_CONFIG_COUNT"], "2")
-                self.assertEqual(environment["GIT_CONFIG_KEY_0"], "core.hooksPath")
-                self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "/dev/null")
-                self.assertEqual(environment["GIT_CONFIG_KEY_1"], "core.fsmonitor")
-                self.assertEqual(environment["GIT_CONFIG_VALUE_1"], "false")
+                expected_overrides = (
+                    ("core.hooksPath", "/dev/null"),
+                    ("core.fsmonitor", "false"),
+                    ("protocol.ext.allow", "never"),
+                    (
+                        "core.sshCommand",
+                        "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none "
+                        "-oPermitLocalCommand=no -oClearAllForwardings=yes "
+                        "-oStrictHostKeyChecking=yes",
+                    ),
+                    ("core.askPass", "/bin/false"),
+                    ("credential.helper", ""),
+                    ("http.proxy", ""),
+                    ("http.sslVerify", "true"),
+                )
+                self.assertEqual(
+                    environment["GIT_CONFIG_COUNT"], str(len(expected_overrides))
+                )
+                actual_overrides = tuple(
+                    (
+                        environment[f"GIT_CONFIG_KEY_{index}"],
+                        environment[f"GIT_CONFIG_VALUE_{index}"],
+                    )
+                    for index in range(len(expected_overrides))
+                )
+                self.assertEqual(actual_overrides, expected_overrides)
                 self.assertNotIn("GIT_CONFIG_GLOBAL", environment)
                 self.assertNotIn("GIT_CONFIG_NOSYSTEM", environment)
 
