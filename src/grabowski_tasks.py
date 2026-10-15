@@ -8298,6 +8298,27 @@ def _apply_terminalization_projection(
             connection.rollback()
             raise ValueError(f"Unknown task: {task_id}")
         current_record = dict(current)
+        # Page/status preauthorization may refer to a different pathname
+        # image. Authorize the row bound to THIS writable connection before
+        # committing its projection, receipt or resource-store effects.
+        admission = {
+            "path": current_record["cwd"],
+            "repo": current_record["cwd"],
+            "task_id": task_id,
+            "owner_id": current_record.get("lease_owner_id") or _lease_owner(task_id),
+            "host": current_record["host"],
+        }
+        checked_services: set[str] = set()
+        for service in (
+            _authoritative_unit(current_record),
+            _validate_unit(str(projection["unit"])),
+            _validate_unit(str(projection["authoritative_unit"])),
+        ):
+            if service not in checked_services:
+                operator._require_operator_mutation(
+                    "durable_job", service=service, **admission
+                )
+                checked_services.add(service)
         existing_digest = current_record.get("terminalization_sha256")
         if existing_digest not in {None, transition_sha256}:
             connection.rollback()
@@ -8645,6 +8666,11 @@ def _recover_pending_task_terminalizations(
                 terminalization,
                 recovered=True,
             )
+        except PermissionError:
+            # A late denial after page-wide preauthorization is an authority
+            # change, not an isolated poison record. Never advance the cursor
+            # or apply later projections under the stale batch admission.
+            raise
         except Exception as exc:
             failed.append(
                 {
