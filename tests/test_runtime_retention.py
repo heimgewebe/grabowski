@@ -909,6 +909,58 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(plan["archive_eligible_count"], 3)
             self.assertEqual(plan["archive_deferred_count"], 1)
 
+    def test_oversized_terminal_stderr_does_not_stall_other_job_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            oversized_name = "grabowski-job-000000000001"
+            good_name = "grabowski-job-000000000002"
+            bad_unit = oversized_name + ".service"
+            good_unit = good_name + ".service"
+            oversized = self._job(jobs, oversized_name, 100)
+            self._job(jobs, good_name, 101)
+            stderr = oversized / "stderr.log"
+            original = b"preserve terminal error evidence\n" * 100
+            stderr.write_bytes(original)
+            stderr.chmod(0o600)
+            states = {unit: self._state(unit) for unit in (bad_unit, good_unit)}
+            with patch.object(RETENTION, "MAX_ARCHIVE_FILE_BYTES", 1_024):
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50,
+                    max_archive_jobs=2,
+                    now=1_000,
+                    jobs_root=jobs,
+                    archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=root / "missing.sqlite3",
+                    failed_units=[bad_unit, good_unit],
+                    unit_states=states,
+                )
+                _, _, _, prepared = RETENTION._prepare_archives(plan)
+            self.assertEqual([item["unit"] for item in plan["archive_jobs"]], [good_unit])
+            self.assertEqual([item["record"]["unit"] for item in prepared], [good_unit])
+            self.assertNotIn(bad_unit, plan["reset_failed_units"])
+            self.assertEqual(plan["reset_failed_units"], [good_unit])
+            self.assertEqual(plan["archive_deferred_count"], 0)
+            self.assertTrue(any(
+                item["unit"] == bad_unit and "bounded" in item["reason"]
+                for item in plan["blocked"]
+            ))
+            self.assertEqual(stderr.read_bytes(), original)
+
+    def test_periodic_noop_keeps_oversized_artifact_blocker_visible(self) -> None:
+        blocked = [{"unit": "grabowski-job-000000000001.service",
+                    "reason": "archive source is too large"}]
+        plan = {"plan_sha256": "f" * 64, "reset_failed_units": [],
+                "archive_jobs": [], "blocked": blocked}
+        with patch.object(RETENTION, "build_plan", side_effect=[plan, plan]), patch.object(
+            RETENTION, "_apply_periodic_worktree_hygiene", return_value={"completed": True}
+        ):
+            result = RETENTION.apply_periodic_plan()
+        self.assertTrue(result["completed"])
+        self.assertFalse(result["mutated"])
+        self.assertEqual(result["preserved_blocked_units"], blocked)
+
     def test_oversized_job_registry_keeps_task_reset_planning_available(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
