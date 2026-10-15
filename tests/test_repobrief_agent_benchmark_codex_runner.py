@@ -10767,6 +10767,125 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
             intent.assert_not_called()
             provider.assert_not_called()
 
+    def test_untrusted_checkout_fsmonitor_cannot_get_parent_rpc_or_inet(self) -> None:
+        # A compromised Codex can write its same-UID checkout/.git/config.
+        # Git's core.fsmonitor runs subprocesses when postflight uses git status.
+        # The private bwrap /tmp must hide the host /tmp, so place the fixture
+        # in the normal benchmark state tree rather than that hidden mount.
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-postflight-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            value = request(commit=commit)
+            value["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(value, source, state)
+            marker = root / "fsmonitor-kernel-socket-result"
+            script = root / "untrusted-fsmonitor"
+            script.write_text(
+                "#!/usr/bin/python3\n"
+                "import errno,socket,pathlib\n"
+                "observed=[]\n"
+                "for family in (socket.AF_UNIX,socket.AF_INET):\n"
+                " try:\n"
+                "  s=socket.socket(family,socket.SOCK_STREAM);s.close()\n"
+                "  observed.append('ALLOWED')\n"
+                " except OSError as error:\n"
+                "  observed.append('EPERM' if error.errno==errno.EPERM else 'OTHER')\n"
+                + "pathlib.Path("
+                + repr(str(marker))
+                + ").write_text(','.join(observed))\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            subprocess.run(
+                [
+                    "/usr/bin/git",
+                    "-C",
+                    str(checkout),
+                    "config",
+                    "--local",
+                    "core.fsmonitor",
+                    str(script),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+            observed = runner._secure_post_provider_checkout_readback(
+                value, checkout, source
+            )
+            self.assertEqual(observed["working_tree"], "clean")
+            self.assertFalse(marker.exists(), "Git executed an untrusted fsmonitor")
+
+    def test_postprovider_git_child_rejects_real_host_file_write(self) -> None:
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-postflight-ro-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            value = request(commit=commit)
+            value["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(value, source, state)
+            marker = checkout / "FORBIDDEN_POST_PROVIDER_HOST_WRITE"
+            target = "scenario = base.attest_checkout_setup(request, checkout)"
+            self.assertEqual(
+                runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM.count(target), 1
+            )
+            injection = (
+                "try:\n"
+                " (checkout / 'FORBIDDEN_POST_PROVIDER_HOST_WRITE').write_bytes(b'BAD')\n"
+                "except OSError:\n"
+                " pass\n"
+                "else:\n"
+                " raise RuntimeError('host write was allowed')\n"
+            )
+            with patch.object(
+                runner,
+                "_POST_PROVIDER_GIT_ISOLATED_PROGRAM",
+                runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM.replace(
+                    target, injection + target
+                ),
+            ):
+                result = runner._secure_post_provider_checkout_readback(
+                    value, checkout, source
+                )
+            self.assertEqual(result["working_tree"], "clean")
+            self.assertFalse(marker.exists(), "post-Git sandbox wrote a host file")
+
+    def test_seccomp_postprovider_mode_denies_all_socket_creation(self) -> None:
+        child = (
+            "import errno,socket\n"
+            "for family in (socket.AF_UNIX,socket.AF_INET,socket.AF_INET6):\n"
+            " try:\n"
+            "  s=socket.socket(family,socket.SOCK_STREAM);s.close()\n"
+            "  raise RuntimeError('new socket was unexpectedly allowed')\n"
+            " except OSError as error:\n"
+            "  assert error.errno==errno.EPERM,(family,error.errno)\n"
+            "print('GIT_POSTFLIGHT_NO_NETWORK_PROVEN')\n"
+        )
+        command = runner._unix_socket_restricted_codex_argv(
+            [str(Path(sys.executable).resolve()), "-I", "-c", child],
+            block_network=True,
+        )
+        process = subprocess.run(command, check=False, capture_output=True, timeout=20)
+        self.assertEqual(process.returncode, 0, process.stderr[-1000:])
+        self.assertIn(b"GIT_POSTFLIGHT_NO_NETWORK_PROVEN", process.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

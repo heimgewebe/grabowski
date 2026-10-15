@@ -102,7 +102,7 @@ def trusted_seccomp_library():
         return binary
     raise RuntimeError("trusted kernel socket filter library unavailable")
 
-def deny_unix():
+def deny_unix(block_network=False):
     library = trusted_seccomp_library()
     seccomp = ctypes.CDLL(library, use_errno=True)
     class Compare(ctypes.Structure):
@@ -130,11 +130,22 @@ def deny_unix():
         # to an accessible privileged daemon. Kernel syscall int arguments
         # are truncated AFTER seccomp sees the raw 64-bit registers.
         unix_socket = seccomp.seccomp_syscall_resolve_name(b"socket")
-        if unix_socket < 0 or seccomp.seccomp_rule_add(
-            context, error_action, unix_socket, 1,
-            Compare(0, 7, 0xffffffff, socket.AF_UNIX),
-        ) != 0:
-            raise RuntimeError("unable to deny Unix socket creation")
+        if unix_socket < 0:
+            raise RuntimeError("unable to identify Unix socket syscall")
+        # Post-provider Git may process hostile repository-local hooks/config.
+        # Deny *all* new sockets for it, not just AF_UNIX, including localhost
+        # HTTP/INET escape routes; Codex itself retains its scoped INET proxy.
+        if block_network:
+            socket_rule = seccomp.seccomp_rule_add(
+                context, error_action, unix_socket, 0,
+            )
+        else:
+            socket_rule = seccomp.seccomp_rule_add(
+                context, error_action, unix_socket, 1,
+                Compare(0, 7, 0xffffffff, socket.AF_UNIX),
+            )
+        if socket_rule != 0:
+            raise RuntimeError("unable to deny new kernel sockets")
         # Tokio needs anonymous, already-connected SOCK_STREAM socketpairs
         # for its internal wakeup channel. Such a stream cannot reconnect
         # to a filesystem socket. Reject every other AF_UNIX socketpair type
@@ -193,6 +204,16 @@ def deny_unix():
             for item in created if isinstance(created, tuple) else (created,):
                 item.close()
             raise RuntimeError("kernel Unix socket filter not enforced")
+    if block_network:
+        for family in (socket.AF_INET, socket.AF_INET6):
+            try:
+                created = socket.socket(family, socket.SOCK_STREAM)
+            except OSError as exc:
+                if exc.errno != errno.EPERM:
+                    raise RuntimeError("post-provider network filter not enforced") from exc
+            else:
+                created.close()
+                raise RuntimeError("post-provider network filter not enforced")
     try:
         pair = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     except OSError as exc:
@@ -201,10 +222,12 @@ def deny_unix():
         for item in pair:
             item.close()
 
-if not sys.argv[1:] or not os.path.isabs(sys.argv[1]):
+block_network = sys.argv[1:2] == ["--block-network"]
+command = sys.argv[2:] if block_network else sys.argv[1:]
+if not command or not os.path.isabs(command[0]):
     raise RuntimeError("Codex child executable must be absolute")
-deny_unix()
-os.execve(sys.argv[1], sys.argv[1:], os.environ)
+deny_unix(block_network=block_network)
+os.execve(command[0], command, os.environ)
 """
 
 
@@ -934,7 +957,9 @@ def _assert_trusted_runner_nondumpable() -> None:
         raise RunnerError("Codex trusted parent ptrace isolation unavailable") from exc
 
 
-def _unix_socket_restricted_codex_argv(command: Sequence[str]) -> list[str]:
+def _unix_socket_restricted_codex_argv(
+    command: Sequence[str], *, block_network: bool = False
+) -> list[str]:
     """Wrap an authorized Codex executable with a fail-closed seccomp exec.
 
     A DynamicUser and read-only mounts cannot prevent privileged AF_UNIX RPC.
@@ -948,8 +973,170 @@ def _unix_socket_restricted_codex_argv(command: Sequence[str]) -> list[str]:
         or any(not isinstance(argument, str) for argument in command)
     ):
         raise RunnerError("Codex socket isolation command is invalid")
+    if type(block_network) is not bool:
+        raise RunnerError("kernel socket isolation profile is invalid")
     python = _validated_mcp_proxy_python()
-    return [python, "-I", "-c", _UNIX_SOCKET_DENY_CHILD_PROGRAM, *command]
+    prefix = ["--block-network"] if block_network else []
+    return [python, "-I", "-c", _UNIX_SOCKET_DENY_CHILD_PROGRAM, *prefix, *command]
+
+
+_POST_PROVIDER_GIT_ISOLATED_PROGRAM = r"""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+if len(sys.argv) != 4:
+    raise RuntimeError("invalid frozen checkout readback arguments")
+base_path, checkout_path, source_path = map(Path, sys.argv[1:])
+if not all(path.is_absolute() for path in (base_path, checkout_path, source_path)):
+    raise RuntimeError("post-provider attestation must use absolute paths")
+raw = sys.stdin.buffer.read(1024 * 1024 + 1)
+if len(raw) > 1024 * 1024:
+    raise RuntimeError("post-provider request is unbounded")
+request = json.loads(raw)
+if not isinstance(request, dict):
+    raise RuntimeError("post-provider request is invalid")
+spec = importlib.util.spec_from_file_location("post_provider_frozen_base", base_path)
+if spec is None or spec.loader is None:
+    raise RuntimeError("trusted base module cannot be loaded")
+base = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(base)
+# Prevent fsmonitor, hooks and Git optional index writes even if the
+# checkout's local configuration was modified by untrusted Codex.
+original_git_environment = base._git_environment
+def isolated_git_environment():
+    env = original_git_environment()
+    env.update({
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": "false",
+        "GIT_CONFIG_KEY_1": "core.hooksPath",
+        "GIT_CONFIG_VALUE_1": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+    })
+    return env
+base._git_environment = isolated_git_environment
+checkout = Path(checkout_path)
+source = Path(source_path)
+if any(
+    not (os.statvfs(path).f_flag & os.ST_RDONLY)
+    for path in (base_path, checkout, source)
+):
+    raise RuntimeError("post-provider input is writable inside read-only sandbox")
+scenario = base.attest_checkout_setup(request, checkout)
+expected = request["repository"]["commit"]
+if (
+    base._run_checked(["git", "rev-parse", "HEAD"], cwd=source) != expected
+    or base._run_checked(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
+    )
+):
+    raise RuntimeError("historical benchmark source checkout changed")
+sys.stdout.write(json.dumps(scenario, sort_keys=True, separators=(",", ":")))
+"""
+
+
+def _secure_post_provider_checkout_readback(
+    request: Mapping[str, Any], checkout: Path, source: Path
+) -> dict[str, Any]:
+    """Inspect potentially hostile post-Codex Git only in a read-only child.
+
+    The root filesystem is bind-mounted read-only, IPC/PID are unshared,
+    /dev and /tmp are private, and a seccomp filter denies ALL new sockets,
+    including network sockets, before bwrap and its user namespace run.
+    This avoids accepting unmapped UID 65534 as a trusted library owner.
+    The unfiltered parent never invokes Git with untrusted checkout config.
+    """
+    if (
+        not checkout.is_absolute()
+        or not source.is_absolute()
+        or not checkout.is_dir()
+        or not source.is_dir()
+    ):
+        raise RunnerError("post-provider checkout readback paths are invalid")
+    try:
+        encoded_request = canonical(dict(request)).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise RunnerError("post-provider checkout request is invalid") from exc
+    if len(encoded_request) > base.MAX_REQUEST_BYTES:
+        raise RunnerError("post-provider checkout request is unbounded")
+    command = [
+        "/usr/bin/bwrap",
+        "--ro-bind",
+        "/",
+        "/",
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--die-with-parent",
+        "--new-session",
+        "--tmpfs",
+        "/tmp",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--chdir",
+        "/",
+        "--",
+        _validated_mcp_proxy_python(),
+        "-I",
+        "-B",
+        "-c",
+        _POST_PROVIDER_GIT_ISOLATED_PROGRAM,
+        str(BASE_PATH),
+        str(checkout),
+        str(source),
+    ]
+    try:
+        completed = subprocess.run(
+            _unix_socket_restricted_codex_argv(command, block_network=True),
+            cwd="/",
+            env=base._git_environment(),
+            input=encoded_request,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=90,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RunnerError("post-provider Git isolation unavailable") from exc
+    if (
+        completed.returncode != 0
+        or not isinstance(completed.stdout, bytes)
+        or not isinstance(completed.stderr, bytes)
+        or len(completed.stdout) > 8192
+        or len(completed.stderr) > 8192
+    ):
+        raise RunnerError("post-provider Git isolation failed")
+    try:
+        result = json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RunnerError("post-provider Git readback is invalid") from exc
+    if (
+        not isinstance(result, dict)
+        or set(result)
+        != {
+            "working_tree",
+            "git_commit",
+            "status_sha256",
+            "fixture_sha256",
+        }
+        or result["git_commit"] != request["repository"]["commit"]
+        or result["working_tree"] != base.validated_setup(request)
+        or not isinstance(result["status_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", result["status_sha256"]) is None
+        or (
+            result["fixture_sha256"] is not None
+            and (
+                not isinstance(result["fixture_sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", result["fixture_sha256"]) is None
+            )
+        )
+    ):
+        raise RunnerError("post-provider Git readback differs from bound request")
+    return result
 
 
 def validate_toolchain(codex: str) -> str:
@@ -8911,14 +9098,21 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         capture = dict(capture)
         capture["scenario_before"] = scenario_before
         try:
-            capture["scenario_after"] = base.attest_checkout_setup(request, checkout)
-            if base._run_checked(["git", "rev-parse", "HEAD"], cwd=source) != request[
-                "repository"
-            ]["commit"] or base._run_checked(
-                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
-                cwd=source,
-            ):
-                raise RunnerError("historical benchmark source checkout changed")
+            if synthetic:
+                capture["scenario_after"] = base.attest_checkout_setup(
+                    request, checkout
+                )
+                if base._run_checked(
+                    ["git", "rev-parse", "HEAD"], cwd=source
+                ) != request["repository"]["commit"] or base._run_checked(
+                    ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                    cwd=source,
+                ):
+                    raise RunnerError("historical benchmark source checkout changed")
+            else:
+                capture["scenario_after"] = _secure_post_provider_checkout_readback(
+                    request, checkout, source
+                )
         except BaseException as exc:
             marker = f"benchmark_scenario_readback_failed:{type(exc).__name__}"
             previous = capture.get("capture_error")
@@ -8979,13 +9173,16 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 args.codex_command_sha256,
                 require_read_only_mount=True,
             )
-        base.attest_checkout_setup(request, checkout)
-        if base._run_checked(["git", "rev-parse", "HEAD"], cwd=source) != request[
-            "repository"
-        ]["commit"] or base._run_checked(
-            ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
-        ):
-            raise RunnerError("Codex changed historical benchmark source checkout")
+        if synthetic:
+            base.attest_checkout_setup(request, checkout)
+            if base._run_checked(["git", "rev-parse", "HEAD"], cwd=source) != request[
+                "repository"
+            ]["commit"] or base._run_checked(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"], cwd=source
+            ):
+                raise RunnerError("Codex changed historical benchmark source checkout")
+        else:
+            _secure_post_provider_checkout_readback(request, checkout, source)
 
         normalized = receipt(
             request,
