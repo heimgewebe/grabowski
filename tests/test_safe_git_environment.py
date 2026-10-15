@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import pwd
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -46,12 +48,13 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
         snapshot = dict(inherited)
         environment = safe_git_environment(inherited)
         self.assertEqual(inherited, snapshot)
-        self.assertEqual(environment["HOME"], inherited["HOME"])
-        self.assertEqual(environment["PATH"], inherited["PATH"])
+        self.assertEqual(environment["HOME"], pwd.getpwuid(os.geteuid()).pw_dir)
+        self.assertEqual(environment["PATH"], "/usr/bin:/bin")
         for key in inherited:
             if key.startswith("GIT_") and key not in {
                 "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0",
                 "GIT_CONFIG_VALUE_0", "GIT_CONFIG_GLOBAL",
+                "GIT_SSH_COMMAND", "GIT_ASKPASS",
             }:
                 with self.subTest(key=key):
                     self.assertNotIn(key, environment)
@@ -101,6 +104,78 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
             self.assertEqual(Path(result.stdout.strip()).resolve(), expected.resolve())
             self.assertFalse(foreign_index.exists())
             self.assertFalse((root / "foreign-objects").exists())
+
+
+    def test_transport_and_non_git_environment_injection_is_rejected(self) -> None:
+        # Independently reported P1: stripping GIT_* is not enough when SSH,
+        # PATH, HOME or HTTPS trust paths remain executable overrides.
+        incoming = {
+            "HOME": "/tmp/attacker-ssh-home",
+            "PATH": "/tmp/attacker-binaries:/usr/bin",
+            "XDG_CONFIG_HOME": "/tmp/attacker-xdg",
+            "SSH_ASKPASS": "/tmp/attacker-askpass",
+            "SSH_ASKPASS_REQUIRE": "force",
+            "SSH_AUTH_SOCK": "/tmp/attacker-agent.sock",
+            "LD_PRELOAD": "/tmp/attacker.so",
+            "LD_LIBRARY_PATH": "/tmp/attacker-libs",
+            "PYTHONPATH": "/tmp/attacker-python",
+            "HTTPS_PROXY": "http://attacker-proxy.invalid:3128",
+            "HTTP_PROXY": "http://attacker-proxy.invalid:3128",
+            "ALL_PROXY": "socks5://attacker-proxy.invalid:3128",
+            "CURL_CA_BUNDLE": "/tmp/attacker-ca",
+            "SSL_CERT_FILE": "/tmp/attacker-cert",
+            "GIT_SSH_COMMAND": "/tmp/attacker-ssh",
+            "GIT_ASKPASS": "/tmp/attacker-git-askpass",
+        }
+        before = dict(incoming)
+        protected = safe_git_environment(incoming)
+        self.assertEqual(incoming, before)
+        self.assertEqual(protected["PATH"], "/usr/bin:/bin")
+        self.assertEqual(protected["HOME"], pwd.getpwuid(os.geteuid()).pw_dir)
+        self.assertEqual(protected["SSH_ASKPASS"], "/bin/false")
+        self.assertEqual(protected["SSH_ASKPASS_REQUIRE"], "never")
+        self.assertEqual(protected["GIT_ASKPASS"], "/bin/false")
+        ssh = protected["GIT_SSH_COMMAND"]
+        self.assertTrue(ssh.startswith("/usr/bin/ssh -F /dev/null "), ssh)
+        for required in (
+            "-oBatchMode=yes", "-oProxyCommand=none",
+            "-oPermitLocalCommand=no", "-oClearAllForwardings=yes",
+            "-oStrictHostKeyChecking=yes",
+        ):
+            self.assertIn(required, ssh)
+        self.assertEqual(protected["GIT_SSH_VARIANT"], "ssh")
+        for key in (
+            "XDG_CONFIG_HOME", "SSH_AUTH_SOCK", "LD_PRELOAD",
+            "LD_LIBRARY_PATH", "PYTHONPATH", "HTTPS_PROXY",
+            "HTTP_PROXY", "ALL_PROXY", "CURL_CA_BUNDLE", "SSL_CERT_FILE",
+        ):
+            with self.subTest(key=key):
+                self.assertNotIn(key, protected)
+
+    def test_poisoned_path_cannot_replace_git_executable(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="review-git-path-") as temporary:
+            root = Path(temporary)
+            fake_bin = root / "fake-bin"
+            fake_bin.mkdir()
+            marker = root / "fake-git-was-executed"
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                "#!/bin/sh\\n: > " + shlex.quote(str(marker))
+                + "\\nprintf 'attacker git\\n'\\n",
+                encoding="utf-8",
+            )
+            fake_git.chmod(0o700)
+            secure = safe_git_environment({
+                "HOME": str(root),
+                "PATH": str(fake_bin) + ":/usr/bin:/bin",
+            })
+            result = subprocess.run(
+                ["git", "--version"], env=secure, text=True,
+                capture_output=True, timeout=15,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(result.stdout.startswith("git version "), result.stdout)
+            self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":

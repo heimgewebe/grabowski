@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import selectors
 import shutil
 import signal
@@ -16,9 +17,23 @@ from typing import Iterable
 BWRAP = Path(os.environ.get("GRABOWSKI_BWRAP_BIN", "/usr/bin/bwrap"))
 TAIL_BYTES = 12000
 MAX_WRITABLE_SCOPE_ENTRIES = 100_000
+# Prevent the local Git repository from supplying executable helpers or
+# altering the network trust path. Git's environment overrides this config
+# after repository configuration has been loaded.
+_TRUSTED_GIT_SSH_COMMAND = (
+    "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none "
+    "-oPermitLocalCommand=no -oClearAllForwardings=yes "
+    "-oStrictHostKeyChecking=yes"
+)
 _GIT_COMMAND_CONFIG = (
     ("core.hooksPath", "/dev/null"),
     ("core.fsmonitor", "false"),
+    ("protocol.ext.allow", "never"),
+    ("core.sshCommand", _TRUSTED_GIT_SSH_COMMAND),
+    ("core.askPass", "/bin/false"),
+    ("credential.helper", ""),
+    ("http.proxy", ""),
+    ("http.sslVerify", "true"),
 )
 
 
@@ -443,14 +458,30 @@ def _git_command_environment() -> dict[str, str]:
 def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
     """Return a non-interactive Git environment with executable helpers disabled."""
     inherited = os.environ if base is None else base
-    # Git's environment variables can redirect -C to foreign refs, indexes,
-    # objects, configuration and executable helpers. Do not inherit any GIT_*
-    # value: only explicitly controlled Git settings below may be installed.
-    # SSH identities must be admitted by their own verified transport contract.
+    # No caller environment is transport or executable authority. Git -C
+    # does not defeat GIT_DIR, but filtering only GIT_* is insufficient:
+    # PATH, HOME, SSH_ASKPASS, LD_PRELOAD, proxy and CA variables can also
+    # redirect or execute programs at a Git subprocess effect boundary.
+    # Preserve only inert terminal/user labels; use OS-account HOME for
+    # pinned SSH host keys and trusted system Git/SSH executables.
+    try:
+        home = pwd.getpwuid(os.geteuid()).pw_dir
+    except (KeyError, OSError) as exc:
+        raise AgentSandboxError("trusted Git process account home unavailable") from exc
+    if not os.path.isabs(home) or not os.path.isdir(home):
+        raise AgentSandboxError("trusted Git process account home invalid")
     environment = {
-        key: value for key, value in inherited.items()
-        if not key.startswith("GIT_")
+        key: value
+        for key, value in inherited.items()
+        if key in {"TERM", "LANG", "LC_CTYPE", "USER", "LOGNAME"}
+        and isinstance(value, str)
     }
+    environment.update({
+        "HOME": home,
+        "PATH": "/usr/bin:/bin",
+        "SSH_ASKPASS": "/bin/false",
+        "SSH_ASKPASS_REQUIRE": "never",
+    })
     # Flowlines exporter authentication is server-only and must never cross
     # into agent, workspace, reviewer, or writer child processes.
     for key in (
@@ -490,6 +521,9 @@ def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_ATTR_NOSYSTEM": "1",
             "GIT_ALLOW_PROTOCOL": "ssh:https:file",
+            "GIT_SSH_COMMAND": _TRUSTED_GIT_SSH_COMMAND,
+            "GIT_SSH_VARIANT": "ssh",
+            "GIT_ASKPASS": "/bin/false",
         }
     )
     environment.update(_git_command_environment())
