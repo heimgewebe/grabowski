@@ -1199,6 +1199,21 @@ def _migrate_resource_schema_v2(connection: sqlite3.Connection) -> None:
     _publish_resource_lease_contract(connection)
 
 
+class _ClosingResourceConnection(sqlite3.Connection):
+    """Close after a database context; sqlite3's default __exit__ only commits.
+
+    A still-referenced connection can retain WAL/SHM locks until GC, which is
+    not an authority or lifetime boundary (including under Python 3.12).
+    Explicit non-context users keep ordinary connection semantics.
+    """
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def _connect_existing_resource_database() -> sqlite3.Connection:
     if RESOURCE_DB.is_symlink():
         raise PermissionError(f"Resource database may not be a symlink: {RESOURCE_DB}")
@@ -1207,6 +1222,7 @@ def _connect_existing_resource_database() -> sqlite3.Connection:
         uri=True,
         timeout=10,
         isolation_level=None,
+        factory=_ClosingResourceConnection,
     )
     if RESOURCE_DB.is_symlink():
         connection.close()
@@ -1252,7 +1268,7 @@ def _database() -> sqlite3.Connection:
         if observed == "3":
             return _open_current_resource_database()
         connection = (
-            sqlite3.connect(RESOURCE_DB, timeout=10, isolation_level=None)
+            sqlite3.connect(RESOURCE_DB, timeout=10, isolation_level=None, factory=_ClosingResourceConnection)
             if observed is None
             else _connect_existing_resource_database()
         )
