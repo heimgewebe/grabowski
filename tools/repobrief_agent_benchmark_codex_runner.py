@@ -1045,8 +1045,232 @@ if any(
     for path in (base_path, checkout, source)
 ):
     raise RuntimeError("post-provider input is writable inside read-only sandbox")
-scenario = base.attest_checkout_setup(request, checkout)
+# Never run Git against the provider-writable checkout after model execution:
+# its .git/config, info/attributes, filters, refs and gitfile can forge status
+# and execute programs. Read ONLY the immutable source's Git tree and compare
+# each physical tracked file against its exact Git object, without filters.
+import re
+import stat
+import subprocess
+
 expected = request["repository"]["commit"]
+if not isinstance(expected, str) or re.fullmatch("[0-9a-f]{40}", expected) is None:
+    raise RuntimeError("bound source Git commit identity is invalid")
+setup = base.validated_setup(request)
+MAX_TREE_BYTES = 16 * 1024 * 1024
+MAX_FILES = 65536
+MAX_FILE_BYTES = 256 * 1024 * 1024
+MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+total_read = [0]
+
+def bound_file_digests(path, *, executable=None):
+    first = path.lstat()
+    if (
+        not stat.S_ISREG(first.st_mode)
+        or first.st_nlink != 1
+        or first.st_size > MAX_FILE_BYTES
+        or (executable is not None and bool(first.st_mode & 0o111) != executable)
+    ):
+        raise RuntimeError("untrusted checkout file type, mode or size")
+    descriptor = os.open(
+        path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev, opened.st_ino, opened.st_size, opened.st_mode,
+            opened.st_mtime_ns
+        ) != (
+            first.st_dev, first.st_ino, first.st_size, first.st_mode,
+            first.st_mtime_ns
+        ):
+            raise RuntimeError("untrusted checkout file identity changed")
+        sha1 = hashlib.sha1()
+        sha1.update(b"blob " + str(opened.st_size).encode("ascii") + b"\0")
+        sha256 = hashlib.sha256()
+        count = 0
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            count += len(chunk)
+            total_read[0] += len(chunk)
+            if count > opened.st_size or total_read[0] > MAX_TOTAL_BYTES:
+                raise RuntimeError("untrusted checkout file bytes exceed bounds")
+            sha1.update(chunk)
+            sha256.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            count != opened.st_size
+            or (
+                after.st_dev, after.st_ino, after.st_size, after.st_mode,
+                after.st_mtime_ns
+            ) != (
+                opened.st_dev, opened.st_ino, opened.st_size, opened.st_mode,
+                opened.st_mtime_ns
+            )
+        ):
+            raise RuntimeError("untrusted checkout file changed during readback")
+        return sha1.hexdigest(), sha256.hexdigest()
+    finally:
+        os.close(descriptor)
+
+# Freeze the checkout's mutable Git control metadata before intent. A provider
+# editing .git/HEAD/config/index/info/attributes is rejected even if tracked
+# bytes happen to remain identical. Never interpret these bytes as Git config.
+git_root = checkout / ".git"
+git_info = git_root.lstat()
+if not stat.S_ISDIR(git_info.st_mode):
+    raise RuntimeError("provider checkout Git metadata is not a directory")
+controls = (
+    "HEAD", "config", "index", "info/attributes", "info/exclude",
+    "objects/info/alternates", "commondir", "gitdir", "packed-refs"
+)
+control_hash = hashlib.sha256()
+for relative in controls:
+    current = git_root
+    parts = Path(relative).parts
+    for component in parts[:-1]:
+        current = current / component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            current = None
+            break
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError("untrusted Git control parent is not a directory")
+    target = None if current is None else current / parts[-1]
+    control_hash.update(relative.encode("ascii") + b"\0")
+    try:
+        info = target.lstat() if target is not None else None
+    except FileNotFoundError:
+        info = None
+    if info is None:
+        control_hash.update(b"absent\0")
+        if relative in ("HEAD", "config", "index"):
+            raise RuntimeError("provider checkout mandatory Git control is absent")
+        continue
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise RuntimeError("provider Git control is linked or not regular")
+    _sha1, content_hash = bound_file_digests(target)
+    control_hash.update(info.st_mode.to_bytes(4, "little"))
+    control_hash.update(bytes.fromhex(content_hash))
+    if relative == "HEAD":
+        if target.read_bytes() != (expected + "\n").encode("ascii"):
+            raise RuntimeError("provider checkout detached HEAD changed")
+
+# Inspect committed tree with Git in the immutable source, NEVER in checkout.
+listing = subprocess.run(
+    ["/usr/bin/git", "-C", str(source), "ls-tree", "-r",
+     "--full-tree", "-z", expected],
+    env=base._git_environment(),
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    check=False,
+    timeout=30,
+)
+if (
+    listing.returncode != 0
+    or len(listing.stdout) > MAX_TREE_BYTES
+    or len(listing.stderr) > 4096
+    or not listing.stdout.endswith(b"\0")
+):
+    raise RuntimeError("immutable source Git tree listing invalid")
+tracked = {}
+expected_directories = set()
+for entry in listing.stdout[:-1].split(b"\0"):
+    metadata, tab, relative = entry.partition(b"\t")
+    header = metadata.split(b" ")
+    components = relative.split(b"/")
+    if (
+        tab != b"\t"
+        or len(header) != 3
+        or header[0] not in (b"100644", b"100755")
+        or header[1] != b"blob"
+        or re.fullmatch(rb"[0-9a-f]{40}", header[2]) is None
+        or len(entry) > 8192
+        or not 1 <= len(components) <= 30
+        or any(part in (b"", b".", b"..") for part in components)
+        or components[0] == b".git"
+    ):
+        raise RuntimeError("immutable source Git tree has unsupported entries")
+    rel = Path(os.fsdecode(relative))
+    if rel in tracked:
+        raise RuntimeError("duplicate immutable Git tree entry")
+    tracked[rel] = (header[0] == b"100755", header[2].decode("ascii"))
+    for depth in range(1, len(components)):
+        expected_directories.add(Path(os.fsdecode(b"/".join(components[:depth]))))
+    if len(tracked) + len(expected_directories) > MAX_FILES:
+        raise RuntimeError("immutable source tree too large")
+
+expected_files = set(tracked)
+if setup == "dirty":
+    fixture = Path(base.DIRTY_FIXTURE_NAME)
+    if fixture in tracked or len(fixture.parts) != 1:
+        raise RuntimeError("dirty fixture aliases committed path")
+    expected_files.add(fixture)
+seen = set()
+entries_seen = 0
+for directory, directories, filenames in os.walk(checkout, followlinks=False):
+    current = Path(directory)
+    ancestor = current.relative_to(checkout)
+    for child in list(directories):
+        relative = ancestor / child
+        info = (current / child).lstat()
+        if relative == Path(".git") and ancestor == Path("."):
+            if not stat.S_ISDIR(info.st_mode):
+                raise RuntimeError("provider checkout git root is invalid")
+            directories.remove(child)
+            continue
+        if not stat.S_ISDIR(info.st_mode) or relative not in expected_directories:
+            raise RuntimeError("provider checkout has unexpected directory")
+    for child in filenames:
+        relative = ancestor / child
+        if relative not in expected_files or relative in seen:
+            raise RuntimeError("provider checkout has unexpected file")
+        info = (current / child).lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise RuntimeError("provider checkout contains linked or special file")
+        seen.add(relative)
+    entries_seen += len(directories) + len(filenames)
+    if entries_seen > MAX_FILES or len(ancestor.parts) > 32:
+        raise RuntimeError("provider checkout exceeds filesystem scan bounds")
+if seen != expected_files:
+    raise RuntimeError("provider checkout missing committed file")
+
+for relative, (executable, object_id) in tracked.items():
+    original_sha1, original_sha256 = bound_file_digests(
+        source / relative, executable=executable
+    )
+    checkout_sha1, checkout_sha256 = bound_file_digests(
+        checkout / relative, executable=executable
+    )
+    if (
+        original_sha1 != object_id
+        or checkout_sha1 != object_id
+        or original_sha256 != checkout_sha256
+    ):
+        raise RuntimeError("provider checkout tracked file differs from source commit")
+
+status = b""
+fixture_sha256 = None
+if setup == "dirty":
+    path = checkout / base.DIRTY_FIXTURE_NAME
+    info = path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_mode & 0o777 != 0o600
+        or info.st_uid != os.geteuid()
+        or path.read_bytes() != base.DIRTY_FIXTURE_BYTES
+    ):
+        raise RuntimeError("provider dirty fixture differs from frozen bytes")
+    status = ("?? " + base.DIRTY_FIXTURE_NAME).encode("utf-8")
+    fixture_sha256 = hashlib.sha256(base.DIRTY_FIXTURE_BYTES).hexdigest()
+
+# The immutable source is itself still subject to the root/kernel mount check
+# and the original clean-source attestation, but it cannot delegate via the
+# mutable provider checkout.
 if (
     base._run_checked(["git", "rev-parse", "HEAD"], cwd=source) != expected
     or base._run_checked(
@@ -1054,12 +1278,26 @@ if (
     )
 ):
     raise RuntimeError("historical benchmark source checkout changed")
-sys.stdout.write(json.dumps(scenario, sort_keys=True, separators=(",", ":")))
+scenario = {
+    "working_tree": setup,
+    "git_commit": expected,
+    "status_sha256": hashlib.sha256(status).hexdigest(),
+    "fixture_sha256": fixture_sha256,
+}
+sys.stdout.write(json.dumps(
+    {"scenario": scenario, "git_control_sha256": control_hash.hexdigest()},
+    sort_keys=True, separators=(",", ":")
+))
 """
 
 
 def _secure_post_provider_checkout_readback(
-    request: Mapping[str, Any], checkout: Path, source: Path
+    request: Mapping[str, Any],
+    checkout: Path,
+    source: Path,
+    *,
+    expected_git_control_sha256: str | None = None,
+    git_control_out: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Inspect potentially hostile post-Codex Git only in a read-only child.
 
@@ -1150,29 +1388,44 @@ def _secure_post_provider_checkout_readback(
         result = json.loads(completed["stdout"])
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RunnerError("post-provider Git readback is invalid") from exc
+    if not isinstance(result, dict) or set(result) != {
+        "scenario",
+        "git_control_sha256",
+    }:
+        raise RunnerError("post-provider Git readback differs from bound request")
+    control = result["git_control_sha256"]
+    scenario = result["scenario"]
     if (
-        not isinstance(result, dict)
-        or set(result)
+        not isinstance(control, str)
+        or re.fullmatch(r"[0-9a-f]{64}", control) is None
+        or not isinstance(scenario, dict)
+        or set(scenario)
         != {
             "working_tree",
             "git_commit",
             "status_sha256",
             "fixture_sha256",
         }
-        or result["git_commit"] != request["repository"]["commit"]
-        or result["working_tree"] != base.validated_setup(request)
-        or not isinstance(result["status_sha256"], str)
-        or re.fullmatch(r"[0-9a-f]{64}", result["status_sha256"]) is None
+        or scenario["git_commit"] != request["repository"]["commit"]
+        or scenario["working_tree"] != base.validated_setup(request)
+        or not isinstance(scenario["status_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", scenario["status_sha256"]) is None
         or (
-            result["fixture_sha256"] is not None
+            scenario["fixture_sha256"] is not None
             and (
-                not isinstance(result["fixture_sha256"], str)
-                or re.fullmatch(r"[0-9a-f]{64}", result["fixture_sha256"]) is None
+                not isinstance(scenario["fixture_sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", scenario["fixture_sha256"]) is None
             )
         )
     ):
         raise RunnerError("post-provider Git readback differs from bound request")
-    return result
+    if expected_git_control_sha256 is not None and not hmac.compare_digest(
+        control, expected_git_control_sha256
+    ):
+        raise RunnerError("post-provider Git control metadata changed")
+    if git_control_out is not None:
+        git_control_out["sha256"] = control
+    return scenario
 
 
 def validate_toolchain(codex: str) -> str:
@@ -9014,10 +9267,14 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     and _frozen_g1_mcp_profile(request) == MCP_PROFILE_FROZEN_G1
                 ):
                     _frozen_g1_vendor_snapshot()
-                # The same exact kernel-filtered, root-readonly postflight
-                # command must succeed on this checkout BEFORE provider intent.
-                # Its failure must not burn a non-retryable paid identity.
-                _secure_post_provider_checkout_readback(request, checkout, source)
+                # Prove the real byte-for-byte working tree and freeze Git
+                # control metadata BEFORE consuming the provider one-shot.
+                git_controls_before: dict[str, str] = {}
+                _secure_post_provider_checkout_readback(
+                    request, checkout, source, git_control_out=git_controls_before
+                )
+                if "sha256" not in git_controls_before:
+                    raise RunnerError("post-provider Git control baseline unavailable")
                 # Recheck in the actual provider process namespace, after all
                 # staging and immediately before the irreversible one-shot intent.
                 validate_live_immutable_mounts(
@@ -9158,7 +9415,10 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     raise RunnerError("historical benchmark source checkout changed")
             else:
                 capture["scenario_after"] = _secure_post_provider_checkout_readback(
-                    request, checkout, source
+                    request,
+                    checkout,
+                    source,
+                    expected_git_control_sha256=git_controls_before["sha256"],
                 )
         except BaseException as exc:
             marker = f"benchmark_scenario_readback_failed:{type(exc).__name__}"
@@ -9229,7 +9489,12 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
             ):
                 raise RunnerError("Codex changed historical benchmark source checkout")
         else:
-            _secure_post_provider_checkout_readback(request, checkout, source)
+            _secure_post_provider_checkout_readback(
+                request,
+                checkout,
+                source,
+                expected_git_control_sha256=git_controls_before["sha256"],
+            )
 
         normalized = receipt(
             request,

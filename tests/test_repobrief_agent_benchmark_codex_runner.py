@@ -4199,6 +4199,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
             def qualified_smoke(*_args, **_kwargs):
                 execution_order.append("postflight_smoke")
+                control = _kwargs.get("git_control_out")
+                if isinstance(control, dict):
+                    control["sha256"] = "0" * 64
                 return {"working_tree": "clean"}
 
             with ExitStack() as stack:
@@ -10852,7 +10855,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 timeout=10,
             )
             os.utime(checkout / "src" / "example.py", None)
-            target = "scenario = base.attest_checkout_setup(request, checkout)"
+            target = 'scenario = {\n    "working_tree": setup,'
             original = runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM
             self.assertEqual(original.count(target), 1)
             detection = (
@@ -10860,7 +10863,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 "if HookPath('/tmp/rab-fsmonitor-executed').exists():\n"
                 " raise RuntimeError('Git invoked the untrusted fsmonitor')\n"
             )
-            qualified = original.replace(target, target + "\n" + detection)
+            qualified = original.replace(target, detection + target)
             with patch.object(runner, "_POST_PROVIDER_GIT_ISOLATED_PROGRAM", qualified):
                 attested = runner._secure_post_provider_checkout_readback(
                     value, checkout, source
@@ -10872,15 +10875,16 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 '"GIT_CONFIG_KEY_0": "core.logAllRefUpdates"',
             )
             self.assertNotEqual(unprotected, qualified)
+            # Even when the Git fsmonitor override is removed, no command is
+            # run against the provider-writable checkout. The independent
+            # clean-filter RED test proves ordinary Git status can be forged.
             with patch.object(
                 runner, "_POST_PROVIDER_GIT_ISOLATED_PROGRAM", unprotected
             ):
-                with self.assertRaisesRegex(
-                    runner.RunnerError, "post-provider Git isolation failed"
-                ):
-                    runner._secure_post_provider_checkout_readback(
-                        value, checkout, source
-                    )
+                attested = runner._secure_post_provider_checkout_readback(
+                    value, checkout, source
+                )
+                self.assertEqual(attested["working_tree"], "clean")
 
     def test_postprovider_git_child_rejects_real_host_file_write(self) -> None:
         scratch = ROOT / "build"
@@ -10899,7 +10903,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
             }
             checkout = runner.create_checkout(value, source, state)
             marker = checkout / "FORBIDDEN_POST_PROVIDER_HOST_WRITE"
-            target = "scenario = base.attest_checkout_setup(request, checkout)"
+            target = 'scenario = {\n    "working_tree": setup,'
             self.assertEqual(
                 runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM.count(target), 1
             )
@@ -10940,7 +10944,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 "fixture": "fresh-matching-snapshot",
             }
             checkout = runner.create_checkout(value, source, state)
-            anchor = "scenario = base.attest_checkout_setup(request, checkout)"
+            anchor = 'scenario = {\n    "working_tree": setup,'
             self.assertEqual(
                 runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM.count(anchor), 1
             )
@@ -11015,6 +11019,182 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
         process = subprocess.run(command, check=False, capture_output=True, timeout=20)
         self.assertEqual(process.returncode, 0, process.stderr[-1000:])
         self.assertIn(b"GIT_POSTFLIGHT_NO_NETWORK_PROVEN", process.stdout)
+
+    def test_postflight_rejects_git_clean_filter_false_clean(self) -> None:
+        # Control: Git status can be tricked into a false clean result by
+        # repository-local clean filters, despite changed tracked file bytes.
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-malicious-clean-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            value = request(commit=commit)
+            value["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(value, source, state)
+            original = (source / "src" / "example.py").read_bytes()
+            (checkout / "src" / "example.py").write_bytes(b"X" * len(original))
+            driver = root / "malicious-clean-filter"
+            driver.write_text(
+                "#!/usr/bin/python3\n"
+                "import sys\n"
+                "sys.stdout.buffer.write(" + repr(original) + ")\n",
+                encoding="utf-8",
+            )
+            driver.chmod(0o755)
+            subprocess.run(
+                [
+                    "/usr/bin/git",
+                    "-C",
+                    str(checkout),
+                    "config",
+                    "--local",
+                    "filter.rabmal.clean",
+                    str(driver),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+            (checkout / ".git" / "info" / "attributes").write_text(
+                "src/example.py filter=rabmal\n", encoding="utf-8"
+            )
+            untrusted_status = subprocess.run(
+                ["/usr/bin/git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=checkout,
+                env=runner.base._git_environment(),
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(untrusted_status.stdout, b"")
+            self.assertNotEqual(
+                (checkout / "src" / "example.py").read_bytes(), original
+            )
+            with self.assertRaisesRegex(
+                runner.RunnerError, "post-provider Git isolation failed"
+            ):
+                runner._secure_post_provider_checkout_readback(value, checkout, source)
+
+    def test_postflight_rejects_forged_detached_git_head(self) -> None:
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-malicious-head-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            value = request(commit=commit)
+            value["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(value, source, state)
+            self.assertEqual((checkout / ".git" / "HEAD").read_text().strip(), commit)
+            (checkout / ".git" / "HEAD").write_text(
+                "ref: refs/heads/forged\n", encoding="ascii"
+            )
+            with self.assertRaisesRegex(
+                runner.RunnerError, "post-provider Git isolation failed"
+            ):
+                runner._secure_post_provider_checkout_readback(value, checkout, source)
+
+    def test_postflight_dirty_fixture_bytes_and_modes_are_bound(self) -> None:
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-postflight-dirty-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            frozen = runner.base.FROZEN_G2_IDENTITY
+            with patch.dict(
+                frozen, {"repository": {**frozen["repository"], "commit": commit}}
+            ):
+                value = frozen_g2_request(commit=commit)
+                checkout = runner.create_checkout(value, source, state)
+                # A private scratch Git commit cannot equal the historical
+                # frozen G2 SHA. Bind the child to that same scratch commit
+                # only within this test, without changing production code.
+                original_script = runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM
+                anchor = "setup = base.validated_setup(request)"
+                self.assertEqual(original_script.count(anchor), 1)
+                injected = (
+                    "base.FROZEN_G2_IDENTITY['repository'] = "
+                    "{**base.FROZEN_G2_IDENTITY['repository'], "
+                    "'commit': expected}\n"
+                )
+                with patch.object(
+                    runner,
+                    "_POST_PROVIDER_GIT_ISOLATED_PROGRAM",
+                    original_script.replace(anchor, injected + anchor),
+                ):
+                    result = runner._secure_post_provider_checkout_readback(
+                        value, checkout, source
+                    )
+                self.assertEqual(result["working_tree"], "dirty")
+                self.assertEqual(
+                    result["fixture_sha256"],
+                    runner.sha_bytes(runner.base.DIRTY_FIXTURE_BYTES),
+                )
+                dirty_path = checkout / runner.base.DIRTY_FIXTURE_NAME
+                dirty_path.write_bytes(b"forged-but-present")
+                with patch.object(
+                    runner,
+                    "_POST_PROVIDER_GIT_ISOLATED_PROGRAM",
+                    original_script.replace(anchor, injected + anchor),
+                ):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "post-provider Git isolation failed"
+                    ):
+                        runner._secure_post_provider_checkout_readback(
+                            value, checkout, source
+                        )
+
+    def test_postflight_detects_git_control_metadata_drift_after_intent(self) -> None:
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-postflight-controls-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            value = request(commit=commit)
+            value["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(value, source, state)
+            control: dict[str, str] = {}
+            runner._secure_post_provider_checkout_readback(
+                value, checkout, source, git_control_out=control
+            )
+            self.assertRegex(control["sha256"], r"^[0-9a-f]{64}$")
+            (checkout / ".git" / "config").write_text(
+                (checkout / ".git" / "config").read_text()
+                + '\n[filter "malicious"]\n\tclean = /usr/bin/true\n'
+            )
+            with self.assertRaisesRegex(
+                runner.RunnerError, "post-provider Git control metadata changed"
+            ):
+                runner._secure_post_provider_checkout_readback(
+                    value,
+                    checkout,
+                    source,
+                    expected_git_control_sha256=control["sha256"],
+                )
 
 
 if __name__ == "__main__":
