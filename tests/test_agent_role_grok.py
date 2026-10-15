@@ -566,7 +566,8 @@ class GrokReviewRoleTests(unittest.TestCase):
         base = "b" * 40
         review_diff = b"diff --git a/a.py b/a.py\n+safe = True\n"
         actual, prompt_bytes = role._grok_streaming_review_command(
-            prepared, expected_head=head, expected_base_head=base, review_diff=review_diff
+            prepared, expected_head=head, expected_base_head=base, review_diff=review_diff,
+            object_format="sha1",
         )
         self.assertEqual(actual[actual.index("--tools") + 1], "todo_write")
         self.assertEqual(
@@ -595,6 +596,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             expected_head="a" * 40,
             expected_base_head="b" * 40,
             review_diff=review_diff,
+            object_format="sha1",
         )
         self.assertLess(max(len(item.encode("utf-8")) for item in actual), 4096)
         self.assertGreater(len(prompt_bytes), len(review_diff))
@@ -606,10 +608,11 @@ class GrokReviewRoleTests(unittest.TestCase):
         kwargs = {"expected_head": "a" * 40, "expected_base_head": "b" * 40}
         with self.assertRaisesRegex(RuntimeError, "exceeds"):
             role._grok_streaming_review_command(
-                prepared, review_diff=b"x" * (role.MAX_GROK_REVIEW_INPUT_BYTES + 1), **kwargs
+                prepared, review_diff=b"x" * (role.MAX_GROK_REVIEW_INPUT_BYTES + 1), **kwargs,
+                object_format="sha1",
             )
         with self.assertRaisesRegex(RuntimeError, "UTF-8"):
-            role._grok_streaming_review_command(prepared, review_diff=b"\xff", **kwargs)
+            role._grok_streaming_review_command(prepared, review_diff=b"\xff", **kwargs, object_format="sha1")
 
     def test_bound_review_input_artifact_is_private_hash_bound_and_size_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -911,7 +914,8 @@ class GrokReviewRoleTests(unittest.TestCase):
                     prepared = ("/opt/grabowski-external/grok", *item, "-p", "review this")
                     with self.assertRaisesRegex(RuntimeError, "controlled by Grabowski"):
                         role._grok_streaming_review_command(
-                            prepared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff"
+                            prepared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff",
+                            object_format="sha1",
                         )
 
     def test_claude_review_sandbox_binds_frozen_diff_stdin_headlessly(self) -> None:
@@ -925,6 +929,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         )
         raw_diff = b"diff --git a/a.py b/a.py\n+interesting_but_untrusted\n"
         with (
+                mock.patch.object(role, "_repo_git_object_format", return_value="sha1"),
             mock.patch.object(role, "prepare_external_agent_command",
                               return_value=prepared) as prepare,
             mock.patch.object(role, "sandbox_argv",
@@ -933,6 +938,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             argv, contract, stdin = role._review_sandbox_argv(
                 repo, declared, expected_head="a" * 40,
                 expected_base_head="b" * 40, review_diff=raw_diff,
+                object_format="sha1",
             )
         self.assertEqual(["read-only-sandbox"], argv)
         self.assertEqual(role.CLAUDE_REVIEW_JSON_CONTRACT, contract)
@@ -977,6 +983,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         )
         frozen = b"diff --git a/a.py b/a.py\n+safe only\n"
         with (
+                mock.patch.object(role, "_repo_git_object_format", return_value="sha1"),
             mock.patch.object(role, "prepare_external_agent_command",
                               return_value=prepared) as prepare,
             mock.patch.object(role, "sandbox_argv",
@@ -985,6 +992,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             argv, contract, stdin = role._review_sandbox_argv(
                 repo, declared, expected_head="a" * 40,
                 expected_base_head="b" * 40, review_diff=frozen,
+                object_format="sha1",
             )
         self.assertEqual(["read-only-sandbox"], argv)
         self.assertEqual(role.CLAUDE_REVIEW_JSON_CONTRACT, contract)
@@ -1020,6 +1028,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                 actual, stdin = role._claude_json_review_command(
                     declared, expected_head="a" * 40,
                     expected_base_head="b" * 40, review_diff=b"diff --git a/a b/a\n",
+                    object_format="sha1",
                 )
                 self.assertEqual("mcp__*", actual[actual.index("--disallowedTools") + 1])
                 self.assertNotIn("*", actual)
@@ -1065,6 +1074,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                     role._claude_json_review_command(
                         command, expected_head="a" * 40,
                         expected_base_head="b" * 40, review_diff=content,
+                        object_format="sha1",
                     )
 
     @staticmethod
@@ -1607,6 +1617,7 @@ class GrokReviewRoleTests(unittest.TestCase):
         actual, prompt = role._claude_json_review_command(
             declared, expected_head="a" * 40, expected_base_head="b" * 40,
             review_diff=diff, review_input_source="frozen_writer_patch",
+            object_format="sha1",
         )
         self.assertIn(b"verified frozen writer patch", prompt)
         self.assertNotIn(b"committed Git diff", prompt)
@@ -1619,6 +1630,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             role._claude_json_review_command(
                 declared, expected_head="a" * 40, expected_base_head="b" * 40,
                 review_diff=diff, review_input_source="caller_supplied_text",
+                object_format="sha1",
             )
 
     def test_claude_main_emits_job_bound_receipt_from_success_envelope(self) -> None:
@@ -1746,6 +1758,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             command=("/usr/bin/python3", "-I", "codex-launcher", "exec", "review this")
         )
         with (
+                mock.patch.object(role, "_repo_git_object_format", return_value="sha1"),
             mock.patch.object(
                 role, "prepare_external_agent_command", return_value=prepared
             ) as prepare,
@@ -1757,6 +1770,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                 expected_head="a" * 40,
                 expected_base_head="b" * 40,
                 review_diff=b"",
+                object_format="sha1",
             )
 
         self.assertEqual(argv, ["sandbox"])
@@ -1785,6 +1799,7 @@ class GrokReviewRoleTests(unittest.TestCase):
             command=("/usr/bin/python3", "-I", "codex-launcher", "exec", "review this")
         )
         with (
+                mock.patch.object(role, "_repo_git_object_format", return_value="sha1"),
             mock.patch.object(
                 role, "prepare_external_agent_command", return_value=prepared
             ) as prepare,
@@ -1796,6 +1811,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                 expected_head="a" * 40,
                 expected_base_head="b" * 40,
                 review_diff=b"",
+                object_format="sha1",
             )
 
         prepare.assert_called_once_with(declared)
@@ -1809,6 +1825,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                     command=("/usr/bin/python3", "-I", "codex-launcher", subcommand, "review this")
                 )
                 with (
+                        mock.patch.object(role, "_repo_git_object_format", return_value="sha1"),
                     mock.patch.object(
                         role, "prepare_external_agent_command", return_value=prepared
                     ) as prepare,
@@ -1820,6 +1837,7 @@ class GrokReviewRoleTests(unittest.TestCase):
                         expected_head="a" * 40,
                         expected_base_head="b" * 40,
                         review_diff=b"",
+                        object_format="sha1",
                     )
 
                 prepare.assert_called_once_with(declared)
@@ -1971,11 +1989,13 @@ class GrokReviewRoleTests(unittest.TestCase):
             command=("/opt/grabowski-external/grok", "--model", "grok-4.6", "-p", "review this")
         )
         with (
+                mock.patch.object(role, "_repo_git_object_format", return_value="sha1"),
             mock.patch.object(role, "prepare_external_agent_command", return_value=prepared),
             mock.patch.object(role, "sandbox_argv", return_value=["sandbox"]) as sandbox_argv,
         ):
             argv, contract, prompt_bytes = role._review_sandbox_argv(
-                repo, declared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff"
+                repo, declared, expected_head="a" * 40, expected_base_head="b" * 40, review_diff=b"diff",
+                object_format="sha1",
             )
         self.assertEqual(argv, ["sandbox"])
         self.assertEqual(contract, role.GROK_REVIEW_STREAM_CONTRACT)
@@ -2193,6 +2213,241 @@ class GrokReviewRoleTests(unittest.TestCase):
             payload["error"],
             f"review document exceeds {role.MAX_REVIEW_JSON_BYTES} bytes",
         )
+
+
+    def test_oid_regexes_have_both_absolute_anchors(self) -> None:
+        # Pure .fullmatch() callers are safe, but future regex.search() users
+        # must not be able to reinterpret a SHA-256 suffix as SHA-1.
+        for pattern, width in (
+            (role.SHA40, 40),
+            (role.SHA256, 64),
+            (role.GIT_OID, 40),
+            (role.GIT_OID, 64),
+        ):
+            oid = "a" * width
+            with self.subTest(width=width, pattern=pattern.pattern):
+                self.assertIsNotNone(pattern.fullmatch(oid))
+                self.assertIsNone(pattern.search("prefix" + oid))
+                self.assertIsNone(pattern.search(oid + "\n"))
+
+    def test_object_format_probe_rejects_successful_git_with_stderr(self) -> None:
+        from types import SimpleNamespace
+        with mock.patch(
+            "subprocess.run",
+            return_value=SimpleNamespace(
+                returncode=0, stdout=b"sha1\n",
+                stderr=b"attacker-controlled Git diagnostic\n",
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stderr"):
+                role._repo_git_object_format(Path("/tmp/imaginary-checkout"))
+
+    def test_storage_format_probe_ignores_ambient_git_directory_redirects(self) -> None:
+        import subprocess
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            authentic = root / "authentic-sha256"
+            foreign = root / "foreign-sha1"
+            subprocess.run(
+                ["git", "init", "-q", "--object-format=sha256", str(authentic)],
+                check=True, capture_output=True, timeout=15,
+            )
+            subprocess.run(
+                ["git", "init", "-q", str(foreign)],
+                check=True, capture_output=True, timeout=15,
+            )
+            poisoned = {
+                "GIT_DIR": str(foreign / ".git"),
+                "GIT_WORK_TREE": str(foreign),
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.hooksPath",
+                "GIT_CONFIG_VALUE_0": str(root / "attacker-hooks"),
+                "GIT_OBJECT_DIRECTORY": str(foreign / ".git" / "objects"),
+            }
+            with mock.patch.dict(os.environ, poisoned):
+                self.assertEqual("sha256", role._repo_git_object_format(authentic))
+            self.assertFalse((root / "attacker-hooks").exists())
+
+    def test_sha256_sandbox_refuses_spoofed_sha1_storage_format(self) -> None:
+        import subprocess
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw) / "sha256-repo"
+            subprocess.run(
+                ["git", "init", "--quiet", "--object-format=sha256", str(repo)],
+                check=True, capture_output=True, timeout=15,
+            )
+            with mock.patch.object(
+                role, "prepare_external_agent_command",
+                side_effect=AssertionError("must reject before launching provider"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "object format"):
+                    role._review_sandbox_argv(
+                        repo, ["grok", "-p", "Review exact diff"],
+                        expected_head="a" * 40, expected_base_head="b" * 40,
+                        review_diff=b"+change\n", object_format="sha1",
+                    )
+
+    def test_review_postflight_rejects_changed_storage_object_format(self) -> None:
+        from types import SimpleNamespace
+        head, base, fp = "a" * 40, "b" * 40, "c" * 64
+        result = SimpleNamespace(
+            returncode=0, stdout_sha256="d" * 64,
+            stderr_sha256="e" * 64, stdout_bytes=2, stderr_bytes=0,
+            stdout_tail="{}", stderr_tail="", output_limit_exceeded=False,
+            stdout_content_exceeded=False, stdout_content=b'{"verdict":"PASS","findings":[]}',
+        )
+        with (
+            mock.patch.object(role, "_repo_git_object_format",
+                              side_effect=["sha1", "sha256"]),
+            mock.patch.object(role, "current_binding",
+                              side_effect=[(head, fp, False), (head, fp, False)]),
+            mock.patch.object(role, "committed_diff", return_value=b"+change\n"),
+            mock.patch.object(role, "_review_sandbox_argv",
+                              return_value=(["sandbox"], None, None)),
+            mock.patch.object(role, "runtime_sandbox_argv",
+                              return_value=["sandbox-runtime"]),
+            mock.patch.object(role, "run_bounded_capture", return_value=result),
+            mock.patch.object(role, "write_receipt") as capture,
+        ):
+            outcome = role.main([
+                "--role", "review", "--repository", str(ROOT),
+                "--expected-head", head, "--expected-base-head", base,
+                "--expected-diff-sha256", fp, "--expected-dirty", "false",
+                "--output", "/tmp/storage-drift-test-receipt.json",
+                "--", "grok", "-p", "Review exact diff",
+            ])
+        self.assertEqual(125, outcome)
+        receipt = capture.call_args.args[1]
+        self.assertEqual("writer_binding_violation", receipt["failure_classification"])
+        self.assertIsNotNone(receipt.get("postflight_error_type"))
+
+    def test_git_review_oids_accept_sha1_sha256_but_no_mixed_format(self) -> None:
+        for width, storage in ((40, "sha1"), (64, "sha256")):
+            with self.subTest(width=width, storage=storage):
+                self.assertTrue(role._same_git_oid_format(
+                    "a" * width, "b" * width, object_format=storage
+                ))
+                wrong_width = 64 if width == 40 else 40
+                self.assertFalse(role._same_git_oid_format(
+                    "a" * wrong_width, "b" * wrong_width, object_format=storage
+                ))
+        for first, second in ((40, 64), (64, 40), (64, 63), (40, 41)):
+            with self.subTest(first=first, second=second):
+                self.assertFalse(role._same_git_oid_format(
+                    "a" * first, "b" * second, object_format="sha1"
+                ))
+        for malformed in ("", "A" * 40, "a" * 39, "a" * 65, "a" * 40 + "\n", "a" * 40 + "\r"):
+            self.assertFalse(role._same_git_oid_format(malformed, object_format="sha1"))
+        self.assertFalse(role._same_git_oid_format(
+            "a" * 64 + "\n", "b" * 64 + "\n", object_format="sha256"
+        ))
+        self.assertFalse(role._same_git_oid_format(
+            "a" * 40, "b" * 40, object_format="sha512"
+        ))
+
+    def test_sha256_review_prompts_keep_complete_exact_bound_commit_ids(self) -> None:
+        head, base = "a" * 64, "b" * 64
+        claude = ("claude", "--model", "claude-opus-5-5",
+                  "--effort", "high", "--permission-mode", "plan", "Review exact diff")
+        command, prompt = role._claude_json_review_command(
+            claude, expected_head=head, expected_base_head=base, review_diff=b"+change\n",
+            object_format="sha256",
+        )
+        self.assertEqual("claude", command[0])
+        self.assertIn(head.encode(), prompt)
+        self.assertIn(base.encode(), prompt)
+        grok_command, grok_prompt = role._grok_streaming_review_command(
+            ("grok", "-p", "Review exact diff"), expected_head=head,
+            expected_base_head=base, review_diff=b"+change\n",
+            object_format="sha256",
+        )
+        self.assertEqual("grok", grok_command[0])
+        self.assertIn(head.encode(), grok_prompt)
+        self.assertIn(base.encode(), grok_prompt)
+        for wrong in ("b" * 40, "b" * 63, "B" * 64):
+            with self.subTest(wrong_len=len(wrong), upper=wrong[:1].isupper()):
+                with self.assertRaisesRegex(RuntimeError, "exact bound head"):
+                    role._claude_json_review_command(
+                        claude, expected_head=head, expected_base_head=wrong,
+                        review_diff=b"+change\n",
+                        object_format="sha256",
+                    )
+                with self.assertRaisesRegex(RuntimeError, "exact bound head"):
+                    role._grok_streaming_review_command(
+                        ("grok", "-p", "Review exact diff"),
+                        expected_head=head, expected_base_head=wrong,
+                        review_diff=b"+change\n",
+                        object_format="sha256",
+                    )
+
+    def test_sha256_native_committed_diff_rejects_mixed_widths(self) -> None:
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "native-sha256"
+            subprocess.run(
+                ["git", "init", "--quiet", "--object-format=sha256", str(repo)],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            def git(*args: str) -> str:
+                return subprocess.run(
+                    ["git", "-c", "core.hooksPath=/dev/null",
+                     "-c", "user.name=Review Test", "-c", "user.email=review@example.org",
+                     "-C", str(repo), *args],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                ).stdout.decode().strip()
+            file = repo / "src" / "change.txt"
+            file.parent.mkdir()
+            file.write_text("before\n", encoding="utf-8")
+            git("add", "src/change.txt")
+            git("commit", "-m", "before")
+            base = git("rev-parse", "HEAD")
+            file.write_text("after\n", encoding="utf-8")
+            git("add", "src/change.txt")
+            git("commit", "-m", "after")
+            head = git("rev-parse", "HEAD")
+            self.assertEqual((64, 64), (len(base), len(head)))
+            self.assertIn(b"+after", role.committed_diff(repo, base, head))
+            # Both 40-hex prefixes have plausible syntax but are not native SHA-256 OIDs.
+            with self.assertRaisesRegex(RuntimeError, "exact base and head"):
+                role.committed_diff(repo, base[:40], head[:40])
+            for bad in ("b" * 40, "b" * 63, "B" * 64):
+                with self.subTest(bad_len=len(bad), upper=bad[:1].isupper()):
+                    with self.assertRaisesRegex(RuntimeError, "exact base and head"):
+                        role.committed_diff(repo, base, bad)
+
+    def test_sha256_review_main_passes_valid_bound_input_without_provider(self) -> None:
+        from types import SimpleNamespace
+        head, base, fp = "a" * 64, "b" * 64, "c" * 64
+        doc = b'{"verdict":"PASS","findings":[]}'
+        result = SimpleNamespace(
+            returncode=0, stdout_sha256=hashlib.sha256(doc).hexdigest(),
+            stderr_sha256=hashlib.sha256(b"").hexdigest(), stdout_bytes=len(doc),
+            stderr_bytes=0, stdout_tail=doc.decode(), stderr_tail="",
+            output_limit_exceeded=False, stdout_content_exceeded=False,
+            stdout_content=doc,
+        )
+        with (
+            mock.patch.object(role, "_repo_git_object_format", return_value="sha256"),
+            mock.patch.object(role, "current_binding", side_effect=[
+                (head, fp, False), (head, fp, False),
+            ]),
+            mock.patch.object(role, "committed_diff", return_value=b"+change\n"),
+            mock.patch.object(role, "_review_sandbox_argv",
+                              return_value=(["sandbox"], None, None)),
+            mock.patch.object(role, "runtime_sandbox_argv", return_value=["runtime"]),
+            mock.patch.object(role, "run_bounded_capture", return_value=result),
+            mock.patch.object(role, "write_receipt") as receipt,
+        ):
+            code = role.main([
+                "--role", "review", "--repository", str(ROOT),
+                "--expected-head", head, "--expected-base-head", base,
+                "--expected-diff-sha256", fp, "--expected-dirty", "false",
+                "--output", "/tmp/sha256-review-role-test.json",
+                "--", "grok", "-p", "Review exact changes",
+            ])
+        self.assertEqual(0, code)
+        self.assertEqual("PASS", receipt.call_args.args[1]["verdict"])
+        self.assertEqual(head, receipt.call_args.args[1]["head_after"])
 
 
 if __name__ == "__main__":

@@ -51,7 +51,7 @@ DECISION_REVIEW_ORDER_MAX_JOB_DIRECTORIES = 10_000
 DECISION_REVIEW_ORDER_MAX_METADATA_BYTES = 256 * 1024
 DECISION_REVIEW_ORDER_MAX_NS = (1 << 63) - 1
 _DECISION_REVIEW_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
-_DECISION_REVIEW_SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
+_DECISION_REVIEW_GIT_OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _DECISION_REVIEW_ORDER_FIELDS = {
     "schema_version",
     "kind",
@@ -93,6 +93,8 @@ def _decision_review_order_key(scope: dict[str, Any]) -> str | None:
     repo = binding.get("repo")
     pr = binding.get("pr")
     head_sha = binding.get("head_sha")
+    base_sha = binding.get("base_sha")
+    diff_sha256 = binding.get("diff_sha256")
     if (
         not isinstance(repo, str)
         or _DECISION_REVIEW_REPO_RE.fullmatch(repo.strip()) is None
@@ -100,13 +102,24 @@ def _decision_review_order_key(scope: dict[str, Any]) -> str | None:
         or not isinstance(pr, int)
         or pr <= 0
         or not isinstance(head_sha, str)
-        or _DECISION_REVIEW_SHA40_RE.fullmatch(head_sha.strip().lower()) is None
+        or _DECISION_REVIEW_GIT_OID_RE.fullmatch(head_sha) is None
+        or not isinstance(base_sha, str)
+        or _DECISION_REVIEW_GIT_OID_RE.fullmatch(base_sha) is None
+        or len(head_sha) != len(base_sha)
+        or not isinstance(diff_sha256, str)
+        or SHA256_RE.fullmatch(diff_sha256) is None
     ):
         raise ValueError("decision review binding is invalid for causal ordering")
+    # Bind the clock to the exact reviewed base/diff as well as HEAD.
+    # Different bases or diffs cannot influence each other's decision order.
+    # Leave out slot: independent providers of the *same* bound revision
+    # must still share the monotone causal clock.
     material = {
         "repo": repo.strip().lower(),
         "pr": pr,
-        "head_sha": head_sha.strip().lower(),
+        "head_sha": head_sha,
+        "base_sha": base_sha,
+        "diff_sha256": diff_sha256,
     }
     return hashlib.sha256(canonical_json_bytes(material)).hexdigest()
 
