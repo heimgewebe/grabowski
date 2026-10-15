@@ -2546,6 +2546,47 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(len(observed), 1)
             self.assertFalse((state / "codex-workspaces" / workspace_name).exists())
 
+    def test_baseline_preflight_reserves_only_unscanned_treatment_clone(self) -> None:
+        # The baseline staged checkout is already part of the state-root scan.
+        # Pretend it has 25k entries without allocating a huge Git repository.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            candidate = request(commit=commit)
+            candidate["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            observed: list[int] = []
+
+            def assert_future_headroom(pending: int) -> None:
+                observed.append(pending)
+                self.assertEqual(pending, 25_000 + 2 + 16)
+                raise runner.RunnerError("stop before one-use workspace")
+
+            with patch.object(
+                runner, "_assert_private_output_tree_scan", return_value=25_000
+            ) as count_staged:
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "stop before one-use workspace"
+                ):
+                    runner.create_checkout(
+                        candidate,
+                        source,
+                        state,
+                        preallocate_check=assert_future_headroom,
+                    )
+            count_staged.assert_called_once()
+            self.assertEqual(observed, [25_018])
+            workspace = (
+                state
+                / "codex-workspaces"
+                / hashlib.sha256(candidate["workspace_id"].encode("utf-8")).hexdigest()
+            )
+            self.assertFalse(workspace.exists())
+
     def test_private_output_scan_reserves_preintent_artifact_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

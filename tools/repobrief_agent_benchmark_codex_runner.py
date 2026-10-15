@@ -3507,11 +3507,13 @@ def create_checkout(
                     # Fail before a non-retryable baseline one-shot if the
                     # future treatment clone might exceed the output cap.
                     # Count generated .git as well as tracked entries and
-                    # reserve a second clone, metadata drift and ledger files.
+                    # The state-root preflight already scans this baseline
+                    # staging checkout. Reserve only the future treatment clone
+                    # plus its metadata and ledger entries, not two more copies.
                     staged_entries = _assert_private_output_tree_scan(
                         (staged_checkout,)
                     )
-                    future_pair_entries = 2 * (staged_entries + 2) + 16
+                    future_pair_entries = staged_entries + 2 + 16
                     if future_pair_entries > 65536:
                         raise RunnerError("paired clone budget exceeds output limit")
                 preallocate_check(future_pair_entries)
