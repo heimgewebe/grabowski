@@ -3056,6 +3056,77 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 ):
                     runner._unix_socket_restricted_codex_argv(value)
 
+    def test_linux_sandbox_smoke_is_filtered_without_provider_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir(mode=0o700)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            result = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+
+            def isolated_env(*, codex, codex_home):
+                self.assertEqual(codex, "/opt/codex")
+                self.assertTrue(codex_home.is_relative_to(state))
+                self.assertEqual((codex_home / "auth.json").read_bytes(), b"{}")
+                return {"HOME": str(codex_home), "CODEX_HOME": str(codex_home)}
+
+            with (
+                patch.object(runner, "provider_env", side_effect=isolated_env),
+                patch.object(
+                    runner,
+                    "_unix_socket_restricted_codex_argv",
+                    side_effect=lambda argv: ["kernel-guard", *argv],
+                ) as guard,
+                patch.object(runner.subprocess, "run", return_value=result) as launch,
+            ):
+                runner.validate_codex_linux_sandbox_before_intent(
+                    "/opt/codex", source, state
+                )
+            guard.assert_called_once()
+            launched = guard.call_args.args[0]
+            self.assertEqual(launched[:2], ["/opt/codex", "sandbox"])
+            self.assertEqual(launched[-2:], ["--", "/bin/true"])
+            self.assertIn("network_proxy", launched)
+            self.assertIn(runner.PERMISSION_PROFILE, launched)
+            launch.assert_called_once()
+            self.assertEqual(
+                launch.call_args.args[0][:2], ["kernel-guard", "/opt/codex"]
+            )
+            self.assertEqual(launch.call_args.kwargs["cwd"], source)
+            self.assertEqual(launch.call_args.kwargs["timeout"], 25)
+            self.assertEqual(list((state / "codex-runtime").iterdir()), [])
+
+    def test_linux_sandbox_smoke_fails_before_provider_on_bwrap_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir(mode=0o700)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            broken = subprocess.CompletedProcess(
+                [], 1, stdout=b"", stderr=b"bwrap: helper unavailable"
+            )
+            with (
+                patch.object(
+                    runner,
+                    "provider_env",
+                    return_value={"HOME": str(root), "PATH": "/usr/bin:/bin"},
+                ),
+                patch.object(
+                    runner, "_unix_socket_restricted_codex_argv", side_effect=list
+                ),
+                patch.object(runner.subprocess, "run", return_value=broken) as run,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "sandbox startup failed before provider intent"
+                ):
+                    runner.validate_codex_linux_sandbox_before_intent(
+                        "/opt/codex", source, state
+                    )
+            run.assert_called_once()
+            self.assertEqual(list((state / "codex-runtime").iterdir()), [])
+
     def test_codex_login_status_always_runs_under_kernel_socket_filter(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary) / "home"
@@ -3066,15 +3137,29 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             status = subprocess.CompletedProcess(
                 [], 0, stdout=b"Logged in using ChatGPT\n", stderr=b""
             )
+            order: list[str] = []
+
+            def harden() -> None:
+                order.append("parent_hardened")
+
+            def run_status(*_args, **_kwargs):
+                order.append("codex_started")
+                return status
+
             with (
                 patch.object(
                     runner,
                     "provider_env",
                     return_value={"HOME": str(home), "PATH": "/usr/bin:/bin"},
                 ),
-                patch.object(runner.subprocess, "run", return_value=status) as call,
+                patch.object(
+                    runner, "_assert_trusted_runner_nondumpable", side_effect=harden
+                ) as guard,
+                patch.object(runner.subprocess, "run", side_effect=run_status) as call,
             ):
                 runner.validate_chatgpt_subscription("/opt/codex")
+            guard.assert_called_once_with()
+            self.assertEqual(order, ["parent_hardened", "codex_started"])
             launched = call.call_args.args[0]
             self.assertEqual(launched[:2], [runner._validated_mcp_proxy_python(), "-I"])
             self.assertEqual(launched[-3:], ["/opt/codex", "login", "status"])
@@ -4125,6 +4210,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 for name in (
                     "_assert_authorized_codex_executable",
                     "_assert_authorized_chatgpt_auth",
+                    "validate_codex_linux_sandbox_before_intent",
                     "_assert_authorized_runtime_binding",
                     "validate_live_immutable_mounts",
                     "close_provider_evidence_plan",
@@ -10504,6 +10590,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                     for name in (
                         "_assert_authorized_codex_executable",
                         "_assert_authorized_chatgpt_auth",
+                        "validate_codex_linux_sandbox_before_intent",
                         "_assert_authorized_runtime_binding",
                         "validate_live_immutable_mounts",
                         "close_provider_evidence_plan",
@@ -10639,6 +10726,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 for name in (
                     "_assert_authorized_codex_executable",
                     "_assert_authorized_chatgpt_auth",
+                    "validate_codex_linux_sandbox_before_intent",
                     "_assert_authorized_runtime_binding",
                     "validate_live_immutable_mounts",
                     "close_provider_evidence_plan",

@@ -156,6 +156,16 @@ def deny_unix():
                 context, error_action, syscall, 0,
             ) != 0:
                 raise RuntimeError("unable to deny io_uring socket bypass")
+        # Prevent the filtered Codex process from taking control of the
+        # same-UID trusted (unfiltered) parent through kernel process access.
+        for name in (
+            b"ptrace", b"process_vm_readv", b"process_vm_writev", b"pidfd_getfd",
+        ):
+            syscall = seccomp.seccomp_syscall_resolve_name(name)
+            if syscall < 0 or seccomp.seccomp_rule_add(
+                context, error_action, syscall, 0,
+            ) != 0:
+                raise RuntimeError("unable to deny kernel process introspection")
         libc = ctypes.CDLL(None, use_errno=True)
         libc.prctl.argtypes = [
             ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
@@ -888,6 +898,40 @@ def _validated_mcp_proxy_python(
                 "Codex MCP proxy Python executable is not preflight-authorized"
             )
     return validated
+
+
+def _assert_trusted_runner_nondumpable() -> None:
+    """Deny same-UID Codex process inspection before the first Codex child.
+
+    If the privileged-unfiltered runner were ptraceable, a filtered child
+    could hijack it and delegate Unix RPC or rewrite trusted evidence.
+    PR_SET_DUMPABLE=0 is enforced at the actual Linux process boundary.
+    Restrict Yama policy as an additional fail-closed prerequisite.
+    """
+    if sys.platform != "linux":
+        raise RunnerError("Codex parent process isolation requires Linux")
+    try:
+        yama = Path("/proc/sys/kernel/yama/ptrace_scope").read_bytes()
+    except OSError as exc:
+        raise RunnerError("Codex kernel ptrace policy unavailable") from exc
+    if len(yama) > 16 or yama.strip() not in {b"1", b"2", b"3"}:
+        raise RunnerError("Codex kernel ptrace policy is unsafe")
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.argtypes = [
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        ]
+        libc.prctl.restype = ctypes.c_int
+        if libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+            raise RunnerError("Codex trusted parent cannot disable ptrace")
+        if libc.prctl(3, 0, 0, 0, 0) != 0:  # PR_GET_DUMPABLE
+            raise RunnerError("Codex trusted parent remains ptraceable")
+    except (AttributeError, OSError, ctypes.ArgumentError) as exc:
+        raise RunnerError("Codex trusted parent ptrace isolation unavailable") from exc
 
 
 def _unix_socket_restricted_codex_argv(command: Sequence[str]) -> list[str]:
@@ -2366,6 +2410,9 @@ def validate_chatgpt_subscription(codex: str) -> bytes:
         snapshot_home = stage_codex_home(snapshot_root, auth_data)
         try:
             environment = provider_env(codex=codex, codex_home=snapshot_home)
+            # Protect the unfiltered parent BEFORE the first real Codex
+            # child, and therefore before any irreversible provider intent.
+            _assert_trusted_runner_nondumpable()
             try:
                 completed = subprocess.run(
                     _unix_socket_restricted_codex_argv([codex, "login", "status"]),
@@ -2472,6 +2519,78 @@ def cleanup_codex_home(path: Path) -> str | None:
     except OSError as exc:
         return type(exc).__name__
     return None
+
+
+def validate_codex_linux_sandbox_before_intent(
+    codex: str, source: Path, state_root: Path
+) -> None:
+    """Exercise the real Codex Linux sandbox without provider or one-shot use.
+
+    Run before workspace/evidence allocation and before recording dispatch
+    intent. The transient Codex home stays on the trusted private state mount:
+    Codex refuses to create its argv0 Linux helper when CODEX_HOME is in /tmp.
+    No authenticated bytes are staged or sent to this smoke process.
+    """
+    private_home = stage_codex_home(state_root, b"{}")
+    try:
+        private_tmp, tmp_fd = _open_private_directory(private_home / "tmp")
+        os.close(tmp_fd)
+        filesystem = (
+            '{":minimal"="read",":workspace_roots"={"."="read"},'
+            + _toml_string(str(private_tmp))
+            + '="read",'
+            + _toml_string(str(Path(codex).parent))
+            + '="read"}'
+        )
+        command = [
+            codex,
+            "sandbox",
+            "-c",
+            "allow_login_shell=false",
+            "-c",
+            "features.network_proxy=true",
+            "-c",
+            f"permissions.{PERMISSION_PROFILE}.filesystem={filesystem}",
+            "-c",
+            f"permissions.{PERMISSION_PROFILE}.network="
+            '{enabled=true,mode="limited",allow_local_binding=false,domains={}}',
+            "--permission-profile",
+            PERMISSION_PROFILE,
+            "--enable",
+            "network_proxy",
+            "--cd",
+            str(source),
+            "--",
+            "/bin/true",
+        ]
+        try:
+            completed = subprocess.run(
+                _unix_socket_restricted_codex_argv(command),
+                cwd=source,
+                env=provider_env(codex=codex, codex_home=private_home),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=25,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RunnerError(
+                "Codex Linux sandbox startup failed before provider intent"
+            ) from exc
+        if (
+            completed.returncode != 0
+            or not isinstance(completed.stdout, bytes)
+            or not isinstance(completed.stderr, bytes)
+            or len(completed.stdout) > 8192
+            or len(completed.stderr) > 8192
+        ):
+            raise RunnerError(
+                "Codex Linux sandbox startup failed before provider intent"
+            )
+    finally:
+        if cleanup_codex_home(private_home) is not None:
+            raise RunnerError("Codex sandbox qualification cleanup failed")
 
 
 def _validated_live_mode(
@@ -8593,6 +8712,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         _assert_authorized_chatgpt_auth(
             auth_data, dispatch_authorization["provider_authentication"]
         )
+        validate_codex_linux_sandbox_before_intent(codex, source, args.state_root)
     evidence_plan = prepare_provider_evidence(
         request, args.transcript_root, args.provider_evidence_root
     )
