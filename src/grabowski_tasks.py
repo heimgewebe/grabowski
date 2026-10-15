@@ -4472,7 +4472,8 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
                             if offset < len(segment) and segment[offset] == "()":
                                 offset += 1
                             continue
-                        if prefix.startswith("$"):
+                        # Expansions inside a command word can form Codex after lexical inspection.
+                        if "$" in prefix or chr(96) in prefix:
                             raise RuntimeError(
                                 "Codex filesystem sandbox cannot verify dynamic shell command"
                             )
