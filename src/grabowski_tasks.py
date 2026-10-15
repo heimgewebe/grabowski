@@ -4210,11 +4210,21 @@ def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
             if item in {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}:
                 index += 1
                 continue
-            if item == "--" or (
-                "=" in item and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", item.split("=", 1)[0])
-            ):
-                if item != "--":
-                    reject_unverified_preload_assignment(item)
+            if item == "--":
+                index += 1
+                continue
+            if "=" in item:
+                # GNU env accepts non-identifier assignment keys, including
+                # exported Bash functions named BASH_FUNC_name%%. Bash imports
+                # and executes these before -c, hiding the actual Codex child.
+                # Never reinterpret a non-identifier assignment as a benign
+                # executable. A privileged agent route must attest it first.
+                assignment_key = item.split("=", 1)[0]
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", assignment_key) is None:
+                    raise RuntimeError(
+                        "Codex filesystem sandbox cannot verify env function assignments"
+                    )
+                reject_unverified_preload_assignment(item)
                 index += 1
                 continue
             if item.startswith("-"):
@@ -7082,16 +7092,12 @@ def _task_output_capture_script_path() -> Path:
 
 
 def _task_output_capture_script() -> Path:
-    """Materialize the output capture wrapper on this host and return its path.
+    """Stage the legacy/remote capture wrapper, never local ExecStart code.
 
-    The wrapper must not be handed to the interpreter with ``-c``. systemd
-    serializes every transient unit back to disk, and a single ExecStart
-    argument of ``TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES`` bytes or more cannot
-    be re-read from that file. The unit then loads as ``bad-setting`` after the
-    next daemon-reload, so its status can no longer be read back and its
-    remains can no longer be cleaned up. The file name carries the payload
-    digest, so a changed wrapper writes a new file instead of mutating a path
-    that a running task may still be executing.
+    Local task ExecStart uses _task_output_capture_pinned_argv, with trusted
+    source hash-bound across bounded argument chunks. This owner-writable
+    file remains a remote-transport compatibility artifact and must not be
+    executed before the local task's kernel sandbox.
     """
     payload = TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")
     path = _task_output_capture_script_path()
@@ -7436,10 +7442,68 @@ def _task_sandboxed_command_argv(
     )
 
 
+def _task_output_capture_pinned_argv(
+    directory: str, command: list[str],
+) -> list[str]:
+    """Bind the trusted local capture code in immutable ExecStart arguments.
+
+    systemd cannot persist a >=4096-byte *single* argument, so split only
+    the operator-owned source into bounded base64 chunks. The short fixed
+    Python bootstrap embeds its expected SHA-256 and fails closed on any
+    altered chunk. Unlike a staged owner-writable script, no file is reopened
+    before the outer capture program executes outside the task sandbox.
+    """
+    encoded_source = TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")
+    if not 1 <= len(encoded_source) <= 32 * 1024:
+        raise RuntimeError("Task capture inline source exceeds fixed size limit")
+    digest = hashlib.sha256(encoded_source).hexdigest()
+    encoded = base64.b64encode(encoded_source).decode("ascii")
+    chunk_size = 3072
+    chunks = [
+        encoded[offset:offset + chunk_size]
+        for offset in range(0, len(encoded), chunk_size)
+    ]
+    if not 1 <= len(chunks) <= 16:
+        raise RuntimeError("Task capture source has unsupported chunk count")
+    bootstrap = (
+        "import base64,hashlib,sys\n"
+        "n=int(sys.argv[1])\n"
+        "if not 1<=n<=16 or len(sys.argv)<n+6:raise SystemExit(125)\n"
+        "try: raw=base64.b64decode(''.join(sys.argv[2:2+n]),validate=True)\n"
+        "except (ValueError,TypeError):raise SystemExit(125)\n"
+        "if len(raw)>32768 or hashlib.sha256(raw).hexdigest()!=" + repr(digest) + ":raise SystemExit(125)\n"
+        "sys.argv=['-c',*sys.argv[2+n:]]\n"
+        "exec(compile(raw.decode('utf-8'),'<grabowski-capture>','exec'),{'__name__':'__main__'})\n"
+    )
+    argv = [
+        TASK_OUTPUT_CAPTURE_PYTHON,
+        "-I", "-S", "-c", bootstrap, str(len(chunks)), *chunks,
+        directory, str(TASK_OUTPUT_MAX_BYTES), str(TASK_OUTPUT_TAIL_BYTES),
+        *command,
+    ]
+    if any(
+        not isinstance(arg, str)
+        or len(arg.encode("utf-8")) >= TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES
+        or chr(0) in arg
+        for arg in argv
+    ):
+        raise RuntimeError("Task capture argv exceeds systemd persistence bounds")
+    return argv
+
+
 def _task_output_capture_argv(record: dict[str, Any]) -> list[str]:
     command = json.loads(record["argv_json"])
     command = _task_sandboxed_command_argv(record, command)
     paths = _task_output_paths(record)
+    # Remote hosts keep their distinct typed staging protocol. Only local
+    # sandboxed tasks previously executed the replaceable capture script in
+    # front of the kernel-confined inner command.
+    transport = (
+        fleet.fleet_host(str(record["host"]))["transport"]
+        if record.get("host") else "local"
+    )
+    if transport == "local":
+        return _task_output_capture_pinned_argv(str(paths["directory"]), command)
     return [
         TASK_OUTPUT_CAPTURE_PYTHON,
         str(_task_output_capture_script_path()),

@@ -388,32 +388,59 @@ class TaskTests(unittest.TestCase):
                 script.exists(), "a remote launch must not stage on the controller"
             )
             self.assertEqual(capture_stage.call_count, 1)
-        self.assertEqual(
-            capture[:5],
-            [
-                tasks.TASK_OUTPUT_CAPTURE_PYTHON,
-                str(script),
-                str(paths["directory"]),
-                str(tasks.TASK_OUTPUT_MAX_BYTES),
-                str(tasks.TASK_OUTPUT_TAIL_BYTES),
-            ],
-        )
-        # The trusted seccomp filter is deliberately persisted via Python
-        # -c so no same-UID script pathname can drift before systemd exec.
-        # Keep the output-capture wrapper itself file-backed and require that
-        # the only inlined source is the exact server-owned security program.
-        self.assertNotIn("-c", capture[:5])
         if selected["transport"] == "local":
+            # Local tasks must never execute the owner-writable staged script.
+            # Check the actual persisted arguments and the integrity-bound
+            # trusted capture source, not merely an internal helper result.
             self.assertEqual(
-                capture[5:10],
+                capture[:4],
+                [tasks.TASK_OUTPUT_CAPTURE_PYTHON, "-I", "-S", "-c"],
+            )
+            self.assertNotIn(str(script), capture)
+            self.assertIn(
+                hashlib.sha256(tasks.TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")).hexdigest(),
+                capture[4],
+            )
+            count = int(capture[5])
+            self.assertGreaterEqual(count, 1)
+            self.assertLessEqual(count, 16)
+            self.assertEqual(
+                base64.b64decode("".join(capture[6:6 + count]), validate=True),
+                tasks.TASK_OUTPUT_CAPTURE_CODE.encode("utf-8"),
+            )
+            self.assertEqual(
+                capture[6 + count:9 + count],
+                [
+                    str(paths["directory"]),
+                    str(tasks.TASK_OUTPUT_MAX_BYTES),
+                    str(tasks.TASK_OUTPUT_TAIL_BYTES),
+                ],
+            )
+            sandbox_offset = 9 + count
+            self.assertEqual(
+                capture[sandbox_offset:sandbox_offset + 5],
                 [
                     tasks.agent_sandbox.SANDBOX_LAUNCH_PYTHON,
                     "-I", "-S", "-c",
                     tasks.agent_sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
                 ],
             )
-            self.assertEqual(capture[10], str(tasks.agent_sandbox.require_bwrap()))
+            self.assertEqual(
+                capture[sandbox_offset + 5],
+                str(tasks.agent_sandbox.require_bwrap()),
+            )
         else:
+            # Remote transport keeps its separately staged wrapper contract.
+            self.assertEqual(
+                capture[:5],
+                [
+                    tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+                    str(script),
+                    str(paths["directory"]),
+                    str(tasks.TASK_OUTPUT_MAX_BYTES),
+                    str(tasks.TASK_OUTPUT_TAIL_BYTES),
+                ],
+            )
             self.assertNotIn("-c", capture)
         for argument in launch:
             self.assertLess(

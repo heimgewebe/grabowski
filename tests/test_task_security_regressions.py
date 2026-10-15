@@ -7,6 +7,8 @@ reused from test_tasks rather than duplicating the persistent-task fixtures.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import time
 import unittest
 from unittest.mock import patch
@@ -377,6 +379,71 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             self.assertEqual(output.get("errno"), 1)
 
 
+    def test_local_capture_execstart_never_reopens_owner_mutable_script(self) -> None:
+        """Kernel-filtered task must not start behind owner-replaceable capture file."""
+        identifier = "a" * 24
+        record = {
+            "task_id": identifier,
+            "host": "local",
+            "unit": tasks._task_unit(identifier, 1),
+            "authoritative_unit": tasks._task_unit(identifier, 1),
+            "argv_json": tasks._canonical_json(["/usr/bin/true"]),
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+            patch.object(
+                tasks, "_task_output_paths",
+                return_value={"directory": self.root / "captured"},
+            ),
+        ):
+            capture = tasks._task_output_capture_argv(record)
+        self.assertEqual(
+            capture[:4],
+            [tasks.TASK_OUTPUT_CAPTURE_PYTHON, "-I", "-S", "-c"],
+        )
+        self.assertNotIn(str(tasks._task_output_capture_script_path()), capture)
+        self.assertNotIn(tasks.TASK_OUTPUT_CAPTURE_CODE, capture)
+        self.assertIn(tasks.agent_sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE, capture)
+        self.assertLess(
+            max(len(value.encode("utf-8")) for value in capture),
+            tasks.TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES,
+        )
+        # The source/argv test above alone cannot detect a syntactically
+        # invalid bootstrap: execute the real pinned argv, without systemd
+        # or a mutable disk launcher, and verify bounded captured output.
+        output_directory = self.root / "capture-pinned-real-exec"
+        direct_argv = tasks._task_output_capture_pinned_argv(
+            str(output_directory),
+            [sys.executable, "-c", "print('capture-pinned-ok')"],
+        )
+        # Swap the owner-writable legacy file before invoking the captured argv.
+        # Its payload may not execute even though the file remains stageable.
+        staged = tasks._task_output_capture_script()
+        staged.write_text("raise SystemExit(93)\n", encoding="utf-8")
+        actual = subprocess.run(
+            direct_argv, capture_output=True, text=True, check=False, timeout=20,
+        )
+        self.assertEqual(actual.returncode, 0, actual.stderr[-1000:])
+        self.assertIn(
+            "capture-pinned-ok",
+            (output_directory / "stdout.log").read_text(encoding="utf-8"),
+        )
+        tampered = list(direct_argv)
+        tampered[6] = ("A" if tampered[6][0] != "A" else "B") + tampered[6][1:]
+        tampered_directory = self.root / "tampered-capture-never-created"
+        tampered[6 + int(tampered[5])] = str(tampered_directory)
+        refused = subprocess.run(
+            tampered, capture_output=True, text=True, check=False, timeout=20,
+        )
+        self.assertEqual(refused.returncode, 125, refused.stderr[-1000:])
+        self.assertFalse(tampered_directory.exists())
+
     def test_untrusted_task_unit_must_restrict_host_abstract_unix_sockets(self) -> None:
         """The real systemd child argv must carry the already E2E-tested gate.
 
@@ -419,9 +486,16 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
             str(sandbox.require_bwrap()),
         ]
-        self.assertEqual(captured[5:11], expected_prefix)
-        self.assertLess(len(captured[9].encode("utf-8")), 4096)
-        self.assertEqual(captured[9], sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE)
+        chunk_count = int(captured[5])
+        self.assertGreaterEqual(chunk_count, 1)
+        self.assertLessEqual(chunk_count, 16)
+        sandbox_offset = 9 + chunk_count
+        self.assertEqual(captured[sandbox_offset:sandbox_offset + 6], expected_prefix)
+        self.assertLess(len(captured[sandbox_offset + 4].encode("utf-8")), 4096)
+        self.assertEqual(
+            captured[sandbox_offset + 4],
+            sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
+        )
         with patch.object(tasks, "_task_output_capture_argv", return_value=captured):
             command = tasks._launch_argv(record, include_managed_runtime=False)
         self.assertEqual(
@@ -1992,6 +2066,27 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         tasks._require_direct_codex_filesystem_sandbox(
             ["/bin/bash", "-c", "printf 'alias x=codex'"]
         )
+
+    def test_env_exported_bash_functions_cannot_hide_codex(self) -> None:
+        """GNU env accepts Bash function exports containing '%' in names."""
+        blocked = (
+            ["env", "BASH_FUNC_x%%=() { codex exec prompt; }", "bash", "-c", "x"],
+            ["/usr/bin/env", "-i", "BASH_FUNC_x%%=() { codex exec prompt; }",
+             "/bin/bash", "-c", "x"],
+            ["env", "BASH_FUNC_x%%=() { /usr/bin/true; }", "bash", "-c", "x"],
+            ["env", "BASH_FUNC_x%%=() { codex exec prompt; }", "cargo", "test"],
+            ["env", "bad.key=foo", "bash", "-c", "printf ok"],
+        )
+        for argv in blocked:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+        for safe in (
+            ["/usr/bin/env", "HOME=/tmp/project-codex", "cargo", "test"],
+            ["env", "FOO=bar", "/bin/bash", "-c", "printf ok"],
+        ):
+            with self.subTest(safe=safe):
+                tasks._require_direct_codex_filesystem_sandbox(safe)
 
     def test_shell_builtin_prefixes_do_not_hide_codex(self) -> None:
         commands = (
