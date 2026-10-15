@@ -981,28 +981,48 @@ def _unix_socket_restricted_codex_argv(
 
 
 _POST_PROVIDER_GIT_ISOLATED_PROGRAM = r"""
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import struct
 import sys
 
-if len(sys.argv) != 4:
+if len(sys.argv) != 5:
     raise RuntimeError("invalid frozen checkout readback arguments")
-base_path, checkout_path, source_path = map(Path, sys.argv[1:])
+base_path, checkout_path, source_path = map(Path, sys.argv[1:4])
+expected_base_sha256 = sys.argv[4]
 if not all(path.is_absolute() for path in (base_path, checkout_path, source_path)):
     raise RuntimeError("post-provider attestation must use absolute paths")
-raw = sys.stdin.buffer.read(1024 * 1024 + 1)
-if len(raw) > 1024 * 1024:
-    raise RuntimeError("post-provider request is unbounded")
-request = json.loads(raw)
+# The trusted parent passes an immutable source-byte snapshot in its pipe.
+# The child MUST NOT reload Python code from a mutable filesystem pathname.
+read_limit = 1024 * 1024 + 16 * 1024 * 1024 + 4
+raw = sys.stdin.buffer.read(read_limit + 1)
+if len(raw) < 5 or len(raw) > read_limit:
+    raise RuntimeError("post-provider frozen input is unbounded")
+request_length = struct.unpack("!I", raw[:4])[0]
+if request_length < 1 or request_length > 1024 * 1024 or len(raw) < 4 + request_length:
+    raise RuntimeError("post-provider request framing is invalid")
+request = json.loads(raw[4:4 + request_length])
 if not isinstance(request, dict):
     raise RuntimeError("post-provider request is invalid")
-spec = importlib.util.spec_from_file_location("post_provider_frozen_base", base_path)
-if spec is None or spec.loader is None:
+base_source = raw[4 + request_length:]
+if (
+    not base_source
+    or len(base_source) > 16 * 1024 * 1024
+    or len(expected_base_sha256) != 64
+    or hashlib.sha256(base_source).hexdigest() != expected_base_sha256
+):
+    raise RuntimeError("post-provider base source identity is not authorized")
+spec = importlib.util.spec_from_loader(
+    "post_provider_frozen_base", loader=None, origin=str(base_path)
+)
+if spec is None:
     raise RuntimeError("trusted base module cannot be loaded")
 base = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(base)
+base.__file__ = str(base_path)
+exec(compile(base_source, str(base_path), "exec"), base.__dict__)
 # Prevent fsmonitor, hooks and Git optional index writes even if the
 # checkout's local configuration was modified by untrusted Codex.
 original_git_environment = base._git_environment
@@ -1062,6 +1082,16 @@ def _secure_post_provider_checkout_readback(
         raise RunnerError("post-provider checkout request is invalid") from exc
     if len(encoded_request) > base.MAX_REQUEST_BYTES:
         raise RunnerError("post-provider checkout request is unbounded")
+    # Validate the exact captured base module identity before transferring its
+    # current frozen bytes.  A late host-side source replacement must not
+    # become executed code in this otherwise read-only child.
+    try:
+        base_raw, base_identity = _read_source_snapshot(BASE_PATH)
+    except (OSError, RuntimeError) as exc:
+        raise RunnerError("post-provider base source snapshot unavailable") from exc
+    if base_identity != getattr(base, "__grabowski_source_identity__", None):
+        raise RunnerError("post-provider base source differs from captured code")
+    frozen_input = struct.pack("!I", len(encoded_request)) + encoded_request + base_raw
     command = [
         "/usr/bin/bwrap",
         "--ro-bind",
@@ -1088,30 +1118,36 @@ def _secure_post_provider_checkout_readback(
         str(BASE_PATH),
         str(checkout),
         str(source),
+        base_identity["sha256"],
     ]
     try:
-        completed = subprocess.run(
+        completed = run_bounded(
             _unix_socket_restricted_codex_argv(command, block_network=True),
-            cwd="/",
-            env=base._git_environment(),
-            input=encoded_request,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=90,
+            cwd=Path("/"),
+            timeout_seconds=90,
+            stdin_data=frozen_input,
+            environment=base._git_environment(),
+            stdout_limit=8192,
+            stderr_limit=8192,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, RunnerError) as exc:
         raise RunnerError("post-provider Git isolation unavailable") from exc
+    # Bounded capture kills the whole isolated process group after the first
+    # overflow byte.  A malicious filter subprocess must not fill trusted
+    # memory or hide the evidence before the provider ledger is terminalized.
     if (
-        completed.returncode != 0
-        or not isinstance(completed.stdout, bytes)
-        or not isinstance(completed.stderr, bytes)
-        or len(completed.stdout) > 8192
-        or len(completed.stderr) > 8192
+        completed.get("capture_error") is not None
+        or completed.get("stdout_overflow") is not False
+        or completed.get("stderr_overflow") is not False
+        or completed.get("returncode") != 0
+        or not isinstance(completed.get("stdout"), bytes)
+        or not isinstance(completed.get("stderr"), bytes)
+        or len(completed["stdout"]) > 8192
+        or len(completed["stderr"]) > 8192
     ):
         raise RunnerError("post-provider Git isolation failed")
     try:
-        result = json.loads(completed.stdout)
+        result = json.loads(completed["stdout"])
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise RunnerError("post-provider Git readback is invalid") from exc
     if (
@@ -1145,6 +1181,9 @@ def validate_toolchain(codex: str) -> str:
     for path in (Path("/usr/bin/cat"), Path("/usr/bin/sed"), Path("/bin/bash")):
         _validate_support_executable(path, owner_uid=0)
     _validated_mcp_proxy_python()
+    _validate_support_executable(
+        Path("/usr/bin/bwrap"), owner_uid=0, require_read_only_mount=True
+    )
     return f"{bundled_rg.parent}:/usr/bin:/bin"
 
 
@@ -1609,6 +1648,10 @@ def _assert_root_owned_device_policy() -> None:
         "DynamicUser": "yes",
         "PrivateTmp": "yes",
         "PrivateIPC": "yes",
+        # PrivateDevices alone bind-mounts host /dev/shm into the new /dev.
+        # Require an independently mounted tmpfs with private 1777 mode, as
+        # verified in real root-systemd249 DynamicUser micro-units.
+        "TemporaryFileSystem": "/dev/shm:rw,nosuid,nodev,noexec,mode=1777",
         # Numeric UID/GID must also match the real process, not only the
         # unit's declared user/group strings. Prevent credential drift or
         # a separate same-UID worker masquerading as the dynamic service.
@@ -8971,6 +9014,10 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     and _frozen_g1_mcp_profile(request) == MCP_PROFILE_FROZEN_G1
                 ):
                     _frozen_g1_vendor_snapshot()
+                # The same exact kernel-filtered, root-readonly postflight
+                # command must succeed on this checkout BEFORE provider intent.
+                # Its failure must not burn a non-retryable paid identity.
+                _secure_post_provider_checkout_readback(request, checkout, source)
                 # Recheck in the actual provider process namespace, after all
                 # staging and immediately before the irreversible one-shot intent.
                 validate_live_immutable_mounts(

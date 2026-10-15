@@ -523,6 +523,7 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
         "Group": "grabowski-rab-benchmark",
         "PrivateTmp": "yes",
         "PrivateIPC": "yes",
+        "TemporaryFileSystem": "/dev/shm:rw,nosuid,nodev,noexec,mode=1777",
         "UID": str(os.geteuid()),
         "GID": str(os.getegid()),
     }
@@ -1233,6 +1234,10 @@ class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
             ("Group", "docker"),
             ("PrivateTmp", "no"),
             ("PrivateIPC", "no"),
+            ("TemporaryFileSystem", ""),
+            ("TemporaryFileSystem", "/tmp:rw"),
+            ("TemporaryFileSystem", "/dev/shm:rw"),
+            ("TemporaryFileSystem", "/dev/shm:rw,nosuid,nodev,noexec,mode=0755"),
             ("UID", "9999"),
             ("GID", "9999"),
             ("UID", ""),
@@ -4172,17 +4177,29 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "binding": {},
             }
 
+            execution_order: list[str] = []
+
             def record_intent(*_args, **kwargs):
+                self.assertEqual(execution_order, ["postflight_smoke"])
+                execution_order.append("provider_intent")
                 callback = kwargs.get("intent_persisted_callback")
                 self.assertIsNotNone(callback)
                 callback()
                 return "a" * 64
 
             def launch(*_args, **kwargs):
+                self.assertEqual(
+                    execution_order, ["postflight_smoke", "provider_intent"]
+                )
+                execution_order.append("provider_started")
                 callback = kwargs.get("process_started_callback")
                 self.assertIsNotNone(callback)
                 callback()
                 raise KeyboardInterrupt()
+
+            def qualified_smoke(*_args, **_kwargs):
+                execution_order.append("postflight_smoke")
+                return {"working_tree": "clean"}
 
             with ExitStack() as stack:
                 # This test isolates another failure boundary; the real pair
@@ -4231,6 +4248,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         side_effect=record_intent,
                     )
                 )
+                # This test isolates the provider process-start callback;
+                # the separate exact-namespace preintent Git smoke is tested
+                # with real bwrap rather than stealing this provider mock.
+                smoke = stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_secure_post_provider_checkout_readback",
+                        side_effect=runner.RunnerError(
+                            "postflight sandbox startup failed before intent"
+                        ),
+                    )
+                )
                 provider = stack.enter_context(
                     patch.object(runner, "run_bounded", side_effect=launch)
                 )
@@ -4244,9 +4273,24 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         return_value={"working_tree": "clean"},
                     )
                 )
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "postflight sandbox startup failed before intent",
+                ):
+                    runner.execute(value, args)
+                intent.assert_not_called()
+                provider.assert_not_called()
+                failed.assert_not_called()
+                smoke.side_effect = qualified_smoke
                 with self.assertRaises(KeyboardInterrupt):
                     runner.execute(value, args)
 
+            smoke.assert_called()
+            self.assertEqual(smoke.call_count, 2)
+            self.assertEqual(
+                execution_order,
+                ["postflight_smoke", "provider_intent", "provider_started"],
+            )
             intent.assert_called_once()
             provider.assert_called_once()
             failed.assert_called_once()
@@ -10768,10 +10812,8 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
             provider.assert_not_called()
 
     def test_untrusted_checkout_fsmonitor_cannot_get_parent_rpc_or_inet(self) -> None:
-        # A compromised Codex can write its same-UID checkout/.git/config.
-        # Git's core.fsmonitor runs subprocesses when postflight uses git status.
-        # The private bwrap /tmp must hide the host /tmp, so place the fixture
-        # in the normal benchmark state tree rather than that hidden mount.
+        # A negative control proves the Git fsmonitor hook would actually run
+        # and write to private /tmp if its explicit disabling were removed.
         scratch = ROOT / "build"
         scratch.mkdir(mode=0o700, exist_ok=True)
         with tempfile.TemporaryDirectory(
@@ -10787,21 +10829,11 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 "fixture": "fresh-matching-snapshot",
             }
             checkout = runner.create_checkout(value, source, state)
-            marker = root / "fsmonitor-kernel-socket-result"
             script = root / "untrusted-fsmonitor"
             script.write_text(
                 "#!/usr/bin/python3\n"
-                "import errno,socket,pathlib\n"
-                "observed=[]\n"
-                "for family in (socket.AF_UNIX,socket.AF_INET):\n"
-                " try:\n"
-                "  s=socket.socket(family,socket.SOCK_STREAM);s.close()\n"
-                "  observed.append('ALLOWED')\n"
-                " except OSError as error:\n"
-                "  observed.append('EPERM' if error.errno==errno.EPERM else 'OTHER')\n"
-                + "pathlib.Path("
-                + repr(str(marker))
-                + ").write_text(','.join(observed))\n",
+                "from pathlib import Path\n"
+                "Path('/tmp/rab-fsmonitor-executed').write_text('YES')\n",
                 encoding="utf-8",
             )
             script.chmod(0o700)
@@ -10819,11 +10851,36 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 capture_output=True,
                 timeout=10,
             )
-            observed = runner._secure_post_provider_checkout_readback(
-                value, checkout, source
+            os.utime(checkout / "src" / "example.py", None)
+            target = "scenario = base.attest_checkout_setup(request, checkout)"
+            original = runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM
+            self.assertEqual(original.count(target), 1)
+            detection = (
+                "from pathlib import Path as HookPath\n"
+                "if HookPath('/tmp/rab-fsmonitor-executed').exists():\n"
+                " raise RuntimeError('Git invoked the untrusted fsmonitor')\n"
             )
-            self.assertEqual(observed["working_tree"], "clean")
-            self.assertFalse(marker.exists(), "Git executed an untrusted fsmonitor")
+            qualified = original.replace(target, target + "\n" + detection)
+            with patch.object(runner, "_POST_PROVIDER_GIT_ISOLATED_PROGRAM", qualified):
+                attested = runner._secure_post_provider_checkout_readback(
+                    value, checkout, source
+                )
+            self.assertEqual(attested["working_tree"], "clean")
+
+            unprotected = qualified.replace(
+                '"GIT_CONFIG_KEY_0": "core.fsmonitor"',
+                '"GIT_CONFIG_KEY_0": "core.logAllRefUpdates"',
+            )
+            self.assertNotEqual(unprotected, qualified)
+            with patch.object(
+                runner, "_POST_PROVIDER_GIT_ISOLATED_PROGRAM", unprotected
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "post-provider Git isolation failed"
+                ):
+                    runner._secure_post_provider_checkout_readback(
+                        value, checkout, source
+                    )
 
     def test_postprovider_git_child_rejects_real_host_file_write(self) -> None:
         scratch = ROOT / "build"
@@ -10866,6 +10923,79 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 )
             self.assertEqual(result["working_tree"], "clean")
             self.assertFalse(marker.exists(), "post-Git sandbox wrote a host file")
+
+    def test_git_postflight_output_flood_is_kernel_contained_and_bounded(self) -> None:
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-postflight-flood-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            value = request(commit=commit)
+            value["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(value, source, state)
+            anchor = "scenario = base.attest_checkout_setup(request, checkout)"
+            self.assertEqual(
+                runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM.count(anchor), 1
+            )
+            noisy = "import os\nos.write(1, b'X' * 65536)\n" + anchor
+            actual = runner.run_bounded
+            observations = []
+
+            def observe(*args, **kwargs):
+                self.assertEqual(kwargs["stdout_limit"], 8192)
+                self.assertEqual(kwargs["stderr_limit"], 8192)
+                result = actual(*args, **kwargs)
+                observations.append(result)
+                return result
+
+            with (
+                patch.object(
+                    runner,
+                    "_POST_PROVIDER_GIT_ISOLATED_PROGRAM",
+                    runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM.replace(anchor, noisy),
+                ),
+                patch.object(runner, "run_bounded", side_effect=observe),
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "post-provider Git isolation failed"
+                ):
+                    runner._secure_post_provider_checkout_readback(
+                        value, checkout, source
+                    )
+            self.assertEqual(len(observations), 1)
+            self.assertTrue(observations[0]["stdout_overflow"])
+            self.assertLessEqual(len(observations[0]["stdout"]), 8193)
+
+    def test_git_postflight_rejects_drifted_captured_base_before_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checkout = root / "src", root / "checkout"
+            source.mkdir()
+            checkout.mkdir()
+            identity = dict(runner.base.__grabowski_source_identity__)
+            identity["sha256"] = "0" * 64
+            with (
+                patch.object(
+                    runner,
+                    "_read_source_snapshot",
+                    return_value=(b"untrusted base code", identity),
+                ),
+                patch.object(runner, "run_bounded") as child,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "base source differs from captured code"
+                ):
+                    runner._secure_post_provider_checkout_readback(
+                        request(), checkout, source
+                    )
+                child.assert_not_called()
 
     def test_seccomp_postprovider_mode_denies_all_socket_creation(self) -> None:
         child = (
