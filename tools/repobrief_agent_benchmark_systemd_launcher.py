@@ -89,7 +89,8 @@ def unit_argv(
         "ProtectControlGroups=yes",
         "MemoryMax=512M",
         "TasksMax=128",
-        f"RuntimeMaxSec={30 if probe else 900}",
+        # 3600s maximum provider wall time plus bounded setup and postflight.
+        f"RuntimeMaxSec={30 if probe else 4500}",
     ]
     if not probe:
         properties.extend(

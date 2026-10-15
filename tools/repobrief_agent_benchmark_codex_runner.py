@@ -3251,7 +3251,7 @@ def _assert_checkout_tree_has_regular_blobs(source: Path, commit: str) -> None:
     """
     try:
         process = subprocess.Popen(
-            ["git", "ls-tree", "-r", "--full-tree", "-z", commit],
+            ["git", "ls-tree", "-r", "-l", "--full-tree", "-z", commit],
             cwd=source,
             env=base._git_environment(),
             stdout=subprocess.PIPE,
@@ -3266,6 +3266,10 @@ def _assert_checkout_tree_has_regular_blobs(source: Path, commit: str) -> None:
         remainder = b""
         total_bytes = 0
         total_files = 0
+        total_blob_bytes = 0
+        # Keep these identical to the isolated postflight readback bounds.
+        max_blob_bytes = 256 * 1024 * 1024
+        max_total_blob_bytes = 2 * 1024 * 1024 * 1024
         directories: set[tuple[bytes, ...]] = set()
         # read1() can block indefinitely when a promisor process or inherited
         # pipe remains open. A nonblocking pipe and selector bound the *entire*
@@ -3299,7 +3303,28 @@ def _assert_checkout_tree_has_regular_blobs(source: Path, commit: str) -> None:
                         or record.startswith(b"100755 blob ")
                     ):
                         raise RunnerError("unsupported tracked Git tree entry")
-                    _metadata, separator, relative = record.partition(b"\t")
+                    metadata, separator, relative = record.partition(b"\t")
+                    fields = metadata.split()
+                    if (
+                        len(fields) != 4
+                        or fields[0] not in (b"100644", b"100755")
+                        or fields[1] != b"blob"
+                        or re.fullmatch(rb"[0-9a-f]{40}", fields[2]) is None
+                        or re.fullmatch(rb"(0|[1-9][0-9]{0,19})", fields[3]) is None
+                    ):
+                        raise RunnerError(
+                            "benchmark source Git blob size metadata is invalid"
+                        )
+                    blob_size = int(fields[3])
+                    if blob_size > max_blob_bytes:
+                        raise RunnerError(
+                            "benchmark source Git blob byte limit exceeded"
+                        )
+                    total_blob_bytes += blob_size
+                    if total_blob_bytes > max_total_blob_bytes:
+                        raise RunnerError(
+                            "benchmark source Git blob byte aggregate exceeded"
+                        )
                     segments = relative.split(b"/")
                     if (
                         not separator

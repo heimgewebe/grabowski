@@ -134,6 +134,18 @@ class RootSystemdLauncherTests(unittest.TestCase):
                 p["RuntimeDirectory"].split(),
             )
 
+    def test_live_service_outlives_max_provider_wall_and_cleanup(self) -> None:
+        # The runner accepts 3600s provider wall time. Systemd includes the
+        # setup and postflight phases in its service lifetime, so 900s would
+        # kill the runner after one-shot intent and before ledger finalization.
+        probe = self.props(launcher.probe_argv("probe"))
+        live = self.props(
+            launcher.unit_argv("longwall", ["/usr/bin/true"], probe=False)
+        )
+        self.assertEqual(probe["RuntimeMaxSec"], "30")
+        self.assertGreaterEqual(int(live["RuntimeMaxSec"]), 3600 + 600)
+        self.assertLessEqual(int(live["RuntimeMaxSec"]), 7200)
+
     def test_no_host_shared_dev_shm_mount_alias(self) -> None:
         for mode in (True, False):
             with self.subTest(probe=mode):

@@ -2306,7 +2306,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self,
     ) -> None:
         payload = b"".join(
-            b"100644 blob " + b"a" * 40 + f"\tfile{i:05d}".encode() + b"\0"
+            b"100644 blob " + b"a" * 40 + f" 1\tfile{i:05d}".encode() + b"\0"
             for i in range(65_537)
         )
         stream = mock.Mock()
@@ -2329,6 +2329,55 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(popen.call_args.kwargs["env"]["GIT_NO_LAZY_FETCH"], "1")
         nonblocking.assert_called_once_with(91, False)
         stream.close.assert_called_once()
+
+    def test_checkout_tree_scan_rejects_postflight_blob_byte_budgets(self) -> None:
+        # Fake large blob object sizes using tiny metadata, never allocate
+        # hundreds of MiB or consume a one-use workspace or provider token.
+        max_file = 256 * 1024 * 1024
+        cases = (
+            ("one_oversized_blob", (max_file + 1,)),
+            ("aggregate_over_2gib", (max_file,) * 9),
+            ("unknown_size", ("-",)),
+        )
+        for label, sizes in cases:
+            with self.subTest(label=label):
+                payload = b"".join(
+                    b"100644 blob "
+                    + b"a" * 40
+                    + b" "
+                    + str(size).encode("ascii")
+                    + b"\t"
+                    + f"file{index:02d}".encode("ascii")
+                    + b"\0"
+                    for index, size in enumerate(sizes)
+                )
+                stream = mock.Mock()
+                stream.fileno.return_value = 95
+                process = mock.Mock(stdout=stream)
+                process.poll.return_value = 0
+                process.wait.return_value = 0
+                with (
+                    patch.object(
+                        runner.subprocess, "Popen", return_value=process
+                    ) as popen,
+                    patch.object(runner.os, "set_blocking"),
+                    patch.object(runner.os, "read", side_effect=(payload, b"")),
+                    patch.object(
+                        runner.selectors, "DefaultSelector"
+                    ) as selector_factory,
+                ):
+                    selector_factory.return_value.__enter__.return_value.select.return_value = [
+                        (None, None)
+                    ]
+                    with self.assertRaisesRegex(runner.RunnerError, "blob (byte|size)"):
+                        runner._assert_checkout_tree_has_regular_blobs(
+                            Path("/unused"), "a" * 40
+                        )
+                self.assertIn("-l", popen.call_args.args[0])
+                self.assertEqual(
+                    popen.call_args.kwargs["env"]["GIT_NO_LAZY_FETCH"], "1"
+                )
+                stream.close.assert_called_once()
 
     def test_checkout_tree_scan_succeeds_for_local_complete_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -10562,6 +10611,55 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
 class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
     """Frozen G1 dependency corruption must not consume a paid one-shot."""
 
+    def _assert_postflight_kernel_namespace_available(self) -> None:
+        """Diagnose the exact bwrap + seccomp precondition, without a provider.
+
+        This must not replace or suppress security integration assertions:
+        any inability to create the sandbox is reported as a real failure.
+        """
+        probe = [
+            "/usr/bin/bwrap",
+            "--ro-bind",
+            "/",
+            "/",
+            "--unshare-ipc",
+            "--unshare-pid",
+            "--die-with-parent",
+            "--new-session",
+            "--tmpfs",
+            "/tmp",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--chdir",
+            "/",
+            "--",
+            runner._validated_mcp_proxy_python(),
+            "-I",
+            "-c",
+            "print('RAB_POSTFLIGHT_NAMESPACE_OK')",
+        ]
+        try:
+            result = subprocess.run(
+                runner._unix_socket_restricted_codex_argv(probe, block_network=True),
+                env=runner.base._git_environment(),
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.fail(f"postflight namespace setup unavailable: {type(exc).__name__}")
+        if (
+            result.returncode != 0
+            or result.stdout.strip() != b"RAB_POSTFLIGHT_NAMESPACE_OK"
+        ):
+            self.fail(
+                "postflight namespace setup failed before Git readback: "
+                f"rc={result.returncode}, stderr={result.stderr[:400]!r}, "
+                f"stdout={result.stdout[:160]!r}"
+            )
+
     def test_vendor_failure_before_one_shot_intent_prevents_provider_start(
         self,
     ) -> None:
@@ -10815,6 +10913,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
             provider.assert_not_called()
 
     def test_untrusted_checkout_fsmonitor_cannot_get_parent_rpc_or_inet(self) -> None:
+        self._assert_postflight_kernel_namespace_available()
         # A negative control proves the Git fsmonitor hook would actually run
         # and write to private /tmp if its explicit disabling were removed.
         scratch = ROOT / "build"
@@ -10887,6 +10986,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 self.assertEqual(attested["working_tree"], "clean")
 
     def test_postprovider_git_child_rejects_real_host_file_write(self) -> None:
+        self._assert_postflight_kernel_namespace_available()
         scratch = ROOT / "build"
         scratch.mkdir(mode=0o700, exist_ok=True)
         with tempfile.TemporaryDirectory(
@@ -10929,6 +11029,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
             self.assertFalse(marker.exists(), "post-Git sandbox wrote a host file")
 
     def test_git_postflight_output_flood_is_kernel_contained_and_bounded(self) -> None:
+        self._assert_postflight_kernel_namespace_available()
         scratch = ROOT / "build"
         scratch.mkdir(mode=0o700, exist_ok=True)
         with tempfile.TemporaryDirectory(
@@ -11108,6 +11209,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 runner._secure_post_provider_checkout_readback(value, checkout, source)
 
     def test_postflight_dirty_fixture_bytes_and_modes_are_bound(self) -> None:
+        self._assert_postflight_kernel_namespace_available()
         scratch = ROOT / "build"
         scratch.mkdir(mode=0o700, exist_ok=True)
         with tempfile.TemporaryDirectory(
@@ -11162,6 +11264,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                         )
 
     def test_postflight_detects_git_control_metadata_drift_after_intent(self) -> None:
+        self._assert_postflight_kernel_namespace_available()
         scratch = ROOT / "build"
         scratch.mkdir(mode=0o700, exist_ok=True)
         with tempfile.TemporaryDirectory(
