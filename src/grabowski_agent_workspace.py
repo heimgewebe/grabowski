@@ -1431,6 +1431,21 @@ def _contains(parent: str, child: str) -> bool:
 
 
 def _workspace_host_git_argv(argv: list[str]) -> list[str]:
+    # Host Git add loads repository-selected clean filters at effect time, after
+    # any separate config preflight. Never allow this helper-executing porcelain
+    # command: Candidate adoption stages only its immutable patch with git apply.
+    if argv and argv[0] == "git":
+        index = 1
+        while index < len(argv):
+            part = argv[index]
+            if part in ("-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env"):
+                index += 2
+            elif part.startswith("-"):
+                index += 1
+            else:
+                break
+        if index < len(argv) and argv[index] == "add":
+            raise RuntimeError("host Git add is forbidden; use immutable cached patch staging")
     # Repository diff config may change after preflight but before Git spawn.
     # Disable external diff/textconv at the Git effect itself, not just in a
     # separate earlier config readback.
@@ -4750,11 +4765,32 @@ def _stage_candidate_for_adoption(
         ["git", "reset", "--mixed", "--quiet", base_head],
         label="candidate adoption index reset",
     )
+    # Do not invoke Git clean filters on mutable worktree contents. Stage
+    # exactly the already-verified immutable Candidate patch directly into the
+    # index. Git apply --cached neither consults clean filters nor runs hooks.
+    writer_result = collection.get("writer_result")
+    if (
+        not isinstance(writer_result, dict)
+        or not _verify_patch_artifact(
+            writer_result, expected_path=_writer_patch_path(manifest)
+        )
+    ):
+        raise AgentWorkspaceError("immutable Candidate patch artifact changed")
+    try:
+        patch_bytes = Path(str(writer_result["path"])).read_bytes()
+    except OSError as exc:
+        raise AgentWorkspaceError("immutable Candidate patch became unreadable") from exc
+    if (
+        len(patch_bytes) > MAX_PATCH_BYTES
+        or hashlib.sha256(patch_bytes).hexdigest() != candidate.get("patch_sha256")
+    ):
+        raise AgentWorkspaceError("immutable Candidate patch changed before staging")
     _checked(
         _run,
         worktree,
-        ["git", "--literal-pathspecs", "add", "--all", "--", *[str(path) for path in changed_paths]],
-        label="candidate adoption stage",
+        ["git", "apply", "--cached", "--binary", "--whitespace=nowarn",
+         "--", str(writer_result["path"])],
+        label="candidate adoption cached patch stage",
     )
     staged = _checked_bytes(
         worktree,
@@ -4779,6 +4815,13 @@ def _stage_candidate_for_adoption(
         label="candidate adoption untracked paths",
     )
     if bytes(unstaged["stdout"]) or bytes(untracked["stdout"]):
+        # The worktree no longer matches its frozen patch. Revert the staged
+        # index back to the bound base; never leave a partial adoption staged.
+        restore = _run(worktree, ["git", "reset", "--mixed", "--quiet", base_head])
+        if not isinstance(restore, dict) or restore.get("returncode") != 0:
+            raise AgentWorkspaceError(
+                "Candidate staging drifted and the pre-effect index could not be restored"
+            )
         raise AgentWorkspaceError("Candidate could not be fully staged for adoption")
     tree = str(
         _checked(_run, worktree, ["git", "write-tree"], label="candidate adoption tree").get(

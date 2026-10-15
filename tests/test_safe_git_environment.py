@@ -508,6 +508,77 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
                 workspace_run(repo, ["git", "add", "--", "tracked.txt"])
             self.assertFalse(marker.exists(), "workspace host Git executed local filter")
 
+    def test_workspace_host_git_add_is_forbidden_even_without_filter_config(self) -> None:
+        from grabowski_agent_workspace import _run as workspace_run
+
+        with tempfile.TemporaryDirectory(prefix="workspace-git-add-deny-") as raw:
+            repo = Path(raw) / "repo"
+            self._two_commit_repo(repo, safe_git_environment())
+            (repo / "tracked.txt").write_text("later mutation\n", encoding="ascii")
+            for command in (
+                ["git", "add", "--", "tracked.txt"],
+                ["git", "--literal-pathspecs", "add", "--all", "--", "tracked.txt"],
+                ["git", "-c", "core.hooksPath=/dev/null", "add", "tracked.txt"],
+            ):
+                with self.subTest(command=command):
+                    with self.assertRaisesRegex(RuntimeError, "host Git add is forbidden"):
+                        workspace_run(repo, command)
+
+    def test_cached_candidate_style_git_apply_never_runs_clean_filter(self) -> None:
+        # Effect-bound contrast: git apply --cached stages the exact patch but
+        # git add in the same repository executes the configured clean filter.
+        with tempfile.TemporaryDirectory(prefix="workspace-cached-apply-") as raw:
+            root = Path(raw)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".gitattributes").write_text("tracked.txt filter=attacker\n", encoding="ascii")
+            subprocess.run(
+                ["git", "-C", str(repo), "add", ".gitattributes"],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.name=Safe Test",
+                 "-c", "user.email=safe@example.invalid",
+                 "commit", "-qm", "attributes"],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            (repo / "tracked.txt").write_text("after\n", encoding="ascii")
+            patch = subprocess.check_output(
+                ["git", "-C", str(repo), "diff", "--binary", "--no-ext-diff",
+                 "--no-textconv", "HEAD"],
+                env=secure, timeout=15,
+            )
+            marker = root / "filter-executed"
+            helper = root / "clean-filter"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "filter.attacker.clean", str(helper)],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            applied = subprocess.run(
+                ["git", "-C", str(repo), "apply", "--cached", "--binary",
+                 "--whitespace=nowarn", "-"],
+                input=patch, env=secure, capture_output=True, timeout=15,
+            )
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            staged = subprocess.check_output(
+                ["git", "-C", str(repo), "show", ":tracked.txt"],
+                env=secure, timeout=15,
+            )
+            self.assertEqual(staged, b"after\n")
+            self.assertFalse(marker.exists(), "cached patch staging ran clean filter")
+            uncontrolled = subprocess.run(
+                ["git", "-C", str(repo), "add", "--", "tracked.txt"],
+                env=secure, capture_output=True, timeout=15,
+            )
+            self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
+            self.assertTrue(marker.exists(), "Git add negative control did not execute")
+
     def test_workspace_host_git_rejects_external_diff_helper_before_spawn(self) -> None:
         from grabowski_agent_workspace import _run as workspace_run
 

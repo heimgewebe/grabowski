@@ -1135,9 +1135,11 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "_adoption_candidate_snapshot",
                 side_effect=mutate_after_snapshot,
             ),
+            # Immutable cached-patch staging leaves the post-snapshot tamper
+            # unstaged, so adoption rejects it before creating any commit.
             self.assertRaisesRegex(
                 workspace.AgentWorkspaceError,
-                "staged Candidate tree differs from immutable Candidate patch",
+                "Candidate could not be fully staged for adoption",
             ),
         ):
             workspace.grabowski_agent_workspace_adopt(
