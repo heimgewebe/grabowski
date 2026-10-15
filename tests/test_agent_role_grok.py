@@ -2464,14 +2464,46 @@ class GrokReviewRoleTests(unittest.TestCase):
                 "GIT_CONFIG_NOSYSTEM": "0",
                 "GIT_TRACE": str(root / "foreign-trace"),
             }
-            with mock.patch.dict(os.environ, poisoned):
+            # A poisoned hooksPath only has an observable effect if an
+            # executable hook exists; additionally capture the actual env.
+            import shlex
+            import subprocess
+
+            hook_dir = root / "foreign-hooks"
+            hook_dir.mkdir(mode=0o700)
+            hook_witness = root / "foreign-hook-fired"
+            hook = hook_dir / "pre-commit"
+            hook.write_text(
+                "#!/bin/sh\nprintf 'injected' > "
+                + shlex.quote(str(hook_witness)) + "\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o700)
+            subprocess_envs: list[dict[str, str]] = []
+            real_run = subprocess.run
+
+            def record_git_run(*args: Any, **kwargs: Any) -> Any:
+                subprocess_envs.append(dict(kwargs["env"]))
+                return real_run(*args, **kwargs)
+
+            with (
+                mock.patch.dict(os.environ, poisoned),
+                mock.patch.object(subprocess, "run", side_effect=record_git_run),
+            ):
                 repo, base, head = self._native_sha256_git_commits(directory)
+            self.assertTrue(subprocess_envs)
+            for env in subprocess_envs:
+                self.assertEqual("1", env.get("GIT_CONFIG_NOSYSTEM"))
+                self.assertEqual(os.devnull, env.get("GIT_CONFIG_GLOBAL"))
+                for key in poisoned:
+                    if key not in {"GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL"}:
+                        self.assertNotIn(key, env)
+            self.assertFalse(hook_witness.exists())
             self.assertEqual((64, 64), (len(base), len(head)))
             self.assertIn(b"+after", role.committed_diff(repo, base, head))
             for name in (
                 "foreign.git", "foreign-worktree", "foreign.index",
-                "foreign-objects", "foreign-alternates", "foreign-hooks",
-                "foreign-global-config", "foreign-trace",
+                "foreign-objects", "foreign-trace",
             ):
                 with self.subTest(path=name):
                     self.assertFalse((root / name).exists())
