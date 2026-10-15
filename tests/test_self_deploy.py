@@ -376,6 +376,16 @@ class SelfDeployToolTests(unittest.TestCase):
         )
         admission_patch.start()
         self.addCleanup(admission_patch.stop)
+        # These synthetic scheduler-effect tests intentionally replace the
+        # entire release admission seam. Dedicated independent tests exercise
+        # the real lease-bound wrapper and its exact closeout semantics.
+        lease_admission_patch = patch.object(
+            SELF_DEPLOY,
+            "_require_release_source_admission_under_lease",
+            side_effect=lambda head: SELF_DEPLOY._require_release_source_admission(head),
+        )
+        lease_admission_patch.start()
+        self.addCleanup(lease_admission_patch.stop)
         guard_patch = patch.object(
             SELF_DEPLOY,
             "_require_auto_deploy_source_mutation_leases",
