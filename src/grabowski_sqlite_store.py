@@ -386,7 +386,8 @@ def preauthorization_readonly_sqlite(
     wal_path = Path(str(path) + "-wal")
     if not wal_path.exists() and not wal_path.is_symlink():
         with inventory_readonly_sqlite(
-            path, temporary_prefix="unused-no-wal-", error_type=error_type
+            path, temporary_prefix="unused-no-wal-", error_type=error_type,
+            allow_wal_copy=False,
         ) as connection:
             yield connection
         return
@@ -504,6 +505,7 @@ def inventory_readonly_sqlite(
     temporary_prefix: str,
     error_type: type[ChangedError],
     message: str = INVENTORY_CHANGED_MESSAGE,
+    allow_wal_copy: bool = True,
 ) -> Iterator[sqlite3.Connection]:
     wal_path = Path(str(path) + "-wal")
     wal_present = wal_path.exists() or wal_path.is_symlink()
@@ -529,6 +531,12 @@ def inventory_readonly_sqlite(
             if wal_path.exists() or wal_path.is_symlink():
                 raise _changed(error_type, message)
         return
+
+    # Pre-authorization callers must fail closed if a WAL appears between
+    # their no-WAL check and this inventory probe. Never fall back to a host
+    # snapshot copy before a scoped mutation gate has granted authority.
+    if not allow_wal_copy:
+        raise _changed(error_type, message)
 
     with tempfile.TemporaryDirectory(prefix=temporary_prefix) as temporary_directory:
         snapshot = Path(temporary_directory) / path.name
