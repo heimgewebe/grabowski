@@ -22,7 +22,11 @@ MAX_WRITABLE_SCOPE_ENTRIES = 100_000
 # after repository configuration has been loaded.
 _TRUSTED_GIT_SSH_COMMAND = (
     "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none "
+    "-oProxyJump=none -oControlMaster=no -oControlPath=none "
+    "-oControlPersist=no -oForwardAgent=no -oForwardX11=no "
     "-oPermitLocalCommand=no -oClearAllForwardings=yes "
+    "-oUpdateHostKeys=no -oKnownHostsCommand=none "
+    "-oUserKnownHostsFile=~/.ssh/known_hosts "
     "-oStrictHostKeyChecking=yes"
 )
 _GIT_COMMAND_CONFIG = (
@@ -34,6 +38,8 @@ _GIT_COMMAND_CONFIG = (
     ("credential.helper", ""),
     ("http.proxy", ""),
     ("http.sslVerify", "true"),
+    ("http.sslCAInfo", "/etc/ssl/certs/ca-certificates.crt"),
+    ("http.sslCAPath", "/etc/ssl/certs"),
 )
 
 
@@ -455,6 +461,16 @@ def _git_command_environment() -> dict[str, str]:
     return environment
 
 
+def _git_effect_environment() -> dict[str, str]:
+    """Bind source ancestry and CA trust at the Git process boundary."""
+    return {
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": "/dev/null/grabowski-disabled-grafts",
+        "GIT_SSL_CAINFO": "/etc/ssl/certs/ca-certificates.crt",
+        "GIT_SSL_CAPATH": "/etc/ssl/certs",
+    }
+
+
 def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
     """Return a non-interactive Git environment with executable helpers disabled."""
     inherited = os.environ if base is None else base
@@ -520,13 +536,58 @@ def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_ALLOW_PROTOCOL": "ssh:https:file",
+            # A URL-specific repository http.<url>.sslVerify=false beats a
+            # generic command config sslVerify=true. Until a trusted URL
+            # can be effect-bound, Git HTTPS must fail closed. GitHub SSH
+            # and local file fixtures remain available.
+            "GIT_ALLOW_PROTOCOL": "ssh:file",
             "GIT_SSH_COMMAND": _TRUSTED_GIT_SSH_COMMAND,
             "GIT_SSH_VARIANT": "ssh",
             "GIT_ASKPASS": "/bin/false",
         }
     )
     environment.update(_git_command_environment())
+    environment.update(_git_effect_environment())
+    return environment
+
+
+
+def safe_git_repository_environment(
+    repo: Path, base: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Fail closed before host Git can invoke local executable filters/helpers.
+
+    A repository's effective config can enable clean/smudge/process,
+    textconv/external-diff, merge or alias commands. Host Git operations
+    must not execute these under the Grabowski account.
+    """
+    environment = safe_git_environment(base)
+    checkout = Path(repo)
+    if not checkout.is_absolute() or not checkout.is_dir():
+        raise AgentSandboxError("trusted Git checkout is not an absolute directory")
+    try:
+        result = subprocess.run(
+            ["/usr/bin/git", "-C", str(checkout), "config",
+             "--list", "--name-only", "-z", "--includes"],
+            env=environment, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AgentSandboxError("repository Git helper admission unavailable") from exc
+    if result.returncode != 0 or result.stderr or len(result.stdout) > 1024 * 1024:
+        raise AgentSandboxError("repository Git helper admission failed")
+    for key in result.stdout.split(b"\x00"):
+        label = key.decode("utf-8", errors="surrogateescape").casefold()
+        if (
+            (label.startswith("filter.") and label.endswith((".clean", ".smudge", ".process")))
+            or label == "diff.external"
+            or (label.startswith("diff.") and label.endswith((".command", ".textconv")))
+            or (label.startswith("merge.") and label.endswith(".driver"))
+            or (label.startswith("submodule.") and label.endswith(".update"))
+            or label.startswith("alias.")
+        ):
+            raise AgentSandboxError("repository declares an executable Git helper")
     return environment
 
 
@@ -1023,9 +1084,12 @@ def minimal_sandbox_argv(
             "--setenv",
             "GIT_OPTIONAL_LOCKS",
             "0",
+            "--setenv",
+            "GIT_ALLOW_PROTOCOL",
+            "ssh:file",
         ]
     )
-    for key, value in _git_command_environment().items():
+    for key, value in (*_git_command_environment().items(), *_git_effect_environment().items()):
         arguments.extend(["--setenv", key, value])
     arguments.extend(
         [

@@ -14,7 +14,7 @@ import time
 import uuid
 from typing import Any
 
-from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
+from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_repository_environment, run_bounded_capture
 
 SHA40 = __import__("re").compile(r"\A[0-9a-f]{40}\Z")
 SHA256 = __import__("re").compile(r"\A[0-9a-f]{64}\Z")
@@ -164,8 +164,8 @@ def digest(value: Any) -> str:
 def git(repo: Path, *args: str) -> bytes:
     # The review source itself must not inherit Git scope/objects, executable
     # search paths or dynamic-loader configuration from an untrusted caller.
-    # safe_git_environment() without an explicit base would copy ambient GIT_*.
-    controlled = safe_git_environment({
+    # safe_git_repository_environment() without an explicit base would copy ambient GIT_*.
+    controlled = safe_git_repository_environment(repo, {
         "HOME": pwd.getpwuid(os.geteuid()).pw_dir,
         "PATH": "/usr/bin:/bin",
     })

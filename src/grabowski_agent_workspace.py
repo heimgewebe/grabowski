@@ -32,7 +32,7 @@ import grabowski_lifecycle_collectors as lifecycle_collectors
 import grabowski_lifecycle_effect_plan as lifecycle_effect_plan
 import grabowski_physical_checkout as physical_checkout
 import grabowski_work_acquire as work_acquire
-from grabowski_agent_sandbox import safe_git_environment
+from grabowski_agent_sandbox import safe_git_repository_environment
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -1430,9 +1430,18 @@ def _contains(parent: str, child: str) -> bool:
     return child == parent or child.startswith(parent + "/")
 
 
+def _workspace_host_git_argv(argv: list[str]) -> list[str]:
+    # Repository diff config may change after preflight but before Git spawn.
+    # Disable external diff/textconv at the Git effect itself, not just in a
+    # separate earlier config readback.
+    if argv[:2] == ["git", "diff"]:
+        return ["git", "diff", "--no-ext-diff", "--no-textconv", *argv[2:]]
+    return argv
+
+
 def _run(cwd: Path, argv: list[str], *, timeout: int = 120) -> dict[str, Any]:
     completed = subprocess.run(
-        argv,
+        _workspace_host_git_argv(argv),
         cwd=cwd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -1440,7 +1449,7 @@ def _run(cwd: Path, argv: list[str], *, timeout: int = 120) -> dict[str, Any]:
         text=True,
         timeout=timeout,
         check=False,
-        env=safe_git_environment(),
+        env=safe_git_repository_environment(cwd),
     )
     return {
         "returncode": completed.returncode,
@@ -1461,7 +1470,7 @@ def _checked(runner: CommandRunner, cwd: Path, argv: list[str], *, label: str) -
 
 def _run_bytes(cwd: Path, argv: list[str], *, timeout: int = 120) -> dict[str, Any]:
     completed = subprocess.run(
-        argv,
+        _workspace_host_git_argv(argv),
         cwd=cwd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -1469,7 +1478,7 @@ def _run_bytes(cwd: Path, argv: list[str], *, timeout: int = 120) -> dict[str, A
         text=False,
         timeout=timeout,
         check=False,
-        env=safe_git_environment(),
+        env=safe_git_repository_environment(cwd),
     )
     return {
         "returncode": completed.returncode,
@@ -4685,7 +4694,7 @@ def _candidate_patch_tree_sha(
         index_path = root / "index"
         patch_copy = root / "candidate.patch"
         patch_copy.write_bytes(patch_bytes)
-        environment = safe_git_environment()
+        environment = safe_git_repository_environment(worktree)
         environment["GIT_INDEX_FILE"] = str(index_path)
 
         def run_index(argv: list[str], *, label: str) -> str:

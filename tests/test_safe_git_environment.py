@@ -62,7 +62,7 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
         self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
-        self.assertEqual(environment["GIT_ALLOW_PROTOCOL"], "ssh:https:file")
+        self.assertEqual(environment["GIT_ALLOW_PROTOCOL"], "ssh:file")
         self.assertNotEqual(environment["GIT_CONFIG_VALUE_0"], "/tmp/attacker/hooks")
         pairs = {
             environment[f"GIT_CONFIG_KEY_{index}"]: environment[f"GIT_CONFIG_VALUE_{index}"]
@@ -160,8 +160,8 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
             marker = root / "fake-git-was-executed"
             fake_git = fake_bin / "git"
             fake_git.write_text(
-                "#!/bin/sh\\n: > " + shlex.quote(str(marker))
-                + "\\nprintf 'attacker git\\n'\\n",
+                "#!/bin/sh\n: > " + shlex.quote(str(marker))
+                + "\nprintf 'attacker git\n'\n",
                 encoding="utf-8",
             )
             fake_git.chmod(0o700)
@@ -176,6 +176,414 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(result.stdout.startswith("git version "), result.stdout)
             self.assertFalse(marker.exists())
+
+    def _two_commit_repo(self, repo: Path, environment: dict[str, str]) -> tuple[str, str]:
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(repo)],
+            env=environment, check=True, capture_output=True, timeout=15,
+        )
+        tracked = repo / "tracked.txt"
+        for index in (1, 2):
+            tracked.write_text(str(index), encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(repo), "add", "tracked.txt"],
+                env=environment, check=True, capture_output=True, timeout=15,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.name=Safe Test",
+                 "-c", "user.email=safe@example.invalid", "commit", "-qm", str(index)],
+                env=environment, check=True, capture_output=True, timeout=15,
+            )
+        head = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            env=environment, timeout=15, text=True,
+        ).strip()
+        parent = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD^"],
+            env=environment, timeout=15, text=True,
+        ).strip()
+        return head, parent
+
+    def test_replace_ref_cannot_rewrite_source_commit_parents(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="safe-git-replace-") as temporary:
+            repo = Path(temporary) / "repo"
+            secure = safe_git_environment()
+            head, parent = self._two_commit_repo(repo, secure)
+            subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.name=Safe Test",
+                 "-c", "user.email=safe@example.invalid", "replace", "--graft", "HEAD"],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            actual = subprocess.run(
+                ["git", "-C", str(repo), "rev-list", "--parents", "-1", "HEAD"],
+                env=secure, text=True, capture_output=True, timeout=15,
+            )
+            self.assertEqual(actual.returncode, 0, actual.stderr)
+            self.assertEqual(actual.stdout.split(), [head, parent])
+
+    def test_graft_file_cannot_rewrite_source_commit_parents(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="safe-git-graft-") as temporary:
+            repo = Path(temporary) / "repo"
+            secure = safe_git_environment()
+            head, parent = self._two_commit_repo(repo, secure)
+            (repo / ".git" / "info" / "grafts").write_text(head + "\n", encoding="ascii")
+            actual = subprocess.run(
+                ["git", "-C", str(repo), "rev-list", "--parents", "-1", "HEAD"],
+                env=secure, text=True, capture_output=True, timeout=15,
+            )
+            self.assertEqual(actual.returncode, 0, actual.stderr)
+            self.assertEqual(actual.stdout.split(), [head, parent])
+            self.assertFalse(actual.stderr, actual.stderr)
+
+    def test_https_system_ca_cannot_be_replaced_from_repository_config(self) -> None:
+        # SSL trust must be fixed at libcurl effect time, even when a
+        # URL-specific local Git config has a different CA bundle.
+        import http.server
+        import shutil
+        import socket
+        import ssl
+        import threading
+
+        if not shutil.which("openssl"):
+            self.skipTest("openssl unavailable for loopback adversarial TLS fixture")
+        with tempfile.TemporaryDirectory(prefix="safe-git-tls-") as temporary:
+            root = Path(temporary)
+            cert, key = root / "rogue.crt", root / "rogue.key"
+            generate = subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                 "-days", "1", "-keyout", str(key), "-out", str(cert),
+                 "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"],
+                capture_output=True, timeout=20,
+            )
+            self.assertEqual(generate.returncode, 0, generate.stderr.decode(errors="replace"))
+            observed = threading.Event()
+
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self) -> None:
+                    observed.set()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"ok\n")
+                def log_message(self, *_: object) -> None:
+                    pass
+
+            try:
+                server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+            except OSError as exc:
+                self.skipTest(f"loopback TLS unavailable: {exc}")
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(str(cert), str(key))
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            server.timeout = 12
+            worker = threading.Thread(target=lambda: _accept_tls_once(server), daemon=True)
+
+            def configure_repo() -> Path:
+                checkout = root / "repo"
+                subprocess.run(
+                    ["git", "init", "-q", str(checkout)],
+                    env=safe_git_environment(), check=True,
+                    capture_output=True, timeout=15,
+                )
+                url = f"https://localhost:{server.server_port}/repo.git"
+                subprocess.run(
+                    ["git", "-C", str(checkout), "config",
+                     f"http.{url}.sslCAInfo", str(cert)],
+                    env=safe_git_environment(), check=True,
+                    capture_output=True, timeout=15,
+                )
+                subprocess.run(
+                    ["git", "-C", str(checkout), "config",
+                     f"http.{url}.sslVerify", "false"],
+                    env=safe_git_environment(), check=True,
+                    capture_output=True, timeout=15,
+                )
+                return checkout, url
+
+            def _accept_tls_once(srv: http.server.HTTPServer) -> None:
+                try:
+                    srv.handle_request()
+                except ssl.SSLError:
+                    pass
+
+            try:
+                checkout, url = configure_repo()
+                worker.start()
+                actual = subprocess.run(
+                    ["git", "-C", str(checkout), "ls-remote", url, "HEAD"],
+                    env=safe_git_environment(), text=True, capture_output=True,
+                    timeout=12,
+                )
+                self.assertNotEqual(actual.returncode, 0)
+                self.assertIn("transport 'https' not allowed", actual.stderr)
+                self.assertFalse(observed.is_set(), "repository CA override reached rogue HTTPS endpoint")
+            finally:
+                server.server_close()
+
+    def test_ssh_config_is_effectively_pinned_without_disabling_github_identity(self) -> None:
+        command = shlex.split(safe_git_environment()["GIT_SSH_COMMAND"])
+        actual = subprocess.run(
+            [*command, "-G", "git@github.com"],
+            env=safe_git_environment(), text=True, capture_output=True, timeout=15,
+        )
+        self.assertEqual(actual.returncode, 0, actual.stderr)
+        settings = dict(
+            line.split(" ", 1)
+            for line in actual.stdout.splitlines()
+            if " " in line
+        )
+        for option in ("-oProxyJump=none", "-oControlPath=none"):
+            self.assertIn(option, command)
+        for key, expected in (
+            ("proxyjump", "none"),
+            ("controlpath", "none"),
+            ("controlmaster", "false"),
+            ("updatehostkeys", "false"),
+            ("forwardagent", "no"),
+            ("forwardx11", "no"),
+        ):
+            self.assertEqual(settings.get(key, "none"), expected, f"{key}={settings.get(key)}")
+        self.assertEqual(
+            settings.get("userknownhostsfile"),
+            str(Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".ssh" / "known_hosts"),
+        )
+
+
+    def test_repository_git_diff_helper_is_not_executed_by_review_diff(self) -> None:
+        # A working adversarial helper must execute in the negative control,
+        # but never along the production review's --no-ext-diff boundary.
+        from grabowski_agent_role import git as review_git
+
+        with tempfile.TemporaryDirectory(prefix="review-git-helper-") as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            safe = safe_git_environment()
+            subprocess.run(
+                ["git", "init", "-q", "-b", "main", str(repo)],
+                env=safe, check=True, capture_output=True, timeout=15,
+            )
+            (repo / ".gitattributes").write_text(
+                "tracked.txt diff=attacker\n", encoding="ascii",
+            )
+            tracked = repo / "tracked.txt"
+            tracked.write_text("before\n", encoding="ascii")
+            subprocess.run(["git", "-C", str(repo), "add", "."],
+                           env=safe, check=True, capture_output=True, timeout=15)
+            identity = ["-c", "user.name=Safe Test", "-c", "user.email=safe@example.invalid"]
+            subprocess.run(["git", "-C", str(repo), *identity, "commit", "-qm", "before"],
+                           env=safe, check=True, capture_output=True, timeout=15)
+            tracked.write_text("after\n", encoding="ascii")
+            subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"],
+                           env=safe, check=True, capture_output=True, timeout=15)
+            subprocess.run(["git", "-C", str(repo), *identity, "commit", "-qm", "after"],
+                           env=safe, check=True, capture_output=True, timeout=15)
+            marker = root / "malicious-helper-ran"
+            helper = root / "malicious-helper"
+            helper.write_text("#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\n",
+                              encoding="utf-8")
+            helper.chmod(0o700)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "diff.attacker.command", str(helper)],
+                env=safe, check=True, capture_output=True, timeout=15,
+            )
+            uncontrolled = subprocess.run(
+                ["git", "-C", str(repo), "diff", "HEAD^", "HEAD", "--", "tracked.txt"],
+                env=safe, text=True, capture_output=True, timeout=15,
+            )
+            self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
+            self.assertTrue(marker.exists(), "adversarial helper must really execute")
+            marker.unlink()
+            with self.assertRaises(RuntimeError):
+                review_git(
+                    repo, "diff", "--binary", "--no-ext-diff",
+                    "--no-textconv", "HEAD^", "HEAD", "--", "tracked.txt",
+                )
+            self.assertFalse(marker.exists(), "review diff executed repository helper")
+
+    def test_repository_ssh_helper_is_not_executed_at_transport_effect(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="review-git-ssh-helper-") as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            subprocess.run(
+                ["git", "init", "-q", str(repo)], env=secure,
+                check=True, capture_output=True, timeout=15,
+            )
+            marker = root / "attacker-ssh-was-executed"
+            helper = root / "attacker-ssh"
+            helper.write_text("#!/bin/sh\n: > " + shlex.quote(str(marker))
+                              + "\nexit 1\n", encoding="utf-8")
+            helper.chmod(0o700)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "core.sshCommand", str(helper)],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            inherited = dict(os.environ)
+            inherited.update({
+                "GIT_SSH_COMMAND": str(helper),
+                "GIT_SSH": str(helper),
+                "SSH_ASKPASS": str(helper),
+                "SSH_AUTH_SOCK": str(root / "attacker-agent.sock"),
+                "HOME": str(root),
+                "PATH": str(root) + ":/usr/bin:/bin",
+                "LD_PRELOAD": str(root / "attacker-loader.so"),
+            })
+            actual = subprocess.run(
+                ["git", "-C", str(repo), "ls-remote",
+                 "ssh://git@127.0.0.1:1/repo.git", "HEAD"],
+                env=safe_git_environment(inherited),
+                text=True, capture_output=True, timeout=15,
+            )
+            self.assertNotEqual(actual.returncode, 0)
+            self.assertFalse(marker.exists(),
+                             "repo or inherited SSH helper executed at transport effect")
+
+    def test_dirty_review_diff_rejects_repository_clean_filter_before_spawn(self) -> None:
+        from grabowski_agent_role import git as review_git
+
+        with tempfile.TemporaryDirectory(prefix="review-git-clean-filter-") as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=attacker\n", encoding="ascii",
+            )
+            marker = root / "attacker-filter-was-executed"
+            helper = root / "attacker-filter"
+            helper.write_text("#!/bin/sh\n: > " + shlex.quote(str(marker))
+                              + "\ncat\n", encoding="utf-8")
+            helper.chmod(0o700)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "filter.attacker.clean", str(helper)],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            (repo / "tracked.txt").write_text("dirty mutation\n", encoding="ascii")
+            with self.assertRaises(RuntimeError):
+                review_git(repo, "diff", "--binary", "--no-ext-diff",
+                           "--no-textconv", "HEAD")
+            self.assertFalse(marker.exists(), "review executed local clean filter")
+
+    def test_workspace_host_git_rejects_repo_filter_before_add_effect(self) -> None:
+        from grabowski_agent_workspace import _run as workspace_run
+
+        with tempfile.TemporaryDirectory(prefix="workspace-git-filter-") as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=attacker\n", encoding="ascii",
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "add", ".gitattributes"],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.name=Safe Test",
+                 "-c", "user.email=safe@example.invalid",
+                 "commit", "-qm", "tracked attributes"],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            marker = root / "workspace-filter-executed"
+            helper = root / "workspace-filter"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+            subprocess.run(
+                ["git", "-C", str(repo), "config",
+                 "filter.attacker.clean", str(helper)],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            (repo / "tracked.txt").write_text("dirty\n", encoding="ascii")
+            uncontrolled = subprocess.run(
+                ["git", "-C", str(repo), "add", "--", "tracked.txt"],
+                env=secure, capture_output=True, timeout=15,
+            )
+            self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
+            self.assertTrue(marker.exists(), "clean-filter negative control did not execute")
+            marker.unlink()
+            with self.assertRaises(RuntimeError):
+                workspace_run(repo, ["git", "add", "--", "tracked.txt"])
+            self.assertFalse(marker.exists(), "workspace host Git executed local filter")
+
+    def test_workspace_host_git_rejects_external_diff_helper_before_spawn(self) -> None:
+        from grabowski_agent_workspace import _run as workspace_run
+
+        with tempfile.TemporaryDirectory(prefix="workspace-external-diff-") as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            marker = root / "external-diff-executed"
+            helper = root / "external-diff"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\nexit 0\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "diff.external", str(helper)],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            (repo / "tracked.txt").write_text("dirty\n", encoding="ascii")
+            uncontrolled = subprocess.run(
+                ["git", "-C", str(repo), "diff", "HEAD"],
+                env=secure, capture_output=True, timeout=15,
+            )
+            self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
+            self.assertTrue(marker.exists(), "external diff negative control did not execute")
+            marker.unlink()
+            with self.assertRaises(RuntimeError):
+                workspace_run(repo, ["git", "diff", "HEAD"])
+            self.assertFalse(marker.exists(), "workspace host Git executed repository diff.external")
+
+
+    def test_workspace_diff_remains_helper_free_when_config_changes_at_spawn(self) -> None:
+        # Reproduce the check/spawn race deterministically without relying on
+        # a timer. The injected helper must not execute in the protected path.
+        from unittest import mock
+        from grabowski_agent_workspace import _run as workspace_run
+
+        with tempfile.TemporaryDirectory(prefix="workspace-diff-race-") as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / "tracked.txt").write_text("dirty mutation\n", encoding="ascii")
+            marker = root / "late-external-diff-executed"
+            helper = root / "late-external-diff"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\nexit 0\n",
+                encoding="utf-8",
+            )
+            helper.chmod(0o700)
+            real_run = subprocess.run
+            injected = False
+
+            def inject_after_admission(argv: list[str], *args: object, **kwargs: object):
+                nonlocal injected
+                if argv[:2] == ["git", "diff"] and not injected:
+                    injected = True
+                    real_run(
+                        ["git", "-C", str(repo), "config", "diff.external", str(helper)],
+                        env=secure, check=True, capture_output=True, timeout=15,
+                    )
+                return real_run(argv, *args, **kwargs)
+
+            with mock.patch("subprocess.run", side_effect=inject_after_admission):
+                protected = workspace_run(repo, ["git", "diff", "HEAD"])
+            self.assertTrue(injected, "the adversarial race was not exercised")
+            self.assertEqual(protected["returncode"], 0, protected["stderr"])
+            self.assertIn("diff --git", protected["stdout"])
+            self.assertFalse(marker.exists(), "late diff.external helper executed")
+            uncontrolled = real_run(
+                ["git", "-C", str(repo), "diff", "HEAD"],
+                env=secure, capture_output=True, timeout=15,
+            )
+            self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
+            self.assertTrue(marker.exists(), "negative control did not run helper")
 
 
 if __name__ == "__main__":

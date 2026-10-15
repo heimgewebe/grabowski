@@ -6314,7 +6314,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(pairs["core.hooksPath"], "/dev/null")
         self.assertEqual(pairs["core.fsmonitor"], "false")
         self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
-        self.assertEqual(environment["GIT_ALLOW_PROTOCOL"], "ssh:https:file")
+        self.assertEqual(environment["GIT_ALLOW_PROTOCOL"], "ssh:file")
         self.assertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
         self.assertNotIn("OTEL_EXPORTER_OTLP_HEADERS", environment)
         self.assertNotIn("OTEL_EXPORTER_OTLP_TRACES_HEADERS", environment)

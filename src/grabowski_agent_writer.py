@@ -11,7 +11,7 @@ import stat
 import sys
 from typing import Any
 
-from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_environment, run_bounded_capture
+from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_repository_environment, run_bounded_capture
 
 SHA40 = __import__("re").compile(r"^[0-9a-f]{40}$")
 SHA256 = __import__("re").compile(r"^[0-9a-f]{64}$")
@@ -40,7 +40,7 @@ def _git(repo: Path, *args: str) -> str:
         errors="surrogateescape",
         timeout=30,
         check=False,
-        env=safe_git_environment(),
+        env=safe_git_repository_environment(repo),
     )
     if completed.returncode != 0:
         raise RuntimeError((completed.stderr or completed.stdout or "git failed").strip())
@@ -55,7 +55,7 @@ def _git_bytes(repo: Path, *args: str) -> bytes:
         stderr=subprocess.PIPE,
         timeout=30,
         check=False,
-        env=safe_git_environment(),
+        env=safe_git_repository_environment(repo),
     )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or b"git failed").decode(

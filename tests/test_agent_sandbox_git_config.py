@@ -53,13 +53,19 @@ class AgentSandboxGitConfigTests(unittest.TestCase):
                     (
                         "core.sshCommand",
                         "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none "
+                        "-oProxyJump=none -oControlMaster=no -oControlPath=none "
+                        "-oControlPersist=no -oForwardAgent=no -oForwardX11=no "
                         "-oPermitLocalCommand=no -oClearAllForwardings=yes "
+                        "-oUpdateHostKeys=no -oKnownHostsCommand=none "
+                        "-oUserKnownHostsFile=~/.ssh/known_hosts "
                         "-oStrictHostKeyChecking=yes",
                     ),
                     ("core.askPass", "/bin/false"),
                     ("credential.helper", ""),
                     ("http.proxy", ""),
                     ("http.sslVerify", "true"),
+                    ("http.sslCAInfo", "/etc/ssl/certs/ca-certificates.crt"),
+                    ("http.sslCAPath", "/etc/ssl/certs"),
                 )
                 self.assertEqual(
                     environment["GIT_CONFIG_COUNT"], str(len(expected_overrides))
@@ -72,6 +78,14 @@ class AgentSandboxGitConfigTests(unittest.TestCase):
                     for index in range(len(expected_overrides))
                 )
                 self.assertEqual(actual_overrides, expected_overrides)
+                for key, expected in (
+                    ("GIT_ALLOW_PROTOCOL", "ssh:file"),
+                    ("GIT_NO_REPLACE_OBJECTS", "1"),
+                    ("GIT_GRAFT_FILE", "/dev/null/grabowski-disabled-grafts"),
+                    ("GIT_SSL_CAINFO", "/etc/ssl/certs/ca-certificates.crt"),
+                    ("GIT_SSL_CAPATH", "/etc/ssl/certs"),
+                ):
+                    self.assertEqual(environment[key], expected)
                 self.assertNotIn("GIT_CONFIG_GLOBAL", environment)
                 self.assertNotIn("GIT_CONFIG_NOSYSTEM", environment)
 
