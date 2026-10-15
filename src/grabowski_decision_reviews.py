@@ -90,7 +90,7 @@ _VERDICTS = frozenset({"PASS_THIS_REVISION", "REJECT_THIS_REVISION"})
 # Only the observed human-readable no-inference quota response is an
 # infrastructure error. Unknown message shapes are ambiguous, never review PASS.
 _CLAUDE_QUOTA_RESULT_RE = re.compile(
-    r"(?:You've hit your weekly limit"
+    r"\A(?:You've hit your weekly limit"
     r"(?: · resets (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
     r"(?:[1-9]|[12][0-9]|3[01]), "
     r"(?:[1-9]|1[0-2])(?::[0-5][0-9])?(?:am|pm) \(UTC\))?"

@@ -71,6 +71,10 @@ class SessionQuotaV2Tests(unittest.TestCase):
 
     def test_session_quota_near_misses_are_invalid_despite_later_pass(self):
         messages = [
+            "REJECT_THIS_REVISION " + SESSION,
+            "PASS_THIS_REVISION " + SESSION,
+            "x" + SESSION,
+            "\u200b" + SESSION,
             "You've hit your session limit",
             "You've hit your session limit · resets",
             "You've hit your session limit · resets 9:30am",
@@ -105,6 +109,15 @@ class SessionQuotaV2Tests(unittest.TestCase):
                 self.assertIn(
                     "decision_review_result_invalid:grabowski-job-a88888888888:InvalidReviewDocument",
                     out["errors"],
+                )
+
+    def test_quota_regex_rejects_prefix_even_for_future_search_callers(self):
+        # Reconciliation currently uses fullmatch. The regex itself must still
+        # be independently start-anchored against future match/search refactors.
+        for prefix in ("REJECT_THIS_REVISION ", "PASS_THIS_REVISION ", "x", "\u200b"):
+            with self.subTest(prefix=prefix):
+                self.assertIsNone(
+                    fixtures.reviews._CLAUDE_QUOTA_RESULT_RE.search(prefix + SESSION)
                 )
 
     def test_session_quota_zero_inference_provenance_fences(self):
