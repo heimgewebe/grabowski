@@ -1110,6 +1110,37 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
 
 
+    def test_lane_candidate_staging_uses_verified_patch_bytes_after_path_swap(self) -> None:
+        _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
+        writer_result = collection["writer_result"]
+        patch_path = Path(writer_result["path"])
+        original = patch_path.read_bytes()
+        expected_git_tree = workspace._candidate_patch_tree_sha(manifest, collection, candidate)
+        real_run = subprocess.run
+        observed = []
+
+        def swap_before_git_effect(argv: list[str], *args: object, **kwargs: object):
+            if argv[:1] == ["/usr/bin/git"] and "apply" in argv:
+                observed.append(bytes(kwargs["input"]))
+                patch_path.write_bytes(b"malicious replacement after digest verification\\n")
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(workspace.subprocess, "run", side_effect=swap_before_git_effect):
+            tree = workspace._stage_candidate_for_adoption(manifest, collection, candidate)
+
+        self.assertEqual(observed, [original], "verified bytes must reach Git through stdin")
+        self.assertNotEqual(patch_path.read_bytes(), original)
+        self.assertEqual(tree, expected_git_tree)
+        self.assertEqual(
+            run(self.git.writer, "git", "write-tree"),
+            expected_git_tree,
+        )
+        self.assertEqual(
+            run(self.git.writer, "git", "rev-parse", "HEAD"),
+            candidate["base_head"],
+            "staging must not mutate HEAD",
+        )
+
     def test_lane_candidate_adoption_rejects_staged_content_drift_after_freeze(self) -> None:
         _lane, manifest, collection, candidate, _closed = self.closed_lane_candidate_fixture()
         before_head = run(self.git.writer, "git", "rev-parse", "HEAD")

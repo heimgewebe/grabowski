@@ -4785,13 +4785,29 @@ def _stage_candidate_for_adoption(
         or hashlib.sha256(patch_bytes).hexdigest() != candidate.get("patch_sha256")
     ):
         raise AgentWorkspaceError("immutable Candidate patch changed before staging")
-    _checked(
-        _run,
-        worktree,
-        ["git", "apply", "--cached", "--binary", "--whitespace=nowarn",
-         "--", str(writer_result["path"])],
-        label="candidate adoption cached patch stage",
-    )
+    # Feed the verified bytes directly to Git, not a filename which can be
+    # switched after digest verification and before the Git process opens it.
+    # Git apply --cached operates on the index without clean/smudge filters.
+    try:
+        applied = subprocess.run(
+            ["/usr/bin/git", "-C", str(worktree), "apply", "--cached",
+             "--binary", "--whitespace=nowarn", "-"],
+            input=patch_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            env=safe_git_repository_environment(worktree),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AgentWorkspaceError("candidate adoption cached patch stage unavailable") from exc
+    if applied.returncode != 0 or applied.stdout or applied.stderr:
+        detail = (applied.stderr or applied.stdout or b"git apply failed").decode(
+            "utf-8", errors="replace"
+        ).strip()
+        raise AgentWorkspaceError(
+            f"candidate adoption cached patch stage failed: {detail[:2000]}"
+        )
     staged = _checked_bytes(
         worktree,
         ["git", "diff", "--cached", "--name-only", "-z", "--no-renames"],
