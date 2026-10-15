@@ -62,12 +62,17 @@ frozen inputs or provider credentials. This profile is intentionally
 **not** suitable for a benchmark dispatch, because HOME and temporary
 directories can share the same underlying /run tmpfs.
 
-The no-provider probe remains limited to 30 seconds. A future live unit
-has `RuntimeMaxSec=4500` (75 minutes): this allows the runner's maximum
-3600-second provider wall budget plus 900 seconds for initialization,
-postflight readback and evidence finalization. This is a hard service
-lifetime bound, **not** a guarantee that a stalled finalizer can finish.
-A provider run still requires separate one-shot authorization.
+The no-provider probe remains limited to 30 seconds. The current live
+launcher uses `RuntimeMaxSec=7200` (120 minutes). Its static allowance
+consists of the maximum 3,600-second provider wall budget, up to twenty
+120-second bounded Git phases, four 90-second isolated readbacks, a
+30-second tree inspection, 10-second login check, 25-second sandbox
+check, 300 seconds for cleanup, and a remaining 475-second scheduling/
+ledger margin. This is the configured whole-service hard limit, **not**
+proof that every possible production preflight and finalizer path fits
+within it. That requires a separately authorized full live-runtime
+qualification. A provider run still requires separate one-shot
+authorization.
 
 For a future live plan, the launcher instead uses StateDirectory
 on persistent host storage, with four mode-0700 dynamic UID leaves.
