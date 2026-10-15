@@ -103,6 +103,21 @@ def trusted_seccomp_library():
     raise RuntimeError("trusted kernel socket filter library unavailable")
 
 def deny_unix(block_network=False):
+    # The trusted runner and provider may have the same UID. Force a separate
+    # session for login/probe subprocesses as well as the live provider. The
+    # live Popen already uses start_new_session=True; never join its parent's
+    # session, and fail closed if we cannot establish that separation.
+    trusted_parent = os.getppid()
+    if trusted_parent <= 1:
+        raise RuntimeError("trusted signal parent is unavailable")
+    try:
+        trusted_parent_group = os.getpgid(trusted_parent)
+        if os.getpgrp() == trusted_parent_group:
+            os.setsid()
+        if os.getpgrp() == trusted_parent_group:
+            raise RuntimeError("provider shares trusted parent process group")
+    except OSError as exc:
+        raise RuntimeError("trusted parent signal isolation unavailable") from exc
     library = trusted_seccomp_library()
     seccomp = ctypes.CDLL(library, use_errno=True)
     class Compare(ctypes.Structure):
@@ -177,17 +192,36 @@ def deny_unix(block_network=False):
                 context, error_action, syscall, 0,
             ) != 0:
                 raise RuntimeError("unable to deny kernel process introspection")
-        # Untrusted Codex shares the trusted runner's UID. Even nondumpable
-        # parents accept same-UID SIGKILL after one-shot provider intent.
-        for name in (
-            b"kill", b"tkill", b"tgkill", b"rt_sigqueueinfo",
-            b"rt_tgsigqueueinfo", b"pidfd_send_signal",
-        ):
+        # Do not deny ALL child-management signals: Codex must still stop its
+        # own commands and process groups on timeout/cancellation. A separate
+        # session makes kill(0) local to the provider. The original parent's
+        # PID and process-group target, plus broadcast kill(-1), are forbidden.
+        # pid_t/tgid are 32-bit arguments; mask before comparison so high
+        # syscall-register bits cannot bypass the filter.
+        protected_targets = (
+            (b"kill", (trusted_parent, -trusted_parent_group, -1)),
+            (b"tgkill", (trusted_parent,)),
+            (b"rt_sigqueueinfo", (trusted_parent,)),
+            (b"rt_tgsigqueueinfo", (trusted_parent,)),
+        )
+        for name, targets in protected_targets:
+            syscall = seccomp.seccomp_syscall_resolve_name(name)
+            if syscall < 0:
+                raise RuntimeError("unable to identify provider signal syscall")
+            for target in sorted({item & 0xffffffff for item in targets}):
+                if seccomp.seccomp_rule_add(
+                    context, error_action, syscall, 1,
+                    Compare(0, 7, 0xffffffff, target),
+                ) != 0:
+                    raise RuntimeError("unable to deny provider-to-parent signals")
+        # tkill addresses a raw TID and pidfd_send_signal addresses an opaque
+        # FD; seccomp cannot safely prove either is not a trusted runner thread.
+        for name in (b"tkill", b"pidfd_send_signal"):
             syscall = seccomp.seccomp_syscall_resolve_name(name)
             if syscall < 0 or seccomp.seccomp_rule_add(
                 context, error_action, syscall, 0,
             ) != 0:
-                raise RuntimeError("unable to deny provider-to-parent signals")
+                raise RuntimeError("unable to deny opaque provider signals")
         libc = ctypes.CDLL(None, use_errno=True)
         libc.prctl.argtypes = [
             ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,

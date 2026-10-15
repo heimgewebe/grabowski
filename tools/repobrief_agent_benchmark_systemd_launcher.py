@@ -96,8 +96,12 @@ def unit_argv(
         "ProtectControlGroups=yes",
         "MemoryMax=512M",
         "TasksMax=128",
-        # 3600s maximum provider wall time plus bounded setup and postflight.
-        f"RuntimeMaxSec={30 if probe else 4500}",
+        # The limit covers the entire root service, not just Codex: 3600s
+        # provider wall, 20 x 120s Git-stage allowance, 4 x 90s isolated
+        # readbacks, 30s tree scan, 10s login, 25s sandbox, 300s cleanup
+        # and 475s for ledger finalization / scheduling. Never let systemd
+        # kill the ledger writer immediately after a valid provider intent.
+        f"RuntimeMaxSec={30 if probe else 7200}",
     ]
     if not probe:
         properties.extend(

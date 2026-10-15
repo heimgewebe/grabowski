@@ -160,8 +160,12 @@ class RootSystemdLauncherTests(unittest.TestCase):
             launcher.unit_argv("longwall", ["/usr/bin/true"], probe=False)
         )
         self.assertEqual(probe["RuntimeMaxSec"], "30")
-        self.assertGreaterEqual(int(live["RuntimeMaxSec"]), 3600 + 600)
-        self.assertLessEqual(int(live["RuntimeMaxSec"]), 7200)
+        # Full service lifetime: provider + at most twenty 120s Git phases
+        # spanning preflight/checkout/postflight, four 90s isolated readbacks,
+        # source tree, login, sandbox, and 300s ledger/cleanup allowance.
+        min_service_seconds = 3600 + (20 * 120) + (4 * 90) + 30 + 10 + 25 + 300
+        self.assertGreaterEqual(int(live["RuntimeMaxSec"]), min_service_seconds)
+        self.assertEqual(int(live["RuntimeMaxSec"]), 7200)
 
     def test_no_host_shared_dev_shm_mount_alias(self) -> None:
         for mode in (True, False):

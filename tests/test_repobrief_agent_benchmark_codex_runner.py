@@ -3083,6 +3083,37 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(b"RAB_PARENT_SIGNALS_DENIED", completed.stdout)
 
+    def test_filtered_codex_can_signal_only_its_own_process_group(self) -> None:
+        # A real-kernel subprocess cancellation probe, never a model call.
+        # The provider must be separated from its trusted parent's session.
+        child = (
+            "import errno,os,signal,subprocess\n"
+            "parent=os.getppid()\n"
+            "assert os.getpgrp()!=os.getpgid(parent), 'parent group shared'\n"
+            "for target in (parent, -os.getpgid(parent), -1):\n"
+            " try: os.kill(target, 0)\n"
+            " except OSError as exc: assert exc.errno==errno.EPERM, exc\n"
+            " else: raise RuntimeError('trusted parent target permitted')\n"
+            "for grouped in (False, True):\n"
+            " child=subprocess.Popen(['/usr/bin/sleep','2'], start_new_session=grouped)\n"
+            " try:\n"
+            "  os.kill(-child.pid if grouped else child.pid, signal.SIGTERM)\n"
+            "  assert child.wait(timeout=3)==-signal.SIGTERM\n"
+            " finally:\n"
+            "  if child.poll() is None: child.wait(timeout=4)\n"
+            "print('TRUSTED_PARENT_DENIED_CHILD_CANCELLATION_WORKS')\n"
+        )
+        command = runner._unix_socket_restricted_codex_argv(
+            [sys.executable, "-I", "-c", child]
+        )
+        completed = subprocess.run(
+            command, capture_output=True, timeout=12, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(
+            b"TRUSTED_PARENT_DENIED_CHILD_CANCELLATION_WORKS", completed.stdout
+        )
+
     def test_unix_socket_seccomp_fails_before_child_exec_when_library_missing(
         self,
     ) -> None:
