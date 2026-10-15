@@ -141,6 +141,15 @@ _RUNTIME_PROOF_CACHE: ContextVar[dict[tuple[str, str, str], bool] | None] = Cont
 _CAPTAIN_RUNTIME_RELEASE_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar(
     "grabowski_captain_runtime_release_scope", default=None
 )
+# A successful R3/CI review or a user-hashable ContextVar mapping cannot mint a
+# Captain action. An accepted Captain dispatcher issues a single-use, in-process
+# object identity after its server-authenticated gates have passed. The active
+# origin is revoked when the corresponding source dispatch scope exits.
+_CAPTAIN_ACCEPTED_ACTION: ContextVar[tuple[object, str, int, dict[str, Any], str] | None] = ContextVar(
+    "grabowski_captain_accepted_action", default=None
+)
+_CAPTAIN_PENDING_ACTION_MARKERS: set[object] = set()
+_CAPTAIN_ACTIVE_ACTION_MARKERS: set[object] = set()
 
 
 class BlueGreenCutoverError(RuntimeError):
@@ -5714,30 +5723,160 @@ def _release_documentation_raw_paths(raw_records: str) -> list[str]:
 
 
 @contextmanager
+def _accepted_captain_runtime_action(
+    expected_head: str,
+    release_review_pr: int,
+    *,
+    server_actor_identity: dict[str, Any],
+    execution_intent_sha256: str,
+    accepted_dispatch_ticket: object | None = None,
+) -> Iterator[None]:
+    """Bind a *server-authenticated* Captain executor, after its accepted gates.
+
+    Only the approved captain-run dispatcher may enter this private issuance
+    seam. The signed actor identity proves server provenance, not a Captain
+    decision by itself; the caller must separately have passed the exact
+    Captain action, evidence and execution-intent gates.
+    """
+    import grabowski_grips as grips
+    import grabowski_merge_guard as merge_guard
+
+    # The one-use ticket is issued *only* by the accepted Captain-run path,
+    # after its full action/CI/R3/execution-intent gates have passed. A signed
+    # generic operator actor or hashable user-supplied binding cannot mint it.
+    if not grips._consume_accepted_runtime_ticket(
+        accepted_dispatch_ticket,
+        expected_head,
+        release_review_pr,
+        execution_intent_sha256,
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: accepted Captain dispatch ticket missing"
+        )
+    try:
+        actor = merge_guard.verify_server_runtime_actor_identity(
+            server_actor_identity
+        )
+    except (TypeError, ValueError) as exc:
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: server Captain actor origin invalid"
+        ) from exc
+    if (
+        not isinstance(expected_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None
+        or type(release_review_pr) is not int
+        or release_review_pr <= 0
+        or not isinstance(execution_intent_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", execution_intent_sha256) is None
+        or not isinstance(actor.get("owner_id"), str)
+        or not actor["owner_id"].startswith("runtime-actor:")
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: accepted Captain action identity malformed"
+        )
+    marker = object()
+    _CAPTAIN_PENDING_ACTION_MARKERS.add(marker)
+    context = (marker, expected_head, release_review_pr,
+               dict(server_actor_identity), execution_intent_sha256)
+    reset = _CAPTAIN_ACCEPTED_ACTION.set(context)
+    try:
+        yield
+    finally:
+        _CAPTAIN_ACCEPTED_ACTION.reset(reset)
+        _CAPTAIN_PENDING_ACTION_MARKERS.discard(marker)
+
+
+def _accepted_captain_origin_matches(expected_head: str, review_pr: int) -> bool:
+    context = _CAPTAIN_ACCEPTED_ACTION.get()
+    return bool(
+        isinstance(context, tuple)
+        and len(context) == 5
+        and context[0] in _CAPTAIN_PENDING_ACTION_MARKERS
+        and context[1] == expected_head
+        and context[2] == review_pr
+    )
+
+
+def _active_captain_origin_valid(scope: Any, expected_head: str) -> bool:
+    """Re-admit the exact still-active Captain action, not a copied token."""
+    if not isinstance(scope, dict) or scope.get("target_head") != expected_head:
+        return False
+    accepted = _CAPTAIN_ACCEPTED_ACTION.get()
+    if not isinstance(accepted, tuple) or len(accepted) != 5:
+        return False
+    marker, accepted_head, accepted_review_pr, accepted_actor, accepted_intent = accepted
+    if (
+        accepted_head != expected_head
+        or scope.get("accepted_action_marker") is not marker
+        or scope.get("review_pr") != accepted_review_pr
+        or scope.get("execution_intent_sha256") != accepted_intent
+    ):
+        return False
+    try:
+        if marker not in _CAPTAIN_ACTIVE_ACTION_MARKERS:
+            return False
+        import grabowski_merge_guard as merge_guard
+
+        actor = merge_guard.verify_server_runtime_actor_identity(
+            scope.get("server_actor_identity")
+        )
+        origin_actor = merge_guard.verify_server_runtime_actor_identity(
+            accepted_actor
+        )
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        actor["identity_sha256"] == origin_actor["identity_sha256"]
+        and scope.get("server_actor_identity_sha256") == actor["identity_sha256"]
+        and isinstance(accepted_intent, str)
+        and re.fullmatch(r"[0-9a-f]{64}", accepted_intent) is not None
+    )
+
+
+@contextmanager
 def _captain_release_scope(
     expected_head: str, release_review_pr: int,
 ) -> Iterator[None]:
-    """Ephemeral Captain-only bridge; no direct-scheduler release override."""
-    reviewed = _require_release_source_admission(
+    """One-use accepted Captain action, not a direct callable review override."""
+    if not _accepted_captain_origin_matches(expected_head, release_review_pr):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: authentic accepted Captain action origin missing"
+        )
+    accepted = _CAPTAIN_ACCEPTED_ACTION.get()
+    assert accepted is not None
+    marker, _, _, server_actor_identity, intent_sha256 = accepted
+    _CAPTAIN_PENDING_ACTION_MARKERS.remove(marker)
+    _CAPTAIN_ACTIVE_ACTION_MARKERS.add(marker)
+    try:
+        reviewed = _require_release_source_admission(
         expected_head,
         release_review_pr=release_review_pr,
         captain_preview=True,
     )
-    if reviewed.get("independent_review_required") is not True:
-        yield
-        return
-    binding = {
-        "target_head": expected_head,
-        "review_pr": release_review_pr,
-        "serving_head": reviewed["serving_head"],
-        "serving_release_id": reviewed["serving_release_id"],
-        "identity_sha256": reviewed["release_review_identity_sha256"],
-    }
-    reset = _CAPTAIN_RUNTIME_RELEASE_SCOPE.set(binding)
-    try:
-        yield
+        if reviewed.get("independent_review_required") is not True:
+            yield
+            return
+        import grabowski_merge_guard as merge_guard
+
+        actor = merge_guard.verify_server_runtime_actor_identity(server_actor_identity)
+        binding = {
+            "target_head": expected_head,
+            "review_pr": release_review_pr,
+            "serving_head": reviewed["serving_head"],
+            "serving_release_id": reviewed["serving_release_id"],
+            "identity_sha256": reviewed["release_review_identity_sha256"],
+            "accepted_action_marker": marker,
+            "server_actor_identity": server_actor_identity,
+            "server_actor_identity_sha256": actor["identity_sha256"],
+            "execution_intent_sha256": intent_sha256,
+        }
+        reset = _CAPTAIN_RUNTIME_RELEASE_SCOPE.set(binding)
+        try:
+            yield
+        finally:
+            _CAPTAIN_RUNTIME_RELEASE_SCOPE.reset(reset)
     finally:
-        _CAPTAIN_RUNTIME_RELEASE_SCOPE.reset(reset)
+        _CAPTAIN_ACTIVE_ACTION_MARKERS.discard(marker)
 
 
 def _require_release_source_admission(
@@ -5895,8 +6034,7 @@ def _require_release_source_admission(
         scope = _CAPTAIN_RUNTIME_RELEASE_SCOPE.get()
         if not captain_preview:
             if (
-                not isinstance(scope, dict)
-                or scope.get("target_head") != expected_head
+                not _active_captain_origin_valid(scope, expected_head)
                 or type(scope.get("review_pr")) is not int
                 or scope["review_pr"] <= 0
             ):

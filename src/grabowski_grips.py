@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import Counter
@@ -14,7 +15,7 @@ import stat as statmod
 import subprocess
 import sys
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from urllib.parse import quote, urlsplit
 
 import grabowski_repobrief
@@ -16680,6 +16681,19 @@ def _run_captain_runtime_deploy(
         execution_result["preflight_errors"] = target_errors
         execution_result["verification_error"] = "; ".join(target_errors)
         return execution_result
+    review_pr = parameters.get("release_review_pr")
+    if type(review_pr) is int and review_pr > 0:
+        from grabowski_self_deploy import _accepted_captain_origin_matches
+
+        if not _accepted_captain_origin_matches(expected_head, review_pr):
+            execution_result["preflight_errors"] = [
+                "accepted_captain_action_origin_missing"
+            ]
+            execution_result["verification_error"] = (
+                "runtime deploy refused before scheduling: no authenticated "
+                "accepted Captain action origin"
+            )
+            return execution_result
     try:
         preflight = (
             _runtime_deploy_self_preflight(expected_head)
@@ -18030,6 +18044,110 @@ def _run_captain_preflight(
     return grabowski_grip_orchestration.run_captain_preflight(sys.modules[__name__], spec, parameters, receipt, runner)
 
 
+# The authenticated Captain-run path, not a caller-supplied digest or the
+# general operator actor, owns issuance after *all* action gates pass.
+# Tickets are Python object identities and can be consumed exactly once.
+_CAPTAIN_ACCEPTED_RUNTIME_TICKETS: dict[object, tuple[str, int, str]] = {}
+
+# The MCP admission frontdoor issues this origin *after* session policy and
+# durable Captain intent audit succeed. A generic server-signed operator actor,
+# a caller-hashable PR payload or valid R3 alone never constitutes acceptance.
+_SERVER_CAPTAIN_INGRESS: ContextVar[tuple[object, str, str, str] | None] = ContextVar(
+    "grabowski_server_captain_ingress", default=None
+)
+_SERVER_CAPTAIN_INGRESS_ACTIVE: set[object] = set()
+# A non-serializable, single-use ticket is minted by the accepted MCP dispatch,
+# not by this contextmanager from hashable actor/audit metadata.
+_CAPTAIN_MCP_INGRESS_TICKETS: dict[object, tuple[str, str, str]] = {}
+
+
+@contextmanager
+def _server_captain_dispatch_scope(
+    parameters: dict[str, Any],
+    server_actor_identity: dict[str, Any],
+    intent_audit: dict[str, Any],
+    *,
+    mcp_ticket: object | None = None,
+) -> Iterator[None]:
+    """Server-only ingress, never serialized as user-controlled parameters."""
+    actor = grabowski_merge_guard.verify_server_runtime_actor_identity(
+        server_actor_identity
+    )
+    audit_digest = (
+        intent_audit.get("audit_record_sha256")
+        if isinstance(intent_audit, dict)
+        and intent_audit.get("audit_chain_valid") is True
+        else None
+    )
+    if not _is_hex_sha(audit_digest, lengths=(64,)):
+        raise GripPreflightError(
+            "accepted Captain dispatch requires server intent audit"
+        )
+    request_digest = grabowski_merge_guard.captain_request_sha256(parameters)
+    # An internal caller can invent an audit-looking mapping and request its
+    # own generic signed actor identity. Only the actual server-frontdoor
+    # accepted action may mint a ticket, once, for this exact request.
+    if type(mcp_ticket) is not object:
+        raise GripPreflightError(
+            "accepted Captain MCP ingress ticket is missing"
+        )
+    issued = _CAPTAIN_MCP_INGRESS_TICKETS.pop(mcp_ticket, None)
+    if issued != (
+        actor["identity_sha256"], request_digest, audit_digest
+    ):
+        raise GripPreflightError(
+            "accepted Captain MCP ingress ticket is invalid or already consumed"
+        )
+    marker = object()
+    _SERVER_CAPTAIN_INGRESS_ACTIVE.add(marker)
+    reset = _SERVER_CAPTAIN_INGRESS.set((
+        marker, actor["identity_sha256"], request_digest, audit_digest
+    ))
+    try:
+        yield
+    finally:
+        _SERVER_CAPTAIN_INGRESS.reset(reset)
+        _SERVER_CAPTAIN_INGRESS_ACTIVE.discard(marker)
+
+
+def _server_captain_dispatch_admitted(parameters: dict[str, Any]) -> bool:
+    scope = _SERVER_CAPTAIN_INGRESS.get()
+    if not isinstance(scope, tuple) or len(scope) != 4:
+        return False
+    try:
+        if scope[0] not in _SERVER_CAPTAIN_INGRESS_ACTIVE:
+            return False
+        actor = grabowski_merge_guard.verify_server_runtime_actor_identity(
+            parameters.get("_server_runtime_actor_identity")
+        )
+        request_digest = grabowski_merge_guard.captain_request_sha256(parameters)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        scope[1] == actor["identity_sha256"]
+        and scope[2] == request_digest
+        and _is_hex_sha(scope[3], lengths=(64,))
+    )
+
+
+
+def _consume_accepted_runtime_ticket(
+    ticket: object | None,
+    expected_head: str,
+    release_review_pr: int,
+    execution_intent_sha256: str,
+) -> bool:
+    if ticket is None:
+        return False
+    try:
+        recorded = _CAPTAIN_ACCEPTED_RUNTIME_TICKETS.pop(ticket, None)
+    except TypeError:
+        return False
+    return recorded == (
+        expected_head, release_review_pr, execution_intent_sha256
+    )
+
+
 def _run_captain_run(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -18038,16 +18156,69 @@ def _run_captain_run(
     github_runner: GithubRunner,
 ) -> dict[str, Any]:
     import grabowski_resources as resources
+    from contextlib import nullcontext
 
-    return grabowski_grip_orchestration.run_captain_run(
-        sys.modules[__name__],
-        spec,
-        parameters,
-        receipt,
-        runner,
-        github_runner,
-        resources,
-    )
+    # Only an authenticated accepted Captain invocation can mint an ephemeral
+    # release origin. The real Captain executor independently repeats every
+    # gate before it dispatches; a preview, CI, R3 record, or ordinary
+    # operator action is never a release capability.
+    origin = nullcontext()
+    ticket: object | None = None
+    try:
+        actions = _captain_actions(parameters)
+        if (
+            len(actions) == 1
+            and actions[0]["action"] == "runtime-deploy"
+            and parameters.get("allow_execution") is True
+            and type(parameters.get("release_review_pr")) is int
+            and parameters["release_review_pr"] > 0
+        ):
+            gates, _projection = _captain_authority_gates(parameters, actions)
+            intent, errors = _captain_execution_intent_review(parameters, actions)
+            if (
+                not _captain_blocked_reasons(gates)
+                and not errors
+                and _server_captain_dispatch_admitted(parameters)
+            ):
+                from grabowski_self_deploy import _accepted_captain_runtime_action
+
+                target_head = _runtime_deploy_expected_head(parameters)
+                ticket = object()
+                _CAPTAIN_ACCEPTED_RUNTIME_TICKETS[ticket] = (
+                    target_head,
+                    parameters["release_review_pr"],
+                    intent["intent_sha256"],
+                )
+                origin = _accepted_captain_runtime_action(
+                    target_head,
+                    parameters["release_review_pr"],
+                    server_actor_identity=parameters.get(
+                        "_server_runtime_actor_identity"
+                    ),
+                    execution_intent_sha256=intent["intent_sha256"],
+                    accepted_dispatch_ticket=ticket,
+                )
+    except (GripPreflightError, RuntimeError, TypeError, ValueError):
+        # No origin is issued on uncertainty. The canonical Captain runner
+        # remains responsible for reporting its authoritative gate verdict.
+        origin = nullcontext()
+
+    try:
+        with origin:
+            return grabowski_grip_orchestration.run_captain_run(
+                sys.modules[__name__],
+                spec,
+                parameters,
+                receipt,
+                runner,
+                github_runner,
+                resources,
+            )
+    finally:
+        # A blocked/rejected/unknown run can never leave a reusable Captain
+        # capability for a later unrelated operator action.
+        if ticket is not None:
+            _CAPTAIN_ACCEPTED_RUNTIME_TICKETS.pop(ticket, None)
 
 
 def _run_forrest_server_exit_apply(

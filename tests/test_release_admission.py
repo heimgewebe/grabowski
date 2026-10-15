@@ -433,11 +433,13 @@ class DirectSchedulerDenialTests(unittest.TestCase):
             "release_review_identity_sha256": "a" * 64,
         }
         self.assertIsNone(deploy._CAPTAIN_RUNTIME_RELEASE_SCOPE.get())
+        # A completed independent R3/CI review alone is not an accepted
+        # Captain dispatch. The old expectation minted a critical source
+        # release scope directly from this caller-provided review record.
         with patch.object(deploy, "_require_release_source_admission", return_value=record):
-            with deploy._captain_release_scope(TARGET, 1452):
-                state = deploy._CAPTAIN_RUNTIME_RELEASE_SCOPE.get()
-                self.assertEqual(TARGET, state["target_head"])
-                self.assertEqual(1452, state["review_pr"])
+            with self.assertRaisesRegex(RuntimeError, "accepted Captain action"):
+                with deploy._captain_release_scope(TARGET, 1452):
+                    self.fail("R3-only data cannot authorize a release scope")
         self.assertIsNone(deploy._CAPTAIN_RUNTIME_RELEASE_SCOPE.get())
 
 
