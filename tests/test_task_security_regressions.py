@@ -1735,6 +1735,38 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         finally:
             writer.close()
 
+    def test_wal_child_startup_failure_reports_only_bounded_reason(self) -> None:
+        """A dead WAL helper identifies the failing boundary without raw child stderr."""
+        import os
+        import time
+        from types import SimpleNamespace
+
+        output_read, output_write = os.pipe()
+        error_read, error_write = os.pipe()
+        try:
+            os.write(
+                error_write,
+                b"bwrap: loopback: Failed to create NETLINK_ROUTE socket: "
+                b"Address family not supported by protocol PRIVATE_SENTINEL\n",
+            )
+        finally:
+            os.close(output_write)
+            os.close(error_write)
+        with (
+            os.fdopen(output_read, "rb", buffering=0) as output,
+            os.fdopen(error_read, "rb", buffering=0) as errors,
+        ):
+            child = SimpleNamespace(
+                stdout=output, stderr=errors, poll=lambda: 1,
+            )
+            with self.assertRaisesRegex(ValueError, "sandbox-network") as caught:
+                tasks.resources.sqlite_store._WALReadConnection(
+                    child,
+                    deadline=time.monotonic() + 2,
+                    error_type=tasks.resources.ResourceSchemaInventoryChanged,
+                )
+            self.assertNotIn("PRIVATE_SENTINEL", str(caught.exception))
+
     def test_wal_snapshot_closes_sqlite_child_before_releasing_wal(self) -> None:
         """A successful bounded WAL read should close its helper normally."""
         import sqlite3

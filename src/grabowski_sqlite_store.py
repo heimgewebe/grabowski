@@ -294,6 +294,39 @@ class _WALReadConnection:
             if not selector.select(remaining):
                 raise TimeoutError("Scoped WAL preauthorization timed out")
 
+    def _child_eof_diagnostic(self) -> str:
+        """Report a fixed failure class, never raw child stderr or state paths.
+
+        A broken bwrap/namespace setup must remain an authorization failure,
+        but a bare EOF is insufficient to distinguish it from SQLite errors.
+        Reading at most one nonblocking stderr sample avoids a new pipe hang.
+        """
+        status = self.process.poll()
+        captured = b""
+        if self.process.stderr is not None:
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(self.process.stderr, selectors.EVENT_READ)
+                    if selector.select(0):
+                        captured = os.read(self.process.stderr.fileno(), 4096)
+            except (OSError, ValueError):
+                pass
+        category = "unknown"
+        if b"bwrap:" in captured:
+            if b"NETLINK_ROUTE" in captured or b"loopback:" in captured:
+                category = "sandbox-network"
+            elif b"Permission denied" in captured or b"Operation not permitted" in captured:
+                category = "sandbox-permission"
+            else:
+                category = "sandbox-startup"
+        elif b"MemoryError" in captured:
+            category = "child-memory"
+        elif b"sqlite3." in captured:
+            category = "child-sqlite"
+        elif captured:
+            category = "child-startup"
+        return f"Unexpected WAL child EOF (exit={status}, class={category})"
+
     def _read_line(self) -> dict:
         if self.process.stdout is None:
             raise RuntimeError("WAL child stdout unavailable")
@@ -314,7 +347,7 @@ class _WALReadConnection:
                 min(65536, _PREAUTH_WAL_MAX_DUMP_BYTES + 1 - len(self._pending)),
             )
             if not data:
-                raise ValueError("Unexpected WAL child EOF")
+                raise ValueError(self._child_eof_diagnostic())
             self._pending.extend(data)
             if len(self._pending) > _PREAUTH_WAL_MAX_DUMP_BYTES:
                 raise ValueError("WAL response over size limit")
@@ -448,7 +481,7 @@ def preauthorization_readonly_sqlite(
         ])
         process = subprocess.Popen(
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, close_fds=True,
+            stderr=subprocess.PIPE, close_fds=True,
             pass_fds=(main_fd, wal_fd), start_new_session=True,
         )
         connection = _WALReadConnection(
@@ -486,6 +519,8 @@ def preauthorization_readonly_sqlite(
                         pass
             if process.stdout is not None:
                 process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
         for descriptor in reversed(descriptors):
             os.close(descriptor)
         if identities:
