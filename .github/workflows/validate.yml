@@ -60,7 +60,19 @@ jobs:
           # GitHub's Ubuntu image does not contractually include bwrap.
           # Install the distribution-signed helper, never relax userns or AppArmor.
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo apt-get install -y --no-install-recommends bubblewrap apparmor apparmor-profiles
+          # Ubuntu 24.04 AppArmor can deny bwrap's UID map even after installation.
+          # Load only Ubuntu's packaged, capability-restricting bwrap profile.
+          # Never disable AppArmor or relax host-wide user namespace sysctls.
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
+          profile=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          test -f "$profile"
+          test ! -L "$profile"
+          test "$(stat -c %u "$profile")" -eq 0
+          test -x /usr/sbin/apparmor_parser
+          sudo install -m 0644 "$profile" /etc/apparmor.d/bwrap-userns-restrict
+          sudo /usr/sbin/apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+          test "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" = 1
           test -x /usr/bin/bwrap
           test -f /usr/bin/bwrap
           test ! -L /usr/bin/bwrap
