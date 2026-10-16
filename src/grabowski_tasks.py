@@ -7286,8 +7286,10 @@ try:
             (sys.argv[3],),
         ).fetchone()
         result = {"status": "ok", "row": dict(row) if row is not None else None}
-except (Changed, OSError, sqlite3.Error):
+except (Changed, sqlite3.Error):
     result = {"status": "changed"}
+except OSError:
+    result = {"status": "failed"}
 sys.stdout.write(json.dumps(result))
 """.strip()
 
@@ -7315,27 +7317,31 @@ def _task_scope_wal_copy_row(identifier: str) -> dict[str, Any] | None:
             "Task scope copy exceeds its size budget; retry after the task "
             "WAL is checkpointed"
         )
-    try:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-c",
-                TASK_SCOPE_COPY_CHILD_CODE,
-                str(Path(sqlite_store.__file__).resolve().parent),
-                str(TASK_DB),
-                identifier,
-            ],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=TASK_SCOPE_COPY_TIMEOUT_SECONDS,
-            env={"TMPDIR": tempfile.gettempdir()},
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise TaskSchemaInventoryChanged(changed) from exc
-    except OSError as exc:
-        raise RuntimeError("Task scope copy process could not start") from exc
+    # This process owns the private directory: a child killed on timeout
+    # cannot leave its database copy behind.
+    with tempfile.TemporaryDirectory(prefix="grabowski-task-scope-") as private:
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-c",
+                    TASK_SCOPE_COPY_CHILD_CODE,
+                    str(Path(sqlite_store.__file__).resolve().parent),
+                    str(TASK_DB),
+                    identifier,
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=TASK_SCOPE_COPY_TIMEOUT_SECONDS,
+                env={"TMPDIR": private},
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TaskSchemaInventoryChanged(changed) from exc
+        except OSError as exc:
+            raise RuntimeError("Task scope copy process could not start") from exc
     try:
         result = json.loads(completed.stdout) if completed.returncode == 0 else None
     except ValueError:

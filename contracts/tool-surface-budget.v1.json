@@ -3765,7 +3765,8 @@
         "effects": [
           "lease-reacquire",
           "lease-renew",
-          "state-refresh"
+          "state-refresh",
+          "temporary-file-create"
         ],
         "reversibility": "not-applicable"
       },
@@ -3773,7 +3774,8 @@
       "evidence_refs": [
         "https://github.com/heimgewebe/grabowski/issues/1407",
         "src/grabowski_tasks.py:5734-5794",
-        "src/grabowski_tasks.py:9688-9705"
+        "src/grabowski_tasks.py:9688-9705",
+        "https://github.com/heimgewebe/grabowski/pull/1409#discussion_r4296988440"
       ]
     }
   }

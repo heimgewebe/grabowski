@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "62171c420892349588758d7979501e10875ab1f4b111833e8216e767e633382a",
+  "capability_source_sha256": "ed2614ea2680d0e7bb87ebd7b5de69295fc66a0f8152a350b9121993b456c39f",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "2681d2593edcdc23e200aa0fa3e6eec2cbda1b9c1794b1d9faf87fc81801c567",
   "integrity": {
@@ -1449,10 +1449,11 @@
       "effects": [
         "lease-reacquire",
         "lease-renew",
-        "state-refresh"
+        "state-refresh",
+        "temporary-file-create"
       ],
       "id": "grabowski_task_status",
-      "purpose": "Observe one persistent task and refresh its recorded state.",
+      "purpose": "Observe one persistent task through the mutation gate and refresh its recorded state; scoping a task not yet checkpointed from the WAL and privileged observations may create private temporary files.",
       "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",

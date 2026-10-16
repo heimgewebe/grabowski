@@ -872,9 +872,9 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_task_status": {
         "category": "task",
-        "purpose": "Observe one persistent task and refresh its recorded state.",
+        "purpose": "Observe one persistent task through the mutation gate and refresh its recorded state; scoping a task not yet checkpointed from the WAL and privileged observations may create private temporary files.",
         "risk_class": "low",
-        "effects": ["lease-reacquire", "lease-renew", "state-refresh"],
+        "effects": ["lease-reacquire", "lease-renew", "state-refresh", "temporary-file-create"],
         "reversibility": "not-applicable",
     },
     "grabowski_task_logs": {

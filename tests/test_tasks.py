@@ -11563,6 +11563,7 @@ class TaskTests(unittest.TestCase):
             }
             for name, outcome in (
                 ("changed", (0, {"status": "changed"})),
+                ("failed", (0, {"status": "failed"})),
                 ("exit", (1, {"status": "ok", "row": good})),
                 ("other-task", (0, {"status": "ok", "row": {**good, "task_id": "f" * 24}})),
                 ("extra-column", (0, {"status": "ok", "row": {**good, "command": "x"}})),
@@ -11588,12 +11589,21 @@ class TaskTests(unittest.TestCase):
                         name == "changed",
                         isinstance(raised.exception, tasks.TaskSchemaInventoryChanged),
                     )
-            with patch.object(
-                tasks.subprocess, "run",
-                side_effect=subprocess.TimeoutExpired(["child"], 5),
-            ):
+            private_dirs: list[Path] = []
+
+            def killed_child(argv, **kwargs):
+                # A child killed on timeout leaves its copy in its TMPDIR.
+                self.assertIn("-B", argv)
+                private = Path(kwargs["env"]["TMPDIR"])
+                (private / "leftover-copy").write_bytes(b"x")
+                private_dirs.append(private)
+                raise subprocess.TimeoutExpired(argv, 5)
+
+            with patch.object(tasks.subprocess, "run", side_effect=killed_child):
                 with self.assertRaises(tasks.TaskSchemaInventoryChanged):
                     tasks._task_scope_wal_copy_row(task_id)
+            self.assertEqual(1, len(private_dirs))
+            self.assertFalse(private_dirs[0].exists())
             with patch.object(tasks.subprocess, "run", side_effect=OSError("no exec")):
                 with self.assertRaisesRegex(RuntimeError, "could not start"):
                     tasks._task_scope_wal_copy_row(task_id)
