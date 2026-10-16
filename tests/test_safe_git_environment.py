@@ -1258,7 +1258,8 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
                     )
                 return original_run(argv, **kwargs)
 
-            for filter_option in ("--filters", "--filte"):
+            # Git 2.55 has both --filter and --filters: --filte is ambiguous.
+            for filter_option in ("--filters",):
                 with self.subTest(filter_option=filter_option):
                     injected = False
                     marker.unlink(missing_ok=True)
@@ -1405,6 +1406,209 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
                         self.assertFalse(marker.exists(), "native Git ran caller -c helper")
 
 
+
+
+    def test_git_signing_helper_is_blocked_after_admission(self) -> None:
+        """A late repo-configured signing program must never run on native commit -a."""
+        from unittest import mock
+        import grabowski_operator as operator
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory(prefix="native-gpg-effect-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
+            (repo / "tracked.txt").write_text("changed", encoding="ascii")
+            marker = root / "signer-executed"
+            signer = root / "signer"
+            signer.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\nexit 1\n",
+                encoding="ascii",
+            )
+            signer.chmod(0o700)
+            for key, value in (
+                ("user.name", "Test"), ("user.email", "test@example.invalid"),
+                ("user.signingkey", "attacker-key"),
+            ):
+                subprocess.run(
+                    ["/usr/bin/git", "-C", str(repo), "config", key, value],
+                    env=secure, check=True,
+                )
+            original_run = operator._run
+            injected = False
+
+            def late_signer_config(argv: list[str], **kwargs: object):
+                nonlocal injected
+                if not injected and "commit" in argv:
+                    injected = True
+                    for key, value in (
+                        ("gpg.program", str(signer)), ("commit.gpgsign", "true"),
+                    ):
+                        subprocess.run(
+                            ["/usr/bin/git", "-C", str(repo), "config", key, value],
+                            env=secure, check=True,
+                        )
+                return original_run(argv, **kwargs)
+
+            attempt = {
+                "schema_version": 1,
+                "owner_id": "operator:gpg-p1-security",
+                "operation_id": "gpg-at-effect",
+                "attempt_id": "commit-a",
+                "branch": "main",
+                "expected_preimage_sha256": operator._git_branch_preimage(repo)[
+                    "preimage_sha256"
+                ],
+            }
+            with (
+                mock.patch.object(resources, "RESOURCE_DB", root / "resources.sqlite3"),
+                mock.patch.object(operator, "_require_operator_mutation", return_value=None),
+                mock.patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+                mock.patch.object(operator, "_run", side_effect=late_signer_config),
+            ):
+                actual = operator.grabowski_git(
+                    str(repo), ["commit", "-am", "protected"], branch_attempt=attempt,
+                )
+            self.assertTrue(injected, "late signer injection did not run")
+            self.assertEqual(actual["returncode"], 0, actual.get("stderr"))
+            self.assertEqual(actual["branch_mutation"]["status"], "completed")
+            self.assertFalse(marker.exists(), "repo signing helper ran in protected Git")
+
+            from grabowski_agent_sandbox import AgentSandboxError, safe_git_repository_environment
+            with self.assertRaises(AgentSandboxError):
+                safe_git_repository_environment(repo)
+
+            # Deliberately omit trusted command-scope overrides in the negative control.
+            unprotected_env = {
+                key: value for key, value in secure.items()
+                if not key.startswith("GIT_CONFIG_")
+            }
+            (repo / "tracked.txt").write_text("again!!", encoding="ascii")
+            raw = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "commit", "-am", "unprotected"],
+                env=unprotected_env, capture_output=True, timeout=15,
+            )
+            self.assertNotEqual(raw.returncode, 0)
+            self.assertTrue(marker.exists(), "unprotected Git signing control never ran")
+
+    def test_native_git_preserves_ordinary_text_diff(self) -> None:
+        from grabowski_agent_sandbox import _git_without_external_diff
+        self.assertEqual(
+            _git_without_external_diff(["git", "diff", "--text", "HEAD"]),
+            ["git", "diff", "--no-ext-diff", "--no-textconv", "--text", "HEAD"],
+        )
+        self.assertEqual(
+            _git_without_external_diff(["git", "show", "--text", "HEAD"]),
+            ["git", "show", "--no-ext-diff", "--no-textconv", "--text", "HEAD"],
+        )
+
+    def test_writer_status_blocks_late_clean_filter(self) -> None:
+        """Writer._git status must pin inactive filters at the exact Git process."""
+        from unittest import mock
+        import grabowski_agent_writer as writer
+
+        with tempfile.TemporaryDirectory(prefix="writer-status-p2-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
+            (repo / ".gitattributes").write_text("tracked.txt filter=attacker\n")
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "add", ".gitattributes"],
+                env=secure, check=True,
+            )
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "-c", "user.name=Test",
+                 "-c", "user.email=test@example.invalid", "commit", "-qm", "attributes"],
+                env=secure, check=True,
+            )
+            (repo / "tracked.txt").write_text("3", encoding="ascii")
+            marker = root / "filter-executed"
+            helper = root / "clean-helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            original_run = writer.subprocess.run
+            injected = False
+
+            def late_clean(argv: list[str], **kwargs: object):
+                nonlocal injected
+                if not injected and "status" in argv:
+                    injected = True
+                    original_run(
+                        ["/usr/bin/git", "-C", str(repo),
+                         "config", "filter.attacker.clean", str(helper)],
+                        env=secure, check=True,
+                    )
+                return original_run(argv, **kwargs)
+
+            with mock.patch.object(writer.subprocess, "run", side_effect=late_clean):
+                output = writer._git(
+                    repo, "status", "--porcelain=v1", "--untracked-files=all"
+                )
+            self.assertTrue(injected)
+            self.assertIn("tracked.txt", output)
+            self.assertFalse(marker.exists(), "writer status executed late clean helper")
+            control = original_run(
+                ["/usr/bin/git", "-C", str(repo), "status", "--porcelain=v1"],
+                env=secure, capture_output=True, timeout=15,
+            )
+            self.assertEqual(control.returncode, 0, control.stderr)
+            self.assertTrue(marker.exists(), "unprotected writer status control missed helper")
+
+
+    def test_git_commit_editor_is_denied_before_spawn(self) -> None:
+        """A caller-selected Git editor cannot run through the native Git effect."""
+        from grabowski_agent_sandbox import (
+            AgentSandboxError, safe_git_filter_effect, safe_git_repository_environment,
+        )
+        with tempfile.TemporaryDirectory(prefix="native-git-editor-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
+            with self.assertRaises(AgentSandboxError):
+                with safe_git_filter_effect(
+                    repo, ["git", "-C", str(repo), "commit", "--edit", "-m", "fixture"]
+                ):
+                    self.fail("explicit Git editor was admitted")
+
+            marker = root / "editor-executed"
+            editor = root / "editor"
+            editor.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\nexit 0\n",
+                encoding="ascii",
+            )
+            editor.chmod(0o700)
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "config", "core.editor", str(editor)],
+                env=secure, check=True,
+            )
+            with self.assertRaises(AgentSandboxError):
+                safe_git_repository_environment(repo)
+
+            # The identical Git effect without the admission contract does execute it.
+            (repo / "tracked.txt").write_text("editor control", encoding="ascii")
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "add", "tracked.txt"],
+                env=secure, check=True,
+            )
+            unprotected_env = {
+                key: value for key, value in secure.items()
+                if not key.startswith("GIT_CONFIG_") and key != "GIT_EDITOR"
+            }
+            raw = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "commit", "--edit", "-m", "control"],
+                env=unprotected_env, capture_output=True, timeout=15,
+            )
+            self.assertEqual(raw.returncode, 0, raw.stderr)
+            self.assertTrue(marker.exists(), "unprotected editor control missed helper")
 
 if __name__ == "__main__":
     unittest.main()

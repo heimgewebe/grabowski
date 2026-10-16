@@ -30,18 +30,21 @@ def _digest(value: Any) -> str:
 
 
 def _git(repo: Path, *args: str) -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="surrogateescape",
-        timeout=30,
-        check=False,
-        env=safe_git_repository_environment(repo),
-    )
+    command = ["git", "-C", str(repo), *args]
+    with safe_git_filter_effect(repo, command) as (protected, environment, descriptors):
+        completed = subprocess.run(
+            protected,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="surrogateescape",
+            timeout=30,
+            check=False,
+            env=environment,
+            pass_fds=descriptors,
+        )
     if completed.returncode != 0:
         raise RuntimeError((completed.stderr or completed.stdout or "git failed").strip())
     return completed.stdout.strip()

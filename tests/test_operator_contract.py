@@ -5065,8 +5065,18 @@ class OperatorContractTests(unittest.TestCase):
                 patch.object(operator, "_require_operator_mutation", return_value=None),
                 patch.object(operator, "_append_effect_audit", return_value="b" * 64),
             ):
+                with self.assertRaisesRegex(operator.git_sandbox.AgentSandboxError, "executable Git helper"):
+                    operator.grabowski_git(
+                        str(repo), ["commit", "-m", "jit commit"], branch_attempt=attempt
+                    )
+                self.assertFalse(Path(f"{signer}.ran").exists())
+                for key in ("gpg.program", "commit.gpgSign"):
+                    operator.subprocess.run(
+                        ["git", "-C", str(repo), "config", "--unset", key], check=True
+                    )
                 result = operator.grabowski_git(
-                    str(repo), ["commit", "-m", "jit commit"], branch_attempt=attempt
+                    str(repo), ["commit", "-m", "jit commit"],
+                    branch_attempt={**attempt, "attempt_id": "attempt-2"},
                 )
 
             self.assertEqual(0, result["returncode"])
@@ -7368,6 +7378,20 @@ class GitServerVerifiedReadTransportTests(unittest.TestCase):
             self.assertTrue(marker.exists())
             marker.unlink()
 
+            from grabowski_agent_sandbox import AgentSandboxError
+            for git_arguments in (["show", "--stat"], ["log", "-1"]):
+                with self.subTest(git_arguments=git_arguments):
+                    with patch.object(
+                        operator, "_require_operator_mutation"
+                    ) as mutation:
+                        with self.assertRaisesRegex(AgentSandboxError, "executable Git helper"):
+                            operator.grabowski_git(str(repo), git_arguments)
+                    self.assertFalse(marker.exists())
+                    mutation.assert_not_called()
+            operator.subprocess.run(
+                ["git", "-C", str(repo), "config", "--unset", "gpg.program"],
+                check=True,
+            )
             for git_arguments in (["show", "--stat"], ["log", "-1"]):
                 with self.subTest(git_arguments=git_arguments):
                     marker.unlink(missing_ok=True)

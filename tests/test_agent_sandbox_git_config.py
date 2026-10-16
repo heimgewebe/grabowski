@@ -49,6 +49,13 @@ class AgentSandboxGitConfigTests(unittest.TestCase):
                 expected_overrides = (
                     ("core.hooksPath", "/dev/null"),
                     ("core.fsmonitor", "false"),
+                    ("core.editor", "/bin/false"),
+                    ("commit.gpgsign", "false"),
+                    ("tag.gpgsign", "false"),
+                    ("gpg.program", "/bin/false"),
+                    ("gpg.openpgp.program", "/bin/false"),
+                    ("gpg.ssh.program", "/bin/false"),
+                    ("gpg.x509.program", "/bin/false"),
                     ("protocol.ext.allow", "never"),
                     (
                         "core.sshCommand",

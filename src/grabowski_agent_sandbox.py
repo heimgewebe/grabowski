@@ -34,6 +34,15 @@ _TRUSTED_GIT_SSH_COMMAND = (
 _GIT_COMMAND_CONFIG = (
     ("core.hooksPath", "/dev/null"),
     ("core.fsmonitor", "false"),
+    ("core.editor", "/bin/false"),
+    # Never execute a repository-selected signing program, even if commit
+    # configuration is changed after the repository admission check.
+    ("commit.gpgsign", "false"),
+    ("tag.gpgsign", "false"),
+    ("gpg.program", "/bin/false"),
+    ("gpg.openpgp.program", "/bin/false"),
+    ("gpg.ssh.program", "/bin/false"),
+    ("gpg.x509.program", "/bin/false"),
     ("protocol.ext.allow", "never"),
     ("core.sshCommand", _TRUSTED_GIT_SSH_COMMAND),
     ("core.askPass", "/bin/false"),
@@ -497,6 +506,7 @@ def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
     environment.update({
         "HOME": home,
         "PATH": "/usr/bin:/bin",
+        "GIT_EDITOR": "/bin/false",
         "SSH_ASKPASS": "/bin/false",
         "SSH_ASKPASS_REQUIRE": "never",
     })
@@ -579,14 +589,30 @@ def safe_git_repository_environment(
         raise AgentSandboxError("repository Git helper admission unavailable") from exc
     if result.returncode != 0 or result.stderr or len(result.stdout) > 1024 * 1024:
         raise AgentSandboxError("repository Git helper admission failed")
+    # Trusted environment -c entries are included by git config --list.
+    # Allow exactly their own pinned signer entry; a repository declaration
+    # yields a second occurrence and must still fail closed.
+    trusted_signer_keys = {
+        "core.editor", "commit.gpgsign", "tag.gpgsign", "gpg.program",
+        "gpg.openpgp.program", "gpg.ssh.program", "gpg.x509.program",
+    }
+    seen_signer_keys: set[str] = set()
     for key in result.stdout.split(b"\x00"):
         label = key.decode("utf-8", errors="surrogateescape").casefold()
+        if label in trusted_signer_keys:
+            if label in seen_signer_keys:
+                raise AgentSandboxError("repository declares an executable Git helper")
+            seen_signer_keys.add(label)
+            continue
         if (
             (label.startswith("filter.") and label.endswith((".clean", ".smudge", ".process")))
             or label == "diff.external"
             or (label.startswith("diff.") and label.endswith((".command", ".textconv")))
             or (label.startswith("merge.") and label.endswith(".driver"))
             or (label.startswith("submodule.") and label.endswith(".update"))
+            or label.startswith("gpg.")
+            or label in {"commit.gpgsign", "tag.gpgsign"}
+            or label.endswith((".program", ".cmd"))
             or label.startswith("alias.")
         ):
             raise AgentSandboxError("repository declares an executable Git helper")
@@ -678,6 +704,41 @@ def _git_without_external_diff(argv: list[str]) -> list[str]:
     if position >= len(argv):
         return list(argv)
     subcommand = argv[position]
+    # An explicit signing flag bypasses commit.gpgsign=false, so reject before
+    # any Git spawn rather than allowing a failing /bin/false signer to touch
+    # the branch-attempt outcome. Tag signing is likewise not an allowed effect.
+    if subcommand in {"commit", "tag"}:
+        options = argv[position + 1:]
+        prefix = options[:options.index("--")] if "--" in options else options
+        if any(
+            (subcommand == "commit" and (
+                option.startswith("-S")
+                or (option.startswith("--") and "--gpg-sign".startswith(option.split("=", 1)[0]))
+            ))
+            or (subcommand == "tag" and (
+                option in {"-s", "-u", "--sign", "--local-user"}
+                or option.startswith("--local-user=")
+                or option.startswith("--sign=")
+            ))
+            for option in prefix
+        ):
+            raise AgentSandboxError("explicit Git signing helper is forbidden")
+    if subcommand == "commit":
+        options = argv[position + 1:]
+        prefix = options[:options.index("--")] if "--" in options else options
+        if any(
+            option in {"-e", "-c"}
+            or (option.startswith("-c") and not option.startswith("--"))
+            or (
+                option.startswith("--")
+                and any(
+                    name.startswith(option.split("=", 1)[0])
+                    for name in ("--edit", "--reedit-message")
+                )
+            )
+            for option in prefix
+        ):
+            raise AgentSandboxError("Git commit editor effect is forbidden")
     # Git parses conflicting diff flags in argument order. A caller-supplied
     # --ext-diff/--textconv after our --no-* options would re-enable execution.
     # Also cover blame/annotate/grep/cat-file, whose own --textconv can launch
@@ -691,7 +752,11 @@ def _git_without_external_diff(argv: list[str]) -> list[str]:
         if any(
             option.startswith("--") and (
                 "--ext-diff".startswith(option) or option.startswith("--ext-diff")
-                or "--textconv".startswith(option) or option.startswith("--textconv")
+                or (
+                    "--textconv".startswith(option.split("=", 1)[0])
+                    and len(option.split("=", 1)[0]) > len("--text")
+                )
+                or option.startswith("--textconv=")
             )
             for option in option_prefix
         ):
