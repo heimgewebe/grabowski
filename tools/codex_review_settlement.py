@@ -56,7 +56,7 @@ _CODEX_CLEAN_FOOTER_PATTERN = (
     r"</details>"
 )
 CLEAN_RESULT_RE = re.compile(
-    r"\A(?:<!-- codex-review-receipt:v1 -->\n\n)?Codex Review: Didn't find any major issues\. "
+    r"\ACodex Review: Didn't find any major issues\. "
     r"(?:[^\n]{0,79}[.!?]|[^\n]{0,62}:[a-z0-9_+-]{1,16}:)\n\n"
     r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`\n\n"
     + _CODEX_CLEAN_FOOTER_PATTERN
@@ -1076,7 +1076,14 @@ def _clean_comment_completion(
             or not isinstance(comment_id, int)
         ):
             continue
-        match = CLEAN_RESULT_RE.fullmatch(_normalize_codex_comment_body(body))
+        normalized = _normalize_codex_comment_body(body)
+        # Codex now prefixes clean receipts with this exact versioned marker.
+        # Strip it once only after actor/time checks; keep the full clean body
+        # and exact reviewed-head pattern authoritative below.
+        receipt_marker = "<!-- codex-review-receipt:v1 -->\n\n"
+        if normalized.startswith(receipt_marker):
+            normalized = normalized[len(receipt_marker):]
+        match = CLEAN_RESULT_RE.fullmatch(normalized)
         if match is None:
             continue
         reviewed_prefix = match.group(1)

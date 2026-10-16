@@ -19188,6 +19188,71 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         execution = result["output"]["executions"][0]
         self.assertTrue(execution["verification_passed"])
 
+    def _run_clean_comment_body(self, body: str) -> tuple[dict[str, object], FakeGh]:
+        parameters = authorized_captain_run_parameters()
+        parameters["codex_review_evidence"] = captain_codex_clean_comment_evidence(
+            body=body
+        )
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        template = captain_codex_live_state(view, review_pages=[[]])
+        request_comment = deepcopy(template["request_comment"])
+        clean_comment = captain_codex_clean_comment(body=body)
+        state = captain_codex_live_state(
+            view,
+            request_pages=[[request_comment, clean_comment]],
+            review_pages=[[]],
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+        return result["output"]["executions"][0], gh
+
+    def test_atomic_merge_guard_accepts_versioned_receipt_clean_comment(self) -> None:
+        body = "<!-- codex-review-receipt:v1 -->\n\n" + str(
+            captain_codex_clean_comment()["body"]
+        )
+
+        execution, _gh = self._run_clean_comment_body(body)
+
+        self.assertTrue(execution["verification_passed"])
+
+    def test_atomic_merge_guard_rejects_malformed_receipt_markers(self) -> None:
+        clean = str(captain_codex_clean_comment()["body"])
+        for marker in (
+            "<!-- codex-review-receipt:v2 -->\n\n",
+            "<!-- codex-review-receipt:v1 -->\n",
+            "<!-- codex-review-receipt:v1 -->\n\n<!-- codex-review-receipt:v1 -->\n\n",
+            " <!-- codex-review-receipt:v1 -->\n\n",
+        ):
+            with self.subTest(marker=marker):
+                execution, gh = self._run_clean_comment_body(marker + clean)
+
+                self.assertFalse(execution["verification_passed"])
+                self.assertIn(
+                    "merge_guard_codex_clean_comment_shape_invalid",
+                    execution["merge_lease_guard"]["errors"],
+                )
+                self.assertEqual(
+                    [], [call for call in gh.calls if call[:2] == ("pr", "merge")]
+                )
+
     def test_atomic_merge_guard_rejects_clean_comment_appended_text(self) -> None:
         poisoned_body = str(captain_codex_clean_comment()["body"]) + (
             "\nBlocking issue: do not merge."
