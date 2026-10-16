@@ -6829,6 +6829,186 @@ class TaskTests(unittest.TestCase):
             )
         )
 
+    def _local_terminal_readiness_store(self, count: int) -> None:
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        record = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?",
+                (record["task_id"],),
+            )
+            row = dict(connection.execute(
+                "SELECT * FROM tasks WHERE task_id=?", (record["task_id"],)
+            ).fetchone())
+            columns = list(row)
+            for index in range(1, count):
+                clone = {**row, "task_id": f"{index:024x}"}
+                connection.execute(
+                    f"INSERT INTO tasks({','.join(columns)}) "
+                    f"VALUES({','.join('?' for _ in columns)})",
+                    [clone[column] for column in columns],
+                )
+        complete = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=complete),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+
+    def _local_terminal_readiness_status(self, count: int):
+        self._local_terminal_readiness_store(count)
+        quiescent = {
+            "state": "completed",
+            "properties": {
+                "LoadState": "loaded", "ActiveState": "inactive",
+                "SubState": "dead", "Result": "success",
+            },
+            "probe": {"returncode": 0, "timed_out": False},
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1", "transport": "local",
+            },
+        }
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(
+                tasks, "_observe",
+                side_effect=lambda *_args, **_kwargs: {
+                    **quiescent, "observed_at_unix": tasks._now(),
+                },
+            ) as probe,
+            patch.object(
+                tasks, "_dispatch",
+                side_effect=AssertionError("READ_ONLY readiness must not dispatch"),
+            ),
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        return status, probe
+
+    def test_reconcile_ready_local_terminal_budget_admits_exactly_32(self) -> None:
+        limit = tasks.TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT
+        self.assertEqual(32, limit)
+        status, probe = self._local_terminal_readiness_status(limit)
+        self.assertEqual("verified", status["status"])
+        self.assertEqual(limit, probe.call_count)
+
+    def test_reconcile_ready_local_terminal_budget_has_own_state_at_33(self) -> None:
+        limit = tasks.TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT
+        self.assertEqual(32, limit)
+        status, probe = self._local_terminal_readiness_status(limit + 1)
+        # No unit of an over-budget cohort is observed or certified ready.
+        probe.assert_not_called()
+        self.assertEqual(
+            {
+                "status": "local_terminal_budget_exceeded",
+                "budget": "observation",
+                "local_terminal_limit": limit,
+            },
+            status,
+        )
+        with (
+            patch.object(tasks, "TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT", 0),
+            patch.object(tasks, "_observe") as scan_probe,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                scan = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        scan_probe.assert_not_called()
+        self.assertEqual("local_terminal_budget_exceeded", scan["status"])
+        self.assertEqual("scan", scan["budget"])
+
+    def test_reconcile_ready_publication_applies_task_scope_before_rootbroker(self) -> None:
+        record = {
+            "task_id": "c" * 24,
+            "unit": f"grabowski-task-{'c' * 24}-a1.service",
+            "cwd": "/srv/blockaded-repo",
+            "host": "blockaded-host",
+            "lease_owner_id": "blockaded-owner",
+            "execution_backend": "systemd-root-broker",
+            "systemd_scope": "system",
+            "state": "completed",
+        }
+        prepared = {
+            "task_revision": "t", "resource_revision": "r",
+            "privileged_records": [record], "privileged_tasks_sha256": "0" * 64,
+        }
+        for key, value in (
+            ("host", record["host"]),
+            ("path", record["cwd"]),
+            ("repo", record["cwd"]),
+            ("owner_id", record["lease_owner_id"]),
+        ):
+            calls: list[dict[str, object]] = []
+
+            def gate(capability: str, **scope: object) -> None:
+                calls.append({"capability": capability, **scope})
+                if scope.get(key) == value:
+                    raise PermissionError(f"test {key} blockade")
+
+            with (
+                self.subTest(blockade=key),
+                patch.object(tasks.operator, "_require_operator_mutation", side_effect=gate),
+                patch.object(
+                    tasks.privileged, "_create_privileged_reference",
+                    side_effect=AssertionError("reference before scoped gate"),
+                ) as reference,
+                patch.object(
+                    tasks.privileged, "_invoke_privileged_reference",
+                    side_effect=AssertionError("broker before scoped gate"),
+                ) as invoke,
+                patch.object(
+                    tasks.privileged, "root_task_systemd_request",
+                    side_effect=AssertionError("broker before scoped gate"),
+                ) as broker,
+                patch.object(
+                    tasks, "_task_mutation_lock",
+                    side_effect=AssertionError("CAS lock before scoped gate"),
+                ) as lock,
+            ):
+                with self.assertRaisesRegex(PermissionError, f"test {key} blockade"):
+                    tasks._publish_task_reconcile_ready_evidence(prepared)
+                self.assertEqual(
+                    [{
+                        "capability": "durable_job",
+                        "path": record["cwd"],
+                        "repo": record["cwd"],
+                        "task_id": record["task_id"],
+                        "owner_id": record["lease_owner_id"],
+                        "host": record["host"],
+                    }],
+                    calls,
+                )
+                reference.assert_not_called()
+                invoke.assert_not_called()
+                broker.assert_not_called()
+                lock.assert_not_called()
+        # Positive control: an admitted scope reaches exactly one probe.
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(
+                tasks.privileged, "root_task_systemd_request",
+                return_value={"returncode": 1, "stdout": "", "stderr": ""},
+            ) as broker,
+        ):
+            tasks._publish_task_reconcile_ready_evidence(prepared)
+        broker.assert_called_once()
+
     def test_reconcile_ready_accepts_quiescent_cancelled_local_unit(self) -> None:
         # Systemd reports the unit outcome, not Grabowski's historical
         # cancellation label. A settled cancellation is safe only with fresh
@@ -11196,7 +11376,7 @@ class TaskTests(unittest.TestCase):
         finally:
             keeper.close()
 
-    def test_task_scope_snapshot_fails_closed_for_row_only_in_wal(self) -> None:
+    def test_task_scope_reads_committed_wal_only_task_from_private_copy(self) -> None:
         with tasks._database_connection():
             pass
         keeper = sqlite3.connect(tasks.TASK_DB)
@@ -11204,17 +11384,65 @@ class TaskTests(unittest.TestCase):
             keeper.execute("PRAGMA wal_autocheckpoint=0")
             keeper.execute("SELECT COUNT(*) FROM tasks").fetchone()
             task_id = str(self._start(host="remote")["task"]["task_id"])
-            self.assertGreater(Path(f"{tasks.TASK_DB}-wal").stat().st_size, 32)
+            wal = Path(f"{tasks.TASK_DB}-wal")
+            shm = Path(f"{tasks.TASK_DB}-shm")
+            self.assertGreater(wal.stat().st_size, 32)
+            # The task is committed to the WAL only, never checkpointed.
+            self.assertIsNone(tasks._task_scope_main_file_row(task_id))
+            persisted = tasks._task_scope_wal_copy_row(task_id)
+            self.assertIsNotNone(persisted)
+            files = (tasks.TASK_DB, wal, shm)
+            before = {str(path): (path.stat().st_mtime_ns, path.read_bytes()) for path in files}
+            for name, call in (
+                ("status", lambda: tasks.grabowski_task_status(task_id)),
+                ("logs", lambda: tasks.grabowski_task_logs(task_id, max_lines=5)),
+            ):
+                calls: list[dict[str, object]] = []
+                with (
+                    self.subTest(tool=name),
+                    patch.object(
+                        tasks.operator, "_require_operator_mutation",
+                        side_effect=self._scoped_blockade_gate(calls),
+                    ),
+                    patch.object(tasks.time, "sleep") as pause,
+                    patch.object(
+                        tasks, "_database_connection",
+                        side_effect=AssertionError("mutable store before scoped gate"),
+                    ) as mutable_store,
+                ):
+                    with self.assertRaisesRegex(PermissionError, "test scoped blockade"):
+                        call()
+                    pause.assert_not_called()
+                    mutable_store.assert_not_called()
+                    self.assertEqual(
+                        {
+                            "capability": "durable_job",
+                            "path": persisted["cwd"],
+                            "repo": persisted["cwd"],
+                            "task_id": task_id,
+                            "owner_id": persisted.get("lease_owner_id"),
+                            "host": persisted["host"],
+                        },
+                        calls[-1],
+                    )
+            self.assertEqual(
+                before,
+                {str(path): (path.stat().st_mtime_ns, path.read_bytes()) for path in files},
+            )
+            # An unchanging copy failure stays fail-closed, never the live store.
             with (
-                patch.object(tasks.operator, "_require_operator_mutation"),
+                patch.object(
+                    tasks, "_task_scope_wal_copy_row",
+                    side_effect=tasks.TaskSchemaInventoryChanged("moving WAL"),
+                ),
                 patch.object(tasks.time, "sleep") as pause,
                 patch.object(
                     tasks, "_database_connection",
                     side_effect=AssertionError("mutable store before scoped gate"),
                 ) as mutable_store,
             ):
-                with self.assertRaisesRegex(RuntimeError, "not yet checkpointed"):
-                    tasks.grabowski_task_status(task_id)
+                with self.assertRaisesRegex(RuntimeError, "Task scope snapshot unavailable"):
+                    tasks._task_scope_snapshot(task_id)
             self.assertEqual(tasks.TASK_SCOPE_SNAPSHOT_ATTEMPTS - 1, pause.call_count)
             mutable_store.assert_not_called()
         finally:
@@ -11223,6 +11451,68 @@ class TaskTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Unknown task"):
                 tasks._task_scope_snapshot("f" * 24)
         pause.assert_not_called()
+
+    def test_task_scope_snapshot_retry_wait_does_not_hold_task_lock(self) -> None:
+        task_id = str(self._start(host="remote")["task"]["task_id"])
+        real_read = tasks._task_scope_main_file_row
+        for name, call in (
+            ("status", lambda: tasks.grabowski_task_status(task_id)),
+            ("logs", lambda: tasks.grabowski_task_logs(task_id, max_lines=5)),
+        ):
+            reads = iter((tasks.TaskSchemaInventoryChanged("moving"), None))
+            acquired: list[bool] = []
+
+            def flaky_read(identifier: str):
+                failure = next(reads)
+                if failure is not None:
+                    raise failure
+                return real_read(identifier)
+
+            def concurrent_writer(_seconds: float) -> None:
+                self.assertFalse(tasks._task_mutation_lock_held())
+                done = threading.Event()
+
+                def writer() -> None:
+                    with tasks._task_mutation_lock():
+                        done.set()
+
+                thread = threading.Thread(target=writer, daemon=True)
+                thread.start()
+                acquired.append(done.wait(5))
+                thread.join(5)
+
+            calls: list[dict[str, object]] = []
+            with (
+                self.subTest(tool=name),
+                patch.object(
+                    tasks.operator, "_require_operator_mutation",
+                    side_effect=self._scoped_blockade_gate(calls),
+                ),
+                patch.object(tasks, "_task_scope_main_file_row", side_effect=flaky_read),
+                patch.object(tasks.time, "sleep", side_effect=concurrent_writer) as pause,
+            ):
+                with self.assertRaisesRegex(PermissionError, "test scoped blockade"):
+                    call()
+            pause.assert_called_once_with(tasks.TASK_SCOPE_SNAPSHOT_RETRY_SECONDS)
+            self.assertEqual([True], acquired)
+            self.assertIn("host", calls[-1])
+
+    def test_task_scope_snapshot_under_held_task_lock_fails_closed_without_wait(self) -> None:
+        task_id = str(self._start(host="remote")["task"]["task_id"])
+        with (
+            patch.object(
+                tasks, "_task_scope_main_file_row",
+                side_effect=tasks.TaskSchemaInventoryChanged("moving"),
+            ) as read,
+            patch.object(tasks.time, "sleep") as pause,
+        ):
+            with tasks._task_mutation_lock():
+                self.assertTrue(tasks._task_mutation_lock_held())
+                with self.assertRaisesRegex(RuntimeError, "Task scope snapshot unavailable"):
+                    tasks._task_scope_snapshot(task_id)
+        read.assert_called_once()
+        pause.assert_not_called()
+        self.assertFalse(tasks._task_mutation_lock_held())
 
     def test_task_scope_snapshot_retries_then_fails_closed_on_moving_main_file(self) -> None:
         task_id = str(self._start(host="remote")["task"]["task_id"])
@@ -11293,8 +11583,9 @@ class TaskTests(unittest.TestCase):
             with self.assertRaisesRegex(PermissionError, "current scope blockaded"):
                 tasks.grabowski_task_logs(task_id, max_lines=5)
         scoped = [call for call in calls if "host" in call]
+        # The stale snapshot is gated before and again under the task lock.
         self.assertEqual(
-            ["stale-owner", persisted.get("lease_owner_id")],
+            ["stale-owner", "stale-owner", persisted.get("lease_owner_id")],
             [call["owner_id"] for call in scoped],
         )
         recovery.assert_not_called()

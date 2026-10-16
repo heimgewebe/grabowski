@@ -6574,6 +6574,15 @@ def _operator_system_overview(
             "archive independently verified terminal tasks through the "
             "authorized task-closeout-archive workflow"
         )
+    elif reconciliation_evidence.get("status") == "local_terminal_budget_exceeded":
+        # READ_ONLY observes at most a bounded local terminal cohort; another
+        # reconciliation leaves it unchanged. Archival shrinks the cohort.
+        next_action = (
+            "verify current local terminal tasks with authorized live observation; "
+            "archive independently verified terminal tasks through the "
+            "authorized task-closeout-archive workflow until the local "
+            "terminal readiness budget fits"
+        )
     elif reconciliation_evidence.get("status") != "verified":
         next_action = "reconcile live task outcomes through an authorized mutation-capable path"
     elif obligations.get("integrity_error_count"):

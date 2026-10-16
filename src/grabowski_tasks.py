@@ -7250,48 +7250,89 @@ def _task_scope_main_file_row(identifier: str) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+def _task_wal_has_frames() -> bool:
+    try:
+        return os.lstat(f"{TASK_DB}-wal").st_size > 32
+    except FileNotFoundError:
+        return False
+
+
+def _task_scope_wal_copy_row(identifier: str) -> dict[str, Any] | None:
+    """Read committed WAL frames from a private copy; SQLite never opens the store.
+
+    Database and WAL bytes are only copied. Their identities must stay
+    unchanged across the copy and the query, so a concurrent append,
+    checkpoint or WAL reset is retried rather than trusted. The live -shm is
+    never opened, created or modified.
+    """
+    with sqlite_store.inventory_readonly_sqlite(
+        TASK_DB,
+        temporary_prefix="grabowski-task-scope-",
+        error_type=TaskSchemaInventoryChanged,
+        message="Task store changed during scope snapshot",
+    ) as connection:
+        try:
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE task_id=?", (identifier,)
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise TaskSchemaInventoryChanged(
+                "Task store changed during scope snapshot"
+            ) from exc
+    return dict(row) if row is not None else None
+
+
+def _task_mutation_lock_held() -> bool:
+    return int(getattr(_TASK_MUTATION_LOCK_STATE, "depth", 0)) > 0
+
+
 def _task_scope_snapshot(task_id: str) -> dict[str, Any]:
-    """Read the persisted task scope without opening the mutable task store."""
+    """Read the persisted task scope without opening the mutable task store.
+
+    A task committed only to the WAL is read from a verified private copy.
+    Retry waits never hold the global task lock: a caller that already holds
+    it gets exactly one attempt and fails closed instead of stalling writers.
+    """
     identifier = _validate_task_id(task_id)
-    for attempt in range(TASK_SCOPE_SNAPSHOT_ATTEMPTS):
-        last_attempt = attempt + 1 == TASK_SCOPE_SNAPSHOT_ATTEMPTS
+    attempts = 1 if _task_mutation_lock_held() else TASK_SCOPE_SNAPSHOT_ATTEMPTS
+    for attempt in range(attempts):
         try:
             row = _task_scope_main_file_row(identifier)
+            if row is None and _task_wal_has_frames():
+                row = _task_scope_wal_copy_row(identifier)
         except TaskSchemaInventoryChanged as exc:
             # Never fall back to the mutable store before the scoped gate.
-            if last_attempt:
+            if attempt + 1 == attempts:
                 raise RuntimeError(
                     "Task scope snapshot unavailable while the task store is "
                     "changing; retry after the active writer completes"
                 ) from exc
         else:
-            if row is not None:
-                return row
-            try:
-                wal_size = os.lstat(f"{TASK_DB}-wal").st_size
-            except FileNotFoundError:
-                wal_size = 0
-            # A header-only WAL holds no frames: the task is truly unknown.
-            if wal_size <= 32:
+            if row is None:
                 raise ValueError(f"Unknown task: {identifier}")
-            if last_attempt:
-                raise RuntimeError(
-                    "Task scope is not yet checkpointed from the task WAL; "
-                    "retry after the active writer completes"
-                )
+            return row
         time.sleep(TASK_SCOPE_SNAPSHOT_RETRY_SECONDS)
     raise AssertionError("unreachable")
 
 
-@_serialize_task_mutation
 def _task_row_after_scoped_gate(task_id: str) -> dict[str, Any]:
     """Gate the persisted task scope before any mutable task-store effect.
 
-    The scope comes from a non-writing main-file snapshot. Only after host,
-    owner, path and repository blockades pass is the mutable store opened; a
-    scope that drifted or was stale is gated again before recovery or dispatch.
+    Host, owner, path and repository blockades are checked against a
+    non-writing snapshot taken outside the global task lock; only then is the
+    lock awaited and the mutable store opened.
     """
     snapshot = _task_scope_snapshot(task_id)
+    _require_task_scoped_mutation(snapshot, task_id)
+    return _task_row_after_scope_snapshot(task_id, snapshot)
+
+
+@_serialize_task_mutation
+def _task_row_after_scope_snapshot(
+    task_id: str, snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    """Re-gate under the task lock; a drifted or stale scope is gated again."""
+    # Authority may change while waiting for the lock.
     _require_task_scoped_mutation(snapshot, task_id)
     current = _row_raw(task_id)
     if _task_mutation_scope(current) != _task_mutation_scope(snapshot):
@@ -9938,17 +9979,21 @@ def grabowski_task_start(
 def grabowski_task_status(task_id: str) -> dict[str, Any]:
     """Refresh one task only after the real shared mutation gate succeeds."""
     operator._require_operator_mutation("durable_job", task_id=task_id)
-    return _task_status_after_mutation_guard(task_id)
+    # Host, owner, path and repository blockades need the persisted scope; it
+    # is read non-writingly and gated before the task lock is awaited.
+    snapshot = _task_scope_snapshot(task_id)
+    _require_task_scoped_mutation(snapshot, task_id)
+    return _task_status_after_mutation_guard(task_id, snapshot)
 
 
 @_serialize_task_mutation
-def _task_status_after_mutation_guard(task_id: str) -> dict[str, Any]:
+def _task_status_after_mutation_guard(
+    task_id: str, snapshot: dict[str, Any],
+) -> dict[str, Any]:
     # Revalidate after the shared task lock: authority may change while waiting.
     # No read, lease maintenance or state change may happen before this gate.
     operator._require_operator_mutation("durable_job", task_id=task_id)
-    # Host, owner, path and repository blockades need the persisted scope; it
-    # is read non-writingly and gated before the mutable store is opened.
-    record = _task_row_after_scoped_gate(task_id)
+    record = _task_row_after_scope_snapshot(task_id, snapshot)
     observation = _observe(record)
     effective_state = _effective_observed_state(record, observation["state"])
     lease_maintenance = _maintain_record_resources(record, effective_state)
@@ -12023,9 +12068,9 @@ def _publish_task_reconcile_ready_evidence(
     # Rootbroker show may take 30s per unit. Hold neither a task SQLite
     # connection nor the global task-mutation lock while probing it.
     for record in records:
-        operator._require_operator_mutation(
-            "durable_job", task_id=str(record["task_id"])
-        )
+        # Host, owner, path and repository blockades of each privileged task
+        # apply before its Rootbroker probe can create a reference or dispatch.
+        _require_task_scoped_mutation(record, str(record["task_id"]))
         observed = _observe(record)
         if not _task_reconcile_ready_rootbroker_terminal_observed(
             record, observed
@@ -12093,6 +12138,14 @@ def _publish_task_reconcile_ready_evidence(
 TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT = 32
 
 
+class TaskReconcileReadyLocalTerminalBudgetExceeded(RuntimeError):
+    """More current local terminal tasks exist than READ_ONLY may observe."""
+
+    def __init__(self, budget: str) -> None:
+        super().__init__(f"Local terminal readiness {budget} budget exceeded")
+        self.budget = budget
+
+
 def _task_reconcile_ready_local_terminal_rows(
     connection: sqlite3.Connection,
 ) -> list[dict[str, Any]]:
@@ -12118,7 +12171,7 @@ def _task_reconcile_ready_local_terminal_rows(
     try:
         for examined, raw in enumerate(cursor, start=1):
             if examined > scan_limit:
-                raise RuntimeError("Local terminal readiness scan budget exceeded")
+                raise TaskReconcileReadyLocalTerminalBudgetExceeded("scan")
             record = dict(raw)
             current = lifecycle_projection.bounded_current_task_projection(
                 [_task_archive_record(record)], projection=projection,
@@ -12129,7 +12182,7 @@ def _task_reconcile_ready_local_terminal_rows(
                 raise RuntimeError("Local terminal task has unsupported systemd authority")
             selected.append(record)
             if len(selected) > TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT:
-                raise RuntimeError("Local terminal readiness observation budget exceeded")
+                raise TaskReconcileReadyLocalTerminalBudgetExceeded("observation")
     finally:
         cursor.close()
     return selected
@@ -12314,6 +12367,14 @@ def _task_reconcile_ready_evidence_snapshot(
         if not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS:
             return {"status": "invalid_or_stale"}
         return {"status": "verified", "reconciled_at_unix": timestamp}
+    except TaskReconcileReadyLocalTerminalBudgetExceeded as exc:
+        # Unobserved units are never ready. Repeating reconciliation cannot
+        # shrink this cohort; archiving verified terminal tasks can.
+        return {
+            "status": "local_terminal_budget_exceeded",
+            "budget": exc.budget,
+            "local_terminal_limit": TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT,
+        }
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, sqlite3.Error) as exc:
         return {"status": "unavailable", "error_type": type(exc).__name__}
 
