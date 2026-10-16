@@ -1028,6 +1028,8 @@ class ConsumerSurfaceTests(unittest.TestCase):
             )
         capped_action = capped["recommended_next_action"].lower()
         self.assertIn("compaction", capped_action)
+        self.assertIn("archive-history budget", capped_action)
+        self.assertNotIn("scan budget", capped_action)
         self.assertNotIn("task-closeout-archive", capped_action)
 
     def test_operator_system_overview_keeps_execution_ready_when_publication_is_pending(self) -> None:

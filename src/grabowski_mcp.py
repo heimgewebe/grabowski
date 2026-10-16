@@ -6589,11 +6589,15 @@ def _operator_system_overview(
         # Archived task rows stay in the live task table and still count toward
         # the readiness scan; neither reconciliation nor archival shrinks it.
         # An observed excess beyond the archive headroom cannot be archived.
+        exhausted = (
+            "retained terminal task history exceeds the readiness scan budget"
+            if reconciliation_evidence.get("budget") == "scan"
+            else "the local terminal excess exceeds the remaining archive-history budget"
+        )
         next_action = (
-            "retained terminal task history exceeds the readiness scan budget "
-            "and archival cannot reduce it; escalate an authorized bounded "
-            "compaction of the retained task history together with its archive "
-            "projection before relying on readiness"
+            f"{exhausted} and archival cannot resolve it; escalate an authorized "
+            "bounded compaction of the retained task history together with its "
+            "archive projection before relying on readiness"
         )
     elif reconciliation_evidence.get("status") == "local_terminal_budget_exceeded":
         # READ_ONLY observes at most a bounded local terminal cohort; another
