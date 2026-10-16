@@ -7442,10 +7442,18 @@ def _validate_push_remote_target(repo: Path, remote: str) -> None:
 
 
 def _reject_git_alias_configuration(configurations: list[tuple[str, str]]) -> None:
-    if any(key.startswith("alias.") for key, _value in configurations):
-        raise PermissionError(
-            "Git alias injection is blocked because it can conceal a push operation."
-        )
+    # Git command-line -c has precedence over the trusted Git environment.
+    # Arbitrary values can re-enable executable hooks, fsmonitor and helpers
+    # even at our effect-time sandbox; keep only one audited inert override.
+    for key, value in configurations:
+        if key.startswith("alias."):
+            raise PermissionError(
+                "Git alias injection is blocked because it can conceal a push operation."
+            )
+        if (key, value) != ("core.pager", "cat"):
+            raise PermissionError(
+                "Caller Git -c configuration is blocked to prevent executable helpers."
+            )
 
 
 def _reject_configured_alias(repo: Path, subcommand: str) -> None:
@@ -8971,10 +8979,10 @@ def grabowski_git(
             "branch_attempt is accepted only for local branch/index mutation subcommands"
         )
 
-    if subcommand == "add":
-        # Native CAS-staging can invoke clean/process filters after its earlier
-        # branch preimage checks. Bind the inert attributes to the actual Git
-        # process. Never change branch_attempt ownership or its postimage/audit.
+    if subcommand != "push":
+        # Every non-transport Git invocation needs effect-time helper isolation.
+        # Keep the special push SSH/credential environment and its own transport
+        # gate intact. Never alter branch_attempt ownership or postimage/audit.
         # A guard failure before _run is provably pre-effect: close only that
         # exact acquired attempt; if _run started but failed its outcome is
         # unknown and the lease must stay available for reconciliation.

@@ -5008,6 +5008,7 @@ class OperatorContractTests(unittest.TestCase):
             operator.subprocess.run(
                 ["git", "init", "-q", "-b", "feature", str(repo)], check=True
             )
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
             operator.subprocess.run(
                 ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"],
                 check=True,
@@ -5120,7 +5121,7 @@ class OperatorContractTests(unittest.TestCase):
             )
             with patch.object(operator, "_require_operator_mutation", return_value=None):
                 with self.assertRaisesRegex(
-                    PermissionError, "expected_preimage_sha256 is required"
+                    PermissionError, "Caller Git -c configuration is blocked"
                 ):
                     operator.grabowski_git(
                         str(repo),
@@ -5560,6 +5561,7 @@ class OperatorContractTests(unittest.TestCase):
             operator.subprocess.run(
                 ["git", "init", "-q", "-b", "feature", str(repo)], check=True
             )
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
             operator.subprocess.run(
                 ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"],
                 check=True,
@@ -5644,6 +5646,7 @@ class OperatorContractTests(unittest.TestCase):
             repo = root / "repo"
             resource_db = root / "resources.sqlite3"
             operator.subprocess.run(["git", "init", "-q", "-b", "feature", str(repo)], check=True)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
             operator.subprocess.run(["git", "-C", str(repo), "config", "user.name", "Grabowski Test"], check=True)
             operator.subprocess.run(["git", "-C", str(repo), "config", "user.email", "grabowski@example.invalid"], check=True)
             (repo / "README.md").write_text("baseline\n")
@@ -5766,6 +5769,7 @@ class OperatorContractTests(unittest.TestCase):
             operator.subprocess.run(
                 ["git", "init", "-q", "-b", "feature", str(repo)], check=True
             )
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
             operator.subprocess.run(
                 ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"],
                 check=True,
@@ -5867,6 +5871,7 @@ class OperatorContractTests(unittest.TestCase):
             repo = root / "repo"
             resource_db = root / "resources.sqlite3"
             operator.subprocess.run(["git", "init", "-q", "-b", "feature", str(repo)], check=True)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
             operator.subprocess.run(["git", "-C", str(repo), "config", "user.name", "Grabowski Test"], check=True)
             operator.subprocess.run(["git", "-C", str(repo), "config", "user.email", "grabowski@example.invalid"], check=True)
             (repo / "README.md").write_text("baseline\n")
@@ -5985,16 +5990,21 @@ class OperatorContractTests(unittest.TestCase):
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            environment = {"PATH": "/usr/bin", "GIT_TERMINAL_PROMPT": "0"}
+            subprocess.run(["/usr/bin/git", "init", "-q", str(repo)], check=True)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
             with (
                 patch.object(operator, "_require_operator_mutation", return_value=None),
                 patch.object(operator, "_guard_git", return_value=None),
                 patch.object(operator, "_validate_argv", side_effect=lambda argv, cwd: argv),
-                patch.object(operator, "_git_environment", return_value=environment),
                 patch.object(operator, "_run", return_value={"returncode": 0}) as run,
             ):
                 operator.grabowski_git(str(repo), ["status"])
-        self.assertEqual(run.call_args.kwargs["environment"], environment)
+        secure = run.call_args.kwargs["environment"]
+        self.assertEqual(secure["PATH"], "/usr/bin:/bin")
+        self.assertEqual(secure["GIT_ALLOW_PROTOCOL"], "ssh:file")
+        self.assertEqual(secure["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(secure["GIT_TERMINAL_PROMPT"], "0")
+        self.assertNotIn("GIT_INDEX_FILE", secure)
 
     def test_grabowski_git_push_disables_hooks_helpers_and_unsafe_protocols(self) -> None:
         operator = _load_operator_module()

@@ -611,6 +611,14 @@ def git_requires_filter_effect_guard(argv: list[str]) -> bool:
         return False
     subcommand = argv[index]
     arguments = argv[index + 1:]
+    if subcommand == "cat-file":
+        # Unlike ordinary object reads, --filters executes smudge/process
+        # drivers while materializing blobs. Bind the inert attributes to Git.
+        # --textconv is denied by _git_without_external_diff before execution.
+        return any(
+            argument.startswith("--") and "--filters".startswith(argument)
+            for argument in arguments
+        )
     if subcommand == "diff":
         # Tokens after '--' are pathspecs, never Git options: a tracked file
         # literally named '--cached' must not bypass dirty-diff isolation.
@@ -642,8 +650,10 @@ def git_requires_filter_effect_guard(argv: list[str]) -> bool:
     if subcommand == "worktree":
         return "add" in arguments
     return subcommand in {
-        "add", "checkout", "restore", "switch", "read-tree", "reset",
-        "merge", "rebase", "stash",
+        "add", "am", "apply", "checkout", "checkout-index", "cherry-pick",
+        "commit", "diff-files", "diff-index", "hash-object", "merge",
+        "read-tree", "rebase", "reset", "restore", "revert", "stash",
+        "status", "switch", "update-index",
     }
 
 
@@ -665,10 +675,47 @@ def _git_without_external_diff(argv: list[str]) -> list[str]:
             position += 1
         else:
             break
-    if (
-        position >= len(argv)
-        or argv[position] not in {"diff", "diff-files", "diff-index", "diff-tree", "show", "log"}
-    ):
+    if position >= len(argv):
+        return list(argv)
+    subcommand = argv[position]
+    # Git parses conflicting diff flags in argument order. A caller-supplied
+    # --ext-diff/--textconv after our --no-* options would re-enable execution.
+    # Also cover blame/annotate/grep/cat-file, whose own --textconv can launch
+    # executable drivers despite an otherwise read-only Git classification.
+    if subcommand in {
+        "diff", "diff-files", "diff-index", "diff-tree", "show", "log",
+        "whatchanged", "annotate", "blame", "grep", "cat-file",
+    }:
+        arguments = argv[position + 1:]
+        option_prefix = arguments[:arguments.index("--")] if "--" in arguments else arguments
+        if any(
+            option.startswith("--") and (
+                "--ext-diff".startswith(option) or option.startswith("--ext-diff")
+                or "--textconv".startswith(option) or option.startswith("--textconv")
+            )
+            for option in option_prefix
+        ):
+            raise AgentSandboxError("Git executable diff/textconv helpers are forbidden")
+        # git grep -O/--open-files-in-pager can execute a caller-selected
+        # program even when the read-only Git environment fixes GIT_PAGER.
+        # Reject both abbreviated long and bundled short option forms.
+        if subcommand == "grep" and any(
+            (
+                option.startswith("--")
+                and "--open-files-in-pager".startswith(option.split("=", 1)[0])
+            )
+            or (
+                option.startswith("-")
+                and not option.startswith("--")
+                and "O" in option[1:]
+            )
+            for option in option_prefix
+        ):
+            raise AgentSandboxError("Git grep executable pager is forbidden")
+    if subcommand not in {
+        "diff", "diff-files", "diff-index", "diff-tree", "show", "log",
+        "whatchanged",
+    }:
         return list(argv)
     return [
         *argv[: position + 1], "--no-ext-diff", "--no-textconv",

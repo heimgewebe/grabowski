@@ -1025,5 +1025,386 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
             self.assertTrue(marker.exists(), "negative control failed to execute driver")
 
 
+
+    def test_actual_builtin_git_commands_ignore_shell_aliases(self) -> None:
+        """Git builtins cannot be shadowed by repository alias.<builtin>=!cmd."""
+        with tempfile.TemporaryDirectory(prefix="native-git-alias-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            marker, helper = root / "alias-marker", root / "alias-helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\nexit 0\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            for sub, args in (
+                ("config", ("--list",)),
+                ("status", ("--short",)),
+                ("diff", ("HEAD",)),
+                ("add", ("--", "tracked.txt")),
+                ("rev-parse", ("HEAD",)),
+            ):
+                with self.subTest(builtin=sub):
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo), "config",
+                         "alias." + sub, "!" + str(helper)],
+                        env=secure, check=True,
+                    )
+                    actual = subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo), sub, *args],
+                        env=secure, capture_output=True,
+                    )
+                    self.assertEqual(actual.returncode, 0, actual.stderr)
+                    self.assertFalse(marker.exists(), "Git builtin was shadowed by alias")
+
+    def test_guard_classifies_actual_worktree_git_effects(self) -> None:
+        from grabowski_agent_sandbox import git_requires_filter_effect_guard
+
+        for args in (
+            ("status", "--short"),
+            ("diff-files", "--quiet", "--"),
+            ("diff-index", "--quiet", "HEAD", "--"),
+            ("update-index", "--refresh"),
+            ("checkout-index", "-a"),
+            ("commit", "-am", "message"),
+            ("hash-object", "--path=tracked.txt", "tracked.txt"),
+            ("cherry-pick", "HEAD"),
+            ("revert", "HEAD"),
+            ("am", "-3"),
+        ):
+            with self.subTest(arguments=args):
+                self.assertTrue(
+                    git_requires_filter_effect_guard(["git", "-C", "/repo", *args]),
+                    "untrusted Git worktree operation skipped executable-filter isolation",
+                )
+
+    def test_native_grabowski_git_commit_all_blocks_late_clean_filter(self) -> None:
+        """Real branch-attempt commit -a must not run injected clean helper."""
+        from unittest import mock
+        import grabowski_operator as operator
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory(prefix="native-cas-commit-all-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
+            for key, value in (("user.name", "Test"),
+                               ("user.email", "test@example.invalid")):
+                subprocess.run(["/usr/bin/git", "-C", str(repo), "config", key, value],
+                               check=True, env=secure)
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=attacker\n", encoding="ascii",
+            )
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "add", ".gitattributes"],
+                           env=secure, check=True)
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "commit",
+                            "-qm", "attributes"], env=secure, check=True)
+            (repo / "tracked.txt").write_text("after\n", encoding="ascii")
+            marker, helper = root / "clean-ran", root / "clean-helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            original_run = operator._run
+            injected = False
+
+            def late_config(argv: list[str], **kwargs: object):
+                nonlocal injected
+                if not injected and "commit" in argv:
+                    injected = True
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo),
+                         "config", "filter.attacker.clean", str(helper)],
+                        check=True, env=secure,
+                    )
+                return original_run(argv, **kwargs)
+
+            attempt = {
+                "schema_version": 1,
+                "owner_id": "operator:commit-all-security",
+                "operation_id": "late-filter",
+                "attempt_id": "commit-1",
+                "branch": "main",
+                "expected_preimage_sha256": operator._git_branch_preimage(repo)[
+                    "preimage_sha256"
+                ],
+            }
+            with (
+                mock.patch.object(resources, "RESOURCE_DB", root / "resources.sqlite3"),
+                mock.patch.object(operator, "_require_operator_mutation", return_value=None),
+                mock.patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+                mock.patch.object(operator, "_run", side_effect=late_config),
+            ):
+                result = operator.grabowski_git(
+                    str(repo), ["commit", "-am", "commit-all"], branch_attempt=attempt,
+                )
+            self.assertTrue(injected)
+            self.assertEqual(result["returncode"], 0, result.get("stderr"))
+            self.assertEqual(result["branch_mutation"]["status"], "completed")
+            self.assertFalse(marker.exists(), "native commit -a ran injected clean helper")
+            self.assertEqual(
+                subprocess.check_output(
+                    ["/usr/bin/git", "-C", str(repo), "show", "HEAD:tracked.txt"]
+                ), b"after\n"
+            )
+            (repo / "tracked.txt").write_text("unprotected-control\n", encoding="ascii")
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "commit", "-am", "unprotected"],
+                check=True, env=secure, capture_output=True,
+            )
+            self.assertTrue(marker.exists(), "unprotected commit -a never ran clean filter")
+
+    def test_native_grabowski_git_dirty_diff_blocks_late_clean_filter(self) -> None:
+        """The public Git read must not bypass the shared effect-bound guard."""
+        from unittest import mock
+        import grabowski_operator as operator
+
+        with tempfile.TemporaryDirectory(prefix="native-dirty-diff-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=attacker\n", encoding="ascii",
+            )
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "add", ".gitattributes"],
+                           env=secure, check=True)
+            subprocess.run(["/usr/bin/git", "-C", str(repo),
+                            "-c", "user.name=Safe Test", "-c",
+                            "user.email=safe@example.invalid",
+                            "commit", "-qm", "attributes"],
+                           env=secure, check=True)
+            (repo / "tracked.txt").write_text("dirty\n", encoding="ascii")
+            marker, helper = root / "clean-ran", root / "clean-helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            real_run = operator._run
+            injected = False
+
+            def late_config(argv: list[str], **kwargs: object):
+                nonlocal injected
+                if not injected and "diff" in argv:
+                    injected = True
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo),
+                         "config", "filter.attacker.clean", str(helper)],
+                        check=True, env=secure,
+                    )
+                return real_run(argv, **kwargs)
+
+            with (
+                mock.patch.object(operator, "_require_operator_mutation", return_value=None),
+                mock.patch.object(operator, "_run", side_effect=late_config),
+            ):
+                actual = operator.grabowski_git(str(repo), ["diff", "HEAD"])
+            self.assertTrue(injected)
+            self.assertEqual(actual["returncode"], 0, actual.get("stderr"))
+            self.assertIn("+dirty", actual["stdout"])
+            self.assertFalse(marker.exists(), "public native Git dirty diff ran filter")
+            unprotected = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "diff", "HEAD"],
+                env=secure, capture_output=True,
+            )
+            self.assertEqual(unprotected.returncode, 0, unprotected.stderr)
+            self.assertTrue(marker.exists(), "unprotected diff control missed helper")
+
+
+    def test_native_cat_file_filters_blocks_late_smudge_helper(self) -> None:
+        """cat-file --filters is a real executable-filter effect, not an inert blob read."""
+        from unittest import mock
+        import grabowski_operator as operator
+
+        with tempfile.TemporaryDirectory(prefix="native-cat-filters-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
+            (repo / ".gitattributes").write_text("tracked.txt filter=attacker\n")
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "add", ".gitattributes"],
+                           env=secure, check=True)
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo),
+                 "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                 "commit", "-qm", "attributes"],
+                env=secure, check=True,
+            )
+            marker, helper = root / "smudge-ran", root / "smudge-helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            original_run = operator._run
+            injected = False
+
+            def inject_after_admission(argv: list[str], **kwargs: object):
+                nonlocal injected
+                if not injected:
+                    injected = True
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo), "config",
+                         "filter.attacker.smudge", str(helper)],
+                        env=secure, check=True,
+                    )
+                return original_run(argv, **kwargs)
+
+            for filter_option in ("--filters", "--filte"):
+                with self.subTest(filter_option=filter_option):
+                    injected = False
+                    marker.unlink(missing_ok=True)
+                    with (
+                        mock.patch.object(operator, "_require_operator_mutation", return_value=None),
+                        mock.patch.object(operator, "_run", side_effect=inject_after_admission),
+                    ):
+                        result = operator.grabowski_git(
+                            str(repo), ["cat-file", filter_option,
+                                        "--path=tracked.txt", "HEAD:tracked.txt"]
+                        )
+                    self.assertTrue(injected, "test missed post-admission helper injection")
+                    self.assertEqual(result["returncode"], 0, result.get("stderr"))
+                    self.assertFalse(marker.exists(), "native cat-file smudge helper ran")
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo), "config",
+                         "--unset", "filter.attacker.smudge"],
+                        env=secure, check=True,
+                    )
+
+    def test_native_git_rejects_helper_reenable_options_before_effect(self) -> None:
+        """User-supplied --ext-diff/--textconv must not defeat earlier --no-*."""
+        from unittest import mock
+        import grabowski_operator as operator
+        from grabowski_agent_sandbox import AgentSandboxError
+
+        with tempfile.TemporaryDirectory(prefix="native-diff-override-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
+            (repo / "tracked.txt").write_text("dirty\n", encoding="ascii")
+            (repo / ".gitattributes").write_text("tracked.txt diff=attacker\n")
+            marker, helper = root / "helper-ran", root / "helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            attacks = (
+                ["-c", f"diff.external={helper}", "diff", "--ext-diff", "HEAD"],
+                ["-c", f"diff.attacker.textconv={helper}", "diff", "--textconv", "HEAD"],
+                ["-c", f"diff.attacker.textconv={helper}", "blame",
+                 "--textconv", "HEAD", "--", "tracked.txt"],
+                ["-c", f"diff.attacker.textconv={helper}", "cat-file",
+                 "--textconv", "--path=tracked.txt", "HEAD:tracked.txt"],
+                ["-c", f"diff.attacker.textconv={helper}", "cat-file",
+                 "--textc", "--path=tracked.txt", "HEAD:tracked.txt"],
+                ["-c", f"diff.attacker.textconv={helper}", "annotate",
+                 "--textconv", "HEAD", "--", "tracked.txt"],
+                ["-c", f"diff.attacker.textconv={helper}", "grep",
+                 "--textconv", "dirty", "HEAD", "--", "tracked.txt"],
+                ["-c", f"diff.attacker.textconv={helper}", "show",
+                 "--textconv", "HEAD:tracked.txt"],
+                ["-c", f"diff.attacker.textconv={helper}", "whatchanged",
+                 "--textconv", "-p", "HEAD"],
+                ["diff", "--ext-diff", "HEAD"],
+                ["diff", "--textconv", "HEAD"],
+                ["blame", "--textconv", "HEAD", "--", "tracked.txt"],
+                ["cat-file", "--textc", "--path=tracked.txt", "HEAD:tracked.txt"],
+                ["grep", "-O", str(helper), "needle"],
+                ["grep", "-nO" + str(helper), "needle"],
+                ["grep", "--open-files-in-pager=" + str(helper), "needle"],
+                ["grep", "--open-files-in-pag=" + str(helper), "needle"],
+            )
+            with mock.patch.object(
+                operator, "_require_operator_mutation", return_value=None
+            ):
+                for attack in attacks:
+                    with self.subTest(attack=attack):
+                        marker.unlink(missing_ok=True)
+                        with self.assertRaises((AgentSandboxError, PermissionError)):
+                            operator.grabowski_git(str(repo), attack)
+                        self.assertFalse(marker.exists(), "native Git ran helper")
+
+
+
+    def test_native_git_rejects_caller_executable_cli_config(self) -> None:
+        """CLI -c overrides safe environment and must never launch hooks/fsmonitor."""
+        from unittest import mock
+        import grabowski_operator as operator
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory(prefix="native-cli-helper-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
+            for key, value in (("user.name", "Fixture"),
+                               ("user.email", "fixture@example.invalid")):
+                subprocess.run(
+                    ["/usr/bin/git", "-C", str(repo), "config", key, value],
+                    env=secure, check=True,
+                )
+            hook_dir = root / "hooks"
+            hook_dir.mkdir(mode=0o700)
+            hook_marker = root / "hook-ran"
+            hook = hook_dir / "pre-commit"
+            hook.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(hook_marker)) + "\nexit 0\n",
+                encoding="ascii",
+            )
+            hook.chmod(0o700)
+            fsmarker = root / "fsmonitor-ran"
+            fsmonitor = root / "monitor-helper"
+            fsmonitor.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(fsmarker)) + "\nexit 0\n",
+                encoding="ascii",
+            )
+            fsmonitor.chmod(0o700)
+            (repo / "tracked.txt").write_text("changed\n")
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "add", "--", "tracked.txt"],
+                env=secure, check=True,
+            )
+            preimage = operator._git_branch_preimage(repo)
+            attempt = {
+                "schema_version": 1,
+                "owner_id": "operator:cli-helper-regression",
+                "operation_id": "cli-helper-p1",
+                "attempt_id": "hook-1",
+                "branch": preimage["branch"],
+                "expected_preimage_sha256": preimage["preimage_sha256"],
+            }
+            with (
+                mock.patch.object(resources, "RESOURCE_DB", root / "resources.sqlite3"),
+                mock.patch.object(operator, "_require_operator_mutation", return_value=None),
+                mock.patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+            ):
+                for argv in (
+                    ["-c", f"core.hooksPath={hook_dir}", "commit", "-m", "no hooks"],
+                    ["-c", f"core.fsmonitor={fsmonitor}", "status", "--short"],
+                ):
+                    marker = hook_marker if "commit" in argv else fsmarker
+                    with self.subTest(argv=argv):
+                        marker.unlink(missing_ok=True)
+                        with self.assertRaises(PermissionError):
+                            operator.grabowski_git(
+                                str(repo), argv,
+                                branch_attempt=attempt if "commit" in argv else None,
+                            )
+                        self.assertFalse(marker.exists(), "native Git ran caller -c helper")
+
+
+
 if __name__ == "__main__":
     unittest.main()
