@@ -351,6 +351,307 @@ def authorize_pair(
     )
 
 
+def _require_external_provider_one_shot(*, pair_id: str) -> None:
+    """Keep paired live dispatch closed until a trusted external verifier exists.
+
+    Internal authorize_pair(), cost flags, credentials and root-systemd
+    admission cannot confer separate single-use spending authorization.
+    No canonical verifier is currently wired to this entrypoint.
+    """
+    raise core.PreflightError(
+        "external one-shot provider authorization verifier is unavailable"
+    )
+
+
+def _paired_terminal_path(report_out: Path, *, failed: bool = False) -> Path:
+    """Create-only durable pair result distinct from the authorization report."""
+    return report_out.with_name(
+        report_out.stem + (".pair-failed.json" if failed else ".pair-result.json")
+    )
+
+
+def _persist_pair_artifact(
+    path: Path, value: dict[str, Any], *, digest: bool = False
+) -> None:
+    """Create an immutable private artifact without following untrusted paths.
+
+    The provider can write to the epoch output mounts before it exits, so
+    post-provider finalization must never use Path.resolve()/mkdir on a
+    provider-supplied symlink. The verified parent dirfd pins the destination.
+    """
+    if not path.is_absolute() or os.path.normpath(str(path)) != str(path):
+        raise core.PreflightError("paired artifact path is unsafe")
+    raw = (
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    if not raw or len(raw) > 8 * 1024 * 1024:
+        raise core.PreflightError("paired artifact exceeds private output limit")
+    parent, descriptor = codex_runner._open_private_directory(path.parent)
+    try:
+        codex_runner._directory_fd_matches(parent, descriptor)
+        codex_runner._assert_absent(descriptor, path.name)
+        if digest:
+            codex_runner._assert_absent(descriptor, path.name + ".sha256")
+        codex_runner._write_private_dirfd(descriptor, path.name, raw)
+        if digest:
+            checksum = (f"{hashlib.sha256(raw).hexdigest()}  {path.name}\n").encode(
+                "ascii"
+            )
+            codex_runner._write_private_dirfd(
+                descriptor, path.name + ".sha256", checksum
+            )
+        codex_runner._directory_fd_matches(parent, descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _validated_condition_receipt(
+    *,
+    request: dict[str, Any],
+    receipt: Any,
+    request_root: Path,
+    evidence_root: Path,
+    transcript_root: Path,
+    validator_command: list[str],
+) -> dict[str, Any]:
+    """Validate the exact live condition and its external cost-bearing evidence."""
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("kind") != codex_runner.base.RECEIPT_KIND
+        or receipt.get("status") != "success"
+        or receipt.get("request_id") != request.get("request_id")
+        or receipt.get("request_sha256") != core._sha256_json(request)
+        or receipt.get("exit_code") != 0
+        or receipt.get("error") is not None
+    ):
+        raise core.PreflightError("paired live receipt is missing or mismatched")
+    core._tool_requirement(receipt, treatment=request.get("condition") == "treatment")
+    filename = (
+        hashlib.sha256(str(request["request_id"]).encode("utf-8")).hexdigest()
+        + ".receipt.json"
+    )
+    path = evidence_root / "receipts" / filename
+    _persist_pair_artifact(path, receipt)
+    validated = core._validate_receipt_external(
+        validator_command,
+        request_path=core._request_path(request_root, request),
+        receipt_path=path,
+        transcript_root=transcript_root,
+    )
+    observed = core._observed_cost(receipt, transcript_root)
+    if not observed.is_finite() or observed < 0:
+        raise core.PreflightError("paired live cost is not verified")
+    return {
+        "receipt_sha256": core._sha256_json(receipt),
+        "receipt_path": str(path),
+        "validator_sha256": core._sha256_json(validated),
+        "observed_cost_usd": format(observed, "f"),
+    }
+
+
+def _attest_completed_pair_ledger(
+    *,
+    baseline: dict[str, Any],
+    ordered: list[dict[str, Any]],
+    state_root: Path,
+    results: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Read back the runner-owned, immutable five-event ledger without rewriting it."""
+    loaded = codex_runner._load_preflight_dispatch_authorization(baseline, state_root)
+    state = codex_runner._validated_dispatch_event_state(
+        baseline, state_root, loaded["authorization"]
+    )
+    conditions = [str(request["condition"]) for request in ordered]
+    if (
+        len(conditions) != 2
+        or set(conditions) != {"baseline", "treatment"}
+        or state["condition_intents"] != conditions
+        or state["condition_outcomes"]
+        != {"baseline": "condition-completed", "treatment": "condition-completed"}
+        or state["pending_condition"] is not None
+        or state["terminal_failure"]
+        or state["next_sequence"] != 5
+    ):
+        raise core.PreflightError("paired dispatch ledger is not fully terminal")
+    events = Path(state["events_root"])
+    for index, request in enumerate(ordered, start=1):
+        condition = str(request["condition"])
+        event = codex_runner.base._load_object_bytes(
+            codex_runner._read_bound_regular_file(
+                events / f"{2 * index:04d}-condition-completed.json",
+                label="paired condition terminal event",
+                max_bytes=codex_runner.MAX_DISPATCH_EVENT_BYTES,
+            ),
+            label="paired condition terminal event",
+        )
+        payload = event.get("payload")
+        if (
+            not isinstance(payload, dict)
+            or payload.get("condition") != condition
+            or payload.get("receipt_sha256") != results[condition]["receipt_sha256"]
+        ):
+            raise core.PreflightError("paired terminal ledger receipt binding mismatch")
+    return {
+        "root": str(state["pair_root"]),
+        "event_count": state["next_sequence"],
+        "final_event_sha256": state["previous_event_sha256"],
+        "authorization_sha256": core._sha256_json(loaded["authorization"]),
+        "retry_permitted": False,
+    }
+
+
+def execute_authorized_pair(
+    *,
+    pair_id: str,
+    request_root: Path,
+    repository_map: Path,
+    state_root: Path,
+    transcript_root: Path,
+    evidence_root: Path,
+    report_out: Path,
+    codex_command: str,
+    codex_command_sha256: str,
+    max_cost_usd: Decimal,
+    validator_command: list[str],
+) -> dict[str, Any]:
+    """Run the two exact conditions within one trusted root-systemd main PID.
+
+    A distinct external one-shot verifier is required before any internal
+    authorization or provider intent. The current installation deliberately
+    has no such verifier, so the live path stops closed at that boundary.
+    """
+    if _ENTRYPOINT_BOOTSTRAP_IDENTITY is None:
+        raise core.PreflightError(
+            "paired dispatch requires immutable preflight bootstrap"
+        )
+    _require_external_provider_one_shot(pair_id=pair_id)
+
+    authorization: dict[str, Any] | None = None
+    requests: dict[str, str] = {}
+    results: dict[str, dict[str, Any]] = {}
+    try:
+        baseline, treatment = core.load_pair(request_root, pair_id)
+        authorization = authorize_pair(
+            pair_id=pair_id,
+            request_root=request_root,
+            repository_map=repository_map,
+            state_root=state_root,
+            transcript_root=transcript_root,
+            evidence_root=evidence_root,
+            report_out=report_out,
+            codex_command=codex_command,
+            codex_command_sha256=codex_command_sha256,
+            max_cost_usd=max_cost_usd,
+            validator_command=validator_command,
+        )
+        requests = {
+            "baseline": core._sha256_json(baseline),
+            "treatment": core._sha256_json(treatment),
+        }
+        if (
+            not isinstance(authorization, dict)
+            or authorization.get("status") != "authorized"
+            or authorization.get("pair_id") != pair_id
+            or authorization.get("request_sha256") != requests
+        ):
+            raise core.PreflightError("paired dispatch authorization identity mismatch")
+        arguments = argparse.Namespace(
+            request_root=request_root,
+            repository_map=repository_map,
+            state_root=state_root,
+            transcript_root=transcript_root,
+            provider_evidence_root=evidence_root,
+            codex_command=codex_command,
+            codex_command_sha256=codex_command_sha256,
+            allow_live_provider=True,
+            stream_fixture=None,
+            stderr_fixture=None,
+            fixture_returncode=0,
+        )
+        ordered = sorted(
+            (baseline, treatment), key=lambda request: int(request["order"])
+        )
+        for request in ordered:
+            condition = str(request["condition"])
+            receipt = codex_runner.execute(request, arguments)
+            results[condition] = _validated_condition_receipt(
+                request=request,
+                receipt=receipt,
+                request_root=request_root,
+                evidence_root=evidence_root,
+                transcript_root=transcript_root,
+                validator_command=validator_command,
+            )
+            # There must be no second provider intent if the first receipt,
+            # external validator, or cost report is incomplete.
+        if set(results) != {"baseline", "treatment"}:
+            raise core.PreflightError("paired dispatch is incomplete")
+        observed = sum(
+            (Decimal(result["observed_cost_usd"]) for result in results.values()),
+            Decimal("0"),
+        )
+        authorized_total = max_cost_usd * 2
+        if not observed.is_finite() or observed > authorized_total:
+            raise core.PreflightError("paired provider cost exceeds authorized budget")
+        ledger = _attest_completed_pair_ledger(
+            baseline=baseline,
+            ordered=ordered,
+            state_root=state_root,
+            results=results,
+        )
+        # Runner and ledger readbacks must agree before any final success claim.
+        source_before = authorization.get("source_after")
+        if not isinstance(source_before, dict):
+            raise core.PreflightError("paired source baseline evidence is missing")
+        source_after = core.source_state(
+            core.runner.load_repository_root(baseline, repository_map)
+        )
+        core._assert_source_unchanged(source_before, source_after)
+        report = {
+            "kind": "repobrief.codex_same_unit_pair_result",
+            "status": "valid",
+            "pair_id": pair_id,
+            "request_sha256": requests,
+            "runs": results,
+            "cost": {
+                "total_observed_usd": format(observed, "f"),
+                "total_authorized_usd": format(authorized_total, "f"),
+            },
+            "dispatch_ledger": ledger,
+            "source_after_sha256": core._sha256_json(source_after),
+            "retry_permitted": False,
+            "default_promoted": False,
+        }
+        _persist_pair_artifact(_paired_terminal_path(report_out), report, digest=True)
+        return report
+    except BaseException as exc:
+        # A prior authorized pair can have consumed zero, one or two intents.
+        # Preserve a separate create-only failure artifact, never retry or
+        # misreport a successful individual runner event as complete pair QC.
+        if authorization is not None:
+            failure = {
+                "kind": "repobrief.codex_same_unit_pair_result",
+                "status": "failed",
+                "pair_id": pair_id,
+                "request_sha256": requests,
+                "verified_receipts": results,
+                "failure": core._error_evidence(exc),
+                "retry_permitted": False,
+                "default_promoted": False,
+            }
+            try:
+                _persist_pair_artifact(
+                    _paired_terminal_path(report_out, failed=True),
+                    failure,
+                    digest=True,
+                )
+            except BaseException as persistence_error:
+                raise core.PreflightError(
+                    "paired failure could not be terminalized durably"
+                ) from persistence_error
+        raise
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Authorize one exact RepoBrief Codex benchmark pair.",
@@ -367,6 +668,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--codex-command", required=True)
     parser.add_argument("--codex-command-sha256", required=True)
     parser.add_argument("--max-cost-usd", required=True)
+    parser.add_argument("--execute-pair", action="store_true")
+    parser.add_argument("--allow-live-provider", action="store_true")
     return parser
 
 
@@ -377,7 +680,12 @@ def main(argv: list[str] | None = None) -> int:
             max_cost = Decimal(args.max_cost_usd)
         except InvalidOperation as exc:
             raise core.PreflightError("max cost is not a decimal") from exc
-        report = authorize_pair(
+        if args.execute_pair != args.allow_live_provider:
+            raise core.PreflightError(
+                "paired execution requires an explicit provider opt-in"
+            )
+        dispatch = execute_authorized_pair if args.execute_pair else authorize_pair
+        report = dispatch(
             pair_id=args.pair_id,
             request_root=args.request_root,
             repository_map=args.repository_map,

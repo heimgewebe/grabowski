@@ -3418,5 +3418,508 @@ class FrozenG2PreflightProofTests(unittest.TestCase):
         codex_runner._require_g2_preflight_evidence({}, clean_binding)
 
 
+class CodexSameUnitPairContractTests(unittest.TestCase):
+    """Verify pair admission and ordering without running Codex or a provider."""
+
+    @staticmethod
+    def _requests() -> tuple[dict, dict]:
+        # Opposite order proves there is no hardcoded baseline-first assumption.
+        baseline = {"condition": "baseline", "order": 2, "pair_id": "bound-pair"}
+        treatment = {"condition": "treatment", "order": 1, "pair_id": "bound-pair"}
+        return baseline, treatment
+
+    @staticmethod
+    def _kwargs() -> dict:
+        return {
+            "pair_id": "bound-pair",
+            "request_root": Path("/read-only/requests"),
+            "repository_map": Path("/read-only/map.json"),
+            "state_root": Path("/private/state"),
+            "transcript_root": Path("/private/transcripts"),
+            "evidence_root": Path("/private/evidence"),
+            "report_out": Path("/private/reports/preflight.json"),
+            "codex_command": "/read-only/codex",
+            "codex_command_sha256": "a" * 64,
+            "max_cost_usd": support.Decimal("1.00"),
+            "validator_command": ["/read-only/validator"],
+        }
+
+    def test_provider_flags_must_be_bound_together_before_preflight(self) -> None:
+        normal = [
+            "--pair-id",
+            "bound-pair",
+            "--request-root",
+            "/read-only/requests",
+            "--repository-map",
+            "/read-only/map.json",
+            "--state-root",
+            "/private/state",
+            "--transcript-root",
+            "/private/transcripts",
+            "--evidence-root",
+            "/private/evidence",
+            "--report-out",
+            "/private/reports/preflight.json",
+            "--validator-command",
+            "/read-only/validator.json",
+            "--codex-command",
+            "/read-only/codex",
+            "--codex-command-sha256",
+            "a" * 64,
+            "--max-cost-usd",
+            "1.00",
+        ]
+        for extra in (["--execute-pair"], ["--allow-live-provider"]):
+            with (
+                self.subTest(extra=extra),
+                mock.patch.object(codex_preflight, "authorize_pair") as authorize,
+                mock.patch.object(
+                    codex_preflight, "execute_authorized_pair"
+                ) as execute,
+                redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(codex_preflight.main(normal + extra), 2)
+                authorize.assert_not_called()
+                execute.assert_not_called()
+
+    def test_pair_requires_authenticated_immutable_entrypoint(self) -> None:
+        with (
+            mock.patch.object(codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", None),
+            mock.patch.object(codex_preflight.core, "load_pair") as load,
+            mock.patch.object(codex_preflight, "authorize_pair") as authorize,
+            mock.patch.object(codex_preflight.codex_runner, "execute") as execute,
+        ):
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError, "immutable preflight bootstrap"
+            ):
+                codex_preflight.execute_authorized_pair(**self._kwargs())
+            load.assert_not_called()
+            authorize.assert_not_called()
+            execute.assert_not_called()
+
+    def test_missing_external_one_shot_denies_provider_before_internal_authorization(
+        self,
+    ) -> None:
+        # The production gate has no configured external verifier. CLI flags,
+        # credentials and internally generated ledgers must not start Codex.
+        with (
+            mock.patch.object(
+                codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
+            ),
+            mock.patch.object(codex_preflight.core, "load_pair") as load,
+            mock.patch.object(codex_preflight, "authorize_pair") as authorize,
+            mock.patch.object(codex_preflight.codex_runner, "execute") as execute,
+        ):
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError, "external one-shot"
+            ):
+                codex_preflight.execute_authorized_pair(**self._kwargs())
+            load.assert_not_called()
+            authorize.assert_not_called()
+            execute.assert_not_called()
+
+    def test_mismatched_authorization_cannot_start_either_provider(self) -> None:
+        baseline, treatment = self._requests()
+        with (
+            mock.patch.object(
+                codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
+            ),
+            mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
+            mock.patch.object(
+                codex_preflight.core, "load_pair", return_value=(baseline, treatment)
+            ),
+            mock.patch.object(
+                codex_preflight,
+                "authorize_pair",
+                return_value={
+                    "status": "authorized",
+                    "pair_id": "bound-pair",
+                    "request_sha256": {
+                        "baseline": "0" * 64,
+                        "treatment": "1" * 64,
+                    },
+                },
+            ),
+            mock.patch.object(codex_preflight.codex_runner, "execute") as execute,
+            mock.patch.object(codex_preflight, "_persist_pair_artifact") as persisted,
+        ):
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError,
+                "authorization identity mismatch",
+            ):
+                codex_preflight.execute_authorized_pair(**self._kwargs())
+            execute.assert_not_called()
+            self.assertEqual(persisted.call_count, 1)
+            self.assertEqual(persisted.call_args.args[1]["status"], "failed")
+
+    def test_exact_authorization_runs_both_in_one_process_in_pair_order(self) -> None:
+        baseline, treatment = self._requests()
+        bindings = {
+            "baseline": codex_preflight.core._sha256_json(baseline),
+            "treatment": codex_preflight.core._sha256_json(treatment),
+        }
+        with (
+            mock.patch.object(
+                codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
+            ),
+            mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
+            mock.patch.object(
+                codex_preflight.core, "load_pair", return_value=(baseline, treatment)
+            ),
+            mock.patch.object(
+                codex_preflight,
+                "authorize_pair",
+                return_value={
+                    "status": "authorized",
+                    "pair_id": "bound-pair",
+                    "request_sha256": bindings,
+                    "source_after": {"rev": "same"},
+                },
+            ) as authorize,
+            mock.patch.object(
+                codex_preflight.codex_runner,
+                "execute",
+                side_effect=[
+                    {"status": "completed", "condition": "treatment"},
+                    {"status": "completed", "condition": "baseline"},
+                ],
+            ) as execute,
+            mock.patch.object(
+                codex_preflight,
+                "_validated_condition_receipt",
+                side_effect=[
+                    {"receipt_sha256": "1" * 64, "observed_cost_usd": "0.10"},
+                    {"receipt_sha256": "2" * 64, "observed_cost_usd": "0.20"},
+                ],
+            ) as validated,
+            mock.patch.object(
+                codex_preflight,
+                "_attest_completed_pair_ledger",
+                return_value={"event_count": 5, "final_event_sha256": "a" * 64},
+            ) as ledger,
+            mock.patch.object(
+                codex_preflight.core.runner,
+                "load_repository_root",
+                return_value=Path("/frozen/repo"),
+            ),
+            mock.patch.object(
+                codex_preflight.core, "source_state", return_value={"rev": "same"}
+            ),
+            mock.patch.object(codex_preflight.core, "_assert_source_unchanged"),
+            mock.patch.object(codex_preflight, "_persist_pair_artifact") as persisted,
+        ):
+            result = codex_preflight.execute_authorized_pair(**self._kwargs())
+        self.assertEqual(result["status"], "valid")
+        self.assertEqual(result["request_sha256"], bindings)
+        self.assertEqual(set(result["runs"]), {"baseline", "treatment"})
+        self.assertEqual(result["cost"]["total_observed_usd"], "0.30")
+        self.assertEqual(validated.call_count, 2)
+        ledger.assert_called_once()
+        persisted.assert_called_once()
+        self.assertEqual(persisted.call_args.args[1]["status"], "valid")
+        self.assertTrue(persisted.call_args.kwargs["digest"])
+        self.assertEqual(authorize.call_count, 1)
+        self.assertEqual(execute.call_count, 2)
+        self.assertIs(execute.call_args_list[0].args[0], treatment)
+        self.assertIs(execute.call_args_list[1].args[0], baseline)
+        self.assertIs(
+            execute.call_args_list[0].args[1], execute.call_args_list[1].args[1]
+        )
+        self.assertTrue(execute.call_args_list[0].args[1].allow_live_provider)
+        self.assertIsNone(execute.call_args_list[0].args[1].stream_fixture)
+
+    def test_first_condition_failure_never_dispatches_second(self) -> None:
+        baseline, treatment = self._requests()
+        bindings = {
+            "baseline": codex_preflight.core._sha256_json(baseline),
+            "treatment": codex_preflight.core._sha256_json(treatment),
+        }
+        with (
+            mock.patch.object(
+                codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
+            ),
+            mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
+            mock.patch.object(
+                codex_preflight.core, "load_pair", return_value=(baseline, treatment)
+            ),
+            mock.patch.object(
+                codex_preflight,
+                "authorize_pair",
+                return_value={
+                    "status": "authorized",
+                    "pair_id": "bound-pair",
+                    "request_sha256": bindings,
+                    "source_after": {"rev": "same"},
+                },
+            ),
+            mock.patch.object(
+                codex_preflight.codex_runner,
+                "execute",
+                side_effect=codex_preflight.codex_runner.RunnerError(
+                    "injected first-condition failure"
+                ),
+            ) as execute,
+            mock.patch.object(codex_preflight, "_persist_pair_artifact") as persisted,
+        ):
+            with self.assertRaisesRegex(
+                codex_preflight.codex_runner.RunnerError,
+                "injected first-condition failure",
+            ):
+                codex_preflight.execute_authorized_pair(**self._kwargs())
+            self.assertEqual(execute.call_count, 1)
+            persisted.assert_called_once()
+            self.assertEqual(persisted.call_args.args[1]["status"], "failed")
+
+    def test_typed_receipt_requires_external_validation_and_observed_cost(self) -> None:
+        request = {"condition": "baseline", "request_id": "baseline-receipt"}
+        receipt = {
+            "kind": codex_runner.base.RECEIPT_KIND,
+            "status": "success",
+            "request_id": "baseline-receipt",
+            "request_sha256": codex_preflight.core._sha256_json(request),
+            "exit_code": 0,
+            "error": None,
+            "tool_calls": [],
+        }
+        with (
+            mock.patch.object(codex_preflight, "_persist_pair_artifact") as persist,
+            mock.patch.object(
+                codex_preflight.core,
+                "_request_path",
+                return_value=Path("/frozen/requests/baseline.json"),
+            ),
+            mock.patch.object(
+                codex_preflight.core,
+                "_validate_receipt_external",
+                return_value={"status": "valid", "contract": "bound"},
+            ) as validator,
+            mock.patch.object(
+                codex_preflight.core,
+                "_observed_cost",
+                return_value=support.Decimal("0.25"),
+            ) as cost,
+        ):
+            result = codex_preflight._validated_condition_receipt(
+                request=request,
+                receipt=receipt,
+                request_root=Path("/frozen/requests"),
+                evidence_root=Path("/private/evidence"),
+                transcript_root=Path("/private/transcripts"),
+                validator_command=["/trusted/validator"],
+            )
+        self.assertEqual(result["observed_cost_usd"], "0.25")
+        self.assertEqual(
+            result["receipt_sha256"], codex_preflight.core._sha256_json(receipt)
+        )
+        self.assertEqual(validator.call_count, 1)
+        self.assertEqual(
+            validator.call_args.kwargs["request_path"],
+            Path("/frozen/requests/baseline.json"),
+        )
+        self.assertEqual(cost.call_count, 1)
+        persist.assert_called_once()
+        self.assertEqual(persist.call_args.kwargs, {})
+
+    def test_untrusted_or_incomplete_receipt_never_reaches_validator(self) -> None:
+        request = {"condition": "baseline", "request_id": "incomplete"}
+        with (
+            mock.patch.object(codex_preflight, "_persist_pair_artifact") as persist,
+            mock.patch.object(
+                codex_preflight.core, "_validate_receipt_external"
+            ) as validator,
+            mock.patch.object(codex_preflight.core, "_observed_cost") as cost,
+        ):
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError, "missing or mismatched"
+            ):
+                codex_preflight._validated_condition_receipt(
+                    request=request,
+                    receipt={"status": "success"},
+                    request_root=Path("/frozen/requests"),
+                    evidence_root=Path("/private/evidence"),
+                    transcript_root=Path("/private/transcripts"),
+                    validator_command=["/trusted/validator"],
+                )
+            persist.assert_not_called()
+            validator.assert_not_called()
+            cost.assert_not_called()
+
+    def test_validator_failure_stops_before_observed_cost(self) -> None:
+        request = {"condition": "baseline", "request_id": "bad-validator"}
+        receipt = {
+            "kind": codex_runner.base.RECEIPT_KIND,
+            "status": "success",
+            "request_id": "bad-validator",
+            "request_sha256": codex_preflight.core._sha256_json(request),
+            "exit_code": 0,
+            "error": None,
+            "tool_calls": [],
+        }
+        with (
+            mock.patch.object(codex_preflight, "_persist_pair_artifact"),
+            mock.patch.object(
+                codex_preflight.core,
+                "_request_path",
+                return_value=Path("/frozen/requests/baseline.json"),
+            ),
+            mock.patch.object(
+                codex_preflight.core,
+                "_validate_receipt_external",
+                side_effect=codex_preflight.core.PreflightError(
+                    "external validator rejected the receipt"
+                ),
+            ),
+            mock.patch.object(codex_preflight.core, "_observed_cost") as cost,
+        ):
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError, "external validator rejected"
+            ):
+                codex_preflight._validated_condition_receipt(
+                    request=request,
+                    receipt=receipt,
+                    request_root=Path("/frozen/requests"),
+                    evidence_root=Path("/private/evidence"),
+                    transcript_root=Path("/private/transcripts"),
+                    validator_command=["/trusted/validator"],
+                )
+            cost.assert_not_called()
+
+    def test_no_follow_create_only_pair_artifacts_and_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            report = private / "paired.json"
+            value = {"status": "valid", "pair_id": "test"}
+            codex_preflight._persist_pair_artifact(report, value, digest=True)
+            self.assertEqual(json.loads(report.read_text())["status"], "valid")
+            digest = (private / "paired.json.sha256").read_text().split()[0]
+            self.assertEqual(digest, hashlib.sha256(report.read_bytes()).hexdigest())
+            self.assertEqual(report.stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(codex_preflight.codex_runner.RunnerError):
+                codex_preflight._persist_pair_artifact(report, value, digest=True)
+
+    def test_pair_result_symlink_and_receipts_directory_escape_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            outside = root / "escaped.json"
+            (private / "result.json").symlink_to(outside)
+            with self.assertRaises(codex_preflight.codex_runner.RunnerError):
+                codex_preflight._persist_pair_artifact(
+                    private / "result.json", {"status": "valid"}
+                )
+            self.assertFalse(outside.exists())
+            destination = root / "other"
+            destination.mkdir(mode=0o700)
+            (private / "receipts").symlink_to(destination, target_is_directory=True)
+            with self.assertRaises(codex_preflight.codex_runner.RunnerError):
+                codex_preflight._persist_pair_artifact(
+                    private / "receipts" / "pretend-receipt.json",
+                    {"status": "valid"},
+                )
+            self.assertEqual(list(destination.iterdir()), [])
+
+    def test_first_receipt_failure_writes_terminal_failure_and_no_second_intent(
+        self,
+    ) -> None:
+        baseline, treatment = self._requests()
+        bindings = {
+            "baseline": codex_preflight.core._sha256_json(baseline),
+            "treatment": codex_preflight.core._sha256_json(treatment),
+        }
+        with (
+            mock.patch.object(
+                codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
+            ),
+            mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
+            mock.patch.object(
+                codex_preflight.core, "load_pair", return_value=(baseline, treatment)
+            ),
+            mock.patch.object(
+                codex_preflight,
+                "authorize_pair",
+                return_value={
+                    "status": "authorized",
+                    "pair_id": "bound-pair",
+                    "request_sha256": bindings,
+                },
+            ),
+            mock.patch.object(
+                codex_preflight.codex_runner,
+                "execute",
+                return_value={"status": "success"},
+            ) as run,
+            mock.patch.object(
+                codex_preflight,
+                "_validated_condition_receipt",
+                side_effect=codex_preflight.core.PreflightError(
+                    "receipt validator failed"
+                ),
+            ),
+            mock.patch.object(codex_preflight, "_persist_pair_artifact") as persist,
+        ):
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError, "receipt validator failed"
+            ):
+                codex_preflight.execute_authorized_pair(**self._kwargs())
+            self.assertEqual(run.call_count, 1)
+            persist.assert_called_once()
+            self.assertEqual(persist.call_args.args[1]["status"], "failed")
+            self.assertTrue(persist.call_args.kwargs["digest"])
+            self.assertFalse(persist.call_args.args[1]["retry_permitted"])
+
+    def test_aggregate_spend_overrun_fails_before_pair_success(self) -> None:
+        baseline, treatment = self._requests()
+        bindings = {
+            "baseline": codex_preflight.core._sha256_json(baseline),
+            "treatment": codex_preflight.core._sha256_json(treatment),
+        }
+        with (
+            mock.patch.object(
+                codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
+            ),
+            mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
+            mock.patch.object(
+                codex_preflight.core, "load_pair", return_value=(baseline, treatment)
+            ),
+            mock.patch.object(
+                codex_preflight,
+                "authorize_pair",
+                return_value={
+                    "status": "authorized",
+                    "pair_id": "bound-pair",
+                    "request_sha256": bindings,
+                },
+            ),
+            mock.patch.object(
+                codex_preflight.codex_runner,
+                "execute",
+                side_effect=[{"status": "success"}, {"status": "success"}],
+            ) as run,
+            mock.patch.object(
+                codex_preflight,
+                "_validated_condition_receipt",
+                side_effect=[
+                    {"receipt_sha256": "a" * 64, "observed_cost_usd": "1.50"},
+                    {"receipt_sha256": "b" * 64, "observed_cost_usd": "1.50"},
+                ],
+            ),
+            mock.patch.object(
+                codex_preflight, "_attest_completed_pair_ledger"
+            ) as ledger,
+            mock.patch.object(codex_preflight, "_persist_pair_artifact") as persist,
+        ):
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError, "exceeds authorized budget"
+            ):
+                codex_preflight.execute_authorized_pair(**self._kwargs())
+            self.assertEqual(run.call_count, 2)
+            ledger.assert_not_called()
+            persist.assert_called_once()
+            self.assertEqual(persist.call_args.args[1]["status"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -351,5 +351,150 @@ class RootSystemdLauncherTests(unittest.TestCase):
         process.assert_not_called()
 
 
+class RootSystemdPairPlanTests(unittest.TestCase):
+    @staticmethod
+    def arguments() -> dict:
+        return {
+            "run_id": "bound",
+            "runner": Path(
+                "/usr/local/libexec/repobrief_agent_benchmark_codex_runner.py"
+            ),
+            "preflight": Path(
+                "/usr/local/libexec/repobrief_agent_benchmark_codex_preflight.py"
+            ),
+            "request_root": Path("/frozen/requests"),
+            "repository_map": Path("/frozen/repository-map.json"),
+            "codex": Path("/usr/local/bin/codex"),
+            "codex_sha256": "a" * 64,
+            "pair_id": "frozen-pair",
+            "validator_command": Path("/frozen/validator.json"),
+            "max_cost_usd": "1.00",
+            "allow_live_provider": True,
+        }
+
+    def test_pair_uses_one_root_service_with_bootstrapped_preflight_main(
+        self,
+    ) -> None:
+        with patch.object(
+            launcher, "_frozen_bootstrap_program", return_value="captured-bootstrap"
+        ) as frozen:
+            command = launcher.live_pair_plan(**self.arguments())
+        self.assertEqual(
+            frozen.call_args_list[0].args[0],
+            self.arguments()["runner"],
+        )
+        self.assertEqual(
+            frozen.call_args_list[1].args[0],
+            self.arguments()["preflight"],
+        )
+        self.assertEqual(frozen.call_count, 2)
+        self.assertEqual(command[:3], ["/usr/bin/systemd-run", "--system", "--wait"])
+        self.assertEqual(command.count("--"), 1)
+        self.assertIn("--unit=grabowski-rab-bound", command)
+        self.assertNotIn("--collect", command)
+        props = RootSystemdLauncherTests.props(command)
+        self.assertEqual(props["Type"], "exec")
+        self.assertEqual(props["DynamicUser"], "yes")
+        self.assertEqual(props["DevicePolicy"], "closed")
+        self.assertEqual(props["RuntimeMaxSec"], "21600")
+        self.assertEqual(
+            props["ReadWritePaths"].split(),
+            [
+                f"/var/lib/grabowski-rab-bound/epoch/{leaf}"
+                for leaf in launcher._OUTPUTS
+            ],
+        )
+        child = command[command.index("--") + 1 :]
+        self.assertEqual(
+            child[:5], ["/usr/bin/python3", "-I", "-B", "-c", "captured-bootstrap"]
+        )
+        self.assertEqual(child[5], str(self.arguments()["preflight"]))
+        self.assertIn("--execute-pair", child)
+        self.assertIn("--allow-live-provider", child)
+        self.assertIn("--pair-id", child)
+        self.assertEqual(child[child.index("--pair-id") + 1], "frozen-pair")
+        self.assertEqual(
+            child[child.index("--state-root") + 1],
+            "/var/lib/grabowski-rab-bound/epoch/state",
+        )
+        self.assertEqual(
+            child[child.index("--report-out") + 1],
+            "/var/lib/grabowski-rab-bound/epoch/reports/preflight.json",
+        )
+        # No second ExecStart, shell, or unfiltered same-UID supervisor.
+        self.assertNotIn("sh", child)
+        self.assertNotIn("bash", child)
+
+    def test_pair_plan_rejects_opt_in_path_identity_and_cost_errors(
+        self,
+    ) -> None:
+        arguments = self.arguments()
+        cases = (
+            {"allow_live_provider": False},
+            {"runner": Path("/tmp/other.py")},
+            {"preflight": Path("/usr/local/libexec/unqualified.py")},
+            {"preflight": Path("/tmp/repobrief_agent_benchmark_codex_preflight.py")},
+            {"pair_id": ""},
+            {"pair_id": "line\nbreak"},
+            {"codex_sha256": "a" * 63},
+            {"max_cost_usd": "0"},
+            {"max_cost_usd": "1.01"},
+            {"max_cost_usd": "NaN"},
+            {"validator_command": Path("../validator.json")},
+        )
+        for changed in cases:
+            with (
+                self.subTest(changed=changed),
+                patch.object(launcher, "_frozen_bootstrap_program") as capture,
+            ):
+                with self.assertRaises(launcher.LauncherError):
+                    launcher.live_pair_plan(**{**arguments, **changed})
+                capture.assert_not_called()
+        with self.assertRaisesRegex(launcher.LauncherError, "cannot be a no-provider"):
+            launcher.unit_argv("bound", ["/usr/bin/true"], probe=True, pair=True)
+
+    def test_pair_cli_prints_inert_plan_without_invoking_python_or_provider(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                launcher, "_frozen_bootstrap_program", return_value="frozen-test"
+            ),
+            patch.object(subprocess, "run") as invocation,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            result = launcher.main(
+                [
+                    "--run-id",
+                    "bound",
+                    "--live-pair-plan",
+                    "--runner",
+                    str(self.arguments()["runner"]),
+                    "--preflight",
+                    str(self.arguments()["preflight"]),
+                    "--request-root",
+                    "/frozen/requests",
+                    "--repository-map",
+                    "/frozen/repository-map.json",
+                    "--codex",
+                    "/usr/local/bin/codex",
+                    "--codex-sha256",
+                    "a" * 64,
+                    "--pair-id",
+                    "frozen-pair",
+                    "--validator-command",
+                    "/frozen/validator.json",
+                    "--max-cost-usd",
+                    "1.00",
+                    "--allow-live-provider",
+                ]
+            )
+        self.assertEqual(result, 0)
+        command = json.loads(output.getvalue())
+        self.assertEqual(command["mode"], "pair-live-plan-only")
+        self.assertIn("--execute-pair", command["argv"])
+        invocation.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ and invoke the privileged broker. No live provider is started by this module.
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import json
 import os
 import re
@@ -39,9 +40,12 @@ def unit_argv(
     program: Sequence[str],
     *,
     probe: bool,
+    pair: bool = False,
 ) -> list[str]:
     """Return argv, never a shell string; root-owned PID 1 owns the unit."""
     name = service_name(run_id)
+    if pair and probe:
+        raise LauncherError("a paired provider unit cannot be a no-provider probe")
     if not program or any(not isinstance(x, str) or not x for x in program):
         raise LauncherError("empty program or argument")
     if not Path(program[0]).is_absolute():
@@ -101,7 +105,12 @@ def unit_argv(
         # readbacks, 30s tree scan, 10s login, 25s sandbox, 300s cleanup
         # and 475s for ledger finalization / scheduling. Never let systemd
         # kill the ledger writer immediately after a valid provider intent.
-        f"RuntimeMaxSec={30 if probe else 7200}",
+        # Paired service is ONE original root-systemd unit running the Codex
+        # preflight process, which executes both conditions itself. Reserve
+        # two entire 7200s single-request envelopes plus 3600s for pair
+        # preflight and 3600s for scheduling/ledger/cleanup slack. This
+        # conservative bound still requires a positive live qualification.
+        f"RuntimeMaxSec={30 if probe else 21600 if pair else 7200}",
     ]
     if not probe:
         properties.extend(
@@ -332,21 +341,157 @@ def live_runner_plan(
     return unit_argv(run_id, runner_args, probe=False)
 
 
+def live_pair_plan(
+    run_id: str,
+    runner: Path,
+    preflight: Path,
+    request_root: Path,
+    repository_map: Path,
+    codex: Path,
+    codex_sha256: str,
+    pair_id: str,
+    validator_command: Path,
+    max_cost_usd: str,
+    *,
+    allow_live_provider: bool = False,
+) -> list[str]:
+    """Plan one service whose immutable preflight main PID runs BOTH requests.
+
+    The plan prints command data only. Its separate broker approval must bind
+    the one-shot provider authority; CLI opt-in is not spend authorization.
+    Do not spawn a same-UID supervisor above the trusted runner: otherwise
+    Codex could kill that unfiltered ancestor despite the parent PID filter.
+    """
+    name = service_name(run_id)
+    if not allow_live_provider:
+        raise LauncherError("paired provider plan requires explicit live opt-in")
+    for label, path in (
+        ("runner", runner),
+        ("preflight", preflight),
+        ("request root", request_root),
+        ("repository map", repository_map),
+        ("codex", codex),
+        ("validator command", validator_command),
+    ):
+        if (
+            not isinstance(path, Path)
+            or not path.is_absolute()
+            or ".." in path.parts
+            or "." in path.parts
+        ):
+            raise LauncherError(f"{label} must be a canonical absolute path")
+    if (
+        runner.name != "repobrief_agent_benchmark_codex_runner.py"
+        or preflight.name != "repobrief_agent_benchmark_codex_preflight.py"
+        or runner.parent != preflight.parent
+    ):
+        raise LauncherError("paired runner and preflight source must be co-installed")
+    if (
+        not isinstance(pair_id, str)
+        or not pair_id
+        or len(pair_id.encode("utf-8")) > 256
+        or any(ord(char) < 32 for char in pair_id)
+    ):
+        raise LauncherError("paired request identity is invalid")
+    if not isinstance(codex_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", codex_sha256
+    ):
+        raise LauncherError("Codex executable SHA-256 is required")
+    try:
+        cost = Decimal(max_cost_usd)
+    except (TypeError, ValueError, InvalidOperation) as exc:
+        raise LauncherError("pair cost ceiling is invalid") from exc
+    if not cost.is_finite() or not Decimal("0") < cost <= Decimal("1.00"):
+        raise LauncherError("pair cost ceiling must be in (0, 1.00] USD")
+
+    # Both code files and their shared bootstrap must be root-owned,
+    # symlink-free and immutable before returning an executable plan.
+    _frozen_bootstrap_program(runner)
+    program = _frozen_bootstrap_program(preflight)
+    home = Path("/var/lib") / name
+    args = [
+        "/usr/bin/python3",
+        "-I",
+        "-B",
+        "-c",
+        program,
+        str(preflight),
+        "--execute-pair",
+        "--allow-live-provider",
+        "--pair-id",
+        pair_id,
+        "--request-root",
+        str(request_root),
+        "--repository-map",
+        str(repository_map),
+        "--state-root",
+        str(home / "epoch" / "state"),
+        "--transcript-root",
+        str(home / "epoch" / "transcripts"),
+        "--evidence-root",
+        str(home / "epoch" / "evidence"),
+        "--report-out",
+        str(home / "epoch" / "reports" / "preflight.json"),
+        "--validator-command",
+        str(validator_command),
+        "--codex-command",
+        str(codex),
+        "--codex-command-sha256",
+        codex_sha256,
+        "--max-cost-usd",
+        str(cost),
+    ]
+    return unit_argv(run_id, args, probe=False, pair=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--run-id", required=True)
     mode = cli.add_mutually_exclusive_group(required=True)
     mode.add_argument("--probe-plan", action="store_true")
     mode.add_argument("--live-plan", action="store_true")
+    mode.add_argument("--live-pair-plan", action="store_true")
     cli.add_argument("--runner", type=Path)
     cli.add_argument("--request-root", type=Path)
     cli.add_argument("--repository-map", type=Path)
     cli.add_argument("--codex", type=Path)
     cli.add_argument("--codex-sha256")
+    cli.add_argument("--preflight", type=Path)
+    cli.add_argument("--pair-id")
+    cli.add_argument("--validator-command", type=Path)
+    cli.add_argument("--max-cost-usd")
     cli.add_argument("--allow-live-provider", action="store_true")
     args = cli.parse_args(argv)
     try:
-        if args.live_plan:
+        if args.live_pair_plan:
+            if None in (
+                args.runner,
+                args.preflight,
+                args.request_root,
+                args.repository_map,
+                args.codex,
+                args.codex_sha256,
+                args.pair_id,
+                args.validator_command,
+                args.max_cost_usd,
+            ):
+                raise LauncherError(
+                    "pair plan requires frozen sources, both requests, validator, and cost ceiling"
+                )
+            command = live_pair_plan(
+                args.run_id,
+                args.runner,
+                args.preflight,
+                args.request_root,
+                args.repository_map,
+                args.codex,
+                args.codex_sha256,
+                args.pair_id,
+                args.validator_command,
+                args.max_cost_usd,
+                allow_live_provider=args.allow_live_provider,
+            )
+        elif args.live_plan:
             if None in (
                 args.runner,
                 args.request_root,
@@ -373,7 +518,13 @@ def main(argv: list[str] | None = None) -> int:
         print(
             json.dumps(
                 {
-                    "mode": "probe" if not args.live_plan else "live-plan-only",
+                    "mode": (
+                        "pair-live-plan-only"
+                        if args.live_pair_plan
+                        else "live-plan-only"
+                        if args.live_plan
+                        else "probe"
+                    ),
                     "argv": command,
                 },
                 sort_keys=True,
