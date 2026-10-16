@@ -1076,7 +1076,14 @@ def _clean_comment_completion(
             or not isinstance(comment_id, int)
         ):
             continue
-        match = CLEAN_RESULT_RE.fullmatch(_normalize_codex_comment_body(body))
+        normalized = _normalize_codex_comment_body(body)
+        # Codex now prefixes clean receipts with this exact versioned marker.
+        # Strip it once only after actor/time checks; keep the full clean body
+        # and exact reviewed-head pattern authoritative below.
+        receipt_marker = "<!-- codex-review-receipt:v1 -->\n\n"
+        if normalized.startswith(receipt_marker):
+            normalized = normalized[len(receipt_marker):]
+        match = CLEAN_RESULT_RE.fullmatch(normalized)
         if match is None:
             continue
         reviewed_prefix = match.group(1)
