@@ -2354,5 +2354,58 @@ class CaptainRequiredChecksProbeTests(unittest.TestCase):
 
 
 
+
+class CodexCleanReceiptAtomicGuardTests(unittest.TestCase):
+    """Accepted Codex v1 receipts must also survive Captain's atomic guard."""
+
+    @staticmethod
+    def _clean_body() -> str:
+        return (
+            "Codex Review: Didn't find any major issues. More of your lovely PRs please.\n\n"
+            "**Reviewed commit:** " + chr(96) + "aaaaaaaaaa" + chr(96) + "\n\n"
+            "<details> <summary>ℹ️ About Codex in GitHub</summary>\n"
+            "<br/>\n\n"
+            "[Your team has set up Codex to review pull requests in this repo]"
+            "(https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n"
+            "- Open a pull request for review\n"
+            "- Mark a draft as ready\n"
+            '- Comment "@codex review".\n\n'
+            "If Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n"
+            "Codex can also answer questions or update the PR. Try commenting "
+            '"@codex address that feedback".\n\n'
+            "</details>"
+        )
+
+    def _matches_atomic_clean_shape(self, body: str) -> bool:
+        normalized = merge_guard._normalize_codex_clean_receipt_body(body)
+        return merge_guard._CODEX_CLEAN_RESULT_RE.fullmatch(normalized) is not None
+
+    def test_exact_single_v1_marker_and_legacy_clean_are_accepted(self) -> None:
+        clean = self._clean_body()
+        self.assertTrue(self._matches_atomic_clean_shape(clean))
+        self.assertTrue(self._matches_atomic_clean_shape(
+            "<!-- codex-review-receipt:v1 -->\n\n" + clean
+        ))
+
+    def test_unknown_duplicate_or_badly_separated_marker_rejected(self) -> None:
+        clean = self._clean_body()
+        for prefix in (
+            "<!-- codex-review-receipt:v2 -->\n\n",
+            "<!-- codex-review-receipt:v1 -->\n",
+            "<!-- codex-review-receipt:v1 -->\n\n"
+            "<!-- codex-review-receipt:v1 -->\n\n",
+        ):
+            with self.subTest(prefix=prefix):
+                self.assertFalse(self._matches_atomic_clean_shape(prefix + clean))
+
+    def test_marker_cannot_hide_postscript_blocking_finding(self) -> None:
+        body = (
+            "<!-- codex-review-receipt:v1 -->\n\n"
+            + self._clean_body()
+            + "\nBlocking finding remains."
+        )
+        self.assertFalse(self._matches_atomic_clean_shape(body))
+
+
 if __name__ == "__main__":
     unittest.main()

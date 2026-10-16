@@ -365,6 +365,15 @@ def _normalize_codex_comment_body(value: str) -> str:
     return "\n".join(line.rstrip() for line in normalized.split("\n")).rstrip("\n")
 
 
+def _normalize_codex_clean_receipt_body(value: str) -> str:
+    """Accept only the exact v1 Codex header once; keep anchored body verification."""
+    normalized = _normalize_codex_comment_body(value)
+    marker = "<!-- codex-review-receipt:v1 -->\n\n"
+    if normalized.startswith(marker):
+        return normalized[len(marker):]
+    return normalized
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -4878,7 +4887,7 @@ class CaptainMergeGuardRunner:
                         errors.append("merge_guard_codex_clean_comment_body_missing")
                     else:
                         match = _CODEX_CLEAN_RESULT_RE.fullmatch(
-                            _normalize_codex_comment_body(body)
+                            _normalize_codex_clean_receipt_body(body)
                         )
                         if match is None:
                             errors.append("merge_guard_codex_clean_comment_shape_invalid")
