@@ -138,6 +138,112 @@ class TaskScopeToctouRecoveryTests(unittest.TestCase):
             tasks.resources.task_terminalization_record(task_id)["phase"],
         )
 
+    def test_scoped_denial_precedes_sqlite_chmod_and_wal_open(self) -> None:
+        """Denied projection may not repair permissions or mutate the DB first."""
+        transition = self.fixtures._prepare_pending_terminalization()
+        task_id = str(transition["task_id"])
+        db = tasks.TASK_DB
+        original_mode = db.stat().st_mode & 0o777
+        scoped_calls = []
+
+        try:
+            db.chmod(0o640)
+            before_db = db.read_bytes()
+            before_wal = (
+                (tasks.Path(str(db) + "-wal")).read_bytes()
+                if tasks.Path(str(db) + "-wal").exists() else None
+            )
+
+            def deny_scope(_capability: str, **scope: object) -> None:
+                scoped_calls.append(dict(scope))
+                if scope.get("path") == str(self.fixtures.root):
+                    raise PermissionError("scoped projection denied")
+
+            with (
+                patch.object(tasks.operator, "_require_operator_mutation",
+                             side_effect=deny_scope),
+                self.assertRaisesRegex(PermissionError, "scoped projection denied"),
+            ):
+                tasks._apply_terminalization_projection(transition, recovered=True)
+
+            self.assertTrue(any(s.get("path") == str(self.fixtures.root)
+                                for s in scoped_calls))
+            self.assertEqual(db.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(db.read_bytes(), before_db)
+            wal_path = tasks.Path(str(db) + "-wal")
+            self.assertEqual(wal_path.read_bytes() if wal_path.exists() else None, before_wal)
+            self.assertEqual(
+                "leases_revoked",
+                tasks.resources.task_terminalization_record(task_id)["phase"],
+            )
+        finally:
+            db.chmod(original_mode)
+
+
+    def test_path_swap_does_not_repair_denied_replacement_database(self) -> None:
+        """Gate the opened DB row before chmod/WAL when the path is exchanged."""
+        import os
+        import sqlite3
+        from contextlib import closing
+
+        transition = self.fixtures._prepare_pending_terminalization()
+        task_id = str(transition["task_id"])
+        database = tasks.TASK_DB
+        original = database.with_name(database.name + ".original")
+        replacement = database.with_name(database.name + ".replacement")
+        blocked_path = str(self.fixtures.root / "blocked-swapped-workspace")
+        with (
+            closing(sqlite3.connect(database)) as source,
+            closing(sqlite3.connect(replacement)) as clone,
+        ):
+            source.backup(clone)
+            clone.execute(
+                "UPDATE tasks SET cwd=? WHERE task_id=?", (blocked_path, task_id)
+            )
+            clone.commit()
+        replacement.chmod(0o640)
+        blocked_db_bytes = replacement.read_bytes()
+        original_readonly = tasks._row_scope_identity_readonly
+        swapped = False
+
+        def swap_after_read(identifier: str) -> dict:
+            nonlocal swapped
+            record = original_readonly(identifier)
+            if not swapped:
+                os.replace(database, original)
+                os.replace(replacement, database)
+                swapped = True
+            return record
+
+        def deny_replaced_scope(_capability: str, **scope: object) -> None:
+            if scope.get("path") == blocked_path:
+                raise PermissionError("swapped database is denied")
+
+        try:
+            with (
+                patch.object(tasks, "_row_scope_identity_readonly",
+                             side_effect=swap_after_read),
+                patch.object(tasks.operator, "_require_operator_mutation",
+                             side_effect=deny_replaced_scope),
+                self.assertRaisesRegex(PermissionError, "swapped database is denied"),
+            ):
+                tasks._apply_terminalization_projection(transition, recovered=True)
+            self.assertTrue(swapped)
+            self.assertEqual(
+                database.stat().st_mode & 0o777, 0o640,
+                "denied replacement DB must not be chmod-repaired before its gate",
+            )
+            self.assertEqual(database.read_bytes(), blocked_db_bytes)
+            self.assertEqual(
+                "leases_revoked",
+                tasks.resources.task_terminalization_record(task_id)["phase"],
+            )
+        finally:
+            if swapped:
+                os.replace(database, replacement)
+                os.replace(original, database)
+
+
     def test_authorized_projection_retains_existing_recovery_behavior(self) -> None:
         transition = self.fixtures._prepare_pending_terminalization()
         task_id = str(transition["task_id"])

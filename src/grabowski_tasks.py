@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import fcntl
@@ -2017,10 +2017,14 @@ def _connect_existing_task_database() -> sqlite3.Connection:
     return connection
 
 
-def _open_current_task_database() -> sqlite3.Connection:
+def _open_current_task_database(
+    *, before_write: Callable[[sqlite3.Connection], None] | None = None,
+) -> sqlite3.Connection:
     connection = _connect_existing_task_database()
     connection.row_factory = sqlite3.Row
     try:
+        if before_write is not None:
+            before_write(connection)
         if _task_schema_version(connection) != "5":
             raise RuntimeError(
                 "Task database schema changed while opening; retry with a compatible runtime"
@@ -2038,7 +2042,9 @@ def _open_current_task_database() -> sqlite3.Connection:
         raise
 
 
-def _database() -> sqlite3.Connection:
+def _database(
+    *, before_write: Callable[[sqlite3.Connection], None] | None = None,
+) -> sqlite3.Connection:
     parent = TASK_DB.parent
     if parent.is_symlink():
         raise PermissionError(f"Task state directory may not be a symlink: {parent}")
@@ -2048,12 +2054,12 @@ def _database() -> sqlite3.Connection:
 
     observed = _preflight_task_store(verify_integrity=False)
     if observed == "5":
-        return _open_current_task_database()
+        return _open_current_task_database(before_write=before_write)
 
     with _schema_directory_lock(parent):
         observed = _preflight_task_store(verify_integrity=False)
         if observed == "5":
-            return _open_current_task_database()
+            return _open_current_task_database(before_write=before_write)
         connection = (
             sqlite3.connect(TASK_DB, timeout=10)
             if observed is None
@@ -2061,6 +2067,8 @@ def _database() -> sqlite3.Connection:
         )
         connection.row_factory = sqlite3.Row
         try:
+            if before_write is not None:
+                before_write(connection)
             connection.execute("BEGIN IMMEDIATE")
             version = _task_schema_version(connection)
             if version not in {None, "1", "2", "3", "4", "5"}:
@@ -8270,6 +8278,30 @@ def _terminal_projection(
     }
 
 
+def _require_terminalization_projection_scope(
+    record: dict[str, Any], task_id: str, projection: dict[str, Any]
+) -> None:
+    """Authorize the current task scope and every projected systemd unit."""
+    admission = {
+        "path": record["cwd"],
+        "repo": record["cwd"],
+        "task_id": task_id,
+        "owner_id": record.get("lease_owner_id") or _lease_owner(task_id),
+        "host": record["host"],
+    }
+    checked_services: set[str] = set()
+    for service in (
+        _authoritative_unit(record),
+        _validate_unit(str(projection["unit"])),
+        _validate_unit(str(projection["authoritative_unit"])),
+    ):
+        if service not in checked_services:
+            operator._require_operator_mutation(
+                "durable_job", service=service, **admission
+            )
+            checked_services.add(service)
+
+
 def _apply_terminalization_projection(
     terminalization: dict[str, Any], *, recovered: bool = False
 ) -> dict[str, Any]:
@@ -8289,7 +8321,23 @@ def _apply_terminalization_projection(
     transition_sha256 = terminalization.get("transition_sha256")
     if not isinstance(transition_sha256, str) or SHA256.fullmatch(transition_sha256) is None:
         raise RuntimeError("Task terminalization digest is invalid")
-    with _database_connection() as connection:
+    # _database_connection() may repair schema, create WAL/SHM or chmod the
+    # task DB. First authorize against a host-write-free snapshot; the
+    # transaction below still reauthorizes its actual row after opening.
+    preflight_record = _row_scope_identity_readonly(task_id)
+    _require_terminalization_projection_scope(preflight_record, task_id, projection)
+
+    def check_open_connection(connection: sqlite3.Connection) -> None:
+        # Authorize the actual SQLite row BEFORE opening helpers can change
+        # its journal mode, migrate the schema or repair file permissions.
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown task: {task_id}")
+        _require_terminalization_projection_scope(dict(row), task_id, projection)
+
+    with _database_connection(before_write=check_open_connection) as connection:
         connection.execute("BEGIN IMMEDIATE")
         current = connection.execute(
             "SELECT * FROM tasks WHERE task_id=?", (task_id,)
@@ -8301,24 +8349,7 @@ def _apply_terminalization_projection(
         # Page/status preauthorization may refer to a different pathname
         # image. Authorize the row bound to THIS writable connection before
         # committing its projection, receipt or resource-store effects.
-        admission = {
-            "path": current_record["cwd"],
-            "repo": current_record["cwd"],
-            "task_id": task_id,
-            "owner_id": current_record.get("lease_owner_id") or _lease_owner(task_id),
-            "host": current_record["host"],
-        }
-        checked_services: set[str] = set()
-        for service in (
-            _authoritative_unit(current_record),
-            _validate_unit(str(projection["unit"])),
-            _validate_unit(str(projection["authoritative_unit"])),
-        ):
-            if service not in checked_services:
-                operator._require_operator_mutation(
-                    "durable_job", service=service, **admission
-                )
-                checked_services.add(service)
+        _require_terminalization_projection_scope(current_record, task_id, projection)
         existing_digest = current_record.get("terminalization_sha256")
         if existing_digest not in {None, transition_sha256}:
             connection.rollback()
@@ -8865,8 +8896,10 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
 
 
 @contextmanager
-def _database_connection() -> Iterator[sqlite3.Connection]:
-    connection = _database()
+def _database_connection(
+    *, before_write: Callable[[sqlite3.Connection], None] | None = None
+) -> Iterator[sqlite3.Connection]:
+    connection = _database(before_write=before_write)
     try:
         with connection:
             yield connection
