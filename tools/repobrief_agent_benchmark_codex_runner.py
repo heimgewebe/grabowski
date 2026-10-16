@@ -102,7 +102,7 @@ def trusted_seccomp_library():
         return binary
     raise RuntimeError("trusted kernel socket filter library unavailable")
 
-def deny_unix(block_network=False):
+def deny_unix(block_network=False, pid_isolated=False):
     # The trusted runner and provider may have the same UID. Force a separate
     # session for login/probe subprocesses as well as the live provider. The
     # live Popen already uses start_new_session=True; never join its parent's
@@ -214,6 +214,22 @@ def deny_unix(block_network=False):
                     Compare(0, 7, 0xffffffff, target),
                 ) != 0:
                     raise RuntimeError("unable to deny provider-to-parent signals")
+        # prlimit64 can mutate any same-UID process's limits without sending
+        # a signal. A nonzero PID could be the runner (or any of its threads),
+        # and the kernel does not expose child ownership to seccomp. Deny all
+        # cross-process targets while retaining pid=0 for the provider itself.
+        # An untrusted direct child without PID isolation must never name
+        # another same-UID task (including the trusted runner or its TIDs).
+        # In the separately attested nested provider PID namespace, ancestor
+        # tasks cannot be addressed, so normal child prlimit64 may remain
+        # usable. Only the fixed trusted bwrap launcher runs before unshare.
+        if not pid_isolated:
+            cross_process_prlimit = seccomp.seccomp_syscall_resolve_name(b"prlimit64")
+            if cross_process_prlimit < 0 or seccomp.seccomp_rule_add(
+                context, error_action, cross_process_prlimit, 1,
+                Compare(0, 1, 0, 0),  # SCMP_CMP_NE: requested PID != 0
+            ) != 0:
+                raise RuntimeError("unable to deny cross-process provider prlimit64")
         # tkill addresses a raw TID and pidfd_send_signal addresses an opaque
         # FD; seccomp cannot safely prove either is not a trusted runner thread.
         for name in (b"tkill", b"pidfd_send_signal"):
@@ -267,11 +283,28 @@ def deny_unix(block_network=False):
         for item in pair:
             item.close()
 
-block_network = sys.argv[1:2] == ["--block-network"]
-command = sys.argv[2:] if block_network else sys.argv[1:]
+args = sys.argv[1:]
+block_network = args[:1] == ["--block-network"]
+if block_network:
+    args = args[1:]
+pid_isolated = args[:1] == ["--provider-pid-namespace"]
+if pid_isolated:
+    args = args[1:]
+command = args
 if not command or not os.path.isabs(command[0]):
     raise RuntimeError("Codex child executable must be absolute")
-deny_unix(block_network=block_network)
+if pid_isolated:
+    # The only relaxed prlimit profile is allowed for a fixed, root-owned
+    # bwrap stage that unshares PID before executing any provider bytes.
+    required = [
+        "/usr/bin/bwrap", "--ro-bind", "/", "/", "--unshare-pid",
+        "--unshare-ipc", "--die-with-parent", "--proc", "/proc",
+    ]
+    if block_network or command[:len(required)] != required:
+        raise RuntimeError("isolated provider PID namespace launcher invalid")
+    if "--" not in command or command.index("--") < len(required):
+        raise RuntimeError("isolated provider executable bootstrap missing")
+deny_unix(block_network=block_network, pid_isolated=pid_isolated)
 os.execve(command[0], command, os.environ)
 """
 
@@ -1003,7 +1036,10 @@ def _assert_trusted_runner_nondumpable() -> None:
 
 
 def _unix_socket_restricted_codex_argv(
-    command: Sequence[str], *, block_network: bool = False
+    command: Sequence[str],
+    *,
+    block_network: bool = False,
+    provider_pid_namespace: bool = False,
 ) -> list[str]:
     """Wrap an authorized Codex executable with a fail-closed seccomp exec.
 
@@ -1018,11 +1054,214 @@ def _unix_socket_restricted_codex_argv(
         or any(not isinstance(argument, str) for argument in command)
     ):
         raise RunnerError("Codex socket isolation command is invalid")
-    if type(block_network) is not bool:
+    if type(block_network) is not bool or type(provider_pid_namespace) is not bool:
         raise RunnerError("kernel socket isolation profile is invalid")
+    if provider_pid_namespace and (
+        block_network
+        or list(command[:9])
+        != [
+            "/usr/bin/bwrap",
+            "--ro-bind",
+            "/",
+            "/",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--die-with-parent",
+            "--proc",
+            "/proc",
+        ]
+    ):
+        raise RunnerError("provider PID namespace profile requires trusted bwrap")
     python = _validated_mcp_proxy_python()
     prefix = ["--block-network"] if block_network else []
+    if provider_pid_namespace:
+        prefix.append("--provider-pid-namespace")
     return [python, "-I", "-c", _UNIX_SOCKET_DENY_CHILD_PROGRAM, *prefix, *command]
+
+
+_PROVIDER_PID_ATTEST_AND_EXEC_PROGRAM = r"""
+import os
+from pathlib import Path
+import sys
+
+# These exact arguments are constructed by the trusted parent, never by Codex.
+if len(sys.argv) < 9 or sys.argv[7] != "--":
+    raise RuntimeError("provider PID sandbox bootstrap arguments are invalid")
+outer_pid_ns, source, state, transcripts, evidence, reports = sys.argv[1:7]
+command = sys.argv[8:]
+if (
+    not outer_pid_ns.startswith("pid:[")
+    or not outer_pid_ns.endswith("]")
+    or not command
+    or not os.path.isabs(command[0])
+    or not hasattr(os, "ST_RDONLY")
+):
+    raise RuntimeError("provider PID sandbox bootstrap identity is invalid")
+# /proc is a freshly mounted procfs for the new PID namespace.  Merely
+# using a different mount namespace is not sufficient to hide host TIDs.
+if os.readlink("/proc/self/ns/pid") == outer_pid_ns:
+    raise RuntimeError("provider still shares the trusted parent's PID namespace")
+status = Path("/proc/self/status").read_text(encoding="ascii")
+nspid = [line.split(":", 1)[1].split() for line in status.splitlines()
+         if line.startswith("NSpid:")]
+if len(nspid) != 1 or nspid[0] != [str(os.getpid())]:
+    raise RuntimeError("provider procfs does not belong to isolated PID namespace")
+if not (os.statvfs("/").f_flag & os.ST_RDONLY):
+    raise RuntimeError("provider root filesystem is writable")
+if not (os.statvfs(source).f_flag & os.ST_RDONLY):
+    raise RuntimeError("provider immutable source is writable")
+for output in (state, transcripts, evidence, reports):
+    if os.statvfs(output).f_flag & os.ST_RDONLY:
+        raise RuntimeError("provider private output mount is not writable")
+fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+if (
+    fields.get("NoNewPrivs", "").strip() != "1"
+    or fields.get("Seccomp", "").strip() != "2"
+    or int(fields.get("CapEff", "1").strip(), 16) != 0
+):
+    raise RuntimeError("provider kernel privileges or seccomp are unsafe")
+os.execve(command[0], command, os.environ)
+"""
+
+
+def _provider_pid_namespaced_codex_argv(
+    command: Sequence[str],
+    *,
+    source: Path,
+    state_root: Path,
+    transcript_root: Path,
+    evidence_root: Path,
+    report_root: Path,
+) -> list[str]:
+    """Run hostile provider bytes below a distinct PID namespace.
+
+    Seccomp can compare numeric PID arguments, but cannot prove that a TID
+    belongs to the trusted parent. A separate PID namespace makes *all*
+    ancestor process and thread IDs unreachable while retaining normal
+    signals and prlimit64 handling for the provider's own children.
+    """
+    if (
+        not command
+        or any(not isinstance(arg, str) for arg in command)
+        or not Path(command[0]).is_absolute()
+        or sys.platform != "linux"
+    ):
+        raise RunnerError("provider PID sandbox command is invalid")
+    requested = {
+        "state": state_root,
+        "transcripts": transcript_root,
+        "evidence": evidence_root,
+        "reports": report_root,
+    }
+    try:
+        source_real = source.expanduser().resolve(strict=True)
+        outputs = {
+            name: path.expanduser().resolve(strict=True)
+            for name, path in requested.items()
+        }
+        home = Path.home().resolve(strict=True)
+        outer_pid_ns = os.readlink("/proc/self/ns/pid")
+    except (OSError, RuntimeError) as exc:
+        raise RunnerError("provider PID sandbox paths are unavailable") from exc
+    epoch = outputs["state"].parent
+    if (
+        home not in epoch.parents
+        or any(
+            path.parent != epoch or path.name != name for name, path in outputs.items()
+        )
+        or len(set(outputs.values())) != 4
+        or not outer_pid_ns.startswith("pid:[")
+        or not outer_pid_ns.endswith("]")
+    ):
+        raise RunnerError("provider PID sandbox output binding is invalid")
+    # Private /tmp is ephemeral; prevent it from hiding any protected input
+    # or the only copy of a permitted epoch output directory.
+    temp = Path("/tmp")
+    if any(
+        path == temp or temp in path.parents
+        for path in (source_real, *outputs.values())
+    ):
+        raise RunnerError("provider PID sandbox cannot shadow bound paths")
+    bwrap = [
+        "/usr/bin/bwrap",
+        "--ro-bind",
+        "/",
+        "/",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--die-with-parent",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--chmod",
+        "1777",
+        "/tmp",
+    ]
+    for output in outputs.values():
+        bwrap.extend(("--bind", str(output), str(output)))
+    bwrap.extend(
+        (
+            "--",
+            _validated_mcp_proxy_python(),
+            "-I",
+            "-B",
+            "-c",
+            _PROVIDER_PID_ATTEST_AND_EXEC_PROGRAM,
+            outer_pid_ns,
+            str(source_real),
+            *(str(path) for path in outputs.values()),
+            "--",
+            *command,
+        )
+    )
+    return bwrap
+
+
+def _assert_provider_pid_namespace_ready(
+    *,
+    source: Path,
+    state_root: Path,
+    transcript_root: Path,
+    evidence_root: Path,
+    report_root: Path,
+    cwd: Path,
+) -> None:
+    """No-provider smoke before intent; the real child re-attests after fork."""
+    probe = _provider_pid_namespaced_codex_argv(
+        [
+            _validated_mcp_proxy_python(),
+            "-I",
+            "-B",
+            "-c",
+            "print('RAB_PID_NAMESPACE_READY')",
+        ],
+        source=source,
+        state_root=state_root,
+        transcript_root=transcript_root,
+        evidence_root=evidence_root,
+        report_root=report_root,
+    )
+    try:
+        completed = subprocess.run(
+            _unix_socket_restricted_codex_argv(probe),
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            env=base._git_environment(),
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RunnerError("provider PID sandbox smoke unavailable") from exc
+    if (
+        completed.returncode != 0
+        or completed.stdout != b"RAB_PID_NAMESPACE_READY\n"
+        or completed.stderr
+    ):
+        raise RunnerError("provider PID sandbox smoke failed")
 
 
 _POST_PROVIDER_GIT_ISOLATED_PROGRAM = r"""
@@ -9366,6 +9605,21 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     evidence_root=args.provider_evidence_root,
                     runtime_binding=dispatch_authorization["binding"],
                 )
+                # A PID namespace, not a per-PID seccomp exception, keeps
+                # every trusted parent thread unreachable from hostile Codex.
+                # Check its exact four writable mounts before the one-shot
+                # provider intent. The fixed inner bootstrap repeats checks.
+                report_out = dispatch_authorization["binding"].get("report_out")
+                if not isinstance(report_out, str) or not report_out:
+                    raise RunnerError("provider PID sandbox report binding missing")
+                pid_sandbox = {
+                    "source": source,
+                    "state_root": args.state_root,
+                    "transcript_root": args.transcript_root,
+                    "evidence_root": args.provider_evidence_root,
+                    "report_root": Path(report_out).parent,
+                }
+                _assert_provider_pid_namespace_ready(**pid_sandbox, cwd=checkout)
                 _record_preflight_dispatch_intent(
                     request,
                     state_path,
@@ -9373,7 +9627,10 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     intent_persisted_callback=mark_dispatch_intent_recorded,
                 )
                 capture = run_bounded(
-                    _unix_socket_restricted_codex_argv(command),
+                    _unix_socket_restricted_codex_argv(
+                        _provider_pid_namespaced_codex_argv(command, **pid_sandbox),
+                        provider_pid_namespace=True,
+                    ),
                     cwd=checkout,
                     timeout_seconds=int(request["budgets"]["wall_seconds"]),
                     stdin_data=(prompt_for(request) + "\n").encode("utf-8"),

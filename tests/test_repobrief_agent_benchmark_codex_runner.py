@@ -3104,6 +3104,143 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaises(runner.socket.timeout):
                     server.accept()
 
+    def test_untrusted_codex_cannot_prlimit_trusted_parent(self) -> None:
+        # Only query a limit: an unfiltered RED run never harms the parent.
+        # prlimit64(pid=0) remains usable for the provider's own limits.
+        child = (
+            "import errno,os,resource\n"
+            "try: resource.prlimit(os.getppid(), resource.RLIMIT_NOFILE)\n"
+            "except OSError as exc: assert exc.errno == errno.EPERM, exc\n"
+            "else: raise RuntimeError('trusted parent prlimit64 permitted')\n"
+            "assert resource.prlimit(0, resource.RLIMIT_NOFILE)[0] >= 0\n"
+            "print('TRUSTED_PARENT_PRLIMIT_DENIED_SELF_ALLOWED')\n"
+        )
+        command = runner._unix_socket_restricted_codex_argv(
+            [sys.executable, "-I", "-c", child]
+        )
+        completed = subprocess.run(
+            command, capture_output=True, timeout=12, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(b"TRUSTED_PARENT_PRLIMIT_DENIED_SELF_ALLOWED", completed.stdout)
+
+    def test_provider_pid_namespace_hides_nondumpable_parent_threads(self) -> None:
+        # Host-kernel test with no provider: protect a nonleader native TID,
+        # preserve direct child cancellation, and reject an omitted PIDNS.
+        parent = r"""
+import ctypes
+import errno
+import os
+from pathlib import Path
+import resource
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+runner_path = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(runner_path.parent))
+import repobrief_agent_benchmark_codex_runner as guarded
+assert Path(guarded.__file__).resolve(strict=True) == runner_path
+libc = ctypes.CDLL(None)
+assert libc.prctl(4, 0, 0, 0, 0) == 0
+assert libc.prctl(3, 0, 0, 0, 0) == 0
+signals = []
+old_handler = signal.signal(signal.SIGUSR1, lambda *_: signals.append(True))
+stop = threading.Event()
+thread = threading.Thread(target=stop.wait, args=(10,), daemon=True)
+thread.start()
+assert thread.native_id not in (None, os.getpid())
+try:
+    with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+        root = Path(temporary)
+        source = root / "source"
+        source.mkdir()
+        epoch = root / "epoch"
+        epoch.mkdir()
+        roots = {name: epoch / name
+                 for name in ("state", "transcripts", "evidence", "reports")}
+        for directory in roots.values():
+            directory.mkdir(mode=0o700)
+        kwargs = dict(
+            source=source, state_root=roots["state"],
+            transcript_root=roots["transcripts"],
+            evidence_root=roots["evidence"], report_root=roots["reports"],
+        )
+        guarded._assert_provider_pid_namespace_ready(**kwargs, cwd=source)
+        child = r'''
+import errno
+import os
+import resource
+import signal
+import subprocess
+import sys
+parent_pid, parent_tid = map(int, sys.argv[1:3])
+for target in (parent_pid, parent_tid):
+    try:
+        os.kill(target, signal.SIGUSR1)
+    except OSError as exc:
+        assert exc.errno in (errno.ESRCH, errno.EPERM), exc
+    else:
+        raise RuntimeError("provider signaled trusted parent PID/TID")
+try:
+    os.setpriority(os.PRIO_PROCESS, parent_pid, 19)
+except OSError as exc:
+    assert exc.errno in (errno.ESRCH, errno.EPERM), exc
+else:
+    raise RuntimeError("provider changed trusted parent's priority")
+process = subprocess.Popen(["/usr/bin/sleep", "2"])
+try:
+    assert resource.prlimit(process.pid, resource.RLIMIT_NOFILE)[0] >= 0
+    os.kill(process.pid, signal.SIGTERM)
+    assert process.wait(timeout=3) == -signal.SIGTERM
+finally:
+    if process.poll() is None:
+        process.kill()
+        process.wait(timeout=3)
+assert resource.prlimit(0, resource.RLIMIT_NOFILE)[0] >= 0
+print("PARENT_TIDS_HIDDEN_CHILD_SIGNALS_WORK")
+'''
+        provider = [
+            sys.executable, "-I", "-c", child,
+            str(os.getpid()), str(thread.native_id),
+        ]
+        sandbox = guarded._provider_pid_namespaced_codex_argv(provider, **kwargs)
+        def run(candidate, *, isolated=False):
+            return subprocess.run(
+                guarded._unix_socket_restricted_codex_argv(
+                    candidate, provider_pid_namespace=isolated
+                ),
+                cwd=source, capture_output=True, timeout=12, check=False,
+            )
+        good = run(sandbox, isolated=True)
+        assert good.returncode == 0, good.stderr[-1024:]
+        assert b"PARENT_TIDS_HIDDEN_CHILD_SIGNALS_WORK" in good.stdout
+        bad = run([item for item in sandbox if item != "--unshare-pid"])
+        assert bad.returncode != 0, bad.stdout
+        assert b"PARENT_TIDS_HIDDEN_CHILD_SIGNALS_WORK" not in bad.stdout
+        time.sleep(0.05)
+        assert not signals, "trusted parent received provider signal"
+finally:
+    stop.set()
+    thread.join(timeout=2)
+    signal.signal(signal.SIGUSR1, old_handler)
+print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
+"""
+        completed = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", parent, str(Path(runner.__file__))],
+            capture_output=True,
+            timeout=28,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2048:])
+        self.assertIn(
+            b"PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS",
+            completed.stdout,
+        )
+
     def test_untrusted_codex_cannot_signal_same_uid_trusted_parent(self) -> None:
         # PR_SET_DUMPABLE=0 blocks ptrace, NOT signals from the same UID.
         # A provider may otherwise SIGKILL the ledger writer after one-shot
@@ -4317,7 +4454,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "provider_codex": {},
                 "provider_authentication": {},
                 "repository_map_bytes": b"{}",
-                "binding": {},
+                "binding": {"report_out": str(root / "reports" / "preflight.json")},
             }
 
             execution_order: list[str] = []
@@ -4364,6 +4501,22 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     ("create_checkout", checkout),
                     ("stage_codex_home", codex_home),
                     ("build_command", ["/opt/codex"]),
+                    (
+                        "_provider_pid_namespaced_codex_argv",
+                        [
+                            "/usr/bin/bwrap",
+                            "--ro-bind",
+                            "/",
+                            "/",
+                            "--unshare-pid",
+                            "--unshare-ipc",
+                            "--die-with-parent",
+                            "--proc",
+                            "/proc",
+                            "--",
+                            "/opt/codex",
+                        ],
+                    ),
                     ("provider_env", {}),
                     ("cleanup_codex_home", None),
                 ):
@@ -4376,6 +4529,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "validate_codex_linux_sandbox_before_intent",
                     "_assert_authorized_runtime_binding",
                     "validate_live_immutable_mounts",
+                    "_assert_provider_pid_namespace_ready",
                     "close_provider_evidence_plan",
                     "write_schema",
                 ):
