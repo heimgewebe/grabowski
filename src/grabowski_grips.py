@@ -12586,7 +12586,7 @@ def _run_saga_external_merge_closeout(
         return value
 
     branch_command = [
-        "api", f"repos/{repo_slug}/branches/{quote(base, safe='/')}",
+        "api", f"repos/{repo_slug}/branches/{quote(base, safe='')}",
         "--jq", "{name:.name,sha:.commit.sha,protected:.protected}",
     ]
     branch = github_json(branch_command, "base_branch")
@@ -12656,6 +12656,10 @@ def _run_saga_external_merge_closeout(
             persisted, audit_sha = _saga_external_merge_verified_prior(existing, settlement)
             reused = True
         else:
+            if github_json(branch_command, "base_branch_postlookup_recheck") != branch:
+                raise GripPreflightError(
+                    "external merge protected base branch changed during audit lookup"
+                )
             try:
                 work_acquire = __import__("grabowski_work_acquire")
                 audit_sha = work_acquire.operator.base._append_audit_with_digest(record)
