@@ -6574,6 +6574,17 @@ def _operator_system_overview(
             "archive independently verified terminal tasks through the "
             "authorized task-closeout-archive workflow"
         )
+    elif (
+        reconciliation_evidence.get("status") == "local_terminal_budget_exceeded"
+        and reconciliation_evidence.get("budget") == "scan"
+    ):
+        # Archived task rows stay in the live task table and still count toward
+        # the readiness scan; neither reconciliation nor archival shrinks it.
+        next_action = (
+            "retained terminal task history exceeds the readiness scan budget "
+            "and archival cannot reduce it; escalate an authorized bounded "
+            "task-store history compaction before relying on readiness"
+        )
     elif reconciliation_evidence.get("status") == "local_terminal_budget_exceeded":
         # READ_ONLY observes at most a bounded local terminal cohort; another
         # reconciliation leaves it unchanged. Archival shrinks the cohort.

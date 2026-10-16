@@ -12474,7 +12474,8 @@ def _task_reconcile_ready_evidence_snapshot(
         return {"status": "verified", "reconciled_at_unix": timestamp}
     except TaskReconcileReadyLocalTerminalBudgetExceeded as exc:
         # Unobserved units are never ready. Repeating reconciliation cannot
-        # shrink this cohort; archiving verified terminal tasks can.
+        # shrink either budget. Archiving verified terminal tasks shrinks the
+        # observed cohort only: archived rows still count toward the scan.
         return {
             "status": "local_terminal_budget_exceeded",
             "budget": exc.budget,

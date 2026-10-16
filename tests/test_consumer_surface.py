@@ -916,6 +916,41 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertIn("task-closeout-archive", next_action)
         self.assertNotIn("reconcile live task outcomes", next_action)
 
+        # Archived rows stay in the task table and still count toward the
+        # scan budget, so archival must not be recommended for it.
+        scan_tasks = SimpleNamespace(
+            grabowski_task_list=lambda **kwargs: {
+                **fake_tasks.grabowski_task_list(**kwargs),
+                "reconciliation_evidence": {
+                    "status": "local_terminal_budget_exceeded",
+                    "budget": "scan",
+                    "local_terminal_limit": 32,
+                },
+            },
+        )
+        with mock.patch.dict("sys.modules", {
+            "grabowski_tasks": scan_tasks,
+            "grabowski_resources": fake_resources,
+            "grabowski_operator_obligation": fake_obligations,
+        }):
+            scan = grabowski_mcp._operator_system_overview(
+                runtime_healthy=True,
+                normal_mutation_path_ready=True,
+                coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                client_snapshot={
+                    "observable": True, "fresh": True, "matched": True,
+                    "server_loopback_schema_contract_matches": True,
+                    "platform_publication_state": "platform_converged",
+                    "platform_publication_pending": False,
+                },
+            )
+        self.assertFalse(scan["operator_ready"])
+        scan_action = scan["recommended_next_action"].lower()
+        self.assertIn("scan budget", scan_action)
+        self.assertIn("compaction", scan_action)
+        self.assertNotIn("task-closeout-archive", scan_action)
+        self.assertNotIn("reconcile live task outcomes", scan_action)
+
     def test_operator_system_overview_keeps_execution_ready_when_publication_is_pending(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
