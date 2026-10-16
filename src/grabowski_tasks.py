@@ -9943,10 +9943,13 @@ def grabowski_task_routing_shadow_seal(
     }
 
 def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
-    """Read bounded redacted stdout and stderr for one local or fleet task."""
+    """Read bounded redacted task output after the shared mutation gate."""
     operator._require_operator_capability("durable_job")
     if not isinstance(max_lines, int) or not 1 <= max_lines <= 2000:
         raise ValueError("max_lines must be between 1 and 2000")
+    # _row() takes the task-mutation lock and may recover terminalizations;
+    # Rootbroker journal reads write a reference file and fleet reads use SSH.
+    operator._require_operator_mutation("durable_job", task_id=task_id)
     record = _row(task_id)
     output_source = "root-journal-v1"
     if _is_root_systemd_backend(record):
@@ -12055,17 +12058,29 @@ def _task_reconcile_ready_local_terminal_observed(
     now = _now()
     if type(seen_at) is not int or not 0 <= now - seen_at <= 30:
         return False
+    unit = _authoritative_unit(record)
+    if "Id" in props and props["Id"] != unit:
+        return False
+    if "Names" in props and unit not in str(props["Names"]).split():
+        return False
+    if props.get("LoadState") == "not-found":
+        # systemd-run transient units are garbage-collected after a clean
+        # exit. A confirmed-absent unit cannot be live; the persisted terminal
+        # row stays the outcome truth because GC erased the unit result.
+        return (
+            _is_terminal_state(str(record.get("state")))
+            and props.get("ActiveState") == "inactive"
+            and props.get("SubState") == "dead"
+            and props.get("Result") in {None, "", "success"}
+            and props.get("ExecMainCode") in {None, "", "0"}
+            and props.get("ExecMainStatus") in {None, "", "0"}
+        )
     if (
         props.get("LoadState") != "loaded"
         or props.get("ActiveState") not in {"inactive", "failed"}
         or props.get("SubState") not in {"dead", "failed"}
         or _task_reconcile_ready_observed_terminal_state(record, observed) is None
     ):
-        return False
-    unit = _authoritative_unit(record)
-    if "Id" in props and props["Id"] != unit:
-        return False
-    if "Names" in props and unit not in str(props["Names"]).split():
         return False
     result = props.get("Result")
     allowed = {
@@ -13590,13 +13605,13 @@ async def _grabowski_task_routing_shadow_seal_tool(
     )
 
 
-@mcp.tool(name="grabowski_task_logs", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_task_logs", annotations=MUTATING)
 async def _grabowski_task_logs_tool(
     task_id: str,
     max_lines: int = 200,
 ) -> dict[str, Any]:
-    """Read redacted journal output for one local or fleet task."""
-    operator._require_operator_capability("durable_job")
+    """Read redacted task output; terminalization recovery may mutate stores."""
+    operator._require_operator_mutation("durable_job", task_id=task_id)
     return await asyncio.to_thread(grabowski_task_logs, task_id, max_lines)
 
 

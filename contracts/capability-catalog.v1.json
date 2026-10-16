@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "a5469c45befc5e65fa71e13c3a69d050d0c23db8f261434095b5cbab7055d780",
+  "capability_source_sha256": "62171c420892349588758d7979501e10875ab1f4b111833e8216e767e633382a",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "2681d2593edcdc23e200aa0fa3e6eec2cbda1b9c1794b1d9faf87fc81801c567",
   "integrity": {
@@ -1460,11 +1460,16 @@
     },
     {
       "category": "task",
-      "description": "Read redacted journal output for one local or fleet task.",
-      "effects": [],
+      "description": "Read redacted task output; terminalization recovery may mutate stores.",
+      "effects": [
+        "remote-read",
+        "schema-migration",
+        "temporary-file-create",
+        "terminalization-recovery"
+      ],
       "id": "grabowski_task_logs",
-      "purpose": "Read redacted journal output for one local or fleet task.",
-      "read_only": true,
+      "purpose": "Read redacted output for one local or fleet task through the mutation gate; terminalization recovery may update task and resource stores.",
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_logs"

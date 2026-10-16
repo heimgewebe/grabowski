@@ -1520,11 +1520,16 @@
     },
     {
       "category": "task",
-      "description": "Read redacted journal output for one local or fleet task.",
-      "effects": [],
+      "description": "Read redacted task output; terminalization recovery may mutate stores.",
+      "effects": [
+        "remote-read",
+        "schema-migration",
+        "temporary-file-create",
+        "terminalization-recovery"
+      ],
       "id": "grabowski_task_logs",
-      "purpose": "Read redacted journal output for one local or fleet task.",
-      "read_only": true,
+      "purpose": "Read redacted output for one local or fleet task through the mutation gate; terminalization recovery may update task and resource stores.",
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_logs"
@@ -3684,7 +3689,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "a5469c45befc5e65fa71e13c3a69d050d0c23db8f261434095b5cbab7055d780"
+      "sha256": "62171c420892349588758d7979501e10875ab1f4b111833e8216e767e633382a"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3814,7 +3819,7 @@
       "src/grabowski_systemkatalog.py": "e3ec4884b3dd367b8970b3143432cab0fea5fe55963292806001f5df535c83f9",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "d822ef6e676a9ad5dd79cebb7d9b27fbb965915340273c030f5737473d50ee9a",
+      "src/grabowski_tasks.py": "52c70dd3238b0938612b65ceffa13d7ec50e8ecdcfe7c18aaf56cdeb90579cd9",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",

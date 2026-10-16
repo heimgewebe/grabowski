@@ -6729,6 +6729,106 @@ class TaskTests(unittest.TestCase):
         persist.assert_not_called()
         renew.assert_not_called()
 
+    def test_reconcile_ready_accepts_garbage_collected_local_terminal_unit(self) -> None:
+        # systemd-run transient units are unloaded after a clean exit. A
+        # confirmed-absent unit is positive quiescence, not an unverifiable
+        # state; otherwise readiness stays false until archival.
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        record = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='failed' WHERE task_id=?",
+                (record["task_id"],),
+            )
+        complete = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=complete),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        unit = tasks._authoritative_unit({**record, "state": "failed"})
+        absent = {
+            "state": "completed",
+            "properties": {
+                "LoadState": "not-found", "ActiveState": "inactive",
+                "SubState": "dead", "Result": "success",
+                "ExecMainCode": "0", "ExecMainStatus": "0",
+            },
+            "probe": {"returncode": 0, "timed_out": False},
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1", "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(tasks, "_observe", return_value=absent) as probe,
+            patch.object(
+                tasks, "_dispatch",
+                side_effect=AssertionError("READ_ONLY readiness must not dispatch Fleet"),
+            ) as dispatch,
+            patch.object(
+                tasks, "_set_state",
+                side_effect=AssertionError("READ_ONLY readiness must not change task state"),
+            ) as persist,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("verified", status["status"])
+        probe.assert_called_once()
+        dispatch.assert_not_called()
+        persist.assert_not_called()
+        terminal = {**record, "state": "failed"}
+        self.assertTrue(
+            tasks._task_reconcile_ready_local_terminal_observed(terminal, absent)
+        )
+        for name, mutated in (
+            ("live", {**absent, "properties": {
+                **absent["properties"], "ActiveState": "active", "SubState": "running",
+            }}),
+            ("material-result", {**absent, "properties": {
+                **absent["properties"], "Result": "exit-code",
+            }}),
+            ("material-status", {**absent, "properties": {
+                **absent["properties"], "ExecMainStatus": "1",
+            }}),
+            ("bus-unavailable", {**absent, "probe": {"returncode": 1, "timed_out": False}}),
+            ("timed-out", {**absent, "probe": {"returncode": 0, "timed_out": True}}),
+            ("stale", {**absent, "observed_at_unix": tasks._now() - 120}),
+            ("other-unit", {**absent, "properties": {
+                **absent["properties"], "Id": unit + "-other",
+            }}),
+            ("ssh-observer", {**absent, "observer": {
+                "kind": "bound-local-user-systemd-show-v1", "transport": "ssh",
+            }}),
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(
+                    tasks._task_reconcile_ready_local_terminal_observed(terminal, mutated)
+                )
+        self.assertFalse(
+            tasks._task_reconcile_ready_local_terminal_observed(
+                {**record, "state": "running"}, absent
+            )
+        )
+
     def test_reconcile_ready_accepts_quiescent_cancelled_local_unit(self) -> None:
         # Systemd reports the unit outcome, not Grabowski's historical
         # cancellation label. A settled cancellation is safe only with fresh
@@ -10903,6 +11003,48 @@ class TaskTests(unittest.TestCase):
                 asyncio.run(tasks._grabowski_task_status_tool("0" * 24))
         gate.assert_called_once_with("durable_job", task_id="0" * 24)
         status.assert_not_called()
+
+    def test_task_logs_mcp_denies_before_task_lock_and_recovery(self) -> None:
+        with (
+            patch.object(
+                tasks.operator,
+                "_require_operator_mutation",
+                side_effect=PermissionError("test mutation denied"),
+            ) as gate,
+            patch.object(tasks, "grabowski_task_logs") as logs,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test mutation denied"):
+                asyncio.run(tasks._grabowski_task_logs_tool("0" * 24))
+        gate.assert_called_once_with("durable_job", task_id="0" * 24)
+        logs.assert_not_called()
+
+    def test_task_logs_gates_before_row_recovery_broker_or_dispatch(self) -> None:
+        # _row() serializes on the task-mutation lock and may recover a
+        # terminalization; no store, lock, broker or SSH effect may precede
+        # the shared mutation gate.
+        with (
+            patch.object(
+                tasks.operator,
+                "_require_operator_mutation",
+                side_effect=PermissionError("test mutation denied"),
+            ) as gate,
+            patch.object(
+                tasks, "_row", side_effect=AssertionError("row read before gate")
+            ) as row,
+            patch.object(
+                tasks.privileged, "root_task_systemd_request",
+                side_effect=AssertionError("broker before gate"),
+            ) as broker,
+            patch.object(
+                tasks, "_dispatch", side_effect=AssertionError("dispatch before gate")
+            ) as dispatch,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test mutation denied"):
+                tasks.grabowski_task_logs("0" * 24, max_lines=5)
+        gate.assert_called_once_with("durable_job", task_id="0" * 24)
+        row.assert_not_called()
+        broker.assert_not_called()
+        dispatch.assert_not_called()
 
     def test_task_schema_only_inventory_reports_migration_without_mutation(self) -> None:
         self._create_task_schema_version("2")

@@ -879,9 +879,14 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     },
     "grabowski_task_logs": {
         "category": "task",
-        "purpose": "Read redacted journal output for one local or fleet task.",
+        "purpose": "Read redacted output for one local or fleet task through the mutation gate; terminalization recovery may update task and resource stores.",
         "risk_class": "low",
-        "effects": [],
+        "effects": [
+            "remote-read",
+            "schema-migration",
+            "temporary-file-create",
+            "terminalization-recovery",
+        ],
         "reversibility": "not-applicable",
     },
     "grabowski_task_cancel": {
