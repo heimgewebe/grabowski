@@ -50,6 +50,8 @@ class AgentSandboxGitConfigTests(unittest.TestCase):
                     ("core.hooksPath", "/dev/null"),
                     ("core.fsmonitor", "false"),
                     ("core.editor", "/bin/false"),
+                    ("core.pager", "cat"),
+                    ("sequence.editor", "/bin/false"),
                     ("commit.gpgsign", "false"),
                     ("tag.gpgsign", "false"),
                     ("gpg.program", "/bin/false"),

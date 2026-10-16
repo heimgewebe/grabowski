@@ -1604,11 +1604,210 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
                 if not key.startswith("GIT_CONFIG_") and key != "GIT_EDITOR"
             }
             raw = subprocess.run(
-                ["/usr/bin/git", "-C", str(repo), "commit", "--edit", "-m", "control"],
+                ["/usr/bin/git", "-C", str(repo),
+                 "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                 "commit", "--edit", "-m", "control"],
                 env=unprotected_env, capture_output=True, timeout=15,
             )
             self.assertEqual(raw.returncode, 0, raw.stderr)
             self.assertTrue(marker.exists(), "unprotected editor control missed helper")
+
+
+    def test_global_git_option_parser_rejects_ambiguous_or_executable_shapes(self) -> None:
+        """A global option cannot turn its operand into a fake Git subcommand."""
+        from grabowski_agent_sandbox import (
+            AgentSandboxError, git_requires_filter_effect_guard, _git_without_external_diff,
+        )
+        for invocation in (
+            ("--exec-path", "/tmp/foreign-git", "status"),
+            ("--exec-path=/tmp/foreign-git", "status"),
+            ("--super-prefix", "nested", "status"),
+            ("--super-prefix=nested", "status"),
+            ("--git-dir", "/tmp/foreign.git", "status"),
+            ("--work-tree", "/tmp/foreign", "status"),
+            ("--namespace", "foreign", "status"),
+            ("--config-env", "core.hooksPath=HELPER", "status"),
+            ("--bare", "status"),
+            ("-p", "log", "-1"),
+            ("-P", "log", "-1"),
+            ("--paginate", "log", "-1"),
+            ("-C",),
+            ("-c",),
+        ):
+            argv = ["git", *invocation]
+            with self.subTest(argv=argv):
+                with self.assertRaises(AgentSandboxError):
+                    _git_without_external_diff(argv)
+                with self.assertRaises(AgentSandboxError):
+                    git_requires_filter_effect_guard(argv)
+
+        accepted = ["git", "-c", "advice.graftFileDeprecated=false", "-C",
+                    "/tmp/checkout", "--no-pager", "diff", "HEAD"]
+        self.assertEqual(
+            _git_without_external_diff(accepted),
+            ["git", "-c", "advice.graftFileDeprecated=false", "-C",
+             "/tmp/checkout", "--no-pager", "diff",
+             "--no-ext-diff", "--no-textconv", "HEAD"],
+        )
+        self.assertTrue(git_requires_filter_effect_guard(
+            ["git", "-c", "advice.graftFileDeprecated=false", "-C",
+             "/tmp/checkout", "status", "--short"]
+        ))
+
+    def test_git_configured_pager_sequence_and_interactive_helpers_fail_closed(self) -> None:
+        from grabowski_agent_sandbox import AgentSandboxError, safe_git_repository_environment
+        incoming = {
+            "GIT_PAGER": "/tmp/attacker-pager",
+            "GIT_SEQUENCE_EDITOR": "/tmp/attacker-sequence",
+            "PAGER": "/tmp/attacker-pager",
+        }
+        secure = safe_git_environment(incoming)
+        self.assertEqual(secure["GIT_PAGER"], "cat")
+        self.assertEqual(secure["PAGER"], "cat")
+        self.assertEqual(secure["GIT_SEQUENCE_EDITOR"], "/bin/false")
+        pairs = {
+            secure[f"GIT_CONFIG_KEY_{i}"]: secure[f"GIT_CONFIG_VALUE_{i}"]
+            for i in range(int(secure["GIT_CONFIG_COUNT"]))
+        }
+        self.assertEqual(pairs["core.pager"], "cat")
+        self.assertEqual(pairs["sequence.editor"], "/bin/false")
+        with tempfile.TemporaryDirectory(prefix="pr1522-helper-config-") as tmp:
+            repo = Path(tmp) / "repo"
+            self._two_commit_repo(repo, secure)
+            for key in (
+                "core.pager", "pager.log", "sequence.editor",
+                "interactive.diffFilter", "interactive.singleKey",
+                "mergetool.attacker.cmd",
+            ):
+                with self.subTest(config_key=key):
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo), "config", key, "/bin/false"],
+                        env=secure, check=True, timeout=15,
+                    )
+                    with self.assertRaises(AgentSandboxError):
+                        safe_git_repository_environment(repo)
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo), "config", "--unset", key],
+                        env=secure, check=True, timeout=15,
+                    )
+
+    def test_native_git_interactive_and_bundled_signer_editor_flags_are_denied(self) -> None:
+        """Reject helper invocation modes before spawning Git or acquiring effects."""
+        from grabowski_agent_sandbox import AgentSandboxError, _git_without_external_diff
+        forbidden = (
+            ("commit", "-aS", "-m", "message"),
+            ("commit", "-ae", "-m", "message"),
+            ("commit", "-acHEAD", "-m", "message"),
+            ("tag", "-as", "-m", "message", "v1"),
+            ("tag", "-auattacker", "-m", "message", "v1"),
+            ("tag", "--si", "v1"),
+            ("tag", "--local-u", "attacker", "v1"),
+            ("add", "-p", "--", "tracked.txt"),
+            ("add", "-ap", "--", "tracked.txt"),
+            ("commit", "--patch", "-m", "message"),
+            ("checkout", "-p", "HEAD", "--", "tracked.txt"),
+            ("reset", "--patch", "HEAD", "--", "tracked.txt"),
+            ("restore", "-p", "--", "tracked.txt"),
+            ("stash", "--patch"),
+            ("rebase", "-i", "HEAD"),
+            ("rebase", "-ix", "HEAD"),
+            ("rebase", "--interac", "HEAD"),
+            ("rebase", "--exec", "echo something", "HEAD"),
+            ("rebase", "-xecho something", "HEAD"),
+        )
+        for command in forbidden:
+            with self.subTest(argv=command):
+                with self.assertRaises(AgentSandboxError):
+                    _git_without_external_diff(["git", *command])
+        # -m consumes the rest of this short token. Letters in a commit/tag
+        # message are not subsequent -S/-e/-s or other options.
+        for command in (
+            ("commit", "-amSaveSignedNote"),
+            ("commit", "-mEditText"),
+            ("commit", "--no-edit"),
+            ("tag", "-amSignedTitle", "v1"),
+        ):
+            with self.subTest(allowed=command):
+                self.assertEqual(_git_without_external_diff(["git", *command]),
+                                 ["git", *command])
+
+
+    def test_effect_time_git_rejects_foreign_checkout_and_executable_cli_config(self) -> None:
+        """A verified checkout and inert config must bind the *executed* Git."""
+        from grabowski_agent_sandbox import AgentSandboxError, safe_git_filter_effect
+        with tempfile.TemporaryDirectory(prefix="native-git-global-bind-") as directory:
+            root = Path(directory)
+            trusted, foreign = root / "trusted", root / "foreign"
+            secure = safe_git_environment()
+            for repo in (trusted, foreign):
+                self._two_commit_repo(repo, secure)
+                (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
+            (foreign / ".gitattributes").write_text("tracked.txt filter=attacker\n")
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(foreign), "add", ".gitattributes"],
+                env=secure, check=True, timeout=15,
+            )
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(foreign),
+                 "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                 "commit", "-qm", "attributes"], env=secure, check=True, timeout=15,
+            )
+            (foreign / "tracked.txt").write_text("changed\n", encoding="ascii")
+            marker = root / "executable-helper-ran"
+            helper = root / "helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(foreign), "config",
+                 "filter.attacker.clean", str(helper)], env=secure, check=True,
+            )
+            # The bound trusted repo has no executable helper configuration.
+            # -C must not be allowed to silently redirect the *effect* to the
+            # foreign repo, whose info/attributes are not covered by the mount.
+            with self.assertRaises(AgentSandboxError):
+                with safe_git_filter_effect(
+                    trusted, ["git", "-C", str(foreign), "diff", "HEAD"]
+                ):
+                    self.fail("foreign Git checkout was admitted")
+            self.assertFalse(marker.exists())
+            raw = subprocess.run(
+                ["/usr/bin/git", "-C", str(foreign), "diff", "HEAD"],
+                env=secure, capture_output=True, timeout=15,
+            )
+            self.assertEqual(raw.returncode, 0, raw.stderr)
+            self.assertTrue(marker.exists(), "cross-checkout control missed clean filter")
+
+            marker.unlink()
+            with self.assertRaises(AgentSandboxError):
+                with safe_git_filter_effect(
+                    trusted,
+                    ["git", "-c", f"core.fsmonitor={helper}", "-C", str(trusted),
+                     "status", "--short"],
+                ):
+                    self.fail("caller Git -c helper override was admitted")
+            self.assertFalse(marker.exists())
+
+            # Safe, fixed command configurations and exact physical checkout
+            # binding remain available for reviewer/WorkAcquire/Operator reads.
+            for setting in (
+                "advice.graftFileDeprecated=false", "core.fsmonitor=false",
+                "core.hooksPath=/dev/null", "core.pager=cat",
+                "user.name=Fixture", "user.email=fixture@example.invalid",
+            ):
+                with self.subTest(admitted_cli_config=setting):
+                    with safe_git_filter_effect(
+                        trusted,
+                        ["git", "-c", setting, "-C", str(trusted), "status", "--short"],
+                    ) as (argv, environment, descriptors):
+                        positive = subprocess.run(
+                            argv, env=environment, pass_fds=descriptors,
+                            capture_output=True, timeout=15,
+                        )
+                    self.assertEqual(positive.returncode, 0, positive.stderr)
+                    self.assertFalse(marker.exists())
 
 if __name__ == "__main__":
     unittest.main()

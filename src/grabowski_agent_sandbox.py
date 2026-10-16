@@ -35,6 +35,8 @@ _GIT_COMMAND_CONFIG = (
     ("core.hooksPath", "/dev/null"),
     ("core.fsmonitor", "false"),
     ("core.editor", "/bin/false"),
+    ("core.pager", "cat"),
+    ("sequence.editor", "/bin/false"),
     # Never execute a repository-selected signing program, even if commit
     # configuration is changed after the repository admission check.
     ("commit.gpgsign", "false"),
@@ -507,6 +509,9 @@ def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
         "HOME": home,
         "PATH": "/usr/bin:/bin",
         "GIT_EDITOR": "/bin/false",
+        "GIT_SEQUENCE_EDITOR": "/bin/false",
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
         "SSH_ASKPASS": "/bin/false",
         "SSH_ASKPASS_REQUIRE": "never",
     })
@@ -593,7 +598,8 @@ def safe_git_repository_environment(
     # Allow exactly their own pinned signer entry; a repository declaration
     # yields a second occurrence and must still fail closed.
     trusted_signer_keys = {
-        "core.editor", "commit.gpgsign", "tag.gpgsign", "gpg.program",
+        "core.editor", "core.pager", "sequence.editor",
+        "commit.gpgsign", "tag.gpgsign", "gpg.program",
         "gpg.openpgp.program", "gpg.ssh.program", "gpg.x509.program",
     }
     seen_signer_keys: set[str] = set()
@@ -610,9 +616,11 @@ def safe_git_repository_environment(
             or (label.startswith("diff.") and label.endswith((".command", ".textconv")))
             or (label.startswith("merge.") and label.endswith(".driver"))
             or (label.startswith("submodule.") and label.endswith(".update"))
+            or label.startswith(("pager.", "interactive."))
+            or label in {"core.pager", "sequence.editor"}
             or label.startswith("gpg.")
             or label in {"commit.gpgsign", "tag.gpgsign"}
-            or label.endswith((".program", ".cmd"))
+            or label.endswith((".program", ".cmd", ".command"))
             or label.startswith("alias.")
         ):
             raise AgentSandboxError("repository declares an executable Git helper")
@@ -620,21 +628,120 @@ def safe_git_repository_environment(
 
 
 
+# One fail-closed parser for both effect classification and the actual Git argv.
+# A guessed global-option arity could interpret an operand as the subcommand
+# and silently omit the sealed-attribute overlay. Unknown/rebinding/indirect
+# options are not silently skipped.
+_GIT_EFFECT_SAFE_GLOBAL_FLAGS = frozenset({
+    "--no-pager", "--no-replace-objects", "--literal-pathspecs",
+    "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs",
+    "--no-optional-locks", "--no-lazy-fetch",
+})
+
+
+def _git_effect_subcommand_index(argv: list[str]) -> int:
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument in {"-C", "-c"}:
+            if index + 1 >= len(argv) or not argv[index + 1]:
+                raise AgentSandboxError("Git global option is missing its operand")
+            index += 2
+            continue
+        if argument in _GIT_EFFECT_SAFE_GLOBAL_FLAGS:
+            index += 1
+            continue
+        if argument.startswith("-"):
+            raise AgentSandboxError("Git global option is not admitted at effect")
+        return index
+    raise AgentSandboxError("Git subcommand is missing")
+
+
+def _git_validate_effect_global_bindings(repo: Path, argv: list[str]) -> None:
+    """The exact Git command must use the admitted checkout and inert CLI config.
+
+    The repository config preflight and sealed info/attributes overlay cover
+    *repo*, not another repository selected with -C. Git command-line -c
+    outranks safe GIT_CONFIG_COUNT environment pins. Deny both escapes before
+    any Git subprocess effect, including before deciding whether to bwrap.
+    """
+    if not argv or Path(argv[0]).name != "git":
+        return
+    stop = _git_effect_subcommand_index(argv)
+    try:
+        checkout = Path(repo).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise AgentSandboxError("Git execution checkout binding unavailable") from exc
+    trusted_config = {
+        key.casefold(): value for key, value in _GIT_COMMAND_CONFIG
+    }
+    trusted_config.update({
+        "advice.graftfiledeprecated": "false",
+        "pager.status": "false", "pager.diff": "false",
+        "pager.log": "false", "pager.show": "false",
+        "diff.external": "", "diff.trustexitcode": "false",
+        "protocol.file.allow": "never",
+    })
+    index = 1
+    while index < stop:
+        option = argv[index]
+        if option == "-C":
+            target = Path(argv[index + 1])
+            if not target.is_absolute():
+                raise AgentSandboxError("Git -C must bind the exact absolute checkout")
+            try:
+                observed = target.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise AgentSandboxError("Git -C checkout binding unavailable") from exc
+            if observed != checkout:
+                raise AgentSandboxError("Git -C checkout differs from admitted repository")
+            index += 2
+            continue
+        if option == "-c":
+            configured = argv[index + 1]
+            key, separator, value = configured.partition("=")
+            key = key.casefold()
+            if not separator or not key or any(
+                character in value for character in ("\x00", "\r", "\n")
+            ):
+                raise AgentSandboxError("Git CLI config assignment is not trusted")
+            if key in {"user.name", "user.email"}:
+                if not value or len(value.encode("utf-8")) > 256:
+                    raise AgentSandboxError("Git CLI identity config is not bounded")
+            elif key not in trusted_config or value != trusted_config[key]:
+                raise AgentSandboxError("Git CLI executable config override is forbidden")
+            index += 2
+            continue
+        index += 1
+
+
+def _git_long_option_matches(option: str, *denied: str) -> bool:
+    if not option.startswith("--"):
+        return False
+    flag = option.split("=", 1)[0]
+    return any(target.startswith(flag) for target in denied)
+
+
+def _git_short_option_has_helper(
+    option: str, *, denied: frozenset[str], operand_flags: frozenset[str] = frozenset(),
+) -> bool:
+    if not option.startswith("-") or option.startswith("--"):
+        return False
+    # -amMessage: 'm' consumes the remainder; letters within Message cannot
+    # accidentally become -S/-e. -aS and -ae must still be caught.
+    for flag in option[1:]:
+        if flag in denied:
+            return True
+        if flag in operand_flags:
+            return False
+    return False
+
+
 def git_requires_filter_effect_guard(argv: list[str]) -> bool:
     """Identify host Git effects which can inspect or transform worktree bytes."""
     if not argv or Path(argv[0]).name != "git":
         return False
-    index = 1
-    while index < len(argv):
-        option = argv[index]
-        if option in ("-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env"):
-            index += 2
-        elif option.startswith("-"):
-            index += 1
-        else:
-            break
-    if index >= len(argv):
-        return False
+    index = _git_effect_subcommand_index(argv)
     subcommand = argv[index]
     arguments = argv[index + 1:]
     if subcommand == "cat-file":
@@ -692,53 +799,67 @@ def _git_without_external_diff(argv: list[str]) -> list[str]:
     """
     if not argv or Path(argv[0]).name != "git":
         return list(argv)
-    position = 1
-    while position < len(argv):
-        option = argv[position]
-        if option in ("-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env"):
-            position += 2
-        elif option.startswith("-"):
-            position += 1
-        else:
-            break
-    if position >= len(argv):
-        return list(argv)
+    position = _git_effect_subcommand_index(argv)
     subcommand = argv[position]
-    # An explicit signing flag bypasses commit.gpgsign=false, so reject before
-    # any Git spawn rather than allowing a failing /bin/false signer to touch
-    # the branch-attempt outcome. Tag signing is likewise not an allowed effect.
-    if subcommand in {"commit", "tag"}:
-        options = argv[position + 1:]
-        prefix = options[:options.index("--")] if "--" in options else options
-        if any(
-            (subcommand == "commit" and (
-                option.startswith("-S")
-                or (option.startswith("--") and "--gpg-sign".startswith(option.split("=", 1)[0]))
-            ))
-            or (subcommand == "tag" and (
-                option in {"-s", "-u", "--sign", "--local-user"}
-                or option.startswith("--local-user=")
-                or option.startswith("--sign=")
-            ))
-            for option in prefix
-        ):
-            raise AgentSandboxError("explicit Git signing helper is forbidden")
-    if subcommand == "commit":
-        options = argv[position + 1:]
-        prefix = options[:options.index("--")] if "--" in options else options
-        if any(
-            option in {"-e", "-c"}
-            or (option.startswith("-c") and not option.startswith("--"))
-            or (
-                option.startswith("--")
-                and any(
-                    name.startswith(option.split("=", 1)[0])
-                    for name in ("--edit", "--reedit-message")
+    # Enforce interactive/signer denial before the real Git spawn, including
+    # bundled short options and unique long-option prefixes. The sandbox's
+    # /bin/false pins remain defence-in-depth for unknown future Git behavior.
+    options = argv[position + 1:]
+    prefix = options[:options.index("--")] if "--" in options else options
+    if subcommand == "commit" and any(
+        _git_short_option_has_helper(
+            option, denied=frozenset({"S", "e", "c"}),
+            operand_flags=frozenset({"m", "F", "C", "t", "o"}),
+        )
+        or _git_long_option_matches(
+            option, "--gpg-sign", "--edit", "--reedit-message"
+        )
+        for option in prefix
+    ):
+        raise AgentSandboxError("Git signing or editor helper is forbidden")
+    if subcommand == "tag" and any(
+        _git_short_option_has_helper(
+            option, denied=frozenset({"s", "u", "v"}),
+            operand_flags=frozenset({"m", "F", "n"}),
+        )
+        or _git_long_option_matches(
+            option, "--sign", "--local-user", "--verify"
+        )
+        for option in prefix
+    ):
+        raise AgentSandboxError("Git tag signing or verification helper is forbidden")
+    interactive_subcommands = {"add", "commit", "checkout", "reset", "restore", "stash"}
+    if subcommand in interactive_subcommands | {"rebase"} and any(
+        (
+            subcommand in interactive_subcommands
+            and (
+                _git_long_option_matches(option, "--patch")
+                or _git_short_option_has_helper(
+                    option, denied=frozenset({"p", "i"} if subcommand == "add" else {"p"}),
+                    operand_flags=frozenset(
+                        {"m", "F", "C", "t", "o"} if subcommand == "commit"
+                        else {"b", "B", "c", "C"} if subcommand == "checkout"
+                        else {"s", "S"} if subcommand == "restore" else set()
+                    ),
                 )
             )
-            for option in prefix
-        ):
-            raise AgentSandboxError("Git commit editor effect is forbidden")
+        )
+        or (
+            subcommand in {"add", "rebase"}
+            and _git_long_option_matches(option, "--interactive")
+        )
+        or (
+            subcommand == "rebase"
+            and (
+                _git_long_option_matches(option, "--exec")
+                or _git_short_option_has_helper(
+                    option, denied=frozenset({"i", "x"}),
+                )
+            )
+        )
+        for option in prefix
+    ):
+        raise AgentSandboxError("Git interactive helper effect is forbidden")
     # Git parses conflicting diff flags in argument order. A caller-supplied
     # --ext-diff/--textconv after our --no-* options would re-enable execution.
     # Also cover blame/annotate/grep/cat-file, whose own --textconv can launch
@@ -804,6 +925,7 @@ def safe_git_filter_effect(
     file is created, altered or removed by the overlay. Fail closed when that
     effect-time binding is unavailable; never fall back to unsandboxed Git.
     """
+    _git_validate_effect_global_bindings(repo, argv)
     environment = safe_git_repository_environment(repo, base)
     # Apply the diff-driver denial at the actual spawn even when no attribute
     # overlay is needed, e.g. committed two-object SHA-1/SHA-256 diffs.
