@@ -7212,11 +7212,90 @@ def _require_task_scoped_mutation(record: dict[str, Any], task_id: str) -> None:
     )
 
 
+TASK_SCOPE_SNAPSHOT_ATTEMPTS = 5
+TASK_SCOPE_SNAPSHOT_RETRY_SECONDS = 0.2
+
+
+def _task_mutation_scope(record: dict[str, Any]) -> tuple[Any, ...]:
+    return (record["cwd"], record["host"], record.get("lease_owner_id"))
+
+
+def _task_scope_main_file_row(identifier: str) -> dict[str, Any] | None:
+    """Read one row from the main task file only; no sidecar is opened.
+
+    The immutable reader ignores WAL frames, so the row can predate the last
+    checkpoint; the caller re-gates the current row after the mutable read.
+    """
+    if TASK_DB.is_symlink() or not TASK_DB.is_file() or TASK_DB.stat().st_size == 0:
+        raise RuntimeError("Task store cannot be observed without explicit initialization")
+    before = sqlite_store.file_identity(TASK_DB)
+    connection = sqlite3.connect(
+        TASK_DB.absolute().as_uri() + "?mode=ro&immutable=1", uri=True, timeout=1
+    )
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only=ON")
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (identifier,)
+        ).fetchone()
+    except sqlite3.DatabaseError as exc:
+        # A concurrent checkpoint can rewrite pages mid-read; never trust it.
+        raise TaskSchemaInventoryChanged(
+            "Task store changed during scope snapshot"
+        ) from exc
+    finally:
+        connection.close()
+    if sqlite_store.file_identity(TASK_DB) != before:
+        raise TaskSchemaInventoryChanged("Task store changed during scope snapshot")
+    return dict(row) if row is not None else None
+
+
+def _task_scope_snapshot(task_id: str) -> dict[str, Any]:
+    """Read the persisted task scope without opening the mutable task store."""
+    identifier = _validate_task_id(task_id)
+    for attempt in range(TASK_SCOPE_SNAPSHOT_ATTEMPTS):
+        last_attempt = attempt + 1 == TASK_SCOPE_SNAPSHOT_ATTEMPTS
+        try:
+            row = _task_scope_main_file_row(identifier)
+        except TaskSchemaInventoryChanged as exc:
+            # Never fall back to the mutable store before the scoped gate.
+            if last_attempt:
+                raise RuntimeError(
+                    "Task scope snapshot unavailable while the task store is "
+                    "changing; retry after the active writer completes"
+                ) from exc
+        else:
+            if row is not None:
+                return row
+            try:
+                wal_size = os.lstat(f"{TASK_DB}-wal").st_size
+            except FileNotFoundError:
+                wal_size = 0
+            # A header-only WAL holds no frames: the task is truly unknown.
+            if wal_size <= 32:
+                raise ValueError(f"Unknown task: {identifier}")
+            if last_attempt:
+                raise RuntimeError(
+                    "Task scope is not yet checkpointed from the task WAL; "
+                    "retry after the active writer completes"
+                )
+        time.sleep(TASK_SCOPE_SNAPSHOT_RETRY_SECONDS)
+    raise AssertionError("unreachable")
+
+
 @_serialize_task_mutation
-def _task_logs_row_after_scoped_gate(task_id: str) -> dict[str, Any]:
-    # Bind the persisted task scope before terminalization recovery; the later
-    # broker or fleet read only runs for a scope that passed the blockade gate.
-    _require_task_scoped_mutation(_row_raw(task_id), task_id)
+def _task_row_after_scoped_gate(task_id: str) -> dict[str, Any]:
+    """Gate the persisted task scope before any mutable task-store effect.
+
+    The scope comes from a non-writing main-file snapshot. Only after host,
+    owner, path and repository blockades pass is the mutable store opened; a
+    scope that drifted or was stale is gated again before recovery or dispatch.
+    """
+    snapshot = _task_scope_snapshot(task_id)
+    _require_task_scoped_mutation(snapshot, task_id)
+    current = _row_raw(task_id)
+    if _task_mutation_scope(current) != _task_mutation_scope(snapshot):
+        _require_task_scoped_mutation(current, task_id)
     return _row(task_id)
 
 def _task_systemd_unit_health(
@@ -9867,10 +9946,9 @@ def _task_status_after_mutation_guard(task_id: str) -> dict[str, Any]:
     # Revalidate after the shared task lock: authority may change while waiting.
     # No read, lease maintenance or state change may happen before this gate.
     operator._require_operator_mutation("durable_job", task_id=task_id)
-    # Host, owner, path and repository blockades need the persisted scope;
-    # read it without terminalization recovery, then recheck before effects.
-    _require_task_scoped_mutation(_row_raw(task_id), task_id)
-    record = _row(task_id)
+    # Host, owner, path and repository blockades need the persisted scope; it
+    # is read non-writingly and gated before the mutable store is opened.
+    record = _task_row_after_scoped_gate(task_id)
     observation = _observe(record)
     effective_state = _effective_observed_state(record, observation["state"])
     lease_maintenance = _maintain_record_resources(record, effective_state)
@@ -9973,7 +10051,7 @@ def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
     # _row() takes the task-mutation lock and may recover terminalizations;
     # Rootbroker journal reads write a reference file and fleet reads use SSH.
     operator._require_operator_mutation("durable_job", task_id=task_id)
-    record = _task_logs_row_after_scoped_gate(task_id)
+    record = _task_row_after_scoped_gate(task_id)
     output_source = "root-journal-v1"
     if _is_root_systemd_backend(record):
         result = privileged.root_task_systemd_request(

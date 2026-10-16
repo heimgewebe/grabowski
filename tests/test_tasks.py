@@ -11078,9 +11078,14 @@ class TaskTests(unittest.TestCase):
             patch.object(
                 tasks, "_dispatch", side_effect=AssertionError("dispatch before scoped gate")
             ) as dispatch,
+            patch.object(
+                tasks, "_database_connection",
+                side_effect=AssertionError("mutable store before scoped gate"),
+            ) as mutable_store,
         ):
             with self.assertRaisesRegex(PermissionError, "test scoped blockade"):
                 tasks.grabowski_task_logs(task_id, max_lines=5)
+        mutable_store.assert_not_called()
         self.assertEqual(
             [
                 {"capability": "durable_job", "task_id": task_id},
@@ -11121,9 +11126,14 @@ class TaskTests(unittest.TestCase):
                 tasks, "_maintain_record_resources",
                 side_effect=AssertionError("lease work before scoped gate"),
             ) as leases,
+            patch.object(
+                tasks, "_database_connection",
+                side_effect=AssertionError("mutable store before scoped gate"),
+            ) as mutable_store,
         ):
             with self.assertRaisesRegex(PermissionError, "test scoped blockade"):
                 tasks.grabowski_task_status(task_id)
+        mutable_store.assert_not_called()
         self.assertEqual(
             {
                 "capability": "durable_job",
@@ -11139,6 +11149,155 @@ class TaskTests(unittest.TestCase):
         recovery.assert_not_called()
         observe.assert_not_called()
         leases.assert_not_called()
+
+    def test_task_scope_gate_reads_main_file_beside_live_wal_without_sidecar_effects(self) -> None:
+        record = self._start(host="remote")["task"]
+        task_id = str(record["task_id"])
+        persisted = tasks._row_raw(task_id)
+        keeper = sqlite3.connect(tasks.TASK_DB)
+        try:
+            keeper.execute("PRAGMA wal_autocheckpoint=0")
+            keeper.execute(
+                "UPDATE tasks SET updated_at_unix=updated_at_unix WHERE task_id=?",
+                (task_id,),
+            )
+            keeper.commit()
+            wal = Path(f"{tasks.TASK_DB}-wal")
+            shm = Path(f"{tasks.TASK_DB}-shm")
+            self.assertGreater(wal.stat().st_size, 32)
+            files = (tasks.TASK_DB, wal, shm)
+            before = {str(path): (path.stat().st_mtime_ns, path.read_bytes()) for path in files}
+            for name, call in (
+                ("status", lambda: tasks.grabowski_task_status(task_id)),
+                ("logs", lambda: tasks.grabowski_task_logs(task_id, max_lines=5)),
+            ):
+                calls: list[dict[str, object]] = []
+                with (
+                    self.subTest(tool=name),
+                    patch.object(
+                        tasks.operator, "_require_operator_mutation",
+                        side_effect=self._scoped_blockade_gate(calls),
+                    ),
+                    patch.object(tasks.time, "sleep") as pause,
+                    patch.object(
+                        tasks, "_database_connection",
+                        side_effect=AssertionError("mutable store before scoped gate"),
+                    ) as mutable_store,
+                ):
+                    with self.assertRaisesRegex(PermissionError, "test scoped blockade"):
+                        call()
+                    pause.assert_not_called()
+                    mutable_store.assert_not_called()
+                    self.assertEqual(persisted["host"], calls[-1]["host"])
+            self.assertEqual(
+                before,
+                {str(path): (path.stat().st_mtime_ns, path.read_bytes()) for path in files},
+            )
+        finally:
+            keeper.close()
+
+    def test_task_scope_snapshot_fails_closed_for_row_only_in_wal(self) -> None:
+        with tasks._database_connection():
+            pass
+        keeper = sqlite3.connect(tasks.TASK_DB)
+        try:
+            keeper.execute("PRAGMA wal_autocheckpoint=0")
+            keeper.execute("SELECT COUNT(*) FROM tasks").fetchone()
+            task_id = str(self._start(host="remote")["task"]["task_id"])
+            self.assertGreater(Path(f"{tasks.TASK_DB}-wal").stat().st_size, 32)
+            with (
+                patch.object(tasks.operator, "_require_operator_mutation"),
+                patch.object(tasks.time, "sleep") as pause,
+                patch.object(
+                    tasks, "_database_connection",
+                    side_effect=AssertionError("mutable store before scoped gate"),
+                ) as mutable_store,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "not yet checkpointed"):
+                    tasks.grabowski_task_status(task_id)
+            self.assertEqual(tasks.TASK_SCOPE_SNAPSHOT_ATTEMPTS - 1, pause.call_count)
+            mutable_store.assert_not_called()
+        finally:
+            keeper.close()
+        with patch.object(tasks.time, "sleep") as pause:
+            with self.assertRaisesRegex(ValueError, "Unknown task"):
+                tasks._task_scope_snapshot("f" * 24)
+        pause.assert_not_called()
+
+    def test_task_scope_snapshot_retries_then_fails_closed_on_moving_main_file(self) -> None:
+        task_id = str(self._start(host="remote")["task"]["task_id"])
+        identities = iter(range(1000))
+        with (
+            patch.object(
+                tasks.sqlite_store, "file_identity",
+                side_effect=lambda _path: (next(identities),),
+            ),
+            patch.object(tasks.time, "sleep") as pause,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Task scope snapshot unavailable"):
+                tasks._task_scope_snapshot(task_id)
+        self.assertEqual(tasks.TASK_SCOPE_SNAPSHOT_ATTEMPTS - 1, pause.call_count)
+
+    def test_task_scope_snapshot_accepts_frameless_read_only_sidecars(self) -> None:
+        # Plain read-only task-store readers leave a header-only WAL and an
+        # SHM behind; they must not lock status/logs out of the scoped gate.
+        record = self._start(host="remote")["task"]
+        task_id = str(record["task_id"])
+        with tasks.sqlite_store.readonly_sqlite(tasks.TASK_DB) as reader:
+            reader.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
+        wal = Path(f"{tasks.TASK_DB}-wal")
+        shm = Path(f"{tasks.TASK_DB}-shm")
+        self.assertTrue(wal.is_file() and shm.is_file())
+        self.assertLessEqual(wal.stat().st_size, 32)
+        sidecars = {path.name: path.read_bytes() for path in (wal, shm)}
+        calls: list[dict[str, object]] = []
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=self._scoped_blockade_gate(calls),
+            ),
+            patch.object(
+                tasks, "_database_connection",
+                side_effect=AssertionError("mutable store before scoped gate"),
+            ) as mutable_store,
+            patch.object(tasks.time, "sleep") as pause,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test scoped blockade"):
+                tasks.grabowski_task_logs(task_id, max_lines=5)
+        mutable_store.assert_not_called()
+        pause.assert_not_called()
+        self.assertEqual(task_id, calls[-1]["task_id"])
+        self.assertIn("host", calls[-1])
+        self.assertEqual(sidecars, {path.name: path.read_bytes() for path in (wal, shm)})
+
+    def test_task_scope_drift_after_snapshot_is_gated_again(self) -> None:
+        record = self._start(host="remote")["task"]
+        task_id = str(record["task_id"])
+        persisted = tasks._row_raw(task_id)
+        stale = {**persisted, "lease_owner_id": "stale-owner"}
+        calls: list[dict[str, object]] = []
+
+        def gate(capability: str, **scope: object) -> None:
+            calls.append({"capability": capability, **scope})
+            if scope.get("owner_id") == persisted.get("lease_owner_id") and "host" in scope:
+                raise PermissionError("current scope blockaded")
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation", side_effect=gate),
+            patch.object(tasks, "_task_scope_snapshot", return_value=stale),
+            patch.object(
+                tasks, "_recover_task_terminalization",
+                side_effect=AssertionError("recovery before current scope gate"),
+            ) as recovery,
+        ):
+            with self.assertRaisesRegex(PermissionError, "current scope blockaded"):
+                tasks.grabowski_task_logs(task_id, max_lines=5)
+        scoped = [call for call in calls if "host" in call]
+        self.assertEqual(
+            ["stale-owner", persisted.get("lease_owner_id")],
+            [call["owner_id"] for call in scoped],
+        )
+        recovery.assert_not_called()
 
     def test_task_schema_only_inventory_reports_migration_without_mutation(self) -> None:
         self._create_task_schema_version("2")
