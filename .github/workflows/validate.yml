@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     defaults:
       run:
@@ -57,8 +57,18 @@ jobs:
       - name: Install Git sandbox prerequisite
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends bubblewrap
+          sudo apt-get install -y --no-install-recommends bubblewrap apparmor-profiles apparmor-utils
+          # Ubuntu 24.04 restricts user namespaces via AppArmor. Use the distro
+          # profile for bubblewrap; do not disable host-wide AppArmor protection.
+          test -f /usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+          test ! -L /etc/apparmor.d/bwrap-userns-restrict
+          if [ ! -e /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo install -m 0644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/bwrap-userns-restrict
+          fi
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
           /usr/bin/bwrap --version
+          # Probe the real unprivileged uid-map and mount effects before tests.
+          /usr/bin/bwrap --bind / / --dev-bind /dev /dev -- /usr/bin/true
 
       - name: Validate repository
         run: make validate
