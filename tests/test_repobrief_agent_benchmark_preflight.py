@@ -3858,6 +3858,9 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
                     "receipt validator failed"
                 ),
             ),
+            mock.patch.object(
+                codex_preflight, "_terminalize_pair_after_completed_condition"
+            ) as ledger_terminal,
             mock.patch.object(codex_preflight, "_persist_pair_artifact") as persist,
         ):
             with self.assertRaisesRegex(
@@ -3865,6 +3868,7 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             ):
                 codex_preflight.execute_authorized_pair(**self._kwargs())
             self.assertEqual(run.call_count, 1)
+            ledger_terminal.assert_called_once()
             persist.assert_called_once()
             self.assertEqual(persist.call_args.args[1]["status"], "failed")
             self.assertTrue(persist.call_args.kwargs["digest"])
@@ -3909,14 +3913,76 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_attest_completed_pair_ledger"
             ) as ledger,
+            mock.patch.object(
+                codex_preflight, "_terminalize_pair_after_completed_condition"
+            ) as ledger_terminal,
             mock.patch.object(codex_preflight, "_persist_pair_artifact") as persist,
         ):
             with self.assertRaisesRegex(
                 codex_preflight.core.PreflightError, "exceeds authorized budget"
             ):
                 codex_preflight.execute_authorized_pair(**self._kwargs())
+            # Pair ceiling is 1.00 USD total: first condition already
+            # exceeded it, so the second must never start.
+            self.assertEqual(run.call_count, 1)
+            ledger.assert_not_called()
+            ledger_terminal.assert_called_once()
+            persist.assert_called_once()
+            self.assertEqual(persist.call_args.args[1]["status"], "failed")
+
+    def test_pair_total_spend_overrun_after_second_condition_fails(self) -> None:
+        baseline, treatment = self._requests()
+        bindings = {
+            "baseline": codex_preflight.core._sha256_json(baseline),
+            "treatment": codex_preflight.core._sha256_json(treatment),
+        }
+        with (
+            mock.patch.object(
+                codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
+            ),
+            mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
+            mock.patch.object(
+                codex_preflight.core, "load_pair", return_value=(baseline, treatment)
+            ),
+            mock.patch.object(
+                codex_preflight,
+                "authorize_pair",
+                return_value={
+                    "status": "authorized",
+                    "pair_id": "bound-pair",
+                    "request_sha256": bindings,
+                },
+            ),
+            mock.patch.object(
+                codex_preflight.codex_runner,
+                "execute",
+                side_effect=[{"status": "success"}, {"status": "success"}],
+            ) as run,
+            mock.patch.object(
+                codex_preflight,
+                "_validated_condition_receipt",
+                side_effect=[
+                    {"receipt_sha256": "a" * 64, "observed_cost_usd": "0.75"},
+                    {"receipt_sha256": "b" * 64, "observed_cost_usd": "0.40"},
+                ],
+            ),
+            mock.patch.object(
+                codex_preflight, "_attest_completed_pair_ledger"
+            ) as ledger,
+            mock.patch.object(
+                codex_preflight, "_terminalize_pair_after_completed_condition"
+            ) as ledger_terminal,
+            mock.patch.object(codex_preflight, "_persist_pair_artifact") as persist,
+        ):
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError, "exceeds authorized budget"
+            ):
+                codex_preflight.execute_authorized_pair(**self._kwargs())
+            # Both conditions are individually within the ceiling,
+            # but together 0.75 + 0.40 exceeds the single pair grant.
             self.assertEqual(run.call_count, 2)
             ledger.assert_not_called()
+            ledger_terminal.assert_called_once()
             persist.assert_called_once()
             self.assertEqual(persist.call_args.args[1]["status"], "failed")
 

@@ -62,17 +62,35 @@ frozen inputs or provider credentials. This profile is intentionally
 **not** suitable for a benchmark dispatch, because HOME and temporary
 directories can share the same underlying /run tmpfs.
 
-The no-provider probe remains limited to 30 seconds. The current live
-launcher uses `RuntimeMaxSec=7200` (120 minutes). Its static allowance
-consists of the maximum 3,600-second provider wall budget, up to twenty
-120-second bounded Git phases, four 90-second isolated readbacks, a
-30-second tree inspection, 10-second login check, 25-second sandbox
-check, 300 seconds for cleanup, and a remaining 475-second scheduling/
-ledger margin. This is the configured whole-service hard limit, **not**
-proof that every possible production preflight and finalizer path fits
-within it. That requires a separately authorized full live-runtime
-qualification. A provider run still requires separate one-shot
-authorization.
+The no-provider probe remains limited to 30 seconds. The current
+**single-request** live launcher uses `RuntimeMaxSec=7200` (120 minutes).
+Its static allowance consists of the maximum 3,600-second provider wall
+budget, up to twenty 120-second bounded Git phases, four 90-second
+isolated readbacks, a 30-second tree inspection, a 10-second login
+check, a 25-second Codex sandbox check, a separate 15-second provider
+PID-namespace smoke, 300 seconds for cleanup, and 460 seconds for
+scheduling and ledger terminalization. This allowance is a configured
+whole-service limit, **not** a measured upper bound for every dynamic
+path. The extra PID smoke must not be silently omitted.
+
+The **same-unit baseline/treatment pair** uses
+`RuntimeMaxSec=21600` (six hours), separately from the single-request
+limit. The current configured envelope reserves up to two 7,200-second
+single-request paths plus 3,600 seconds for pair-preflight, external
+validators, cost and receipt verification, ledger and failure
+terminalization, and shutdown. The remaining 3,600 seconds are
+conservative scheduling slack; the split is an upper planning
+allowance, not proof of a production maximum. A formal end-to-end
+worst-case call-graph test and the installed root-systemd no-provider
+sandbox attestation remain mandatory before any approval or real
+provider invocation. The `--max-cost-usd` argument on the pair plan
+is a total **pair spending ceiling** (not a per-condition budget that
+may be doubled). Both conditions together must fit it, and every
+condition's verified actual cost must be checked before the next
+irreversible provider intent. No CLI flag, generated ledger or Codex
+login substitutes for a separately verified external one-shot approval.
+Until a canonical external verifier is installed, every direct and
+paired live provider entrypoint fails closed.
 
 For a future live plan, the launcher instead uses StateDirectory
 on persistent host storage, with four mode-0700 dynamic UID leaves.

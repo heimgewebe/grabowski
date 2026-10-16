@@ -3168,20 +3168,42 @@ try:
                  for name in ("state", "transcripts", "evidence", "reports")}
         for directory in roots.values():
             directory.mkdir(mode=0o700)
+        # Provider may write only its unique ephemeral CODEX_HOME, never
+        # the trusted dispatch ledger, receipts or final reports.
+        session_parent = roots["state"] / "codex-runtime"
+        session_parent.mkdir(mode=0o700)
+        session_home = session_parent / ("session-" + "a" * 24)
+        session_home.mkdir(mode=0o700)
+        protected_ledger = roots["state"] / "preflight-dispatch-ledger"
+        protected_ledger.mkdir(mode=0o700)
+        trusted_event = protected_ledger / "0001-dispatch-intent.json"
+        trusted_event.write_text("trusted-intent", encoding="ascii")
         kwargs = dict(
             source=source, state_root=roots["state"],
             transcript_root=roots["transcripts"],
             evidence_root=roots["evidence"], report_root=roots["reports"],
+            codex_home=session_home,
         )
         guarded._assert_provider_pid_namespace_ready(**kwargs, cwd=source)
         child = r'''
 import errno
 import os
+from pathlib import Path
 import resource
 import signal
 import subprocess
 import sys
 parent_pid, parent_tid = map(int, sys.argv[1:3])
+trusted_event, report_dir, session_home = map(Path, sys.argv[3:6])
+for destination in (trusted_event, report_dir / "untrusted-create.json"):
+    try:
+        destination.write_text("hostile-provider-write", encoding="ascii")
+    except OSError as exc:
+        assert exc.errno in (errno.EROFS, errno.EACCES), exc
+    else:
+        raise RuntimeError("provider modified trusted persistent output")
+session_marker = session_home / "child-marker"
+session_marker.write_text("allowed", encoding="ascii")
 for target in (parent_pid, parent_tid):
     try:
         os.kill(target, signal.SIGUSR1)
@@ -3210,6 +3232,7 @@ print("PARENT_TIDS_HIDDEN_CHILD_SIGNALS_WORK")
         provider = [
             sys.executable, "-I", "-c", child,
             str(os.getpid()), str(thread.native_id),
+            str(trusted_event), str(roots["reports"]), str(session_home),
         ]
         sandbox = guarded._provider_pid_namespaced_codex_argv(provider, **kwargs)
         def run(candidate, *, isolated=False):
@@ -3218,10 +3241,14 @@ print("PARENT_TIDS_HIDDEN_CHILD_SIGNALS_WORK")
                     candidate, provider_pid_namespace=isolated
                 ),
                 cwd=source, capture_output=True, timeout=12, check=False,
+                env={**os.environ, "CODEX_HOME": str(session_home)},
             )
         good = run(sandbox, isolated=True)
         assert good.returncode == 0, good.stderr[-1024:]
         assert b"PARENT_TIDS_HIDDEN_CHILD_SIGNALS_WORK" in good.stdout
+        assert trusted_event.read_text(encoding="ascii") == "trusted-intent"
+        assert not (roots["reports"] / "untrusted-create.json").exists()
+        assert (session_home / "child-marker").read_text(encoding="ascii") == "allowed"
         bad = run([item for item in sandbox if item != "--unshare-pid"])
         assert bad.returncode != 0, bad.stdout
         assert b"PARENT_TIDS_HIDDEN_CHILD_SIGNALS_WORK" not in bad.stdout
@@ -4523,6 +4550,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     ),
                     ("provider_env", {}),
                     ("cleanup_codex_home", None),
+                    ("_require_external_provider_one_shot", None),
                 ):
                     stack.enter_context(
                         patch.object(runner, name, return_value=return_value)
@@ -9860,6 +9888,85 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             self.assertIsNone(final_state["pending_condition"])
             self.assertFalse(final_state["terminal_failure"])
             self.assertEqual(final_state["next_sequence"], 5)
+
+    def test_completed_condition_validator_failure_blocks_pair_replay(self) -> None:
+        # A completed runner condition may be rejected by pair QC, but
+        # its prior one-shot authorization must not permit treatment.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            treatment = request(condition="treatment")
+            manifest = root / "bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            treatment["repobrief"]["manifest"] = str(manifest)
+            treatment["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                manifest.read_bytes()
+            ).hexdigest()
+            baseline = request(
+                condition="baseline",
+                commit=treatment["repository"]["commit"],
+            )
+            state_root = write_dispatch_authorization(root, treatment, [])
+            authorization = runner._load_preflight_dispatch_authorization(
+                baseline, state_root
+            )["authorization"]
+            runner._record_preflight_dispatch_intent(
+                baseline, state_root, authorization
+            )
+            runner._record_preflight_dispatch_completed(
+                baseline,
+                state_root,
+                authorization,
+                {
+                    "transcript": {
+                        "sha256": "a" * 64,
+                        "bytes": 17,
+                        "artifact": "baseline.jsonl",
+                    }
+                },
+            )
+            previous = runner._validated_dispatch_event_state(
+                baseline, state_root, authorization
+            )
+            self.assertFalse(previous["terminal_failure"])
+            self.assertEqual(previous["next_sequence"], 3)
+            event_sha = runner._record_preflight_dispatch_pair_failed(
+                baseline,
+                state_root,
+                authorization,
+                runner.RunnerError("external validator rejected receipt"),
+            )
+            state = runner._validated_dispatch_event_state(
+                baseline, state_root, authorization
+            )
+            self.assertEqual(state["next_sequence"], 4)
+            self.assertTrue(state["terminal_failure"])
+            self.assertEqual(
+                state["condition_outcomes"], {"baseline": "condition-completed"}
+            )
+            self.assertEqual(state["previous_event_sha256"], event_sha)
+            self.assertTrue((state["events_root"] / "0003-pair-failed.json").is_file())
+            self.assertEqual(
+                runner._record_preflight_dispatch_pair_failed(
+                    baseline,
+                    state_root,
+                    authorization,
+                    runner.RunnerError("another failure"),
+                ),
+                event_sha,
+            )
+            with self.assertRaisesRegex(runner.RunnerError, "terminal after failure"):
+                runner._record_preflight_dispatch_intent(
+                    treatment, state_root, authorization
+                )
+
+    def test_direct_live_provider_one_shot_verifier_missing_fail_closed(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "external one-shot provider authorization"
+        ):
+            runner._require_external_provider_one_shot(
+                request=request(condition="baseline"),
+                authorization={"internal_dispatch_ledger": True},
+            )
 
     def test_failed_or_ambiguous_first_dispatch_terminalizes_pair(self) -> None:
         for provider_process_started in (False, True):

@@ -500,6 +500,24 @@ def _attest_completed_pair_ledger(
     }
 
 
+def _terminalize_pair_after_completed_condition(
+    *,
+    request: dict[str, Any],
+    state_root: Path,
+    error: BaseException,
+) -> str:
+    """Append trusted terminal ledger event, not merely a report-side warning.
+
+    A successfully written runner condition-completed event remains
+    dispatchable unless the canonical ledger records the pair-level failure.
+    This operation revalidates and locks the same authorization as the runner.
+    """
+    loaded = codex_runner._load_preflight_dispatch_authorization(request, state_root)
+    return codex_runner._record_preflight_dispatch_pair_failed(
+        request, state_root, loaded["authorization"], error
+    )
+
+
 def execute_authorized_pair(
     *,
     pair_id: str,
@@ -529,6 +547,7 @@ def execute_authorized_pair(
     authorization: dict[str, Any] | None = None
     requests: dict[str, str] = {}
     results: dict[str, dict[str, Any]] = {}
+    last_completed_request: dict[str, Any] | None = None
     try:
         baseline, treatment = core.load_pair(request_root, pair_id)
         authorization = authorize_pair(
@@ -571,9 +590,17 @@ def execute_authorized_pair(
         ordered = sorted(
             (baseline, treatment), key=lambda request: int(request["order"])
         )
+        # The launcher calls max_cost_usd the PAIR ceiling, not a per-run
+        # allowance to double. Never expand an external spending authorization.
+        if not max_cost_usd.is_finite() or max_cost_usd <= 0:
+            raise core.PreflightError("paired provider cost ceiling is invalid")
+        authorized_total = max_cost_usd
+        observed = Decimal("0")
         for request in ordered:
             condition = str(request["condition"])
+            last_completed_request = None
             receipt = codex_runner.execute(request, arguments)
+            last_completed_request = request
             results[condition] = _validated_condition_receipt(
                 request=request,
                 receipt=receipt,
@@ -582,17 +609,23 @@ def execute_authorized_pair(
                 transcript_root=transcript_root,
                 validator_command=validator_command,
             )
-            # There must be no second provider intent if the first receipt,
-            # external validator, or cost report is incomplete.
+            try:
+                condition_cost = Decimal(results[condition]["observed_cost_usd"])
+            except (InvalidOperation, TypeError, KeyError, ValueError) as exc:
+                raise core.PreflightError(
+                    "paired provider cost is not verified"
+                ) from exc
+            if not condition_cost.is_finite() or condition_cost < 0:
+                raise core.PreflightError("paired provider cost is not verified")
+            observed += condition_cost
+            # Crucial: reject an overspent first condition BEFORE another
+            # irreversible treatment or baseline provider intent.
+            if not observed.is_finite() or observed > authorized_total:
+                raise core.PreflightError(
+                    "paired provider cost exceeds authorized budget"
+                )
         if set(results) != {"baseline", "treatment"}:
             raise core.PreflightError("paired dispatch is incomplete")
-        observed = sum(
-            (Decimal(result["observed_cost_usd"]) for result in results.values()),
-            Decimal("0"),
-        )
-        authorized_total = max_cost_usd * 2
-        if not observed.is_finite() or observed > authorized_total:
-            raise core.PreflightError("paired provider cost exceeds authorized budget")
         ledger = _attest_completed_pair_ledger(
             baseline=baseline,
             ordered=ordered,
@@ -625,8 +658,18 @@ def execute_authorized_pair(
         _persist_pair_artifact(_paired_terminal_path(report_out), report, digest=True)
         return report
     except BaseException as exc:
-        # A prior authorized pair can have consumed zero, one or two intents.
-        # Preserve a separate create-only failure artifact, never retry or
+        # A completed runner condition can still fail validator/cost/pair QC.
+        # Terminalize that state in the runner-owned ledger BEFORE reporting
+        # failure; a standalone *.pair-failed.json cannot block direct replay.
+        ledger_failure: BaseException | None = None
+        if authorization is not None and last_completed_request is not None:
+            try:
+                _terminalize_pair_after_completed_condition(
+                    request=last_completed_request, state_root=state_root, error=exc
+                )
+            except BaseException as terminal_error:
+                ledger_failure = terminal_error
+        # Preserve an independent create-only failure artifact, never retry or
         # misreport a successful individual runner event as complete pair QC.
         if authorization is not None:
             failure = {
@@ -649,6 +692,10 @@ def execute_authorized_pair(
                 raise core.PreflightError(
                     "paired failure could not be terminalized durably"
                 ) from persistence_error
+        if ledger_failure is not None:
+            raise core.PreflightError(
+                "paired failure could not be terminalized in dispatch ledger"
+            ) from ledger_failure
         raise
 
 

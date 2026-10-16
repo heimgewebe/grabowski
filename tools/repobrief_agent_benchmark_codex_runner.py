@@ -1085,10 +1085,10 @@ from pathlib import Path
 import sys
 
 # These exact arguments are constructed by the trusted parent, never by Codex.
-if len(sys.argv) < 9 or sys.argv[7] != "--":
+if len(sys.argv) < 10 or sys.argv[8] != "--":
     raise RuntimeError("provider PID sandbox bootstrap arguments are invalid")
-outer_pid_ns, source, state, transcripts, evidence, reports = sys.argv[1:7]
-command = sys.argv[8:]
+outer_pid_ns, source, state, transcripts, evidence, reports, codex_home = sys.argv[1:8]
+command = sys.argv[9:]
 if (
     not outer_pid_ns.startswith("pid:[")
     or not outer_pid_ns.endswith("]")
@@ -1111,8 +1111,15 @@ if not (os.statvfs("/").f_flag & os.ST_RDONLY):
 if not (os.statvfs(source).f_flag & os.ST_RDONLY):
     raise RuntimeError("provider immutable source is writable")
 for output in (state, transcripts, evidence, reports):
-    if os.statvfs(output).f_flag & os.ST_RDONLY:
-        raise RuntimeError("provider private output mount is not writable")
+    if not (os.statvfs(output).f_flag & os.ST_RDONLY):
+        raise RuntimeError("trusted epoch output is writable inside provider namespace")
+if (
+    Path(codex_home).parent.name != "codex-runtime"
+    or Path(codex_home).parent.parent != Path(state)
+    or os.statvfs(codex_home).f_flag & os.ST_RDONLY
+    or os.environ.get("CODEX_HOME") != codex_home
+):
+    raise RuntimeError("provider session home mount or environment is invalid")
 fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
 if (
     fields.get("NoNewPrivs", "").strip() != "1"
@@ -1132,6 +1139,7 @@ def _provider_pid_namespaced_codex_argv(
     transcript_root: Path,
     evidence_root: Path,
     report_root: Path,
+    codex_home: Path,
 ) -> list[str]:
     """Run hostile provider bytes below a distinct PID namespace.
 
@@ -1160,6 +1168,8 @@ def _provider_pid_namespaced_codex_argv(
             for name, path in requested.items()
         }
         home = Path.home().resolve(strict=True)
+        private_home = codex_home.expanduser().resolve(strict=True)
+        private_home_stat = private_home.lstat()
         outer_pid_ns = os.readlink("/proc/self/ns/pid")
     except (OSError, RuntimeError) as exc:
         raise RunnerError("provider PID sandbox paths are unavailable") from exc
@@ -1170,6 +1180,13 @@ def _provider_pid_namespaced_codex_argv(
             path.parent != epoch or path.name != name for name, path in outputs.items()
         )
         or len(set(outputs.values())) != 4
+        or private_home.parent.parent != outputs["state"]
+        or private_home.parent.name != "codex-runtime"
+        or re.fullmatch(r"session-[0-9a-f]{24}", private_home.name) is None
+        or private_home != codex_home.expanduser().absolute()
+        or not stat.S_ISDIR(private_home_stat.st_mode)
+        or private_home_stat.st_uid != os.geteuid()
+        or stat.S_IMODE(private_home_stat.st_mode) != 0o700
         or not outer_pid_ns.startswith("pid:[")
         or not outer_pid_ns.endswith("]")
     ):
@@ -1179,7 +1196,7 @@ def _provider_pid_namespaced_codex_argv(
     temp = Path("/tmp")
     if any(
         path == temp or temp in path.parents
-        for path in (source_real, *outputs.values())
+        for path in (source_real, private_home, *outputs.values())
     ):
         raise RunnerError("provider PID sandbox cannot shadow bound paths")
     bwrap = [
@@ -1200,8 +1217,9 @@ def _provider_pid_namespaced_codex_argv(
         "1777",
         "/tmp",
     ]
-    for output in outputs.values():
-        bwrap.extend(("--bind", str(output), str(output)))
+    # Only the unique private per-session Codex home is writable to hostile
+    # provider bytes; trusted state, ledger, receipts and reports remain RO.
+    bwrap.extend(("--bind", str(private_home), str(private_home)))
     bwrap.extend(
         (
             "--",
@@ -1213,6 +1231,7 @@ def _provider_pid_namespaced_codex_argv(
             outer_pid_ns,
             str(source_real),
             *(str(path) for path in outputs.values()),
+            str(private_home),
             "--",
             *command,
         )
@@ -1227,6 +1246,7 @@ def _assert_provider_pid_namespace_ready(
     transcript_root: Path,
     evidence_root: Path,
     report_root: Path,
+    codex_home: Path,
     cwd: Path,
 ) -> None:
     """No-provider smoke before intent; the real child re-attests after fork."""
@@ -1243,6 +1263,7 @@ def _assert_provider_pid_namespace_ready(
         transcript_root=transcript_root,
         evidence_root=evidence_root,
         report_root=report_root,
+        codex_home=codex_home,
     )
     try:
         completed = subprocess.run(
@@ -1250,7 +1271,7 @@ def _assert_provider_pid_namespace_ready(
             cwd=cwd,
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            env=base._git_environment(),
+            env={**base._git_environment(), "CODEX_HOME": str(codex_home)},
             timeout=15,
             check=False,
         )
@@ -5059,8 +5080,8 @@ def _validated_dispatch_event_state(
         events_root, label="preflight dispatch event ledger"
     )
     entries = sorted(events_root.iterdir(), key=lambda path: path.name)
-    # authorized + two (intent, terminal-outcome) pairs
-    if not 1 <= len(entries) <= 5:
+    # Authorized + two (intent, outcome) pairs + optional pair-failed event.
+    if not 1 <= len(entries) <= 6:
         raise RunnerError("preflight dispatch event ledger cardinality is invalid")
     binding = authorization.get("binding")
     contract = authorization.get("contract_sha256")
@@ -5239,6 +5260,37 @@ def _validated_dispatch_event_state(
 
             outcomes[str(condition)] = str(event_type)
             pending_condition = None
+
+        elif event_type == "pair-failed":
+            # The runner may have completed a condition, while its external
+            # receipt validator or cost gate rejects the PAIR afterward.
+            # Without this terminal event a second direct dispatch could
+            # reuse the same internal authorization.
+            if (
+                terminal_failure
+                or pending_condition is not None
+                or not intents
+                or len(intents) != len(outcomes)
+                or condition != intents[-1]
+                or outcomes.get(condition) != "condition-completed"
+                or not isinstance(expected, dict)
+                or payload.get("request_id") != expected.get("request_id")
+                or payload.get("request_sha256") != expected.get("sha256")
+                or payload.get("process_index") != len(intents)
+                or payload.get("order") != len(intents)
+                or payload.get("synthetic_fixture") is not False
+                or payload.get("provider_process_started") is not False
+                or payload.get("outcome_ambiguous") is not False
+                or payload.get("transcript")
+                != {"status": "unavailable", "reason": "pair-validation-failed"}
+                or payload.get("receipt_sha256") is not None
+                or payload.get("observed_cost_usd") is not None
+                or payload.get("observed_cost_status")
+                != "not-reported-by-codex-subscription-stream"
+                or not valid_error(payload.get("error"))
+            ):
+                raise RunnerError("preflight paired terminal failure event is invalid")
+            terminal_failure = True
 
         else:
             raise RunnerError("preflight dispatch event type is invalid")
@@ -5470,7 +5522,7 @@ def _record_preflight_dispatch_outcome(
     observed_cost_usd: str | None = None,
     observed_cost_status: str = "unavailable",
 ) -> str:
-    if event_type not in {"condition-completed", "condition-failed"}:
+    if event_type not in {"condition-completed", "condition-failed", "pair-failed"}:
         raise RunnerError("preflight dispatch outcome type is invalid")
     pair_id = str(request["pair_id"])
     pair_root = (
@@ -5518,8 +5570,19 @@ def _record_preflight_dispatch_outcome(
         state = _validated_dispatch_event_state(request, state_root, current)
         condition = str(request.get("condition"))
         if state["terminal_failure"]:
+            if event_type == "pair-failed":
+                return str(state["previous_event_sha256"])
             raise RunnerError("preflight dispatch pair is terminal after failure")
-        if state["pending_condition"] != condition:
+        if event_type == "pair-failed":
+            completed = state["condition_intents"]
+            if (
+                not completed
+                or state["pending_condition"] is not None
+                or state["condition_outcomes"].get(condition) != "condition-completed"
+                or completed[-1] != condition
+            ):
+                raise RunnerError("paired failure has no completed condition")
+        elif state["pending_condition"] != condition:
             raise RunnerError(
                 "preflight dispatch outcome has no matching pending intent"
             )
@@ -5624,6 +5687,33 @@ def _record_preflight_dispatch_failed(
         provider_process_started=provider_process_started,
         outcome_ambiguous=provider_process_started,
         transcript=_dispatch_failure_transcript_evidence(request, authorization),
+        receipt_sha256=None,
+        error=_dispatch_error_evidence(exc),
+        observed_cost_usd=None,
+        observed_cost_status="not-reported-by-codex-subscription-stream",
+    )
+
+
+def _record_preflight_dispatch_pair_failed(
+    request: Mapping[str, Any],
+    state_root: Path,
+    authorization: Mapping[str, Any],
+    exc: BaseException,
+) -> str:
+    """One create-only terminal ledger event for post-condition pair failure.
+
+    Serialized under the same trusted dispatch lock as every future intent.
+    If the runner already recorded a condition-failed event, the ledger is
+    already terminal. No new event is added in that case.
+    """
+    return _record_preflight_dispatch_outcome(
+        request,
+        state_root,
+        authorization,
+        event_type="pair-failed",
+        provider_process_started=False,
+        outcome_ambiguous=False,
+        transcript={"status": "unavailable", "reason": "pair-validation-failed"},
         receipt_sha256=None,
         error=_dispatch_error_evidence(exc),
         observed_cost_usd=None,
@@ -9361,6 +9451,23 @@ def _fixture_capture(
     }
 
 
+def _require_external_provider_one_shot(
+    *, request: Mapping[str, Any], authorization: Mapping[str, Any]
+) -> None:
+    """Do not spend from an internal ledger or CLI flag.
+
+    A separate trusted verifier must eventually bind the exact source, pair,
+    condition, model, total budget and one-time authorization. Until that
+    canonical verifier exists, every direct live path remains fail closed.
+    This function runs before the irreversible provider intent.
+    """
+    if not isinstance(request, Mapping) or not isinstance(authorization, Mapping):
+        raise RunnerError("external one-shot provider authorization is invalid")
+    raise RunnerError(
+        "external one-shot provider authorization verifier is unavailable"
+    )
+
+
 def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     validate_request(request)
     _validated_live_mode(
@@ -9607,8 +9714,9 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 )
                 # A PID namespace, not a per-PID seccomp exception, keeps
                 # every trusted parent thread unreachable from hostile Codex.
-                # Check its exact four writable mounts before the one-shot
-                # provider intent. The fixed inner bootstrap repeats checks.
+                # Trusted epoch outputs must be readonly to hostile Codex.
+                # Only its unique session HOME may be writable; the fixed inner
+                # bootstrap re-attests mount/namespace state before provider bytes.
                 report_out = dispatch_authorization["binding"].get("report_out")
                 if not isinstance(report_out, str) or not report_out:
                     raise RunnerError("provider PID sandbox report binding missing")
@@ -9618,8 +9726,13 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     "transcript_root": args.transcript_root,
                     "evidence_root": args.provider_evidence_root,
                     "report_root": Path(report_out).parent,
+                    "codex_home": codex_home,
                 }
                 _assert_provider_pid_namespace_ready(**pid_sandbox, cwd=checkout)
+                _require_external_provider_one_shot(
+                    request=request,
+                    authorization=dispatch_authorization["authorization"],
+                )
                 _record_preflight_dispatch_intent(
                     request,
                     state_path,
