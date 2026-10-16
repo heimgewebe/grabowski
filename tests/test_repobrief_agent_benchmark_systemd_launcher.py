@@ -163,9 +163,21 @@ class RootSystemdLauncherTests(unittest.TestCase):
         # Full service lifetime: provider + at most twenty 120s Git phases
         # spanning preflight/checkout/postflight, four 90s isolated readbacks,
         # source tree, login, sandbox, and 300s ledger/cleanup allowance.
-        min_service_seconds = 3600 + (20 * 120) + (4 * 90) + 30 + 10 + 25 + 300
+        # All bounded startup checks are inside the same service deadline,
+        # including 15s provider PIDNS and 25s nested Codex-in-PIDNS smoke.
+        min_service_seconds = (
+            3600 + (20 * 120) + (4 * 90) + 30 + 10 + 25 + 15 + 25 + 300
+        )
         self.assertGreaterEqual(int(live["RuntimeMaxSec"]), min_service_seconds)
         self.assertEqual(int(live["RuntimeMaxSec"]), 7200)
+        self.assertEqual(int(live["RuntimeMaxSec"]) - min_service_seconds, 435)
+        pair = self.props(
+            launcher.unit_argv("pairbudget", ["/usr/bin/true"], probe=False, pair=True)
+        )
+        self.assertEqual(int(pair["RuntimeMaxSec"]), 21600)
+        self.assertEqual(
+            int(pair["RuntimeMaxSec"]), 2 * int(live["RuntimeMaxSec"]) + 7200
+        )
 
     def test_no_host_shared_dev_shm_mount_alias(self) -> None:
         for mode in (True, False):

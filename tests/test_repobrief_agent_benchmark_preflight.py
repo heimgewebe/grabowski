@@ -3670,6 +3670,97 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             persisted.assert_called_once()
             self.assertEqual(persisted.call_args.args[1]["status"], "failed")
 
+    def test_second_preintent_failure_terminalizes_previous_completed_condition(
+        self,
+    ) -> None:
+        baseline, treatment = self._requests()
+        bindings = {
+            "baseline": codex_preflight.core._sha256_json(baseline),
+            "treatment": codex_preflight.core._sha256_json(treatment),
+        }
+        with (
+            mock.patch.object(
+                codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
+            ),
+            mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
+            mock.patch.object(
+                codex_preflight.core, "load_pair", return_value=(baseline, treatment)
+            ),
+            mock.patch.object(
+                codex_preflight,
+                "authorize_pair",
+                return_value={
+                    "status": "authorized",
+                    "pair_id": "bound-pair",
+                    "request_sha256": bindings,
+                },
+            ),
+            mock.patch.object(
+                codex_preflight.codex_runner,
+                "execute",
+                side_effect=[
+                    {"status": "success"},
+                    codex_preflight.codex_runner.RunnerError(
+                        "second preintent sandbox drift"
+                    ),
+                ],
+            ) as run,
+            mock.patch.object(
+                codex_preflight,
+                "_validated_condition_receipt",
+                return_value={
+                    "observed_cost_usd": "0.10",
+                    "receipt_sha256": "a" * 64,
+                },
+            ) as validated,
+            mock.patch.object(
+                codex_preflight, "_terminalize_pair_after_completed_condition"
+            ) as ledger_terminal,
+            mock.patch.object(codex_preflight, "_persist_pair_artifact") as persisted,
+        ):
+            with self.assertRaisesRegex(
+                codex_preflight.codex_runner.RunnerError,
+                "second preintent sandbox drift",
+            ):
+                codex_preflight.execute_authorized_pair(**self._kwargs())
+            self.assertEqual(run.call_count, 2)
+            validated.assert_called_once()
+            ledger_terminal.assert_called_once()
+            self.assertIs(ledger_terminal.call_args.kwargs["request"], treatment)
+            self.assertEqual(
+                ledger_terminal.call_args.kwargs["state_root"],
+                self._kwargs()["state_root"],
+            )
+            persisted.assert_called_once()
+            self.assertEqual(persisted.call_args.args[1]["status"], "failed")
+            self.assertFalse(persisted.call_args.args[1]["retry_permitted"])
+
+    def test_real_codex_receipt_without_dollar_cost_is_not_budget_evidence(
+        self,
+    ) -> None:
+        # The real Codex turn.completed fixture reports tokens, not USD.
+        # Never invent $0 or assume an API tariff for subscription usage.
+        from test_repobrief_agent_benchmark_codex_runner import (
+            request as codex_request,
+            stream as codex_stream,
+        )
+
+        value = codex_request(condition="baseline")
+        raw = codex_stream(value)
+        now = datetime.now(timezone.utc)
+        receipt = codex_runner.receipt(value, raw, "codex-fixture.jsonl", 0, now, now)
+        self.assertEqual(receipt["provider"]["token_source"], "provider_reported")
+        self.assertGreater(receipt["provider"]["input_tokens"], 0)
+        self.assertNotIn("total_cost_usd", receipt["provider"])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "codex-fixture.jsonl").write_bytes(raw)
+            with self.assertRaisesRegex(
+                codex_preflight.core.runner.RunnerError,
+                "provider transcript requires one result",
+            ):
+                codex_preflight.core._observed_cost(receipt, root)
+
     def test_typed_receipt_requires_external_validation_and_observed_cost(self) -> None:
         request = {"condition": "baseline", "request_id": "baseline-receipt"}
         receipt = {

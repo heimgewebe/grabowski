@@ -42,6 +42,19 @@ from typing import Any
 
 SOURCE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
 
+# Never persist the key: a new process after SIGKILL/RuntimeMaxSec cannot
+# continue a previously completed condition under the original pair grant.
+_DISPATCH_PROCESS_NONCE = os.urandom(32)
+
+
+def _live_dispatch_process_binding(pair_id: str) -> str:
+    return hmac.new(
+        _DISPATCH_PROCESS_NONCE,
+        pair_id.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 ENTRYPOINT_BOOTSTRAP_KIND = "grabowski.python_c_source_bootstrap"
 ENTRYPOINT_BOOTSTRAP_SCHEMA_VERSION = 1
 ENTRYPOINT_BOOTSTRAP_NAME = "repobrief_agent_benchmark_source_bootstrap.py"
@@ -1248,8 +1261,9 @@ def _assert_provider_pid_namespace_ready(
     report_root: Path,
     codex_home: Path,
     cwd: Path,
+    codex_command: str | None = None,
 ) -> None:
-    """No-provider smoke before intent; the real child re-attests after fork."""
+    """Exercise the real outer bwrap PIDNS (and nested Codex sandbox) before intent."""
     probe = _provider_pid_namespaced_codex_argv(
         [
             _validated_mcp_proxy_python(),
@@ -1267,7 +1281,7 @@ def _assert_provider_pid_namespace_ready(
     )
     try:
         completed = subprocess.run(
-            _unix_socket_restricted_codex_argv(probe),
+            _unix_socket_restricted_codex_argv(probe, provider_pid_namespace=True),
             cwd=cwd,
             stdin=subprocess.DEVNULL,
             capture_output=True,
@@ -1283,6 +1297,71 @@ def _assert_provider_pid_namespace_ready(
         or completed.stderr
     ):
         raise RunnerError("provider PID sandbox smoke failed")
+    if codex_command is None:
+        # Older no-provider kernel regressions cover parent-TID isolation
+        # without an installed Codex CLI. The live path always supplies Codex.
+        return
+
+    private_tmp, tmp_fd = _open_private_directory(codex_home / "tmp")
+    os.close(tmp_fd)
+    filesystem = (
+        '{":minimal"="read",":workspace_roots"={"."="read"},'
+        + _toml_string(str(private_tmp))
+        + '="read",'
+        + _toml_string(str(Path(codex_command).parent))
+        + '="read"}'
+    )
+    nested_command = [
+        codex_command,
+        "sandbox",
+        "-c",
+        "allow_login_shell=false",
+        "-c",
+        "features.network_proxy=true",
+        "-c",
+        f"permissions.{PERMISSION_PROFILE}.filesystem={filesystem}",
+        "-c",
+        f'permissions.{PERMISSION_PROFILE}.network={{enabled=true,mode="limited",allow_local_binding=false,domains={{}}}}',
+        "--permission-profile",
+        PERMISSION_PROFILE,
+        "--enable",
+        "network_proxy",
+        "--cd",
+        str(cwd),
+        "--",
+        "/bin/true",
+    ]
+    nested = _provider_pid_namespaced_codex_argv(
+        nested_command,
+        source=source,
+        state_root=state_root,
+        transcript_root=transcript_root,
+        evidence_root=evidence_root,
+        report_root=report_root,
+        codex_home=codex_home,
+    )
+    try:
+        nested_result = subprocess.run(
+            _unix_socket_restricted_codex_argv(nested, provider_pid_namespace=True),
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            env=provider_env(codex=codex_command, codex_home=codex_home),
+            timeout=25,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RunnerError(
+            "nested Codex sandbox smoke unavailable before intent"
+        ) from exc
+    if (
+        nested_result.returncode != 0
+        or not isinstance(nested_result.stdout, bytes)
+        or not isinstance(nested_result.stderr, bytes)
+        or len(nested_result.stdout) > 8192
+        or len(nested_result.stderr) > 8192
+    ):
+        raise RunnerError("nested Codex sandbox smoke failed before intent")
 
 
 _POST_PROVIDER_GIT_ISOLATED_PROGRAM = r"""
@@ -5109,6 +5188,7 @@ def _validated_dispatch_event_state(
     terminal_failure = False
     pending_condition: str | None = None
     authorized_sha256: str | None = None
+    origin_process_sha256: str | None = None
 
     def valid_sha256(value: Any) -> bool:
         return (
@@ -5189,6 +5269,7 @@ def _validated_dispatch_event_state(
 
         if event_type == "dispatch-intent":
             next_process_index = len(intents) + 1
+            process_sha256 = payload.get("origin_process_sha256")
             if (
                 terminal_failure
                 or len(intents) != len(outcomes)
@@ -5201,8 +5282,15 @@ def _validated_dispatch_event_state(
                 or payload.get("order") != next_process_index
                 or payload.get("synthetic_fixture") is not False
                 or payload.get("max_cost_usd") != binding.get("max_cost_usd")
+                or not valid_sha256(process_sha256)
+                or (
+                    origin_process_sha256 is not None
+                    and process_sha256 != origin_process_sha256
+                )
             ):
                 raise RunnerError("preflight dispatch intent event is invalid")
+            if origin_process_sha256 is None:
+                origin_process_sha256 = str(process_sha256)
             intents.append(str(condition))
             pending_condition = str(condition)
 
@@ -5308,6 +5396,7 @@ def _validated_dispatch_event_state(
         "condition_outcomes": outcomes,
         "pending_condition": pending_condition,
         "terminal_failure": terminal_failure,
+        "origin_process_sha256": origin_process_sha256,
     }
 
 
@@ -5372,6 +5461,11 @@ def _record_preflight_dispatch_intent(
             raise RunnerError("preflight dispatch pair is terminal after failure")
         if state["pending_condition"] is not None:
             raise RunnerError("prior dispatch intent has no terminal outcome")
+        process_sha256 = _live_dispatch_process_binding(pair_id)
+        if intents and state["origin_process_sha256"] != process_sha256:
+            raise RunnerError(
+                "preflight dispatch pair cannot resume after process restart"
+            )
         if len(intents) >= 2:
             raise RunnerError(
                 "preflight dispatch ledger refuses a third provider process"
@@ -5404,6 +5498,7 @@ def _record_preflight_dispatch_intent(
                 "order": order,
                 "synthetic_fixture": False,
                 "max_cost_usd": binding.get("max_cost_usd"),
+                "origin_process_sha256": process_sha256,
             },
         }
         events_path, events_fd = _open_private_directory(
@@ -9536,6 +9631,14 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
             str(args.codex_command_sha256),
             dispatch_authorization["provider_codex"],
         )
+        # The external one-shot grant is a separate precondition, never the
+        # internally produced dispatch ledger or a CLI --allow-live-provider
+        # flag. Deny before Codex login/sandbox calls or consuming a checkout;
+        # repeat the non-consuming verification immediately before intent.
+        _require_external_provider_one_shot(
+            request=request,
+            authorization=dispatch_authorization["authorization"],
+        )
         validate_toolchain(codex)
         if request["condition"] == "treatment":
             authorized_mcp_files = list(dispatch_authorization["mcp_files"])
@@ -9672,7 +9775,9 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     manifest_path=None
                     if manifest_binding is None
                     else Path(manifest_binding["path"]),
-                    mcp_runtime_root=state_path,
+                    # The Codex child MCP proxy may stage only inside its
+                    # private session home; epoch/ledger roots stay read-only.
+                    mcp_runtime_root=codex_home,
                     source=source,
                 )
                 if dispatch_authorization is None:
@@ -9728,7 +9833,9 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     "report_root": Path(report_out).parent,
                     "codex_home": codex_home,
                 }
-                _assert_provider_pid_namespace_ready(**pid_sandbox, cwd=checkout)
+                _assert_provider_pid_namespace_ready(
+                    **pid_sandbox, cwd=checkout, codex_command=codex
+                )
                 _require_external_provider_one_shot(
                     request=request,
                     authorization=dispatch_authorization["authorization"],

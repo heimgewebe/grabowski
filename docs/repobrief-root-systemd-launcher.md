@@ -68,10 +68,14 @@ Its static allowance consists of the maximum 3,600-second provider wall
 budget, up to twenty 120-second bounded Git phases, four 90-second
 isolated readbacks, a 30-second tree inspection, a 10-second login
 check, a 25-second Codex sandbox check, a separate 15-second provider
-PID-namespace smoke, 300 seconds for cleanup, and 460 seconds for
-scheduling and ledger terminalization. This allowance is a configured
-whole-service limit, **not** a measured upper bound for every dynamic
-path. The extra PID smoke must not be silently omitted.
+PID-namespace smoke, a further 25-second **nested Codex sandbox inside
+that same PID namespace**, 300 seconds for cleanup, and 435 seconds
+for scheduling and ledger terminalization. Of the four 90-second
+readback slots, three are used by the current pre-/post-provider
+call graph, with one retained as conservative allowance. These
+per-phase budgets are configured planning limits, **not** a measured
+upper bound or qualified worst-case execution time for the entire
+production call graph. The extra smoke and readbacks must not be omitted.
 
 The **same-unit baseline/treatment pair** uses
 `RuntimeMaxSec=21600` (six hours), separately from the single-request

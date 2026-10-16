@@ -100,16 +100,16 @@ def unit_argv(
         "ProtectControlGroups=yes",
         "MemoryMax=512M",
         "TasksMax=128",
-        # The limit covers the entire root service, not just Codex: 3600s
-        # provider wall, 20 x 120s Git-stage allowance, 4 x 90s isolated
-        # readbacks, 30s tree scan, 10s login, 25s sandbox, 300s cleanup
-        # and 475s for ledger finalization / scheduling. Never let systemd
-        # kill the ledger writer immediately after a valid provider intent.
-        # Paired service is ONE original root-systemd unit running the Codex
-        # preflight process, which executes both conditions itself. Reserve
-        # two entire 7200s single-request envelopes plus 3600s for pair
-        # preflight and 3600s for scheduling/ledger/cleanup slack. This
-        # conservative bound still requires a positive live qualification.
+        # Service lifetime includes every bounded pre- and post-intent
+        # phase: provider 3600s + Git 20*120s + 4*90s readbacks +
+        # tree 30s + login 10s + Codex sandbox 25s + PIDNS smoke 15s +
+        # *nested* Codex-in-PIDNS smoke 25s + cleanup 300s + ledger
+        # scheduling/terminalization 435s = 7200s. Three readbacks
+        # currently execute; the fourth is reserved margin. A timeout
+        # before final ledger evidence must never be called success.
+        # The paired unit reuses two 7200s phase envelopes, plus 3600s
+        # combined preflight/validator and 3600s cleanup/scheduling slack:
+        # 21600s. These are planning envelopes, NOT host-validated WCET.
         f"RuntimeMaxSec={30 if probe else 21600 if pair else 7200}",
     ]
     if not probe:

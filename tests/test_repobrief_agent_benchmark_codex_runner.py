@@ -3124,6 +3124,87 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn(b"TRUSTED_PARENT_PRLIMIT_DENIED_SELF_ALLOWED", completed.stdout)
 
+    def test_provider_pid_namespace_stages_mcp_proxy_tools_list(self) -> None:
+        """Real bwrap, real MCP proxy, fake upstream: no paid provider activity."""
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir(mode=0o700)
+            epoch = root / "epoch"
+            epoch.mkdir(mode=0o700)
+            outputs = {
+                name: epoch / name
+                for name in ("state", "transcripts", "evidence", "reports")
+            }
+            for directory in outputs.values():
+                directory.mkdir(mode=0o700)
+            state = outputs["state"]
+            parent = state / "codex-runtime"
+            parent.mkdir(mode=0o700)
+            session_home = parent / ("session-" + "a" * 24)
+            session_home.mkdir(mode=0o700)
+            ledger = state / "preflight-dispatch-ledger"
+            ledger.mkdir(mode=0o700)
+            event = ledger / "0001-dispatch-intent.json"
+            event.write_text("trusted-intent", encoding="ascii")
+            upstream = source / "fake-mcp.py"
+            upstream.write_text(
+                "import json, sys\n"
+                f"TOOLS = {treatment_tools()!r}\n"
+                "for line in sys.stdin:\n"
+                "    request = json.loads(line)\n"
+                "    if request.get('method') == 'tools/list':\n"
+                "        print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], "
+                "'result': {'tools': TOOLS}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            payload = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode("utf-8")
+                + b"\n"
+            )
+
+            def run_proxy(stage_root: Path) -> subprocess.CompletedProcess[bytes]:
+                command = proxy_command(upstream, source)
+                command[-1] = str(stage_root)
+                sandbox = runner._provider_pid_namespaced_codex_argv(
+                    command,
+                    source=source,
+                    state_root=state,
+                    transcript_root=outputs["transcripts"],
+                    evidence_root=outputs["evidence"],
+                    report_root=outputs["reports"],
+                    codex_home=session_home,
+                )
+                return subprocess.run(
+                    runner._unix_socket_restricted_codex_argv(
+                        sandbox, provider_pid_namespace=True
+                    ),
+                    input=payload,
+                    cwd=source,
+                    env={**os.environ, "CODEX_HOME": str(session_home)},
+                    capture_output=True,
+                    timeout=18,
+                    check=False,
+                )
+
+            # RED: previous staging under the trusted state must fail (EROFS).
+            denied = run_proxy(state)
+            self.assertNotEqual(denied.returncode, 0, denied.stdout[-1024:])
+            self.assertEqual(event.read_text(encoding="ascii"), "trusted-intent")
+            # GREEN: private session-home staging completes a real tools/list.
+            allowed = run_proxy(session_home)
+            self.assertEqual(allowed.returncode, 0, allowed.stderr[-2048:])
+            messages = [json.loads(line) for line in allowed.stdout.splitlines()]
+            reply = next((item for item in messages if item.get("id") == 1), None)
+            self.assertIsNotNone(reply)
+            self.assertIn(
+                "ask_context",
+                {tool["name"] for tool in reply["result"]["tools"]},
+            )
+            self.assertEqual(event.read_text(encoding="ascii"), "trusted-intent")
+
     def test_provider_pid_namespace_hides_nondumpable_parent_threads(self) -> None:
         # Host-kernel test with no provider: protect a nonleader native TID,
         # preserve direct child cancellation, and reject an omitted PIDNS.
@@ -3204,6 +3285,20 @@ for destination in (trusted_event, report_dir / "untrusted-create.json"):
         raise RuntimeError("provider modified trusted persistent output")
 session_marker = session_home / "child-marker"
 session_marker.write_text("allowed", encoding="ascii")
+# This is the actual provider-side private MCP stage allocator, not a
+# fake mkdir: it must succeed beneath Codex HOME while its ancestor
+# state/ledger remains read-only under the real kernel.
+runner_path = Path(sys.argv[6]).resolve(strict=True)
+sys.path.insert(0, str(runner_path.parent))
+import repobrief_agent_benchmark_codex_runner as guarded
+stage_path, stage_fd = guarded._create_private_stage_directory(
+    session_home / "repoground-mcp-upstream-runtime", prefix="upstream-"
+)
+try:
+    guarded._write_private_dirfd(stage_fd, "tools-list.json", b'{"tools":[]}\\n')
+finally:
+    os.close(stage_fd)
+assert (stage_path / "tools-list.json").is_file()
 for target in (parent_pid, parent_tid):
     try:
         os.kill(target, signal.SIGUSR1)
@@ -3230,9 +3325,10 @@ assert resource.prlimit(0, resource.RLIMIT_NOFILE)[0] >= 0
 print("PARENT_TIDS_HIDDEN_CHILD_SIGNALS_WORK")
 '''
         provider = [
-            sys.executable, "-I", "-c", child,
+            sys.executable, "-I", "-B", "-c", child,
             str(os.getpid()), str(thread.native_id),
             str(trusted_event), str(roots["reports"]), str(session_home),
+            str(runner_path),
         ]
         sandbox = guarded._provider_pid_namespaced_codex_argv(provider, **kwargs)
         def run(candidate, *, isolated=False):
@@ -4416,6 +4512,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 )
                 for name in (
                     "_assert_authorized_codex_executable",
+                    "_require_external_provider_one_shot",
                     "_assert_authorized_chatgpt_auth",
                     "_assert_authorized_runtime_binding",
                 ):
@@ -9929,6 +10026,61 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             )
             self.assertFalse(previous["terminal_failure"])
             self.assertEqual(previous["next_sequence"], 3)
+            # Reopen the same original ledger from a fresh Python process,
+            # not a mock process nonce. A post-crash retry cannot resume after
+            # a completed condition, even if the DynamicUser/PID is reused.
+            replay_probe = r"""
+import importlib.util
+import json
+from pathlib import Path
+import sys
+module_path = Path(sys.argv[1]).resolve(strict=True)
+spec = importlib.util.spec_from_file_location(
+    "repobrief_agent_benchmark_codex_runner", module_path
+)
+guarded = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = guarded
+spec.loader.exec_module(guarded)
+request = json.loads(sys.argv[2])
+state_root = Path(sys.argv[3])
+baseline_request = json.loads(sys.argv[4])
+authorization = guarded._load_preflight_dispatch_authorization(
+    baseline_request, state_root
+)["authorization"]
+try:
+    guarded._record_preflight_dispatch_intent(
+        request, state_root, authorization
+    )
+except guarded.RunnerError as exc:
+    assert "cannot resume after process restart" in str(exc), str(exc)
+else:
+    raise AssertionError("fresh process re-dispatched a completed pair")
+print("PREVIOUS_COMPLETION_REPLAY_BLOCKED")
+"""
+            resumed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-c",
+                    replay_probe,
+                    str(MODULE_PATH),
+                    json.dumps(treatment),
+                    str(state_root),
+                    json.dumps(baseline),
+                ],
+                capture_output=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(resumed.returncode, 0, resumed.stderr[-2048:])
+            self.assertEqual(resumed.stdout, b"PREVIOUS_COMPLETION_REPLAY_BLOCKED\n")
+            self.assertEqual(
+                runner._validated_dispatch_event_state(
+                    baseline, state_root, authorization
+                )["next_sequence"],
+                3,
+            )
             event_sha = runner._record_preflight_dispatch_pair_failed(
                 baseline,
                 state_root,
@@ -9967,6 +10119,55 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 request=request(condition="baseline"),
                 authorization={"internal_dispatch_ledger": True},
             )
+
+    def test_missing_external_one_shot_denies_before_login_and_workspace(self) -> None:
+        # Authorizing an internal ledger is not paid-provider consent. Even
+        # fake Codex login and checkout creation must be unreachable.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request()
+            planned_request_root(root, value)
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "repositories.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "provider-evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            with (
+                patch.object(runner, "validate_executable", return_value="/opt/codex"),
+                patch.object(
+                    runner,
+                    "_load_preflight_dispatch_authorization",
+                    return_value={
+                        "authorization": {"contract": "internal-only"},
+                        "provider_codex": {},
+                    },
+                ),
+                patch.object(runner, "_assert_authorized_codex_executable"),
+                patch.object(runner, "validate_toolchain") as toolchain,
+                patch.object(runner, "validate_chatgpt_subscription") as login,
+                patch.object(runner, "prepare_provider_evidence") as evidence,
+                patch.object(runner, "create_checkout") as checkout,
+                patch.object(runner, "_record_preflight_dispatch_intent") as intent,
+                patch.object(runner, "run_bounded") as provider,
+                self.assertRaisesRegex(
+                    runner.RunnerError, "external one-shot provider authorization"
+                ),
+            ):
+                runner.execute(value, args)
+            toolchain.assert_not_called()
+            login.assert_not_called()
+            evidence.assert_not_called()
+            checkout.assert_not_called()
+            intent.assert_not_called()
+            provider.assert_not_called()
 
     def test_failed_or_ambiguous_first_dispatch_terminalizes_pair(self) -> None:
         for provider_process_started in (False, True):
@@ -11093,6 +11294,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                         )
                     for name in (
                         "_assert_authorized_codex_executable",
+                        "_require_external_provider_one_shot",
                         "_assert_authorized_chatgpt_auth",
                         "validate_codex_linux_sandbox_before_intent",
                         "_assert_authorized_runtime_binding",
@@ -11229,6 +11431,7 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                     stack.enter_context(patch.object(runner, name, return_value=result))
                 for name in (
                     "_assert_authorized_codex_executable",
+                    "_require_external_provider_one_shot",
                     "_assert_authorized_chatgpt_auth",
                     "validate_codex_linux_sandbox_before_intent",
                     "_assert_authorized_runtime_binding",

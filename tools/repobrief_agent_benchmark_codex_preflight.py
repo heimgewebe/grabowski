@@ -598,7 +598,9 @@ def execute_authorized_pair(
         observed = Decimal("0")
         for request in ordered:
             condition = str(request["condition"])
-            last_completed_request = None
+            # Keep the previous completion until the current condition has
+            # durably completed; failures before its intent must close the
+            # prior condition's original one-shot pair ledger.
             receipt = codex_runner.execute(request, arguments)
             last_completed_request = request
             results[condition] = _validated_condition_receipt(
