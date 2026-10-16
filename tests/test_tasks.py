@@ -10148,7 +10148,10 @@ class TaskTests(unittest.TestCase):
         task_id = "d" * 24
         with tasks._database():
             pass
-        with sqlite3.connect(self.database) as connection:
+        # sqlite3.Connection.__exit__ commits but does not close. A
+        # later GC-triggered WAL checkpoint must not change the store
+        # while its read-only preauthorization identity is being checked.
+        with closing(sqlite3.connect(self.database)) as connection:
             connection.execute("ALTER TABLE tasks DROP COLUMN repository_scope_manifest_json")
             connection.execute("ALTER TABLE tasks DROP COLUMN lifecycle_receipt_sha256")
             connection.execute("ALTER TABLE tasks DROP COLUMN terminalized_at_unix")
