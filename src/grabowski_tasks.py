@@ -7261,6 +7261,9 @@ def _task_wal_has_frames() -> bool:
 TASK_SCOPE_COPY_TIMEOUT_SECONDS = 5
 TASK_SCOPE_COPY_MAX_BYTES = 256 * 1024 * 1024
 TASK_SCOPE_COPY_COLUMNS = ("task_id", "cwd", "host", "lease_owner_id")
+# Pinned at import: a later release-symlink swap must not hand an old process
+# the new release's helper file.
+TASK_SCOPE_COPY_HELPER = str(Path(sqlite_store.__file__).resolve())
 TASK_SCOPE_COPY_CHILD_CODE = r"""
 import importlib.util
 import json
@@ -7334,7 +7337,7 @@ def _task_scope_wal_copy_row(identifier: str) -> dict[str, Any] | None:
                     "-B",
                     "-c",
                     TASK_SCOPE_COPY_CHILD_CODE,
-                    str(Path(sqlite_store.__file__).resolve()),
+                    TASK_SCOPE_COPY_HELPER,
                     str(TASK_DB),
                     identifier,
                     str(TASK_SCOPE_COPY_MAX_BYTES),

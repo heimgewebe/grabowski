@@ -11679,10 +11679,16 @@ class TaskTests(unittest.TestCase):
             self.assertEqual({"status": "changed"}, results["other"])
             with patch.object(tasks.subprocess, "run", wraps=subprocess.run) as child:
                 self.assertEqual(task_id, tasks._task_scope_wal_copy_row(task_id)["task_id"])
+            self.assertEqual(tasks.TASK_SCOPE_COPY_HELPER, child.call_args.args[0][5])
             self.assertEqual(
                 str(Path(tasks.sqlite_store.__file__).resolve()),
-                child.call_args.args[0][5],
+                tasks.TASK_SCOPE_COPY_HELPER,
             )
+            with patch.object(tasks.sqlite_store, "__file__", "/swapped/release/helper.py"):
+                with patch.object(tasks.subprocess, "run", wraps=subprocess.run) as child:
+                    tasks._task_scope_wal_copy_row(task_id)
+            # The helper stays pinned to the file imported at startup.
+            self.assertEqual(tasks.TASK_SCOPE_COPY_HELPER, child.call_args.args[0][5])
         finally:
             keeper.close()
 
