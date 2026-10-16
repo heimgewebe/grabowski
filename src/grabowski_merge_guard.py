@@ -192,7 +192,7 @@ _CODEX_CLEAN_FOOTER_PATTERN = (
     r"</details>"
 )
 _CODEX_CLEAN_RESULT_RE = re.compile(
-    r"\ACodex Review: Didn't find any major issues\. "
+    r"\A(?:<!-- codex-review-receipt:v1 -->\n\n)?Codex Review: Didn't find any major issues\. "
     r"(?:[^\n]{0,79}[.!?]|[^\n]{0,62}:[a-z0-9_+-]{1,16}:)\n\n"
     r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`\n\n"
     + _CODEX_CLEAN_FOOTER_PATTERN
