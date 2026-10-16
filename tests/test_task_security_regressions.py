@@ -1591,11 +1591,18 @@ class TaskSecurityRegressionTests(unittest.TestCase):
             self.assertNotIn(str(tasks.Path(str(database) + "-wal").absolute()), argv)
             inherited = launch.call_args.kwargs["pass_fds"]
             self.assertEqual(len(inherited), 2)
-            self.assertIn(f"/proc/self/fd/{inherited[0]}", argv)
-            self.assertIn(f"/proc/self/fd/{inherited[1]}", argv)
-            self.assertIn("/snapshot/input.db", argv)
-            self.assertIn("/snapshot/input.db-wal", argv)
-            # The only host DB authority passed to bwrap is two pinned FDs.
+            self.assertEqual(argv.count("--ro-bind-data"), 2)
+            for descriptor, target in zip(
+                inherited, ("/snapshot/input.db", "/snapshot/input.db-wal")
+            ):
+                target_index = argv.index(target)
+                self.assertEqual(
+                    argv[target_index - 2: target_index + 1],
+                    ["--ro-bind-data", str(descriptor), target],
+                )
+                self.assertNotIn(f"/proc/self/fd/{descriptor}", argv)
+            # Data is copied from verified FDs inside bwrap, not from a
+            # pathname which could have vanished or been substituted.
         finally:
             writer.close()
 
@@ -1685,6 +1692,53 @@ class TaskSecurityRegressionTests(unittest.TestCase):
         finally:
             if attacker is not None:
                 attacker.close()
+            writer.close()
+
+    def test_wal_unlinked_after_fd_open_still_reaches_pinned_sqlite_image(self) -> None:
+        """An unlinked WAL fd remains readable inside bwrap; authority still denies drift."""
+        import sqlite3
+        import subprocess
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        wal = tasks.Path(f"{database}-wal")
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                ("wal_unlinked_fd_probe", "pinned"),
+            )
+            self.assertTrue(wal.exists())
+            original_popen = subprocess.Popen
+            reached_query = []
+
+            def unlink_after_pin(argv, **kwargs):
+                self.assertEqual(len(kwargs["pass_fds"]), 2)
+                wal.unlink()
+                return original_popen(argv, **kwargs)
+
+            with (
+                patch.object(
+                    tasks.resources.sqlite_store.subprocess,
+                    "Popen", side_effect=unlink_after_pin,
+                ),
+                self.assertRaises(tasks.resources.ResourceSchemaInventoryChanged),
+            ):
+                with tasks.resources.sqlite_store.preauthorization_readonly_sqlite(
+                    database, error_type=tasks.resources.ResourceSchemaInventoryChanged,
+                ) as connection:
+                    reached_query.append(
+                        connection.execute(
+                            "SELECT value FROM metadata WHERE key=?",
+                            ("wal_unlinked_fd_probe",),
+                        ).fetchone()[0]
+                    )
+            # Even if the authoritative WAL pathname vanishes, the verified
+            # descriptor data remains readable. The final identity assertion
+            # still fails closed; it must not silently authorize the changed store.
+            self.assertEqual(reached_query, ["pinned"])
+        finally:
             writer.close()
 
     def test_wal_snapshot_never_replays_schema_expressions_in_operator(self) -> None:

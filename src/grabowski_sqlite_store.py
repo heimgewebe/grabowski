@@ -473,8 +473,12 @@ def preauthorization_readonly_sqlite(
         argv.extend([
             "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
             "--tmpfs", "/snapshot",
-            "--ro-bind", f"/proc/self/fd/{main_fd}", "/snapshot/input.db",
-            "--ro-bind", f"/proc/self/fd/{wal_fd}", "/snapshot/input.db-wal",
+            # Copy directly from verified descriptors inside private bwrap.
+            # /proc/self/fd/N path mounts fail for an unlinked WAL inode;
+            # --ro-bind-data avoids a second pathname resolution and never
+            # creates a preauthorization snapshot on the host filesystem.
+            "--ro-bind-data", str(main_fd), "/snapshot/input.db",
+            "--ro-bind-data", str(wal_fd), "/snapshot/input.db-wal",
             "--clearenv", "--setenv", "HOME", "/tmp", "--chdir", "/tmp",
             "--", "/usr/bin/python3", "-I", "-S", "-c",
             _PREAUTH_WAL_QUERY_CODE,
