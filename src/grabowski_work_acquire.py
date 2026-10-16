@@ -14,6 +14,7 @@ import time
 import uuid
 from typing import Any, Callable, Iterator
 
+import grabowski_agent_sandbox as sandbox
 import grabowski_checkouts as checkouts
 import grabowski_execution_plan as execution_plan_contract
 import grabowski_git_preimage as git_preimage
@@ -2379,6 +2380,18 @@ def _git_runner(
 ) -> dict[str, Any]:
     command = ["git", "-C", str(cwd), *arguments]
     command = operator._validate_argv(command, cwd=cwd)
+    if sandbox.git_requires_filter_effect_guard(command):
+        # Preserve native bounded subprocess, redaction, validation, and WAL.
+        # Pass exactly the sealed attribute descriptor to the real Git effect.
+        with sandbox.safe_git_filter_effect(cwd, command) as (guarded, environment, fds):
+            return operator._run(
+                guarded,
+                cwd=cwd,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes=250_000,
+                environment=environment,
+                pass_fds=fds,
+            )
     return operator._run(
         command,
         cwd=cwd,

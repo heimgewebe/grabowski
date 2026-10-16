@@ -249,6 +249,9 @@ class GitFixture:
         self.writer = root / "writer"
         self.repo.mkdir()
         subprocess.run(["git", "init", "-b", "main"], cwd=self.repo, check=True, stdout=subprocess.PIPE)
+        # A normal managed checkout is admitted with an inert Git attribute mountpoint.
+        # This source fixture must model it; the read-only Git guard never creates it.
+        (self.repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
         subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "user.name", "Test"], cwd=self.repo, check=True)
         (self.repo / "src").mkdir()

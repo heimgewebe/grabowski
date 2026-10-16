@@ -14,7 +14,7 @@ import time
 import uuid
 from typing import Any
 
-from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_repository_environment, run_bounded_capture
+from grabowski_agent_sandbox import minimal_sandbox_argv, prepare_external_agent_command, runtime_sandbox_argv, safe_git_filter_effect, safe_git_repository_environment, run_bounded_capture
 
 SHA40 = __import__("re").compile(r"\A[0-9a-f]{40}\Z")
 SHA256 = __import__("re").compile(r"\A[0-9a-f]{64}\Z")
@@ -165,28 +165,29 @@ def git(repo: Path, *args: str) -> bytes:
     # The review source itself must not inherit Git scope/objects, executable
     # search paths or dynamic-loader configuration from an untrusted caller.
     # safe_git_repository_environment() without an explicit base would copy ambient GIT_*.
-    controlled = safe_git_repository_environment(repo, {
-        "HOME": pwd.getpwuid(os.geteuid()).pw_dir,
-        "PATH": "/usr/bin:/bin",
-    })
-    controlled.update({
-        "GIT_NO_REPLACE_OBJECTS": "1",
-        "GIT_GRAFT_FILE": "/dev/null",
-    })
-    # Never mix Git diagnostics into commit IDs or review diff bytes.
-    # The graft override is deliberately explicit and must not silently
-    # contaminate output with the Git deprecation advisory.
-    completed = subprocess.run(
-        [
-            "/usr/bin/git", "-c", "advice.graftFileDeprecated=false",
-            "-C", str(repo), *args,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=30,
-        env=controlled,
-        check=False,
-    )
+    command = [
+        "/usr/bin/git", "-c", "advice.graftFileDeprecated=false",
+        "-C", str(repo), *args,
+    ]
+    # Dirty review diffs must not invoke executable clean filters selected
+    # after an earlier config read. The attribute override lives at Git effect.
+    base = {"HOME": pwd.getpwuid(os.geteuid()).pw_dir, "PATH": "/usr/bin:/bin"}
+    with safe_git_filter_effect(repo, command, base=base) as (protected, controlled, descriptors):
+        controlled.update({
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_GRAFT_FILE": "/dev/null",
+        })
+        # Git diagnostics must never contaminate source IDs or review bytes.
+        completed = subprocess.run(
+            protected,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            env=controlled,
+            check=False,
+            pass_fds=descriptors,
+        )
     if completed.returncode != 0 or completed.stderr:
         raise RuntimeError("review Git read failed or emitted stderr")
     return completed.stdout

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import os
@@ -12,7 +14,7 @@ import signal
 import stat
 import subprocess
 import tempfile
-from typing import Iterable
+from typing import Iterable, Iterator
 
 BWRAP = Path(os.environ.get("GRABOWSKI_BWRAP_BIN", "/usr/bin/bwrap"))
 TAIL_BYTES = 12000
@@ -589,6 +591,158 @@ def safe_git_repository_environment(
         ):
             raise AgentSandboxError("repository declares an executable Git helper")
     return environment
+
+
+
+def git_requires_filter_effect_guard(argv: list[str]) -> bool:
+    """Identify host Git effects which can inspect or transform worktree bytes."""
+    if not argv or Path(argv[0]).name != "git":
+        return False
+    index = 1
+    while index < len(argv):
+        option = argv[index]
+        if option in ("-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env"):
+            index += 2
+        elif option.startswith("-"):
+            index += 1
+        else:
+            break
+    if index >= len(argv):
+        return False
+    subcommand = argv[index]
+    arguments = argv[index + 1:]
+    if subcommand == "diff":
+        # Tokens after '--' are pathspecs, never Git options: a tracked file
+        # literally named '--cached' must not bypass dirty-diff isolation.
+        prefix = arguments[:arguments.index("--")] if "--" in arguments else arguments
+        if any(item in {"--cached", "--staged", "--no-index"} for item in prefix):
+            return False
+        # A committed two-object diff never reads worktree contents or
+        # invokes clean/smudge filters. Do not require a Git info directory
+        # solely to compare immutable SHA-1 or SHA-256 commit objects.
+        revisions = [item for item in prefix if not item.startswith("-")]
+        if (
+            len(revisions) == 2
+            and len(revisions[0]) == len(revisions[1])
+            and len(revisions[0]) in {40, 64}
+            and all(all(char in "0123456789abcdef" for char in item) for item in revisions)
+        ):
+            return False
+        if len(revisions) == 1:
+            for separator in ("...", ".."):
+                pair = revisions[0].split(separator)
+                if (
+                    len(pair) == 2
+                    and len(pair[0]) == len(pair[1])
+                    and len(pair[0]) in {40, 64}
+                    and all(all(char in "0123456789abcdef" for char in item) for item in pair)
+                ):
+                    return False
+        return True
+    if subcommand == "worktree":
+        return "add" in arguments
+    return subcommand in {
+        "add", "checkout", "restore", "switch", "read-tree", "reset",
+        "merge", "rebase", "stash",
+    }
+
+
+@contextmanager
+def safe_git_filter_effect(
+    repo: Path,
+    argv: list[str],
+    *,
+    base: dict[str, str] | None = None,
+) -> Iterator[tuple[list[str], dict[str, str], tuple[int, ...]]]:
+    """Pin an inert filter attribute at the Git effect, not at earlier preflight.
+
+    Native Git can run filter.* helpers when reading dirty files or checking out
+    tracked files even with --no-ext-diff. A separate config read is racy. The
+    Linux mount namespace overlays Git's highest-precedence info/attributes
+    with a sealed memfd, preserving other info files read-only. No repository
+    file is created, altered or removed by the overlay. Fail closed when that
+    effect-time binding is unavailable; never fall back to unsandboxed Git.
+    """
+    environment = safe_git_repository_environment(repo, base)
+    if not git_requires_filter_effect_guard(argv):
+        yield argv, environment, ()
+        return
+    if not hasattr(os, "memfd_create") or not hasattr(os, "MFD_ALLOW_SEALING"):
+        raise AgentSandboxError("effect-bound Git filter isolation unsupported")
+    if not Path("/usr/bin/bwrap").is_file():
+        raise AgentSandboxError("effect-bound Git filter isolation unavailable")
+    probe = subprocess.run(
+        ["/usr/bin/git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-path", "info/attributes"],
+        env=environment, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False,
+    )
+    if probe.returncode != 0 or probe.stderr or len(probe.stdout) > 4096:
+        raise AgentSandboxError("Git attribute source identity unavailable")
+    try:
+        raw_attribute_path = os.fsdecode(probe.stdout).rstrip("\n")
+        attribute_path = Path(raw_attribute_path)
+        if not attribute_path.is_absolute():
+            attribute_path = Path(repo) / attribute_path
+        info = attribute_path.parent
+        if (
+            not attribute_path.is_absolute()
+            or attribute_path.name != "attributes"
+            or not info.is_dir()
+            or info.is_symlink()
+        ):
+            raise ValueError("unsafe Git attribute path")
+        entries = sorted(info.iterdir())
+        if len(entries) > 128:
+            raise ValueError("Git info directory exceeds safe mount budget")
+        # Only ordinary Git info entries can be preserved in the overlay.
+        # Symlinks/active special files fail closed rather than reinterpreted.
+        siblings: list[Path] = []
+        original = b""
+        for entry in entries:
+            metadata = entry.lstat()
+            if entry.name == "attributes":
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+                    raise ValueError("unsafe Git info attributes")
+                descriptor = os.open(entry, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    original = os.read(descriptor, 1024 * 1024 + 1)
+                finally:
+                    os.close(descriptor)
+                if len(original) > 1024 * 1024:
+                    raise ValueError("Git info attributes exceed bound")
+            elif stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode):
+                siblings.append(entry)
+            else:
+                raise ValueError("unsafe Git info entry")
+        # Last matching Git attribute wins. Preserve preceding benign
+        # attribute semantics, but prevent any clean/smudge/process driver.
+        inert = original + (b"" if not original or original.endswith(b"\n") else b"\n") + b"* -filter\n"
+        fd = os.memfd_create("grabowski-git-inert-attrs", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise AgentSandboxError("Git attribute effect admission failed") from exc
+    try:
+        os.write(fd, inert)
+        fcntl.fcntl(
+            fd, fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK |
+            fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE,
+        )
+        os.lseek(fd, 0, os.SEEK_SET)
+        command = [
+            "/usr/bin/bwrap", "--die-with-parent",
+            "--bind", "/", "/",
+            "--dev-bind", "/dev", "/dev",
+            "--tmpfs", str(info),
+        ]
+        for entry in siblings:
+            command.extend(("--ro-bind", str(entry), str(entry)))
+        command.extend((
+            "--ro-bind-data", str(fd), str(attribute_path),
+            "--", "/usr/bin/git", *argv[1:],
+        ))
+        yield command, environment, (fd,)
+    finally:
+        os.close(fd)
 
 
 def runtime_sandbox_argv(arguments: list[str]) -> list[str]:

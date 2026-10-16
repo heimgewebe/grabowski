@@ -5409,6 +5409,7 @@ def _run(
     timeout_seconds: int,
     max_output_bytes: int,
     environment: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     started = time.monotonic()
     process = subprocess.Popen(
@@ -5419,6 +5420,7 @@ def _run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
+        pass_fds=pass_fds,
     )
     (
         stdout_raw,

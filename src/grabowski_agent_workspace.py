@@ -32,7 +32,7 @@ import grabowski_lifecycle_collectors as lifecycle_collectors
 import grabowski_lifecycle_effect_plan as lifecycle_effect_plan
 import grabowski_physical_checkout as physical_checkout
 import grabowski_work_acquire as work_acquire
-from grabowski_agent_sandbox import safe_git_repository_environment
+from grabowski_agent_sandbox import safe_git_filter_effect, safe_git_repository_environment
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -1455,17 +1455,20 @@ def _workspace_host_git_argv(argv: list[str]) -> list[str]:
 
 
 def _run(cwd: Path, argv: list[str], *, timeout: int = 120) -> dict[str, Any]:
-    completed = subprocess.run(
-        _workspace_host_git_argv(argv),
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-        check=False,
-        env=safe_git_repository_environment(cwd),
-    )
+    # Git loads attributes at the actual effect, after config preflight.
+    with safe_git_filter_effect(cwd, _workspace_host_git_argv(argv)) as (command, env, fds):
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=env,
+            pass_fds=fds,
+        )
     return {
         "returncode": completed.returncode,
         "stdout": completed.stdout,
@@ -1484,17 +1487,19 @@ def _checked(runner: CommandRunner, cwd: Path, argv: list[str], *, label: str) -
 
 
 def _run_bytes(cwd: Path, argv: list[str], *, timeout: int = 120) -> dict[str, Any]:
-    completed = subprocess.run(
-        _workspace_host_git_argv(argv),
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=False,
-        timeout=timeout,
-        check=False,
-        env=safe_git_repository_environment(cwd),
-    )
+    with safe_git_filter_effect(cwd, _workspace_host_git_argv(argv)) as (command, env, fds):
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            timeout=timeout,
+            check=False,
+            env=env,
+            pass_fds=fds,
+        )
     return {
         "returncode": completed.returncode,
         "stdout": completed.stdout,
@@ -3476,6 +3481,8 @@ def _initialize_isolated_git_repository(root: Path, source_objects: Path) -> Non
     (git_dir / "objects" / "pack").mkdir(mode=0o700)
     (git_dir / "refs" / "heads").mkdir(parents=True, mode=0o700)
     (git_dir / "refs" / "tags").mkdir(parents=True, mode=0o700)
+    # Materializing the isolated checkout requires an inert-attribute mountpoint.
+    (git_dir / "info").mkdir(mode=0o700)
     (git_dir / "HEAD").write_text(
         "ref: refs/heads/grabowski-integration-probe\n", encoding="utf-8"
     )

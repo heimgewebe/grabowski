@@ -635,7 +635,8 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
 
             def inject_after_admission(argv: list[str], *args: object, **kwargs: object):
                 nonlocal injected
-                if argv[:2] == ["git", "diff"] and not injected:
+                if not injected and (argv[:2] == ["git", "diff"] or
+                                     (argv[:1] == ["/usr/bin/bwrap"] and "diff" in argv)):
                     injected = True
                     real_run(
                         ["git", "-C", str(repo), "config", "diff.external", str(helper)],
@@ -655,6 +656,204 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
             )
             self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
             self.assertTrue(marker.exists(), "negative control did not run helper")
+
+
+
+    def test_dirty_diff_remains_filter_free_after_late_config_injection(self) -> None:
+        """An executable clean filter added after admission must never run."""
+        from unittest import mock
+        from grabowski_agent_workspace import _run as workspace_run
+
+        with tempfile.TemporaryDirectory(prefix="workspace-late-clean-") as raw:
+            root = Path(raw)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=attacker\n", encoding="ascii",
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "add", ".gitattributes"],
+                env=secure, check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.name=Safe Test",
+                 "-c", "user.email=safe@example.invalid",
+                 "commit", "-qm", "selected filter"],
+                env=secure, check=True, capture_output=True,
+            )
+            (repo / "tracked.txt").write_text("dirty after commit\n", encoding="ascii")
+            marker = root / "clean-marker"
+            helper = root / "clean-helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            real_run = subprocess.run
+            injected = False
+
+            def inject_before_git_effect(argv: list[str], *args: object, **kwargs: object):
+                nonlocal injected
+                if not injected and argv and argv[0] in ("git", "/usr/bin/bwrap") and "diff" in argv:
+                    injected = True
+                    real_run(
+                        ["/usr/bin/git", "-C", str(repo),
+                         "config", "filter.attacker.clean", str(helper)],
+                        env=secure, check=True, capture_output=True,
+                    )
+                return real_run(argv, *args, **kwargs)
+
+            with mock.patch("subprocess.run", side_effect=inject_before_git_effect):
+                result = workspace_run(repo, ["git", "diff", "--binary", "HEAD"])
+            self.assertTrue(injected, "the post-admission config mutation was missed")
+            self.assertEqual(result["returncode"], 0, result["stderr"])
+            self.assertIn("+dirty after commit", result["stdout"])
+            self.assertFalse(marker.exists(), "dirty Git diff ran an injected clean filter")
+
+    def test_native_worktree_creation_remains_filter_free_after_late_injection(self) -> None:
+        """The native WorkAcquire runner must materialize files without smudge code."""
+        from unittest import mock
+        import grabowski_work_acquire as work_acquire
+
+        with tempfile.TemporaryDirectory(prefix="lane-late-smudge-") as raw:
+            root = Path(raw)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=attacker\n", encoding="ascii",
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "add", ".gitattributes"],
+                env=secure, check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.name=Safe Test",
+                 "-c", "user.email=safe@example.invalid",
+                 "commit", "-qm", "selected filter"],
+                env=secure, check=True, capture_output=True,
+            )
+            marker = root / "smudge-marker"
+            helper = root / "smudge-helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            real_operator_run = work_acquire.operator._run
+            injected = False
+
+            def inject_before_checkout(argv: list[str], **kwargs: object):
+                nonlocal injected
+                if not injected and "worktree" in argv and "add" in argv:
+                    injected = True
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo),
+                         "config", "filter.attacker.smudge", str(helper)],
+                        env=secure, check=True, capture_output=True,
+                    )
+                return real_operator_run(argv, **kwargs)
+
+            checkout = root / "writer"
+            with mock.patch.object(work_acquire.operator, "_run", side_effect=inject_before_checkout):
+                result = work_acquire._git_runner(
+                    repo, ["worktree", "add", "-b", "safe",
+                           str(checkout), "HEAD"],
+                )
+            self.assertTrue(injected, "the post-admission config mutation was missed")
+            self.assertEqual(result["returncode"], 0, result["stderr"])
+            self.assertTrue((checkout / "tracked.txt").is_file())
+            self.assertFalse(marker.exists(), "native worktree checkout ran an injected smudge filter")
+
+
+
+    def test_role_and_writer_dirty_diff_reject_late_clean_filter_helper(self) -> None:
+        """Both actual host Git diff readers must bind filter denial at Git effect."""
+        from unittest import mock
+        import grabowski_agent_role as role
+        import grabowski_agent_writer as writer
+
+        for label, reader in (
+            ("reviewer", lambda repo: role.git(
+                repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD",
+            )),
+            ("writer", lambda repo: writer._git_bytes(
+                repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD",
+            )),
+        ):
+            with self.subTest(reader=label), tempfile.TemporaryDirectory(
+                prefix=f"late-clean-{label}-"
+            ) as temporary:
+                root = Path(temporary)
+                repo = root / "repo"
+                secure = safe_git_environment()
+                self._two_commit_repo(repo, secure)
+                (repo / ".gitattributes").write_text(
+                    "tracked.txt filter=attacker\n", encoding="ascii",
+                )
+                subprocess.run(
+                    ["git", "-C", str(repo), "add", ".gitattributes"],
+                    env=secure, check=True, capture_output=True, timeout=15,
+                )
+                subprocess.run(
+                    ["git", "-C", str(repo), "-c", "user.name=Safe Test",
+                     "-c", "user.email=safe@example.invalid", "commit", "-qm",
+                     "tracked filter selection"],
+                    env=secure, check=True, capture_output=True, timeout=15,
+                )
+                (repo / "tracked.txt").write_text(
+                    "dirty reviewer/writer\n", encoding="ascii",
+                )
+                marker = root / "executed-clean-filter"
+                helper = root / "clean-filter"
+                helper.write_text(
+                    "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                    encoding="ascii",
+                )
+                helper.chmod(0o700)
+                real_run = subprocess.run
+                injected = False
+
+                def inject_at_effect(argv: list[str], *args: object, **kwargs: object):
+                    nonlocal injected
+                    if not injected and argv[:1] == ["/usr/bin/bwrap"] and "diff" in argv:
+                        injected = True
+                        real_run(
+                            ["/usr/bin/git", "-C", str(repo), "config",
+                             "filter.attacker.clean", str(helper)],
+                            env=secure, check=True, capture_output=True, timeout=15,
+                        )
+                    return real_run(argv, *args, **kwargs)
+
+                with mock.patch("subprocess.run", side_effect=inject_at_effect):
+                    diff = reader(repo)
+                self.assertTrue(injected, f"{label} did not reach a protected Git effect")
+                self.assertIn(b"+dirty reviewer/writer", diff)
+                self.assertFalse(marker.exists(), f"{label} ran late clean filter")
+                uncontrolled = real_run(
+                    ["/usr/bin/git", "-C", str(repo), "diff", "--binary", "HEAD"],
+                    env=secure, capture_output=True, timeout=15,
+                )
+                self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
+                self.assertTrue(marker.exists(), f"{label} negative control missed filter")
+
+
+
+    def test_dirty_diff_pathspec_named_cached_cannot_disable_filter_guard(self) -> None:
+        from grabowski_agent_sandbox import git_requires_filter_effect_guard
+
+        for dangerous_pathspec in ("--cached", "--staged", "--no-index"):
+            with self.subTest(path=dangerous_pathspec):
+                self.assertTrue(
+                    git_requires_filter_effect_guard(
+                        ["git", "diff", "HEAD", "--", dangerous_pathspec]
+                    ),
+                    "Git option-like pathspec must not suppress dirty-diff effect guard",
+                )
+        self.assertFalse(
+            git_requires_filter_effect_guard(["git", "diff", "--cached", "HEAD"])
+        )
 
 
 if __name__ == "__main__":
