@@ -11631,7 +11631,7 @@ class TaskTests(unittest.TestCase):
                         [
                             sys.executable, "-I", "-B", "-c",
                             tasks.TASK_SCOPE_COPY_CHILD_CODE,
-                            str(Path(tasks.sqlite_store.__file__).resolve().parent),
+                            str(Path(tasks.sqlite_store.__file__).resolve()),
                             str(tasks.TASK_DB), task_id, str(budget),
                         ],
                         capture_output=True, check=True, env={"TMPDIR": private},
@@ -11641,6 +11641,48 @@ class TaskTests(unittest.TestCase):
             self.assertEqual({"status": "changed"}, results[total - 1])
             self.assertEqual("ok", results[total]["status"])
             self.assertEqual(task_id, results[total]["row"]["task_id"])
+        finally:
+            keeper.close()
+
+    def test_task_scope_copy_child_loads_exactly_the_parent_helper_file(self) -> None:
+        keeper, task_id = self._wal_only_task()
+        try:
+            with tempfile.TemporaryDirectory() as private:
+                # A same-named helper elsewhere must never stand in for the
+                # parent's verified file, whatever sys.path or site-packages hold.
+                other = Path(private) / "grabowski_sqlite_store.py"
+                other.write_text(
+                    "from contextlib import contextmanager\n"
+                    "@contextmanager\n"
+                    "def inventory_readonly_sqlite(path, **kwargs):\n"
+                    "    raise kwargs['error_type']('foreign helper')\n"
+                    "    yield\n"
+                )
+                results = {}
+                for name, helper in (
+                    ("parent", Path(tasks.sqlite_store.__file__).resolve()),
+                    ("other", other),
+                ):
+                    completed = subprocess.run(
+                        [
+                            sys.executable, "-I", "-B", "-c",
+                            tasks.TASK_SCOPE_COPY_CHILD_CODE,
+                            str(helper), str(tasks.TASK_DB), task_id,
+                            str(tasks.TASK_SCOPE_COPY_MAX_BYTES),
+                        ],
+                        capture_output=True, check=True, cwd=private,
+                        env={"TMPDIR": private},
+                    )
+                    results[name] = json.loads(completed.stdout)
+            self.assertEqual("ok", results["parent"]["status"])
+            self.assertEqual(task_id, results["parent"]["row"]["task_id"])
+            self.assertEqual({"status": "changed"}, results["other"])
+            with patch.object(tasks.subprocess, "run", wraps=subprocess.run) as child:
+                self.assertEqual(task_id, tasks._task_scope_wal_copy_row(task_id)["task_id"])
+            self.assertEqual(
+                str(Path(tasks.sqlite_store.__file__).resolve()),
+                child.call_args.args[0][5],
+            )
         finally:
             keeper.close()
 

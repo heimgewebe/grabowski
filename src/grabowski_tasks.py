@@ -7262,13 +7262,16 @@ TASK_SCOPE_COPY_TIMEOUT_SECONDS = 5
 TASK_SCOPE_COPY_MAX_BYTES = 256 * 1024 * 1024
 TASK_SCOPE_COPY_COLUMNS = ("task_id", "cwd", "host", "lease_owner_id")
 TASK_SCOPE_COPY_CHILD_CODE = r"""
+import importlib.util
 import json
 from pathlib import Path
 import sqlite3
 import sys
 
-sys.path.append(sys.argv[1])
-import grabowski_sqlite_store as store
+# Load exactly the parent's helper file; never resolve it through sys.path.
+spec = importlib.util.spec_from_file_location("grabowski_sqlite_store", sys.argv[1])
+store = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(store)
 
 
 class Changed(RuntimeError):
@@ -7331,7 +7334,7 @@ def _task_scope_wal_copy_row(identifier: str) -> dict[str, Any] | None:
                     "-B",
                     "-c",
                     TASK_SCOPE_COPY_CHILD_CODE,
-                    str(Path(sqlite_store.__file__).resolve().parent),
+                    str(Path(sqlite_store.__file__).resolve()),
                     str(TASK_DB),
                     identifier,
                     str(TASK_SCOPE_COPY_MAX_BYTES),
