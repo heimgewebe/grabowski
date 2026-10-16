@@ -191,6 +191,7 @@ _CODEX_CLEAN_FOOTER_PATTERN = (
     r'"@codex address that feedback"\.\n\n'
     r"</details>"
 )
+_CODEX_CLEAN_RECEIPT_MARKER = "<!-- codex-review-receipt:v1 -->\n\n"
 _CODEX_CLEAN_RESULT_RE = re.compile(
     r"\ACodex Review: Didn't find any major issues\. "
     r"(?:[^\n]{0,79}[.!?]|[^\n]{0,62}:[a-z0-9_+-]{1,16}:)\n\n"
@@ -4906,9 +4907,14 @@ class CaptainMergeGuardRunner:
                     if not isinstance(body, str):
                         errors.append("merge_guard_codex_clean_comment_body_missing")
                     else:
-                        match = _CODEX_CLEAN_RESULT_RE.fullmatch(
-                            _normalize_codex_comment_body(body)
+                        normalized_body = _normalize_codex_comment_body(body)
+                        # Mirror settlement: strip the one exact versioned
+                        # receipt marker only after actor checks; the full
+                        # clean body and reviewed-head prefix stay authoritative.
+                        normalized_body = normalized_body.removeprefix(
+                            _CODEX_CLEAN_RECEIPT_MARKER
                         )
+                        match = _CODEX_CLEAN_RESULT_RE.fullmatch(normalized_body)
                         if match is None:
                             errors.append("merge_guard_codex_clean_comment_shape_invalid")
                         else:
