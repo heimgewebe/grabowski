@@ -6920,6 +6920,9 @@ class TaskTests(unittest.TestCase):
                 "status": "local_terminal_budget_exceeded",
                 "budget": "observation",
                 "local_terminal_limit": limit,
+                "current_local_terminal_count": limit + 1,
+                "archive_excess": 1,
+                "archive_headroom": tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT,
             },
             status,
         )
@@ -6932,6 +6935,34 @@ class TaskTests(unittest.TestCase):
         scan_probe.assert_not_called()
         self.assertEqual("local_terminal_budget_exceeded", scan["status"])
         self.assertEqual("scan", scan["budget"])
+
+    def test_reconcile_ready_scan_budget_is_classified_by_total_not_first_trip(self) -> None:
+        # Archived rows are never deleted and still count toward the scan. A
+        # total above the scan budget must read as "scan" even though the
+        # observation check would trip first, or archival advice would push
+        # the archive history over its budget instead of fitting.
+        with patch.object(tasks, "TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT", 8):
+            status, probe = self._local_terminal_readiness_status(41)
+        probe.assert_not_called()
+        self.assertEqual(
+            {
+                "status": "local_terminal_budget_exceeded",
+                "budget": "scan",
+                "local_terminal_limit": 32,
+                "scan_limit": 40,
+            },
+            status,
+        )
+
+    def test_reconcile_ready_observation_excess_fits_archive_headroom(self) -> None:
+        with patch.object(tasks, "TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT", 8):
+            status, probe = self._local_terminal_readiness_status(40)
+        probe.assert_not_called()
+        self.assertEqual("observation", status["budget"])
+        self.assertEqual(40, status["current_local_terminal_count"])
+        self.assertEqual(8, status["archive_excess"])
+        # Within the scan budget, archiving exactly the excess always fits.
+        self.assertLessEqual(status["archive_excess"], status["archive_headroom"])
 
     def test_reconcile_ready_publication_applies_task_scope_before_rootbroker(self) -> None:
         record = {

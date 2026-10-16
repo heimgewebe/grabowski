@@ -12244,11 +12244,12 @@ TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT = 32
 
 
 class TaskReconcileReadyLocalTerminalBudgetExceeded(RuntimeError):
-    """More current local terminal tasks exist than READ_ONLY may observe."""
+    """Retained terminal tasks exceed a bounded READ_ONLY readiness budget."""
 
-    def __init__(self, budget: str) -> None:
+    def __init__(self, budget: str, **counts: int) -> None:
         super().__init__(f"Local terminal readiness {budget} budget exceeded")
         self.budget = budget
+        self.counts = counts
 
 
 def _task_reconcile_ready_local_terminal_rows(
@@ -12267,16 +12268,31 @@ def _task_reconcile_ready_local_terminal_rows(
         TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT
         + TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT
     )
+    # Archived rows are never deleted and still count toward the scan. Classify
+    # the scan budget from the bounded total, not from whichever check trips
+    # first: only within it can archiving the observed excess ever fit.
+    terminal_total = connection.execute(
+        f"SELECT COUNT(*) FROM (SELECT 1 FROM tasks WHERE state IN ({placeholders}) "
+        "LIMIT ?)",
+        (*terminal_states, scan_limit + 1),
+    ).fetchone()[0]
+    if terminal_total > scan_limit:
+        raise TaskReconcileReadyLocalTerminalBudgetExceeded(
+            "scan", scan_limit=scan_limit,
+        )
     cursor = connection.execute(
         f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
         "ORDER BY task_id LIMIT ?",
         (*terminal_states, scan_limit + 1),
     )
     selected: list[dict[str, Any]] = []
+    current_local = 0
     try:
         for examined, raw in enumerate(cursor, start=1):
             if examined > scan_limit:
-                raise TaskReconcileReadyLocalTerminalBudgetExceeded("scan")
+                raise TaskReconcileReadyLocalTerminalBudgetExceeded(
+                    "scan", scan_limit=scan_limit,
+                )
             record = dict(raw)
             current = lifecycle_projection.bounded_current_task_projection(
                 [_task_archive_record(record)], projection=projection,
@@ -12285,11 +12301,21 @@ def _task_reconcile_ready_local_terminal_rows(
                 continue
             if _execution_backend(record) != "systemd-user" or _systemd_scope(record) != "user":
                 raise RuntimeError("Local terminal task has unsupported systemd authority")
-            selected.append(record)
-            if len(selected) > TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT:
-                raise TaskReconcileReadyLocalTerminalBudgetExceeded("observation")
+            current_local += 1
+            if current_local <= TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT:
+                selected.append(record)
     finally:
         cursor.close()
+    if current_local > TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT:
+        # Each closeout archive adds one switch and one binding; both share
+        # the readiness history budget. Within the scan budget the excess fits.
+        archived = max(len(bindings), len(projection.get("switches") or ()))
+        raise TaskReconcileReadyLocalTerminalBudgetExceeded(
+            "observation",
+            current_local_terminal_count=current_local,
+            archive_excess=current_local - TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT,
+            archive_headroom=TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - archived,
+        )
     return selected
 
 
@@ -12480,6 +12506,7 @@ def _task_reconcile_ready_evidence_snapshot(
             "status": "local_terminal_budget_exceeded",
             "budget": exc.budget,
             "local_terminal_limit": TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT,
+            **exc.counts,
         }
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, sqlite3.Error) as exc:
         return {"status": "unavailable", "error_type": type(exc).__name__}

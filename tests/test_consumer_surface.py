@@ -915,6 +915,8 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertIn("authorized live observation", next_action)
         self.assertIn("task-closeout-archive", next_action)
         self.assertNotIn("reconcile live task outcomes", next_action)
+        self.assertIn("only the excess", next_action)
+        self.assertIn("no more", next_action)
 
         # Archived rows stay in the task table and still count toward the
         # scan budget, so archival must not be recommended for it.
@@ -948,8 +950,57 @@ class ConsumerSurfaceTests(unittest.TestCase):
         scan_action = scan["recommended_next_action"].lower()
         self.assertIn("scan budget", scan_action)
         self.assertIn("compaction", scan_action)
+        self.assertIn("archive projection", scan_action)
         self.assertNotIn("task-closeout-archive", scan_action)
         self.assertNotIn("reconcile live task outcomes", scan_action)
+
+    def test_overview_local_terminal_observation_names_exact_archive_excess(self) -> None:
+        fake_tasks = SimpleNamespace(
+            grabowski_task_list=lambda **_kwargs: {
+                "state_counts": {"completed": 40},
+                "projection_counts": {"active": 0, "terminal": 40, "attention": 0},
+                "projection_counts_overlap": False,
+                "unknown_state_count": 0,
+                "state_counts_complete": True,
+                "reconciliation_performed": False,
+                "reconciliation_evidence": {
+                    "status": "local_terminal_budget_exceeded",
+                    "budget": "observation",
+                    "local_terminal_limit": 32,
+                    "current_local_terminal_count": 40,
+                    "archive_excess": 8,
+                    "archive_headroom": 8,
+                },
+            },
+        )
+        fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)
+        fake_obligations = SimpleNamespace(
+            list_obligations=lambda _parameters: {
+                "record_count": 0,
+                "integrity_errors": [],
+                "scan_truncated": False,
+            },
+        )
+        with mock.patch.dict("sys.modules", {
+            "grabowski_tasks": fake_tasks,
+            "grabowski_resources": fake_resources,
+            "grabowski_operator_obligation": fake_obligations,
+        }):
+            result = grabowski_mcp._operator_system_overview(
+                runtime_healthy=True,
+                normal_mutation_path_ready=True,
+                coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                client_snapshot={
+                    "observable": True, "fresh": True, "matched": True,
+                    "server_loopback_schema_contract_matches": True,
+                    "platform_publication_state": "platform_converged",
+                    "platform_publication_pending": False,
+                },
+            )
+        next_action = result["recommended_next_action"].lower()
+        self.assertIn("archive exactly 8 independently verified", next_action)
+        self.assertIn("no more", next_action)
+        self.assertFalse(result["operator_ready"])
 
     def test_operator_system_overview_keeps_execution_ready_when_publication_is_pending(self) -> None:
         fake_tasks = SimpleNamespace(

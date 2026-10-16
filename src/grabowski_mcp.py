@@ -6583,16 +6583,22 @@ def _operator_system_overview(
         next_action = (
             "retained terminal task history exceeds the readiness scan budget "
             "and archival cannot reduce it; escalate an authorized bounded "
-            "task-store history compaction before relying on readiness"
+            "compaction of the retained task history together with its archive "
+            "projection before relying on readiness"
         )
     elif reconciliation_evidence.get("status") == "local_terminal_budget_exceeded":
         # READ_ONLY observes at most a bounded local terminal cohort; another
-        # reconciliation leaves it unchanged. Archival shrinks the cohort.
+        # reconciliation leaves it unchanged. Archiving exactly the excess fits
+        # the archive history budget; archiving more can exceed it.
+        excess = reconciliation_evidence.get("archive_excess")
+        count = (
+            f"exactly {excess} " if type(excess) is int and excess > 0 else "only the excess "
+        )
         next_action = (
             "verify current local terminal tasks with authorized live observation; "
-            "archive independently verified terminal tasks through the "
-            "authorized task-closeout-archive workflow until the local "
-            "terminal readiness budget fits"
+            f"archive {count}independently verified terminal tasks through the "
+            "authorized task-closeout-archive workflow, no more, so the local "
+            "terminal readiness budget fits within the archive history budget"
         )
     elif reconciliation_evidence.get("status") != "verified":
         next_action = "reconcile live task outcomes through an authorized mutation-capable path"
