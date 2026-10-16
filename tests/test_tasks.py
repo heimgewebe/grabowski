@@ -1299,7 +1299,10 @@ class TaskTests(unittest.TestCase):
             observation_sha256=tasks._sha256_json(observation),
         )
         if prepared_at_unix is not None:
-            with sqlite3.connect(self.resource_database) as connection:
+            # sqlite3.Connection.__exit__ commits but does not close. A
+            # delayed WAL checkpoint must not mutate the source during a
+            # later read-only authorization snapshot.
+            with closing(sqlite3.connect(self.resource_database)) as connection:
                 connection.execute(
                     "UPDATE task_terminalizations SET prepared_at_unix=? "
                     "WHERE task_id=?",
