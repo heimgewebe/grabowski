@@ -2201,6 +2201,35 @@ def _exact_base_git_cas_commit_identity(
     return {"name": login, "email": email}, evidence, []
 
 
+_PR_HEAD_CAS_GITHUB_SSH_RE = re.compile(
+    r"(?:(?P<scp_user>git|org-[1-9][0-9]{0,15})@github\.com:"
+    r"(?P<scp_path>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?)"
+    r"|ssh://(?P<uri_user>git|org-[1-9][0-9]{0,15})@github\.com/"
+    r"(?P<uri_path>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?))\Z"
+)
+
+
+def _pr_head_cas_github_ssh_login(value: str, repo_slug: str) -> str | None:
+    """Allow GitHub's canonical Git user or a bounded organization SSH login.
+
+    Both URL forms pin the literal github.com host and canonical repository path.
+    An org-scoped SSH login is transport identity only, never review or merge
+    authority: the exact authenticated remote refs and GitHub PR still control CAS.
+    """
+    if not isinstance(value, str):
+        return None
+    match = _PR_HEAD_CAS_GITHUB_SSH_RE.fullmatch(value)
+    if match is None:
+        return None
+    try:
+        repository = _merge_guard_github_repository_identity(value)
+    except RuntimeError:
+        return None
+    if repository.casefold() != repo_slug.casefold():
+        return None
+    return match.group("scp_user") or match.group("uri_user")
+
+
 def _exact_base_content_git_head_cas_update_pr_head(
     repo_path: Path,
     *,
@@ -2259,10 +2288,8 @@ def _exact_base_content_git_head_cas_update_pr_head(
         raise RuntimeError(
             "exact PR-head convergence origin is not canonical GitHub"
         ) from exc
-    if not (
-        remote_url.startswith("git@github.com:")
-        or remote_url.startswith("ssh://git@github.com/")
-    ):
+    origin_login = _pr_head_cas_github_ssh_login(remote_url, repo_slug)
+    if origin_login is None:
         raise RuntimeError(
             "exact PR-head convergence requires canonical SSH GitHub origin"
         )
@@ -2373,12 +2400,14 @@ def _exact_base_content_git_head_cas_update_pr_head(
                 raise RuntimeError(
                     "exact PR-head convergence effective push URL repository drift"
                 )
-            if not (
-                push_url.startswith("git@github.com:")
-                or push_url.startswith("ssh://git@github.com/")
-            ):
+            push_login = _pr_head_cas_github_ssh_login(push_url, repo_slug)
+            if push_login is None:
                 raise RuntimeError(
                     "exact PR-head convergence requires canonical SSH GitHub effective push URLs"
+                )
+            if push_login != origin_login:
+                raise RuntimeError(
+                    "exact PR-head convergence effective push URL SSH principal drift"
                 )
             push_url_digests.append(
                 hashlib.sha256(push_url.encode("utf-8")).hexdigest()
