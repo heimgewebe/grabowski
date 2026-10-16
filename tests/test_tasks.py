@@ -11617,6 +11617,33 @@ class TaskTests(unittest.TestCase):
         finally:
             keeper.close()
 
+    def test_task_scope_copy_child_enforces_budget_while_streaming(self) -> None:
+        keeper, task_id = self._wal_only_task()
+        try:
+            total = (
+                tasks.TASK_DB.stat().st_size
+                + Path(f"{tasks.TASK_DB}-wal").stat().st_size
+            )
+            results = {}
+            for budget in (total - 1, total):
+                with tempfile.TemporaryDirectory() as private:
+                    completed = subprocess.run(
+                        [
+                            sys.executable, "-I", "-B", "-c",
+                            tasks.TASK_SCOPE_COPY_CHILD_CODE,
+                            str(Path(tasks.sqlite_store.__file__).resolve().parent),
+                            str(tasks.TASK_DB), task_id, str(budget),
+                        ],
+                        capture_output=True, check=True, env={"TMPDIR": private},
+                    )
+                results[budget] = json.loads(completed.stdout)
+            # A store that outgrows the budget mid-copy reads as changing.
+            self.assertEqual({"status": "changed"}, results[total - 1])
+            self.assertEqual("ok", results[total]["status"])
+            self.assertEqual(task_id, results[total]["row"]["task_id"])
+        finally:
+            keeper.close()
+
     def test_task_scope_snapshot_reads_task_checkpointed_during_main_read(self) -> None:
         task_id = str(self._start(host="remote")["task"]["task_id"])
         scope = {"task_id": task_id, "cwd": "/srv/repo", "host": "remote", "lease_owner_id": None}

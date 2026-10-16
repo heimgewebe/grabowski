@@ -7280,6 +7280,7 @@ try:
         Path(sys.argv[2]),
         temporary_prefix="grabowski-task-scope-",
         error_type=Changed,
+        max_copy_bytes=int(sys.argv[4]),
     ) as connection:
         row = connection.execute(
             "SELECT task_id, cwd, host, lease_owner_id FROM tasks WHERE task_id=?",
@@ -7302,6 +7303,8 @@ def _task_scope_wal_copy_row(identifier: str) -> dict[str, Any] | None:
     another process checkpoint and delete the live WAL and -shm. Only a
     short-lived child, which holds no SQLite lock, copies database and WAL
     with identity checks and queries the copy; the live -shm is never opened.
+    The child enforces the copy budget while streaming, so a WAL that grows
+    after the size check cannot exceed it.
     """
     changed = "Task store changed during scope snapshot"
     try:
@@ -7331,6 +7334,7 @@ def _task_scope_wal_copy_row(identifier: str) -> dict[str, Any] | None:
                     str(Path(sqlite_store.__file__).resolve().parent),
                     str(TASK_DB),
                     identifier,
+                    str(TASK_SCOPE_COPY_MAX_BYTES),
                 ],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,

@@ -34,6 +34,64 @@ class SQLiteStoreTests(unittest.TestCase):
             self.assertEqual(len(payload), identity[2])
             self.assertEqual(0o600, stat.S_IMODE(target.stat().st_mode))
 
+    def test_copy_regular_file_stops_streaming_at_byte_budget(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.sqlite3"
+            payload = b"w" * 12288
+            source.write_bytes(payload)
+            with patch.object(sqlite_store, "COPY_CHUNK_BYTES", 4096):
+                with self.assertRaises(InventoryChanged):
+                    sqlite_store.copy_regular_file(
+                        source,
+                        root / "over.sqlite3",
+                        error_type=InventoryChanged,
+                        max_bytes=8192,
+                    )
+                # Nothing past the budget reaches the private copy.
+                self.assertEqual(8192, (root / "over.sqlite3").stat().st_size)
+                identity = sqlite_store.copy_regular_file(
+                    source,
+                    root / "exact.sqlite3",
+                    error_type=InventoryChanged,
+                    max_bytes=len(payload),
+                )
+            self.assertEqual(len(payload), identity[2])
+            self.assertEqual(payload, (root / "exact.sqlite3").read_bytes())
+
+    def test_inventory_wal_copy_enforces_combined_byte_budget(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            database = Path(temporary_directory) / "store.sqlite3"
+            writer = sqlite3.connect(database)
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("CREATE TABLE items(value TEXT)")
+            writer.execute("INSERT INTO items VALUES ('wal-only')")
+            writer.commit()
+            try:
+                wal = Path(f"{database}-wal")
+                total = database.stat().st_size + wal.stat().st_size
+                with self.assertRaises(InventoryChanged):
+                    with sqlite_store.inventory_readonly_sqlite(
+                        database,
+                        temporary_prefix="budget-test-",
+                        error_type=InventoryChanged,
+                        max_copy_bytes=total - 1,
+                    ):
+                        pass
+                with sqlite_store.inventory_readonly_sqlite(
+                    database,
+                    temporary_prefix="budget-test-",
+                    error_type=InventoryChanged,
+                    max_copy_bytes=total,
+                ) as connection:
+                    self.assertEqual(
+                        [("wal-only",)],
+                        [tuple(row) for row in connection.execute("SELECT value FROM items")],
+                    )
+            finally:
+                writer.close()
+
     def test_copy_regular_file_rejects_truncated_target(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
