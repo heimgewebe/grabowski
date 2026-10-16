@@ -10777,8 +10777,9 @@ class TaskTests(unittest.TestCase):
 
     def test_shared_task_status_rechecks_mutation_authority_under_lock(self) -> None:
         # The policy may change while waiting for the shared process lock.
-        task_id = "0" * 24
+        task_id = str(self._start(host="remote")["task"]["task_id"])
         guard_positions: list[str] = []
+        scoped_positions: list[str] = []
         inside_lock = False
 
         @contextmanager
@@ -10792,24 +10793,54 @@ class TaskTests(unittest.TestCase):
 
         def authorize(capability: str, **kwargs) -> None:
             self.assertEqual("durable_job", capability)
+            self.assertEqual(task_id, kwargs["task_id"])
+            if "host" in kwargs:
+                # The persisted scope is gated before the lock is awaited.
+                scoped_positions.append("inside" if inside_lock else "before")
+                return
             self.assertEqual({"task_id": task_id}, kwargs)
             guard_positions.append("inside" if inside_lock else "before")
             if inside_lock:
                 raise PermissionError("policy revoked while waiting for task lock")
 
+        before = self.database.read_bytes()
         with (
             patch.object(tasks.operator, "_require_operator_mutation", side_effect=authorize),
             patch.object(tasks, "_task_mutation_lock", side_effect=held_lock),
             patch.object(tasks, "_row", side_effect=AssertionError("store accessed after revocation")) as row,
+            patch.object(
+                tasks, "_database_connection",
+                side_effect=AssertionError("mutable store opened after revocation"),
+            ) as mutable_store,
             patch.object(tasks, "_maintain_record_resources") as maintain,
             patch.object(tasks, "_set_state") as persist,
         ):
             with self.assertRaisesRegex(PermissionError, "policy revoked"):
                 tasks.grabowski_task_status(task_id)
         self.assertEqual(["before", "inside"], guard_positions)
+        self.assertEqual(["before"], scoped_positions)
         row.assert_not_called()
+        mutable_store.assert_not_called()
         maintain.assert_not_called()
         persist.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_shared_task_status_cannot_initialize_missing_store(self) -> None:
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(
+                tasks, "_task_mutation_lock",
+                side_effect=AssertionError("task lock before store observation"),
+            ) as lock,
+            patch.object(
+                tasks, "_database_connection",
+                side_effect=AssertionError("mutable store before scoped gate"),
+            ) as mutable_store,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "explicit initialization"):
+                tasks.grabowski_task_status("0" * 24)
+        lock.assert_not_called()
+        mutable_store.assert_not_called()
         self.assertFalse(self.database.exists())
 
     def test_task_peek_cannot_initialize_missing_store(self) -> None:
