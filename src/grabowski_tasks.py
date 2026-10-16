@@ -8302,6 +8302,29 @@ def _require_terminalization_projection_scope(
             checked_services.add(service)
 
 
+def _terminalization_source_identity() -> tuple[sqlite_store.FileIdentity | None, ...]:
+    """Read source and WAL sidecar identities without SQLite or host writes.
+
+    Between snapshot authorization and the writable connection, a new WAL,
+    SHM or database inode invalidates the authorization. This check also
+    precedes the first query on a writable SQLite connection, since a SELECT
+    itself can create a host-side -shm for an uncheckpointed WAL.
+    """
+    identities: list[sqlite_store.FileIdentity | None] = []
+    for path in (TASK_DB, Path(str(TASK_DB) + "-wal"), Path(str(TASK_DB) + "-shm")):
+        try:
+            status = path.lstat()
+        except FileNotFoundError:
+            if path == TASK_DB:
+                raise TaskSchemaInventoryChanged("Task database disappeared before authorization")
+            identities.append(None)
+            continue
+        if not stat.S_ISREG(status.st_mode):
+            raise TaskSchemaInventoryChanged("Task database identity changed before authorization")
+        identities.append(sqlite_store.status_identity(status))
+    return tuple(identities)
+
+
 def _apply_terminalization_projection(
     terminalization: dict[str, Any], *, recovered: bool = False
 ) -> dict[str, Any]:
@@ -8322,14 +8345,25 @@ def _apply_terminalization_projection(
     if not isinstance(transition_sha256, str) or SHA256.fullmatch(transition_sha256) is None:
         raise RuntimeError("Task terminalization digest is invalid")
     # _database_connection() may repair schema, create WAL/SHM or chmod the
-    # task DB. First authorize against a host-write-free snapshot; the
-    # transaction below still reauthorizes its actual row after opening.
+    # task DB. Record the DB/WAL/SHM identity before the safe read-only
+    # snapshot: even a SELECT on a writable WAL connection can create -shm.
+    source_identity = _terminalization_source_identity()
     preflight_record = _row_scope_identity_readonly(task_id)
     _require_terminalization_projection_scope(preflight_record, task_id, projection)
+    if _terminalization_source_identity() != source_identity:
+        raise TaskSchemaInventoryChanged("Task store changed after scoped preauthorization")
 
     def check_open_connection(connection: sqlite3.Connection) -> None:
-        # Authorize the actual SQLite row BEFORE opening helpers can change
-        # its journal mode, migrate the schema or repair file permissions.
+        # Check for post-authorization source drift before the first query.
+        # The actual opened row is still reauthorized before any UPDATE.
+        opened_source = _terminalization_source_identity()
+        # Creating WAL/SHM after a successful scope gate is expected when
+        # SQLite enables WAL on an authorized current-schema database. The
+        # main database object itself must remain the one preauthorized.
+        if opened_source[0] is None or source_identity[0] is None or (
+            opened_source[0][:2] != source_identity[0][:2]
+        ):
+            raise TaskSchemaInventoryChanged("Task database inode changed before writable row check")
         row = connection.execute(
             "SELECT * FROM tasks WHERE task_id=?", (task_id,)
         ).fetchone()

@@ -225,7 +225,7 @@ class TaskScopeToctouRecoveryTests(unittest.TestCase):
                              side_effect=swap_after_read),
                 patch.object(tasks.operator, "_require_operator_mutation",
                              side_effect=deny_replaced_scope),
-                self.assertRaisesRegex(PermissionError, "swapped database is denied"),
+                self.assertRaisesRegex(tasks.TaskSchemaInventoryChanged, "changed after scoped preauthorization"),
             ):
                 tasks._apply_terminalization_projection(transition, recovered=True)
             self.assertTrue(swapped)
@@ -242,6 +242,71 @@ class TaskScopeToctouRecoveryTests(unittest.TestCase):
             if swapped:
                 os.replace(database, replacement)
                 os.replace(original, database)
+
+
+    def test_late_wal_scope_denial_does_not_create_shared_memory_file(self) -> None:
+        """A newly appearing WAL must not create host SHM before scoped denial."""
+        import os
+        import sqlite3
+        import subprocess
+        import sys
+        from contextlib import closing
+
+        transition = self.fixtures._prepare_pending_terminalization()
+        task_id = str(transition["task_id"])
+        database = tasks.TASK_DB
+        wal = tasks.Path(str(database) + "-wal")
+        shm = tasks.Path(str(database) + "-shm")
+        denied_scope = str(self.fixtures.root / "denied-wal-scope")
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(
+                "delete",
+                connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0],
+            )
+        original_read = tasks._row_scope_identity_readonly
+        raced = False
+
+        def read_then_race(identifier: str) -> dict:
+            nonlocal raced
+            allowed = original_read(identifier)
+            if not raced:
+                child = (
+                    "import os,sqlite3,sys\n"
+                    "c=sqlite3.connect(sys.argv[1])\n"
+                    "c.execute('PRAGMA journal_mode=WAL')\n"
+                    "c.execute('UPDATE tasks SET cwd=? WHERE task_id=?',"
+                    "(sys.argv[2],sys.argv[3]))\n"
+                    "c.commit()\n"
+                    "os._exit(0)\n"
+                )
+                subprocess.run(
+                    [sys.executable, "-B", "-c", child, str(database),
+                     denied_scope, task_id],
+                    check=True, timeout=15, capture_output=True,
+                )
+                self.assertTrue(wal.exists())
+                if shm.exists():
+                    shm.unlink()
+                raced = True
+            return allowed
+
+        def deny_changed_scope(_capability: str, **scope: object) -> None:
+            if scope.get("path") == denied_scope:
+                self.assertFalse(
+                    shm.exists(), "untrusted SQLite WAL created SHM before authorization"
+                )
+                raise PermissionError("late WAL identity denied")
+
+        with (
+            patch.object(tasks, "_row_scope_identity_readonly",
+                         side_effect=read_then_race),
+            patch.object(tasks.operator, "_require_operator_mutation",
+                         side_effect=deny_changed_scope),
+            self.assertRaisesRegex(tasks.TaskSchemaInventoryChanged, "changed after scoped preauthorization"),
+        ):
+            tasks._apply_terminalization_projection(transition, recovered=True)
+        self.assertTrue(raced)
+        self.assertFalse(shm.exists(), "no host -shm may be created on late WAL denial")
 
 
     def test_authorized_projection_retains_existing_recovery_behavior(self) -> None:
