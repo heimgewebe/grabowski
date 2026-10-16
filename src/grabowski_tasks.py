@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -7257,29 +7258,112 @@ def _task_wal_has_frames() -> bool:
         return False
 
 
-def _task_scope_wal_copy_row(identifier: str) -> dict[str, Any] | None:
-    """Read committed WAL frames from a private copy; SQLite never opens the store.
+TASK_SCOPE_COPY_TIMEOUT_SECONDS = 5
+TASK_SCOPE_COPY_MAX_BYTES = 256 * 1024 * 1024
+TASK_SCOPE_COPY_COLUMNS = ("task_id", "cwd", "host", "lease_owner_id")
+TASK_SCOPE_COPY_CHILD_CODE = r"""
+import json
+from pathlib import Path
+import sqlite3
+import sys
 
-    Database and WAL bytes are only copied. Their identities must stay
-    unchanged across the copy and the query, so a concurrent append,
-    checkpoint or WAL reset is retried rather than trusted. The live -shm is
-    never opened, created or modified.
-    """
-    with sqlite_store.inventory_readonly_sqlite(
-        TASK_DB,
+sys.path.append(sys.argv[1])
+import grabowski_sqlite_store as store
+
+
+class Changed(RuntimeError):
+    pass
+
+
+try:
+    with store.inventory_readonly_sqlite(
+        Path(sys.argv[2]),
         temporary_prefix="grabowski-task-scope-",
-        error_type=TaskSchemaInventoryChanged,
-        message="Task store changed during scope snapshot",
+        error_type=Changed,
     ) as connection:
+        row = connection.execute(
+            "SELECT task_id, cwd, host, lease_owner_id FROM tasks WHERE task_id=?",
+            (sys.argv[3],),
+        ).fetchone()
+        result = {"status": "ok", "row": dict(row) if row is not None else None}
+except (Changed, OSError, sqlite3.Error):
+    result = {"status": "changed"}
+sys.stdout.write(json.dumps(result))
+""".strip()
+
+
+def _task_scope_wal_copy_row(identifier: str) -> dict[str, Any] | None:
+    """Read a WAL-only task scope from a private copy made by a child process.
+
+    SQLite's POSIX locks on the task database belong to this whole process:
+    closing any plain descriptor on that file here would drop them and let
+    another process checkpoint and delete the live WAL and -shm. Only a
+    short-lived child, which holds no SQLite lock, copies database and WAL
+    with identity checks and queries the copy; the live -shm is never opened.
+    """
+    changed = "Task store changed during scope snapshot"
+    try:
+        database_size = TASK_DB.stat().st_size
         try:
-            row = connection.execute(
-                "SELECT * FROM tasks WHERE task_id=?", (identifier,)
-            ).fetchone()
-        except sqlite3.DatabaseError as exc:
-            raise TaskSchemaInventoryChanged(
-                "Task store changed during scope snapshot"
-            ) from exc
-    return dict(row) if row is not None else None
+            wal_size = os.lstat(f"{TASK_DB}-wal").st_size
+        except FileNotFoundError:
+            wal_size = 0
+    except FileNotFoundError as exc:
+        raise TaskSchemaInventoryChanged(changed) from exc
+    if database_size + wal_size > TASK_SCOPE_COPY_MAX_BYTES:
+        raise RuntimeError(
+            "Task scope copy exceeds its size budget; retry after the task "
+            "WAL is checkpointed"
+        )
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                TASK_SCOPE_COPY_CHILD_CODE,
+                str(Path(sqlite_store.__file__).resolve().parent),
+                str(TASK_DB),
+                identifier,
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=TASK_SCOPE_COPY_TIMEOUT_SECONDS,
+            env={"TMPDIR": tempfile.gettempdir()},
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TaskSchemaInventoryChanged(changed) from exc
+    except OSError as exc:
+        raise RuntimeError("Task scope copy process could not start") from exc
+    try:
+        result = json.loads(completed.stdout) if completed.returncode == 0 else None
+    except ValueError:
+        result = None
+    if result == {"status": "changed"}:
+        raise TaskSchemaInventoryChanged(changed)
+    row = result.get("row") if isinstance(result, dict) else None
+    if (
+        not isinstance(result, dict)
+        or set(result) != {"status", "row"}
+        or result["status"] != "ok"
+        or (
+            row is not None
+            and (
+                not isinstance(row, dict)
+                or sorted(row) != sorted(TASK_SCOPE_COPY_COLUMNS)
+                or row["task_id"] != identifier
+                or not isinstance(row["cwd"], str)
+                or not isinstance(row["host"], str)
+                or not (
+                    row["lease_owner_id"] is None
+                    or isinstance(row["lease_owner_id"], str)
+                )
+            )
+        )
+    ):
+        raise RuntimeError("Task scope copy returned no verified task scope")
+    return row
 
 
 def _task_mutation_lock_held() -> bool:
@@ -7289,7 +7373,9 @@ def _task_mutation_lock_held() -> bool:
 def _task_scope_snapshot(task_id: str) -> dict[str, Any]:
     """Read the persisted task scope without opening the mutable task store.
 
-    A task committed only to the WAL is read from a verified private copy.
+    A task committed only to the WAL is read from a verified private copy
+    that a child process makes; this process opens the store only through
+    SQLite's own immutable reader and never closes a plain store descriptor.
     Retry waits never hold the global task lock: a caller that already holds
     it gets exactly one attempt and fails closed instead of stalling writers.
     """
@@ -7297,8 +7383,11 @@ def _task_scope_snapshot(task_id: str) -> dict[str, Any]:
     attempts = 1 if _task_mutation_lock_held() else TASK_SCOPE_SNAPSHOT_ATTEMPTS
     for attempt in range(attempts):
         try:
+            # Frames seen before the main-file read may be checkpointed and
+            # the WAL removed during it; that task must not read as unknown.
+            framed = _task_wal_has_frames()
             row = _task_scope_main_file_row(identifier)
-            if row is None and _task_wal_has_frames():
+            if row is None and (framed or _task_wal_has_frames()):
                 row = _task_scope_wal_copy_row(identifier)
         except TaskSchemaInventoryChanged as exc:
             # Never fall back to the mutable store before the scoped gate.

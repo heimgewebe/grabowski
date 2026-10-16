@@ -11483,6 +11483,152 @@ class TaskTests(unittest.TestCase):
                 tasks._task_scope_snapshot("f" * 24)
         pause.assert_not_called()
 
+    def _wal_only_task(self) -> tuple[sqlite3.Connection, str]:
+        with tasks._database_connection():
+            pass
+        keeper = sqlite3.connect(tasks.TASK_DB)
+        keeper.execute("PRAGMA wal_autocheckpoint=0")
+        keeper.execute("SELECT COUNT(*) FROM tasks").fetchone()
+        task_id = str(self._start(host="remote")["task"]["task_id"])
+        self.assertIsNone(tasks._task_scope_main_file_row(task_id))
+        return keeper, task_id
+
+    def test_task_scope_copy_keeps_this_process_sqlite_locks(self) -> None:
+        # Closing a plain descriptor on the live database in this process
+        # would drop every SQLite POSIX lock it holds; another process could
+        # then checkpoint and delete the WAL and -shm under live connections.
+        keeper, task_id = self._wal_only_task()
+        try:
+            scope = tasks._task_scope_wal_copy_row(task_id)
+            self.assertEqual(task_id, scope["task_id"])
+            subprocess.run(
+                [
+                    sys.executable, "-c",
+                    "import sqlite3, sys\n"
+                    "c = sqlite3.connect(sys.argv[1])\n"
+                    "c.execute('SELECT COUNT(*) FROM tasks').fetchone()\n"
+                    "c.close()\n",
+                    str(tasks.TASK_DB),
+                ],
+                check=True,
+            )
+            self.assertTrue(Path(f"{tasks.TASK_DB}-wal").exists())
+            self.assertTrue(Path(f"{tasks.TASK_DB}-shm").exists())
+            self.assertIsNone(tasks._task_scope_main_file_row(task_id))
+        finally:
+            keeper.close()
+
+    def test_task_logs_progress_for_committed_wal_only_task(self) -> None:
+        keeper, task_id = self._wal_only_task()
+        try:
+            scope = tasks._task_scope_wal_copy_row(task_id)
+            calls: list[dict[str, object]] = []
+
+            def gate(capability: str, **kwargs: object) -> None:
+                calls.append({"capability": capability, **kwargs})
+
+            with (
+                patch.object(tasks.operator, "_require_operator_mutation", side_effect=gate),
+                patch.object(tasks.time, "sleep") as pause,
+                patch.object(
+                    tasks, "_read_task_output_files", return_value={"stdout": "ok"},
+                ) as output,
+            ):
+                result = tasks.grabowski_task_logs(task_id, max_lines=5)
+            pause.assert_not_called()
+            output.assert_called_once()
+            self.assertEqual(task_id, output.call_args.args[0]["task_id"])
+            self.assertEqual("private-task-files-v1", result["output_source"])
+            self.assertEqual(scope["host"], result["host"])
+            self.assertIn(
+                {
+                    "capability": "durable_job",
+                    "path": scope["cwd"],
+                    "repo": scope["cwd"],
+                    "task_id": task_id,
+                    "owner_id": scope["lease_owner_id"],
+                    "host": scope["host"],
+                },
+                calls,
+            )
+        finally:
+            keeper.close()
+
+    def test_task_scope_copy_rejects_unverified_child_results(self) -> None:
+        keeper, task_id = self._wal_only_task()
+        try:
+            good = {
+                "task_id": task_id, "cwd": "/srv/repo", "host": "remote",
+                "lease_owner_id": None,
+            }
+            for name, outcome in (
+                ("changed", (0, {"status": "changed"})),
+                ("exit", (1, {"status": "ok", "row": good})),
+                ("other-task", (0, {"status": "ok", "row": {**good, "task_id": "f" * 24}})),
+                ("extra-column", (0, {"status": "ok", "row": {**good, "command": "x"}})),
+                ("bad-host", (0, {"status": "ok", "row": {**good, "host": 7}})),
+                ("extra-field", (0, {"status": "ok", "row": None, "x": 1})),
+                ("garbage", (0, None)),
+            ):
+                returncode, payload = outcome
+                completed = subprocess.CompletedProcess(
+                    [], returncode,
+                    stdout=b"not json" if payload is None else json.dumps(payload).encode(),
+                    stderr=b"",
+                )
+                with (
+                    self.subTest(result=name),
+                    patch.object(tasks.subprocess, "run", return_value=completed),
+                ):
+                    with self.assertRaises(RuntimeError) as raised:
+                        tasks._task_scope_wal_copy_row(task_id)
+                    # Only a concurrently changing store is retried; a failed
+                    # or unverifiable copy fails closed at once.
+                    self.assertEqual(
+                        name == "changed",
+                        isinstance(raised.exception, tasks.TaskSchemaInventoryChanged),
+                    )
+            with patch.object(
+                tasks.subprocess, "run",
+                side_effect=subprocess.TimeoutExpired(["child"], 5),
+            ):
+                with self.assertRaises(tasks.TaskSchemaInventoryChanged):
+                    tasks._task_scope_wal_copy_row(task_id)
+            with patch.object(tasks.subprocess, "run", side_effect=OSError("no exec")):
+                with self.assertRaisesRegex(RuntimeError, "could not start"):
+                    tasks._task_scope_wal_copy_row(task_id)
+            with (
+                patch.object(tasks, "TASK_SCOPE_COPY_MAX_BYTES", 1),
+                patch.object(tasks.subprocess, "run") as child,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "size budget"):
+                    tasks._task_scope_wal_copy_row(task_id)
+            child.assert_not_called()
+        finally:
+            keeper.close()
+
+    def test_task_scope_snapshot_reads_task_checkpointed_during_main_read(self) -> None:
+        task_id = str(self._start(host="remote")["task"]["task_id"])
+        scope = {"task_id": task_id, "cwd": "/srv/repo", "host": "remote", "lease_owner_id": None}
+        main_read: list[str] = []
+
+        def checkpointing_main_read(identifier: str) -> None:
+            # The row was in the WAL until a checkpoint removed it mid-read.
+            main_read.append(identifier)
+            return None
+
+        with (
+            patch.object(
+                tasks, "_task_wal_has_frames", side_effect=lambda: not main_read,
+            ),
+            patch.object(
+                tasks, "_task_scope_main_file_row", side_effect=checkpointing_main_read,
+            ),
+            patch.object(tasks, "_task_scope_wal_copy_row", return_value=scope) as copy,
+        ):
+            self.assertEqual(scope, tasks._task_scope_snapshot(task_id))
+        copy.assert_called_once_with(task_id)
+
     def test_task_scope_snapshot_retry_wait_does_not_hold_task_lock(self) -> None:
         task_id = str(self._start(host="remote")["task"]["task_id"])
         real_read = tasks._task_scope_main_file_row
