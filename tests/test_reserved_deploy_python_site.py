@@ -7,6 +7,7 @@ that the user site is a generally trusted source.
 from __future__ import annotations
 
 import os
+import pwd
 from pathlib import Path
 import subprocess
 import tempfile
@@ -37,7 +38,16 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                 patch.object(operator.uuid, "uuid4",
                     return_value=types.SimpleNamespace(hex="aaaa1111222233334444")),
                 patch.object(operator, "_managed_runtime_environment",
-                    return_value={"XDG_RUNTIME_DIR": "/run/user/1000"}),
+                    return_value={
+                        "XDG_RUNTIME_DIR": "/run/user/1000",
+                        "PYTHONNOUSERSITE": "1",
+                        "PYTHONUSERBASE": "/tmp/untrusted-python-site",
+                        "PYTHONWARNINGS": "error",
+                        "PYTHONSAFEPATH": "1",
+                        "PYTHONPLATLIBDIR": "foreign",
+                        "PYTHONINSPECT": "1",
+                        "PYTHONSTARTUP": "/tmp/untrusted-startup",
+                    }),
                 patch.object(operator, "_run", return_value=launch_result) as run,
             ):
                 job = operator._start_job(
@@ -55,9 +65,24 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
             )
             self.assertIn("--setenv=PYTHONPATH=", before_command)
             self.assertIn("--setenv=PYTHONHOME=", before_command)
-            # On this host /usr/bin/python3 imports the exact pinned PyYAML
-            # 6.0.3 from user-site; -s would select system PyYAML 5.4.1.
-            self.assertFalse(any("PYTHONNOUSERSITE" in arg for arg in before_command))
+            # Explicitly override hostile user-manager Python environment,
+            # but do not claim that the mutable user site is authenticated.
+            for item in (
+                "--setenv=PYTHONNOUSERSITE=",
+                "--setenv=PYTHONWARNINGS=",
+                "--setenv=PYTHONSAFEPATH=",
+                "--setenv=PYTHONPLATLIBDIR=",
+                "--setenv=PYTHONINSPECT=",
+                "--setenv=PYTHONSTARTUP=",
+                "--setenv=PYTHONBREAKPOINT=0",
+            ):
+                self.assertIn(item, before_command)
+            expected_site = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local"
+            self.assertIn(f"--setenv=PYTHONUSERBASE={expected_site}", before_command)
+            self.assertEqual(
+                1, sum(arg.startswith("--setenv=PYTHONUSERBASE=") for arg in before_command)
+            )
+            self.assertNotIn("--setenv=PYTHONUSERBASE=/tmp/untrusted-python-site", before_command)
             self.assertEqual(
                 argv[argv.index("--") + 1:],
                 operator.command_identity.systemd_escape_argv(
@@ -74,8 +99,8 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
             env.update(
                 PYTHONUSERBASE=str(base), PYTHONPATH="", PYTHONHOME="",
                 PYTHONPYCACHEPREFIX="/dev/null/grabowski-runtime-deploy",
+                PYTHONNOUSERSITE="",
             )
-            env.pop("PYTHONNOUSERSITE", None)
             env.pop("PYTHONSAFEPATH", None)
             site_path = subprocess.run(
                 ["/usr/bin/python3", "-c", "import site; print(site.getusersitepackages())"],
@@ -95,12 +120,67 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
             )
             self.assertEqual(0, allowed.returncode, allowed.stderr)
             self.assertEqual("6.0.3", allowed.stdout.strip())
+            suppressed_by_env = subprocess.run(
+                command, cwd=root, env={**env, "PYTHONNOUSERSITE": "1"},
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertNotEqual(0, suppressed_by_env.returncode)
+            self.assertIn("No module named", suppressed_by_env.stderr)
             suppressed = subprocess.run(
                 ["/usr/bin/python3", "-s", *command[1:]],
                 cwd=root, env=env, capture_output=True, text=True, timeout=10,
             )
             self.assertNotEqual(0, suppressed.returncode)
             self.assertIn("No module named", suppressed.stderr)
+
+
+    @unittest.skipUnless(Path("/usr/bin/python3").is_file(), "system Python absent")
+    def test_private_cache_prefix_ignores_stale_same_mtime_user_site_bytecode(self):
+        # Positive control for the narrow pycache guarantee, not source trust:
+        # a mutable .pth or sourceless .pyc remains outside this protection.
+        with tempfile.TemporaryDirectory(prefix="reserved-worker-cache-negative-") as tmp:
+            root = Path(tmp)
+            env = os.environ.copy()
+            env.update(
+                PYTHONUSERBASE=str(root / "user"),
+                PYTHONPATH="", PYTHONHOME="", PYTHONNOUSERSITE="",
+            )
+            for key in ("PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE", "PYTHONSAFEPATH"):
+                env.pop(key, None)
+            site = Path(subprocess.run(
+                ["/usr/bin/python3", "-c", "import site; print(site.getusersitepackages())"],
+                cwd=root, env=env, capture_output=True, text=True,
+                timeout=10, check=True,
+            ).stdout.strip())
+            site.mkdir(parents=True, exist_ok=True)
+            module = site / "grabowski_reserved_cache_control.py"
+            module.write_text("VALUE = 'POISONED'\n", encoding="ascii")
+            command = [
+                "/usr/bin/python3", "-c",
+                "import grabowski_reserved_cache_control as dep; print(dep.VALUE)",
+            ]
+            first = subprocess.run(
+                command, cwd=root, env=env, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(0, first.returncode, first.stderr)
+            self.assertEqual("POISONED", first.stdout.strip())
+            self.assertTrue((site / "__pycache__").is_dir())
+            original = module.stat()
+            # Same mtime and byte count leave a plausible stale timestamp .pyc.
+            module.write_text("VALUE = 'ORIGINAL'\n", encoding="ascii")
+            os.utime(module, ns=(original.st_atime_ns, original.st_mtime_ns))
+            unsafe = subprocess.run(
+                command, cwd=root, env=env, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(0, unsafe.returncode, unsafe.stderr)
+            self.assertEqual("POISONED", unsafe.stdout.strip())
+            isolated = subprocess.run(
+                command, cwd=root,
+                env={**env, "PYTHONPYCACHEPREFIX": "/dev/null/grabowski-runtime-deploy"},
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(0, isolated.returncode, isolated.stderr)
+            self.assertEqual("ORIGINAL", isolated.stdout.strip())
 
 
 if __name__ == "__main__":

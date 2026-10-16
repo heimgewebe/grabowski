@@ -8307,10 +8307,23 @@ def _start_job(
         # Isolate pycache before interpreter startup, not after imports.
         # The fixed /usr/bin/python3 worker needs pinned user-site PyYAML.
         # This alone cannot attest mutable Python source or sourceless .pyc.
+        # Reject inherited user-manager Python environment overrides.
+        import pwd
+        user_home = pwd.getpwuid(os.getuid()).pw_dir
+        if not os.path.isabs(user_home):
+            raise RuntimeError("reserved runtime user home is invalid")
         environment.update({
             "PYTHONPYCACHEPREFIX": "/dev/null/grabowski-runtime-deploy",
             "PYTHONPATH": "",
             "PYTHONHOME": "",
+            "PYTHONNOUSERSITE": "",
+            "PYTHONUSERBASE": os.path.join(user_home, ".local"),
+            "PYTHONWARNINGS": "",
+            "PYTHONSAFEPATH": "",
+            "PYTHONPLATLIBDIR": "",
+            "PYTHONINSPECT": "",
+            "PYTHONSTARTUP": "",
+            "PYTHONBREAKPOINT": "0",
         })
     if (
         decision_review_binding is not None
