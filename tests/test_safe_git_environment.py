@@ -856,5 +856,174 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
         )
 
 
+
+    def test_native_work_acquire_git_diff_blocks_late_external_driver(self) -> None:
+        """Native host Git must preserve committed patch bytes without executing a helper."""
+        from unittest import mock
+        import grabowski_work_acquire as work_acquire
+
+        with tempfile.TemporaryDirectory(prefix="work-acquire-late-diff-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            head, parent = self._two_commit_repo(repo, secure)
+            marker, helper = root / "executed", root / "external-driver"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\nexit 0\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            original_run = work_acquire.operator._run
+            injected = False
+
+            def inject_before_effect(argv: list[str], **kwargs: object):
+                nonlocal injected
+                if not injected and "diff" in argv:
+                    injected = True
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo), "config",
+                         "diff.external", str(helper)],
+                        env=secure, check=True, capture_output=True,
+                    )
+                return original_run(argv, **kwargs)
+
+            with mock.patch.object(
+                work_acquire.operator, "_run", side_effect=inject_before_effect,
+            ):
+                result = work_acquire._git_runner(repo, ["diff", parent, head])
+            self.assertTrue(injected, "late native Git diff configuration race not tested")
+            self.assertEqual(result["returncode"], 0, result["stderr"])
+            self.assertIn("diff --git", result["stdout"])
+            self.assertFalse(marker.exists(), "native WorkAcquire Git executed late diff helper")
+            uncontrolled = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "diff", parent, head],
+                capture_output=True, env=secure, check=False,
+            )
+            self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
+            self.assertTrue(marker.exists(), "late external diff negative control missed")
+
+
+
+    def test_merge_driver_inserted_after_admission_stays_inert(self) -> None:
+        """A late repository-configured merge driver must not run."""
+        from grabowski_agent_sandbox import safe_git_filter_effect
+
+        with tempfile.TemporaryDirectory(prefix="late-merge-driver-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            subprocess.run(["/usr/bin/git", "init", "-q", "-b", "main", str(repo)],
+                           env=secure, check=True)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
+            for key, value in (("user.name", "Safe Test"),
+                               ("user.email", "safe@example.invalid")):
+                subprocess.run(["/usr/bin/git", "-C", str(repo), "config", key, value],
+                               env=secure, check=True)
+            tracked = repo / "tracked"
+            tracked.write_text("base\n", encoding="ascii")
+            (repo / ".gitattributes").write_text("tracked merge=attacker\n", encoding="ascii")
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "add",
+                            "tracked", ".gitattributes"], env=secure, check=True)
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "commit", "-qm", "base"],
+                           env=secure, check=True)
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "checkout", "-qb", "feature"],
+                           env=secure, check=True)
+            tracked.write_text("feature\n", encoding="ascii")
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "commit", "-qam", "feature"],
+                           env=secure, check=True)
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "checkout", "-q", "main"],
+                           env=secure, check=True)
+            tracked.write_text("main\n", encoding="ascii")
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "commit", "-qam", "main"],
+                           env=secure, check=True)
+            marker, helper = root / "helper-ran", root / "merge-helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) +
+                '\nprintf "MALICIOUS\\n" > "$2"\nexit 0\n', encoding="ascii",
+            )
+            helper.chmod(0o700)
+            with safe_git_filter_effect(
+                repo, ["git", "-C", str(repo), "merge", "feature"]
+            ) as (command, environment, fds):
+                subprocess.run(
+                    ["/usr/bin/git", "-C", str(repo), "config",
+                     "merge.attacker.driver", f"{helper} %O %A %B"],
+                    env=secure, check=True,
+                )
+                guarded = subprocess.run(
+                    command, env=environment, pass_fds=fds,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+            self.assertEqual(guarded.returncode, 1, guarded.stderr)
+            self.assertIn("<<<<<<< HEAD", tracked.read_text(encoding="ascii"))
+            self.assertFalse(marker.exists(), "late merge driver executed")
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "merge", "--abort"],
+                           env=secure, check=True, capture_output=True)
+            uncontrolled = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "merge", "feature"],
+                env=secure, capture_output=True,
+            )
+            self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
+            self.assertTrue(marker.exists(), "unprotected merge control missed")
+
+
+
+    def test_two_oid_diff_custom_command_cannot_run_at_effect_time(self) -> None:
+        """A committed Git diff must preserve a patch but never run a late driver."""
+        from unittest import mock
+        import grabowski_work_acquire as work_acquire
+
+        with tempfile.TemporaryDirectory(prefix="two-oid-diff-driver-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            head, parent = self._two_commit_repo(repo, secure)
+            (repo / ".gitattributes").write_text(
+                "tracked.txt diff=attacker\n", encoding="ascii",
+            )
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "add", ".gitattributes"],
+                           env=secure, check=True)
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "-c", "user.name=Safe Test",
+                            "-c", "user.email=safe@example.invalid",
+                            "commit", "-qm", "attribute driver"], env=secure, check=True)
+            head = subprocess.check_output(
+                ["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"],
+                env=secure, text=True,
+            ).strip()
+            marker, helper = root / "external-command-ran", root / "custom-diff"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\nexit 0\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            original_run = work_acquire.operator._run
+            injected = False
+
+            def inject_at_git_effect(argv: list[str], **kwargs: object):
+                nonlocal injected
+                if not injected and "diff" in argv:
+                    injected = True
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo), "config",
+                         "diff.attacker.command", str(helper)],
+                        env=secure, check=True,
+                    )
+                return original_run(argv, **kwargs)
+
+            with mock.patch.object(work_acquire.operator, "_run",
+                                   side_effect=inject_at_git_effect):
+                result = work_acquire._git_runner(repo, ["diff", parent, head])
+            self.assertTrue(injected)
+            self.assertEqual(result["returncode"], 0, result["stderr"])
+            self.assertIn("diff --git", result["stdout"])
+            self.assertFalse(marker.exists(), "two-object Git diff ran custom driver")
+            plain = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "diff", parent, head],
+                env=secure, capture_output=True,
+            )
+            self.assertEqual(plain.returncode, 0, plain.stderr)
+            self.assertTrue(marker.exists(), "negative control failed to execute driver")
+
+
 if __name__ == "__main__":
     unittest.main()

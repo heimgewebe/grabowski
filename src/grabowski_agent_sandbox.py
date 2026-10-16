@@ -647,6 +647,35 @@ def git_requires_filter_effect_guard(argv: list[str]) -> bool:
     }
 
 
+def _git_without_external_diff(argv: list[str]) -> list[str]:
+    """Suppress executable external-diff/textconv at the same Git process effect.
+
+    Git's -c and -C global options can precede the subcommand, so injecting
+    solely at argv[:2] misses real WorkAcquire/Reviewer Git invocations.
+    Ordinary built-in text/binary diff algorithms remain unchanged.
+    """
+    if not argv or Path(argv[0]).name != "git":
+        return list(argv)
+    position = 1
+    while position < len(argv):
+        option = argv[position]
+        if option in ("-c", "-C", "--git-dir", "--work-tree", "--namespace", "--config-env"):
+            position += 2
+        elif option.startswith("-"):
+            position += 1
+        else:
+            break
+    if (
+        position >= len(argv)
+        or argv[position] not in {"diff", "diff-files", "diff-index", "diff-tree", "show", "log"}
+    ):
+        return list(argv)
+    return [
+        *argv[: position + 1], "--no-ext-diff", "--no-textconv",
+        *argv[position + 1 :],
+    ]
+
+
 @contextmanager
 def safe_git_filter_effect(
     repo: Path,
@@ -664,8 +693,11 @@ def safe_git_filter_effect(
     effect-time binding is unavailable; never fall back to unsandboxed Git.
     """
     environment = safe_git_repository_environment(repo, base)
-    if not git_requires_filter_effect_guard(argv):
-        yield argv, environment, ()
+    # Apply the diff-driver denial at the actual spawn even when no attribute
+    # overlay is needed, e.g. committed two-object SHA-1/SHA-256 diffs.
+    effect_argv = _git_without_external_diff(argv)
+    if not git_requires_filter_effect_guard(effect_argv):
+        yield effect_argv, environment, ()
         return
     if not hasattr(os, "memfd_create") or not hasattr(os, "MFD_ALLOW_SEALING"):
         raise AgentSandboxError("effect-bound Git filter isolation unsupported")
@@ -716,7 +748,10 @@ def safe_git_filter_effect(
                 raise ValueError("unsafe Git info entry")
         # Last matching Git attribute wins. Preserve preceding benign
         # attribute semantics, but prevent any clean/smudge/process driver.
-        inert = original + (b"" if not original or original.endswith(b"\n") else b"\n") + b"* -filter\n"
+        # Restore Git's built-in merge handling, never a repository-defined
+        # executable merge driver. Keep diff attributes unchanged to preserve
+        # binary/text patch semantics; --no-ext-diff/--no-textconv guard those.
+        inert = original + (b"" if not original or original.endswith(b"\n") else b"\n") + b"* -filter !merge\n"
         fd = os.memfd_create("grabowski-git-inert-attrs", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
     except (OSError, ValueError, UnicodeError) as exc:
         raise AgentSandboxError("Git attribute effect admission failed") from exc
@@ -738,7 +773,7 @@ def safe_git_filter_effect(
             command.extend(("--ro-bind", str(entry), str(entry)))
         command.extend((
             "--ro-bind-data", str(fd), str(attribute_path),
-            "--", "/usr/bin/git", *argv[1:],
+            "--", "/usr/bin/git", *effect_argv[1:],
         ))
         yield command, environment, (fd,)
     finally:

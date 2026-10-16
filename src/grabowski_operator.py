@@ -48,6 +48,7 @@ import grabowski_merge_authority as merge_authority
 import grabowski_deployment_observer as deployment_observer
 import grabowski_private_io as private_io
 import grabowski_effect_interceptor
+import grabowski_agent_sandbox as git_sandbox
 import grabowski_grips
 import grabowski_git_preimage
 import grabowski_transport_assertion
@@ -8970,13 +8971,47 @@ def grabowski_git(
             "branch_attempt is accepted only for local branch/index mutation subcommands"
         )
 
-    result = _run(
-        command,
-        cwd=path,
-        timeout_seconds=execution_timeout_seconds,
-        max_output_bytes=MAX_OUTPUT_BYTES,
-        environment=environment,
-    )
+    if subcommand == "add":
+        # Native CAS-staging can invoke clean/process filters after its earlier
+        # branch preimage checks. Bind the inert attributes to the actual Git
+        # process. Never change branch_attempt ownership or its postimage/audit.
+        # A guard failure before _run is provably pre-effect: close only that
+        # exact acquired attempt; if _run started but failed its outcome is
+        # unknown and the lease must stay available for reconciliation.
+        effect_started = False
+        try:
+            with git_sandbox.safe_git_filter_effect(path, command) as (
+                effect_command, effect_env, effect_fds
+            ):
+                effect_started = True
+                result = _run(
+                    effect_command,
+                    cwd=path,
+                    timeout_seconds=execution_timeout_seconds,
+                    max_output_bytes=MAX_OUTPUT_BYTES,
+                    environment=effect_env,
+                    pass_fds=effect_fds,
+                )
+        except Exception:
+            if not effect_started and branch_context is not None:
+                try:
+                    resources.complete_branch_mutation_attempt(
+                        branch_context["lease"]
+                    )
+                except Exception as cleanup_exc:
+                    raise RuntimeError(
+                        "Git filter admission denied before effect; branch attempt "
+                        "lease cleanup failed, reconcile before any retry"
+                    ) from cleanup_exc
+            raise
+    else:
+        result = _run(
+            command,
+            cwd=path,
+            timeout_seconds=execution_timeout_seconds,
+            max_output_bytes=MAX_OUTPUT_BYTES,
+            environment=environment,
+        )
     if branch_context is None:
         return result
 

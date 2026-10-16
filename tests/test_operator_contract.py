@@ -3073,6 +3073,8 @@ class OperatorContractTests(unittest.TestCase):
                 ).stdout.strip()
 
             git("init", "-q")
+            # Role diff checks use the admitted inert attribute mountpoint.
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
             git("config", "user.name", "Review Test")
             git("config", "user.email", "review-test@example.invalid")
             (repo / "source.py").write_text("before\n", encoding="utf-8")
@@ -4814,6 +4816,84 @@ class OperatorContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "requires a branch_attempt"):
                     operator.grabowski_git(str(repo), ["add", "README.md"])
 
+    def test_grabowski_git_jit_add_blocks_post_preflight_clean_helper(self) -> None:
+        """The actual CAS Git-add effect must not execute a late local clean driver."""
+        operator = _load_operator_module()
+        import grabowski_resources as resources
+
+        with tempfile.TemporaryDirectory(prefix="native-cas-clean-race-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            resource_db = root / "resources.sqlite3"
+            subprocess.run(["/usr/bin/git", "init", "-q", "-b", "feature", str(repo)], check=True)
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
+            for key, value in (("user.name", "Security Test"),
+                               ("user.email", "test@example.invalid")):
+                subprocess.run(["/usr/bin/git", "-C", str(repo),
+                                "config", key, value], check=True)
+            tracked = repo / "tracked"
+            tracked.write_text("original\n", encoding="ascii")
+            (repo / ".gitattributes").write_text(
+                "tracked filter=attacker\n", encoding="ascii",
+            )
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "add",
+                            "tracked", ".gitattributes"], check=True)
+            subprocess.run(["/usr/bin/git", "-C", str(repo), "commit",
+                            "-qm", "base"], check=True)
+            tracked.write_text("after\n", encoding="ascii")
+            marker, helper = root / "helper-effect", root / "clean-helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + __import__("shlex").quote(str(marker)) + "\ncat\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            raw_run = operator._run
+            injected = False
+
+            def effect_run(argv: list[str], **kwargs: object):
+                nonlocal injected
+                if not injected and "add" in argv:
+                    injected = True
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo),
+                         "config", "filter.attacker.clean", str(helper)],
+                        check=True,
+                    )
+                return raw_run(argv, **kwargs)
+
+            attempt = {
+                "schema_version": 1,
+                "owner_id": "operator:jit-clean-race",
+                "operation_id": "race",
+                "attempt_id": "1",
+                "branch": "feature",
+            }
+            with (
+                patch.object(resources, "RESOURCE_DB", resource_db),
+                patch.object(operator, "_require_operator_mutation", return_value=None),
+                patch.object(operator, "_append_effect_audit", return_value="a" * 64),
+                patch.object(operator, "_run", side_effect=effect_run),
+            ):
+                outcome = operator.grabowski_git(
+                    str(repo), ["add", "--", "tracked"], branch_attempt=attempt
+                )
+            self.assertTrue(injected, "Git add effect was never exercised")
+            self.assertEqual(outcome["returncode"], 0, outcome.get("stderr"))
+            self.assertEqual(outcome["branch_mutation"]["status"], "completed")
+            self.assertFalse(marker.exists(), "native branch-CAS Git ran attacker filter")
+            staged = subprocess.check_output(
+                ["/usr/bin/git", "-C", str(repo), "show", ":tracked"],
+            )
+            self.assertEqual(staged, b"after\n")
+            # Force a new content hash: otherwise Git may reuse its fresh index
+            # cache without invoking the control's clean filter.
+            tracked.write_text("after-unprotected-control\n", encoding="ascii")
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "add", "--", "tracked"],
+                check=True,
+            )
+            self.assertTrue(marker.exists(), "unprotected Git-add control did not execute")
+
     def test_grabowski_git_jit_add_stages_one_literal_file_without_old_preimage(self) -> None:
         operator = _load_operator_module()
         import grabowski_resources as resources
@@ -4825,6 +4905,8 @@ class OperatorContractTests(unittest.TestCase):
             operator.subprocess.run(
                 ["git", "init", "-q", "-b", "feature", str(repo)], check=True
             )
+            # Managed Git effects require a pre-existing safe attribute mountpoint.
+            (repo / ".git" / "info").mkdir(mode=0o700, exist_ok=True)
             operator.subprocess.run(
                 ["git", "-C", str(repo), "config", "user.name", "Grabowski Test"],
                 check=True,
