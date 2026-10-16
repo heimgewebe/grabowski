@@ -3154,7 +3154,11 @@ thread = threading.Thread(target=stop.wait, args=(10,), daemon=True)
 thread.start()
 assert thread.native_id not in (None, os.getpid())
 try:
-    with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+    test_home = Path.home()
+    writable_root = Path.cwd()
+    if test_home not in writable_root.parents:
+        writable_root = test_home
+    with tempfile.TemporaryDirectory(dir=writable_root) as temporary:
         root = Path(temporary)
         source = root / "source"
         source.mkdir()
