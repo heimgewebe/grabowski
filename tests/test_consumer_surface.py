@@ -864,6 +864,53 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertIn("archiv", next_action)
         self.assertNotIn("reconcile live task outcomes", next_action)
 
+    def test_overview_local_terminal_budget_requires_archival_not_reconciliation(self) -> None:
+        """A 33-unit observation budget failure must not recommend an ineffective refresh."""
+        fake_tasks = SimpleNamespace(
+            grabowski_task_list=lambda **_kwargs: {
+                "state_counts": {"completed": 33},
+                "projection_counts": {"active": 0, "terminal": 33, "attention": 0},
+                "projection_counts_overlap": False,
+                "unknown_state_count": 0,
+                "state_counts_complete": True,
+                "reconciliation_performed": False,
+                "reconciliation_evidence": {
+                    "status": "local_terminal_observation_budget_exceeded",
+                    "limit": 32,
+                },
+            },
+        )
+        fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)
+        fake_obligations = SimpleNamespace(
+            list_obligations=lambda _parameters: {
+                "record_count": 0,
+                "integrity_errors": [],
+                "scan_truncated": False,
+            },
+        )
+        with mock.patch.dict("sys.modules", {
+            "grabowski_tasks": fake_tasks,
+            "grabowski_resources": fake_resources,
+            "grabowski_operator_obligation": fake_obligations,
+        }):
+            result = grabowski_mcp._operator_system_overview(
+                runtime_healthy=True,
+                normal_mutation_path_ready=True,
+                coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                client_snapshot={
+                    "observable": True, "fresh": True, "matched": True,
+                    "server_loopback_schema_contract_matches": True,
+                    "platform_publication_state": "platform_converged",
+                    "platform_publication_pending": False,
+                },
+            )
+        self.assertFalse(result["readiness"]["truth_model_ready"])
+        self.assertFalse(result["operator_ready"])
+        advice = result["recommended_next_action"].lower()
+        self.assertIn("archiv", advice)
+        self.assertIn("terminal", advice)
+        self.assertNotIn("reconcile live task outcomes", advice)
+
     def test_operator_system_overview_keeps_execution_ready_when_publication_is_pending(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {

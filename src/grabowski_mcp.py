@@ -6574,6 +6574,21 @@ def _operator_system_overview(
             "archive independently verified terminal tasks through the "
             "authorized task-closeout-archive workflow"
         )
+    elif reconciliation_evidence.get("status") == "local_terminal_observation_budget_exceeded":
+        # A bounded local systemd probe may not silently skip terminal units.
+        # Another reconciliation cannot reduce the number of retained rows.
+        next_action = (
+            "inspect and verify current terminal tasks, then archive eligible "
+            "terminal tasks through the authorized task-closeout-archive workflow "
+            "before rechecking readiness"
+        )
+    elif reconciliation_evidence.get("status") == "local_terminal_scan_budget_exceeded":
+        # Archiving without compacting the scanned raw history cannot resolve
+        # this larger bound either; retain fail-closed readiness.
+        next_action = (
+            "inspect archived terminal task history and arrange authorized "
+            "bounded task-store history compaction before rechecking readiness"
+        )
     elif reconciliation_evidence.get("status") != "verified":
         next_action = "reconcile live task outcomes through an authorized mutation-capable path"
     elif obligations.get("integrity_error_count"):

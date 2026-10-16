@@ -6466,6 +6466,75 @@ class TaskTests(unittest.TestCase):
                 with self.assertRaises(tasks.lifecycle_projection.LifecycleProjectionIntegrityError):
                     tasks._task_reconcile_ready_privileged_rows(connection)
 
+    def test_reconcile_ready_privileged_probe_gates_all_task_scopes(self) -> None:
+        """A Rootbroker reference must not be written before every scoped blockade."""
+        task_id = str(self._start()["task"]["task_id"])
+        record = {
+            **tasks._row_raw(task_id),
+            "host": "blocked-host",
+            "cwd": "/blocked/path",
+            "lease_owner_id": "blocked-owner",
+            "execution_backend": "systemd-root-broker",
+            "systemd_scope": "system",
+        }
+        for field, blocked in (
+            ("host", "blocked-host"),
+            ("path", "/blocked/path"),
+            ("repo", "/blocked/path"),
+            ("owner_id", "blocked-owner"),
+        ):
+            with self.subTest(scope=field):
+                def gate(_capability: str, **scope: object) -> None:
+                    if scope.get(field) == blocked:
+                        raise PermissionError("task scope is blockaded")
+
+                with (
+                    patch.object(tasks.operator, "_require_operator_mutation", side_effect=gate),
+                    patch.object(tasks.privileged, "root_task_systemd_request") as broker,
+                ):
+                    with self.assertRaisesRegex(PermissionError, "task scope is blockaded"):
+                        tasks._publish_task_reconcile_ready_evidence(
+                            {"privileged_records": [record]}
+                        )
+                    broker.assert_not_called()
+
+    def test_reconcile_ready_terminal_budget_reports_archival_instead_of_retry(self) -> None:
+        """A complete reconcile cannot make 33 current terminal rows fit a 32-unit probe budget."""
+        with tasks._database_connection():
+            pass
+        with closing(tasks.resources._database()):
+            pass
+        for _ in range(tasks.TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT + 1):
+            self._start()
+        with tasks._database_connection() as connection:
+            connection.execute("UPDATE tasks SET state='completed'")
+        complete = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        for _ in range(2):
+            with (
+                patch.object(tasks.operator, "_require_operator_mutation"),
+                patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=complete),
+                patch.object(tasks.base, "_append_audit"),
+            ):
+                tasks._task_reconcile_refresh_after_guard("")
+            with tasks._task_readonly_snapshot() as connection:
+                result = tasks._task_reconcile_ready_evidence_snapshot(connection)
+            self.assertEqual(
+                "local_terminal_observation_budget_exceeded", result["status"]
+            )
+            self.assertEqual(
+                tasks.TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT, result["limit"]
+            )
+
     def test_reconcile_ready_proof_requires_authorized_quiescent_refresh_and_current_revisions(self) -> None:
         # Build both existing stores without launching a process.
         with tasks._database_connection():
@@ -11193,6 +11262,59 @@ class TaskTests(unittest.TestCase):
                 before,
                 {str(path): (path.stat().st_mtime_ns, path.read_bytes()) for path in files},
             )
+        finally:
+            keeper.close()
+
+    def test_task_scope_wal_waits_never_hold_the_task_mutation_lock(self) -> None:
+        """Committed WAL-only tasks remain fail-closed, without serializing other task mutations."""
+        with tasks._database_connection():
+            pass
+        keeper = sqlite3.connect(tasks.TASK_DB)
+        try:
+            keeper.execute("PRAGMA wal_autocheckpoint=0")
+            keeper.execute("SELECT COUNT(*) FROM tasks").fetchone()
+            task_id = str(self._start(host="remote")["task"]["task_id"])
+            self.assertIsNone(tasks._task_scope_main_file_row(task_id))
+            self.assertIsNotNone(
+                keeper.execute(
+                    "SELECT task_id FROM tasks WHERE task_id=?", (task_id,)
+                ).fetchone()
+            )
+            for name, call in (
+                ("status", lambda: tasks.grabowski_task_status(task_id)),
+                ("logs", lambda: tasks.grabowski_task_logs(task_id, max_lines=5)),
+            ):
+                lock_depths: list[int] = []
+                with (
+                    self.subTest(tool=name),
+                    patch.object(tasks.operator, "_require_operator_mutation"),
+                    patch.object(
+                        tasks.time, "sleep",
+                        side_effect=lambda _s: lock_depths.append(
+                            int(getattr(tasks._TASK_MUTATION_LOCK_STATE, "depth", 0))
+                        ),
+                    ),
+                    patch.object(
+                        tasks, "_database_connection",
+                        side_effect=AssertionError("mutable open before scoped gate"),
+                    ) as mutable,
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "not yet checkpointed"):
+                        call()
+                    self.assertEqual(
+                        [0] * (tasks.TASK_SCOPE_SNAPSHOT_ATTEMPTS - 1),
+                        lock_depths,
+                    )
+                    mutable.assert_not_called()
+            # A nested authorized caller already holding the lock may not
+            # poll/wait while serializing other task writes.
+            with (
+                tasks._task_mutation_lock(),
+                patch.object(tasks.time, "sleep") as pause,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "not yet checkpointed"):
+                    tasks._task_scope_snapshot(task_id)
+                pause.assert_not_called()
         finally:
             keeper.close()
 
