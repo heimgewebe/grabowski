@@ -11046,6 +11046,100 @@ class TaskTests(unittest.TestCase):
         broker.assert_not_called()
         dispatch.assert_not_called()
 
+    def _scoped_blockade_gate(self, calls: list[dict[str, object]]):
+        def gate(capability: str, **scope: object) -> None:
+            calls.append({"capability": capability, **scope})
+            if "host" in scope:
+                raise PermissionError("test scoped blockade")
+        return gate
+
+    def test_task_logs_applies_task_scope_blockade_before_recovery_and_reads(self) -> None:
+        record = self._start(host="remote")["task"]
+        task_id = str(record["task_id"])
+        persisted = tasks._row_raw(task_id)
+        calls: list[dict[str, object]] = []
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=self._scoped_blockade_gate(calls),
+            ),
+            patch.object(
+                tasks, "_recover_task_terminalization",
+                side_effect=AssertionError("recovery before scoped gate"),
+            ) as recovery,
+            patch.object(
+                tasks, "_read_task_output_files",
+                side_effect=AssertionError("output read before scoped gate"),
+            ) as output,
+            patch.object(
+                tasks.privileged, "root_task_systemd_request",
+                side_effect=AssertionError("broker before scoped gate"),
+            ) as broker,
+            patch.object(
+                tasks, "_dispatch", side_effect=AssertionError("dispatch before scoped gate")
+            ) as dispatch,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test scoped blockade"):
+                tasks.grabowski_task_logs(task_id, max_lines=5)
+        self.assertEqual(
+            [
+                {"capability": "durable_job", "task_id": task_id},
+                {
+                    "capability": "durable_job",
+                    "path": persisted["cwd"],
+                    "repo": persisted["cwd"],
+                    "task_id": task_id,
+                    "owner_id": persisted.get("lease_owner_id"),
+                    "host": persisted["host"],
+                },
+            ],
+            calls,
+        )
+        recovery.assert_not_called()
+        output.assert_not_called()
+        broker.assert_not_called()
+        dispatch.assert_not_called()
+
+    def test_task_status_applies_task_scope_blockade_before_observation(self) -> None:
+        record = self._start(host="remote")["task"]
+        task_id = str(record["task_id"])
+        persisted = tasks._row_raw(task_id)
+        calls: list[dict[str, object]] = []
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=self._scoped_blockade_gate(calls),
+            ),
+            patch.object(
+                tasks, "_recover_task_terminalization",
+                side_effect=AssertionError("recovery before scoped gate"),
+            ) as recovery,
+            patch.object(
+                tasks, "_observe", side_effect=AssertionError("observation before scoped gate")
+            ) as observe,
+            patch.object(
+                tasks, "_maintain_record_resources",
+                side_effect=AssertionError("lease work before scoped gate"),
+            ) as leases,
+        ):
+            with self.assertRaisesRegex(PermissionError, "test scoped blockade"):
+                tasks.grabowski_task_status(task_id)
+        self.assertEqual(
+            {
+                "capability": "durable_job",
+                "path": persisted["cwd"],
+                "repo": persisted["cwd"],
+                "task_id": task_id,
+                "owner_id": persisted.get("lease_owner_id"),
+                "host": persisted["host"],
+            },
+            calls[-1],
+        )
+        self.assertTrue(all("host" not in call for call in calls[:-1]))
+        recovery.assert_not_called()
+        observe.assert_not_called()
+        leases.assert_not_called()
+
     def test_task_schema_only_inventory_reports_migration_without_mutation(self) -> None:
         self._create_task_schema_version("2")
         before = self.database.read_bytes()

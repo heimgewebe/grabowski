@@ -7199,6 +7199,26 @@ def _row(task_id: str) -> dict[str, Any]:
     recovered = _recover_task_terminalization(identifier)
     return recovered if recovered is not None else _row_raw(identifier)
 
+
+def _require_task_scoped_mutation(record: dict[str, Any], task_id: str) -> None:
+    """Apply host, owner, path and repository blockades of one persisted task."""
+    operator._require_operator_mutation(
+        "durable_job",
+        path=record["cwd"],
+        repo=record["cwd"],
+        task_id=task_id,
+        owner_id=record.get("lease_owner_id"),
+        host=record["host"],
+    )
+
+
+@_serialize_task_mutation
+def _task_logs_row_after_scoped_gate(task_id: str) -> dict[str, Any]:
+    # Bind the persisted task scope before terminalization recovery; the later
+    # broker or fleet read only runs for a scope that passed the blockade gate.
+    _require_task_scoped_mutation(_row_raw(task_id), task_id)
+    return _row(task_id)
+
 def _task_systemd_unit_health(
     state: str,
     observation: dict[str, Any] | None,
@@ -9847,6 +9867,9 @@ def _task_status_after_mutation_guard(task_id: str) -> dict[str, Any]:
     # Revalidate after the shared task lock: authority may change while waiting.
     # No read, lease maintenance or state change may happen before this gate.
     operator._require_operator_mutation("durable_job", task_id=task_id)
+    # Host, owner, path and repository blockades need the persisted scope;
+    # read it without terminalization recovery, then recheck before effects.
+    _require_task_scoped_mutation(_row_raw(task_id), task_id)
     record = _row(task_id)
     observation = _observe(record)
     effective_state = _effective_observed_state(record, observation["state"])
@@ -9950,7 +9973,7 @@ def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
     # _row() takes the task-mutation lock and may recover terminalizations;
     # Rootbroker journal reads write a reference file and fleet reads use SSH.
     operator._require_operator_mutation("durable_job", task_id=task_id)
-    record = _row(task_id)
+    record = _task_logs_row_after_scoped_gate(task_id)
     output_source = "root-journal-v1"
     if _is_root_systemd_backend(record):
         result = privileged.root_task_systemd_request(
