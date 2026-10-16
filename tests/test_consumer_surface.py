@@ -1002,6 +1002,34 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertIn("no more", next_action)
         self.assertFalse(result["operator_ready"])
 
+        # An excess beyond the archive headroom cannot be archived away.
+        evidence = fake_tasks.grabowski_task_list()["reconciliation_evidence"]
+        over = SimpleNamespace(
+            grabowski_task_list=lambda **kwargs: {
+                **fake_tasks.grabowski_task_list(**kwargs),
+                "reconciliation_evidence": {**evidence, "archive_headroom": 7},
+            },
+        )
+        with mock.patch.dict("sys.modules", {
+            "grabowski_tasks": over,
+            "grabowski_resources": fake_resources,
+            "grabowski_operator_obligation": fake_obligations,
+        }):
+            capped = grabowski_mcp._operator_system_overview(
+                runtime_healthy=True,
+                normal_mutation_path_ready=True,
+                coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                client_snapshot={
+                    "observable": True, "fresh": True, "matched": True,
+                    "server_loopback_schema_contract_matches": True,
+                    "platform_publication_state": "platform_converged",
+                    "platform_publication_pending": False,
+                },
+            )
+        capped_action = capped["recommended_next_action"].lower()
+        self.assertIn("compaction", capped_action)
+        self.assertNotIn("task-closeout-archive", capped_action)
+
     def test_operator_system_overview_keeps_execution_ready_when_publication_is_pending(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {

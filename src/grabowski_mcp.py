@@ -6576,10 +6576,19 @@ def _operator_system_overview(
         )
     elif (
         reconciliation_evidence.get("status") == "local_terminal_budget_exceeded"
-        and reconciliation_evidence.get("budget") == "scan"
+        and (
+            reconciliation_evidence.get("budget") == "scan"
+            or (
+                type(reconciliation_evidence.get("archive_excess")) is int
+                and type(reconciliation_evidence.get("archive_headroom")) is int
+                and reconciliation_evidence["archive_excess"]
+                > reconciliation_evidence["archive_headroom"]
+            )
+        )
     ):
         # Archived task rows stay in the live task table and still count toward
         # the readiness scan; neither reconciliation nor archival shrinks it.
+        # An observed excess beyond the archive headroom cannot be archived.
         next_action = (
             "retained terminal task history exceeds the readiness scan budget "
             "and archival cannot reduce it; escalate an authorized bounded "
