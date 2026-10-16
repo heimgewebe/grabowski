@@ -8303,6 +8303,15 @@ def _start_job(
         "GRABOWSKI_JOB_STDERR_PATH": finalization_contract["receipt_paths"]["stderr"],
         "GRABOWSKI_JOB_FINALIZATION_PATH": finalization_contract["receipt_paths"]["finalization"],
     }
+    if allow_reserved_runtime_deploy:
+        # Isolate pycache before interpreter startup, not after imports.
+        # The fixed /usr/bin/python3 worker needs pinned user-site PyYAML.
+        # This alone cannot attest mutable Python source or sourceless .pyc.
+        environment.update({
+            "PYTHONPYCACHEPREFIX": "/dev/null/grabowski-runtime-deploy",
+            "PYTHONPATH": "",
+            "PYTHONHOME": "",
+        })
     if (
         decision_review_binding is not None
         and scope.get("decision_review_provenance", {}).get("schema_version") == 2
