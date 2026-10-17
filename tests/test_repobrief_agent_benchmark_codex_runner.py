@@ -3476,6 +3476,57 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
         """
         if sys.platform != "linux" or not Path("/usr/bin/bwrap").is_file():
             self.skipTest("Linux bubblewrap is required")
+        # Ubuntu's bwrap-userns-restrict AppArmor profile allows one sandbox
+        # level but deliberately denies a *second* user namespace below it.
+        # Probe that precise outer->inner capability without trusted runner
+        # code or provider calls. Only a kernel permission-denied result may
+        # skip the positive nested subcase; unexpected errors still fail CI.
+        # The negative nested Codex-failure path always runs.
+        try:
+            nested_kernel_probe = subprocess.run(
+                [
+                    "/usr/bin/bwrap",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--unshare-pid",
+                    "--unshare-ipc",
+                    "--die-with-parent",
+                    "--proc",
+                    "/proc",
+                    "--dev",
+                    "/dev",
+                    "--",
+                    "/usr/bin/bwrap",
+                    "--unshare-user",
+                    "--unshare-pid",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--proc",
+                    "/proc",
+                    "--dev",
+                    "/dev",
+                    "--",
+                    "/bin/true",
+                ],
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.fail(
+                f"nested kernel capability preflight unavailable: {type(exc).__name__}"
+            )
+        kernel_denial = nested_kernel_probe.stderr[-2048:].decode(
+            "utf-8", errors="replace"
+        )
+        nested_userns_available = nested_kernel_probe.returncode == 0
+        if not nested_userns_available and not any(
+            marker in kernel_denial.lower()
+            for marker in ("permission denied", "operation not permitted")
+        ):
+            self.fail("nested kernel preflight failed for an unclassified reason")
         inner = (
             "import os,sys,subprocess\nfrom pathlib import Path\n"
             "source,state,home,outer_pid,outer_user=sys.argv[1:]\n"
@@ -3499,6 +3550,12 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     prefix="rab-nested-kernel-", dir=str(Path.home())
                 ) as temporary,
             ):
+                if not reject and not nested_userns_available:
+                    self.skipTest(
+                        "host AppArmor/kernel denies nested user namespaces; "
+                        "positive provider-free smoke remains mandatory on "
+                        "the supported production qualification host"
+                    )
                 root = Path(temporary)
                 source = root / "source"
                 source.mkdir()
