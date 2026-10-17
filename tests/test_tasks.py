@@ -11377,11 +11377,13 @@ class TaskTests(unittest.TestCase):
         for observed_state, systemd_result in (
             ("completed", "success"),
             ("failed", "exit-code"),
+            ("failed", "oom-kill"),
+            ("failed", "start-limit-hit"),
             ("signalled", "signal"),
             ("timed_out", "timeout"),
         ):
             with (
-                self.subTest(terminal=observed_state),
+                self.subTest(terminal=observed_state, result=systemd_result),
                 patch.object(
                     tasks, "_resolve_task_dispatch_host",
                     return_value=("local", {"transport": "local"}, False),
