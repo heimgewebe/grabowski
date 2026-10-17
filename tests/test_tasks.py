@@ -11474,6 +11474,49 @@ class TaskTests(unittest.TestCase):
             self.assertEqual("cancelled", result["persisted_state"])
         self.assertEqual(before, self.database.read_bytes())
 
+    def test_cancelled_peek_truncated_systemd_probe_fails_closed(self) -> None:
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='cancelled' WHERE task_id=?",
+                (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        for bad_field in ("stdout_truncated", "stderr_truncated"):
+            with (
+                self.subTest(bad_field=bad_field),
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(tasks, "_observe", return_value={
+                    "state": "failed",
+                    "properties": {
+                        "LoadState": "loaded", "ActiveState": "failed",
+                        "SubState": "failed", "Result": "oom-kill",
+                    },
+                    "probe": {
+                        "returncode": 0, "timed_out": False,
+                        "stdout_truncated": bad_field == "stdout_truncated",
+                        "stderr_truncated": bad_field == "stderr_truncated",
+                    },
+                    "observer": {
+                        "kind": "bound-local-user-systemd-show-v1",
+                        "transport": "local",
+                    },
+                    "observed_at_unix": tasks._now(),
+                }),
+                patch.object(
+                    tasks, "_set_state",
+                    side_effect=AssertionError("READ_ONLY may not write"),
+                ),
+            ):
+                peek = tasks.grabowski_task_peek(task["task_id"])
+            self.assertEqual("observation_error", peek["state"])
+            self.assertTrue(peek["reconcile_required"])
+            self.assertEqual("cancelled", peek["persisted_state"])
+        self.assertEqual(before, self.database.read_bytes())
+
     def test_task_peek_terminal_unknown_observation_fails_closed(self) -> None:
         task = self._start()["task"]
         with tasks._database_connection() as connection:

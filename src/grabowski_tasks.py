@@ -12467,6 +12467,10 @@ def _task_reconcile_ready_local_terminal_observed(
         or probe["returncode"] != 0
         or probe.get("timed_out")
         or probe.get("outcome_unknown")
+        # A partial systemctl show response cannot prove quiescence even if
+        # its prefix contains plausible ActiveState/Result properties.
+        or probe.get("stdout_truncated") not in (None, False)
+        or probe.get("stderr_truncated") not in (None, False)
         or not isinstance(props, dict)
     ):
         return False
