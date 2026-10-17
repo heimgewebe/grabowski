@@ -6920,6 +6920,9 @@ class TaskTests(unittest.TestCase):
                 "status": "local_terminal_budget_exceeded",
                 "budget": "observation",
                 "local_terminal_limit": limit,
+                "current_local_terminal_count": limit + 1,
+                "archive_excess": 1,
+                "archive_headroom": tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT,
             },
             status,
         )
@@ -6932,6 +6935,85 @@ class TaskTests(unittest.TestCase):
         scan_probe.assert_not_called()
         self.assertEqual("local_terminal_budget_exceeded", scan["status"])
         self.assertEqual("scan", scan["budget"])
+
+    def test_reconcile_ready_scan_budget_is_classified_by_total_not_first_trip(self) -> None:
+        # Archived rows are never deleted and still count toward the scan. A
+        # total above the scan budget must read as "scan" even though the
+        # observation check would trip first, or archival advice would push
+        # the archive history over its budget instead of fitting.
+        with patch.object(tasks, "TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT", 8):
+            status, probe = self._local_terminal_readiness_status(41)
+        probe.assert_not_called()
+        self.assertEqual(
+            {
+                "status": "local_terminal_budget_exceeded",
+                "budget": "scan",
+                "local_terminal_limit": 32,
+                "scan_limit": 40,
+            },
+            status,
+        )
+
+    def test_reconcile_ready_observation_excess_fits_archive_headroom(self) -> None:
+        with patch.object(tasks, "TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT", 8):
+            status, probe = self._local_terminal_readiness_status(40)
+        probe.assert_not_called()
+        self.assertEqual("observation", status["budget"])
+        self.assertEqual(40, status["current_local_terminal_count"])
+        self.assertEqual(8, status["archive_excess"])
+        # Within the scan budget, archiving exactly the excess always fits.
+        self.assertLessEqual(status["archive_excess"], status["archive_headroom"])
+
+    def test_remote_terminal_cohort_has_bounded_count_and_zero_local_probes(self) -> None:
+        self._local_terminal_readiness_store(33)
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh"}, False),
+            ),
+            patch.object(
+                tasks, "_observe",
+                side_effect=AssertionError("remote units cannot be local-probed"),
+            ) as probe,
+            patch.object(
+                tasks, "_dispatch",
+                side_effect=AssertionError("READ_ONLY must not dispatch"),
+            ) as dispatch,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual(
+            {
+                "status": "local_terminal_transport_unverified",
+                "non_local_terminal_count": 33,
+                "archive_headroom": tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT,
+            },
+            status,
+        )
+        probe.assert_not_called()
+        dispatch.assert_not_called()
+
+    def test_remote_terminal_cohort_reports_exhausted_history_budget(self) -> None:
+        self._local_terminal_readiness_store(2)
+        with (
+            patch.object(tasks, "TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT", 0),
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh"}, False),
+            ),
+            patch.object(tasks, "_observe") as probe,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual(
+            {
+                "status": "local_terminal_transport_unverified",
+                "non_local_terminal_count": 2,
+                "archive_headroom": 0,
+            },
+            status,
+        )
+        probe.assert_not_called()
 
     def test_reconcile_ready_publication_applies_task_scope_before_rootbroker(self) -> None:
         record = {

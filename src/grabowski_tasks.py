@@ -12244,16 +12244,17 @@ TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT = 32
 
 
 class TaskReconcileReadyLocalTerminalBudgetExceeded(RuntimeError):
-    """More current local terminal tasks exist than READ_ONLY may observe."""
+    """Retained terminal tasks exceed a bounded READ_ONLY readiness budget."""
 
-    def __init__(self, budget: str) -> None:
+    def __init__(self, budget: str, **counts: int) -> None:
         super().__init__(f"Local terminal readiness {budget} budget exceeded")
         self.budget = budget
+        self.counts = counts
 
 
 def _task_reconcile_ready_local_terminal_rows(
     connection: sqlite3.Connection,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int, int]:
     projection = _task_current_projection(readiness_bounded=True)
     bindings = projection.get("archived_task_bindings")
     if not isinstance(bindings, dict) or len(bindings) > TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT:
@@ -12267,16 +12268,33 @@ def _task_reconcile_ready_local_terminal_rows(
         TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT
         + TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT
     )
+    # Archived rows are never deleted and still count toward the scan. Classify
+    # the scan budget from the bounded total, not from whichever check trips
+    # first: only within it can archiving the observed excess ever fit.
+    terminal_total = connection.execute(
+        f"SELECT COUNT(*) FROM (SELECT 1 FROM tasks WHERE state IN ({placeholders}) "
+        "LIMIT ?)",
+        (*terminal_states, scan_limit + 1),
+    ).fetchone()[0]
+    if terminal_total > scan_limit:
+        raise TaskReconcileReadyLocalTerminalBudgetExceeded(
+            "scan", scan_limit=scan_limit,
+        )
     cursor = connection.execute(
         f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
         "ORDER BY task_id LIMIT ?",
         (*terminal_states, scan_limit + 1),
     )
     selected: list[dict[str, Any]] = []
+    current_local = 0
+    non_local = 0
+    host_transports: dict[str, str] = {}
     try:
         for examined, raw in enumerate(cursor, start=1):
             if examined > scan_limit:
-                raise TaskReconcileReadyLocalTerminalBudgetExceeded("scan")
+                raise TaskReconcileReadyLocalTerminalBudgetExceeded(
+                    "scan", scan_limit=scan_limit,
+                )
             record = dict(raw)
             current = lifecycle_projection.bounded_current_task_projection(
                 [_task_archive_record(record)], projection=projection,
@@ -12285,12 +12303,37 @@ def _task_reconcile_ready_local_terminal_rows(
                 continue
             if _execution_backend(record) != "systemd-user" or _systemd_scope(record) != "user":
                 raise RuntimeError("Local terminal task has unsupported systemd authority")
-            selected.append(record)
-            if len(selected) > TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT:
-                raise TaskReconcileReadyLocalTerminalBudgetExceeded("observation")
+            # Do not spend the 32 local-systemd observation slots on SSH
+            # units. A remote terminal cohort is never certifiable by this
+            # read-only local observer, regardless of its size.
+            host = str(record["host"])
+            if host not in host_transports:
+                _, target, _ = _resolve_task_dispatch_host(host)
+                host_transports[host] = str(target.get("transport") or "")
+            if host_transports[host] != "local":
+                non_local += 1
+                continue
+            current_local += 1
+            if current_local <= TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT:
+                selected.append(record)
     finally:
         cursor.close()
-    return selected
+    # Each closeout adds one binding and one switch. Already archived rows
+    # cannot be archived again; only the remaining room may be recommended.
+    archived = max(len(bindings), len(projection.get("switches") or ()))
+    headroom = TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - archived
+    if not 0 <= headroom <= TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT:
+        raise RuntimeError("Readiness archive history exceeds safety budget")
+    if non_local:
+        return selected, non_local, headroom
+    if current_local > TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT:
+        raise TaskReconcileReadyLocalTerminalBudgetExceeded(
+            "observation",
+            current_local_terminal_count=current_local,
+            archive_excess=current_local - TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT,
+            archive_headroom=headroom,
+        )
+    return selected, 0, headroom
 
 
 def _task_reconcile_ready_local_terminal_observed(
@@ -12438,13 +12481,18 @@ def _task_reconcile_ready_evidence_snapshot(
         # A terminal SQLite row can become live again without changing any
         # stored revision. Bind each retained local user-systemd unit to a
         # fresh, strictly non-dispatching read-only observation.
-        local_terminal_records = _task_reconcile_ready_local_terminal_rows(
-            task_connection
-        )
+        (
+            local_terminal_records, non_local_terminal_count, archive_headroom,
+        ) = _task_reconcile_ready_local_terminal_rows(task_connection)
+        if non_local_terminal_count:
+            # No remote execution or dispatch in a READ_ONLY readiness query.
+            # A valid remote closeout requires an authorized fresh live probe.
+            return {
+                "status": "local_terminal_transport_unverified",
+                "non_local_terminal_count": non_local_terminal_count,
+                "archive_headroom": archive_headroom,
+            }
         for record in local_terminal_records:
-            _, target, _ = _resolve_task_dispatch_host(str(record["host"]))
-            if target.get("transport") != "local":
-                return {"status": "local_terminal_transport_unverified"}
             observed = _observe(record, bound_local_user=True)
             if not _task_reconcile_ready_local_terminal_observed(record, observed):
                 return {"status": "local_terminal_live_unverified"}
@@ -12474,11 +12522,13 @@ def _task_reconcile_ready_evidence_snapshot(
         return {"status": "verified", "reconciled_at_unix": timestamp}
     except TaskReconcileReadyLocalTerminalBudgetExceeded as exc:
         # Unobserved units are never ready. Repeating reconciliation cannot
-        # shrink this cohort; archiving verified terminal tasks can.
+        # shrink either budget. Archiving verified terminal tasks shrinks the
+        # observed cohort only: archived rows still count toward the scan.
         return {
             "status": "local_terminal_budget_exceeded",
             "budget": exc.budget,
             "local_terminal_limit": TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT,
+            **exc.counts,
         }
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, sqlite3.Error) as exc:
         return {"status": "unavailable", "error_type": type(exc).__name__}
