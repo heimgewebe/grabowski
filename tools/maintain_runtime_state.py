@@ -198,6 +198,8 @@ def _archive_file_shape_preflight(directory: Path) -> None:
     directory = _private_directory(directory)
     files = 0
     for path in directory.rglob("*"):
+        if path == directory / "archive-manifest.json":
+            continue
         if path.is_symlink():
             raise RuntimeError(f"archive source contains a symlink: {path}")
         if path.is_dir():

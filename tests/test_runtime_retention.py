@@ -937,7 +937,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                     failed_units=[bad_unit, good_unit],
                     unit_states=states,
                 )
-                _, _, _, prepared = RETENTION._prepare_archives(plan)
+                with patch.object(RETENTION, "_systemd_unit_states", return_value=states):
+                    _, _, _, prepared = RETENTION._prepare_archives(plan)
             self.assertEqual([item["unit"] for item in plan["archive_jobs"]], [good_unit])
             self.assertEqual([item["record"]["unit"] for item in prepared], [good_unit])
             self.assertNotIn(bad_unit, plan["reset_failed_units"])
@@ -1003,7 +1004,8 @@ class RuntimeRetentionTests(unittest.TestCase):
                             failed_units=[bad_unit, good_unit],
                             unit_states=states,
                         )
-                        _, _, _, prepared = RETENTION._prepare_archives(plan)
+                        with patch.object(RETENTION, "_systemd_unit_states", return_value=states):
+                            _, _, _, prepared = RETENTION._prepare_archives(plan)
 
                     blocked_reasons = [
                         item["reason"] for item in plan["blocked"]
@@ -1042,6 +1044,47 @@ class RuntimeRetentionTests(unittest.TestCase):
                         self.assertEqual(stderr.stat().st_mode & 0o777, 0o644)
                     else:
                         self.assertEqual(extra.read_bytes(), b"counted, never deleted\n")
+
+    def test_stale_internal_archive_manifest_does_not_exhaust_file_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            retry_name = "grabowski-job-000000000001"
+            good_name = "grabowski-job-000000000002"
+            retry_unit = retry_name + ".service"
+            good_unit = good_name + ".service"
+            retry_job = self._job(jobs, retry_name, 100)
+            self._job(jobs, good_name, 101)
+            stale_manifest = retry_job / "archive-manifest.json"
+            original = b'{"retry":true}\n'
+            stale_manifest.write_bytes(original)
+            stale_manifest.chmod(0o600)
+            states = {unit: self._state(unit) for unit in (retry_unit, good_unit)}
+            with patch.object(RETENTION, "MAX_ARCHIVE_FILES", 3):
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50,
+                    max_archive_jobs=2,
+                    now=1_000,
+                    jobs_root=jobs,
+                    archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=root / "missing.sqlite3",
+                    failed_units=[retry_unit, good_unit],
+                    unit_states=states,
+                )
+                with patch.object(RETENTION, "_systemd_unit_states", return_value=states):
+                    _, _, _, prepared = RETENTION._prepare_archives(plan)
+            self.assertEqual(
+                [item["unit"] for item in plan["archive_jobs"]],
+                [retry_unit, good_unit],
+            )
+            self.assertEqual(
+                [item["record"]["unit"] for item in prepared],
+                [retry_unit, good_unit],
+            )
+            self.assertNotIn(retry_unit, [item["unit"] for item in plan["blocked"]])
+            self.assertEqual(plan["reset_failed_units"], [retry_unit, good_unit])
+            self.assertEqual(stale_manifest.read_bytes(), original)
 
     def test_periodic_noop_keeps_oversized_artifact_blocker_visible(self) -> None:
         blocked = [{"unit": "grabowski-job-000000000001.service",
