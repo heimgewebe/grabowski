@@ -7180,7 +7180,7 @@ def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
             executable=index == 0,
         )
         if (
-            current["identity"] != file_binding["identity"]
+            tuple(current["identity"]) != tuple(file_binding["identity"])
             or current["sha256"] != file_binding["sha256"]
         ):
             raise RunnerError(f"staged {label} changed during execution")
@@ -7190,7 +7190,7 @@ def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
         executable=False,
     )
     if (
-        current_manifest["identity"] != manifest_binding["identity"]
+        tuple(current_manifest["identity"]) != tuple(manifest_binding["identity"])
         or current_manifest["sha256"] != manifest_binding["sha256"]
     ):
         raise RunnerError("staged MCP bundle manifest changed during execution")
@@ -7201,7 +7201,7 @@ def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
             executable=False,
         )
         if (
-            current["identity"] != file_binding["identity"]
+            tuple(current["identity"]) != tuple(file_binding["identity"])
             or current["sha256"] != file_binding["sha256"]
         ):
             raise RunnerError("staged MCP bundle artifact changed during execution")
@@ -7212,7 +7212,7 @@ def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
             executable=False,
         )
         if (
-            current["identity"] != file_binding["identity"]
+            tuple(current["identity"]) != tuple(file_binding["identity"])
             or current["sha256"] != file_binding["sha256"]
         ):
             raise RunnerError("staged RepoGround MCP source changed during execution")
@@ -7330,6 +7330,55 @@ def _pin_treatment_arguments(
     arguments["stem"] = None
 
 
+def _prepared_mcp_upstream_from_parent(
+    stage_text: str, manifest: Path
+) -> dict[str, Any]:
+    """Accept only a parent-staged MCP closure on a kernel-readonly mount.
+
+    All executable bytes are staged before provider intent. This child never
+    writes executable files or trusts a final digest to cover a transient edit.
+    """
+    try:
+        stage = json.loads(stage_text)
+    except (TypeError, ValueError) as exc:
+        raise RunnerError("MCP upstream requires parent-prepared stage") from exc
+    if not isinstance(stage, dict) or not isinstance(stage.get("argv"), list):
+        raise RunnerError("MCP upstream requires parent-prepared stage")
+    try:
+        root = Path(stage["runtime_dir"])
+        state = manifest.parents[2]
+        staged_manifest = Path(stage["manifest_binding"]["path"])
+        home_text = os.environ.get("CODEX_HOME")
+        if (
+            not root.is_absolute()
+            or not manifest.is_absolute()
+            or manifest.parent.parent != state / "repoground-manifest-runtime"
+            or root.parent != state / "repoground-mcp-upstream-runtime"
+            or not root.name.startswith("upstream-")
+            or staged_manifest.parent != root / "manifest"
+            or staged_manifest
+            != Path(stage["argv"][stage["argv"].index("--bundle-root") + 1])
+            or (home_text is not None and Path(home_text).parents[1] != state)
+            or (
+                home_text is not None
+                and (root == Path(home_text) or Path(home_text) in root.parents)
+            )
+        ):
+            raise RunnerError("MCP prepared-stage physical binding is invalid")
+    except (KeyError, IndexError, TypeError, ValueError, AttributeError) as exc:
+        raise RunnerError("MCP prepared-stage physical binding is invalid") from exc
+    if not hasattr(os, "ST_RDONLY"):
+        raise RunnerError("MCP prepared stage requires kernel readonly evidence")
+    for path in (root, manifest, staged_manifest):
+        try:
+            if not os.statvfs(path).f_flag & os.ST_RDONLY:
+                raise RunnerError("MCP prepared stage is provider-writable")
+        except OSError as exc:
+            raise RunnerError("MCP prepared stage mount is unavailable") from exc
+    _revalidate_staged_mcp_upstream(stage)
+    return stage
+
+
 def run_mcp_proxy(
     upstream: Sequence[str],
     manifest_text: str,
@@ -7373,18 +7422,9 @@ def run_mcp_proxy(
         manifest_metadata.st_size,
         manifest_metadata.st_mode,
     )
-    if profile == MCP_PROFILE_FROZEN_G1:
-        upstream_stage = stage_mcp_upstream(
-            Path(runtime_root_text),
-            upstream,
-            manifest,
-            authorized_files,
-            legacy_g1=True,
-        )
-    else:
-        upstream_stage = stage_mcp_upstream(
-            Path(runtime_root_text), upstream, manifest, authorized_files
-        )
+    # The provider-controlled process must never stage executable bytes.
+    # The root-owned parent prepared and bound the entire closure before intent.
+    upstream_stage = _prepared_mcp_upstream_from_parent(runtime_root_text, manifest)
     bound_upstream = [str(item) for item in upstream_stage["argv"]]
     staged_manifest = Path(upstream_stage["manifest_binding"]["path"])
     process: subprocess.Popen[bytes] | None = None
@@ -7747,9 +7787,8 @@ def run_mcp_proxy(
                 cleanup_failures.append(
                     f"stderr-thread-join:{type(cleanup_exc).__name__}"
                 )
-        stage_cleanup_error = cleanup_staged_mcp_upstream(upstream_stage)
-        if stage_cleanup_error is not None:
-            cleanup_failures.append(f"stage-cleanup:{stage_cleanup_error}")
+        # The trusted parent owns staged executable cleanup. The untrusted
+        # provider namespace is readonly and must not remove that closure.
         if cleanup_failures:
             raise RunnerError(
                 "MCP upstream setup failed and cleanup was incomplete: "
@@ -7977,11 +8016,9 @@ def run_mcp_proxy(
         if upstream_stderr:
             sys.stderr.buffer.write(bytes(upstream_stderr))
             sys.stderr.buffer.flush()
-        upstream_cleanup_error = cleanup_staged_mcp_upstream(upstream_stage)
-        if upstream_cleanup_error is not None:
-            raise RunnerError(
-                f"MCP upstream private runtime cleanup failed: {upstream_cleanup_error}"
-            )
+        # The immutable staged tree remains parent-owned until the provider
+        # group has exited and the trusted parent can revalidate and remove it.
+        _revalidate_staged_mcp_upstream(upstream_stage)
         current_manifest = _read_bound_regular_file(
             manifest, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
         )
@@ -8085,6 +8122,51 @@ def _bootstrap_program_text() -> str:
         raise RunnerError("Codex immutable source bootstrap is not UTF-8") from exc
 
 
+def _mcp_stage_wire(value: Any) -> Any:
+    """Serialize only validated stage metadata, never ambient object reprs."""
+    if isinstance(value, Path):
+        return str(value)
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_mcp_stage_wire(item) for item in value]
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise RunnerError("MCP stage transport keys are invalid")
+        return {key: _mcp_stage_wire(item) for key, item in value.items()}
+    raise RunnerError("MCP stage transport contains unsupported data")
+
+
+def _treatment_mcp_upstream_command(
+    request: Mapping[str, Any],
+    checkout: Path,
+    source: Path | None,
+    manifest_path: Path,
+) -> list[str]:
+    binding = request["repobrief"]
+    upstream = [str(item) for item in binding["mcp_command"]]
+    if upstream.count("--bundle-root") != 1:
+        raise RunnerError("treatment MCP command bundle root is invalid")
+    bundle_index = upstream.index("--bundle-root")
+    if bundle_index + 1 >= len(upstream):
+        raise RunnerError("treatment MCP command bundle root is invalid")
+    upstream[bundle_index + 1] = str(manifest_path)
+    if base.validated_setup(request) == "dirty":
+        if upstream.count("--repo-root") != 1:
+            raise RunnerError("dirty treatment requires exactly one MCP --repo-root")
+        repo_index = upstream.index("--repo-root")
+        if (
+            repo_index + 1 >= len(upstream)
+            or source is None
+            or Path(upstream[repo_index + 1]).expanduser().resolve() != source.resolve()
+        ):
+            raise RunnerError(
+                "dirty treatment MCP source is not the bound clean checkout"
+            )
+        upstream[repo_index + 1] = str(checkout)
+    return upstream
+
+
 def build_command(
     request: Mapping[str, Any],
     codex: str,
@@ -8097,6 +8179,7 @@ def build_command(
     manifest_path: Path | None = None,
     mcp_runtime_root: Path | None = None,
     source: Path | None = None,
+    prepared_mcp_stage: Mapping[str, Any] | None = None,
 ) -> list[str]:
     filesystem = (
         '{":minimal"="read",":workspace_roots"={"."="read"},'
@@ -8156,29 +8239,11 @@ def build_command(
             raise RunnerError("treatment requires a private absolute MCP runtime root")
         proxy_python = _validated_mcp_proxy_python(authorized_mcp_files)
         binding = request["repobrief"]
-        upstream = [str(item) for item in binding["mcp_command"]]
-        if "--bundle-root" not in upstream:
-            raise RunnerError("treatment MCP command must declare --bundle-root")
-        bundle_index = upstream.index("--bundle-root")
-        if bundle_index + 1 >= len(upstream) or upstream.count("--bundle-root") != 1:
-            raise RunnerError("treatment MCP command bundle root is invalid")
-        upstream[bundle_index + 1] = str(manifest_path)
-        if base.validated_setup(request) == "dirty":
-            if upstream.count("--repo-root") != 1:
-                raise RunnerError(
-                    "dirty treatment requires exactly one MCP --repo-root"
-                )
-            repo_index = upstream.index("--repo-root")
-            if (
-                repo_index + 1 >= len(upstream)
-                or source is None
-                or Path(upstream[repo_index + 1]).expanduser().resolve()
-                != source.resolve()
-            ):
-                raise RunnerError(
-                    "dirty treatment MCP source is not the bound clean checkout"
-                )
-            upstream[repo_index + 1] = str(checkout)
+        if prepared_mcp_stage is None:
+            raise RunnerError("treatment requires parent-prepared immutable MCP stage")
+        upstream = _treatment_mcp_upstream_command(
+            request, checkout, source, manifest_path
+        )
         logical_manifest = Path(str(binding.get("manifest"))).expanduser()
         if not logical_manifest.is_absolute():
             raise RunnerError("treatment logical manifest path must be absolute")
@@ -8193,7 +8258,7 @@ def build_command(
             str(logical_manifest),
             str(binding["manifest_sha256"]),
             canonical(list(authorized_mcp_files)),
-            str(mcp_runtime_root),
+            canonical(_mcp_stage_wire(prepared_mcp_stage)),
         ]
         mcp_profile = _frozen_g1_mcp_profile(request)
         if mcp_profile == MCP_PROFILE_FROZEN_G1:
@@ -9799,6 +9864,8 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         schema = checkout.parent / "answer-schema.json"
         write_schema(schema)
         started = utc_now()
+        provider_started_at: datetime | None = None
+        provider_ended_at: datetime | None = None
         if synthetic:
             capture = _fixture_capture(
                 args.stream_fixture, args.stderr_fixture, args.fixture_returncode
@@ -9808,6 +9875,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
             codex_home = stage_codex_home(args.state_root, auth_data)
             proxy_binding: dict[str, Any] | None = None
             manifest_binding: dict[str, Any] | None = None
+            upstream_stage: dict[str, Any] | None = None
             try:
                 if request["condition"] == "treatment":
                     if (
@@ -9831,6 +9899,23 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                         authorized_mcp_files,
                         manifest_binding,
                     )
+                    staged_manifest = Path(manifest_binding["path"])
+                    if _frozen_g1_mcp_profile(request) == MCP_PROFILE_FROZEN_G1:
+                        # Historical dependency provenance is a separate
+                        # pre-intent security boundary, even if upstream
+                        # authorization fails before stage creation.
+                        _frozen_g1_vendor_snapshot()
+                    upstream_stage = stage_mcp_upstream(
+                        args.state_root,
+                        _treatment_mcp_upstream_command(
+                            request, checkout, source, staged_manifest
+                        ),
+                        staged_manifest,
+                        authorized_mcp_files,
+                        legacy_g1=(
+                            _frozen_g1_mcp_profile(request) == MCP_PROFILE_FROZEN_G1
+                        ),
+                    )
                 command = build_command(
                     request,
                     codex,
@@ -9846,8 +9931,9 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     else Path(manifest_binding["path"]),
                     # The Codex child MCP proxy may stage only inside its
                     # private session home; epoch/ledger roots stay read-only.
-                    mcp_runtime_root=codex_home,
+                    mcp_runtime_root=args.state_root,
                     source=source,
+                    prepared_mcp_stage=upstream_stage,
                 )
                 if dispatch_authorization is None:
                     raise RunnerError(
@@ -9905,6 +9991,11 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 _assert_provider_pid_namespace_ready(
                     **pid_sandbox, cwd=checkout, codex_command=codex
                 )
+                if upstream_stage is not None:
+                    # The trusted parent checks all executable bytes immediately
+                    # before irreversible provider intent; the provider child
+                    # independently checks its own kernel-readonly view.
+                    _revalidate_staged_mcp_upstream(upstream_stage)
                 _require_external_provider_one_shot(
                     request=request,
                     authorization=dispatch_authorization["authorization"],
@@ -9915,6 +10006,10 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     dispatch_authorization["authorization"],
                     intent_persisted_callback=mark_dispatch_intent_recorded,
                 )
+                # Provider wall-clock begins only at the irreversible bounded
+                # invocation. Sandbox and pre-intent preparation have separate
+                # allowances in the outer systemd service lifetime.
+                provider_started_at = utc_now()
                 capture = run_bounded(
                     _unix_socket_restricted_codex_argv(
                         _provider_pid_namespaced_codex_argv(command, **pid_sandbox),
@@ -9926,7 +10021,13 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     environment=provider_env(codex=codex, codex_home=codex_home),
                     process_started_callback=mark_provider_process_started,
                 )
+                provider_ended_at = utc_now()
             except BaseException as exc:
+                upstream_cleanup_error = (
+                    None
+                    if upstream_stage is None
+                    else cleanup_staged_mcp_upstream(upstream_stage)
+                )
                 manifest_cleanup_error = (
                     None
                     if manifest_binding is None
@@ -9939,13 +10040,15 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 )
                 cleanup_error = cleanup_codex_home(codex_home)
                 if (
-                    manifest_cleanup_error is not None
+                    upstream_cleanup_error is not None
+                    or manifest_cleanup_error is not None
                     or proxy_cleanup_error is not None
                     or cleanup_error is not None
                 ):
                     failure_exc = RunnerError(
                         "Codex failed before capture completion and private runtime cleanup failed: "
-                        f"manifest={manifest_cleanup_error} proxy={proxy_cleanup_error} home={cleanup_error}"
+                        f"upstream={upstream_cleanup_error} manifest={manifest_cleanup_error} "
+                        f"proxy={proxy_cleanup_error} home={cleanup_error}"
                     )
                     if dispatch_intent_recorded and dispatch_authorization is not None:
                         try:
@@ -9976,6 +10079,22 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                         ) from ledger_exc
                 raise
             capture = dict(capture)
+            if upstream_stage is not None:
+                try:
+                    _revalidate_staged_mcp_upstream(upstream_stage)
+                except BaseException as exc:
+                    marker = f"mcp_upstream_revalidate_failed:{type(exc).__name__}"
+                    previous = capture.get("capture_error")
+                    capture["capture_error"] = (
+                        marker if previous is None else f"{previous};{marker}"
+                    )
+                upstream_cleanup_error = cleanup_staged_mcp_upstream(upstream_stage)
+                if upstream_cleanup_error is not None:
+                    marker = f"mcp_upstream_cleanup_failed:{upstream_cleanup_error}"
+                    previous = capture.get("capture_error")
+                    capture["capture_error"] = (
+                        marker if previous is None else f"{previous};{marker}"
+                    )
             if manifest_binding is not None:
                 try:
                     _revalidate_staged_repoground_manifest(manifest_binding)
@@ -10046,7 +10165,16 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
             capture["capture_error"] = (
                 marker if previous is None else f"{previous};{marker}"
             )
-        ended = utc_now()
+        if synthetic:
+            ended = utc_now()
+        else:
+            if provider_started_at is None or provider_ended_at is None:
+                raise RunnerError("bounded live provider timestamps are unavailable")
+            # Post-provider source readback, cleanup, and evidence persistence
+            # remain inside RuntimeMaxSec, but may not invalidate a provider
+            # that respected its independent request wall_seconds budget.
+            started = provider_started_at
+            ended = provider_ended_at
         try:
             evidence = persist_provider_capture(
                 request,

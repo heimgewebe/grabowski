@@ -107,7 +107,9 @@ class RootSystemdLauncherTests(unittest.TestCase):
         for probe in (True, False):
             with self.subTest(probe=probe):
                 p = self.props(
-                    launcher.unit_argv("optional", ["/usr/bin/true"], probe=probe)
+                    launcher.unit_argv(
+                        "optional", ["/usr/bin/true"], probe=probe, pair=not probe
+                    )
                 )
                 masked = p["InaccessiblePaths"].split()
                 self.assertEqual(
@@ -152,38 +154,28 @@ class RootSystemdLauncherTests(unittest.TestCase):
                 p["RuntimeDirectory"].split(),
             )
 
-    def test_live_service_outlives_max_provider_wall_and_cleanup(self) -> None:
-        # The runner accepts 3600s provider wall time. Systemd includes the
-        # setup and postflight phases in its service lifetime, so 900s would
-        # kill the runner after one-shot intent and before ledger finalization.
+    def test_pair_lifetime_includes_both_provider_windows_and_cleanup(self) -> None:
+        # Standalone runner is disabled; only a same-unit paired service exists.
+        with self.assertRaisesRegex(launcher.LauncherError, "standalone live"):
+            launcher.unit_argv("single", ["/usr/bin/true"], probe=False)
         probe = self.props(launcher.probe_argv("probe"))
-        live = self.props(
-            launcher.unit_argv("longwall", ["/usr/bin/true"], probe=False)
-        )
-        self.assertEqual(probe["RuntimeMaxSec"], "30")
-        # Full service lifetime: provider + at most twenty 120s Git phases
-        # spanning preflight/checkout/postflight, four 90s isolated readbacks,
-        # source tree, login, sandbox, and 300s ledger/cleanup allowance.
-        # All bounded startup checks are inside the same service deadline,
-        # including 15s provider PIDNS and 25s nested Codex-in-PIDNS smoke.
-        min_service_seconds = (
-            3600 + (20 * 120) + (4 * 90) + 30 + 10 + 25 + 15 + 25 + 300
-        )
-        self.assertGreaterEqual(int(live["RuntimeMaxSec"]), min_service_seconds)
-        self.assertEqual(int(live["RuntimeMaxSec"]), 7200)
-        self.assertEqual(int(live["RuntimeMaxSec"]) - min_service_seconds, 435)
         pair = self.props(
             launcher.unit_argv("pairbudget", ["/usr/bin/true"], probe=False, pair=True)
         )
+        self.assertEqual(probe["RuntimeMaxSec"], "30")
+        # The two individual 7,200 second phase envelopes are planning
+        # allowances only; they do not qualify a measured production WCET.
+        min_single = 3600 + (20 * 120) + (4 * 90) + 30 + 10 + 25 + 15 + 25 + 300
+        self.assertLessEqual(min_single, 7200)
         self.assertEqual(int(pair["RuntimeMaxSec"]), 21600)
-        self.assertEqual(
-            int(pair["RuntimeMaxSec"]), 2 * int(live["RuntimeMaxSec"]) + 7200
-        )
+        self.assertGreaterEqual(int(pair["RuntimeMaxSec"]), 2 * 7200 + 7200)
 
     def test_no_host_shared_dev_shm_mount_alias(self) -> None:
         for mode in (True, False):
             with self.subTest(probe=mode):
-                cmd = launcher.unit_argv("safe", ["/usr/bin/true"], probe=mode)
+                cmd = launcher.unit_argv(
+                    "safe", ["/usr/bin/true"], probe=mode, pair=not mode
+                )
                 p = self.props(cmd)
                 self.assertNotIn("/dev/shm:/tmp", p["BindPaths"])
                 self.assertNotIn("/dev/shm:/var/tmp", p["BindPaths"])
@@ -205,13 +197,18 @@ class RootSystemdLauncherTests(unittest.TestCase):
     def test_live_plan_uses_proven_physical_state_root_binding(
         self, _program: object
     ) -> None:
-        cmd = launcher.live_runner_plan(
+        cmd = launcher.live_pair_plan(
             "live",
             Path("/usr/local/libexec/repobrief_agent_benchmark_codex_runner.py"),
+            Path("/usr/local/libexec/repobrief_agent_benchmark_codex_preflight.py"),
             Path("/var/lib/frozen/requests"),
             Path("/var/lib/frozen/map.json"),
             Path("/usr/local/bin/codex"),
             "a" * 64,
+            "frozen-pair",
+            Path("/var/lib/frozen/validator.json"),
+            "1.00",
+            allow_live_provider=True,
         )
         p = self.props(cmd)
         self.assertIn("/var/lib/private", p["InaccessiblePaths"].split())
@@ -249,47 +246,57 @@ class RootSystemdLauncherTests(unittest.TestCase):
         )
         self.assertNotIn("--collect", cmd)
         self.assertIn("--codex-command-sha256", cmd)
-        self.assertNotIn("--allow-live-provider", cmd)
+        self.assertIn("--allow-live-provider", cmd)
 
-    def test_live_plan_uses_captured_immutable_bootstrap(self) -> None:
+    def test_pair_plan_uses_captured_immutable_bootstrap(self) -> None:
         target = Path("/usr/local/libexec/repobrief_agent_benchmark_codex_runner.py")
-        code = "print('FROZEN_BOOTSTRAP')"
+        preflight = target.with_name("repobrief_agent_benchmark_codex_preflight.py")
+        program = "print('FROZEN_BOOTSTRAP')"
         with patch.object(
-            launcher, "_frozen_bootstrap_program", return_value=code, create=True
+            launcher, "_frozen_bootstrap_program", return_value=program
         ) as frozen:
-            cmd = launcher.live_runner_plan(
+            cmd = launcher.live_pair_plan(
                 "boot",
                 target,
+                preflight,
                 Path("/requests"),
                 Path("/map.json"),
                 Path("/usr/bin/codex"),
                 "a" * 64,
-            )
-        frozen.assert_called_once_with(target)
-        child = cmd[cmd.index("--") + 1 :]
-        self.assertEqual(child[:5], ["/usr/bin/python3", "-I", "-B", "-c", code])
-        self.assertEqual(child[5], str(target))
-        self.assertIn("--request-root", child)
-        self.assertNotIn("--allow-live-provider", child)
-
-    @patch.object(
-        launcher, "_frozen_bootstrap_program", return_value="frozen-test-only"
-    )
-    def test_live_plan_provider_optin_does_not_start_any_process(
-        self, _program: object
-    ) -> None:
-        with patch.object(subprocess, "run") as subprocess_run:
-            cmd = launcher.live_runner_plan(
-                "candidate",
-                Path("/usr/lib/repobrief_agent_benchmark_codex_runner.py"),
-                Path("/requests"),
-                Path("/repo.json"),
-                Path("/usr/bin/codex"),
-                "b" * 64,
+                "frozen-pair",
+                Path("/validator.json"),
+                "1.00",
                 allow_live_provider=True,
             )
-            self.assertIn("--allow-live-provider", cmd)
-            subprocess_run.assert_not_called()
+        self.assertEqual(frozen.call_count, 2)
+        self.assertEqual(
+            [x.args[0] for x in frozen.call_args_list], [target, preflight]
+        )
+        child = cmd[cmd.index("--") + 1 :]
+        self.assertEqual(child[:5], ["/usr/bin/python3", "-I", "-B", "-c", program])
+        self.assertEqual(child[5], str(preflight))
+        self.assertIn("--execute-pair", child)
+        self.assertIn("--allow-live-provider", child)
+
+    def test_single_live_plan_always_denied_without_launch(self) -> None:
+        for optin in (False, True):
+            with (
+                self.subTest(optin=optin),
+                patch.object(subprocess, "run") as runner_process,
+                self.assertRaisesRegex(
+                    launcher.LauncherError, "standalone live Codex plan is disabled"
+                ),
+            ):
+                launcher.live_runner_plan(
+                    "candidate",
+                    Path("/usr/lib/repobrief_agent_benchmark_codex_runner.py"),
+                    Path("/requests"),
+                    Path("/repo.json"),
+                    Path("/usr/bin/codex"),
+                    "b" * 64,
+                    allow_live_provider=optin,
+                )
+            runner_process.assert_not_called()
 
     def test_live_plan_rejects_invalid_input_paths_and_identity(self) -> None:
         params = dict(
@@ -310,7 +317,9 @@ class RootSystemdLauncherTests(unittest.TestCase):
             {"codex_sha256": "g" * 64},
         ):
             with self.subTest(change=change):
-                with self.assertRaises(launcher.LauncherError):
+                with self.assertRaisesRegex(
+                    launcher.LauncherError, "standalone live Codex plan is disabled"
+                ):
                     launcher.live_runner_plan(**{**params, **change})
 
     def test_live_plan_requires_root_owned_staged_bootstrap(self) -> None:
@@ -338,14 +347,7 @@ class RootSystemdLauncherTests(unittest.TestCase):
             return b"print('captured')\n"
 
         with patch.object(launcher, "_root_owned_source", side_effect=trusted):
-            command = launcher.live_runner_plan(
-                "closed",
-                target,
-                Path("/requests"),
-                Path("/map.json"),
-                Path("/usr/local/bin/codex"),
-                "a" * 64,
-            )
+            command = launcher._frozen_bootstrap_program(target)
         self.assertEqual(set(inspected), required)
         self.assertEqual(len(inspected), len(required))
         self.assertIn("print('captured')\n", command)
@@ -359,15 +361,7 @@ class RootSystemdLauncherTests(unittest.TestCase):
             patch.object(launcher, "_root_owned_source", side_effect=compromised),
             self.assertRaisesRegex(launcher.LauncherError, "root-owned immutable"),
         ):
-            launcher.live_runner_plan(
-                "closed",
-                target,
-                Path("/requests"),
-                Path("/map.json"),
-                Path("/usr/local/bin/codex"),
-                "a" * 64,
-                allow_live_provider=True,
-            )
+            launcher._frozen_bootstrap_program(target)
 
     def test_pair_plan_checks_all_transitive_source_files(self) -> None:
         target = Path("/usr/local/libexec/repobrief_agent_benchmark_codex_runner.py")
@@ -433,6 +427,20 @@ class RootSystemdLauncherTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output.getvalue())["mode"], "probe")
         process.assert_not_called()
+
+    def test_standalone_live_cli_rejects_before_emitting_broker_plan(self) -> None:
+        errors = io.StringIO()
+        output = io.StringIO()
+        with (
+            patch.object(subprocess, "run") as launch,
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(errors),
+        ):
+            result = launcher.main(["--run-id", "closed", "--live-plan"])
+        self.assertEqual(result, 2)
+        self.assertIn("standalone live Codex plan is disabled", errors.getvalue())
+        self.assertEqual(output.getvalue(), "")
+        launch.assert_not_called()
 
     def test_provider_flag_rejected_for_probe(self) -> None:
         out = io.StringIO()

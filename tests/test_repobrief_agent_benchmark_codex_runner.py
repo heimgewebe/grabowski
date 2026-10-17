@@ -335,34 +335,76 @@ def bootstrap_program() -> str:
     return BOOTSTRAP_PATH.read_text(encoding="utf-8")
 
 
-def proxy_command(upstream: Path, root: Path) -> list[str]:
+def synthetic_prepared_stage(root: Path) -> dict:
+    """Metadata only for command-construction tests, never a live authorization."""
+    return {
+        "runtime_dir": str(root / "unused-stage"),
+        "argv": ["/bin/true", "--bundle-root", str(root / "unused-manifest")],
+        "manifest_binding": {"path": str(root / "unused-manifest")},
+    }
+
+
+def proxy_command(
+    upstream: Path,
+    root: Path,
+    *,
+    staging_state: Path | None = None,
+    wrap: bool = True,
+) -> list[str]:
+    """Prepare code outside a writable session, exactly as the trusted parent does.
+
+    The subprocess never generates executable code. The outer test bwrap keeps
+    all staged bytes on a kernel-readonly mount while allowing fixture output.
+    """
     manifest = root / "bound.bundle.manifest.json"
-    runtime_root = root / "proxy-runtime"
-    runtime_root.mkdir(mode=0o700, exist_ok=True)
     if not manifest.exists():
         manifest.write_text("{}\n", encoding="utf-8")
-    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    state = (
+        staging_state if staging_state is not None else root / "fixture-trusted-state"
+    )
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
     authorized = [file_identity(Path(sys.executable)), file_identity(upstream)]
-    return [
+    manifest_stage = runner.stage_repoground_manifest(state, file_identity(manifest))
+    staged_manifest = Path(manifest_stage["path"])
+    upstream_argv = [
+        str(Path(sys.executable).resolve()),
+        str(upstream),
+        "--bundle-root",
+        str(staged_manifest),
+    ]
+    prepared = runner.stage_mcp_upstream(
+        state, upstream_argv, staged_manifest, authorized
+    )
+    encoded = runner.canonical(runner._mcp_stage_wire(prepared))
+    command = [
         sys.executable,
         "-I",
         "-c",
         bootstrap_program(),
         str(MODULE_PATH),
         "--codex-mcp-proxy",
-        json.dumps(
-            [
-                str(Path(sys.executable).resolve()),
-                str(upstream),
-                "--bundle-root",
-                str(root),
-            ]
-        ),
+        json.dumps(upstream_argv),
+        str(staged_manifest),
         str(manifest),
-        str(manifest),
-        digest,
+        hashlib.sha256(manifest.read_bytes()).hexdigest(),
         json.dumps(authorized, sort_keys=True),
-        str(runtime_root),
+        encoded,
+    ]
+    if not wrap:
+        return command
+    return [
+        "/usr/bin/bwrap",
+        "--ro-bind",
+        "/",
+        "/",
+        "--bind",
+        str(root),
+        str(root),
+        "--ro-bind",
+        str(state),
+        str(state),
+        "--",
+        *command,
     ]
 
 
@@ -2755,6 +2797,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         proxy_path=root / "proxy.py",
                         manifest_path=root / "staged.bundle.manifest.json",
                         mcp_runtime_root=root / "state",
+                        prepared_mcp_stage=synthetic_prepared_stage(root),
                         source=source,
                     )
                     config = next(
@@ -2781,6 +2824,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                             proxy_path=root / "proxy.py",
                             manifest_path=root / "staged.bundle.manifest.json",
                             mcp_runtime_root=root / "state",
+                            prepared_mcp_stage=synthetic_prepared_stage(root),
                             source=source,
                         )
 
@@ -3165,9 +3209,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 + b"\n"
             )
 
-            def run_proxy(stage_root: Path) -> subprocess.CompletedProcess[bytes]:
-                command = proxy_command(upstream, source)
-                command[-1] = str(stage_root)
+            def run_proxy() -> tuple[subprocess.CompletedProcess[bytes], Path]:
+                command = proxy_command(
+                    upstream, source, staging_state=state, wrap=False
+                )
+                stage = json.loads(command[-1])
+                staged_script = Path(stage["bindings"][1]["path"])
                 sandbox = runner._provider_pid_namespaced_codex_argv(
                     command,
                     source=source,
@@ -3177,7 +3224,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     report_root=outputs["reports"],
                     codex_home=session_home,
                 )
-                return subprocess.run(
+                result = subprocess.run(
                     runner._unix_socket_restricted_codex_argv(
                         sandbox, provider_pid_namespace=True
                     ),
@@ -3188,13 +3235,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     timeout=18,
                     check=False,
                 )
+                return result, staged_script
 
-            # RED: previous staging under the trusted state must fail (EROFS).
-            denied = run_proxy(state)
-            self.assertNotEqual(denied.returncode, 0, denied.stdout[-1024:])
-            self.assertEqual(event.read_text(encoding="ascii"), "trusted-intent")
-            # GREEN: private session-home staging completes a real tools/list.
-            allowed = run_proxy(session_home)
+            # GREEN: trusted parent-staging outside CODEX_HOME completes
+            # the real tools/list under the provider's kernel PID/mount limits.
+            allowed, immutable_script = run_proxy()
             self.assertEqual(allowed.returncode, 0, allowed.stderr[-2048:])
             messages = [json.loads(line) for line in allowed.stdout.splitlines()]
             reply = next((item for item in messages if item.get("id") == 1), None)
@@ -3203,6 +3248,55 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "ask_context",
                 {tool["name"] for tool in reply["result"]["tools"]},
             )
+            self.assertEqual(event.read_text(encoding="ascii"), "trusted-intent")
+
+            # Same-UID attacker tries overwrite, chmod, replacement and
+            # hardlink-to-writable-session alias, all from the *real* PIDNS.
+            original = immutable_script.read_bytes()
+            attack_code = (
+                "import os,sys,pathlib\n"
+                "p=pathlib.Path(sys.argv[1]);home=pathlib.Path(sys.argv[2])\n"
+                "attempts=[lambda:p.write_bytes(b'changed'),"
+                "lambda:os.chmod(p,0o777),"
+                "lambda:os.replace(home/'replacement',p),"
+                "lambda:os.link(p,home/'mutable-hardlink')]\n"
+                "for attempt in attempts:\n"
+                " try:attempt()\n"
+                " except OSError:continue\n"
+                " raise RuntimeError('provider changed trusted MCP code')\n"
+                "print('MCP_CODE_IMMUTABLE')\n"
+            )
+            (session_home / "replacement").write_bytes(b"payload")
+            tamper = runner._provider_pid_namespaced_codex_argv(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    attack_code,
+                    str(immutable_script),
+                    str(session_home),
+                ],
+                source=source,
+                state_root=state,
+                transcript_root=outputs["transcripts"],
+                evidence_root=outputs["evidence"],
+                report_root=outputs["reports"],
+                codex_home=session_home,
+            )
+            blocked = subprocess.run(
+                runner._unix_socket_restricted_codex_argv(
+                    tamper, provider_pid_namespace=True
+                ),
+                cwd=source,
+                capture_output=True,
+                env={**os.environ, "CODEX_HOME": str(session_home)},
+                timeout=18,
+                check=False,
+            )
+            self.assertEqual(blocked.returncode, 0, blocked.stderr[-2048:])
+            self.assertIn(b"MCP_CODE_IMMUTABLE", blocked.stdout)
+            self.assertEqual(immutable_script.read_bytes(), original)
+            self.assertFalse((session_home / "mutable-hardlink").exists())
             self.assertEqual(event.read_text(encoding="ascii"), "trusted-intent")
 
     def test_provider_pid_namespace_hides_nondumpable_parent_threads(self) -> None:
@@ -3468,7 +3562,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 ):
                     runner._unix_socket_restricted_codex_argv(value)
 
-    def test_real_nested_codex_sandbox_kernel_positive_and_negative(self) -> None:
+    def _assert_real_nested_codex_sandbox_kernel(self, *, reject: bool) -> None:
         """Exercise outer and inner PID, user, seccomp and mount isolation.
 
         The executable named codex is a controlled local stub, never a provider.
@@ -3522,11 +3616,21 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             "utf-8", errors="replace"
         )
         nested_userns_available = nested_kernel_probe.returncode == 0
-        if not nested_userns_available and not any(
-            marker in kernel_denial.lower()
-            for marker in ("permission denied", "operation not permitted")
+        if (
+            not nested_userns_available
+            and not reject
+            and not any(
+                marker in kernel_denial.lower()
+                for marker in ("permission denied", "operation not permitted")
+            )
         ):
-            self.fail("nested kernel preflight failed for an unclassified reason")
+            self.fail(
+                "nested kernel preflight failed for an unclassified reason: "
+                f"returncode={nested_kernel_probe.returncode}, "
+                f"stderr={kernel_denial!r}, "
+                f"stdout={nested_kernel_probe.stdout[-512:]!r}. "
+                "Do not skip before classifying the actual runner policy."
+            )
         inner = (
             "import os,sys,subprocess\nfrom pathlib import Path\n"
             "source,state,home,outer_pid,outer_user=sys.argv[1:]\n"
@@ -3543,102 +3647,109 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             "assert subprocess.run(['/bin/true'],check=False).returncode==0\n"
             "print('NESTED_BOUNDARY_VERIFIED')\n"
         )
-        for reject in (False, True):
+        with (
+            self.subTest(nested_stub_fails=reject),
+            tempfile.TemporaryDirectory(
+                prefix="rab-nested-kernel-", dir=str(Path.home())
+            ) as temporary,
+        ):
+            if not reject and not nested_userns_available:
+                self.skipTest(
+                    "host AppArmor/kernel denies nested user namespaces; "
+                    "positive provider-free smoke remains mandatory on "
+                    "the supported production qualification host"
+                )
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            epoch = root / "epoch"
+            epoch.mkdir()
+            outputs = {
+                name: epoch / name
+                for name in ("state", "transcripts", "evidence", "reports")
+            }
+            for folder in outputs.values():
+                folder.mkdir(mode=0o700)
+            session = outputs["state"] / "codex-runtime" / ("session-" + "a" * 24)
+            session.mkdir(parents=True, mode=0o700)
+            (session / "tmp").mkdir(mode=0o700)
+            trusted_event = outputs["state"] / "trusted-event"
+            trusted_event.write_text("unchanged", encoding="ascii")
+            stub = root / "codex"
+            if reject:
+                stub_code = (
+                    "#!/usr/bin/python3\nimport sys\n"
+                    "assert sys.argv[1]=='sandbox' and "
+                    "sys.argv[-2:]==['--','/bin/true']\n"
+                    "raise SystemExit(41)\n"
+                )
+            else:
+                stub_code = (
+                    "#!/usr/bin/python3\n"
+                    "import os,subprocess,sys\n"
+                    "assert sys.argv[1]=='sandbox' and "
+                    "sys.argv[-2:]==['--','/bin/true']\n"
+                    "home=os.environ['CODEX_HOME']\n"
+                    f"inner={inner!r}\n"
+                    f"source={str(source)!r}\n"
+                    f"state={str(outputs['state'])!r}\n"
+                    "command=['/usr/bin/bwrap','--unshare-user',"
+                    "'--unshare-pid','--ro-bind','/','/',"
+                    "'--bind',home,home,'--proc','/proc',"
+                    "'--dev','/dev','--','/usr/bin/python3',"
+                    "'-I','-c',inner,source,state,home,"
+                    "os.readlink('/proc/self/ns/pid'),"
+                    "os.readlink('/proc/self/ns/user')]\n"
+                    "result=subprocess.run(command,capture_output=True,"
+                    "check=False,timeout=12)\n"
+                    "if result.returncode: "
+                    "sys.stderr.buffer.write(result.stderr[-2048:])\n"
+                    "raise SystemExit(result.returncode)\n"
+                )
+            stub.write_text(stub_code, encoding="utf-8")
+            stub.chmod(0o700)
+            kwargs = {
+                "source": source,
+                "state_root": outputs["state"],
+                "transcript_root": outputs["transcripts"],
+                "evidence_root": outputs["evidence"],
+                "report_root": outputs["reports"],
+                "codex_home": session,
+                "cwd": source,
+                "codex_command": str(stub),
+            }
             with (
-                self.subTest(nested_stub_fails=reject),
-                tempfile.TemporaryDirectory(
-                    prefix="rab-nested-kernel-", dir=str(Path.home())
-                ) as temporary,
+                patch.object(
+                    runner,
+                    "provider_env",
+                    return_value={
+                        "HOME": str(session),
+                        "CODEX_HOME": str(session),
+                    },
+                ),
+                patch.object(
+                    runner, "_record_preflight_dispatch_intent"
+                ) as provider_intent,
             ):
-                if not reject and not nested_userns_available:
-                    self.skipTest(
-                        "host AppArmor/kernel denies nested user namespaces; "
-                        "positive provider-free smoke remains mandatory on "
-                        "the supported production qualification host"
-                    )
-                root = Path(temporary)
-                source = root / "source"
-                source.mkdir()
-                epoch = root / "epoch"
-                epoch.mkdir()
-                outputs = {
-                    name: epoch / name
-                    for name in ("state", "transcripts", "evidence", "reports")
-                }
-                for folder in outputs.values():
-                    folder.mkdir(mode=0o700)
-                session = outputs["state"] / "codex-runtime" / ("session-" + "a" * 24)
-                session.mkdir(parents=True, mode=0o700)
-                (session / "tmp").mkdir(mode=0o700)
-                trusted_event = outputs["state"] / "trusted-event"
-                trusted_event.write_text("unchanged", encoding="ascii")
-                stub = root / "codex"
                 if reject:
-                    stub_code = (
-                        "#!/usr/bin/python3\nimport sys\n"
-                        "assert sys.argv[1]=='sandbox' and "
-                        "sys.argv[-2:]==['--','/bin/true']\n"
-                        "raise SystemExit(41)\n"
-                    )
-                else:
-                    stub_code = (
-                        "#!/usr/bin/python3\n"
-                        "import os,subprocess,sys\n"
-                        "assert sys.argv[1]=='sandbox' and "
-                        "sys.argv[-2:]==['--','/bin/true']\n"
-                        "home=os.environ['CODEX_HOME']\n"
-                        f"inner={inner!r}\n"
-                        f"source={str(source)!r}\n"
-                        f"state={str(outputs['state'])!r}\n"
-                        "command=['/usr/bin/bwrap','--unshare-user',"
-                        "'--unshare-pid','--ro-bind','/','/',"
-                        "'--bind',home,home,'--proc','/proc',"
-                        "'--dev','/dev','--','/usr/bin/python3',"
-                        "'-I','-c',inner,source,state,home,"
-                        "os.readlink('/proc/self/ns/pid'),"
-                        "os.readlink('/proc/self/ns/user')]\n"
-                        "result=subprocess.run(command,capture_output=True,"
-                        "check=False,timeout=12)\n"
-                        "if result.returncode: "
-                        "sys.stderr.buffer.write(result.stderr[-2048:])\n"
-                        "raise SystemExit(result.returncode)\n"
-                    )
-                stub.write_text(stub_code, encoding="utf-8")
-                stub.chmod(0o700)
-                kwargs = {
-                    "source": source,
-                    "state_root": outputs["state"],
-                    "transcript_root": outputs["transcripts"],
-                    "evidence_root": outputs["evidence"],
-                    "report_root": outputs["reports"],
-                    "codex_home": session,
-                    "cwd": source,
-                    "codex_command": str(stub),
-                }
-                with (
-                    patch.object(
-                        runner,
-                        "provider_env",
-                        return_value={
-                            "HOME": str(session),
-                            "CODEX_HOME": str(session),
-                        },
-                    ),
-                    patch.object(
-                        runner, "_record_preflight_dispatch_intent"
-                    ) as provider_intent,
-                ):
-                    if reject:
-                        with self.assertRaisesRegex(
-                            runner.RunnerError,
-                            "nested Codex sandbox smoke failed before intent",
-                        ):
-                            runner._assert_provider_pid_namespace_ready(**kwargs)
-                    else:
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "nested Codex sandbox smoke failed before intent",
+                    ):
                         runner._assert_provider_pid_namespace_ready(**kwargs)
-                    provider_intent.assert_not_called()
-                self.assertEqual(trusted_event.read_text(encoding="ascii"), "unchanged")
-                self.assertEqual((session / "nested-marker").exists(), not reject)
+                else:
+                    runner._assert_provider_pid_namespace_ready(**kwargs)
+                provider_intent.assert_not_called()
+            self.assertEqual(trusted_event.read_text(encoding="ascii"), "unchanged")
+            self.assertEqual((session / "nested-marker").exists(), not reject)
+
+    def test_real_nested_codex_sandbox_kernel_positive(self) -> None:
+        """Positive nested userns is a host capability, not an unconditional CI skip."""
+        self._assert_real_nested_codex_sandbox_kernel(reject=False)
+
+    def test_real_nested_codex_sandbox_kernel_negative(self) -> None:
+        """The fail-closed negative path always runs even when positive is unsupported."""
+        self._assert_real_nested_codex_sandbox_kernel(reject=True)
 
     def test_linux_sandbox_smoke_is_filtered_without_provider_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4074,6 +4185,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     proxy_path=(root / "bound-proxy.py").resolve(),
                     manifest_path=(root / "bound.bundle.manifest.json").resolve(),
                     mcp_runtime_root=(root / "state").resolve(),
+                    prepared_mcp_stage=synthetic_prepared_stage(root),
                 )
         baseline_joined = " ".join(baseline)
         treatment_joined = " ".join(treatment)
@@ -4308,6 +4420,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     proxy_path=(root / "bound-proxy.py").resolve(),
                     manifest_path=(root / "bound.bundle.manifest.json").resolve(),
                     mcp_runtime_root=(root / "state").resolve(),
+                    prepared_mcp_stage=synthetic_prepared_stage(root),
                 )
             validate.assert_called_once_with([])
             self.assertIn(
@@ -4982,6 +5095,158 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             provider.assert_called_once()
             failed.assert_called_once()
             self.assertTrue(failed.call_args.kwargs["provider_process_started"])
+
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
+    def test_live_wall_budget_excludes_postflight_after_bounded_provider(self) -> None:
+        """A provider finishing at 299/300s is not late because postflight takes 61s.
+
+        Every external authorization and actual Codex execution is mocked; the
+        real execute() control flow must carry the provider-only timestamps to
+        evidence, while systemd still independently bounds the entire unit.
+        """
+        from datetime import timedelta
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request()
+            planned_request_root(root, value)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            session_home = root / "codex-home"
+            session_home.mkdir()
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "repositories.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "provider-evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            authorization = {
+                "authorization": {"contract": "mock-only"},
+                "provider_codex": {},
+                "provider_authentication": {},
+                "repository_map_bytes": b"{}",
+                "binding": {"report_out": str(root / "reports" / "preflight.json")},
+            }
+            start = datetime(2026, 10, 17, tzinfo=timezone.utc)
+            clock = {"now": start, "provider_done": False}
+            observed: list[tuple[datetime, datetime]] = []
+
+            def readback(*_args, **kwargs):
+                if clock["provider_done"]:
+                    clock["now"] = start + timedelta(seconds=360)
+                control = kwargs.get("git_control_out")
+                if isinstance(control, dict):
+                    control["sha256"] = "0" * 64
+                return {"working_tree": "clean"}
+
+            def record_intent(*_args, **kwargs):
+                kwargs["intent_persisted_callback"]()
+                return "a" * 64
+
+            def provider_stub(*_args, **kwargs):
+                kwargs["process_started_callback"]()
+                clock["now"] = start + timedelta(seconds=299)
+                clock["provider_done"] = True
+                return {
+                    "returncode": 0,
+                    "stdout": b"",
+                    "stderr": b"",
+                    "capture_error": None,
+                    "stdout_overflow": False,
+                    "stderr_overflow": False,
+                }
+
+            def observe_capture(*_args, **kwargs):
+                observed.append((kwargs["started_at"], kwargs["ended_at"]))
+                raise RuntimeError("POSTFLIGHT_CAPTURE_OBSERVED")
+
+            with ExitStack() as stack:
+                for name, return_value in (
+                    ("validate_executable", "/opt/codex"),
+                    ("validate_toolchain", "/usr/bin:/bin"),
+                    ("validate_chatgpt_subscription", b"mock-auth"),
+                    ("_repository_root_from_authorized_map_bytes", root),
+                    ("_preintent_output_entry_reservation", 4),
+                    ("prepare_provider_evidence", {"plan": True}),
+                    ("create_checkout", checkout),
+                    ("stage_codex_home", session_home),
+                    ("build_command", ["/opt/codex"]),
+                    ("_provider_pid_namespaced_codex_argv", ["/opt/codex"]),
+                    ("_unix_socket_restricted_codex_argv", ["/opt/codex"]),
+                    ("provider_env", {}),
+                    ("cleanup_codex_home", None),
+                ):
+                    stack.enter_context(
+                        patch.object(runner, name, return_value=return_value)
+                    )
+                for name in (
+                    "_assert_authorized_codex_executable",
+                    "_assert_authorized_chatgpt_auth",
+                    "_assert_authorized_runtime_binding",
+                    "_require_external_provider_one_shot",
+                    "validate_live_immutable_mounts",
+                    "validate_codex_linux_sandbox_before_intent",
+                    "_assert_provider_pid_namespace_ready",
+                    "_record_preflight_dispatch_failed",
+                    "close_provider_evidence_plan",
+                    "write_schema",
+                ):
+                    stack.enter_context(patch.object(runner, name))
+                stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_load_preflight_dispatch_authorization",
+                        return_value=authorization,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        runner.base,
+                        "attest_checkout_setup",
+                        return_value={"working_tree": "clean"},
+                    )
+                )
+                stack.enter_context(
+                    patch.object(runner, "utc_now", side_effect=lambda: clock["now"])
+                )
+                stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_record_preflight_dispatch_intent",
+                        side_effect=record_intent,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_secure_post_provider_checkout_readback",
+                        side_effect=readback,
+                    )
+                )
+                dispatch = stack.enter_context(
+                    patch.object(runner, "run_bounded", side_effect=provider_stub)
+                )
+                stack.enter_context(
+                    patch.object(
+                        runner, "persist_provider_capture", side_effect=observe_capture
+                    )
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "POSTFLIGHT_CAPTURE_OBSERVED"
+                ):
+                    runner.execute(value, args)
+            dispatch.assert_called_once()
+            self.assertEqual(clock["now"], start + timedelta(seconds=360))
+            self.assertEqual(observed, [(start, start + timedelta(seconds=299))])
 
     def test_treatment_manifest_mismatch_fails_before_workspace_consumption(
         self,
@@ -6276,7 +6541,13 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 "--bundle-root",
                 str(root),
             ]
+            prepared = runner.stage_mcp_upstream(
+                runtime_root, command, manifest, authorized
+            )
             with (
+                patch.object(
+                    runner, "_prepared_mcp_upstream_from_parent", return_value=prepared
+                ),
                 patch.object(runner.subprocess, "Popen", tracked_popen),
                 patch.object(
                     runner.threading.Thread,
@@ -6300,6 +6571,9 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             self.assertIsNotNone(observed["process"].poll())
             stage_parent = runtime_root / "repoground-mcp-upstream-runtime"
             self.assertTrue(stage_parent.is_dir())
+            # Untrusted proxy cannot delete trusted staged executable bytes.
+            self.assertEqual(len(list(stage_parent.iterdir())), 1)
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(prepared))
             self.assertEqual([], list(stage_parent.iterdir()))
 
     def test_mcp_proxy_propagates_post_spawn_keyboard_interrupt_and_reaps(self) -> None:
@@ -6329,7 +6603,13 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 "--bundle-root",
                 str(root),
             ]
+            prepared = runner.stage_mcp_upstream(
+                runtime_root, command, manifest, authorized
+            )
             with (
+                patch.object(
+                    runner, "_prepared_mcp_upstream_from_parent", return_value=prepared
+                ),
                 patch.object(runner.subprocess, "Popen", tracked_popen),
                 patch.object(
                     runner.threading.Thread,
@@ -6350,6 +6630,9 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             self.assertIsNotNone(observed["process"].poll())
             stage_parent = runtime_root / "repoground-mcp-upstream-runtime"
             self.assertTrue(stage_parent.is_dir())
+            # Untrusted proxy cannot delete trusted staged executable bytes.
+            self.assertEqual(len(list(stage_parent.iterdir())), 1)
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(prepared))
             self.assertEqual([], list(stage_parent.iterdir()))
 
     def test_mcp_proxy_stops_client_reader_on_error_without_stdin_eof(self) -> None:
@@ -8014,7 +8297,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             self.assertNotEqual(staged_manifest, logical_manifest)
             self.assertEqual(staged_manifest.name, logical_manifest.name)
             self.assertIn(
-                root / "proxy-runtime" / "repoground-mcp-upstream-runtime",
+                root / "fixture-trusted-state" / "repoground-mcp-upstream-runtime",
                 staged_manifest.parents,
             )
             self.assertIsNone(arguments["repo"])
@@ -9796,6 +10079,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     proxy_path=Path(binding["path"]),
                     manifest_path=staged_manifest.resolve(),
                     mcp_runtime_root=state_root.resolve(),
+                    prepared_mcp_stage=synthetic_prepared_stage(root),
                 )
             encoded = next(
                 item
@@ -9924,6 +10208,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     proxy_path=(root / "bound-proxy.py").resolve(),
                     manifest_path=staged.resolve(),
                     mcp_runtime_root=state_root.resolve(),
+                    prepared_mcp_stage=synthetic_prepared_stage(root),
                 )
             encoded = next(
                 item

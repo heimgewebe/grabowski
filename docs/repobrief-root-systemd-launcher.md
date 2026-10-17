@@ -62,39 +62,37 @@ frozen inputs or provider credentials. This profile is intentionally
 **not** suitable for a benchmark dispatch, because HOME and temporary
 directories can share the same underlying /run tmpfs.
 
-The no-provider probe remains limited to 30 seconds. The current
-**single-request** live launcher uses `RuntimeMaxSec=7200` (120 minutes).
-Its static allowance consists of the maximum 3,600-second provider wall
-budget, up to twenty 120-second bounded Git phases, four 90-second
-isolated readbacks, a 30-second tree inspection, a 10-second login
-check, a 25-second Codex sandbox check, a separate 15-second provider
-PID-namespace smoke, a further 25-second **nested Codex sandbox inside
-that same PID namespace**, 300 seconds for cleanup, and 435 seconds
-for scheduling and ledger terminalization. Of the four 90-second
-readback slots, three are used by the current pre-/post-provider
-call graph, with one retained as conservative allowance. These
-per-phase budgets are configured planning limits, **not** a measured
-upper bound or qualified worst-case execution time for the entire
-production call graph. The extra smoke and readbacks must not be omitted.
+The no-provider probe remains limited to 30 seconds. **Standalone live
+requests are disabled.** The earlier 7,200-second single-request profile
+was only a planning estimate and is retained as historical evidence, not an
+executable systemd command. Calling --live-plan, live_runner_plan(),
+or unit_argv() for a live single condition now fails closed. In particular,
+neither a prior 3,600-second provider wall clock, twenty bounded Git phases,
+nested sandbox checks nor postflight allowances make standalone dispatch safe
+or supported.
 
-The **same-unit baseline/treatment pair** uses
-`RuntimeMaxSec=21600` (six hours), separately from the single-request
-limit. The current configured envelope reserves up to two 7,200-second
-single-request paths plus 3,600 seconds for pair-preflight, external
-validators, cost and receipt verification, ledger and failure
-terminalization, and shutdown. The remaining 3,600 seconds are
-conservative scheduling slack; the split is an upper planning
-allowance, not proof of a production maximum. A formal end-to-end
-worst-case call-graph test and the installed root-systemd no-provider
-sandbox attestation remain mandatory before any approval or real
-provider invocation. The `--max-cost-usd` argument on the pair plan
-is a total **pair spending ceiling** (not a per-condition budget that
-may be doubled). Both conditions together must fit it, and every
-condition's verified actual cost must be checked before the next
-irreversible provider intent. No CLI flag, generated ledger or Codex
-login substitutes for a separately verified external one-shot approval.
-Until a canonical external verifier is installed, every direct and
-paired live provider entrypoint fails closed.
+Only the **same-unit baseline/treatment pair** has a qualified *plan format*:
+--live-pair-plan emits RuntimeMaxSec=21600 (six hours). The configured
+envelope allocates up to two former 7,200-second condition allowances and
+3,600 seconds for pair-preflight, independent external validators, ledger,
+terminalization and shutdown; the remaining 3,600 seconds are conservative
+scheduling slack. This is not an observed production worst-case duration.
+The per-condition wall_seconds budget measures only the bounded provider
+execution, not subsequent Git readback, evidence cleanup or terminalization.
+The latter still count toward the independent systemd service maximum.
+
+The --max-cost-usd flag is a ceiling for **both** conditions together, not an
+independent allowance for each arm. Checking costs *after* a condition is
+not a verified pre-spend reservation for the next one: an initial $0.99
+condition followed by a $0.02 condition cannot be dispatched under a
+$1.00 limit without a trustworthy prior reservation/authorization.
+Codex subscription token counts, synthetic CLI dollar values, mock ledgers
+and optional configuration flags do not enforce that USD ceiling.
+There is currently no installed external one-shot verifier with actual
+independent cost reservation and observed USD costs. The pair planner
+is therefore **non-authorizing**, and the real provider path remains
+fail-closed before provider intent. Full systemd and cost qualification
+must precede any paid provider request.
 
 For a future live plan, the launcher instead uses StateDirectory
 on persistent host storage, with four mode-0700 dynamic UID leaves.
@@ -128,9 +126,11 @@ checkout's Python code as root.
 The transient root unit runs its child as DynamicUser, contains no
 provider invocation, and removes its runtime directories on exit.
 
-The separate --live-plan option prints a command but **never
-executes** it. Even the --allow-live-provider flag is only a plan
-argument, not a one-shot authorization.
+The obsolete --live-plan option now **rejects before emitting a broker
+plan**; it is not a supported single-request entrypoint. Only
+--live-pair-plan can print a proposed paired service. Even
+--allow-live-provider is merely a plan opt-in, **never** a one-shot
+authorization or actual cost reservation.
 
 The host kernel confirmed the genuine system-bus listener as root
 PID 1 in /init.scope, and a nonprivileged root-systemd DynamicUser
@@ -160,9 +160,15 @@ never recursively delete runtime roots or evidence.
 4. Verify no extra writable aliases, privileged sockets, hard links
    or writable source mounts; repeat admission before provider intent
    and after provider completion.
-5. Run fresh tests, Python CI, exact-diff independent High-Critical
+5. Stage the complete MCP executable/script/manifest/source closure through
+   the trusted parent before provider intent, outside writable CODEX_HOME.
+   Kernel-bind it read-only inside the actual provider PID/mount namespace,
+   including all alternative writable aliases. Verify real provider-free
+   tools/list, malicious same-UID mutation attempts and immutable cleanup.
+   A final SHA-256 comparison does not detect an intermediate swap-and-restore.
+6. Run fresh tests, Python CI, exact-diff independent High-Critical
    review and settlement of every material review thread.
-6. Merge only through Captain, then verify deployed and serving state.
+7. Merge only through Captain, then verify deployed and serving state.
    Obtain separate explicit one-shot approval *after* all safety gates
    before any provider run or six-case benchmark.
 

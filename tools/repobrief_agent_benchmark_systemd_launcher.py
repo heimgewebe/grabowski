@@ -46,6 +46,10 @@ def unit_argv(
     name = service_name(run_id)
     if pair and probe:
         raise LauncherError("a paired provider unit cannot be a no-provider probe")
+    if not probe and not pair:
+        raise LauncherError(
+            "standalone live services are disabled; only a same-unit pair may run"
+        )
     if not program or any(not isinstance(x, str) or not x for x in program):
         raise LauncherError("empty program or argument")
     if not Path(program[0]).is_absolute():
@@ -110,7 +114,7 @@ def unit_argv(
         # The paired unit reuses two 7200s phase envelopes, plus 3600s
         # combined preflight/validator and 3600s cleanup/scheduling slack:
         # 21600s. These are planning envelopes, NOT host-validated WCET.
-        f"RuntimeMaxSec={30 if probe else 21600 if pair else 7200}",
+        f"RuntimeMaxSec={30 if probe else 21600}",
     ]
     if not probe:
         properties.extend(
@@ -319,46 +323,12 @@ def live_runner_plan(
     *,
     allow_live_provider: bool = False,
 ) -> list[str]:
-    """Plan a fail-closed actual runner entrypoint; never execute it here."""
-    name = service_name(run_id)
-    for label, path in (
-        ("runner", runner),
-        ("request root", request_root),
-        ("repository map", repository_map),
-        ("codex", codex),
-    ):
-        if not isinstance(path, Path) or not path.is_absolute() or ".." in path.parts:
-            raise LauncherError(f"{label} must be a canonical absolute path")
-    if not re.fullmatch(r"[0-9a-f]{64}", codex_sha256):
-        raise LauncherError("codex executable sha256 is required")
-    if not runner.name == "repobrief_agent_benchmark_codex_runner.py":
-        raise LauncherError("not the qualified benchmark runner")
-    home = Path("/var/lib") / name
-    runner_args = [
-        "/usr/bin/python3",
-        "-I",
-        "-B",
-        "-c",
-        _frozen_bootstrap_program(runner),
-        str(runner),
-        "--request-root",
-        str(request_root),
-        "--repository-map",
-        str(repository_map),
-        "--state-root",
-        str(home / "epoch" / "state"),
-        "--transcript-root",
-        str(home / "epoch" / "transcripts"),
-        "--provider-evidence-root",
-        str(home / "epoch" / "evidence"),
-        "--codex-command",
-        str(codex),
-        "--codex-command-sha256",
-        codex_sha256,
-    ]
-    if allow_live_provider:
-        runner_args.append("--allow-live-provider")
-    return unit_argv(run_id, runner_args, probe=False)
+    """Always deny obsolete single-request plans before exposing systemd argv.
+
+    The runner now admits only an in-process two-condition paired dispatch.
+    Retain this named API solely for safe legacy caller rejection.
+    """
+    raise LauncherError("standalone live Codex plan is disabled; use --live-pair-plan")
 
 
 def live_pair_plan(
@@ -512,24 +482,8 @@ def main(argv: list[str] | None = None) -> int:
                 allow_live_provider=args.allow_live_provider,
             )
         elif args.live_plan:
-            if None in (
-                args.runner,
-                args.request_root,
-                args.repository_map,
-                args.codex,
-                args.codex_sha256,
-            ):
-                raise LauncherError(
-                    "live plan requires frozen runner, request, map and codex identities"
-                )
-            command = live_runner_plan(
-                args.run_id,
-                args.runner,
-                args.request_root,
-                args.repository_map,
-                args.codex,
-                args.codex_sha256,
-                allow_live_provider=args.allow_live_provider,
+            raise LauncherError(
+                "standalone live Codex plan is disabled; use --live-pair-plan"
             )
         else:
             if args.allow_live_provider:
@@ -538,13 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             json.dumps(
                 {
-                    "mode": (
-                        "pair-live-plan-only"
-                        if args.live_pair_plan
-                        else "live-plan-only"
-                        if args.live_plan
-                        else "probe"
-                    ),
+                    "mode": ("pair-live-plan-only" if args.live_pair_plan else "probe"),
                     "argv": command,
                 },
                 sort_keys=True,
