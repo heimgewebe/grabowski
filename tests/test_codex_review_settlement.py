@@ -337,6 +337,62 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual(HEAD[:10], completion["reviewed_commit_prefix"])
         self.assertEqual("CLEAN", completion["state"])
 
+
+    def test_versioned_clean_receipt_comment_settles_current_head(self) -> None:
+        state = base_state()
+        clean = codex_clean_comment(
+            actor="chatgpt-codex-connector[bot]",
+            closing="More of your lovely PRs please.",
+        )
+        clean["body"] = "<!-- codex-review-receipt:v1 -->\n\n" + clean["body"]
+        state["comments"] = connection(
+            [request_comment(), clean], hasPreviousPage=False
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pass", result["status"])
+        self.assertTrue(result["settled"])
+        self.assertEqual("review_settled", result["status_code"])
+        self.assertEqual("clean_comment", result["evidence"]["completion"]["mode"])
+        self.assertEqual(HEAD[:10], result["evidence"]["completion"]["reviewed_commit_prefix"])
+
+    def test_receipt_prefix_must_be_exactly_one_known_version(self) -> None:
+        for invalid_prefix in (
+            "<!-- codex-review-receipt:v2 -->\n\n",
+            "<!-- codex-review-receipt:v1 -->\n",
+            "<!-- codex-review-receipt:v1 -->\n\n"
+            "<!-- codex-review-receipt:v1 -->\n\n",
+        ):
+            with self.subTest(prefix=invalid_prefix):
+                state = base_state()
+                clean = codex_clean_comment()
+                clean["body"] = invalid_prefix + clean["body"]
+                state["comments"] = connection(
+                    [request_comment(), clean], hasPreviousPage=False
+                )
+                result = self.evaluate(state)
+                self.assertEqual("pending", result["status"])
+                self.assertFalse(result["settled"])
+
+    def test_receipt_prefix_does_not_waive_actor_head_or_body_trust(self) -> None:
+        cases = (
+            codex_clean_comment(actor="untrusted-bot"),
+            codex_clean_comment(reviewed_prefix="d" * 10),
+            codex_clean_comment(),
+        )
+        cases[2]["body"] += "\nBlocking finding remains."
+        for clean in cases:
+            with self.subTest(comment=clean["databaseId"], body=clean["body"][-36:]):
+                state = base_state()
+                clean["body"] = "<!-- codex-review-receipt:v1 -->\n\n" + clean["body"]
+                state["comments"] = connection(
+                    [request_comment(), clean], hasPreviousPage=False
+                )
+                result = self.evaluate(state)
+                self.assertEqual("pending", result["status"])
+                self.assertFalse(result["settled"])
+
     def test_on_a_roll_clean_result_comment_settles_current_head(self) -> None:
         state = base_state()
         clean = codex_clean_comment(closing="You're on a roll.")
