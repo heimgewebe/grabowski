@@ -8153,6 +8153,12 @@ def _start_job(
         raise PermissionError(
             "runtime deploy runner is reserved for the typed self-deploy scheduler"
         )
+    # Source trust must be established before allocating durable job metadata.
+    pinned_deploy_site = (
+        _reserved_runtime_deploy_pinned_python_path()
+        if allow_reserved_runtime_deploy
+        else None
+    )
     runtime = _job_runtime(runtime_seconds)
     notify_metadata = _normalize_notify_on_done(notify_on_done)
     unit = (
@@ -8355,10 +8361,10 @@ def _start_job(
         # The fixed system Python can import the lock-pinned serving venv
         # packages via one explicit path; Python does not execute .pth files
         # from PYTHONPATH. Reject the ambient user site *before startup*.
-        pinned_site = _reserved_runtime_deploy_pinned_python_path()
+        assert pinned_deploy_site is not None
         environment.update({
             "PYTHONPYCACHEPREFIX": "/dev/null/grabowski-runtime-deploy",
-            "PYTHONPATH": pinned_site,
+            "PYTHONPATH": pinned_deploy_site,
             "PYTHONHOME": "",
             "PYTHONNOUSERSITE": "1",
             "PYTHONUSERBASE": "",

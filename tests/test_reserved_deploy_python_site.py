@@ -158,6 +158,27 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
             )
 
 
+    def test_unavailable_pinned_site_fails_before_job_metadata_side_effects(self):
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory(prefix="reserved-worker-preflight-") as tmp:
+            root = Path(tmp)
+            with (
+                patch.object(operator, "_reserved_runtime_deploy_pinned_python_path",
+                    side_effect=RuntimeError("pinned dependency unavailable")),
+                patch.object(operator, "_cleanup_stale_job_metadata_temps",
+                    side_effect=AssertionError("metadata sweep before dependency validation")),
+                patch.object(operator, "_job_directory",
+                    side_effect=AssertionError("job directory allocated before validation")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "pinned dependency unavailable"):
+                    operator._start_job(
+                        ["/usr/bin/python3", "-c", "print('worker')"],
+                        cwd=str(root), runtime_seconds=60,
+                        finalization_expected_head="a" * 40,
+                        allow_reserved_runtime_deploy=True,
+                    )
+            self.assertFalse((root / "state").exists())
+
     @unittest.skipUnless(Path("/usr/bin/python3").is_file(), "system Python absent")
     def test_reserved_worker_pinned_site_excludes_ambient_pth_and_fake_yaml(self):
         # Actual startup semantics: .pth runs from user site before any code.
