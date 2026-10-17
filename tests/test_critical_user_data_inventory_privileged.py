@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 HELPER_PATH = ROOT / "tools" / "grabowski_critical_user_data_inventory.py"
 BROKER_PATH = ROOT / "src" / "grabowski_privileged_broker.py"
+BROKER_SERVER_PATH = ROOT / "tools" / "grabowski_privileged_broker.py"
 PRIVILEGED_PATH = ROOT / "src" / "grabowski_privileged.py"
 
 
@@ -29,6 +30,7 @@ def _load(name: str, path: Path):
 
 helper = _load("grabowski_critical_user_data_inventory_test", HELPER_PATH)
 broker = _load("grabowski_privileged_broker_inventory_test", BROKER_PATH)
+server = _load("grabowski_privileged_broker_server_inventory_test", BROKER_SERVER_PATH)
 privileged = _load("grabowski_privileged_inventory_test", PRIVILEGED_PATH)
 
 
@@ -2515,6 +2517,257 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
         self.assertEqual(value["request_id"], "req-safe")
         self.assertEqual(value["reference_sha256"], "9" * 64)
 
+
+
+    def test_rootbroker_inventory_refusal_binds_preclaim_no_dispatch(self) -> None:
+        """Only rejection before request claim may assert no dispatch."""
+        import io
+        from contextlib import redirect_stdout
+
+        reference = {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "action": "critical_user_data_inventory",
+        }
+        execution = {
+            "mode": "template",
+            "argv": ["/usr/bin/true"],
+            "timeout_seconds": 90,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": "grabowski-operator.service",
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(server, "parse_reference", return_value=reference),
+            mock.patch.object(server, "load_root_config", return_value={}),
+            mock.patch.object(server, "resolve_regular_execution", return_value=execution),
+            mock.patch.object(
+                server, "_validate_blockade_lifecycle_peer",
+                side_effect=PermissionError("peer not systemd MainPID"),
+            ),
+            mock.patch.object(server, "claim_once") as claim,
+            mock.patch.object(server, "_execute_broker_command") as execute,
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(
+                server._run_non_secret_reference_request(b"opaque-request"), 0
+            )
+        claim.assert_not_called()
+        execute.assert_not_called()
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_pre_effect_refusal.v1",
+                "request_id": reference["request_id"],
+                "reference_sha256": reference["reference_sha256"],
+                "action": reference["action"],
+                "phase": "pre_claim",
+                "claim_started": False,
+                "dispatch_started": False,
+                "reason_code": "peer_authority",
+            },
+        )
+
+    def test_rootbroker_invalid_policy_is_preclaim_no_dispatch(self) -> None:
+        """A rejected inventory action cannot claim or spawn a process."""
+        import io
+        from contextlib import redirect_stdout
+
+        reference = {
+            "request_id": "f" * 32,
+            "reference_sha256": "e" * 64,
+            "action": "critical_user_data_inventory",
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(server, "parse_reference", return_value=reference),
+            mock.patch.object(server, "load_root_config", return_value={}),
+            mock.patch.object(
+                server, "resolve_regular_execution",
+                side_effect=ValueError("invalid inventory action"),
+            ),
+            mock.patch.object(server, "claim_once") as claim,
+            mock.patch.object(server, "_execute_broker_command") as execute,
+            redirect_stdout(stdout),
+        ):
+            self.assertEqual(
+                server._run_non_secret_reference_request(b"typed-request"), 0
+            )
+        claim.assert_not_called()
+        execute.assert_not_called()
+        record = json.loads(stdout.getvalue())
+        self.assertEqual(record["request_id"], reference["request_id"])
+        self.assertEqual(record["reference_sha256"], reference["reference_sha256"])
+        self.assertEqual(record["reason_code"], "action_resolution")
+        self.assertFalse(record["claim_started"])
+        self.assertFalse(record["dispatch_started"])
+
+    def test_rootbroker_claim_failure_has_no_preclaim_attestation(self) -> None:
+        """A failure after admission may not be laundered into a safe retry."""
+        import io
+        from contextlib import redirect_stdout
+
+        reference = {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "action": "critical_user_data_inventory",
+        }
+        execution = {
+            "mode": "template",
+            "argv": ["/usr/bin/true"],
+            "timeout_seconds": 90,
+            "allowed_peer_uid": 1000,
+            "allowed_peer_unit": "grabowski-operator.service",
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(server, "parse_reference", return_value=reference),
+            mock.patch.object(server, "load_root_config", return_value={}),
+            mock.patch.object(server, "resolve_regular_execution", return_value=execution),
+            mock.patch.object(
+                server, "_validate_blockade_lifecycle_peer",
+                return_value={"peer_uid": 1000},
+            ),
+            mock.patch.object(
+                server, "claim_once",
+                side_effect=FileExistsError("request was claimed"),
+            ),
+            mock.patch.object(server, "_execute_broker_command") as execute,
+            redirect_stdout(stdout),
+        ):
+            with self.assertRaises(FileExistsError):
+                server._run_non_secret_reference_request(b"opaque-request")
+        self.assertEqual(stdout.getvalue(), "")
+        execute.assert_not_called()
+
+    def test_authenticated_preclaim_refusal_reconciles_without_dispatch(self) -> None:
+        """An exact root-owned pre-claim denial plus fresh status permits retry."""
+        scanner = helper.AUTHORIZED_SCANNER_SHA256
+        contract = helper.AUTHORIZED_CONTRACT_SHA256
+        status = {
+            "schema_version": 1,
+            "kind": "grabowski.critical_user_data_inventory_status.v1",
+            "status": "not-started",
+            "scanner_sha256": scanner,
+            "contract_sha256": contract,
+            "unit": "grabowski-inventory.service",
+            "unit_state": {
+                "load": "not-found", "active": "inactive",
+                "sub": "dead", "result": "success",
+            },
+            "result_sha256": None,
+        }
+        def status_invoked(request: str) -> dict[str, object]:
+            return {
+                "request_id": request,
+                "reference_sha256": "e" * 64,
+                "broker_client_timed_out": False,
+                "broker_client_transport_error": None,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "broker_response": {
+                    "returncode": 0, "timed_out": False,
+                    "stdout": json.dumps(status),
+                },
+            }
+        start = {
+            "request_id": "b" * 32,
+            "reference_sha256": "c" * 64,
+            "broker_client_timed_out": False,
+            "broker_client_transport_error": None,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "broker_response": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_pre_effect_refusal.v1",
+                "request_id": "b" * 32,
+                "reference_sha256": "c" * 64,
+                "action": "critical_user_data_inventory",
+                "phase": "pre_claim",
+                "claim_started": False,
+                "dispatch_started": False,
+                "reason_code": "peer_authority",
+            },
+        }
+        with (
+            mock.patch.object(
+                privileged, "_invoke_mainpid_privileged_reference",
+                side_effect=[status_invoked("a" * 32), start, status_invoked("d" * 32)],
+            ) as transport,
+            mock.patch.object(
+                privileged.operator, "_require_operator_mutation",
+                return_value=None,
+            ),
+        ):
+            result = privileged.grabowski_critical_user_data_inventory(
+                "start", scanner, contract
+            )
+        self.assertEqual(transport.call_count, 3)
+        self.assertEqual(result["outcome"], "pre_effect_refused")
+        self.assertTrue(result["retry_safe"])
+        self.assertFalse(result["readback_required"])
+        self.assertEqual(result["request_id"], "b" * 32)
+        self.assertEqual(result["readback_request_id"], "d" * 32)
+        self.assertEqual(result["reason_code"], "peer_authority")
+        self.assertNotIn("broker_response", result)
+        self.assertNotIn("stdout", result)
+
+    def test_untrusted_preclaim_claims_stay_outcome_unknown(self) -> None:
+        """No unbound/transport-uncertain/staged marker can authorize replay."""
+        base = {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "broker_client_timed_out": False,
+            "broker_client_transport_error": None,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "broker_response": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_pre_effect_refusal.v1",
+                "request_id": "a" * 32,
+                "reference_sha256": "b" * 64,
+                "action": "critical_user_data_inventory",
+                "phase": "pre_claim",
+                "claim_started": False,
+                "dispatch_started": False,
+                "reason_code": "peer_authority",
+            },
+        }
+        self.assertEqual(
+            privileged._critical_inventory_proven_pre_effect_refusal(base),
+            "peer_authority",
+        )
+        variants = [
+            {"request_id": "different"},
+            {"reference_sha256": "f" * 64},
+            {"action": "critical_user_data_inventory_read"},
+            {"phase": "post_claim"},
+            {"claim_started": True},
+            {"dispatch_started": True},
+            {"reason_code": "unknown"},
+            {"reason_code": []},
+            {"reason_code": {}},
+            {"schema_version": True},
+            {"arbitrary_proof": True},
+        ]
+        for change in variants:
+            forged = {**base, "broker_response": {**base["broker_response"], **change}}
+            with self.subTest(change=change):
+                self.assertIsNone(
+                    privileged._critical_inventory_proven_pre_effect_refusal(forged)
+                )
+        for change in (
+            {"broker_client_timed_out": True},
+            {"broker_client_transport_error": "network failure"},
+            {"stdout_truncated": True},
+            {"stderr_truncated": True},
+        ):
+            forged = {**base, **change}
+            with self.subTest(change=change):
+                self.assertIsNone(
+                    privileged._critical_inventory_proven_pre_effect_refusal(forged)
+                )
 
 
 if __name__ == "__main__":
