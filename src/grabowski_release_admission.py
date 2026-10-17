@@ -1,0 +1,347 @@
+"""Server-observed post-merge review and CI for a whole serving-to-target delta.
+
+This module grants no authorization by itself. Captain must independently pass
+its action gates and establish an ephemeral execution scope. Direct schedulers
+cannot supply release review identifiers or PASS attestations.
+"""
+from __future__ import annotations
+
+import hashlib
+import http.client
+import json
+import re
+from typing import Any
+from urllib.parse import parse_qs, urlsplit
+
+REPOSITORY = "heimgewebe/grabowski"
+GITHUB_HOST = "api.github.com"
+CHECK_BYTES_LIMIT = 262_144
+REQUIRED_CI_CHECKS = ("validate (3.10)", "validate (3.12)")
+CANONICAL_WORKFLOW_PATH = ".github/workflows/validate.yml"
+MAX_GITHUB_ITEMS = 1_000
+GITHUB_PAGE_SIZE = 100
+_SHA40 = re.compile(r"[0-9a-f]{40}\Z")
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+class ReleaseAdmissionDenied(RuntimeError):
+    """A post-merge release review or CI origin did not verify."""
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _github_json(path: str) -> tuple[dict[str, Any], str]:
+    """Bounded HTTPS read; responses, including pagination, are untrusted until checked."""
+    conn = http.client.HTTPSConnection(GITHUB_HOST, timeout=15)
+    try:
+        conn.request(
+            "GET", path,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "grabowski-release-admission/2",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        response = conn.getresponse()
+        if response.status != 200:
+            raise ReleaseAdmissionDenied(f"authoritative CI lookup HTTP {response.status}")
+        link = response.getheader("Link", "") or ""
+        payload = response.read(CHECK_BYTES_LIMIT + 1)
+    except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        raise ReleaseAdmissionDenied("authoritative CI lookup failed") from exc
+    finally:
+        conn.close()
+    if len(payload) > CHECK_BYTES_LIMIT:
+        raise ReleaseAdmissionDenied("authoritative CI payload exceeded bound")
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ReleaseAdmissionDenied("authoritative CI payload is invalid") from exc
+    if not isinstance(data, dict) or not isinstance(link, str):
+        raise ReleaseAdmissionDenied("authoritative CI result is malformed")
+    return data, link
+
+
+def _github_inventory(path: str, key: str) -> list[dict[str, Any]]:
+    """Read all pages, fail closed on changed counts, missing pages and unsafe links."""
+    collected: list[dict[str, Any]] = []
+    observed_ids: set[int] = set()
+    total: int | None = None
+    for page in range(1, MAX_GITHUB_ITEMS // GITHUB_PAGE_SIZE + 1):
+        suffix = "&" if "?" in path else "?"
+        page_path = f"{path}{suffix}per_page={GITHUB_PAGE_SIZE}&page={page}"
+        data, link = _github_json(page_path)
+        items = data.get(key)
+        count = data.get("total_count")
+        if (
+            type(count) is not int or count < 0 or count > MAX_GITHUB_ITEMS
+            or not isinstance(items, list) or len(items) > GITHUB_PAGE_SIZE
+            or (total is not None and count != total)
+        ):
+            raise ReleaseAdmissionDenied("authoritative CI inventory incomplete")
+        total = count
+        expected = min(GITHUB_PAGE_SIZE, total - len(collected))
+        if len(items) != expected:
+            raise ReleaseAdmissionDenied("authoritative CI pagination incomplete")
+        for item in items:
+            item_id = item.get("id") if isinstance(item, dict) else None
+            if type(item_id) is not int or item_id <= 0 or item_id in observed_ids:
+                raise ReleaseAdmissionDenied("authoritative CI page has invalid or duplicate IDs")
+            observed_ids.add(item_id)
+            collected.append(item)
+        more = len(collected) < total
+        links = re.findall(r'<([^>]+)>;\s*rel="next"', link)
+        if more != bool(links) or len(links) > 1:
+            raise ReleaseAdmissionDenied("authoritative CI pagination link mismatch")
+        if more:
+            next_url = urlsplit(links[0])
+            current_url = urlsplit(f"https://{GITHUB_HOST}{path}")
+            current_query = parse_qs(current_url.query)
+            current_query.update({"per_page": [str(GITHUB_PAGE_SIZE)], "page": [str(page + 1)]})
+            if (
+                next_url.scheme != "https" or next_url.netloc != GITHUB_HOST
+                or next_url.path != current_url.path
+                or parse_qs(next_url.query) != current_query
+                or next_url.fragment
+            ):
+                raise ReleaseAdmissionDenied("authoritative CI pagination destination mismatch")
+        else:
+            return collected
+    raise ReleaseAdmissionDenied("authoritative CI pagination exceeds bound")
+
+
+def _fresh_github_checks(target_head: str) -> dict[str, Any]:
+    """Bind green checks to the actual canonical workflow, run, job and suite."""
+    if not isinstance(target_head, str) or not _SHA40.fullmatch(target_head):
+        raise ReleaseAdmissionDenied("release target commit is invalid")
+    prefix = f"/repos/{REPOSITORY}"
+    workflow, link = _github_json(f"{prefix}/actions/workflows/validate.yml")
+    workflow_id = workflow.get("id")
+    if (
+        link or type(workflow_id) is not int or workflow_id <= 0
+        or workflow.get("path") != CANONICAL_WORKFLOW_PATH
+        or workflow.get("state") != "active"
+    ):
+        raise ReleaseAdmissionDenied("canonical Validate workflow identity is invalid")
+
+    runs = _github_inventory(
+        f"{prefix}/actions/workflows/{workflow_id}/runs?head_sha={target_head}",
+        "workflow_runs",
+    )
+    matching: list[dict[str, Any]] = []
+    for run in runs:
+        if (
+            run.get("workflow_id") != workflow_id
+            or run.get("path") != CANONICAL_WORKFLOW_PATH
+            or run.get("head_sha") != target_head
+        ):
+            raise ReleaseAdmissionDenied("canonical Validate run origin or commit mismatch")
+        if (
+            run.get("event") == "push"
+            and run.get("head_branch") == "main"
+            and isinstance(run.get("repository"), dict)
+            and run["repository"].get("full_name") == REPOSITORY
+            and isinstance(run.get("head_repository"), dict)
+            and run["head_repository"].get("full_name") == REPOSITORY
+        ):
+            matching.append(run)
+    if not matching:
+        raise ReleaseAdmissionDenied("canonical Validate push run is missing")
+    def order(run: dict[str, Any]) -> tuple[int, int]:
+        number, run_id = run.get("run_number"), run.get("id")
+        if type(number) is not int or number <= 0 or type(run_id) is not int:
+            raise ReleaseAdmissionDenied("canonical Validate run ordering is invalid")
+        return number, run_id
+    latest = max(matching, key=order)
+    run_id = latest["id"]
+    run, link = _github_json(f"{prefix}/actions/runs/{run_id}")
+    attempt, suite_id = run.get("run_attempt"), run.get("check_suite_id")
+    if (
+        link or run.get("id") != run_id
+        or run.get("workflow_id") != workflow_id
+        or run.get("path") != CANONICAL_WORKFLOW_PATH
+        or run.get("event") != "push"
+        or run.get("head_branch") != "main"
+        or not isinstance(run.get("repository"), dict)
+        or run["repository"].get("full_name") != REPOSITORY
+        or not isinstance(run.get("head_repository"), dict)
+        or run["head_repository"].get("full_name") != REPOSITORY
+        or run.get("head_sha") != target_head
+        or run.get("run_number") != latest.get("run_number")
+        or type(attempt) is not int or attempt <= 0
+        or attempt != latest.get("run_attempt")
+        or type(suite_id) is not int or suite_id <= 0
+        or suite_id != latest.get("check_suite_id")
+        or run.get("status") != "completed"
+        or run.get("conclusion") != "success"
+    ):
+        raise ReleaseAdmissionDenied("current canonical Validate run is not authenticated green")
+
+    jobs = _github_inventory(f"{prefix}/actions/runs/{run_id}/jobs?filter=all", "jobs")
+    selected: dict[str, dict[str, Any]] = {}
+    for job in jobs:
+        name = job.get("name")
+        if name not in REQUIRED_CI_CHECKS:
+            continue
+        job_attempt = job.get("run_attempt")
+        if (
+            job.get("run_id") != run_id
+            or job.get("head_sha") != target_head
+            or type(job_attempt) is not int or not 1 <= job_attempt <= attempt
+        ):
+            raise ReleaseAdmissionDenied("canonical Validate job binding is invalid")
+        previous = selected.get(name)
+        if previous is None or job_attempt > previous["run_attempt"]:
+            selected[name] = job
+        elif job_attempt == previous["run_attempt"]:
+            raise ReleaseAdmissionDenied("duplicate canonical Validate job identity")
+    if set(selected) != set(REQUIRED_CI_CHECKS):
+        raise ReleaseAdmissionDenied("required canonical Validate jobs are missing")
+
+    ordered = []
+    for name in REQUIRED_CI_CHECKS:
+        job = selected[name]
+        check_id = job["id"]
+        # The job ID is the Check-Run ID. Fetch it directly rather than
+        # enumerating unrelated checks on a busy commit (possibly >1,000).
+        check, link = _github_json(f"{prefix}/check-runs/{check_id}")
+        suite = check.get("check_suite") if isinstance(check, dict) else None
+        app = check.get("app") if isinstance(check, dict) else None
+        if (
+            job.get("check_run_url") != f"https://{GITHUB_HOST}{prefix}/check-runs/{check_id}"
+            or link or check.get("id") != check_id
+            or job.get("status") != "completed" or job.get("conclusion") != "success"
+            or not isinstance(check, dict)
+            or check.get("name") != name
+            or check.get("head_sha") != target_head
+            or check.get("status") != "completed" or check.get("conclusion") != "success"
+            or not isinstance(app, dict) or app.get("slug") != "github-actions"
+            or not isinstance(suite, dict) or suite.get("id") != suite_id
+        ):
+            raise ReleaseAdmissionDenied("required canonical Validate job/check provenance is not green")
+        ordered.append({
+            "name": name, "id": check_id, "head_sha": target_head,
+            "status": "completed", "conclusion": "success",
+            "workflow_id": workflow_id, "run_id": run_id,
+            "run_attempt": job["run_attempt"], "check_suite_id": suite_id,
+        })
+    workflow_identity = {
+        "id": workflow_id, "path": CANONICAL_WORKFLOW_PATH,
+        "run_id": run_id, "run_attempt": attempt,
+        "check_suite_id": suite_id, "event": "push", "head_branch": "main",
+        "head_repository": REPOSITORY, "head_sha": target_head,
+    }
+    return {
+        "checks": ordered,
+        "workflow": workflow_identity,
+        "checks_sha256": _sha256_json({"workflow": workflow_identity, "checks": ordered}),
+    }
+
+
+def validate_independent_release_review(
+    *, serving_head: str, target_head: str, diff_sha256: str,
+    review_pr: int,
+) -> dict[str, Any]:
+    """Reconcile an actual role-bound independent review of the *whole* delta.
+
+    The PR integer is a durable review-job namespace, not proof of a PR merge.
+    The server checks job-origin provenance, isolated reviewer-role receipt and
+    exact serving/head/diff identities; a generic PASS never counts.
+    """
+    if (
+        not isinstance(serving_head, str) or not _SHA40.fullmatch(serving_head)
+        or not isinstance(target_head, str) or not _SHA40.fullmatch(target_head)
+        or not isinstance(diff_sha256, str) or not _SHA256.fullmatch(diff_sha256)
+        or type(review_pr) is not int or review_pr <= 0
+    ):
+        raise ReleaseAdmissionDenied("release review identity is invalid")
+    import grabowski_decision_reviews as decisions
+    import grabowski_merge_guard as merge_guard
+
+    try:
+        reconciliation = decisions.reconcile(
+            repo=REPOSITORY, pr=review_pr, head_sha=target_head,
+            base_sha=serving_head, diff_sha256=diff_sha256,
+            defer_diff_identity=False,
+        )
+        summary = merge_guard.independent_review_reconciliation_summary(reconciliation)
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+        raise ReleaseAdmissionDenied("independent release review reconciliation failed") from exc
+    if (
+        not isinstance(reconciliation, dict)
+        or reconciliation.get("status") != "settled"
+        or reconciliation.get("errors") != []
+        or not isinstance(summary, dict)
+        or summary.get("errors") != []
+        or type(summary.get("pass_count")) is not int
+        or summary["pass_count"] < 1
+        or not summary.get("admissible_slots")
+        or reconciliation.get("deferred_diff_identity_count") != 0
+    ):
+        raise ReleaseAdmissionDenied("authentic independent release R3 PASS is missing")
+    binding = reconciliation.get("binding")
+    if (
+        not isinstance(binding, dict)
+        or binding.get("repo") != REPOSITORY
+        or binding.get("pr") != review_pr
+        or binding.get("head_sha") != target_head
+        or binding.get("base_sha") != serving_head
+        or binding.get("diff_sha256") != diff_sha256
+    ):
+        raise ReleaseAdmissionDenied("release reviewer binding drift")
+    return {
+        "review_pr": review_pr,
+        "review_binding_sha256": reconciliation.get("binding_sha256"),
+        "review_attempts_sha256": reconciliation.get("attempts_sha256"),
+        "independent_pass_count": summary["pass_count"],
+        "admissible_slots": summary["admissible_slots"],
+    }
+
+
+def validate_release(
+    *, serving_head: str, target_head: str, serving_release_id: str,
+    serving_tree: str, target_tree: str, diff_sha256: str, review_pr: int,
+) -> dict[str, Any]:
+    """Recompute all external evidence on each authorization/dispatch check."""
+    for value in (serving_head, target_head, serving_tree, target_tree):
+        if not isinstance(value, str) or not _SHA40.fullmatch(value):
+            raise ReleaseAdmissionDenied("release source/tree identity is invalid")
+    if not isinstance(serving_release_id, str) or not serving_release_id.strip():
+        raise ReleaseAdmissionDenied("serving release ID is invalid")
+    if not isinstance(diff_sha256, str) or not _SHA256.fullmatch(diff_sha256):
+        raise ReleaseAdmissionDenied("release diff identity is invalid")
+    review = validate_independent_release_review(
+        serving_head=serving_head, target_head=target_head,
+        diff_sha256=diff_sha256, review_pr=review_pr,
+    )
+    checks = _fresh_github_checks(target_head)
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_post_merge_release_review",
+        "source": "server-observed",
+        "repo": REPOSITORY,
+        "serving_release_id": serving_release_id,
+        "serving_head": serving_head,
+        "target_head": target_head,
+        "serving_tree": serving_tree,
+        "target_tree": target_tree,
+        "diff_sha256": diff_sha256,
+        "review": review,
+        "ci": checks,
+    }
+    return {
+        **material,
+        "release_review_identity_sha256": _sha256_json(material),
+        "independent_review_required": True,
+        "status": "authenticated-post-merge-r3-ci",
+        "does_not_establish": [
+            "historical pre-merge review authorization",
+            "Captain runtime-deploy decision",
+            "deployment execution or completion",
+            "external connector publication",
+        ],
+    }

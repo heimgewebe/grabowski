@@ -12,6 +12,7 @@ import secrets
 import shlex
 import stat
 import subprocess
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -136,6 +137,23 @@ MAX_SIDECAR_READBACK_BYTES = 256 * 1024
 _RUNTIME_PROOF_CACHE: ContextVar[dict[tuple[str, str, str], bool] | None] = ContextVar(
     "grabowski_runtime_proof_cache", default=None
 )
+# Only Captain's accepted runtime-deploy action may establish this per-call
+# context. It is never a public scheduler parameter or persisted caller PASS.
+_CAPTAIN_RUNTIME_RELEASE_SCOPE: ContextVar[dict[str, Any] | None] = ContextVar(
+    "grabowski_captain_runtime_release_scope", default=None
+)
+# A successful R3/CI review or a user-hashable ContextVar mapping cannot mint a
+# Captain action. An accepted Captain dispatcher issues a single-use, in-process
+# object identity after its server-authenticated gates have passed. The active
+# origin is revoked when the corresponding source dispatch scope exits.
+_CAPTAIN_ACCEPTED_ACTION: ContextVar[tuple[object, str, int, dict[str, Any], str] | None] = ContextVar(
+    "grabowski_captain_accepted_action", default=None
+)
+_CAPTAIN_PENDING_ACTION_MARKERS: set[object] = set()
+_CAPTAIN_ACTIVE_ACTION_MARKERS: set[object] = set()
+# A ContextVar can be copied; only a single dispatch may claim an accepted action.
+_CAPTAIN_EFFECT_CLAIM_LOCK = threading.Lock()
+_CAPTAIN_CLAIMED_EFFECT_MARKERS: set[object] = set()
 
 
 class BlueGreenCutoverError(RuntimeError):
@@ -5707,12 +5725,214 @@ def _release_documentation_raw_paths(raw_records: str) -> list[str]:
     return changed_paths
 
 
-def _require_release_source_admission(expected_head: str) -> dict[str, Any]:
-    """Read-only release admission; never infer an independent R3 from main.
 
-    Independently authenticated post-merge release authorization is not yet
-    implemented by this seam. Changed runtime and policy sources are blocked
-    before scheduling, Git-ref changes and Rootbroker side effects.
+@contextmanager
+def _accepted_captain_runtime_action(
+    expected_head: str,
+    release_review_pr: int,
+    *,
+    server_actor_identity: dict[str, Any],
+    execution_intent_sha256: str,
+    accepted_dispatch_ticket: object | None = None,
+) -> Iterator[None]:
+    """Bind a *server-authenticated* Captain executor, after its accepted gates.
+
+    Only the approved captain-run dispatcher may enter this private issuance
+    seam. The signed actor identity proves server provenance, not a Captain
+    decision by itself; the caller must separately have passed the exact
+    Captain action, evidence and execution-intent gates.
+    """
+    import grabowski_grips as grips
+    import grabowski_merge_guard as merge_guard
+
+    # The one-use ticket is issued *only* by the accepted Captain-run path,
+    # after its full action/CI/R3/execution-intent gates have passed. A signed
+    # generic operator actor or hashable user-supplied binding cannot mint it.
+    if not grips._consume_accepted_runtime_ticket(
+        accepted_dispatch_ticket,
+        expected_head,
+        release_review_pr,
+        execution_intent_sha256,
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: accepted Captain dispatch ticket missing"
+        )
+    try:
+        actor = merge_guard.verify_server_runtime_actor_identity(
+            server_actor_identity
+        )
+    except (TypeError, ValueError) as exc:
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: server Captain actor origin invalid"
+        ) from exc
+    if (
+        not isinstance(expected_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None
+        or type(release_review_pr) is not int
+        or release_review_pr <= 0
+        or not isinstance(execution_intent_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", execution_intent_sha256) is None
+        or not isinstance(actor.get("owner_id"), str)
+        or not actor["owner_id"].startswith("runtime-actor:")
+    ):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: accepted Captain action identity malformed"
+        )
+    marker = object()
+    _CAPTAIN_PENDING_ACTION_MARKERS.add(marker)
+    context = (marker, expected_head, release_review_pr,
+               dict(server_actor_identity), execution_intent_sha256)
+    reset = _CAPTAIN_ACCEPTED_ACTION.set(context)
+    try:
+        yield
+    finally:
+        _CAPTAIN_ACCEPTED_ACTION.reset(reset)
+        _CAPTAIN_PENDING_ACTION_MARKERS.discard(marker)
+
+
+def _accepted_captain_origin_matches(expected_head: str, review_pr: int) -> bool:
+    context = _CAPTAIN_ACCEPTED_ACTION.get()
+    return bool(
+        isinstance(context, tuple)
+        and len(context) == 5
+        and context[0] in _CAPTAIN_PENDING_ACTION_MARKERS
+        and context[1] == expected_head
+        and context[2] == review_pr
+    )
+
+
+def _active_captain_origin_valid(scope: Any, expected_head: str) -> bool:
+    """Re-admit the exact still-active Captain action, not a copied token."""
+    if not isinstance(scope, dict) or scope.get("target_head") != expected_head:
+        return False
+    accepted = _CAPTAIN_ACCEPTED_ACTION.get()
+    if not isinstance(accepted, tuple) or len(accepted) != 5:
+        return False
+    marker, accepted_head, accepted_review_pr, accepted_actor, accepted_intent = accepted
+    if (
+        accepted_head != expected_head
+        or scope.get("accepted_action_marker") is not marker
+        or scope.get("review_pr") != accepted_review_pr
+        or scope.get("execution_intent_sha256") != accepted_intent
+    ):
+        return False
+    try:
+        if marker not in _CAPTAIN_ACTIVE_ACTION_MARKERS:
+            return False
+        import grabowski_merge_guard as merge_guard
+
+        actor = merge_guard.verify_server_runtime_actor_identity(
+            scope.get("server_actor_identity")
+        )
+        origin_actor = merge_guard.verify_server_runtime_actor_identity(
+            accepted_actor
+        )
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        actor["identity_sha256"] == origin_actor["identity_sha256"]
+        and scope.get("server_actor_identity_sha256") == actor["identity_sha256"]
+        and isinstance(accepted_intent, str)
+        and re.fullmatch(r"[0-9a-f]{64}", accepted_intent) is not None
+    )
+
+
+def _claim_captain_schedule_effect(expected_head: str, admitted: dict[str, Any]) -> None:
+    """Atomically consume the accepted action at the job-registration boundary.
+
+    Earlier admission probes are read-only and deliberately do not consume it.
+    The one use is claimed after the final source/CI/R3 validation and before
+    the durable deploy-index or job-dispatch effects. A copied ContextVar may
+    read the scope, but cannot claim it a second time or in another task.
+    """
+    if admitted.get("independent_review_required") is False:
+        return
+    if admitted.get("independent_review_required") is not True:
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: malformed critical-source decision"
+        )
+    scope = _CAPTAIN_RUNTIME_RELEASE_SCOPE.get()
+    if not _active_captain_origin_valid(scope, expected_head):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: accepted Captain action is no longer active"
+        )
+    marker = scope["accepted_action_marker"]
+    with _CAPTAIN_EFFECT_CLAIM_LOCK:
+        if (
+            marker not in _CAPTAIN_ACTIVE_ACTION_MARKERS
+            or marker in _CAPTAIN_CLAIMED_EFFECT_MARKERS
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: Captain scheduling action already consumed"
+            )
+        # Keep read-only final admission possible, but no second side-effect
+        # invocation can ever claim this accepted action (including a clone).
+        _CAPTAIN_CLAIMED_EFFECT_MARKERS.add(marker)
+
+
+@contextmanager
+def _captain_release_scope(
+    expected_head: str, release_review_pr: int,
+) -> Iterator[None]:
+    """One-use accepted Captain action, not a direct callable review override."""
+    if not _accepted_captain_origin_matches(expected_head, release_review_pr):
+        raise DeploySchedulePreEffectRefusal(
+            "release admission blocked: authentic accepted Captain action origin missing"
+        )
+    accepted = _CAPTAIN_ACCEPTED_ACTION.get()
+    assert accepted is not None
+    marker, _, _, server_actor_identity, intent_sha256 = accepted
+    with _CAPTAIN_EFFECT_CLAIM_LOCK:
+        if marker not in _CAPTAIN_PENDING_ACTION_MARKERS:
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: Captain action already consumed"
+            )
+        _CAPTAIN_PENDING_ACTION_MARKERS.remove(marker)
+        _CAPTAIN_ACTIVE_ACTION_MARKERS.add(marker)
+    try:
+        reviewed = _require_release_source_admission(
+        expected_head,
+        release_review_pr=release_review_pr,
+        captain_preview=True,
+    )
+        if reviewed.get("independent_review_required") is not True:
+            yield
+            return
+        import grabowski_merge_guard as merge_guard
+
+        actor = merge_guard.verify_server_runtime_actor_identity(server_actor_identity)
+        binding = {
+            "target_head": expected_head,
+            "review_pr": release_review_pr,
+            "serving_head": reviewed["serving_head"],
+            "serving_release_id": reviewed["serving_release_id"],
+            "identity_sha256": reviewed["release_review_identity_sha256"],
+            "accepted_action_marker": marker,
+            "server_actor_identity": server_actor_identity,
+            "server_actor_identity_sha256": actor["identity_sha256"],
+            "execution_intent_sha256": intent_sha256,
+        }
+        reset = _CAPTAIN_RUNTIME_RELEASE_SCOPE.set(binding)
+        try:
+            yield
+        finally:
+            _CAPTAIN_RUNTIME_RELEASE_SCOPE.reset(reset)
+    finally:
+        with _CAPTAIN_EFFECT_CLAIM_LOCK:
+            _CAPTAIN_ACTIVE_ACTION_MARKERS.discard(marker)
+            _CAPTAIN_CLAIMED_EFFECT_MARKERS.discard(marker)
+
+
+def _require_release_source_admission(
+    expected_head: str, *,
+    release_review_pr: int | None = None,
+    captain_preview: bool = False,
+) -> dict[str, Any]:
+    """Server-observed release proof; Captain preview never grants dispatch.
+
+    The direct scheduler cannot accept caller-provided review identities. Its
+    only critical-release authority is an ephemeral accepted Captain action,
+    whose exact review/CI/serving evidence is re-read before effects.
     """
     if not isinstance(expected_head, str) or re.fullmatch(r"[0-9a-f]{40}", expected_head) is None:
         raise DeploySchedulePreEffectRefusal("release admission blocked: exact target head is invalid")
@@ -5855,10 +6075,94 @@ def _require_release_source_admission(expected_head: str) -> dict[str, Any]:
         not path.startswith("docs/") or not path.endswith(safe_document_extensions)
         for path in changed_paths
     ):
-        raise DeploySchedulePreEffectRefusal(
-            "release review admission missing: changed runtime/policy sources "
-            "require independent exact-revision authorization before deployment"
+        scope = _CAPTAIN_RUNTIME_RELEASE_SCOPE.get()
+        if not captain_preview:
+            if (
+                not _active_captain_origin_valid(scope, expected_head)
+                or type(scope.get("review_pr")) is not int
+                or scope["review_pr"] <= 0
+            ):
+                raise DeploySchedulePreEffectRefusal(
+                    "release review admission missing: critical source deployment "
+                    "requires an accepted Captain release action"
+                )
+            release_review_pr = scope["review_pr"]
+        if type(release_review_pr) is not int or release_review_pr <= 0:
+            raise DeploySchedulePreEffectRefusal(
+                "release review admission missing: exact independent R3 job namespace"
+            )
+
+        def exact_tree(commit: str) -> str:
+            result = _git_result(
+                CANONICAL_REPOSITORY, "rev-parse", f"{commit}^{{tree}}"
+            )
+            if (
+                type(result.get("returncode")) is not int
+                or result["returncode"] != 0
+                or result.get("timed_out") is not False
+                or result.get("stdout_truncated") is not False
+                or result.get("stderr_truncated") is not False
+                or result.get("stderr") != ""
+                or not isinstance(result.get("stdout"), str)
+                or re.fullmatch(r"[0-9a-f]{40}\n?", result["stdout"]) is None
+            ):
+                raise DeploySchedulePreEffectRefusal(
+                    "release admission blocked: exact source tree unavailable"
+                )
+            return result["stdout"].strip()
+
+        raw_diff = _git_result(
+            CANONICAL_REPOSITORY,
+            "diff", "--no-ext-diff", "--no-textconv",
+            "--no-renames", "--ignore-submodules=none",
+            "--raw", "--abbrev=40", "-z",
+            serving_head, expected_head, "--",
+            max_output_bytes=262_144,
         )
+        if (
+            type(raw_diff.get("returncode")) is not int
+            or raw_diff["returncode"] != 0
+            or raw_diff.get("timed_out") is not False
+            or raw_diff.get("stdout_truncated") is not False
+            or raw_diff.get("stderr_truncated") is not False
+            or raw_diff.get("stderr") != ""
+            or not isinstance(raw_diff.get("stdout"), str)
+            or "\ufffd" in raw_diff["stdout"]
+            or "<REDACTED>" in raw_diff["stdout"]
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release admission blocked: exact complete raw source diff unavailable"
+            )
+        import grabowski_release_admission as release_admission
+
+        try:
+            reviewed = release_admission.validate_release(
+                serving_head=serving_head,
+                target_head=expected_head,
+                serving_release_id=release_id,
+                serving_tree=exact_tree(serving_head),
+                target_tree=exact_tree(expected_head),
+                diff_sha256=hashlib.sha256(
+                    raw_diff["stdout"].encode("utf-8")
+                ).hexdigest(),
+                review_pr=release_review_pr,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise DeploySchedulePreEffectRefusal(
+                "release review admission blocked: " + str(exc)
+            ) from exc
+        if not captain_preview and (
+            reviewed["release_review_identity_sha256"] != scope.get("identity_sha256")
+            or serving_head != scope.get("serving_head")
+            or release_id != scope.get("serving_release_id")
+        ):
+            raise DeploySchedulePreEffectRefusal(
+                "release review admission blocked: Captain-to-dispatch identity drift"
+            )
+        return reviewed
+    # _release_documentation_raw_paths already verified every changed
+    # entry's complete Git raw header, exact OID width, regular-file mode
+    # transition and unambiguous path before the documentation exemption.
     return {
         "status": "non-runtime-documentation",
         "serving_repo_head": serving_head,
@@ -5902,26 +6206,46 @@ def _require_release_source_admission_under_lease(
         admitted = _require_release_source_admission(expected_head)
         # A non-exception result is not itself authorization. The caller may
         # proceed only with one of the helper's two exact source identities.
-        if (
-            not isinstance(admitted, dict)
-            or admitted.get("target_repo_head") != expected_head
-            or admitted.get("independent_review_required") is not False
-            or (
-                admitted.get("status") == "already-serving-exact-source"
-                and admitted.get("serving_repo_head") != expected_head
-            )
-            or (
-                admitted.get("status") == "non-runtime-documentation"
-                and (
-                    admitted.get("serving_repo_head") == expected_head
-                    or type(admitted.get("changed_path_count")) is not int
-                    or not 0 <= admitted["changed_path_count"] <= 8192
+        # Exempt identities remain fully source-bound. An authenticated
+        # non-documentary source change must instead be re-admitted by the
+        # server under the exact current Captain release scope. Neither a
+        # PR number nor a local ContextVar alone can grant this status.
+        exempt = (
+            isinstance(admitted, dict)
+            and admitted.get("target_repo_head") == expected_head
+            and admitted.get("independent_review_required") is False
+            and (
+                (
+                    admitted.get("status") == "already-serving-exact-source"
+                    and admitted.get("serving_repo_head") == expected_head
+                )
+                or (
+                    admitted.get("status") == "non-runtime-documentation"
+                    and admitted.get("serving_repo_head") != expected_head
+                    and type(admitted.get("changed_path_count")) is int
+                    and 0 <= admitted["changed_path_count"] <= 8192
                 )
             )
-            or admitted.get("status") not in {
-                "already-serving-exact-source", "non-runtime-documentation"
-            }
-        ):
+        )
+        positive = (
+            isinstance(admitted, dict)
+            and admitted.get("status") == "authenticated-post-merge-r3-ci"
+            and admitted.get("target_head") == expected_head
+            and admitted.get("independent_review_required") is True
+            and isinstance(admitted.get("release_review_identity_sha256"), str)
+            and re.fullmatch(
+                r"[0-9a-f]{64}", admitted["release_review_identity_sha256"]
+            ) is not None
+            and isinstance(admitted.get("serving_head"), str)
+            and re.fullmatch(r"[0-9a-f]{40}", admitted["serving_head"]) is not None
+            and admitted.get("serving_head") != expected_head
+            and isinstance(admitted.get("serving_release_id"), str)
+            and bool(admitted["serving_release_id"])
+            and isinstance(admitted.get("review"), dict)
+            and type(admitted["review"].get("review_pr")) is int
+            and admitted["review"]["review_pr"] > 0
+        )
+        if not (exempt or positive):
             raise DeploySchedulePreEffectRefusal(
                 "release admission refused: protected policy result is unbound"
             )
@@ -6035,7 +6359,13 @@ def _grabowski_runtime_deploy_schedule_impl(
             # Re-admit even when another scheduler imported the exact object.
             # Mandatory re-admission under the lock even when an earlier read
             # succeeded. No index, Git-ref, Rootbroker, or dispatch effect precedes it.
-            _require_release_source_admission_under_lease(expected_head)
+            admitted_under_lease = _require_release_source_admission_under_lease(
+                expected_head
+            )
+            # Claim one-use Captain authority before any main-ref refresh,
+            # Rootbroker, deploy-index or job effects. Later re-admissions
+            # remain read-only and cannot authorize a second schedule.
+            _claim_captain_schedule_effect(expected_head, admitted_under_lease)
             public_github_main_before = _fresh_public_github_main(expected_head)
             if public_github_main_before != expected_head:
                 raise RuntimeError(
@@ -6469,6 +6799,33 @@ def _grabowski_runtime_deploy_schedule_impl(
         reserved_unit: str | None = None
         pending_index_written = False
         try:
+            # Final pre-effect revalidation: Rootbroker/auto-source handling
+            # may have taken time. No pending index or job is registered yet.
+            # Persist a server-observed admission *identity* alongside the
+            # launch intent. No caller-supplied PASS or reviewer text is
+            # accepted as a scheduling capability or deployment receipt.
+            admitted = _require_release_source_admission(expected_head)
+            if not isinstance(admitted, dict) or not isinstance(
+                admitted.get("status"), str
+            ):
+                raise DeploySchedulePreEffectRefusal(
+                    "release admission blocked: final server evidence malformed"
+                )
+            intent["release_admission"] = {
+                "source": "server-revalidated-at-scheduler-dispatch",
+                "status": admitted["status"],
+                "serving_repo_head": admitted.get(
+                    "serving_head", admitted.get("serving_repo_head")
+                ),
+                "serving_release_id": admitted.get("serving_release_id"),
+                "target_repo_head": expected_head,
+                "review_identity_sha256": admitted.get(
+                    "release_review_identity_sha256"
+                ),
+                "independent_review_required": admitted.get(
+                    "independent_review_required"
+                ),
+            }
             _append_deploy_audit(intent)
             jobs_root = operator._jobs_root()
             index = _deploy_index(jobs_root)

@@ -14,6 +14,7 @@ from tests.test_grips import (
 )
 
 import grabowski_grips as grips
+import grabowski_self_deploy as real_deploy
 import grabowski_task_attention as attention
 
 
@@ -173,6 +174,9 @@ class DeploySourceSurfaceTests(unittest.TestCase):
         # Deliberately synthetic authorized-release fixture; the real
         # high-critical R3 gate is not relaxed by this unit test.
         with patch.object(
+            real_deploy, "_require_release_source_admission",
+            return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "independent_review_required": False},
+        ), patch.object(
             grips, "_captain_independent_review_gate",
             return_value={
                 "id": "independent-review-policy",
