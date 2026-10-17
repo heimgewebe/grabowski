@@ -8303,6 +8303,55 @@ def _start_job(
         "GRABOWSKI_JOB_STDERR_PATH": finalization_contract["receipt_paths"]["stderr"],
         "GRABOWSKI_JOB_FINALIZATION_PATH": finalization_contract["receipt_paths"]["finalization"],
     }
+    if allow_reserved_runtime_deploy:
+        # Isolate pycache before interpreter startup, not after imports.
+        # The fixed /usr/bin/python3 worker needs pinned user-site PyYAML.
+        # This alone cannot attest mutable Python source or sourceless .pyc.
+        # Reject inherited user-manager Python environment overrides.
+        import pwd
+        user_home = pwd.getpwuid(os.getuid()).pw_dir
+        if not os.path.isabs(user_home):
+            raise RuntimeError("reserved runtime user home is invalid")
+        environment.update({
+            "PYTHONPYCACHEPREFIX": "/dev/null/grabowski-runtime-deploy",
+            "PYTHONPATH": "",
+            "PYTHONHOME": "",
+            "PYTHONNOUSERSITE": "",
+            "PYTHONUSERBASE": os.path.join(user_home, ".local"),
+            "PYTHONWARNINGS": "",
+            "PYTHONSAFEPATH": "",
+            "PYTHONPLATLIBDIR": "",
+            "PYTHONINSPECT": "",
+            "PYTHONSTARTUP": "",
+            "PYTHONBREAKPOINT": "0",
+            # systemd manager environment is inherited before this Python
+            # process starts. Mask CPython's preinitialization controls,
+            # not just import-path variables: malformed values can be fatal.
+            # Keep hash randomization rather than selecting a fixed seed.
+            "PYTHONHASHSEED": "random",
+            "PYTHONMALLOC": "",
+            "PYTHONUTF8": "",
+            "PYTHONCOERCECLOCALE": "",
+            "PYTHONIOENCODING": "",
+            "PYTHONINTMAXSTRDIGITS": "",
+            "PYTHONDEBUG": "",
+            "PYTHONOPTIMIZE": "",
+            "PYTHONUNBUFFERED": "",
+            "PYTHONVERBOSE": "",
+            "PYTHONFAULTHANDLER": "",
+            "PYTHONDEVMODE": "",
+            "PYTHONWARNDEFAULTENCODING": "",
+            "PYTHONTRACEMALLOC": "",
+            "PYTHONPROFILEIMPORTTIME": "",
+            "PYTHONASYNCIODEBUG": "",
+            "PYTHONDONTWRITEBYTECODE": "",
+            "PYTHONPERFSUPPORT": "0",
+        })
+        # CPython treats NODEBUGRANGES as a presence-only switch: NAME= is
+        # still enabled. UnsetEnvironment runs *last* in systemd.exec, after
+        # all user-manager inheritance and transient unit Environment=.
+        environment.pop("PYTHONNODEBUGRANGES", None)
+        systemd_argv.append("--property=UnsetEnvironment=PYTHONNODEBUGRANGES")
     if (
         decision_review_binding is not None
         and scope.get("decision_review_provenance", {}).get("schema_version") == 2
