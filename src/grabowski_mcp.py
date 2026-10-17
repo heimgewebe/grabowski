@@ -6613,6 +6613,18 @@ def _operator_system_overview(
             "authorized task-closeout-archive workflow, no more, so the local "
             "terminal readiness budget fits within the archive history budget"
         )
+    elif reconciliation_evidence.get("status") == "local_terminal_transport_unverified":
+        # A persisted terminal task resolves to a non-local (e.g. SSH)
+        # fleet host. READ_ONLY cannot bind that unit to a live local
+        # observation, and reconciliation cannot make a remote transport
+        # locally verifiable. Only authorized live remote observation,
+        # followed by archiving independently verified terminal tasks,
+        # can shrink this cohort.
+        next_action = (
+            "inspect current remote-host terminal tasks with authorized live "
+            "observation; archive independently verified terminal tasks "
+            "through the authorized task-closeout-archive workflow"
+        )
     elif reconciliation_evidence.get("status") != "verified":
         next_action = "reconcile live task outcomes through an authorized mutation-capable path"
     elif obligations.get("integrity_error_count"):
