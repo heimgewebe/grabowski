@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""Construct a bounded RAB root-systemd sandbox argv without executing it.
+
+The live plan is data, not dispatch authority. The caller must independently
+authorize the one-shot, stage immutable readable runner inputs, verify mounts,
+and invoke the privileged broker. No live provider is started by this module.
+"""
+
+from __future__ import annotations
+
+import argparse
+from decimal import Decimal, InvalidOperation
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+from typing import Sequence
+
+_UNIT_ID = re.compile(r"\A[a-z][a-z0-9-]{0,16}\Z")
+_OUTPUTS = ("state", "transcripts", "evidence", "reports")
+_TMPFS_SHM = "/dev/shm:rw,nosuid,nodev,noexec,mode=1777"
+
+
+class LauncherError(ValueError):
+    """Deny an unsafe or incomplete root-systemd launch plan."""
+
+
+def service_name(run_id: str) -> str:
+    if not isinstance(run_id, str) or not _UNIT_ID.fullmatch(run_id):
+        raise LauncherError(
+            "run id must be 1-17 lowercase ASCII letters/digits/hyphens"
+        )
+    return "grabowski-rab-" + run_id
+
+
+def unit_argv(
+    run_id: str,
+    program: Sequence[str],
+    *,
+    probe: bool,
+    pair: bool = False,
+) -> list[str]:
+    """Return argv, never a shell string; root-owned PID 1 owns the unit."""
+    name = service_name(run_id)
+    if pair and probe:
+        raise LauncherError("a paired provider unit cannot be a no-provider probe")
+    if not probe and not pair:
+        raise LauncherError(
+            "standalone live services are disabled; only a same-unit pair may run"
+        )
+    if not program or any(not isinstance(x, str) or not x for x in program):
+        raise LauncherError("empty program or argument")
+    if not Path(program[0]).is_absolute():
+        raise LauncherError("program must be an absolute executable path")
+
+    tmp, var = name + "-tmp", name + "-var"
+    home = f"/run/{name}-home" if probe else f"/var/lib/{name}"
+    outputs = tuple(f"{home}/epoch/{x}" for x in _OUTPUTS)
+    runtime = [tmp, var]
+    binds = [f"/run/{tmp}:/tmp", f"/run/{var}:/var/tmp"]
+    if probe:
+        runtime.extend(f"{name}-home/epoch/{x}" for x in _OUTPUTS)
+        runtime.append(f"{name}-home/repos")
+    else:
+        # DynamicUser creates StateDirectory leaves behind public symlinks.
+        # Bind the root-owned physical parent over the public directory so that
+        # Python's Path.resolve() sees all four real leaves below HOME.
+        binds.append(f"/var/lib/private/{name}:{home}")
+
+    # A missing host-specific path is harmless; an unexpected existing one
+    # remains masked. The private StateDirectory alias is mandatory for live.
+    optional_masks = "-/run/user -/run/docker -/mnt/backup -/dev/hugepages"
+    private_alias_mask = "-/var/lib/private" if probe else "/var/lib/private"
+
+    properties = [
+        "Type=exec",
+        "DynamicUser=yes",
+        f"User={name}",
+        f"Group={name}",
+        "PrivateTmp=yes",
+        "PrivateIPC=yes",
+        "PrivateDevices=yes",
+        "DevicePolicy=closed",
+        "Delegate=no",
+        "NoNewPrivileges=yes",
+        "CapabilityBoundingSet=",
+        "AmbientCapabilities=",
+        "ProtectSystem=strict",
+        "ProtectHome=read-only",
+        "UMask=0077",
+        f"Environment=HOME={home}",
+        f"RuntimeDirectory={' '.join(runtime)}",
+        "RuntimeDirectoryMode=0700",
+        f"BindPaths={' '.join(binds)}",
+        f"ReadOnlyPaths=/run /run/{tmp} /run/{var} {home} {home}/repos /proc /sys",
+        f"InaccessiblePaths={optional_masks} {private_alias_mask}",
+        f"ReadWritePaths={' '.join(outputs)}",
+        f"TemporaryFileSystem={_TMPFS_SHM}",
+        "ProtectKernelTunables=yes",
+        "ProtectKernelModules=yes",
+        "ProtectKernelLogs=yes",
+        "ProtectControlGroups=yes",
+        "MemoryMax=512M",
+        "TasksMax=128",
+        # Service lifetime includes every bounded pre- and post-intent
+        # phase: provider 3600s + Git 20*120s + 4*90s readbacks +
+        # tree 30s + login 10s + Codex sandbox 25s + PIDNS smoke 15s +
+        # *nested* Codex-in-PIDNS smoke 25s + cleanup 300s + ledger
+        # scheduling/terminalization 435s = 7200s. Three readbacks
+        # currently execute; the fourth is reserved margin. A timeout
+        # before final ledger evidence must never be called success.
+        # The paired unit reuses two 7200s phase envelopes, plus 3600s
+        # combined preflight/validator and 3600s cleanup/scheduling slack:
+        # 21600s. These are planning envelopes, NOT host-validated WCET.
+        f"RuntimeMaxSec={30 if probe else 21600}",
+    ]
+    if not probe:
+        properties.extend(
+            [
+                f"StateDirectory={' '.join([f'{name}/epoch/{x}' for x in _OUTPUTS] + [f'{name}/repos'])}",
+                "StateDirectoryMode=0700",
+            ]
+        )
+
+    return [
+        "/usr/bin/systemd-run",
+        "--system",
+        "--wait",
+        "--pipe",
+        *(["--collect"] if probe else []),
+        f"--unit={name}",
+        *(f"--property={p}" for p in properties),
+        "--",
+        *program,
+    ]
+
+
+# This process has no access to benchmark requests, provider credentials or
+# frozen runner code. It only reads the live kernel state from its own service.
+_PROBE_PROGRAM = r"""
+import json, os, pathlib, stat, sys
+
+name = sys.argv[1]
+home = pathlib.Path.home().resolve(strict=True)
+unit = name + ".service"
+def deny(message):
+    raise RuntimeError(message)
+if os.getuid() == 0 or os.getuid() != os.geteuid() or os.getgid() != os.getegid():
+    deny("not an unprivileged dynamic identity")
+if not str(home).startswith("/run/" + name + "-home"):
+    deny("unrecognized probe HOME")
+cgroup = pathlib.Path("/proc/self/cgroup").read_text(encoding="ascii")
+if cgroup.strip() != "0::/system.slice/" + unit:
+    deny("not running in the exact root systemd cgroup")
+status = pathlib.Path("/proc/self/status").read_text(encoding="ascii")
+fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+if fields.get("NoNewPrivs", "").strip() != "1":
+    deny("new privileges are possible")
+for key in ("CapEff", "CapPrm", "CapAmb"):
+    if int(fields.get(key, "-1").strip(), 16) != 0:
+        deny("nonzero kernel capabilities")
+if not (os.statvfs("/").f_flag & os.ST_RDONLY):
+    deny("filesystem root is writable")
+records = {}
+for line in pathlib.Path("/proc/self/mountinfo").read_text(encoding="ascii").splitlines():
+    row = line.split()
+    if "-" not in row:
+        deny("malformed mountinfo")
+    records[row[4]] = (row[2], row[3], row[5].split(","), row[row.index("-")+1])
+def mount(path, *, writable, fstype=None):
+    row = records.get(str(path))
+    if row is None or (("rw" in row[2]) != writable):
+        deny("incorrect mount mode: " + str(path))
+    if fstype is not None and row[3] != fstype:
+        deny("incorrect filesystem: " + str(path))
+    return row
+mount("/", writable=False)
+if os.access(home, os.W_OK):
+    deny("HOME root unexpectedly writable")
+out = [home / "epoch" / part for part in ("state", "transcripts", "evidence", "reports")]
+for path in out:
+    mount(path, writable=True, fstype="tmpfs")
+    info = path.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        deny("private output ownership invalid")
+for path, suffix in (("/tmp", "-tmp"), ("/var/tmp", "-var")):
+    live = mount(path, writable=True, fstype="tmpfs")
+    source = "/run/" + name + suffix
+    private = mount(source, writable=False, fstype="tmpfs")
+    if live[:2] != private[:2]:
+        deny("writable temp mount backing is not the private read-only source")
+    info = os.stat(path)
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        deny("temporary output owner or mode invalid")
+allowed_rw = {str(path) for path in out}
+allowed_rw.update(("/tmp", "/var/tmp", "/dev/pts", "/dev/mqueue", "/dev/shm"))
+actual_rw = {path for path, row in records.items() if "rw" in row[2]}
+if actual_rw != allowed_rw:
+    deny("unexpected writable mount(s): " + repr(sorted(actual_rw ^ allowed_rw)))
+print(json.dumps({"result": "PASS", "unit": unit, "cgroup": cgroup.strip(),
+                  "private_outputs": len(out), "separate_private_tmpfs": True,
+                  "only_expected_rw_mounts": len(actual_rw)},
+                 sort_keys=True))
+"""
+
+
+def probe_argv(run_id: str) -> list[str]:
+    name = service_name(run_id)
+    return unit_argv(
+        run_id, ["/usr/bin/python3", "-c", _PROBE_PROGRAM, name], probe=True
+    )
+
+
+_LIVE_RUNTIME_CODE_NAMES = (
+    "repobrief_agent_benchmark_preflight_core.py",
+    "repobrief_agent_benchmark_codex_preflight.py",
+    "repobrief_agent_benchmark_runner.py",
+    "repobrief_agent_benchmark_source_bootstrap.py",
+    "repobrief_agent_benchmark_codex_runner.py",
+)
+
+
+def _root_owned_source(path: Path, *, maximum: int) -> bytes:
+    if not path.is_absolute() or ".." in path.parts:
+        raise LauncherError("live source path is not canonical")
+    directories: list[int] = []
+    source: int | None = None
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        current = os.open("/", flags)
+        directories.append(current)
+        for component in path.parts[1:-1]:
+            current = os.open(component, flags, dir_fd=current)
+            directories.append(current)
+            info = os.fstat(current)
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                raise LauncherError("live source parent is not root-owned immutable")
+        source = os.open(
+            path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=current
+        )
+        before = os.fstat(source)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_mode & 0o022
+            or not 0 < before.st_size <= maximum
+        ):
+            raise LauncherError("live source is not root-owned immutable")
+        raw = bytearray()
+        while len(raw) <= maximum:
+            chunk = os.read(source, min(65536, maximum + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(source)
+        linked = os.stat(path.name, dir_fd=current, follow_symlinks=False)
+
+        def identity(x: os.stat_result) -> tuple[int, ...]:
+            return (
+                x.st_dev,
+                x.st_ino,
+                x.st_mode,
+                x.st_uid,
+                x.st_size,
+                x.st_mtime_ns,
+                x.st_ctime_ns,
+            )
+
+        if (
+            len(raw) != before.st_size
+            or len(raw) > maximum
+            or identity(before) != identity(after)
+            or identity(before) != identity(linked)
+        ):
+            raise LauncherError("live source changed during immutable capture")
+        return bytes(raw)
+    except OSError as exc:
+        raise LauncherError("trusted staged live source unavailable") from exc
+    finally:
+        if source is not None:
+            os.close(source)
+        for fd in reversed(directories):
+            os.close(fd)
+
+
+def _frozen_bootstrap_program(runner: Path) -> str:
+    """Capture root-owned installed bootstrap bytes, never a developer source."""
+    # Root-owned entrypoint and bootstrap alone are insufficient: their
+    # import-time Python siblings execute before the runtime mount admission.
+    # Keep this exact set aligned with the runner's authorized code bundle.
+    if runner.name not in {
+        "repobrief_agent_benchmark_codex_runner.py",
+        "repobrief_agent_benchmark_codex_preflight.py",
+    }:
+        raise LauncherError("live benchmark entrypoint is not qualified")
+    captures = {}
+    for name in _LIVE_RUNTIME_CODE_NAMES:
+        captures[name] = _root_owned_source(
+            runner.with_name(name),
+            maximum=1024 * 1024
+            if name == "repobrief_agent_benchmark_source_bootstrap.py"
+            else 16 * 1024 * 1024,
+        )
+    raw = captures["repobrief_agent_benchmark_source_bootstrap.py"]
+    try:
+        program = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise LauncherError("installed bootstrap must be UTF-8") from exc
+    if not program or "\x00" in program:
+        raise LauncherError("installed bootstrap program is invalid")
+    return program
+
+
+def live_runner_plan(
+    run_id: str,
+    runner: Path,
+    request_root: Path,
+    repository_map: Path,
+    codex: Path,
+    codex_sha256: str,
+    *,
+    allow_live_provider: bool = False,
+) -> list[str]:
+    """Always deny obsolete single-request plans before exposing systemd argv.
+
+    The runner now admits only an in-process two-condition paired dispatch.
+    Retain this named API solely for safe legacy caller rejection.
+    """
+    raise LauncherError("standalone live Codex plan is disabled; use --live-pair-plan")
+
+
+def live_pair_plan(
+    run_id: str,
+    runner: Path,
+    preflight: Path,
+    request_root: Path,
+    repository_map: Path,
+    codex: Path,
+    codex_sha256: str,
+    pair_id: str,
+    validator_command: Path,
+    max_cost_usd: str,
+    *,
+    allow_live_provider: bool = False,
+) -> list[str]:
+    """Plan one service whose immutable preflight main PID runs BOTH requests.
+
+    The plan prints command data only. Its separate broker approval must bind
+    the one-shot provider authority; CLI opt-in is not spend authorization.
+    Do not spawn a same-UID supervisor above the trusted runner: otherwise
+    Codex could kill that unfiltered ancestor despite the parent PID filter.
+    """
+    name = service_name(run_id)
+    if not allow_live_provider:
+        raise LauncherError("paired provider plan requires explicit live opt-in")
+    for label, path in (
+        ("runner", runner),
+        ("preflight", preflight),
+        ("request root", request_root),
+        ("repository map", repository_map),
+        ("codex", codex),
+        ("validator command", validator_command),
+    ):
+        if (
+            not isinstance(path, Path)
+            or not path.is_absolute()
+            or ".." in path.parts
+            or "." in path.parts
+        ):
+            raise LauncherError(f"{label} must be a canonical absolute path")
+    if (
+        runner.name != "repobrief_agent_benchmark_codex_runner.py"
+        or preflight.name != "repobrief_agent_benchmark_codex_preflight.py"
+        or runner.parent != preflight.parent
+    ):
+        raise LauncherError("paired runner and preflight source must be co-installed")
+    if (
+        not isinstance(pair_id, str)
+        or not pair_id
+        or len(pair_id.encode("utf-8")) > 256
+        or any(ord(char) < 32 for char in pair_id)
+    ):
+        raise LauncherError("paired request identity is invalid")
+    if not isinstance(codex_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", codex_sha256
+    ):
+        raise LauncherError("Codex executable SHA-256 is required")
+    try:
+        cost = Decimal(max_cost_usd)
+    except (TypeError, ValueError, InvalidOperation) as exc:
+        raise LauncherError("pair cost ceiling is invalid") from exc
+    if not cost.is_finite() or not Decimal("0") < cost <= Decimal("1.00"):
+        raise LauncherError("pair cost ceiling must be in (0, 1.00] USD")
+
+    # Both code files and their shared bootstrap must be root-owned,
+    # symlink-free and immutable before returning an executable plan.
+    _frozen_bootstrap_program(runner)
+    program = _frozen_bootstrap_program(preflight)
+    home = Path("/var/lib") / name
+    args = [
+        "/usr/bin/python3",
+        "-I",
+        "-B",
+        "-c",
+        program,
+        str(preflight),
+        "--execute-pair",
+        "--allow-live-provider",
+        "--pair-id",
+        pair_id,
+        "--request-root",
+        str(request_root),
+        "--repository-map",
+        str(repository_map),
+        "--state-root",
+        str(home / "epoch" / "state"),
+        "--transcript-root",
+        str(home / "epoch" / "transcripts"),
+        "--evidence-root",
+        str(home / "epoch" / "evidence"),
+        "--report-out",
+        str(home / "epoch" / "reports" / "preflight.json"),
+        "--validator-command",
+        str(validator_command),
+        "--codex-command",
+        str(codex),
+        "--codex-command-sha256",
+        codex_sha256,
+        "--max-cost-usd",
+        str(cost),
+    ]
+    return unit_argv(run_id, args, probe=False, pair=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument("--run-id", required=True)
+    mode = cli.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--probe-plan", action="store_true")
+    mode.add_argument("--live-plan", action="store_true")
+    mode.add_argument("--live-pair-plan", action="store_true")
+    cli.add_argument("--runner", type=Path)
+    cli.add_argument("--request-root", type=Path)
+    cli.add_argument("--repository-map", type=Path)
+    cli.add_argument("--codex", type=Path)
+    cli.add_argument("--codex-sha256")
+    cli.add_argument("--preflight", type=Path)
+    cli.add_argument("--pair-id")
+    cli.add_argument("--validator-command", type=Path)
+    cli.add_argument("--max-cost-usd")
+    cli.add_argument("--allow-live-provider", action="store_true")
+    args = cli.parse_args(argv)
+    try:
+        if args.live_pair_plan:
+            if None in (
+                args.runner,
+                args.preflight,
+                args.request_root,
+                args.repository_map,
+                args.codex,
+                args.codex_sha256,
+                args.pair_id,
+                args.validator_command,
+                args.max_cost_usd,
+            ):
+                raise LauncherError(
+                    "pair plan requires frozen sources, both requests, validator, and cost ceiling"
+                )
+            command = live_pair_plan(
+                args.run_id,
+                args.runner,
+                args.preflight,
+                args.request_root,
+                args.repository_map,
+                args.codex,
+                args.codex_sha256,
+                args.pair_id,
+                args.validator_command,
+                args.max_cost_usd,
+                allow_live_provider=args.allow_live_provider,
+            )
+        elif args.live_plan:
+            raise LauncherError(
+                "standalone live Codex plan is disabled; use --live-pair-plan"
+            )
+        else:
+            if args.allow_live_provider:
+                raise LauncherError("provider flag is forbidden for sandbox probes")
+            command = probe_argv(args.run_id)
+        print(
+            json.dumps(
+                {
+                    "mode": ("pair-live-plan-only" if args.live_pair_plan else "probe"),
+                    "argv": command,
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    except (LauncherError, OSError) as exc:
+        print(f"root-systemd sandbox denied: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

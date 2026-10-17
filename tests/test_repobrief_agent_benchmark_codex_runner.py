@@ -11,16 +11,20 @@ import os
 from pathlib import Path
 import subprocess
 import stat
+import struct
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "tools" / "repobrief_agent_benchmark_codex_runner.py"
 BOOTSTRAP_PATH = ROOT / "tools" / "repobrief_agent_benchmark_source_bootstrap.py"
-SPEC = importlib.util.spec_from_file_location("repobrief_agent_benchmark_codex_runner", MODULE_PATH)
+SPEC = importlib.util.spec_from_file_location(
+    "repobrief_agent_benchmark_codex_runner", MODULE_PATH
+)
 assert SPEC is not None and SPEC.loader is not None
 runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
@@ -39,7 +43,12 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
         repobrief = {
             "manifest": "/bundles/repo.bundle.manifest.json",
             "manifest_sha256": MANIFEST_SHA,
-            "mcp_command": ["/usr/bin/python3", "repobrief-mcp-stdio.py", "--bundle-root", "/bundles"],
+            "mcp_command": [
+                "/usr/bin/python3",
+                "repobrief-mcp-stdio.py",
+                "--bundle-root",
+                "/bundles",
+            ],
         }
     pair_id = "taskset:case:r1"
     request_id = f"{pair_id}:{condition}"
@@ -87,7 +96,6 @@ def request(*, condition: str = "baseline", commit: str = COMMIT) -> dict:
     }
 
 
-
 def bind_manifest(
     value: dict,
     root: Path,
@@ -103,9 +111,7 @@ def bind_manifest(
         "version": "2.0",
         "snapshotProvenance": {"repositories": [repository]},
     }
-    raw = json.dumps(
-        manifest, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    raw = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
     path = root / "repo.bundle.manifest.json"
     path.write_bytes(raw)
     value["repobrief"]["manifest"] = str(path)
@@ -113,7 +119,9 @@ def bind_manifest(
     return path
 
 
-def frozen_g2_request(*, condition: str = "baseline", commit: str | None = None) -> dict:
+def frozen_g2_request(
+    *, condition: str = "baseline", commit: str | None = None
+) -> dict:
     """Use the frozen task identity, independently of local test Git fixtures."""
 
     frozen = runner.base.FROZEN_G2_IDENTITY
@@ -262,7 +270,9 @@ def write_dispatch_authorization(
     }
     authorized_event_sha256 = runner.base._sha256_json(authorized_event)
     event_path = events_root / "0000-authorized.json"
-    event_path.write_text(json.dumps(authorized_event, sort_keys=True), encoding="utf-8")
+    event_path.write_text(
+        json.dumps(authorized_event, sort_keys=True), encoding="utf-8"
+    )
     event_path.chmod(0o600)
     path = pair_root / "authorization.json"
     report = {
@@ -302,8 +312,8 @@ def write_dispatch_authorization(
     authorization["report_evidence_sha256"] = runner.base._sha256_json(
         runner._preflight_report_evidence_projection(report)
     )
-    report["dispatch_ledger"]["authorization_sha256"] = (
-        runner.base._sha256_json(authorization)
+    report["dispatch_ledger"]["authorization_sha256"] = runner.base._sha256_json(
+        authorization
     )
 
     report_bytes = (
@@ -325,27 +335,90 @@ def bootstrap_program() -> str:
     return BOOTSTRAP_PATH.read_text(encoding="utf-8")
 
 
-def proxy_command(upstream: Path, root: Path) -> list[str]:
+def synthetic_prepared_stage(root: Path) -> dict:
+    """Metadata only for command-construction tests, never a live authorization."""
+    return {
+        "runtime_dir": str(root / "unused-stage"),
+        "argv": ["/bin/true", "--bundle-root", str(root / "unused-manifest")],
+        "manifest_binding": {"path": str(root / "unused-manifest")},
+    }
+
+
+def synthetic_paired_mcp_files(*, legacy_g1: bool = False) -> list[dict]:
+    """Only mock paired authorization metadata; never a real live grant."""
+    script = "repobrief-mcp-stdio.py" if legacy_g1 else "repoground-mcp-stdio.py"
+    return [
+        {"path": "/test-only/python3", "bytes": 1, "sha256": "0" * 64, "mode": "0o700"},
+        {
+            "path": "/test-only/scripts/" + script,
+            "bytes": 1,
+            "sha256": "1" * 64,
+            "mode": "0o600",
+        },
+    ]
+
+
+def proxy_command(
+    upstream: Path,
+    root: Path,
+    *,
+    staging_state: Path | None = None,
+    wrap: bool = True,
+) -> list[str]:
+    """Prepare code outside a writable session, exactly as the trusted parent does.
+
+    The subprocess never generates executable code. The outer test bwrap keeps
+    all staged bytes on a kernel-readonly mount while allowing fixture output.
+    """
     manifest = root / "bound.bundle.manifest.json"
-    runtime_root = root / "proxy-runtime"
-    runtime_root.mkdir(mode=0o700, exist_ok=True)
     if not manifest.exists():
         manifest.write_text("{}\n", encoding="utf-8")
-    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    state = (
+        staging_state if staging_state is not None else root / "fixture-trusted-state"
+    )
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
     authorized = [file_identity(Path(sys.executable)), file_identity(upstream)]
-    return [
+    manifest_stage = runner.stage_repoground_manifest(state, file_identity(manifest))
+    staged_manifest = Path(manifest_stage["path"])
+    upstream_argv = [
+        str(Path(sys.executable).resolve()),
+        str(upstream),
+        "--bundle-root",
+        str(staged_manifest),
+    ]
+    prepared = runner.stage_mcp_upstream(
+        state, upstream_argv, staged_manifest, authorized
+    )
+    encoded = runner.canonical(runner._mcp_stage_wire(prepared))
+    command = [
         sys.executable,
         "-I",
         "-c",
         bootstrap_program(),
         str(MODULE_PATH),
         "--codex-mcp-proxy",
-        json.dumps([str(Path(sys.executable).resolve()), str(upstream), "--bundle-root", str(root)]),
+        json.dumps(upstream_argv),
+        str(staged_manifest),
         str(manifest),
-        str(manifest),
-        digest,
+        hashlib.sha256(manifest.read_bytes()).hexdigest(),
         json.dumps(authorized, sort_keys=True),
-        str(runtime_root),
+        encoded,
+    ]
+    if not wrap:
+        return command
+    return [
+        "/usr/bin/bwrap",
+        "--ro-bind",
+        "/",
+        "/",
+        "--bind",
+        str(root),
+        str(root),
+        "--ro-bind",
+        str(state),
+        str(state),
+        "--",
+        *command,
     ]
 
 
@@ -377,14 +450,23 @@ def stream(value: dict, *, command: str = "cat src/example.py") -> bytes:
         },
         {
             "type": "item.completed",
-            "item": {"type": "agent_message", "text": json.dumps(answer(), sort_keys=True)},
+            "item": {
+                "type": "agent_message",
+                "text": json.dumps(answer(), sort_keys=True),
+            },
         },
         {
             "type": "turn.completed",
-            "usage": {"input_tokens": 120, "output_tokens": 30, "cached_input_tokens": 0},
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "cached_input_tokens": 0,
+            },
         },
     ]
-    return b"".join(json.dumps(event, sort_keys=True).encode("utf-8") + b"\n" for event in events)
+    return b"".join(
+        json.dumps(event, sort_keys=True).encode("utf-8") + b"\n" for event in events
+    )
 
 
 def git(arguments: list[str], cwd: Path) -> str:
@@ -412,7 +494,9 @@ def repository(root: Path) -> tuple[Path, str]:
 def planned_request_root(root: Path, value: dict) -> Path:
     result = root / "requests"
     result.mkdir()
-    (result / "request.json").write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+    (result / "request.json").write_text(
+        json.dumps(value, sort_keys=True), encoding="utf-8"
+    )
     return result
 
 
@@ -425,7 +509,9 @@ def repository_map(root: Path, source: Path) -> Path:
     return path
 
 
-def fixture_args(root: Path, fixture: Path, *, stderr: Path | None = None, returncode: int = 0) -> Namespace:
+def fixture_args(
+    root: Path, fixture: Path, *, stderr: Path | None = None, returncode: int = 0
+) -> Namespace:
     return Namespace(
         request_root=root / "requests",
         repository_map=root / "repositories.json",
@@ -443,21 +529,1737 @@ def fixture_args(root: Path, fixture: Path, *, stderr: Path | None = None, retur
 
 def treatment_tools() -> list[dict]:
     metadata = {
-        'ask_context': ('RepoGround context pack', 'Build a cited context pack from one existing RepoGround bundle.'),
-        'grounding_verify': ('RepoGround grounding verifier', 'Verify declared citations and ranges against an existing RepoGround bundle.'),
-        'live_freshness': ('RepoGround live freshness', 'Compare snapshot Git provenance with the configured local checkout without refreshing it.'),
+        "ask_context": (
+            "RepoGround context pack",
+            "Build a cited context pack from one existing RepoGround bundle.",
+        ),
+        "grounding_verify": (
+            "RepoGround grounding verifier",
+            "Verify declared citations and ranges against an existing RepoGround bundle.",
+        ),
+        "live_freshness": (
+            "RepoGround live freshness",
+            "Compare snapshot Git provenance with the configured local checkout without refreshing it.",
+        ),
     }
-    annotations = {'readOnlyHint': True, 'destructiveHint': False, 'idempotentHint': True}
+    annotations = {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    }
     return [
         {
-            'name': name,
-            'title': metadata[name][0],
-            'description': metadata[name][1],
-            'inputSchema': json.loads(json.dumps(runner.EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[name])),
-            'annotations': dict(annotations),
+            "name": name,
+            "title": metadata[name][0],
+            "description": metadata[name][1],
+            "inputSchema": json.loads(
+                json.dumps(runner.EXPECTED_UPSTREAM_MCP_INPUT_SCHEMAS[name])
+            ),
+            "annotations": dict(annotations),
         }
         for name in sorted(runner.UPSTREAM_MCP)
     ]
+
+
+class CodexRootDevicePolicyAdmissionTests(unittest.TestCase):
+    """A user-owned runner must not infer root device isolation from mountinfo."""
+
+    CGROUP = b"0::/system.slice/grabowski-rab-benchmark.service\n"
+    UNIT = "grabowski-rab-benchmark.service"
+    PROPERTIES = {
+        "ActiveState": "active",
+        "LoadState": "loaded",
+        "ControlGroup": "/system.slice/grabowski-rab-benchmark.service",
+        "PrivateDevices": "yes",
+        "DevicePolicy": "closed",
+        "DeviceAllow": "",
+        "Delegate": "no",
+        "DynamicUser": "yes",
+        "User": "grabowski-rab-benchmark",
+        "Group": "grabowski-rab-benchmark",
+        "PrivateTmp": "yes",
+        "PrivateIPC": "yes",
+        "TemporaryFileSystem": "/dev/shm:rw,nosuid,nodev,noexec,mode=1777",
+        "UID": str(os.geteuid()),
+        "GID": str(os.getegid()),
+    }
+
+    def test_initial_namespace_kernel_attestation_accepts_host_when_initial(
+        self,
+    ) -> None:
+        expected = {
+            "user": "user:[4026531837]",
+            "pid": "pid:[4026531836]",
+            "cgroup": "cgroup:[4026531835]",
+        }
+        if any(
+            os.readlink(f"/proc/self/ns/{name}") != identity
+            for name, identity in expected.items()
+        ):
+            self.skipTest("running in a noninitial CI namespace")
+        runner._assert_initial_kernel_namespaces()
+
+    def test_initial_namespace_rejects_nested_user_pid_and_cgroup(self) -> None:
+        original = runner.os.readlink
+        for namespace in ("user", "pid", "cgroup"):
+            with self.subTest(namespace=namespace):
+
+                def changed(path: str, *, dir_fd: int | None = None) -> str:
+                    actual = original(path, dir_fd=dir_fd)
+                    if path == "" and actual.startswith(namespace + ":["):
+                        return namespace + ":[4026539999]"
+                    return actual
+
+                with patch.object(runner.os, "readlink", side_effect=changed):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "initial namespace identity"
+                    ):
+                        runner._assert_initial_kernel_namespaces()
+
+    def test_initial_namespace_rejects_nested_uid_and_gid_maps(self) -> None:
+        original = runner.os.read
+        for changed_map in (1, 2):
+            seen = 0
+
+            def changed(fd: int, length: int) -> bytes:
+                nonlocal seen
+                result = original(fd, length)
+                if b"4294967295" in result:
+                    seen += 1
+                    if seen == changed_map:
+                        return b"         0       1000          1\n"
+                return result
+
+            with self.subTest(changed_map=changed_map):
+                with patch.object(runner.os, "read", side_effect=changed):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "initial user namespace map"
+                    ):
+                        runner._assert_initial_kernel_namespaces()
+
+    def test_initial_namespace_rejects_procfs_symlink_mount_substitution(self) -> None:
+        original = runner._kernel_procfs_mount_id
+        observed = 0
+
+        def mismatched_mount(fd: int) -> int:
+            nonlocal observed
+            observed += 1
+            actual = original(fd)
+            return actual + 1 if observed == 4 else actual
+
+        with patch.object(
+            runner, "_kernel_procfs_mount_id", side_effect=mismatched_mount
+        ):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "initial namespace identity"
+            ):
+                runner._assert_initial_kernel_namespaces()
+
+    def test_untrusted_namespace_blocks_system_bus_before_socket_open(self) -> None:
+        with (
+            patch.object(
+                runner,
+                "_assert_initial_kernel_namespaces",
+                side_effect=runner.RunnerError("initial namespace untrusted"),
+            ),
+            patch.object(runner.socket, "socket") as peer_socket,
+            patch.object(runner.os, "lstat") as lstat,
+        ):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "initial namespace untrusted"
+            ):
+                runner._attest_root_system_manager_channels()
+            peer_socket.assert_not_called()
+            lstat.assert_not_called()
+
+    def test_untrusted_namespace_blocks_mount_admission_before_procfs_read(
+        self,
+    ) -> None:
+        with (
+            patch.object(
+                runner,
+                "_assert_initial_kernel_namespaces",
+                side_effect=runner.RunnerError("initial namespace untrusted"),
+            ),
+            patch.object(runner, "_authenticated_procfs_evidence") as evidence,
+        ):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "initial namespace untrusted"
+            ):
+                runner.validate_live_immutable_mounts(
+                    source=Path("/source"),
+                    codex=Path("/codex"),
+                    request_root=Path("/requests"),
+                    repository_map=Path("/map.json"),
+                    manifest=Path("/manifest.json"),
+                    state_root=Path("/state"),
+                    transcript_root=Path("/transcript"),
+                    evidence_root=Path("/evidence"),
+                    report_root=Path("/report"),
+                )
+            evidence.assert_not_called()
+
+    def _probe(
+        self,
+        *,
+        cgroup: bytes = CGROUP,
+        properties: dict[str, str] | None = None,
+        returncode: int = 0,
+        extra_output: str = "",
+    ) -> None:
+        state = self.PROPERTIES if properties is None else properties
+        output = (
+            "".join(f"{key}={value}\n" for key, value in state.items()) + extra_output
+        )
+        completion = subprocess.CompletedProcess(
+            args=["/usr/bin/systemctl"],
+            returncode=returncode,
+            stdout=output,
+            stderr="",
+        )
+        with (
+            patch.object(runner, "_authenticated_procfs_cgroup", return_value=cgroup),
+            patch.object(
+                runner,
+                "_attest_root_system_manager_channels",
+                return_value=None,
+                create=True,
+            ),
+            patch.object(runner.subprocess, "run", return_value=completion) as run,
+        ):
+            runner._assert_root_owned_device_policy()
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], ["/usr/bin/systemctl", "--system", "show"])
+        self.assertIn(self.UNIT, command)
+
+    def test_system_manager_socket_identity_checked_before_policy_readback(
+        self,
+    ) -> None:
+        result = subprocess.CompletedProcess(
+            args=["/usr/bin/systemctl"],
+            returncode=0,
+            stdout="".join(
+                f"{key}={value}\n" for key, value in self.PROPERTIES.items()
+            ),
+            stderr="",
+        )
+        with (
+            patch.object(
+                runner, "_authenticated_procfs_cgroup", return_value=self.CGROUP
+            ),
+            patch.object(
+                runner,
+                "_attest_root_system_manager_channels",
+                side_effect=runner.RunnerError("system manager channel unavailable"),
+                create=True,
+            ),
+            patch.object(runner.subprocess, "run", return_value=result) as run,
+        ):
+            with self.assertRaisesRegex(runner.RunnerError, "system manager channel"):
+                runner._assert_root_owned_device_policy()
+            run.assert_not_called()
+
+    def test_system_manager_socket_peer_credentials_reject_same_uid_forgery(
+        self,
+    ) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        broker_uid, broker_gid = os.geteuid() + 200, os.getegid() + 200
+        allowed_service = b"0::/system.slice/dbus-broker.service\n"
+        for peer, broker_cgroup, admitted in (
+            ((1, 0, 0), b"0::/init.scope\n", True),
+            ((321, 0, 0), allowed_service, True),
+            ((321, broker_uid, broker_gid), allowed_service, True),
+            ((0, 0, 0), allowed_service, False),
+            ((321, os.geteuid(), os.getegid()), allowed_service, False),
+            ((321, os.geteuid(), broker_gid), allowed_service, False),
+            ((321, broker_uid, os.getegid()), allowed_service, False),
+            ((321, 0, 2000), allowed_service, False),
+        ):
+            with self.subTest(peer=peer):
+                with (
+                    patch.object(runner.os, "lstat", return_value=root_socket) as lstat,
+                    patch.object(runner.socket, "socket") as socket_factory,
+                    patch.object(
+                        runner,
+                        "_authenticated_live_broker_cgroup",
+                        return_value=broker_cgroup,
+                    ) as kernel_cgroup,
+                    patch.object(
+                        runner, "_attest_pid1_system_bus_origin"
+                    ) as bus_origin,
+                ):
+                    connection = socket_factory.return_value.__enter__.return_value
+                    connection.getsockopt.return_value = struct.pack("3i", *peer)
+                    connection.getpeername.return_value = "/run/dbus/system_bus_socket"
+                    if admitted:
+                        runner._attest_root_system_manager_channels()
+                        self.assertEqual(socket_factory.call_count, 1)
+                        self.assertEqual(lstat.call_count, 2)
+                        kernel_cgroup.assert_called_once_with(connection, peer[0])
+                        if peer[0] == 1:
+                            bus_origin.assert_called_once_with(root_socket)
+                        else:
+                            bus_origin.assert_not_called()
+                    else:
+                        with self.assertRaisesRegex(
+                            runner.RunnerError, "system manager channel"
+                        ):
+                            runner._attest_root_system_manager_channels()
+                        kernel_cgroup.assert_not_called()
+
+    def test_root_system_bus_rejects_unattested_root_peer(self) -> None:
+        # A foreign root-owned broker must not forge root systemd properties.
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket),
+            patch.object(runner.socket, "socket") as factory,
+            patch.object(
+                runner,
+                "_authenticated_live_broker_cgroup",
+                return_value=b"0::/system.slice/unrelated.service\n",
+            ) as kernel_cgroup,
+        ):
+            connection = factory.return_value.__enter__.return_value
+            connection.getsockopt.return_value = struct.pack("3i", 321, 0, 0)
+            with self.assertRaisesRegex(runner.RunnerError, "system manager channel"):
+                runner._attest_root_system_manager_channels()
+            kernel_cgroup.assert_called_once_with(connection, 321)
+
+    def test_root_pid1_rejects_foreign_activated_socket_alias(self) -> None:
+        # SO_PEERCRED and SO_PEERPIDFD still identify PID 1 when systemd
+        # passed a completely unrelated activated listener to a fake broker.
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket),
+            patch.object(runner.socket, "socket") as factory,
+            patch.object(
+                runner,
+                "_authenticated_live_broker_cgroup",
+                return_value=b"0::/init.scope\n",
+            ) as cgroup,
+        ):
+            peer_socket = factory.return_value.__enter__.return_value
+            peer_socket.getsockopt.return_value = struct.pack("3i", 1, 0, 0)
+            peer_socket.getpeername.return_value = "/run/other-service.sock"
+            with self.assertRaisesRegex(runner.RunnerError, "system manager channel"):
+                runner._attest_root_system_manager_channels()
+            cgroup.assert_not_called()
+
+    def test_root_pid1_accepts_real_bound_system_bus_socket(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket),
+            patch.object(runner.socket, "socket") as factory,
+            patch.object(
+                runner,
+                "_authenticated_live_broker_cgroup",
+                return_value=b"0::/init.scope\n",
+            ) as cgroup,
+            patch.object(runner, "_attest_pid1_system_bus_origin") as origin,
+        ):
+            peer_socket = factory.return_value.__enter__.return_value
+            peer_socket.getsockopt.return_value = struct.pack("3i", 1, 0, 0)
+            peer_socket.getpeername.return_value = "/run/dbus/system_bus_socket"
+            runner._attest_root_system_manager_channels()
+            cgroup.assert_called_once_with(peer_socket, 1)
+            origin.assert_called_once_with(root_socket)
+
+    def test_root_pid1_mount_origin_rejects_foreign_systemd_socket(self) -> None:
+        # getpeername reports the same bus path and SO_PEERCRED reports PID 1;
+        # kernel mountinfo must still expose a different activated listener.
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        host = b"31 33 0:27 / /run rw,nosuid - tmpfs tmpfs rw\n"
+        safe = host + (
+            b"99 31 0:27 /dbus/system_bus_socket "
+            b"/run/dbus/system_bus_socket ro - tmpfs tmpfs rw\n"
+        )
+        foreign = host + (
+            b"99 31 0:27 /other-service.sock "
+            b"/run/dbus/system_bus_socket ro - tmpfs tmpfs rw\n"
+        )
+        different_fs = host + (
+            b"99 31 0:99 /dbus/system_bus_socket "
+            b"/run/dbus/system_bus_socket ro - tmpfs tmpfs rw\n"
+        )
+        with patch.object(runner, "_authenticated_pid1_mountinfo", return_value=host):
+            for mountinfo in (host, safe):
+                with (
+                    self.subTest(mountinfo=mountinfo),
+                    patch.object(
+                        runner,
+                        "_authenticated_procfs_evidence",
+                        return_value=(b"status", mountinfo),
+                    ),
+                ):
+                    runner._attest_pid1_system_bus_origin(root_socket)
+            for mountinfo in (foreign, different_fs):
+                with (
+                    self.subTest(mountinfo=mountinfo),
+                    patch.object(
+                        runner,
+                        "_authenticated_procfs_evidence",
+                        return_value=(b"status", mountinfo),
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "socket bind origin"
+                    ):
+                        runner._attest_pid1_system_bus_origin(root_socket)
+
+    def test_root_pid1_mount_origin_rejects_wrong_host_unit_layout(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        wrong_host = (
+            b"31 33 0:27 / /run rw - tmpfs tmpfs rw\n"
+            b"99 31 0:27 /other-service.sock "
+            b"/run/dbus/system_bus_socket ro - tmpfs tmpfs rw\n"
+        )
+        with (
+            patch.object(
+                runner, "_authenticated_pid1_mountinfo", return_value=wrong_host
+            ),
+            patch.object(
+                runner,
+                "_authenticated_procfs_evidence",
+                return_value=(b"status", wrong_host),
+            ),
+        ):
+            with self.assertRaisesRegex(runner.RunnerError, "host system bus"):
+                runner._attest_pid1_system_bus_origin(root_socket)
+
+    def test_root_pid1_forged_bus_is_rejected_before_systemctl_policy(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        host = b"31 33 0:27 / /run rw - tmpfs tmpfs rw\n"
+        forged = host + (
+            b"99 31 0:27 /activated-attacker.sock "
+            b"/run/dbus/system_bus_socket ro - tmpfs tmpfs rw\n"
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket),
+            patch.object(runner.socket, "socket") as socket_factory,
+            patch.object(
+                runner,
+                "_authenticated_live_broker_cgroup",
+                return_value=b"0::/init.scope\n",
+            ),
+            patch.object(runner, "_authenticated_pid1_mountinfo", return_value=host),
+            patch.object(
+                runner,
+                "_authenticated_procfs_evidence",
+                return_value=(b"status", forged),
+            ),
+            patch.object(runner.subprocess, "run") as policy_read,
+        ):
+            peer = socket_factory.return_value.__enter__.return_value
+            peer.getsockopt.return_value = struct.pack("3i", 1, 0, 0)
+            peer.getpeername.return_value = "/run/dbus/system_bus_socket"
+            with self.assertRaisesRegex(runner.RunnerError, "socket bind origin"):
+                runner._attest_root_system_manager_channels()
+            policy_read.assert_not_called()
+
+    def test_root_pid1_only_accepts_verified_init_scope(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        for cgroup in (
+            b"0::/system.slice/dbus-broker.service\n",
+            b"0::/system.slice/other.service\n",
+            b"0::/init.scope/attacker.scope\n",
+            b"0::/user.slice/user-1000.slice/user@1000.service\n",
+            b"",
+        ):
+            with self.subTest(cgroup=cgroup):
+                with (
+                    patch.object(runner.os, "lstat", return_value=root_socket),
+                    patch.object(runner.socket, "socket") as factory,
+                    patch.object(
+                        runner,
+                        "_authenticated_live_broker_cgroup",
+                        return_value=cgroup,
+                    ) as kernel_cgroup,
+                ):
+                    peer_socket = factory.return_value.__enter__.return_value
+                    peer_socket.getsockopt.return_value = struct.pack("3i", 1, 0, 0)
+                    peer_socket.getpeername.return_value = "/run/dbus/system_bus_socket"
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "system manager channel"
+                    ):
+                        runner._attest_root_system_manager_channels()
+                    kernel_cgroup.assert_called_once_with(peer_socket, 1)
+
+    def test_root_bus_rejects_missing_pidfd_before_cgroup_read(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket),
+            patch.object(runner.socket, "socket") as factory,
+            patch.object(runner, "_authenticated_procfs_cgroup") as procfs,
+        ):
+            peer_socket = factory.return_value.__enter__.return_value
+            peer_socket.getsockopt.side_effect = [
+                struct.pack("3i", 321, 0, 0),
+                OSError("no live peer pidfd"),
+            ]
+            with self.assertRaisesRegex(runner.RunnerError, "system manager channel"):
+                runner._attest_root_system_manager_channels()
+            self.assertEqual(peer_socket.getsockopt.call_count, 2)
+            procfs.assert_not_called()
+
+    def test_nonroot_system_bus_requires_authenticated_dbus_unit_cgroup(self) -> None:
+        socket_file = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        for cgroup in (
+            b"0::/user.slice/user-1200.slice/user@1200.service\n",
+            b"0::/system.slice/unrelated.service\n",
+            b"0::/system.slice/dbus-broker.service/attacker.scope\n",
+            b"0::/system.slice/dbus.service\n1:cpu:/other\n",
+            b"",
+        ):
+            with self.subTest(cgroup=cgroup):
+                with (
+                    patch.object(runner.os, "lstat", return_value=socket_file),
+                    patch.object(runner.socket, "socket") as socket_factory,
+                    patch.object(
+                        runner,
+                        "_authenticated_live_broker_cgroup",
+                        return_value=cgroup,
+                    ) as read_cgroup,
+                ):
+                    peer_socket = socket_factory.return_value.__enter__.return_value
+                    peer_socket.getsockopt.return_value = struct.pack(
+                        "3i", 321, os.geteuid() + 200, os.getegid() + 200
+                    )
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "system manager channel"
+                    ):
+                        runner._attest_root_system_manager_channels()
+                    read_cgroup.assert_called_once_with(peer_socket, 321)
+
+    def test_authenticated_peer_cgroup_uses_genuine_kernel_procfs(self) -> None:
+        current_pid = os.getpid()
+        self.assertEqual(
+            runner._authenticated_procfs_cgroup(current_pid),
+            runner._authenticated_procfs_cgroup(),
+        )
+
+    def test_nonroot_system_bus_pidfd_binds_to_real_live_peer(self) -> None:
+        # This exercises the real kernel socket option, not a mocked PID.
+        connection, other = runner.socket.socketpair()
+        with connection, other:
+            try:
+                raw = connection.getsockopt(runner.socket.SOL_SOCKET, 77, 4)
+            except OSError as exc:
+                self.skipTest(f"Linux SO_PEERPIDFD is unavailable: {exc}")
+            os.close(struct.unpack("i", raw)[0])
+            self.assertEqual(
+                runner._authenticated_live_broker_cgroup(connection, os.getpid()),
+                runner._authenticated_procfs_cgroup(),
+            )
+
+    def test_nonroot_bus_rejects_forgery_even_with_allowed_cgroup_without_pidfd(
+        self,
+    ) -> None:
+        # Before SO_PEERPIDFD this fake broker would be admitted solely
+        # because its numeric PID appeared to belong to dbus.service.
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket),
+            patch.object(runner.socket, "socket") as socket_factory,
+            patch.object(
+                runner,
+                "_authenticated_procfs_cgroup",
+                return_value=b"0::/system.slice/dbus.service\n",
+            ) as cgroup,
+        ):
+            connection = socket_factory.return_value.__enter__.return_value
+            connection.getsockopt.side_effect = [
+                struct.pack("3i", 321, os.geteuid() + 200, os.getegid() + 200),
+                OSError("SO_PEERPIDFD unavailable"),
+            ]
+            with self.assertRaisesRegex(runner.RunnerError, "system manager channel"):
+                runner._attest_root_system_manager_channels()
+            self.assertEqual(connection.getsockopt.call_count, 2)
+            cgroup.assert_not_called()
+
+    def test_nonroot_system_bus_rejects_unavailable_peer_pidfd(self) -> None:
+        connection = mock.Mock()
+        connection.getsockopt.side_effect = OSError("SO_PEERPIDFD unsupported")
+        with patch.object(runner, "_authenticated_procfs_cgroup") as cgroup:
+            with self.assertRaisesRegex(runner.RunnerError, "peer pidfd unavailable"):
+                runner._authenticated_live_broker_cgroup(connection, 321)
+            cgroup.assert_not_called()
+
+    def test_nonroot_system_bus_rejects_exited_peer_before_cgroup_read(self) -> None:
+        read_fd, write_fd = os.pipe()
+        try:
+            os.close(write_fd)
+            connection = mock.Mock()
+            connection.getsockopt.return_value = struct.pack("i", os.dup(read_fd))
+            with patch.object(runner, "_authenticated_procfs_cgroup") as cgroup:
+                with self.assertRaisesRegex(runner.RunnerError, "peer exited"):
+                    runner._authenticated_live_broker_cgroup(connection, 321)
+                cgroup.assert_not_called()
+        finally:
+            os.close(read_fd)
+
+    def test_nonroot_system_bus_rejects_exit_during_cgroup_read(self) -> None:
+        # An old PID may be recycled after the broker exits. Even an otherwise
+        # allowed cgroup must be rejected when the original peer is gone.
+        read_fd, write_fd = os.pipe()
+        try:
+            connection = mock.Mock()
+            connection.getsockopt.return_value = struct.pack("i", os.dup(read_fd))
+
+            def peer_exits(_pid: int) -> bytes:
+                os.write(write_fd, b"x")
+                return b"0::/system.slice/dbus.service\n"
+
+            with patch.object(
+                runner, "_authenticated_procfs_cgroup", side_effect=peer_exits
+            ) as cgroup:
+                with self.assertRaisesRegex(runner.RunnerError, "peer exited"):
+                    runner._authenticated_live_broker_cgroup(connection, 321)
+                cgroup.assert_called_once_with(321)
+        finally:
+            os.close(write_fd)
+            os.close(read_fd)
+
+    def test_root_only_private_socket_allows_verified_system_bus(self) -> None:
+        # The unprivileged runner must not use PID 1's private root socket.
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+
+        def stat_channel(path):
+            if path == "/run/systemd/private":
+                raise PermissionError("root-only systemd channel")
+            self.assertEqual(path, "/run/dbus/system_bus_socket")
+            return root_socket
+
+        with (
+            patch.object(runner.os, "lstat", side_effect=stat_channel),
+            patch.object(runner.socket, "socket") as socket_factory,
+            patch.object(
+                runner,
+                "_authenticated_live_broker_cgroup",
+                return_value=b"0::/system.slice/dbus-broker.service\n",
+            ) as kernel_cgroup,
+        ):
+            connection = socket_factory.return_value.__enter__.return_value
+            connection.getsockopt.return_value = struct.pack("3i", 321, 0, 0)
+            runner._attest_root_system_manager_channels()
+            kernel_cgroup.assert_called_once_with(connection, 321)
+            self.assertEqual(socket_factory.call_count, 1)
+            self.assertEqual(
+                [c.args[0] for c in connection.connect.call_args_list],
+                ["/run/dbus/system_bus_socket"],
+            )
+
+    def test_root_owned_independent_dbus_broker_peer_is_accepted(self) -> None:
+        # A separate root broker is trusted only inside the real D-Bus unit.
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        with (
+            patch.object(runner.os, "lstat", return_value=root_socket) as lstat,
+            patch.object(runner.socket, "socket") as socket_factory,
+            patch.object(
+                runner,
+                "_authenticated_live_broker_cgroup",
+                return_value=b"0::/system.slice/dbus-broker.service\n",
+            ) as kernel_cgroup,
+        ):
+            connection = socket_factory.return_value.__enter__.return_value
+            connection.getsockopt.return_value = struct.pack("3i", 321, 0, 0)
+            runner._attest_root_system_manager_channels()
+            kernel_cgroup.assert_called_once_with(connection, 321)
+            self.assertEqual(socket_factory.call_count, 1)
+            self.assertEqual(lstat.call_count, 2)
+            self.assertEqual(
+                [call.args[0] for call in connection.connect.call_args_list],
+                ["/run/dbus/system_bus_socket"],
+            )
+
+    def test_root_manager_rejects_forged_or_invalid_dbus_broker_peer(self) -> None:
+        root_socket = os.stat_result(
+            (stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0)
+        )
+        for peer in (
+            (321, os.getuid(), os.getgid()),
+            (321, 0, 2000),
+            (0, 0, 0),
+        ):
+            with self.subTest(peer=peer):
+                with (
+                    patch.object(runner.os, "lstat", return_value=root_socket),
+                    patch.object(runner.socket, "socket") as socket_factory,
+                ):
+                    socket_factory.return_value.__enter__.return_value.getsockopt.return_value = struct.pack(
+                        "3i", *peer
+                    )
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "system manager channel",
+                    ):
+                        runner._attest_root_system_manager_channels()
+
+    def test_system_manager_socket_must_be_root_owned_and_stable(self) -> None:
+        for mode, owner in (
+            (stat.S_IFREG | 0o666, 0),
+            (stat.S_IFLNK | 0o777, 0),
+            (stat.S_IFSOCK | 0o666, os.getuid()),
+        ):
+            with self.subTest(mode=mode, owner=owner):
+                linked = os.stat_result((mode, 412, 27, 1, owner, 0, 0, 0, 0, 0))
+                with (
+                    patch.object(runner.os, "lstat", return_value=linked),
+                    patch.object(runner.socket, "socket") as socket_factory,
+                ):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "system manager channel",
+                    ):
+                        runner._attest_root_system_manager_channels()
+                    socket_factory.assert_not_called()
+        original = os.stat_result((stat.S_IFSOCK | 0o666, 412, 27, 1, 0, 0, 0, 0, 0, 0))
+        swapped = os.stat_result((stat.S_IFSOCK | 0o666, 413, 27, 1, 0, 0, 0, 0, 0, 0))
+        with (
+            patch.object(runner.os, "lstat", side_effect=(original, swapped)),
+            patch.object(runner.socket, "socket") as socket_factory,
+        ):
+            socket_factory.return_value.__enter__.return_value.getsockopt.return_value = struct.pack(
+                "3i", 1, 0, 0
+            )
+            with self.assertRaisesRegex(runner.RunnerError, "system manager channel"):
+                runner._attest_root_system_manager_channels()
+
+    def test_exact_root_owned_systemd_device_policy_is_accepted(self) -> None:
+        self._probe()
+
+    def test_empty_device_allow_omitted_by_real_systemctl_is_accepted(self) -> None:
+        # systemctl show emits no DeviceAllow= line for an empty multi-value list.
+        properties = {k: v for k, v in self.PROPERTIES.items() if k != "DeviceAllow"}
+        self._probe(properties=properties)
+
+    def test_nonempty_device_allow_remains_rejected(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+            self._probe(properties={**self.PROPERTIES, "DeviceAllow": "/dev/sda rwm"})
+
+    def test_user_scope_and_relative_cgroup_cannot_claim_root_policy(self) -> None:
+        for cgroup in (
+            b"0::/user.slice/user-1000.slice/user@1000.service\n",
+            b"0::/system.slice/other.service\n",
+            b"0::/system.slice/../grabowski-rab-benchmark.service\n",
+            b"0::/system.slice/grabowski-rab-benchmark.service/../other\n",
+            b"0::/system.slice/grabowski-rab-benchmark.service\n1:cpu:/foo\n",
+            b"",
+        ):
+            with self.subTest(cgroup=cgroup):
+                with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+                    self._probe(cgroup=cgroup)
+
+    def test_device_policy_settings_fail_closed(self) -> None:
+        failures = (
+            ("PrivateDevices", "no"),
+            ("DevicePolicy", "auto"),
+            ("DevicePolicy", "strict"),
+            ("DeviceAllow", "/dev/sda rwm"),
+            ("Delegate", "yes"),
+            ("ControlGroup", "/system.slice/other.service"),
+            ("ActiveState", "inactive"),
+            ("LoadState", "not-found"),
+            ("DynamicUser", "no"),
+            ("User", "alex"),
+            ("Group", "docker"),
+            ("PrivateTmp", "no"),
+            ("PrivateIPC", "no"),
+            ("TemporaryFileSystem", ""),
+            ("TemporaryFileSystem", "/tmp:rw"),
+            ("TemporaryFileSystem", "/dev/shm:rw"),
+            ("TemporaryFileSystem", "/dev/shm:rw,nosuid,nodev,noexec,mode=0755"),
+            ("UID", "9999"),
+            ("GID", "9999"),
+            ("UID", ""),
+            ("GID", ""),
+        )
+        for key, value in failures:
+            with self.subTest(key=key, value=value):
+                changed = dict(self.PROPERTIES)
+                changed[key] = value
+                with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+                    self._probe(properties=changed)
+
+    def test_missing_or_duplicate_device_properties_are_rejected(self) -> None:
+        without = dict(self.PROPERTIES)
+        del without["PrivateDevices"]
+        with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+            self._probe(properties=without)
+
+    def test_failed_root_system_manager_readback_is_rejected(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+            self._probe(returncode=1)
+
+    def test_duplicate_device_policy_is_rejected(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+            self._probe(extra_output="DevicePolicy=closed\n")
+
+    def test_kernel_cgroup_reader_rejects_procfs_file_alias(self) -> None:
+        with patch.object(runner, "_kernel_procfs_mount_id", side_effect=(11, 11, 12)):
+            with self.assertRaisesRegex(runner.RunnerError, "procfs identity"):
+                runner._authenticated_procfs_cgroup()
+
+    def test_kernel_cgroup_evidence_uses_real_procfs(self) -> None:
+        data = runner._authenticated_procfs_cgroup()
+        self.assertIn(b":", data)
+
+
+class CodexLiveKernelMountAdmissionTests(unittest.TestCase):
+    """The same mount namespace must reject nested writable source binds."""
+
+    def _probe(
+        self,
+        *,
+        extra_rw: str | None = None,
+        writable_source: bool = False,
+        extra_system_rw: bool = False,
+        unexpected_etc_rw: str | None = None,
+        output_alias_source: bool = False,
+        output_alias_subdir: bool = False,
+        outside_home_rw: bool = False,
+        external_git_common_rw: bool = False,
+        output_alias_parent: bool = False,
+        outside_protected_alias_rw: bool = False,
+        outside_root_alias_rw: bool = False,
+        outside_same_device_hardlink: bool = False,
+        writable_software_alias: str | None = None,
+        stacked_source_writable_alias: bool = False,
+        stacked_source_hidden_child: bool = False,
+        stacked_source_visible_first: bool = False,
+        hidden_codex_before_parent_mount: bool = False,
+        unrelated_tmpfs_rw: bool = False,
+        shared_runtime_tmpfs_rw: bool = False,
+        unrelated_local_rw: bool = False,
+        root_backing_isolated: bool = False,
+        nested_readonly_binding: str | None = None,
+        runtime_loader_bind: str | None = None,
+        runtime_loader_alias_at: str | None = None,
+        root_mount_rw: bool = False,
+        output_below_protected_backing: bool = False,
+        output_epoch_in_source: bool = False,
+        protected_bind_origin_in_output: str | None = None,
+        protected_bind_origin_outside_output: bool = False,
+        permitted_capabilities: int = 0,
+        ambient_capabilities: int = 0,
+        protected_hardlink: bool = False,
+        private_output_special: tuple[str, str] | None = None,
+        device_policy_denied: bool = False,
+        opaque_union_filesystem: str | None = None,
+        supplementary_groups: tuple[int, ...] = (),
+        primary_gid: int | None = None,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = home / "repos" / "source"
+            source.mkdir(parents=True)
+            if external_git_common_rw:
+                git_dir = Path(tmp) / "external" / "linked-git"
+                common = Path(tmp) / "external" / "git-common"
+                git_dir.mkdir(parents=True)
+                common.mkdir(parents=True)
+                (git_dir / "commondir").write_text(str(common), encoding="utf-8")
+                (source / ".git").write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+                (common / "objects").mkdir()
+            else:
+                (source / ".git").mkdir()
+            (source / "src").mkdir()
+            if nested_readonly_binding is not None:
+                (source / "vendor").mkdir()
+            codex_root = Path(tmp) / "software" / "codex"
+            (codex_root / "bin").mkdir(parents=True)
+            (codex_root / "codex-path").mkdir()
+            codex = codex_root / "bin" / "codex"
+            codex.write_bytes(b"codex immutable executable")
+            bundled_rg = codex_root / "codex-path" / "rg"
+            bundled_rg.write_bytes(b"bundled rg immutable executable")
+            if output_alias_parent:
+                for name in ("state", "transcripts", "evidence", "reports"):
+                    (source / name).mkdir()
+            epoch = (
+                source
+                if output_epoch_in_source
+                else home / ".local" / "state" / "grabowski" / "epoch"
+            )
+            epoch.mkdir(parents=True, exist_ok=output_epoch_in_source)
+            leaves = {
+                name: epoch / name
+                for name in ("state", "transcripts", "evidence", "reports")
+            }
+            for path in leaves.values():
+                path.mkdir(mode=0o700)
+            if nested_readonly_binding == "state":
+                (leaves["state"] / "vendor").mkdir()
+            if private_output_special is not None:
+                leaf, kind = private_output_special
+                target = leaves[leaf] / "unsafe-special-entry"
+                if kind == "fifo":
+                    os.mkfifo(target, mode=0o600)
+                elif kind == "symlink":
+                    target.symlink_to("/dev/null")
+                else:
+                    raise AssertionError("unsupported special entry fixture")
+            if protected_bind_origin_in_output:
+                backing = leaves[protected_bind_origin_in_output] / "frozen-source"
+                backing.mkdir()
+                (backing / "original.txt").write_text("protected\n", encoding="utf-8")
+            if protected_bind_origin_outside_output:
+                (epoch / "frozen-source").mkdir()
+            if protected_hardlink:
+                original_file = source / "src" / "frozen.txt"
+                original_file.write_text("frozen bytes\n", encoding="utf-8")
+                os.link(original_file, leaves["state"] / "existing-hardlink.txt")
+            if outside_same_device_hardlink:
+                original = source / "src" / "protected-external.txt"
+                original.write_text("protected data\n", encoding="utf-8")
+                scratch = Path(tmp) / "scratch"
+                scratch.mkdir()
+                os.link(original, scratch / "writable-alias.txt")
+            request_root = (
+                Path(tmp) / "outside" / "requests"
+                if outside_home_rw
+                else home / "taskset" / "requests"
+            )
+            request_root.mkdir(parents=True)
+            repository_map = epoch / "repository-map.json"
+            repository_map.write_text("{}\n", encoding="utf-8")
+            manifest = home / "bundle" / "manifest.json"
+            manifest.parent.mkdir()
+            manifest.write_text("{}\n", encoding="utf-8")
+
+            real_read_text = Path.read_text
+            real_read_bytes = Path.read_bytes
+            real_samefile = os.path.samefile
+            real_resolve = Path.resolve
+            real_lstat = Path.lstat
+
+            def resolve(path: Path, *args, **kwargs):
+                # The test host may be usr-merged; emulate a distinct visible
+                # /bin or /lib mount without changing the host's actual links.
+                if runtime_loader_bind is not None and str(path) == runtime_loader_bind:
+                    return path
+                return real_resolve(path, *args, **kwargs)
+
+            def read_text(path: Path, *args, **kwargs):
+                if str(path) == "/proc/self/status":
+                    return (
+                        "NoNewPrivs:\t1\nCapEff:\t0000000000000000\n"
+                        f"CapPrm:\t{permitted_capabilities:016x}\n"
+                        f"CapAmb:\t{ambient_capabilities:016x}\n"
+                    )
+                return real_read_text(path, *args, **kwargs)
+
+            mount_number = [100]
+            mount_paths: list[tuple[Path, int]] = []
+
+            def mount_line(
+                path: Path,
+                options: str,
+                *,
+                mount_root: Path | None = None,
+                device: str = "8:1",
+                filesystem_type: str = "ext4",
+                super_options: str | None = None,
+            ) -> bytes:
+                # Real /proc/self/mountinfo identifies each mount uniquely.
+                # Stacking a second mount at the same path makes the covered
+                # mount its parent, irrespective of emitted line order.
+                mount_number[0] += 1
+                mount_id = mount_number[0]
+                parents = [
+                    (index, mountpoint, identifier)
+                    for index, (mountpoint, identifier) in enumerate(mount_paths)
+                    if mountpoint == path or mountpoint in path.parents
+                ]
+                parent_id = (
+                    max(parents, key=lambda row: (len(row[1].parts), row[0]))[2]
+                    if parents
+                    else 0
+                )
+                mount_paths.append((path, mount_id))
+                physical_root = path if mount_root is None else mount_root
+                return (
+                    f"{mount_id} {parent_id} {device} {physical_root} {path} "
+                    f"{options} - {filesystem_type} /dev/test "
+                    f"{options if super_options is None else super_options}\n"
+                ).encode()
+
+            mounts = [
+                mount_line(
+                    Path("/"), "rw,relatime" if root_mount_rw else "ro,relatime"
+                ),
+            ]
+            # A /tmp bind must precede children physically mounted beneath
+            # /tmp. Otherwise the fixture's mount parent chain is impossible
+            # and admission fails for topology rather than backing alias.
+            if runtime_loader_alias_at == "/tmp":
+                mounts.append(
+                    mount_line(
+                        Path("/tmp"),
+                        "rw,relatime",
+                        mount_root=Path("/"),
+                        device="0:51",
+                        filesystem_type="tmpfs",
+                    )
+                )
+            mounts.append(
+                mount_line(
+                    home,
+                    "ro,relatime",
+                    mount_root=(
+                        Path("/backing/repo")
+                        if output_below_protected_backing
+                        else None
+                    ),
+                    device="8:22" if root_backing_isolated else "8:1",
+                )
+            )
+            if root_backing_isolated:
+                # Isolate every non-root protected inode from the root device.
+                # Otherwise the existing HOME/source alias check masks this P1.
+                mounts.extend(
+                    (
+                        mount_line(Path("/usr"), "ro,relatime", device="8:31"),
+                        mount_line(Path("/etc"), "ro,relatime", device="8:32"),
+                        mount_line(
+                            Path(runner.__file__).parent, "ro,relatime", device="8:33"
+                        ),
+                    )
+                )
+            if runtime_loader_bind is not None:
+                if runtime_loader_bind not in {"/bin", "/sbin", "/lib", "/lib64"}:
+                    raise AssertionError("unknown runtime loader mount")
+                mounts.append(
+                    mount_line(
+                        Path(runtime_loader_bind),
+                        "ro,relatime",
+                        mount_root=Path("/isolated-runtime/tools"),
+                        device="0:51",
+                        filesystem_type="tmpfs",
+                    )
+                )
+                if (
+                    runtime_loader_alias_at is not None
+                    and runtime_loader_alias_at != "/tmp"
+                ):
+                    if runtime_loader_alias_at not in {
+                        "/tmp",
+                        "/var/tmp",
+                        "/dev/shm",
+                    }:
+                        raise AssertionError("unexpected writable runtime alias")
+                    mounts.append(
+                        mount_line(
+                            Path(runtime_loader_alias_at),
+                            "rw,relatime",
+                            mount_root=Path("/"),
+                            device="0:51",
+                            filesystem_type="tmpfs",
+                        )
+                    )
+            if hidden_codex_before_parent_mount:
+                # A bind at the executable pathname is covered by a later
+                # RO mount of its parent directory; its backing is invisible.
+                mounts.append(
+                    mount_line(
+                        codex,
+                        "ro,relatime",
+                        mount_root=Path("/covered-codex"),
+                        device="8:5",
+                    )
+                )
+            mounts.extend(
+                (
+                    mount_line(
+                        codex_root,
+                        "ro,relatime",
+                        mount_root=Path("/private-codex-package"),
+                        device="8:2",
+                    ),
+                    mount_line(
+                        bundled_rg,
+                        "ro,relatime",
+                        mount_root=Path("/private-rg-binary"),
+                        device="8:3",
+                    ),
+                )
+            )
+            if output_below_protected_backing:
+                mounts.append(
+                    mount_line(source, "ro,relatime", mount_root=Path("/backing/repo"))
+                )
+            if output_alias_parent:
+                mounts.append(mount_line(epoch, "ro,relatime", mount_root=source))
+            if stacked_source_writable_alias or stacked_source_hidden_child:
+                covered = mount_line(
+                    source,
+                    "ro,relatime",
+                    mount_root=Path("/covered-source"),
+                    device="8:5",
+                )
+                hidden = (
+                    mount_line(
+                        source / "src",
+                        "rw,relatime",
+                        mount_root=Path("/covered-source/src"),
+                        device="8:5",
+                    )
+                    if stacked_source_hidden_child
+                    else None
+                )
+                visible = mount_line(
+                    source,
+                    "ro,relatime",
+                    mount_root=Path("/visible-source"),
+                    device="8:4",
+                )
+                stack = (
+                    [covered, visible] if hidden is None else [covered, hidden, visible]
+                )
+                if stacked_source_visible_first:
+                    stack = (
+                        [visible, covered]
+                        if hidden is None
+                        else [visible, hidden, covered]
+                    )
+                mounts.extend(stack)
+            if protected_bind_origin_in_output or protected_bind_origin_outside_output:
+                backing = (
+                    leaves[protected_bind_origin_in_output] / "frozen-source"
+                    if protected_bind_origin_in_output
+                    else epoch / "frozen-source"
+                )
+                mounts.append(mount_line(source, "ro,relatime", mount_root=backing))
+            if opaque_union_filesystem is not None:
+                # Simulate a RO union source backed by a different physical RW device.
+                mounts.append(
+                    mount_line(
+                        source,
+                        "ro,relatime",
+                        device="0:65",
+                        mount_root=Path("/union-merged"),
+                        filesystem_type=opaque_union_filesystem,
+                        super_options="ro,lowerdir=/backing/protected-source",
+                    )
+                )
+                union_alias = Path(tmp) / "union-lower-rw-alias"
+                union_alias.mkdir()
+                mounts.append(
+                    mount_line(
+                        union_alias,
+                        "rw,relatime",
+                        mount_root=Path("/backing/protected-source"),
+                        device="8:7",
+                    )
+                )
+            mounts.extend(
+                mount_line(
+                    path,
+                    "rw,relatime",
+                    device="8:22" if root_backing_isolated else "8:1",
+                    mount_root=(
+                        Path("/backing/repo") / path.relative_to(home)
+                        if output_below_protected_backing
+                        else (
+                            source / path.name
+                            if output_alias_parent
+                            else (
+                                source / "src"
+                                if output_alias_subdir and path == leaves["state"]
+                                else path
+                            )
+                        )
+                    ),
+                )
+                for path in leaves.values()
+            )
+            if nested_readonly_binding is not None:
+                if nested_readonly_binding == "tmp":
+                    mounts.append(
+                        mount_line(
+                            Path("/tmp"),
+                            "rw,relatime",
+                            mount_root=Path("/"),
+                            device="0:63",
+                            filesystem_type="tmpfs",
+                        )
+                    )
+                candidates = {
+                    "state": ("8:1", leaves["state"] / "vendor", "ext4"),
+                    "tmp": ("0:63", Path("/vendor"), "tmpfs"),
+                    "isolated": ("8:93", Path("/vendor"), "ext4"),
+                }
+                if nested_readonly_binding not in candidates:
+                    raise AssertionError("unknown nested mount case")
+                device, backing, filesystem_type = candidates[nested_readonly_binding]
+                mounts.append(
+                    mount_line(
+                        source / "vendor",
+                        "ro,relatime",
+                        mount_root=backing,
+                        device=device,
+                        filesystem_type=filesystem_type,
+                    )
+                )
+            if extra_rw:
+                unexpected = home / extra_rw
+                unexpected.mkdir(parents=True, exist_ok=True)
+                mounts.append(mount_line(unexpected, "rw,relatime"))
+            if extra_system_rw:
+                mounts.append(mount_line(Path("/usr/bin"), "rw,relatime"))
+            if unexpected_etc_rw is not None:
+                mounts.append(
+                    mount_line(Path(unexpected_etc_rw), "rw,relatime", device="8:9")
+                )
+            if writable_software_alias is not None:
+                if writable_software_alias not in {"codex", "rg"}:
+                    raise AssertionError("unknown software alias fixture")
+                external_alias = Path(tmp) / "external-software-alias"
+                external_alias.mkdir()
+                mounts.append(
+                    mount_line(
+                        external_alias,
+                        "rw,relatime",
+                        mount_root=Path("/unrelated-writable"),
+                        device="8:2" if writable_software_alias == "codex" else "8:3",
+                    )
+                )
+            if unrelated_tmpfs_rw:
+                ephemeral = Path(tmp) / "ephemeral"
+                ephemeral.mkdir()
+                mounts.append(
+                    mount_line(
+                        ephemeral, "rw,relatime", device="0:44", filesystem_type="tmpfs"
+                    )
+                )
+            if shared_runtime_tmpfs_rw:
+                mounts.append(
+                    mount_line(
+                        Path("/run/user") / str(os.getuid()),
+                        "rw,relatime",
+                        device="0:45",
+                        filesystem_type="tmpfs",
+                    )
+                )
+            if unrelated_local_rw:
+                foreign = Path(tmp) / "foreign-local-rw"
+                foreign.mkdir()
+                mounts.append(
+                    mount_line(
+                        foreign, "rw,relatime", device="8:77", filesystem_type="ext4"
+                    )
+                )
+            if outside_home_rw:
+                writable_child = request_root / "nested"
+                writable_child.mkdir()
+                mounts.append(mount_line(writable_child, "rw,relatime"))
+            if external_git_common_rw:
+                mounts.append(mount_line(common / "objects", "rw,relatime"))
+            if outside_same_device_hardlink:
+                mounts.append(mount_line(scratch, "rw,relatime"))
+            if stacked_source_writable_alias:
+                source_alias = Path(tmp) / "stacked-source-rw-alias"
+                source_alias.mkdir()
+                mounts.append(
+                    mount_line(
+                        source_alias,
+                        "rw,relatime",
+                        mount_root=Path("/unrelated-visible-source-alias"),
+                        device="8:4",
+                    )
+                )
+            if outside_protected_alias_rw or outside_root_alias_rw:
+                alias = Path(tmp) / "writable-alias"
+                alias.mkdir()
+                mounts.append(
+                    mount_line(
+                        alias,
+                        "rw,relatime",
+                        mount_root=(Path("/") if outside_root_alias_rw else source),
+                    )
+                )
+
+            def read_bytes(path: Path, *args, **kwargs):
+                if str(path) == "/proc/self/mountinfo":
+                    return b"".join(mounts)
+                return real_read_bytes(path, *args, **kwargs)
+
+            def authenticated_procfs():
+                return (
+                    read_text(Path("/proc/self/status")).encode("ascii"),
+                    read_bytes(Path("/proc/self/mountinfo")),
+                )
+
+            def statvfs(path: Path):
+                target = Path(path)
+                writable = target in leaves.values() or (
+                    writable_source and target == source
+                )
+                return type(
+                    "ReadOnlyFlags", (), {"f_flag": 0 if writable else os.ST_RDONLY}
+                )()
+
+            def samefile(left, right):
+                if (
+                    output_alias_source
+                    and Path(left) == leaves["state"]
+                    and Path(right) == source
+                ):
+                    return True
+                return real_samefile(left, right)
+
+            actual_uid = os.getuid()
+            actual_gid = os.getgid()
+            fixture_uid = actual_uid if actual_uid != 0 else 65534
+
+            def fixture_lstat(path: Path, *args, **kwargs):
+                result = real_lstat(path, *args, **kwargs)
+                if actual_uid == 0 and Path(path) in leaves.values():
+                    values = list(result)
+                    values[4] = fixture_uid  # st_uid in os.stat_result
+                    return os.stat_result(values)
+                return result
+
+            # Normalize an ordinary privileged CI host to an unprivileged
+            # synthetic identity without hiding injected saved-root slots.
+            observed_resuid = os.getresuid()
+            observed_resgid = os.getresgid()
+            if observed_resuid == (actual_uid,) * 3:
+                observed_resuid = (fixture_uid,) * 3
+            expected_gid = primary_gid if primary_gid is not None else fixture_uid
+            synthetic_resgid = (
+                observed_resgid
+                if observed_resgid != (actual_gid,) * 3
+                else (expected_gid,) * 3
+            )
+            with (
+                # Kernel namespace provenance is tested separately. Synthetic
+                # mount evidence must not depend on the CI container namespace.
+                patch.object(runner, "_assert_initial_kernel_namespaces"),
+                patch.object(runner.Path, "home", return_value=home),
+                patch.object(runner.Path, "lstat", new=fixture_lstat),
+                patch.object(runner.Path, "resolve", new=resolve),
+                patch.object(runner.Path, "read_text", new=read_text),
+                patch.object(runner.Path, "read_bytes", new=read_bytes),
+                patch.object(
+                    runner,
+                    "_authenticated_procfs_evidence",
+                    side_effect=authenticated_procfs,
+                ),
+                patch.object(runner.os, "getuid", return_value=fixture_uid),
+                patch.object(runner.os, "geteuid", return_value=fixture_uid),
+                patch.object(runner.os, "getresuid", return_value=observed_resuid),
+                patch.object(
+                    runner.os,
+                    "getgid",
+                    return_value=primary_gid
+                    if primary_gid is not None
+                    else fixture_uid,
+                ),
+                patch.object(
+                    runner.os,
+                    "getegid",
+                    return_value=primary_gid
+                    if primary_gid is not None
+                    else fixture_uid,
+                ),
+                patch.object(runner.os, "getresgid", return_value=synthetic_resgid),
+                patch.object(
+                    runner.os, "getgroups", return_value=list(supplementary_groups)
+                ),
+                patch.object(runner.os, "statvfs", side_effect=statvfs),
+                patch.object(runner.os.path, "samefile", side_effect=samefile),
+                patch.object(
+                    runner,
+                    "_assert_root_owned_device_policy",
+                    side_effect=(
+                        runner.RunnerError("live Codex device isolation missing")
+                        if device_policy_denied
+                        else None
+                    ),
+                ),
+            ):
+                runner.validate_live_immutable_mounts(
+                    source=source,
+                    codex=codex,
+                    request_root=request_root,
+                    repository_map=repository_map,
+                    manifest=manifest,
+                    state_root=leaves["state"],
+                    transcript_root=leaves["transcripts"],
+                    evidence_root=leaves["evidence"],
+                    report_root=leaves["reports"],
+                )
+
+    def test_readonly_union_source_with_writable_lower_alias_is_rejected(self) -> None:
+        for filesystem_type in (
+            "overlay",
+            "aufs",
+            "unionfs",
+            "fuse.overlayfs",
+            "fuse.mergerfs",
+            "fuseblk",
+            "nfs",
+            "nfs4",
+            "cifs",
+            "smb3",
+            "ceph",
+            "9p",
+            "virtiofs",
+            "gfs2",
+            "unknown-fs",
+        ):
+            with self.subTest(filesystem_type=filesystem_type):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "union|overlay|opaque|filesystem"
+                ):
+                    self._probe(opaque_union_filesystem=filesystem_type)
+
+    def test_privileged_supplementary_groups_block_codex_admission(self) -> None:
+        primary_gid = os.getuid() or 65534
+        for inherited in ((0,), (primary_gid, 0), (primary_gid, 9999)):
+            with self.subTest(groups=inherited):
+                with self.assertRaisesRegex(runner.RunnerError, "supplementary"):
+                    self._probe(supplementary_groups=inherited)
+
+    def test_empty_or_primary_only_supplementary_groups_are_accepted(self) -> None:
+        self._probe(supplementary_groups=())
+        self._probe(supplementary_groups=(os.getuid() or 65534,))
+
+    def test_privileged_primary_group_cannot_pass_with_no_supplementary_groups(
+        self,
+    ) -> None:
+        for privileged_gid in (0, 996, 999):
+            with self.subTest(primary_gid=privileged_gid):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "execution identity is unsafe"
+                ):
+                    self._probe(
+                        primary_gid=privileged_gid,
+                        supplementary_groups=(privileged_gid,),
+                    )
+
+    def test_root_owned_device_policy_is_mandatory_for_mount_admission(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "device isolation"):
+            self._probe(device_policy_denied=True)
+
+    def test_only_four_private_output_mounts_are_admissible(self) -> None:
+        self._probe()
+
+    def test_separate_runtime_loader_and_tool_backings_cannot_alias_private_tmpfs(
+        self,
+    ) -> None:
+        for runtime_path in ("/bin", "/sbin", "/lib", "/lib64"):
+            for writable_alias in ("/tmp", "/var/tmp", "/dev/shm"):
+                with self.subTest(runtime=runtime_path, alias=writable_alias):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "writable alias of protected input mount|"
+                        "unexpected writable mount sharing protected filesystem",
+                    ):
+                        self._probe(
+                            runtime_loader_bind=runtime_path,
+                            runtime_loader_alias_at=writable_alias,
+                        )
+
+    def test_separate_runtime_readonly_bind_without_writable_alias_is_allowed(
+        self,
+    ) -> None:
+        for runtime_path in ("/bin", "/sbin", "/lib", "/lib64"):
+            with self.subTest(runtime=runtime_path):
+                self._probe(runtime_loader_bind=runtime_path)
+
+    def test_nested_readonly_source_binding_with_writable_backing_is_denied(
+        self,
+    ) -> None:
+        for backing in ("state", "tmp"):
+            with self.subTest(backing=backing):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "writable output contains protected mount backing|"
+                    "writable alias of protected input mount|"
+                    "unexpected writable mount sharing protected filesystem",
+                ):
+                    self._probe(nested_readonly_binding=backing)
+
+    def test_independent_nested_readonly_source_binding_is_accepted(self) -> None:
+        self._probe(nested_readonly_binding="isolated")
+
+    def test_codex_executable_and_bundled_rg_writable_backing_aliases_are_rejected(
+        self,
+    ) -> None:
+        for executable in ("codex", "rg"):
+            with self.subTest(executable=executable):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "unexpected writable mount sharing protected filesystem",
+                ):
+                    self._probe(writable_software_alias=executable)
+
+    def test_visible_stacked_source_must_block_same_filesystem_writable_alias(
+        self,
+    ) -> None:
+        for visible_first in (False, True):
+            with self.subTest(visible_first=visible_first):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "unexpected writable mount sharing protected filesystem",
+                ):
+                    self._probe(
+                        stacked_source_writable_alias=True,
+                        stacked_source_visible_first=visible_first,
+                    )
+
+    def test_hidden_writable_submount_under_covered_source_is_not_accessible(
+        self,
+    ) -> None:
+        self._probe(stacked_source_hidden_child=True)
+
+    def test_hidden_binary_mount_below_later_parent_bind_cannot_mask_alias(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError,
+            "unexpected writable mount sharing protected filesystem",
+        ):
+            self._probe(
+                hidden_codex_before_parent_mount=True,
+                writable_software_alias="codex",
+            )
+
+    def test_unrelated_writable_tmpfs_is_not_accepted_as_private_runtime(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "writable.*(tmpfs|runtime|mount)"
+        ):
+            self._probe(unrelated_tmpfs_rw=True)
+
+    def test_shared_user_runtime_tmpfs_is_rejected_before_codex_dispatch(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "writable.*(tmpfs|runtime|mount)"
+        ):
+            self._probe(shared_runtime_tmpfs_rw=True)
+
+    def test_extra_writable_local_filesystem_is_rejected(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "writable.*filesystem"):
+            self._probe(unrelated_local_rw=True)
+
+    def test_writable_filesystem_root_mount_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "filesystem root mount writable"
+        ):
+            self._probe(root_mount_rw=True)
+
+    def test_protected_bind_origin_inside_output_is_rejected(self) -> None:
+        for output in ("state", "transcripts", "evidence", "reports"):
+            with self.subTest(output=output):
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "writable output contains protected mount backing",
+                ):
+                    self._probe(protected_bind_origin_in_output=output)
+
+    def test_protected_bind_sibling_of_outputs_is_admissible(self) -> None:
+        self._probe(protected_bind_origin_outside_output=True)
+
+    def test_external_writable_hardlink_to_protected_file_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "unexpected writable mount sharing protected filesystem"
+        ):
+            self._probe(outside_same_device_hardlink=True)
+
+    def test_output_nested_inside_protected_physical_backing_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "writable output overlaps protected mount backing"
+        ):
+            self._probe(output_below_protected_backing=True)
+
+    def test_ambient_capability_without_effective_privilege_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "execution privileges are unsafe"
+        ):
+            self._probe(ambient_capabilities=1 << 21)
+
+    def test_permitted_capability_without_effective_privilege_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "execution privileges are unsafe"
+        ):
+            self._probe(permitted_capabilities=1 << 21)
+
+    def test_writable_etc_loader_configuration_mount_is_rejected(self) -> None:
+        for mount in ("/etc", "/etc/ld.so.preload"):
+            with self.subTest(mount=mount):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "unexpected writable protected input bind mount"
+                ):
+                    self._probe(unexpected_etc_rw=mount)
+
+    def test_kernel_procfs_identity_rejects_ordinary_files(self) -> None:
+        with tempfile.TemporaryFile() as ordinary:
+            with self.assertRaisesRegex(runner.RunnerError, "not kernel procfs"):
+                runner._kernel_procfs_mount_id(ordinary.fileno())
+
+    def test_kernel_procfs_identity_rejects_a_file_bind_alias(self) -> None:
+        with patch.object(
+            runner, "_kernel_procfs_mount_id", side_effect=(11, 11, 12, 11)
+        ):
+            with self.assertRaisesRegex(runner.RunnerError, "procfs mount identity"):
+                runner._authenticated_procfs_evidence()
+
+    def test_kernel_procfs_evidence_is_available_on_real_host(self) -> None:
+        status_bytes, mounts_bytes = runner._authenticated_procfs_evidence()
+        self.assertIn(b"NoNewPrivs:", status_bytes)
+        self.assertIn(b" - ", mounts_bytes)
+
+    def test_root_ci_host_does_not_skip_synthetic_mount_security(self) -> None:
+        # Privileged CI environments must exercise the same mount tests,
+        # including failures for saved UID/GID zero, without using real root.
+        with (
+            patch.object(runner.os, "getuid", return_value=0),
+            patch.object(runner.os, "getgid", return_value=0),
+            patch.object(runner.os, "getresuid", return_value=(0, 0, 0)),
+            patch.object(runner.os, "getresgid", return_value=(0, 0, 0)),
+        ):
+            self._probe()
+            with patch.object(runner.os, "getresuid", return_value=(65534, 65534, 0)):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "execution identity is unsafe"
+                ):
+                    self._probe()
+            with patch.object(runner.os, "getresgid", return_value=(65534, 65534, 0)):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "execution identity is unsafe"
+                ):
+                    self._probe()
+
+    def test_saved_root_uid_cannot_pass_unprivileged_admission(self) -> None:
+        user = os.getuid() or 65534
+        self.assertNotEqual(user, 0)
+        with patch.object(runner.os, "getresuid", return_value=(user, user, 0)):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "execution identity is unsafe"
+            ):
+                self._probe()
+
+    def test_saved_root_gid_cannot_pass_unprivileged_admission(self) -> None:
+        group = os.getgid() or 65534
+        self.assertNotEqual(group, 0)
+        with patch.object(runner.os, "getresgid", return_value=(group, group, 0)):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "execution identity is unsafe"
+            ):
+                self._probe()
+
+    def test_private_output_special_entries_are_rejected(self) -> None:
+        for leaf in ("state", "transcripts", "evidence", "reports"):
+            for kind in ("fifo", "symlink"):
+                with self.subTest(leaf=leaf, kind=kind):
+                    with self.assertRaisesRegex(runner.RunnerError, "special file"):
+                        self._probe(private_output_special=(leaf, kind))
+
+    def test_preexisting_protected_hardlink_in_private_output_is_rejected(self) -> None:
+        with self.assertRaisesRegex(runner.RunnerError, "hardlinked regular file"):
+            self._probe(protected_hardlink=True)
+
+    def test_writable_historical_source_blocks_admission(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "protected input mount writable: source"
+        ):
+            self._probe(writable_source=True)
+
+    def test_readonly_home_does_not_hide_writable_repository_bind(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "unexpected writable home bind mount"
+        ):
+            self._probe(extra_rw="repos/unexpected")
+
+    def test_readonly_request_outside_home_blocks_nested_writable_bind(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "unexpected writable protected input bind mount"
+        ):
+            self._probe(outside_home_rw=True)
+
+    def test_readonly_external_git_common_blocks_nested_writable_bind(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "unexpected writable protected input bind mount"
+        ):
+            self._probe(external_git_common_rw=True)
+
+    def test_nested_output_bind_cannot_alias_protected_data(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "unexpected writable home bind mount"
+        ):
+            self._probe(extra_rw=".local/state/grabowski/epoch/state/alias")
+
+    def test_nested_system_tool_bind_must_be_readonly(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "unexpected writable system tool bind mount"
+        ):
+            self._probe(extra_system_rw=True)
+
+    def test_writable_output_mount_cannot_alias_protected_source(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "writable output aliases protected source"
+        ):
+            self._probe(output_alias_source=True)
+
+    def test_output_mount_cannot_bind_protected_source_subdirectory(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "output mount root does not match writable target"
+        ):
+            self._probe(output_alias_subdir=True)
+
+    def test_readonly_epoch_parent_alias_to_source_blocks_output_mounts(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "epoch parent mount has unexpected backing root"
+        ):
+            self._probe(output_alias_parent=True)
+
+    def test_writable_source_alias_outside_home_blocks_admission(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "writable alias of protected input mount"
+        ):
+            self._probe(outside_protected_alias_rw=True)
+
+    def test_writable_filesystem_root_alias_outside_home_blocks_admission(self) -> None:
+        for isolated in (False, True):
+            with self.subTest(root_backing_isolated=isolated):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "writable alias of filesystem root"
+                ):
+                    self._probe(
+                        outside_root_alias_rw=True, root_backing_isolated=isolated
+                    )
+
+    def test_output_epoch_cannot_overlap_historical_source(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "output epoch overlaps protected input subtree"
+        ):
+            self._probe(output_epoch_in_source=True)
 
 
 class RepoBriefCodexRunnerTests(unittest.TestCase):
@@ -467,12 +2269,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
         value = request()
         value["runner"]["model"] = "gpt-other"
-        with self.assertRaisesRegex(runner.RunnerError, "Codex runner contract mismatch"):
+        with self.assertRaisesRegex(
+            runner.RunnerError, "Codex runner contract mismatch"
+        ):
             runner.validate_request(value)
 
         value = request()
         value["runner"]["sampling"] = {"reasoning_effort": "high"}
-        with self.assertRaisesRegex(runner.RunnerError, "Codex runner contract mismatch"):
+        with self.assertRaisesRegex(
+            runner.RunnerError, "Codex runner contract mismatch"
+        ):
             runner.validate_request(value)
 
     def test_frozen_g2_request_setup_requires_exact_revision_and_provider(self) -> None:
@@ -520,9 +2326,484 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             candidate["session_id"] = f"session:{candidate['request_id']}"
             candidate["workspace_id"] = f"workspace:{candidate['request_id']}"
             with self.subTest(condition=condition):
-                with self.assertRaisesRegex(runner.RunnerError, "pair_id does not match"):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "pair_id does not match"
+                ):
                     runner.validate_request(candidate)
-    def test_private_frozen_g2_checkout_is_reproducibly_dirty_and_read_only(self) -> None:
+
+    def test_create_checkout_rejects_tracked_symlink_before_consuming_workspace(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, _ = repository(root)
+            (source / "src" / "escape").symlink_to("../../outside")
+            git(["add", "src/escape"], source)
+            git(["commit", "-m", "tracked symlink"], source)
+            commit = git(["rev-parse", "HEAD"], source)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            candidate = request(commit=commit)
+            candidate["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            workspace_name = hashlib.sha256(
+                candidate["workspace_id"].encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(
+                runner.RunnerError,
+                "unsupported tracked Git tree entry",
+            ):
+                runner.create_checkout(candidate, source, state)
+            self.assertFalse((state / "codex-workspaces" / workspace_name).exists())
+
+    def test_create_checkout_rejects_oversized_tracked_tree_before_one_shot(
+        self,
+    ) -> None:
+        payload = b"".join(
+            b"100644 blob " + b"a" * 40 + f" 1\tfile{i:05d}".encode() + b"\0"
+            for i in range(65_537)
+        )
+        stream = mock.Mock()
+        stream.fileno.return_value = 91
+        process = mock.Mock(stdout=stream)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with (
+            patch.object(runner.subprocess, "Popen", return_value=process) as popen,
+            patch.object(runner.os, "set_blocking") as nonblocking,
+            patch.object(runner.os, "read", side_effect=[payload, b""]),
+            patch.object(runner.selectors, "DefaultSelector") as selector_factory,
+        ):
+            selector = selector_factory.return_value.__enter__.return_value
+            selector.select.return_value = [(None, None)]
+            with self.assertRaisesRegex(runner.RunnerError, "too many entries"):
+                runner._assert_checkout_tree_has_regular_blobs(
+                    Path("/unused"), "a" * 40
+                )
+        self.assertEqual(popen.call_args.kwargs["env"]["GIT_NO_LAZY_FETCH"], "1")
+        nonblocking.assert_called_once_with(91, False)
+        stream.close.assert_called_once()
+
+    def test_checkout_tree_scan_rejects_postflight_blob_byte_budgets(self) -> None:
+        # Fake large blob object sizes using tiny metadata, never allocate
+        # hundreds of MiB or consume a one-use workspace or provider token.
+        max_file = 256 * 1024 * 1024
+        cases = (
+            ("one_oversized_blob", (max_file + 1,)),
+            ("aggregate_over_2gib", (max_file,) * 9),
+            # Source and checkout each consume the shared 2 GiB readback budget.
+            ("double_read_exhausts_total_budget", (max_file,) * 4),
+            ("unknown_size", ("-",)),
+        )
+        for label, sizes in cases:
+            with self.subTest(label=label):
+                payload = b"".join(
+                    b"100644 blob "
+                    + b"a" * 40
+                    + b" "
+                    + str(size).encode("ascii")
+                    + b"\t"
+                    + f"file{index:02d}".encode("ascii")
+                    + b"\0"
+                    for index, size in enumerate(sizes)
+                )
+                stream = mock.Mock()
+                stream.fileno.return_value = 95
+                process = mock.Mock(stdout=stream)
+                process.poll.return_value = 0
+                process.wait.return_value = 0
+                with (
+                    patch.object(
+                        runner.subprocess, "Popen", return_value=process
+                    ) as popen,
+                    patch.object(runner.os, "set_blocking"),
+                    patch.object(runner.os, "read", side_effect=(payload, b"")),
+                    patch.object(
+                        runner.selectors, "DefaultSelector"
+                    ) as selector_factory,
+                ):
+                    selector_factory.return_value.__enter__.return_value.select.return_value = [
+                        (None, None)
+                    ]
+                    with self.assertRaisesRegex(runner.RunnerError, "blob (byte|size)"):
+                        runner._assert_checkout_tree_has_regular_blobs(
+                            Path("/unused"), "a" * 40
+                        )
+                self.assertIn("-l", popen.call_args.args[0])
+                self.assertEqual(
+                    popen.call_args.kwargs["env"]["GIT_NO_LAZY_FETCH"], "1"
+                )
+                stream.close.assert_called_once()
+
+    def test_checkout_tree_scan_succeeds_for_local_complete_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source, commit = repository(Path(temporary))
+            runner._assert_checkout_tree_has_regular_blobs(source, commit)
+
+    def test_checkout_tree_scan_missing_promisor_tree_never_lazy_fetches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            remote = root / "remote.git"
+            completed = subprocess.run(
+                ["git", "clone", "--bare", "-q", str(source), str(remote)],
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            git(["remote", "add", "origin", str(remote)], source)
+            tree = git(["rev-parse", "HEAD^{tree}"], source)
+            tree_object = source / ".git" / "objects" / tree[:2] / tree[2:]
+            self.assertTrue(tree_object.is_file())
+            tree_object.unlink()
+            marker = root / "uploadpack-executed"
+            uploadpack = root / "uploadpack-wrapper"
+            uploadpack.write_text(
+                f'#!/bin/sh\nprintf executed > {str(marker)!r}\nexec git-upload-pack "$@"\n',
+                encoding="utf-8",
+            )
+            uploadpack.chmod(0o700)
+            git(["config", "remote.origin.promisor", "true"], source)
+            git(["config", "remote.origin.partialclonefilter", "blob:none"], source)
+            git(["config", "remote.origin.uploadpack", str(uploadpack)], source)
+            with self.assertRaisesRegex(runner.RunnerError, "incomplete"):
+                runner._assert_checkout_tree_has_regular_blobs(source, commit)
+            self.assertFalse(
+                marker.exists(), "local tree scan contacted promisor remote"
+            )
+            self.assertFalse(tree_object.exists())
+
+    def test_checkout_tree_scan_deadline_kills_and_reaps_stalled_git(self) -> None:
+        stream = mock.Mock()
+        stream.fileno.return_value = 92
+        process = mock.Mock(stdout=stream)
+        process.poll.return_value = None
+        process.wait.return_value = -9
+        with (
+            patch.object(runner.subprocess, "Popen", return_value=process),
+            patch.object(runner.os, "set_blocking"),
+            patch.object(runner.selectors, "DefaultSelector") as selector_factory,
+        ):
+            selector_factory.return_value.__enter__.return_value.select.return_value = []
+            with self.assertRaisesRegex(runner.RunnerError, "timed out"):
+                runner._assert_checkout_tree_has_regular_blobs(
+                    Path("/unused"), "a" * 40
+                )
+        process.kill.assert_called_once()
+        process.wait.assert_called_once_with(timeout=5)
+        stream.close.assert_called_once()
+
+    def test_checkout_tree_scan_rejects_truncated_stream(self) -> None:
+        stream = mock.Mock()
+        stream.fileno.return_value = 93
+        process = mock.Mock(stdout=stream)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with (
+            patch.object(runner.subprocess, "Popen", return_value=process),
+            patch.object(runner.os, "set_blocking"),
+            patch.object(
+                runner.os,
+                "read",
+                side_effect=[b"100644 blob " + b"a" * 40 + b"\tunfinished", b""],
+            ),
+            patch.object(runner.selectors, "DefaultSelector") as selector_factory,
+        ):
+            selector_factory.return_value.__enter__.return_value.select.return_value = [
+                (None, None)
+            ]
+            with self.assertRaisesRegex(runner.RunnerError, "incomplete"):
+                runner._assert_checkout_tree_has_regular_blobs(
+                    Path("/unused"), "a" * 40
+                )
+        stream.close.assert_called_once()
+
+    def test_create_checkout_rejects_deep_tracked_tree_before_one_shot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, _ = repository(root)
+            deep = source.joinpath("src", *("nested" for _ in range(35)), "leaf.txt")
+            deep.parent.mkdir(parents=True)
+            deep.write_text("safe file but excessive depth\n", encoding="utf-8")
+            git(["add", "src"], source)
+            git(["commit", "-m", "deep tree"], source)
+            commit = git(["rev-parse", "HEAD"], source)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            candidate = request(commit=commit)
+            candidate["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            workspace_name = hashlib.sha256(
+                candidate["workspace_id"].encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(runner.RunnerError, "tree depth"):
+                runner.create_checkout(candidate, source, state)
+            self.assertFalse((state / "codex-workspaces" / workspace_name).exists())
+
+    def test_generated_git_metadata_is_checked_before_one_shot_reservation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            candidate = request(commit=commit)
+            candidate["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            workspace_name = hashlib.sha256(
+                candidate["workspace_id"].encode("utf-8")
+            ).hexdigest()
+            with self.assertRaisesRegex(runner.RunnerError, "generated tree exceeds"):
+                runner.create_checkout(
+                    candidate,
+                    source,
+                    state,
+                    preallocate_check=mock.Mock(
+                        side_effect=runner.RunnerError("generated tree exceeds")
+                    ),
+                )
+            self.assertFalse((state / "codex-workspaces" / workspace_name).exists())
+
+    def test_baseline_preallocates_treatment_clone_before_one_shot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            candidate = request(commit=commit)
+            candidate["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            workspace_name = hashlib.sha256(
+                candidate["workspace_id"].encode("utf-8")
+            ).hexdigest()
+            observed: list[int] = []
+
+            def assert_pair_headroom(pending_second_clone_entries: int) -> None:
+                observed.append(pending_second_clone_entries)
+                self.assertGreater(pending_second_clone_entries, 0)
+                raise runner.RunnerError("pair budget exceeded before first intent")
+
+            with self.assertRaisesRegex(
+                runner.RunnerError, "pair budget exceeded before first intent"
+            ):
+                runner.create_checkout(
+                    candidate, source, state, preallocate_check=assert_pair_headroom
+                )
+            self.assertEqual(len(observed), 1)
+            self.assertFalse((state / "codex-workspaces" / workspace_name).exists())
+
+    def test_baseline_preflight_reserves_only_unscanned_treatment_clone(self) -> None:
+        # The baseline staged checkout is already part of the state-root scan.
+        # Pretend it has 25k entries without allocating a huge Git repository.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            candidate = request(commit=commit)
+            candidate["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            observed: list[int] = []
+
+            def assert_future_headroom(pending: int) -> None:
+                observed.append(pending)
+                self.assertEqual(pending, 25_000 + 2 + 16)
+                raise runner.RunnerError("stop before one-use workspace")
+
+            with patch.object(
+                runner, "_assert_private_output_tree_scan", return_value=25_000
+            ) as count_staged:
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "stop before one-use workspace"
+                ):
+                    runner.create_checkout(
+                        candidate,
+                        source,
+                        state,
+                        preallocate_check=assert_future_headroom,
+                    )
+            count_staged.assert_called_once()
+            self.assertEqual(observed, [25_018])
+            workspace = (
+                state
+                / "codex-workspaces"
+                / hashlib.sha256(candidate["workspace_id"].encode("utf-8")).hexdigest()
+            )
+            self.assertFalse(workspace.exists())
+
+    def test_private_output_scan_reserves_preintent_artifact_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "source.txt").write_text("x", encoding="utf-8")
+            (root / "subdir").mkdir()
+            runner._assert_private_output_tree_scan((root,))
+            # Two existing entries plus the reserved future entries exceed
+            # 65,536 although the current tree by itself is still admissible.
+            with self.assertRaisesRegex(
+                runner.RunnerError, "scan entry budget exceeded"
+            ):
+                runner._assert_private_output_tree_scan((root,), reserved_entries=65535)
+            with self.assertRaisesRegex(
+                runner.RunnerError, "reserved output entries are invalid"
+            ):
+                runner._assert_private_output_tree_scan((root,), reserved_entries=-1)
+
+    def test_preintent_headroom_counts_nested_manifest_artifacts(self) -> None:
+        self.assertEqual(
+            runner._preintent_output_entry_reservation("baseline", None), 4
+        )
+        expected_manifest = {"path": "/bundle/manifest.json", "sha256": "a" * 64}
+        manifest_files = [
+            (Path("a/one"), Path("/source/a/one"), 10, "0" * 64),
+            (Path("a/two"), Path("/source/a/two"), 10, "1" * 64),
+            (Path("b/c/three"), Path("/source/b/c/three"), 10, "2" * 64),
+        ]
+        script = Path("/src/scripts/repoground-mcp-stdio.py")
+        with (
+            patch.object(
+                runner,
+                "_runtime_file_snapshot",
+                return_value=(dict(expected_manifest), b"manifest"),
+            ) as snapshot,
+            patch.object(
+                runner, "_manifest_artifact_paths", return_value=manifest_files
+            ) as artifacts,
+            patch.object(
+                runner,
+                "_repoground_source_tree_snapshot",
+                return_value={
+                    "entries": [
+                        {"relative": Path("merger/a.py")},
+                        {"relative": Path("merger/repoground/cli/mcp_stdio.py")},
+                    ]
+                },
+            ) as source_tree,
+        ):
+            self.assertEqual(
+                runner._preintent_output_entry_reservation(
+                    "treatment", expected_manifest, mcp_script=script
+                ),
+                # Schema+home, proxy, first manifest and three artifacts+
+                # parent dirs, second upstream root/stage, its eight files and
+                # nine distinct nested directories. The prior code reserved 17.
+                4 + 4 + 3 + 3 + 3 + 2 + 8 + 9,
+            )
+            snapshot.assert_called_once()
+            artifacts.assert_called_once()
+            source_tree.assert_called_once_with(script, b"manifest", legacy_g1=False)
+        with self.assertRaisesRegex(
+            runner.RunnerError, "pre-intent manifest binding is missing"
+        ):
+            runner._preintent_output_entry_reservation("treatment", None)
+        with self.assertRaisesRegex(
+            runner.RunnerError, "pre-intent MCP script binding is missing"
+        ):
+            runner._preintent_output_entry_reservation("treatment", expected_manifest)
+
+    def test_preintent_rejects_deep_manifest_artifact_before_workspace(self) -> None:
+        # The second immutable upstream stage adds a manifest/ directory.
+        # It must reject a relative 31-component file even when the first
+        # manifest stage alone could have fit the depth-32 output scanner.
+        binding = {"path": "/bundle/manifest.json", "sha256": "a" * 64}
+        script = Path("/src/scripts/repoground-mcp-stdio.py")
+        valid = Path(*(["nested"] * 29 + ["artifact.dat"]))
+        too_deep = Path(*(["nested"] * 30 + ["artifact.dat"]))
+        with (
+            patch.object(
+                runner,
+                "_runtime_file_snapshot",
+                return_value=(dict(binding), b"manifest"),
+            ),
+            patch.object(runner, "_manifest_artifact_paths") as artifacts,
+            patch.object(
+                runner,
+                "_repoground_source_tree_snapshot",
+                return_value={"entries": [{"relative": Path("merger/a.py")}]},
+            ),
+        ):
+            artifacts.return_value = [(valid, Path("/bundle") / valid, 1, "b" * 64)]
+            self.assertGreater(
+                runner._preintent_output_entry_reservation(
+                    "treatment", binding, mcp_script=script
+                ),
+                0,
+            )
+            artifacts.return_value = [
+                (too_deep, Path("/bundle") / too_deep, 1, "b" * 64)
+            ]
+            with self.assertRaisesRegex(
+                runner.RunnerError, "upstream MCP stage tree depth"
+            ):
+                runner._preintent_output_entry_reservation(
+                    "treatment", binding, mcp_script=script
+                )
+
+    def test_preintent_upstream_source_tree_depth_and_aliases_fail_closed(self) -> None:
+        # An upstream source with a deep path or duplicate name could make the
+        # one-shot checkout fail only after its identity had been consumed.
+        binding = {"path": "/bundle/manifest.json", "sha256": "a" * 64}
+        script = Path("/src/scripts/repoground-mcp-stdio.py")
+        with (
+            patch.object(
+                runner,
+                "_runtime_file_snapshot",
+                return_value=(dict(binding), b"manifest"),
+            ),
+            patch.object(runner, "_manifest_artifact_paths", return_value=[]),
+            patch.object(runner, "_repoground_source_tree_snapshot") as tree,
+        ):
+            tree.return_value = {
+                "entries": [
+                    {"relative": Path("merger") / Path(*(["a"] * 30)) / "deep.py"}
+                ]
+            }
+            with self.assertRaisesRegex(
+                runner.RunnerError, "upstream MCP stage tree depth"
+            ):
+                runner._preintent_output_entry_reservation(
+                    "treatment", binding, mcp_script=script
+                )
+            tree.return_value = {
+                "entries": [
+                    {"relative": Path("merger/a.py")},
+                    {"relative": Path("merger/a.py")},
+                ]
+            }
+            with self.assertRaisesRegex(runner.RunnerError, "duplicate file paths"):
+                runner._preintent_output_entry_reservation(
+                    "treatment", binding, mcp_script=script
+                )
+
+    def test_create_checkout_regular_tracked_files_remain_usable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            candidate = request(commit=commit)
+            candidate["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(candidate, source, state)
+            self.assertTrue((checkout / "src" / "example.py").is_file())
+            self.assertEqual(git(["rev-parse", "HEAD"], checkout), commit)
+
+    def test_private_frozen_g2_checkout_is_reproducibly_dirty_and_read_only(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, commit = repository(root)
@@ -536,9 +2817,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 attestation = runner.base.attest_checkout_setup(value, checkout)
                 self.assertEqual(attestation["working_tree"], "dirty")
                 self.assertEqual(attestation["git_commit"], commit)
-                self.assertEqual(attestation["fixture_sha256"], runner.sha_bytes(
-                    runner.base.DIRTY_FIXTURE_BYTES
-                ))
+                self.assertEqual(
+                    attestation["fixture_sha256"],
+                    runner.sha_bytes(runner.base.DIRTY_FIXTURE_BYTES),
+                )
                 self.assertEqual(git(["status", "--porcelain"], source), "")
                 self.assertEqual(
                     git(["status", "--porcelain"], checkout),
@@ -559,30 +2841,40 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             source, commit = repository(root)
             (root / "state").mkdir(mode=0o700)
             frozen = runner.base.FROZEN_G2_IDENTITY
-            with patch.dict(frozen, {
-                "repository": {**frozen["repository"], "commit": commit}
-            }):
+            with patch.dict(
+                frozen, {"repository": {**frozen["repository"], "commit": commit}}
+            ):
                 value = frozen_g2_request(condition="treatment", commit=commit)
                 value["repobrief"]["mcp_command"] = [
-                    sys.executable, "/fixture/mcp.py", "--bundle-root",
-                    "/snapshot", "--repo-root", str(source),
+                    sys.executable,
+                    "/fixture/mcp.py",
+                    "--bundle-root",
+                    "/snapshot",
+                    "--repo-root",
+                    str(source),
                 ]
                 checkout = runner.create_checkout(value, source, root / "state")
                 with patch.object(
-                    runner, "_validated_mcp_proxy_python",
+                    runner,
+                    "_validated_mcp_proxy_python",
                     return_value=sys.executable,
                 ):
                     command = runner.build_command(
-                        value, "/opt/codex", checkout,
-                        root / "answer.json", root / "codex-home",
+                        value,
+                        "/opt/codex",
+                        checkout,
+                        root / "answer.json",
+                        root / "codex-home",
                         authorized_mcp_files=[],
                         proxy_path=root / "proxy.py",
                         manifest_path=root / "staged.bundle.manifest.json",
                         mcp_runtime_root=root / "state",
+                        prepared_mcp_stage=synthetic_prepared_stage(root),
                         source=source,
                     )
                     config = next(
-                        item for item in command
+                        item
+                        for item in command
                         if item.startswith("mcp_servers.repobrief.args=")
                     )
                     proxy_args = json.loads(config.split("=", 1)[1])
@@ -595,12 +2887,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     value["repobrief"]["mcp_command"][-1] = str(root / "wrong")
                     with self.assertRaisesRegex(runner.RunnerError, "source"):
                         runner.build_command(
-                            value, "/opt/codex", checkout,
-                            root / "answer.json", root / "codex-home",
+                            value,
+                            "/opt/codex",
+                            checkout,
+                            root / "answer.json",
+                            root / "codex-home",
                             authorized_mcp_files=[],
                             proxy_path=root / "proxy.py",
                             manifest_path=root / "staged.bundle.manifest.json",
                             mcp_runtime_root=root / "state",
+                            prepared_mcp_stage=synthetic_prepared_stage(root),
                             source=source,
                         )
 
@@ -632,9 +2928,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "outcome": "answer",
             "reported_paths": ["src/example.py"],
             "reported_symbols": ["example"],
-            "citations": [
-                {"path": "src/example.py", "start_line": 1, "end_line": 2}
-            ],
+            "citations": [{"path": "src/example.py", "start_line": 1, "end_line": 2}],
             "claims": [claim],
             "asserted_sufficient_evidence": False,
         }
@@ -654,7 +2948,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(runner.base.RunnerError, "duplicates"):
                     runner.base.validate_answer(candidate)
 
-    def test_codex_output_schema_fails_closed_on_uniqueness_contract_drift(self) -> None:
+    def test_codex_output_schema_fails_closed_on_uniqueness_contract_drift(
+        self,
+    ) -> None:
         drifted = json.loads(json.dumps(runner.base.ANSWER_SCHEMA))
         del drifted["properties"]["reported_paths"]["uniqueItems"]
         with (
@@ -745,9 +3041,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             marker = root / "uploadpack-ran"
             uploadpack = root / "uploadpack-wrapper"
             uploadpack.write_text(
-                "#!/bin/sh\n"
-                f"printf ran > {str(marker)!r}\n"
-                'exec git-upload-pack "$@"\n',
+                f'#!/bin/sh\nprintf ran > {str(marker)!r}\nexec git-upload-pack "$@"\n',
                 encoding="utf-8",
             )
             uploadpack.chmod(0o700)
@@ -802,7 +3096,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             0,
             completed.stderr.decode("utf-8", errors="replace"),
         )
-        self.assertIn(b"Run one isolated read-only RepoBrief Codex benchmark request", completed.stdout)
+        self.assertIn(
+            b"Run one isolated read-only RepoBrief Codex benchmark request",
+            completed.stdout,
+        )
 
     def test_authorized_runtime_code_must_match_executed_runner_bytes(self) -> None:
         files = []
@@ -810,7 +3107,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             path = runner._runtime_code_path(name)
             raw = path.read_bytes()
             files.append(
-                {"name": name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+                {
+                    "name": name,
+                    "bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
             )
         code = {
             "files": files,
@@ -820,9 +3121,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         drifted["sha256"] = "0" * 64
         with (
             patch.object(runner, "_SELF_SOURCE_IDENTITY", drifted),
-            self.assertRaisesRegex(
-                runner.RunnerError, "differs from executed bytes"
-            ),
+            self.assertRaisesRegex(runner.RunnerError, "differs from executed bytes"),
         ):
             runner._validated_authorized_runtime_code(code)
 
@@ -832,7 +3131,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             path = runner._runtime_code_path(name)
             raw = path.read_bytes()
             files.append(
-                {"name": name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+                {
+                    "name": name,
+                    "bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
             )
         code = {
             "files": files,
@@ -848,9 +3151,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         }
         with (
             patch.object(runner, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", identity),
-            self.assertRaisesRegex(
-                runner.RunnerError, "differs from executed bytes"
-            ),
+            self.assertRaisesRegex(runner.RunnerError, "differs from executed bytes"),
         ):
             runner._validated_authorized_runtime_code(code)
 
@@ -876,6 +3177,984 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         ):
             runner._assert_authorized_chatgpt_auth(b"credential-B", expected)
 
+    def test_unix_socket_seccomp_blocks_rpc_to_accessible_privileged_socket(
+        self,
+    ) -> None:
+        # Even a mode-0666 daemon socket on a RO bind mount can delegate
+        # writes: the kernel filter must deny socket() before connect().
+        with tempfile.TemporaryDirectory() as temporary:
+            socket_path = Path(temporary) / "privileged-daemon.sock"
+            with runner.socket.socket(
+                runner.socket.AF_UNIX, runner.socket.SOCK_STREAM
+            ) as server:
+                server.bind(str(socket_path))
+                socket_path.chmod(0o666)
+                server.listen(1)
+                child = (
+                    "import socket,errno,subprocess,sys\n"
+                    "for make in (lambda:socket.socket(socket.AF_UNIX,socket.SOCK_STREAM),"
+                    "lambda:socket.socketpair(socket.AF_UNIX,socket.SOCK_DGRAM),"
+                    "lambda:socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)):\n"
+                    " try:make();raise RuntimeError('external UNIX socket was permitted')\n"
+                    " except OSError as e:assert e.errno==errno.EPERM\n"
+                    "a,b=socket.socketpair(socket.AF_UNIX,socket.SOCK_STREAM)\n"
+                    "a.close();b.close()\n"
+                    "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.close()\n"
+                    "p=subprocess.run([sys.executable,'-c',"
+                    "'import socket;socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)'],"
+                    "capture_output=True,timeout=4)\n"
+                    "assert p.returncode!=0 and b'Operation not permitted' in p.stderr\n"
+                    "print('UNIX_DENIED_INET_ALLOWED_CHILD_DENIED')\n"
+                )
+                command = runner._unix_socket_restricted_codex_argv(
+                    [sys.executable, "-I", "-c", child, str(socket_path)]
+                )
+                completed = subprocess.run(
+                    command, capture_output=True, timeout=12, check=False
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn(
+                    b"UNIX_DENIED_INET_ALLOWED_CHILD_DENIED", completed.stdout
+                )
+                server.settimeout(0.1)
+                with self.assertRaises(runner.socket.timeout):
+                    server.accept()
+
+    def test_untrusted_codex_cannot_prlimit_trusted_parent(self) -> None:
+        # Only query a limit: an unfiltered RED run never harms the parent.
+        # prlimit64(pid=0) remains usable for the provider's own limits.
+        child = (
+            "import errno,os,resource\n"
+            "try: resource.prlimit(os.getppid(), resource.RLIMIT_NOFILE)\n"
+            "except OSError as exc: assert exc.errno == errno.EPERM, exc\n"
+            "else: raise RuntimeError('trusted parent prlimit64 permitted')\n"
+            "assert resource.prlimit(0, resource.RLIMIT_NOFILE)[0] >= 0\n"
+            "print('TRUSTED_PARENT_PRLIMIT_DENIED_SELF_ALLOWED')\n"
+        )
+        command = runner._unix_socket_restricted_codex_argv(
+            [sys.executable, "-I", "-c", child]
+        )
+        completed = subprocess.run(
+            command, capture_output=True, timeout=12, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(b"TRUSTED_PARENT_PRLIMIT_DENIED_SELF_ALLOWED", completed.stdout)
+
+    def test_provider_pid_namespace_stages_mcp_proxy_tools_list(self) -> None:
+        """Real bwrap, real MCP proxy, fake upstream: no paid provider activity."""
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir(mode=0o700)
+            epoch = root / "epoch"
+            epoch.mkdir(mode=0o700)
+            outputs = {
+                name: epoch / name
+                for name in ("state", "transcripts", "evidence", "reports")
+            }
+            for directory in outputs.values():
+                directory.mkdir(mode=0o700)
+            state = outputs["state"]
+            parent = state / "codex-runtime"
+            parent.mkdir(mode=0o700)
+            session_home = parent / ("session-" + "a" * 24)
+            session_home.mkdir(mode=0o700)
+            ledger = state / "preflight-dispatch-ledger"
+            ledger.mkdir(mode=0o700)
+            event = ledger / "0001-dispatch-intent.json"
+            event.write_text("trusted-intent", encoding="ascii")
+            upstream = source / "fake-mcp.py"
+            upstream.write_text(
+                "import json, sys\n"
+                f"TOOLS = {treatment_tools()!r}\n"
+                "for line in sys.stdin:\n"
+                "    request = json.loads(line)\n"
+                "    if request.get('method') == 'tools/list':\n"
+                "        print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], "
+                "'result': {'tools': TOOLS}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            payload = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode("utf-8")
+                + b"\n"
+            )
+
+            def run_proxy() -> tuple[subprocess.CompletedProcess[bytes], Path]:
+                command = proxy_command(
+                    upstream, source, staging_state=state, wrap=False
+                )
+                stage = json.loads(command[-1])
+                staged_script = Path(stage["bindings"][1]["path"])
+                sandbox = runner._provider_pid_namespaced_codex_argv(
+                    command,
+                    source=source,
+                    state_root=state,
+                    transcript_root=outputs["transcripts"],
+                    evidence_root=outputs["evidence"],
+                    report_root=outputs["reports"],
+                    codex_home=session_home,
+                )
+                result = subprocess.run(
+                    runner._unix_socket_restricted_codex_argv(
+                        sandbox, provider_pid_namespace=True
+                    ),
+                    input=payload,
+                    cwd=source,
+                    env={**os.environ, "CODEX_HOME": str(session_home)},
+                    capture_output=True,
+                    timeout=18,
+                    check=False,
+                )
+                return result, staged_script
+
+            # GREEN: trusted parent-staging outside CODEX_HOME completes
+            # the real tools/list under the provider's kernel PID/mount limits.
+            allowed, immutable_script = run_proxy()
+            self.assertEqual(allowed.returncode, 0, allowed.stderr[-2048:])
+            messages = [json.loads(line) for line in allowed.stdout.splitlines()]
+            reply = next((item for item in messages if item.get("id") == 1), None)
+            self.assertIsNotNone(reply)
+            self.assertIn(
+                "ask_context",
+                {tool["name"] for tool in reply["result"]["tools"]},
+            )
+            self.assertEqual(event.read_text(encoding="ascii"), "trusted-intent")
+
+            # Same-UID attacker tries overwrite, chmod, replacement and
+            # hardlink-to-writable-session alias, all from the *real* PIDNS.
+            original = immutable_script.read_bytes()
+            attack_code = (
+                "import os,sys,pathlib\n"
+                "p=pathlib.Path(sys.argv[1]);home=pathlib.Path(sys.argv[2])\n"
+                "attempts=[lambda:p.write_bytes(b'changed'),"
+                "lambda:os.chmod(p,0o777),"
+                "lambda:os.replace(home/'replacement',p),"
+                "lambda:os.link(p,home/'mutable-hardlink')]\n"
+                "for attempt in attempts:\n"
+                " try:attempt()\n"
+                " except OSError:continue\n"
+                " raise RuntimeError('provider changed trusted MCP code')\n"
+                "print('MCP_CODE_IMMUTABLE')\n"
+            )
+            (session_home / "replacement").write_bytes(b"payload")
+            tamper = runner._provider_pid_namespaced_codex_argv(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    attack_code,
+                    str(immutable_script),
+                    str(session_home),
+                ],
+                source=source,
+                state_root=state,
+                transcript_root=outputs["transcripts"],
+                evidence_root=outputs["evidence"],
+                report_root=outputs["reports"],
+                codex_home=session_home,
+            )
+            blocked = subprocess.run(
+                runner._unix_socket_restricted_codex_argv(
+                    tamper, provider_pid_namespace=True
+                ),
+                cwd=source,
+                capture_output=True,
+                env={**os.environ, "CODEX_HOME": str(session_home)},
+                timeout=18,
+                check=False,
+            )
+            self.assertEqual(blocked.returncode, 0, blocked.stderr[-2048:])
+            self.assertIn(b"MCP_CODE_IMMUTABLE", blocked.stdout)
+            self.assertEqual(immutable_script.read_bytes(), original)
+            self.assertFalse((session_home / "mutable-hardlink").exists())
+            self.assertEqual(event.read_text(encoding="ascii"), "trusted-intent")
+
+    def test_provider_pid_namespace_hides_nondumpable_parent_threads(self) -> None:
+        # Host-kernel test with no provider: protect a nonleader native TID,
+        # preserve direct child cancellation, and reject an omitted PIDNS.
+        parent = r"""
+import ctypes
+import errno
+import os
+from pathlib import Path
+import resource
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+runner_path = Path(sys.argv[1]).resolve(strict=True)
+sys.path.insert(0, str(runner_path.parent))
+import repobrief_agent_benchmark_codex_runner as guarded
+assert Path(guarded.__file__).resolve(strict=True) == runner_path
+libc = ctypes.CDLL(None)
+assert libc.prctl(4, 0, 0, 0, 0) == 0
+assert libc.prctl(3, 0, 0, 0, 0) == 0
+signals = []
+old_handler = signal.signal(signal.SIGUSR1, lambda *_: signals.append(True))
+stop = threading.Event()
+thread = threading.Thread(target=stop.wait, args=(10,), daemon=True)
+thread.start()
+assert thread.native_id not in (None, os.getpid())
+try:
+    test_home = Path.home()
+    writable_root = Path.cwd()
+    if test_home not in writable_root.parents:
+        writable_root = test_home
+    with tempfile.TemporaryDirectory(dir=writable_root) as temporary:
+        root = Path(temporary)
+        source = root / "source"
+        source.mkdir()
+        epoch = root / "epoch"
+        epoch.mkdir()
+        roots = {name: epoch / name
+                 for name in ("state", "transcripts", "evidence", "reports")}
+        for directory in roots.values():
+            directory.mkdir(mode=0o700)
+        # Provider may write only its unique ephemeral CODEX_HOME, never
+        # the trusted dispatch ledger, receipts or final reports.
+        session_parent = roots["state"] / "codex-runtime"
+        session_parent.mkdir(mode=0o700)
+        session_home = session_parent / ("session-" + "a" * 24)
+        session_home.mkdir(mode=0o700)
+        protected_ledger = roots["state"] / "preflight-dispatch-ledger"
+        protected_ledger.mkdir(mode=0o700)
+        trusted_event = protected_ledger / "0001-dispatch-intent.json"
+        trusted_event.write_text("trusted-intent", encoding="ascii")
+        kwargs = dict(
+            source=source, state_root=roots["state"],
+            transcript_root=roots["transcripts"],
+            evidence_root=roots["evidence"], report_root=roots["reports"],
+            codex_home=session_home,
+        )
+        guarded._assert_provider_pid_namespace_ready(**kwargs, cwd=source)
+        child = r'''
+import errno
+import os
+from pathlib import Path
+import resource
+import signal
+import subprocess
+import sys
+parent_pid, parent_tid = map(int, sys.argv[1:3])
+trusted_event, report_dir, session_home = map(Path, sys.argv[3:6])
+for destination in (trusted_event, report_dir / "untrusted-create.json"):
+    try:
+        destination.write_text("hostile-provider-write", encoding="ascii")
+    except OSError as exc:
+        assert exc.errno in (errno.EROFS, errno.EACCES), exc
+    else:
+        raise RuntimeError("provider modified trusted persistent output")
+session_marker = session_home / "child-marker"
+session_marker.write_text("allowed", encoding="ascii")
+# This is the actual provider-side private MCP stage allocator, not a
+# fake mkdir: it must succeed beneath Codex HOME while its ancestor
+# state/ledger remains read-only under the real kernel.
+runner_path = Path(sys.argv[6]).resolve(strict=True)
+sys.path.insert(0, str(runner_path.parent))
+import repobrief_agent_benchmark_codex_runner as guarded
+stage_path, stage_fd = guarded._create_private_stage_directory(
+    session_home / "repoground-mcp-upstream-runtime", prefix="upstream-"
+)
+try:
+    guarded._write_private_dirfd(stage_fd, "tools-list.json", b'{"tools":[]}\\n')
+finally:
+    os.close(stage_fd)
+assert (stage_path / "tools-list.json").is_file()
+for target in (parent_pid, parent_tid):
+    try:
+        os.kill(target, signal.SIGUSR1)
+    except OSError as exc:
+        assert exc.errno in (errno.ESRCH, errno.EPERM), exc
+    else:
+        raise RuntimeError("provider signaled trusted parent PID/TID")
+try:
+    os.setpriority(os.PRIO_PROCESS, parent_pid, 19)
+except OSError as exc:
+    assert exc.errno in (errno.ESRCH, errno.EPERM), exc
+else:
+    raise RuntimeError("provider changed trusted parent's priority")
+process = subprocess.Popen(["/usr/bin/sleep", "2"])
+try:
+    assert resource.prlimit(process.pid, resource.RLIMIT_NOFILE)[0] >= 0
+    os.kill(process.pid, signal.SIGTERM)
+    assert process.wait(timeout=3) == -signal.SIGTERM
+finally:
+    if process.poll() is None:
+        process.kill()
+        process.wait(timeout=3)
+assert resource.prlimit(0, resource.RLIMIT_NOFILE)[0] >= 0
+print("PARENT_TIDS_HIDDEN_CHILD_SIGNALS_WORK")
+'''
+        provider = [
+            sys.executable, "-I", "-B", "-c", child,
+            str(os.getpid()), str(thread.native_id),
+            str(trusted_event), str(roots["reports"]), str(session_home),
+            str(runner_path),
+        ]
+        sandbox = guarded._provider_pid_namespaced_codex_argv(provider, **kwargs)
+        def run(candidate, *, isolated=False):
+            return subprocess.run(
+                guarded._unix_socket_restricted_codex_argv(
+                    candidate, provider_pid_namespace=isolated
+                ),
+                cwd=source, capture_output=True, timeout=12, check=False,
+                env={**os.environ, "CODEX_HOME": str(session_home)},
+            )
+        good = run(sandbox, isolated=True)
+        assert good.returncode == 0, good.stderr[-1024:]
+        assert b"PARENT_TIDS_HIDDEN_CHILD_SIGNALS_WORK" in good.stdout
+        assert trusted_event.read_text(encoding="ascii") == "trusted-intent"
+        assert not (roots["reports"] / "untrusted-create.json").exists()
+        assert (session_home / "child-marker").read_text(encoding="ascii") == "allowed"
+        bad = run([item for item in sandbox if item != "--unshare-pid"])
+        assert bad.returncode != 0, bad.stdout
+        assert b"PARENT_TIDS_HIDDEN_CHILD_SIGNALS_WORK" not in bad.stdout
+        time.sleep(0.05)
+        assert not signals, "trusted parent received provider signal"
+finally:
+    stop.set()
+    thread.join(timeout=2)
+    signal.signal(signal.SIGUSR1, old_handler)
+print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
+"""
+        completed = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", parent, str(Path(runner.__file__))],
+            capture_output=True,
+            timeout=28,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2048:])
+        self.assertIn(
+            b"PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS",
+            completed.stdout,
+        )
+
+    def test_untrusted_codex_cannot_signal_same_uid_trusted_parent(self) -> None:
+        # PR_SET_DUMPABLE=0 blocks ptrace, NOT signals from the same UID.
+        # A provider may otherwise SIGKILL the ledger writer after one-shot
+        # intent. Use signal 0 for a safe real-kernel permission probe.
+        child = (
+            "import errno,os\n"
+            "try: os.kill(os.getppid(), 0)\n"
+            "except OSError as exc: assert exc.errno == errno.EPERM, exc\n"
+            "else: raise RuntimeError('parent signal syscall permitted')\n"
+            "print('RAB_PARENT_SIGNALS_DENIED')\n"
+        )
+        command = runner._unix_socket_restricted_codex_argv(
+            [sys.executable, "-I", "-c", child]
+        )
+        completed = subprocess.run(
+            command, capture_output=True, timeout=12, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(b"RAB_PARENT_SIGNALS_DENIED", completed.stdout)
+
+    def test_filtered_codex_can_signal_only_its_own_process_group(self) -> None:
+        # A real-kernel subprocess cancellation probe, never a model call.
+        # The provider must be separated from its trusted parent's session.
+        child = (
+            "import errno,os,signal,subprocess\n"
+            "parent=os.getppid()\n"
+            "assert os.getpgrp()!=os.getpgid(parent), 'parent group shared'\n"
+            "for target in (parent, -os.getpgid(parent), -1):\n"
+            " try: os.kill(target, 0)\n"
+            " except OSError as exc: assert exc.errno==errno.EPERM, exc\n"
+            " else: raise RuntimeError('trusted parent target permitted')\n"
+            "for grouped in (False, True):\n"
+            " child=subprocess.Popen(['/usr/bin/sleep','2'], start_new_session=grouped)\n"
+            " try:\n"
+            "  os.kill(-child.pid if grouped else child.pid, signal.SIGTERM)\n"
+            "  assert child.wait(timeout=3)==-signal.SIGTERM\n"
+            " finally:\n"
+            "  if child.poll() is None: child.wait(timeout=4)\n"
+            "print('TRUSTED_PARENT_DENIED_CHILD_CANCELLATION_WORKS')\n"
+        )
+        command = runner._unix_socket_restricted_codex_argv(
+            [sys.executable, "-I", "-c", child]
+        )
+        completed = subprocess.run(
+            command, capture_output=True, timeout=12, check=False
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(
+            b"TRUSTED_PARENT_DENIED_CHILD_CANCELLATION_WORKS", completed.stdout
+        )
+
+    def test_unix_socket_seccomp_fails_before_child_exec_when_library_missing(
+        self,
+    ) -> None:
+        bad_program = runner._UNIX_SOCKET_DENY_CHILD_PROGRAM.replace(
+            '_SECCOMP_TRUSTED_LIBRARY_ROOTS = ("/usr/lib", "/usr/lib64", "/lib", "/lib64")',
+            '_SECCOMP_TRUSTED_LIBRARY_ROOTS = ("/unavailable",)',
+        )
+        self.assertNotEqual(bad_program, runner._UNIX_SOCKET_DENY_CHILD_PROGRAM)
+        with patch.object(runner, "_UNIX_SOCKET_DENY_CHILD_PROGRAM", bad_program):
+            command = runner._unix_socket_restricted_codex_argv(
+                [sys.executable, "-I", "-c", "print('CHILD_EXECUTED')"]
+            )
+        completed = subprocess.run(
+            command, capture_output=True, timeout=10, check=False
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn(b"CHILD_EXECUTED", completed.stdout)
+
+    def test_unix_socket_seccomp_rejects_library_under_writable_parent(
+        self,
+    ) -> None:
+        # A caller-controlled library search root must not become trusted
+        # merely because a file with the expected soname exists.
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "libseccomp.so.2").write_bytes(b"malicious ELF")
+            bad_program = runner._UNIX_SOCKET_DENY_CHILD_PROGRAM.replace(
+                '_SECCOMP_TRUSTED_LIBRARY_ROOTS = ("/usr/lib", "/usr/lib64", "/lib", "/lib64")',
+                f"_SECCOMP_TRUSTED_LIBRARY_ROOTS = ({directory!r},)",
+            )
+            self.assertNotEqual(bad_program, runner._UNIX_SOCKET_DENY_CHILD_PROGRAM)
+            with patch.object(runner, "_UNIX_SOCKET_DENY_CHILD_PROGRAM", bad_program):
+                command = runner._unix_socket_restricted_codex_argv(
+                    [sys.executable, "-I", "-c", "print('CHILD_EXECUTED')"]
+                )
+            completed = subprocess.run(
+                command, capture_output=True, timeout=10, check=False
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertNotIn(b"CHILD_EXECUTED", completed.stdout)
+            self.assertIn(b"untrusted kernel socket filter", completed.stderr)
+
+    def test_unix_socket_seccomp_rejects_unqualified_exec_command(self) -> None:
+        for value in ([], ["codex"], ["relative/codex", "login", "status"]):
+            with self.subTest(command=value):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "socket isolation command is invalid"
+                ):
+                    runner._unix_socket_restricted_codex_argv(value)
+
+    @staticmethod
+    def _documented_nested_userns_policy_denial(
+        bubblewrap: subprocess.CompletedProcess[bytes],
+        syscall_witness: subprocess.CompletedProcess[bytes],
+        *,
+        apparmor_profile_attested: bool = False,
+    ) -> bool:
+        """Classify only independently evidenced bwrap sandbox-host policy denial."""
+        return (
+            bubblewrap.returncode == 1
+            and bubblewrap.stdout == b""
+            and bubblewrap.stderr.startswith(
+                b"bwrap: No permissions to create new namespace"
+            )
+            and syscall_witness.returncode == 0
+            and syscall_witness.stderr == b""
+            and (
+                syscall_witness.stdout.strip() == b"NESTED_USERNS_SYSCALL_DENIED"
+                or (
+                    apparmor_profile_attested
+                    and syscall_witness.stdout.strip()
+                    == b"NESTED_USERNS_SYSCALL_ALLOWED"
+                )
+            )
+        )
+
+    @staticmethod
+    def _verified_bwrap_apparmor_profile() -> bool:
+        """Demand the exact Ubuntu distribution-installed bwrap profile.
+
+        A successful raw CLONE_NEWUSER syscall does NOT prove that Bubblewrap's
+        own AppArmor profile can create a nested namespace. This is a
+        test-runner capability classification, never a live-provider grant.
+        """
+        setting = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        packaged = Path("/usr/share/apparmor/extra-profiles/bwrap-userns-restrict")
+        loaded_copy = Path("/etc/apparmor.d/bwrap-userns-restrict")
+        try:
+            if setting.read_bytes().strip() != b"1":
+                return False
+            for entry in (packaged, loaded_copy):
+                info = entry.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != 0
+                    or info.st_mode & 0o022
+                    or info.st_size <= 0
+                    or info.st_size > 256 * 1024
+                ):
+                    return False
+            return packaged.read_bytes() == loaded_copy.read_bytes()
+        except OSError:
+            return False
+
+    def test_nested_userns_skip_requires_independent_kernel_denial(self) -> None:
+        """A generic bwrap failure must not mask a broken positive sandbox."""
+        denied = subprocess.CompletedProcess(
+            [],
+            1,
+            b"",
+            b"bwrap: No permissions to create new namespace, likely because "
+            b"the kernel does not allow non-privileged user namespaces.\n",
+        )
+        witness = subprocess.CompletedProcess(
+            [], 0, b"NESTED_USERNS_SYSCALL_DENIED\n", b""
+        )
+        self.assertTrue(self._documented_nested_userns_policy_denial(denied, witness))
+        permitted = subprocess.CompletedProcess(
+            [], 0, b"NESTED_USERNS_SYSCALL_ALLOWED\n", b""
+        )
+        self.assertFalse(
+            self._documented_nested_userns_policy_denial(denied, permitted)
+        )
+        self.assertTrue(
+            self._documented_nested_userns_policy_denial(
+                denied, permitted, apparmor_profile_attested=True
+            )
+        )
+        for probe, syscall in (
+            (subprocess.CompletedProcess([], 1, b"", b"bwrap: file missing"), witness),
+            (subprocess.CompletedProcess([], 2, b"", denied.stderr), witness),
+            (subprocess.CompletedProcess([], 1, b"unexpected", denied.stderr), witness),
+            (denied, subprocess.CompletedProcess([], 1, b"", b"EPERM")),
+            (
+                denied,
+                subprocess.CompletedProcess([], 0, b"NESTED_USERNS_ALLOWED\n", b""),
+            ),
+        ):
+            with self.subTest(probe=probe, syscall=syscall):
+                self.assertFalse(
+                    self._documented_nested_userns_policy_denial(probe, syscall)
+                )
+
+    def test_nested_userns_denial_never_skips_negative_kernel_case(self) -> None:
+        """Simulate GitHub's policy and prove negative runs despite positive SKIP."""
+        denied = subprocess.CompletedProcess(
+            [], 1, b"", b"bwrap: No permissions to create new namespace\n"
+        )
+        witness = subprocess.CompletedProcess(
+            [], 0, b"NESTED_USERNS_SYSCALL_DENIED\n", b""
+        )
+        real_run = subprocess.run
+        observed = []
+
+        def simulate_host(argv, *args, **kwargs):
+            if argv and argv[0] == "/usr/bin/bwrap":
+                if "--unshare-user" in argv:
+                    observed.append("nested-denial")
+                    return denied
+                if argv and "NESTED_USERNS_SYSCALL_DENIED" in argv[-1]:
+                    observed.append("syscall-denial")
+                    return witness
+            return real_run(argv, *args, **kwargs)
+
+        with patch.object(subprocess, "run", side_effect=simulate_host):
+            with self.assertRaises(unittest.SkipTest):
+                self._assert_real_nested_codex_sandbox_kernel(reject=False)
+            self._assert_real_nested_codex_sandbox_kernel(reject=True)
+        self.assertEqual(observed, ["nested-denial", "syscall-denial", "nested-denial"])
+
+    def test_apparmor_bwrap_denial_still_runs_negative_kernel_proof(self) -> None:
+        """Distro AppArmor may deny nested bwrap while raw unshare succeeds."""
+        denied = subprocess.CompletedProcess(
+            [], 1, b"", b"bwrap: No permissions to create new namespace\n"
+        )
+        permitted = subprocess.CompletedProcess(
+            [], 0, b"NESTED_USERNS_SYSCALL_ALLOWED\n", b""
+        )
+        real_run = subprocess.run
+        observed: list[str] = []
+
+        def simulated_apparmor_host(argv, *args, **kwargs):
+            if argv and argv[0] == "/usr/bin/bwrap":
+                if "--unshare-user" in argv:
+                    observed.append("nested-denied")
+                    return denied
+                if "NESTED_USERNS_SYSCALL_DENIED" in argv[-1]:
+                    observed.append("raw-allowed")
+                    return permitted
+            return real_run(argv, *args, **kwargs)
+
+        with patch.object(subprocess, "run", side_effect=simulated_apparmor_host):
+            with patch.object(
+                self, "_verified_bwrap_apparmor_profile", return_value=False
+            ):
+                with self.assertRaises(AssertionError):
+                    self._assert_real_nested_codex_sandbox_kernel(reject=False)
+            with patch.object(
+                self, "_verified_bwrap_apparmor_profile", return_value=True
+            ) as attested:
+                with self.assertRaises(unittest.SkipTest):
+                    self._assert_real_nested_codex_sandbox_kernel(reject=False)
+                self._assert_real_nested_codex_sandbox_kernel(reject=True)
+            attested.assert_called_once_with()
+        self.assertEqual(
+            observed,
+            [
+                "nested-denied",
+                "raw-allowed",
+                "nested-denied",
+                "raw-allowed",
+                "nested-denied",
+            ],
+        )
+
+    def _assert_real_nested_codex_sandbox_kernel(self, *, reject: bool) -> None:
+        """Exercise outer and inner PID, user, seccomp and mount isolation.
+
+        The executable named codex is a controlled local stub, never a provider.
+        This is a host-kernel proof, not production installed-toolchain proof.
+        """
+        if sys.platform != "linux" or not Path("/usr/bin/bwrap").is_file():
+            self.skipTest("Linux bubblewrap is required")
+        # Ubuntu's bwrap-userns-restrict AppArmor profile allows one sandbox
+        # level but deliberately denies a *second* user namespace below it.
+        # Probe that precise outer->inner capability without trusted runner
+        # code or provider calls. A denied syscall OR an exact distribution
+        # AppArmor bwrap policy plus separately successful raw syscall may
+        # classify the host as unsuitable for the positive nested subcase.
+        # Unexpected errors still fail CI, and negative Codex tests ALWAYS run.
+        try:
+            nested_kernel_probe = subprocess.run(
+                [
+                    "/usr/bin/bwrap",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--unshare-pid",
+                    "--unshare-ipc",
+                    "--die-with-parent",
+                    "--proc",
+                    "/proc",
+                    "--dev",
+                    "/dev",
+                    "--",
+                    "/usr/bin/bwrap",
+                    "--unshare-user",
+                    "--unshare-pid",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--proc",
+                    "/proc",
+                    "--dev",
+                    "/dev",
+                    "--",
+                    "/bin/true",
+                ],
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.fail(
+                f"nested kernel capability preflight unavailable: {type(exc).__name__}"
+            )
+        kernel_denial = nested_kernel_probe.stderr[-2048:].decode(
+            "utf-8", errors="replace"
+        )
+        nested_userns_available = nested_kernel_probe.returncode == 0
+        if not nested_userns_available and not reject:
+            # Bubblewrap's error is not itself sufficient to skip a security
+            # test: independently test CLONE_NEWUSER from inside the same
+            # outer PID/mount namespace. No provider executable is started.
+            syscall_program = (
+                "import ctypes,errno,sys\n"
+                "libc=ctypes.CDLL(None,use_errno=True)\n"
+                "unshare=libc.unshare\n"
+                "unshare.argtypes=[ctypes.c_int]\n"
+                "unshare.restype=ctypes.c_int\n"
+                "result=unshare(0x10000000)  # CLONE_NEWUSER\n"
+                "error=ctypes.get_errno()\n"
+                "if result==-1 and error in (errno.EPERM,errno.EACCES):\n"
+                " print('NESTED_USERNS_SYSCALL_DENIED')\n"
+                "elif result==0:\n"
+                " print('NESTED_USERNS_SYSCALL_ALLOWED')\n"
+                "else:\n"
+                " print(f'UNEXPECTED_USERNS_RESULT={result},errno={error}')\n"
+                " sys.exit(86)\n"
+            )
+            try:
+                syscall_witness = subprocess.run(
+                    [
+                        "/usr/bin/bwrap",
+                        "--ro-bind",
+                        "/",
+                        "/",
+                        "--unshare-pid",
+                        "--unshare-ipc",
+                        "--die-with-parent",
+                        "--proc",
+                        "/proc",
+                        "--dev",
+                        "/dev",
+                        "--",
+                        "/usr/bin/python3",
+                        "-I",
+                        "-c",
+                        syscall_program,
+                    ],
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                self.fail(
+                    f"nested kernel syscall witness unavailable: {type(exc).__name__}"
+                )
+            kernel_permitted = (
+                syscall_witness.returncode == 0
+                and syscall_witness.stdout.strip() == b"NESTED_USERNS_SYSCALL_ALLOWED"
+            )
+            apparmor_attested = (
+                kernel_permitted and self._verified_bwrap_apparmor_profile()
+            )
+            if self._documented_nested_userns_policy_denial(
+                nested_kernel_probe,
+                syscall_witness,
+                apparmor_profile_attested=apparmor_attested,
+            ):
+                self.skipTest(
+                    "CONFIRMED UNSUPPORTED HOST: nested Bubblewrap namespace "
+                    "denied, with an independent syscall witness and, where "
+                    "the syscall works, a verified restrictive AppArmor profile. "
+                    "The provider-free positive production kernel proof "
+                    "remains MANDATORY on the supported target host."
+                )
+            self.fail(
+                "nested kernel preflight failed without independent proof "
+                "of an unsupported host capability: "
+                f"bwrap_returncode={nested_kernel_probe.returncode}, "
+                f"bwrap_stderr={kernel_denial!r}, "
+                f"bwrap_stdout={nested_kernel_probe.stdout[-512:]!r}; "
+                f"syscall_returncode={syscall_witness.returncode}, "
+                f"syscall_stdout={syscall_witness.stdout[-256:]!r}, "
+                f"syscall_stderr={syscall_witness.stderr[-512:]!r}."
+            )
+        inner = (
+            "import os,sys,subprocess\nfrom pathlib import Path\n"
+            "source,state,home,outer_pid,outer_user=sys.argv[1:]\n"
+            "fields=dict(x.split(':',1) for x in "
+            "Path('/proc/self/status').read_text().splitlines() if ':' in x)\n"
+            "assert fields['Seccomp'].strip()=='2',fields['Seccomp']\n"
+            "assert fields['NoNewPrivs'].strip()=='1',fields['NoNewPrivs']\n"
+            "assert os.readlink('/proc/self/ns/pid')!=outer_pid\n"
+            "assert os.readlink('/proc/self/ns/user')!=outer_user\n"
+            "assert os.statvfs(source).f_flag & os.ST_RDONLY\n"
+            "assert os.statvfs(state).f_flag & os.ST_RDONLY\n"
+            "assert not os.statvfs(home).f_flag & os.ST_RDONLY\n"
+            "(Path(home)/'nested-marker').write_text('ok')\n"
+            "assert subprocess.run(['/bin/true'],check=False).returncode==0\n"
+            "print('NESTED_BOUNDARY_VERIFIED')\n"
+        )
+        with (
+            self.subTest(nested_stub_fails=reject),
+            tempfile.TemporaryDirectory(
+                prefix="rab-nested-kernel-", dir=str(Path.home())
+            ) as temporary,
+        ):
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            epoch = root / "epoch"
+            epoch.mkdir()
+            outputs = {
+                name: epoch / name
+                for name in ("state", "transcripts", "evidence", "reports")
+            }
+            for folder in outputs.values():
+                folder.mkdir(mode=0o700)
+            session = outputs["state"] / "codex-runtime" / ("session-" + "a" * 24)
+            session.mkdir(parents=True, mode=0o700)
+            (session / "tmp").mkdir(mode=0o700)
+            trusted_event = outputs["state"] / "trusted-event"
+            trusted_event.write_text("unchanged", encoding="ascii")
+            stub = root / "codex"
+            if reject:
+                stub_code = (
+                    "#!/usr/bin/python3\nimport sys\n"
+                    "assert sys.argv[1]=='sandbox' and "
+                    "sys.argv[-2:]==['--','/bin/true']\n"
+                    "raise SystemExit(41)\n"
+                )
+            else:
+                stub_code = (
+                    "#!/usr/bin/python3\n"
+                    "import os,subprocess,sys\n"
+                    "assert sys.argv[1]=='sandbox' and "
+                    "sys.argv[-2:]==['--','/bin/true']\n"
+                    "home=os.environ['CODEX_HOME']\n"
+                    f"inner={inner!r}\n"
+                    f"source={str(source)!r}\n"
+                    f"state={str(outputs['state'])!r}\n"
+                    "command=['/usr/bin/bwrap','--unshare-user',"
+                    "'--unshare-pid','--ro-bind','/','/',"
+                    "'--bind',home,home,'--proc','/proc',"
+                    "'--dev','/dev','--','/usr/bin/python3',"
+                    "'-I','-c',inner,source,state,home,"
+                    "os.readlink('/proc/self/ns/pid'),"
+                    "os.readlink('/proc/self/ns/user')]\n"
+                    "result=subprocess.run(command,capture_output=True,"
+                    "check=False,timeout=12)\n"
+                    "if result.returncode: "
+                    "sys.stderr.buffer.write(result.stderr[-2048:])\n"
+                    "raise SystemExit(result.returncode)\n"
+                )
+            stub.write_text(stub_code, encoding="utf-8")
+            stub.chmod(0o700)
+            kwargs = {
+                "source": source,
+                "state_root": outputs["state"],
+                "transcript_root": outputs["transcripts"],
+                "evidence_root": outputs["evidence"],
+                "report_root": outputs["reports"],
+                "codex_home": session,
+                "cwd": source,
+                "codex_command": str(stub),
+            }
+            with (
+                patch.object(
+                    runner,
+                    "provider_env",
+                    return_value={
+                        "HOME": str(session),
+                        "CODEX_HOME": str(session),
+                    },
+                ),
+                patch.object(
+                    runner, "_record_preflight_dispatch_intent"
+                ) as provider_intent,
+            ):
+                if reject:
+                    with self.assertRaisesRegex(
+                        runner.RunnerError,
+                        "nested Codex sandbox smoke failed before intent",
+                    ):
+                        runner._assert_provider_pid_namespace_ready(**kwargs)
+                else:
+                    runner._assert_provider_pid_namespace_ready(**kwargs)
+                provider_intent.assert_not_called()
+            self.assertEqual(trusted_event.read_text(encoding="ascii"), "unchanged")
+            self.assertEqual((session / "nested-marker").exists(), not reject)
+
+    def test_real_nested_codex_sandbox_kernel_positive(self) -> None:
+        """Positive nested userns is a host capability, not an unconditional CI skip."""
+        self._assert_real_nested_codex_sandbox_kernel(reject=False)
+
+    def test_real_nested_codex_sandbox_kernel_negative(self) -> None:
+        """The fail-closed negative path always runs even when positive is unsupported."""
+        self._assert_real_nested_codex_sandbox_kernel(reject=True)
+
+    def test_linux_sandbox_smoke_is_filtered_without_provider_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir(mode=0o700)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            result = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+
+            def isolated_env(*, codex, codex_home):
+                self.assertEqual(codex, "/opt/codex")
+                self.assertTrue(codex_home.is_relative_to(state))
+                self.assertEqual((codex_home / "auth.json").read_bytes(), b"{}")
+                return {"HOME": str(codex_home), "CODEX_HOME": str(codex_home)}
+
+            with (
+                patch.object(runner, "provider_env", side_effect=isolated_env),
+                patch.object(
+                    runner,
+                    "_unix_socket_restricted_codex_argv",
+                    side_effect=lambda argv: ["kernel-guard", *argv],
+                ) as guard,
+                patch.object(runner.subprocess, "run", return_value=result) as launch,
+            ):
+                runner.validate_codex_linux_sandbox_before_intent(
+                    "/opt/codex", source, state
+                )
+            guard.assert_called_once()
+            launched = guard.call_args.args[0]
+            self.assertEqual(launched[:2], ["/opt/codex", "sandbox"])
+            self.assertEqual(launched[-2:], ["--", "/bin/true"])
+            self.assertIn("network_proxy", launched)
+            self.assertIn(runner.PERMISSION_PROFILE, launched)
+            launch.assert_called_once()
+            self.assertEqual(
+                launch.call_args.args[0][:2], ["kernel-guard", "/opt/codex"]
+            )
+            self.assertEqual(launch.call_args.kwargs["cwd"], source)
+            self.assertEqual(launch.call_args.kwargs["timeout"], 25)
+            self.assertEqual(list((state / "codex-runtime").iterdir()), [])
+
+    def test_linux_sandbox_smoke_fails_before_provider_on_bwrap_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir(mode=0o700)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            broken = subprocess.CompletedProcess(
+                [], 1, stdout=b"", stderr=b"bwrap: helper unavailable"
+            )
+            with (
+                patch.object(
+                    runner,
+                    "provider_env",
+                    return_value={"HOME": str(root), "PATH": "/usr/bin:/bin"},
+                ),
+                patch.object(
+                    runner, "_unix_socket_restricted_codex_argv", side_effect=list
+                ),
+                patch.object(runner.subprocess, "run", return_value=broken) as run,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "sandbox startup failed before provider intent"
+                ):
+                    runner.validate_codex_linux_sandbox_before_intent(
+                        "/opt/codex", source, state
+                    )
+            run.assert_called_once()
+            self.assertEqual(list((state / "codex-runtime").iterdir()), [])
+
+    def test_codex_login_status_always_runs_under_kernel_socket_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary) / "home"
+            credential_dir = home / ".codex"
+            credential_dir.mkdir(parents=True)
+            (credential_dir / "auth.json").write_bytes(b"credential-bytes")
+            (credential_dir / "auth.json").chmod(0o600)
+            status = subprocess.CompletedProcess(
+                [], 0, stdout=b"Logged in using ChatGPT\n", stderr=b""
+            )
+            order: list[str] = []
+
+            def harden() -> None:
+                order.append("parent_hardened")
+
+            def run_status(*_args, **_kwargs):
+                order.append("codex_started")
+                return status
+
+            with (
+                patch.object(
+                    runner,
+                    "provider_env",
+                    return_value={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                ),
+                patch.object(
+                    runner, "_assert_trusted_runner_nondumpable", side_effect=harden
+                ) as guard,
+                patch.object(runner.subprocess, "run", side_effect=run_status) as call,
+            ):
+                runner.validate_chatgpt_subscription("/opt/codex")
+            guard.assert_called_once_with()
+            self.assertEqual(order, ["parent_hardened", "codex_started"])
+            launched = call.call_args.args[0]
+            self.assertEqual(launched[:2], [runner._validated_mcp_proxy_python(), "-I"])
+            self.assertEqual(launched[-3:], ["/opt/codex", "login", "status"])
+            self.assertEqual(launched[2], "-c")
+            self.assertEqual(launched[3], runner._UNIX_SOCKET_DENY_CHILD_PROGRAM)
+
     def test_chatgpt_subscription_gate_rejects_other_login_modes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary) / "home"
@@ -886,19 +4165,28 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             auth.chmod(0o600)
             environment = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
             ok = subprocess.CompletedProcess(
-                ["codex", "login", "status"], 0,
-                stdout=b"Logged in using ChatGPT\n", stderr=b"",
+                ["codex", "login", "status"],
+                0,
+                stdout=b"Logged in using ChatGPT\n",
+                stderr=b"",
             )
-            with patch.object(runner, "provider_env", return_value=environment), patch.object(
-                runner.subprocess, "run", return_value=ok
+            with (
+                patch.object(runner, "provider_env", return_value=environment),
+                patch.object(runner.subprocess, "run", return_value=ok),
             ):
-                self.assertEqual(runner.validate_chatgpt_subscription("/opt/codex"), b"opaque-chatgpt-auth")
+                self.assertEqual(
+                    runner.validate_chatgpt_subscription("/opt/codex"),
+                    b"opaque-chatgpt-auth",
+                )
             bad = subprocess.CompletedProcess(
-                ["codex", "login", "status"], 0,
-                stdout=b"Logged in using API key\n", stderr=b"",
+                ["codex", "login", "status"],
+                0,
+                stdout=b"Logged in using API key\n",
+                stderr=b"",
             )
-            with patch.object(runner, "provider_env", return_value=environment), patch.object(
-                runner.subprocess, "run", return_value=bad
+            with (
+                patch.object(runner, "provider_env", return_value=environment),
+                patch.object(runner.subprocess, "run", return_value=bad),
             ):
                 with self.assertRaisesRegex(runner.RunnerError, "ChatGPT subscription"):
                     runner.validate_chatgpt_subscription("/opt/codex")
@@ -932,7 +4220,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, {"HOME": str(home)}, clear=True),
-                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(
+                    runner, "validate_toolchain", return_value="/usr/bin:/bin"
+                ),
                 patch.object(runner.subprocess, "run", side_effect=status),
             ):
                 self.assertEqual(
@@ -958,7 +4248,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, {"HOME": str(home)}, clear=True),
-                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(
+                    runner, "validate_toolchain", return_value="/usr/bin:/bin"
+                ),
                 patch.object(runner.subprocess, "run", side_effect=foreign_status),
             ):
                 with self.assertRaisesRegex(runner.RunnerError, "ChatGPT subscription"):
@@ -988,7 +4280,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, {"HOME": str(home)}, clear=True),
-                patch.object(runner, "validate_toolchain", return_value="/usr/bin:/bin"),
+                patch.object(
+                    runner, "validate_toolchain", return_value="/usr/bin:/bin"
+                ),
                 patch.object(runner.subprocess, "run", side_effect=status),
             ):
                 returned = runner.validate_chatgpt_subscription("/opt/codex")
@@ -1009,8 +4303,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(auth.stat().st_mode), 0o600)
             self.assertIsNone(runner.cleanup_codex_home(runtime_home))
             self.assertFalse(runtime_home.exists())
-            with patch.object(runner.shutil, "rmtree", side_effect=OSError("cleanup failed")):
-                self.assertEqual(runner.cleanup_codex_home(Path("/tmp/example")), "OSError")
+            with patch.object(
+                runner.shutil, "rmtree", side_effect=OSError("cleanup failed")
+            ):
+                self.assertEqual(
+                    runner.cleanup_codex_home(Path("/tmp/example")), "OSError"
+                )
 
     def test_stderr_policy_is_explicit_and_fail_closed(self) -> None:
         empty = runner.classify_stderr(b"")
@@ -1043,9 +4341,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
         login_only = runner.classify_stderr(
             b"WARNING: proceeding, even though we could not create PATH aliases: "
-            b"Refusing to create helper binaries under temporary dir \"/tmp\" "
+            b'Refusing to create helper binaries under temporary dir "/tmp" '
             b"(codex_home: AbsolutePathBuf("
-            b"\"/tmp/grabowski-codex-auth-example/codex-runtime/session-example\"))\n"
+            b'"/tmp/grabowski-codex-auth-example/codex-runtime/session-example"))\n'
         )
         self.assertFalse(login_only["allowed"])
         self.assertEqual(login_only["classification"], "text_unqualified")
@@ -1066,18 +4364,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(runner.command_kind("rg foo#bar src"), "grep")
         self.assertEqual(runner.command_kind("rg --regexp=example src"), "grep")
         self.assertEqual(runner.command_kind("cat src/example.py"), "read_file")
-        self.assertEqual(runner.command_kind("sed -n '1,2p' src/example.py"), "read_file")
+        self.assertEqual(
+            runner.command_kind("sed -n '1,2p' src/example.py"), "read_file"
+        )
         self.assertEqual(
             runner.command_kind(
-                "/bin/bash -c \"rg -n 'finaliz|Finaliz' "
-                "--glob '*.py' --glob '*.md'\""
+                "/bin/bash -c \"rg -n 'finaliz|Finaliz' --glob '*.py' --glob '*.md'\""
             ),
             "grep",
         )
         self.assertEqual(
             runner.command_kind(
-                "/bin/bash -c \"sed -n '62,177p' "
-                "src/grabowski_job_finalizer.py\""
+                "/bin/bash -c \"sed -n '62,177p' src/grabowski_job_finalizer.py\""
             ),
             "read_file",
         )
@@ -1145,7 +4443,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         )
         self.assertNotIn(requirement, baseline)
         self.assertIn(requirement, treatment)
-        self.assertNotIn("may additionally use only these RepoGround MCP tools", treatment)
+        self.assertNotIn(
+            "may additionally use only these RepoGround MCP tools", treatment
+        )
         for name in (
             "ask_context",
             "grounding_verify",
@@ -1179,12 +4479,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     proxy_path=(root / "bound-proxy.py").resolve(),
                     manifest_path=(root / "bound.bundle.manifest.json").resolve(),
                     mcp_runtime_root=(root / "state").resolve(),
+                    prepared_mcp_stage=synthetic_prepared_stage(root),
                 )
         baseline_joined = " ".join(baseline)
         treatment_joined = " ".join(treatment)
         for flag in (
-            "--ephemeral", "--ignore-user-config", "--ignore-rules",
-            "--strict-config", "--json",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--strict-config",
+            "--json",
         ):
             self.assertIn(flag, baseline)
         self.assertNotIn("--sandbox", baseline)
@@ -1226,7 +4530,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             [expected_enabled_tools],
         )
         self.assertIn("--codex-mcp-proxy", treatment_joined)
-
 
     def test_validate_support_executable_enforces_permissions_and_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1303,7 +4606,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     executable=True,
                 )
 
-    def test_mcp_authorization_identity_normalizes_to_preflight_mode_contract(self) -> None:
+    def test_mcp_authorization_identity_normalizes_to_preflight_mode_contract(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "file"
             path.write_bytes(b"x")
@@ -1409,6 +4714,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     proxy_path=(root / "bound-proxy.py").resolve(),
                     manifest_path=(root / "bound.bundle.manifest.json").resolve(),
                     mcp_runtime_root=(root / "state").resolve(),
+                    prepared_mcp_stage=synthetic_prepared_stage(root),
                 )
             validate.assert_called_once_with([])
             self.assertIn(
@@ -1416,7 +4722,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 command,
             )
 
-    def test_raw_provider_evidence_is_written_before_unqualified_stderr_fails(self) -> None:
+    def test_raw_provider_evidence_is_written_before_unqualified_stderr_fails(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, commit = repository(root)
@@ -1429,7 +4737,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             stderr.write_bytes(b"warning: not yet qualified\n")
             args = fixture_args(root, fixture, stderr=stderr)
 
-            with self.assertRaisesRegex(runner.RunnerError, "after evidence persistence"):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "after evidence persistence"
+            ):
                 runner.execute(value, args)
 
             names = runner._provider_artifact_names(value)
@@ -1442,14 +4752,22 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
             self.assertEqual(diagnostics["semantic_interpretation"], "not_performed")
             self.assertEqual(
-                diagnostics["stderr"]["sha256"], hashlib.sha256(stderr.read_bytes()).hexdigest()
+                diagnostics["stderr"]["sha256"],
+                hashlib.sha256(stderr.read_bytes()).hexdigest(),
             )
-            self.assertEqual(diagnostics["stdout"]["sha256"], hashlib.sha256(fixture.read_bytes()).hexdigest())
+            self.assertEqual(
+                diagnostics["stdout"]["sha256"],
+                hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            )
             stderr_policy = json.loads(stderr_policy_path.read_text(encoding="utf-8"))
-            self.assertEqual(stderr_policy["stderr"]["classification"], "text_unqualified")
+            self.assertEqual(
+                stderr_policy["stderr"]["classification"], "text_unqualified"
+            )
             self.assertFalse(stderr_policy["stderr"]["allowed"])
 
-    def test_capture_diagnostics_are_persisted_before_stderr_classifier_runs(self) -> None:
+    def test_capture_diagnostics_are_persisted_before_stderr_classifier_runs(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             value = request()
@@ -1462,7 +4780,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "stderr_overflow": False,
             }
             now = datetime.now(timezone.utc)
-            with patch.object(runner, "classify_stderr", side_effect=runner.RunnerError("classifier boom")):
+            with patch.object(
+                runner,
+                "classify_stderr",
+                side_effect=runner.RunnerError("classifier boom"),
+            ):
                 with self.assertRaisesRegex(runner.RunnerError, "classifier boom"):
                     runner.persist_provider_capture(
                         value,
@@ -1474,13 +4796,22 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         synthetic_fixture=True,
                     )
             names = runner._provider_artifact_names(value)
-            self.assertEqual((root / "transcripts" / names["stdout"]).read_bytes(), b"captured\n")
-            self.assertEqual((root / "provider-evidence" / names["stderr"]).read_bytes(), b"diagnostic\n")
+            self.assertEqual(
+                (root / "transcripts" / names["stdout"]).read_bytes(), b"captured\n"
+            )
+            self.assertEqual(
+                (root / "provider-evidence" / names["stderr"]).read_bytes(),
+                b"diagnostic\n",
+            )
             diagnostics = json.loads(
-                (root / "provider-evidence" / names["diagnostics"]).read_text(encoding="utf-8")
+                (root / "provider-evidence" / names["diagnostics"]).read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(diagnostics["semantic_interpretation"], "not_performed")
-            self.assertFalse((root / "provider-evidence" / names["stderr_policy"]).exists())
+            self.assertFalse(
+                (root / "provider-evidence" / names["stderr_policy"]).exists()
+            )
 
     def test_partial_private_write_is_preserved_for_forensics(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1489,16 +4820,20 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             path, descriptor = runner._open_private_directory(root, create_final=False)
             real_write = os.write
             calls = 0
+
             def flaky_write(fd, data):
                 nonlocal calls
                 if calls == 0:
                     calls += 1
                     return real_write(fd, bytes(data[:3]))
                 raise OSError("simulated disk failure")
+
             try:
                 with patch.object(runner.os, "write", side_effect=flaky_write):
                     with self.assertRaisesRegex(OSError, "simulated disk failure"):
-                        runner._write_private_dirfd(descriptor, "partial.bin", b"abcdef")
+                        runner._write_private_dirfd(
+                            descriptor, "partial.bin", b"abcdef"
+                        )
             finally:
                 os.close(descriptor)
             self.assertEqual((path / "partial.bin").read_bytes(), b"abc")
@@ -1510,16 +4845,20 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             path, descriptor = runner._open_private_directory(root, create_final=False)
             real_fsync = os.fsync
             calls = 0
+
             def flaky_fsync(fd):
                 nonlocal calls
                 calls += 1
                 if calls == 2:
                     raise OSError("simulated directory fsync failure")
                 return real_fsync(fd)
+
             try:
                 with patch.object(runner.os, "fsync", side_effect=flaky_fsync):
                     with self.assertRaisesRegex(OSError, "directory fsync failure"):
-                        runner._write_private_dirfd(descriptor, "durable.bin", b"complete")
+                        runner._write_private_dirfd(
+                            descriptor, "durable.bin", b"complete"
+                        )
             finally:
                 os.close(descriptor)
             self.assertEqual((path / "durable.bin").read_bytes(), b"complete")
@@ -1543,7 +4882,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 (root / "transcripts" / names["stdout"]).read_bytes(), b"not-json\n"
             )
             stderr_policy = json.loads(
-                (root / "provider-evidence" / names["stderr_policy"]).read_text(encoding="utf-8")
+                (root / "provider-evidence" / names["stderr_policy"]).read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(stderr_policy["stderr"]["classification"], "empty")
 
@@ -1563,7 +4904,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
             names = runner._provider_artifact_names(value)
             diagnostics = json.loads(
-                (root / "provider-evidence" / names["diagnostics"]).read_text(encoding="utf-8")
+                (root / "provider-evidence" / names["diagnostics"]).read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(diagnostics["returncode"], 7)
             self.assertTrue((root / "transcripts" / names["stdout"]).is_file())
@@ -1593,18 +4936,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             names = runner._provider_artifact_names(value)
             self.assertEqual(receipt["transcript"]["artifact"], names["stdout"])
             self.assertEqual(
-                (root / "transcripts" / names["stdout"]).read_bytes(), fixture.read_bytes()
+                (root / "transcripts" / names["stdout"]).read_bytes(),
+                fixture.read_bytes(),
             )
             diagnostics = json.loads(
-                (root / "provider-evidence" / names["diagnostics"]).read_text(encoding="utf-8")
+                (root / "provider-evidence" / names["diagnostics"]).read_text(
+                    encoding="utf-8"
+                )
             )
             stderr_policy = json.loads(
-                (root / "provider-evidence" / names["stderr_policy"]).read_text(encoding="utf-8")
+                (root / "provider-evidence" / names["stderr_policy"]).read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(stderr_policy["stderr"]["classification"], "empty")
             self.assertTrue(diagnostics["synthetic_fixture"])
 
-    def test_live_execution_requires_explicit_authorization_before_workspace_effect(self) -> None:
+    def test_live_execution_requires_explicit_authorization_before_workspace_effect(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             args = Namespace(
@@ -1620,12 +4970,91 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 stderr_fixture=None,
                 fixture_returncode=0,
             )
-            with self.assertRaisesRegex(runner.RunnerError, "explicit allow_live_provider"):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "explicit allow_live_provider"
+            ):
                 runner.execute(request(), args)
             self.assertFalse((root / "state").exists())
             self.assertFalse((root / "transcripts").exists())
             self.assertFalse((root / "provider-evidence").exists())
 
+    def test_direct_live_baseline_denies_before_request_ledger_or_provider(
+        self,
+    ) -> None:
+        # Real P3 gate: no CLI token may consume a single unmatched pair.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "map.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            with (
+                patch.object(runner.base, "load_planned_request") as planned,
+                patch.object(runner, "validate_executable") as executable,
+                patch.object(
+                    runner, "_load_preflight_dispatch_authorization"
+                ) as ledger,
+                patch.object(runner, "validate_chatgpt_subscription") as login,
+                patch.object(runner, "run_bounded") as provider,
+                self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "direct live provider condition requires in-process pair",
+                ),
+            ):
+                runner.execute(request(), args)
+            planned.assert_not_called()
+            executable.assert_not_called()
+            ledger.assert_not_called()
+            login.assert_not_called()
+            provider.assert_not_called()
+            for folder in ("state", "transcripts", "evidence"):
+                self.assertFalse((root / folder).exists())
+
+    def test_in_process_pair_scope_rejects_order_drift_and_replays(self) -> None:
+        baseline, treatment = request(), request(condition="treatment")
+        authorization = {
+            "status": "authorized",
+            "pair_id": baseline["pair_id"],
+            "request_sha256": {
+                "baseline": runner.base._sha256_json(baseline),
+                "treatment": runner.base._sha256_json(treatment),
+            },
+        }
+        with runner._in_process_pair_dispatch_scope(
+            authorization=authorization, ordered=(baseline, treatment)
+        ):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "order or identity mismatch"
+            ):
+                runner._require_in_process_pair_condition(treatment)
+            runner._require_in_process_pair_condition(baseline)
+            with self.assertRaisesRegex(
+                runner.RunnerError, "order or identity mismatch"
+            ):
+                runner._require_in_process_pair_condition(baseline)
+            runner._require_in_process_pair_condition(treatment)
+            with self.assertRaisesRegex(
+                runner.RunnerError, "order or identity mismatch"
+            ):
+                runner._require_in_process_pair_condition(treatment)
+        with self.assertRaisesRegex(
+            runner.RunnerError, "direct live provider condition"
+        ):
+            runner._require_in_process_pair_condition(baseline)
+
+    # The legacy fixture below isolates a deeper executable identity gate.
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
     def test_bad_live_executable_hash_fails_before_workspace_consumption(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1655,7 +5084,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertFalse((root / "transcripts").exists())
             self.assertFalse((root / "provider-evidence").exists())
 
-    def test_live_baseline_requires_dispatch_authorization_before_codex_status_or_launch(self) -> None:
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
+    def test_live_baseline_requires_dispatch_authorization_before_codex_status_or_launch(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, commit = repository(root)
@@ -1687,7 +5121,209 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             login_status.assert_not_called()
             provider_launch.assert_not_called()
 
-    def test_execute_wires_irreversible_effect_callbacks_into_failure_ledger(self) -> None:
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
+    def test_baseline_reserves_future_upstream_stage_before_any_provider_effect(
+        self,
+    ) -> None:
+        """A too-large Treatment closure must block before Baseline spends its one-shot."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request(condition="baseline")
+            planned_request_root(root, value)
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "repositories.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "provider-evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            bound_script = Path("/test-only/scripts/repoground-mcp-stdio.py")
+            future_manifest = {"path": "/bundle/manifest.json", "sha256": "a" * 64}
+            dispatch = {
+                "authorization": {"contract": "isolated-test-only"},
+                "provider_codex": {},
+                "provider_authentication": {},
+                "repository_map_bytes": b"{}",
+                "binding": {
+                    "mcp_command_files": synthetic_paired_mcp_files(),
+                    "manifest": future_manifest,
+                },
+            }
+            reserved: list[str] = []
+
+            def reserve(
+                condition: str,
+                manifest: object,
+                *,
+                mcp_script: Path | None = None,
+                legacy_g1: bool = False,
+            ) -> int:
+                reserved.append(condition)
+                if condition == "baseline":
+                    return 4
+                self.assertEqual(condition, "treatment")
+                self.assertEqual(manifest, future_manifest)
+                self.assertEqual(mcp_script, bound_script)
+                self.assertFalse(legacy_g1)
+                raise runner.RunnerError(
+                    "future full upstream MCP stage exceeds pre-spend budget"
+                )
+
+            with ExitStack() as stack:
+                for name, value_to_return in (
+                    ("validate_executable", "/opt/codex"),
+                    ("validate_toolchain", None),
+                    ("_repository_root_from_authorized_map_bytes", root),
+                    ("_load_preflight_dispatch_authorization", dispatch),
+                ):
+                    stack.enter_context(
+                        patch.object(runner, name, return_value=value_to_return)
+                    )
+                for name in (
+                    "_assert_authorized_codex_executable",
+                    "_require_external_provider_one_shot",
+                    "_assert_authorized_runtime_binding",
+                ):
+                    stack.enter_context(patch.object(runner, name))
+                stage_headroom = stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_preintent_output_entry_reservation",
+                        side_effect=reserve,
+                    )
+                )
+                login = stack.enter_context(
+                    patch.object(runner, "validate_chatgpt_subscription")
+                )
+                mounts = stack.enter_context(
+                    patch.object(runner, "validate_live_immutable_mounts")
+                )
+                evidence = stack.enter_context(
+                    patch.object(runner, "prepare_provider_evidence")
+                )
+                checkout = stack.enter_context(patch.object(runner, "create_checkout"))
+                intent = stack.enter_context(
+                    patch.object(runner, "_record_preflight_dispatch_intent")
+                )
+                provider = stack.enter_context(patch.object(runner, "run_bounded"))
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "future full upstream MCP stage"
+                ):
+                    runner.execute(value, args)
+            self.assertEqual(reserved, ["baseline", "treatment"])
+            self.assertEqual(stage_headroom.call_count, 2)
+            for forbidden in (login, mounts, evidence, checkout, intent, provider):
+                forbidden.assert_not_called()
+            self.assertFalse((root / "state" / "codex-workspaces").exists())
+
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
+    def test_live_mount_drift_blocks_before_workspace_and_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request()
+            planned_request_root(root, value)
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "repositories.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "provider-evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            dispatch = {
+                "authorization": {"contract": "test"},
+                "provider_codex": {},
+                "provider_authentication": {},
+                "repository_map_bytes": b"{}",
+                "binding": {"mcp_command_files": synthetic_paired_mcp_files()},
+            }
+            with ExitStack() as stack:
+                # This test isolates another failure boundary; the real pair
+                # reservation contract is tested independently.
+                stack.enter_context(
+                    patch.object(
+                        runner, "_preintent_output_entry_reservation", return_value=4
+                    )
+                )
+                for name, value_to_return in (
+                    ("validate_executable", "/opt/codex"),
+                    ("validate_toolchain", "/usr/bin:/bin"),
+                    ("_repository_root_from_authorized_map_bytes", root),
+                ):
+                    stack.enter_context(
+                        patch.object(runner, name, return_value=value_to_return)
+                    )
+                login_status = stack.enter_context(
+                    patch.object(
+                        runner,
+                        "validate_chatgpt_subscription",
+                        return_value=b"opaque-chatgpt-auth",
+                    )
+                )
+                for name in (
+                    "_assert_authorized_codex_executable",
+                    "_require_external_provider_one_shot",
+                    "_assert_authorized_chatgpt_auth",
+                    "_assert_authorized_runtime_binding",
+                ):
+                    stack.enter_context(patch.object(runner, name))
+                stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_load_preflight_dispatch_authorization",
+                        return_value=dispatch,
+                    )
+                )
+                mount_guard = stack.enter_context(
+                    patch.object(
+                        runner,
+                        "validate_live_immutable_mounts",
+                        side_effect=runner.RunnerError(
+                            "live Codex protected input mount writable: source"
+                        ),
+                    )
+                )
+                evidence = stack.enter_context(
+                    patch.object(runner, "prepare_provider_evidence")
+                )
+                checkout = stack.enter_context(patch.object(runner, "create_checkout"))
+                intent = stack.enter_context(
+                    patch.object(runner, "_record_preflight_dispatch_intent")
+                )
+                provider = stack.enter_context(patch.object(runner, "run_bounded"))
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "protected input mount writable: source"
+                ):
+                    runner.execute(value, args)
+            mount_guard.assert_called_once()
+            login_status.assert_not_called()
+            evidence.assert_not_called()
+            checkout.assert_not_called()
+            intent.assert_not_called()
+            provider.assert_not_called()
+            self.assertFalse((root / "state" / "codex-workspaces").exists())
+
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
+    def test_execute_wires_irreversible_effect_callbacks_into_failure_ledger(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             value = request()
@@ -1714,22 +5350,47 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "provider_codex": {},
                 "provider_authentication": {},
                 "repository_map_bytes": b"{}",
-                "binding": {},
+                "binding": {
+                    "report_out": str(root / "reports" / "preflight.json"),
+                    "mcp_command_files": synthetic_paired_mcp_files(),
+                },
             }
 
+            execution_order: list[str] = []
+
             def record_intent(*_args, **kwargs):
+                self.assertEqual(execution_order, ["postflight_smoke"])
+                execution_order.append("provider_intent")
                 callback = kwargs.get("intent_persisted_callback")
                 self.assertIsNotNone(callback)
                 callback()
                 return "a" * 64
 
             def launch(*_args, **kwargs):
+                self.assertEqual(
+                    execution_order, ["postflight_smoke", "provider_intent"]
+                )
+                execution_order.append("provider_started")
                 callback = kwargs.get("process_started_callback")
                 self.assertIsNotNone(callback)
                 callback()
                 raise KeyboardInterrupt()
 
+            def qualified_smoke(*_args, **_kwargs):
+                execution_order.append("postflight_smoke")
+                control = _kwargs.get("git_control_out")
+                if isinstance(control, dict):
+                    control["sha256"] = "0" * 64
+                return {"working_tree": "clean"}
+
             with ExitStack() as stack:
+                # This test isolates another failure boundary; the real pair
+                # reservation contract is tested independently.
+                stack.enter_context(
+                    patch.object(
+                        runner, "_preintent_output_entry_reservation", return_value=4
+                    )
+                )
                 for name, return_value in (
                     ("validate_executable", "/opt/codex"),
                     ("validate_toolchain", "/usr/bin:/bin"),
@@ -1738,9 +5399,26 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     ("prepare_provider_evidence", {"plan": True}),
                     ("create_checkout", checkout),
                     ("stage_codex_home", codex_home),
-                    ("build_command", ["codex"]),
+                    ("build_command", ["/opt/codex"]),
+                    (
+                        "_provider_pid_namespaced_codex_argv",
+                        [
+                            "/usr/bin/bwrap",
+                            "--ro-bind",
+                            "/",
+                            "/",
+                            "--unshare-pid",
+                            "--unshare-ipc",
+                            "--die-with-parent",
+                            "--proc",
+                            "/proc",
+                            "--",
+                            "/opt/codex",
+                        ],
+                    ),
                     ("provider_env", {}),
                     ("cleanup_codex_home", None),
+                    ("_require_external_provider_one_shot", None),
                 ):
                     stack.enter_context(
                         patch.object(runner, name, return_value=return_value)
@@ -1748,7 +5426,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 for name in (
                     "_assert_authorized_codex_executable",
                     "_assert_authorized_chatgpt_auth",
+                    "validate_codex_linux_sandbox_before_intent",
                     "_assert_authorized_runtime_binding",
+                    "validate_live_immutable_mounts",
+                    "_assert_provider_pid_namespace_ready",
                     "close_provider_evidence_plan",
                     "write_schema",
                 ):
@@ -1767,6 +5448,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         side_effect=record_intent,
                     )
                 )
+                # This test isolates the provider process-start callback;
+                # the separate exact-namespace preintent Git smoke is tested
+                # with real bwrap rather than stealing this provider mock.
+                smoke = stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_secure_post_provider_checkout_readback",
+                        side_effect=runner.RunnerError(
+                            "postflight sandbox startup failed before intent"
+                        ),
+                    )
+                )
                 provider = stack.enter_context(
                     patch.object(runner, "run_bounded", side_effect=launch)
                 )
@@ -1775,19 +5468,192 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 )
                 stack.enter_context(
                     patch.object(
-                        runner.base, "attest_checkout_setup",
+                        runner.base,
+                        "attest_checkout_setup",
                         return_value={"working_tree": "clean"},
                     )
                 )
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "postflight sandbox startup failed before intent",
+                ):
+                    runner.execute(value, args)
+                intent.assert_not_called()
+                provider.assert_not_called()
+                failed.assert_not_called()
+                smoke.side_effect = qualified_smoke
                 with self.assertRaises(KeyboardInterrupt):
                     runner.execute(value, args)
 
+            smoke.assert_called()
+            self.assertEqual(smoke.call_count, 2)
+            self.assertEqual(
+                execution_order,
+                ["postflight_smoke", "provider_intent", "provider_started"],
+            )
             intent.assert_called_once()
             provider.assert_called_once()
             failed.assert_called_once()
             self.assertTrue(failed.call_args.kwargs["provider_process_started"])
 
-    def test_treatment_manifest_mismatch_fails_before_workspace_consumption(self) -> None:
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
+    def test_live_wall_budget_excludes_postflight_after_bounded_provider(self) -> None:
+        """A provider finishing at 299/300s is not late because postflight takes 61s.
+
+        Every external authorization and actual Codex execution is mocked; the
+        real execute() control flow must carry the provider-only timestamps to
+        evidence, while systemd still independently bounds the entire unit.
+        """
+        from datetime import timedelta
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request()
+            planned_request_root(root, value)
+            checkout = root / "checkout"
+            checkout.mkdir()
+            session_home = root / "codex-home"
+            session_home.mkdir()
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "repositories.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "provider-evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            authorization = {
+                "authorization": {"contract": "mock-only"},
+                "provider_codex": {},
+                "provider_authentication": {},
+                "repository_map_bytes": b"{}",
+                "binding": {
+                    "report_out": str(root / "reports" / "preflight.json"),
+                    "mcp_command_files": synthetic_paired_mcp_files(),
+                },
+            }
+            start = datetime(2026, 10, 17, tzinfo=timezone.utc)
+            clock = {"now": start, "provider_done": False}
+            observed: list[tuple[datetime, datetime]] = []
+
+            def readback(*_args, **kwargs):
+                if clock["provider_done"]:
+                    clock["now"] = start + timedelta(seconds=360)
+                control = kwargs.get("git_control_out")
+                if isinstance(control, dict):
+                    control["sha256"] = "0" * 64
+                return {"working_tree": "clean"}
+
+            def record_intent(*_args, **kwargs):
+                kwargs["intent_persisted_callback"]()
+                return "a" * 64
+
+            def provider_stub(*_args, **kwargs):
+                kwargs["process_started_callback"]()
+                clock["now"] = start + timedelta(seconds=299)
+                clock["provider_done"] = True
+                return {
+                    "returncode": 0,
+                    "stdout": b"",
+                    "stderr": b"",
+                    "capture_error": None,
+                    "stdout_overflow": False,
+                    "stderr_overflow": False,
+                }
+
+            def observe_capture(*_args, **kwargs):
+                observed.append((kwargs["started_at"], kwargs["ended_at"]))
+                raise RuntimeError("POSTFLIGHT_CAPTURE_OBSERVED")
+
+            with ExitStack() as stack:
+                for name, return_value in (
+                    ("validate_executable", "/opt/codex"),
+                    ("validate_toolchain", "/usr/bin:/bin"),
+                    ("validate_chatgpt_subscription", b"mock-auth"),
+                    ("_repository_root_from_authorized_map_bytes", root),
+                    ("_preintent_output_entry_reservation", 4),
+                    ("prepare_provider_evidence", {"plan": True}),
+                    ("create_checkout", checkout),
+                    ("stage_codex_home", session_home),
+                    ("build_command", ["/opt/codex"]),
+                    ("_provider_pid_namespaced_codex_argv", ["/opt/codex"]),
+                    ("_unix_socket_restricted_codex_argv", ["/opt/codex"]),
+                    ("provider_env", {}),
+                    ("cleanup_codex_home", None),
+                ):
+                    stack.enter_context(
+                        patch.object(runner, name, return_value=return_value)
+                    )
+                for name in (
+                    "_assert_authorized_codex_executable",
+                    "_assert_authorized_chatgpt_auth",
+                    "_assert_authorized_runtime_binding",
+                    "_require_external_provider_one_shot",
+                    "validate_live_immutable_mounts",
+                    "validate_codex_linux_sandbox_before_intent",
+                    "_assert_provider_pid_namespace_ready",
+                    "_record_preflight_dispatch_failed",
+                    "close_provider_evidence_plan",
+                    "write_schema",
+                ):
+                    stack.enter_context(patch.object(runner, name))
+                stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_load_preflight_dispatch_authorization",
+                        return_value=authorization,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        runner.base,
+                        "attest_checkout_setup",
+                        return_value={"working_tree": "clean"},
+                    )
+                )
+                stack.enter_context(
+                    patch.object(runner, "utc_now", side_effect=lambda: clock["now"])
+                )
+                stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_record_preflight_dispatch_intent",
+                        side_effect=record_intent,
+                    )
+                )
+                stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_secure_post_provider_checkout_readback",
+                        side_effect=readback,
+                    )
+                )
+                dispatch = stack.enter_context(
+                    patch.object(runner, "run_bounded", side_effect=provider_stub)
+                )
+                stack.enter_context(
+                    patch.object(
+                        runner, "persist_provider_capture", side_effect=observe_capture
+                    )
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "POSTFLIGHT_CAPTURE_OBSERVED"
+                ):
+                    runner.execute(value, args)
+            dispatch.assert_called_once()
+            self.assertEqual(clock["now"], start + timedelta(seconds=360))
+            self.assertEqual(observed, [(start, start + timedelta(seconds=299))])
+
+    def test_treatment_manifest_mismatch_fails_before_workspace_consumption(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, commit = repository(root)
@@ -1808,7 +5674,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertFalse((root / "transcripts").exists())
             self.assertFalse((root / "provider-evidence").exists())
 
-    def test_treatment_manifest_symlink_fails_before_workspace_consumption(self) -> None:
+    def test_treatment_manifest_symlink_fails_before_workspace_consumption(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, commit = repository(root)
@@ -1818,7 +5686,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             manifest = root / "manifest.json"
             manifest.symlink_to(real_manifest)
             value["repobrief"]["manifest"] = str(manifest)
-            value["repobrief"]["manifest_sha256"] = hashlib.sha256(real_manifest.read_bytes()).hexdigest()
+            value["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                real_manifest.read_bytes()
+            ).hexdigest()
             planned_request_root(root, value)
             repository_map(root, source)
             fixture = root / "stdout.jsonl"
@@ -1828,7 +5698,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 runner.execute(value, args)
             self.assertFalse((root / "state").exists())
 
-    def test_existing_provider_artifact_fails_before_workspace_consumption(self) -> None:
+    def test_existing_provider_artifact_fails_before_workspace_consumption(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, commit = repository(root)
@@ -1863,7 +5735,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 runner.execute(value, args)
             self.assertFalse((root / "state" / "codex-workspaces").exists())
 
-    def test_live_execution_rejects_fixture_controls_before_workspace_effect(self) -> None:
+    def test_live_execution_rejects_fixture_controls_before_workspace_effect(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stderr = root / "stderr.txt"
@@ -1881,7 +5755,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 stderr_fixture=stderr,
                 fixture_returncode=0,
             )
-            with self.assertRaisesRegex(runner.RunnerError, "synthetic fixture controls"):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "synthetic fixture controls"
+            ):
                 runner.execute(request(), args)
             self.assertFalse((root / "state").exists())
 
@@ -1892,7 +5768,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             fixture.write_bytes(b"{}\n")
             args = fixture_args(root, fixture)
             args.allow_live_provider = True
-            with self.assertRaisesRegex(runner.RunnerError, "must not carry live-provider"):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "must not carry live-provider"
+            ):
                 runner.execute(request(), args)
             self.assertFalse((root / "state").exists())
 
@@ -1902,7 +5780,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             path.write_bytes(b"#!/bin/sh\nexit 0\n")
             path.chmod(0o700)
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            self.assertEqual(runner.validate_executable(str(path), digest), str(path.resolve()))
+            self.assertEqual(
+                runner.validate_executable(str(path), digest), str(path.resolve())
+            )
             with self.assertRaisesRegex(runner.RunnerError, "mismatched"):
                 runner.validate_executable(str(path), "0" * 64)
             with self.assertRaisesRegex(runner.RunnerError, "must be absolute"):
@@ -1945,10 +5825,14 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 timeout_seconds=2,
                 stdin_data=b"x" * (2 * 1024 * 1024),
             )
-            self.assertTrue(str(capture["capture_error"]).startswith("stdin_write_failed:"))
+            self.assertTrue(
+                str(capture["capture_error"]).startswith("stdin_write_failed:")
+            )
             self.assertIn(b"input-closed", capture["stderr"])
 
-    def test_run_bounded_converts_post_start_stream_exception_to_capture_error(self) -> None:
+    def test_run_bounded_converts_post_start_stream_exception_to_capture_error(
+        self,
+    ) -> None:
         real_selector = runner.selectors.DefaultSelector
 
         class FlakySelector:
@@ -1987,10 +5871,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             with patch.object(runner.selectors, "DefaultSelector", FlakySelector):
                 capture = runner.run_bounded(
-                    [sys.executable, str(script)], cwd=root, timeout_seconds=2, stdin_data=b""
+                    [sys.executable, str(script)],
+                    cwd=root,
+                    timeout_seconds=2,
+                    stdin_data=b"",
                 )
             self.assertIn(b"captured-before-selector-failure", capture["stdout"])
-            self.assertIn("capture_stream_failed:OSError", str(capture["capture_error"]))
+            self.assertIn(
+                "capture_stream_failed:OSError", str(capture["capture_error"])
+            )
 
     def test_run_bounded_emergency_reaps_unhandled_post_start_exception(self) -> None:
         real_popen = runner.subprocess.Popen
@@ -2020,9 +5909,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     stdin_data=b"",
                 )
 
-        self.assertIn(
-            "capture_unhandled:RuntimeError", str(capture["capture_error"])
-        )
+        self.assertIn("capture_unhandled:RuntimeError", str(capture["capture_error"]))
         self.assertIn("process", observed)
         self.assertIsNotNone(observed["process"].poll())
 
@@ -2060,7 +5947,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertIn("process", observed)
         self.assertIsNotNone(observed["process"].poll())
 
-    def test_run_bounded_retries_interrupted_provider_start_marker_after_popen(self) -> None:
+    def test_run_bounded_retries_interrupted_provider_start_marker_after_popen(
+        self,
+    ) -> None:
         callback_calls: list[int] = []
         provider_started: list[bool] = []
 
@@ -2108,7 +5997,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
         self.assertEqual(provider_started, [True])
 
-    def test_run_bounded_marks_provider_started_when_popen_interrupt_leaves_child(self) -> None:
+    def test_run_bounded_marks_provider_started_when_popen_interrupt_leaves_child(
+        self,
+    ) -> None:
         real_popen = runner.subprocess.Popen
         observed: dict[str, subprocess.Popen] = {}
         provider_started: list[bool] = []
@@ -2165,7 +6056,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         stdin_data=b"",
                     )
 
-    def test_direct_child_pids_falls_back_when_task_children_file_is_missing(self) -> None:
+    def test_direct_child_pids_falls_back_when_task_children_file_is_missing(
+        self,
+    ) -> None:
         child = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(30)"],
             stdout=subprocess.DEVNULL,
@@ -2185,7 +6078,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             child.kill()
             child.wait(timeout=5)
 
-    def test_run_bounded_uses_dedicated_process_group_and_kills_it_on_timeout(self) -> None:
+    def test_run_bounded_uses_dedicated_process_group_and_kills_it_on_timeout(
+        self,
+    ) -> None:
         real_popen = runner.subprocess.Popen
         launch_kwargs = []
 
@@ -2202,13 +6097,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 patch.object(runner.os, "killpg", wraps=runner.os.killpg) as killpg,
             ):
                 capture = runner.run_bounded(
-                    [sys.executable, str(script)], cwd=root, timeout_seconds=1, stdin_data=b""
+                    [sys.executable, str(script)],
+                    cwd=root,
+                    timeout_seconds=1,
+                    stdin_data=b"",
                 )
             self.assertEqual(capture["capture_error"], "timeout")
             self.assertTrue(launch_kwargs[0].get("start_new_session"))
             self.assertGreaterEqual(killpg.call_count, 1)
 
-    def test_run_bounded_kills_process_group_left_after_normal_provider_exit(self) -> None:
+    def test_run_bounded_kills_process_group_left_after_normal_provider_exit(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             child_state = root / "child.pid"
@@ -2232,7 +6132,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             capture = runner.run_bounded(
-                [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
+                [sys.executable, str(script)],
+                cwd=root,
+                timeout_seconds=3,
+                stdin_data=b"",
             )
             self.assertIsNone(capture["capture_error"])
             self.assertIn(
@@ -2250,7 +6153,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     self.fail("provider descendant survived process-group containment")
                 time.sleep(0.02)
 
-    def test_run_bounded_failed_post_exit_containment_remains_capture_error(self) -> None:
+    def test_run_bounded_failed_post_exit_containment_remains_capture_error(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             child_state = root / "child.pid"
@@ -2304,7 +6209,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(child_pid, 0)
 
-    def test_run_bounded_reaps_descendant_that_detaches_from_provider_group(self) -> None:
+    def test_run_bounded_reaps_descendant_that_detaches_from_provider_group(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             child_state = root / "detached.pid"
@@ -2329,7 +6236,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             capture = runner.run_bounded(
-                [sys.executable, str(script)], cwd=root, timeout_seconds=3, stdin_data=b""
+                [sys.executable, str(script)],
+                cwd=root,
+                timeout_seconds=3,
+                stdin_data=b"",
             )
             self.assertIsNone(capture["capture_error"])
             self.assertIn(
@@ -2386,7 +6296,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(capture["capture_error"], "timeout")
             self.assertLess(elapsed, 3.0)
 
-    def test_run_bounded_returns_capture_error_instead_of_discarding_partial_streams(self) -> None:
+    def test_run_bounded_returns_capture_error_instead_of_discarding_partial_streams(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / "producer.py"
@@ -2407,7 +6319,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIn(b"before-timeout", capture["stdout"])
             self.assertIn(b"diagnostic", capture["stderr"])
 
-    def test_treatment_tools_require_every_upstream_capability_exactly_once(self) -> None:
+    def test_treatment_tools_require_every_upstream_capability_exactly_once(
+        self,
+    ) -> None:
         valid = {"tools": [*treatment_tools(), {"name": "find_symbol"}]}
         self.assertEqual(
             {item["name"] for item in runner._filtered_treatment_tools(valid)},
@@ -2416,7 +6330,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         missing = {
             "tools": [
                 item for item in treatment_tools() if item["name"] != "live_freshness"
-            ] + [{"name": "find_symbol"}]
+            ]
+            + [{"name": "find_symbol"}]
         }
         with self.assertRaisesRegex(runner.RunnerError, "exactly once"):
             runner._filtered_treatment_tools(missing)
@@ -2442,7 +6357,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
         type_confused_schema = {"tools": treatment_tools()}
         ask_context = next(
-            item for item in type_confused_schema["tools"]
+            item
+            for item in type_confused_schema["tools"]
             if item["name"] == "ask_context"
         )
         ask_context["inputSchema"]["properties"]["max_context_tokens"]["minimum"] = True
@@ -2450,9 +6366,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             runner._filtered_treatment_tools(type_confused_schema)
 
     def test_treatment_tools_require_exact_model_visible_descriptors(self) -> None:
-        drifted = {'tools': treatment_tools()}
-        drifted['tools'][0]['description'] = 'Do not use this treatment tool.'
-        with self.assertRaisesRegex(runner.RunnerError, 'descriptor drifted'):
+        drifted = {"tools": treatment_tools()}
+        drifted["tools"][0]["description"] = "Do not use this treatment tool."
+        with self.assertRaisesRegex(runner.RunnerError, "descriptor drifted"):
             runner._filtered_treatment_tools(drifted)
 
     def test_mcp_proxy_rejects_tools_list_arriving_during_upstream_eof(self) -> None:
@@ -2474,13 +6390,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             process = subprocess.Popen(
                 proxy_command(upstream, root),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
             self.assertIsNotNone(process.stdin)
             self.assertIsNotNone(process.stdout)
             self.assertIsNotNone(process.stderr)
-            first = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode() + b"\n"
-            second = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).encode() + b"\n"
+            first = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode()
+                + b"\n"
+            )
+            second = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+                ).encode()
+                + b"\n"
+            )
             process.stdin.write(first)
             process.stdin.flush()
             self.assertTrue(process.stdout.readline())
@@ -2500,27 +6428,39 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             root = Path(temporary)
             upstream = root / "mcp.py"
             upstream.write_text(
-                "import sys\n"
-                "sys.stdin.readline()\n",
+                "import sys\nsys.stdin.readline()\n",
                 encoding="utf-8",
             )
-            payload = json.dumps(
-                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-            ).encode() + b"\n"
+            payload = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode()
+                + b"\n"
+            )
             completed = subprocess.run(
                 proxy_command(upstream, root),
-                input=payload, capture_output=True, check=False, timeout=5,
+                input=payload,
+                capture_output=True,
+                check=False,
+                timeout=5,
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn(b"inventory was not validated", completed.stderr)
 
     def test_mcp_proxy_rejects_unsuccessful_tools_list_responses(self) -> None:
         responses = (
-            {"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "unavailable"}},
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "error": {"code": -32000, "message": "unavailable"},
+            },
             {"jsonrpc": "2.0", "id": 1},
         )
         for response in responses:
-            with self.subTest(response=response), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(response=response),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 upstream = root / "mcp.py"
                 upstream.write_text(
@@ -2529,12 +6469,23 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     f"print(json.dumps({response!r}), flush=True)\n",
                     encoding="utf-8",
                 )
-                payload = json.dumps(
-                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-                ).encode() + b"\n"
+                payload = (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/list",
+                            "params": {},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
                 completed = subprocess.run(
                     proxy_command(upstream, root),
-                    input=payload, capture_output=True, check=False, timeout=5,
+                    input=payload,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertTrue(
@@ -2542,7 +6493,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     or b"response envelope is invalid" in completed.stderr
                 )
 
-    def test_mcp_proxy_coalesces_pipelined_resource_lists_to_first_snapshot(self) -> None:
+    def test_mcp_proxy_coalesces_pipelined_resource_lists_to_first_snapshot(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             count_path = root / "resource-list-count.txt"
@@ -2564,17 +6517,38 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             messages = [
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
-                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"repobrief_resource_read","arguments":{"action":"list"}}},
-                {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"repobrief_resource_read","arguments":{"action":"list"}}},
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "list"},
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "list"},
+                    },
+                },
             ]
             completed = subprocess.run(
                 proxy_command(upstream, root),
                 input=b"".join(json.dumps(item).encode() + b"\n" for item in messages),
-                capture_output=True, check=False, timeout=5,
+                capture_output=True,
+                check=False,
+                timeout=5,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-            responses = {item["id"]: item for item in map(json.loads, completed.stdout.decode().splitlines())}
+            responses = {
+                item["id"]: item
+                for item in map(json.loads, completed.stdout.decode().splitlines())
+            }
             first = responses[2]["result"]["content"][0]["text"]
             second = responses[3]["result"]["content"][0]["text"]
             self.assertEqual(first, second)
@@ -2584,7 +6558,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             self.assertEqual(count_path.read_text(), "1")
 
-    def test_mcp_proxy_rebinds_resource_read_live_freshness_to_logical_manifest(self) -> None:
+    def test_mcp_proxy_rebinds_resource_read_live_freshness_to_logical_manifest(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             observed_manifest = root / "observed-manifest-path.txt"
@@ -2625,21 +6601,31 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 return json.loads(process.stdout.readline())
 
             tools = roundtrip(
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
             )
             self.assertIn("result", tools)
             listed = roundtrip(
-                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-                    "name":"repobrief_resource_read",
-                    "arguments":{"action":"list"},
-                }}
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "list"},
+                    },
+                }
             )
             self.assertFalse(listed["result"]["isError"])
             read = roundtrip(
-                {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
-                    "name":"repobrief_resource_read",
-                    "arguments":{"action":"read","uri":"repobrief://frozen/a"},
-                }}
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "read", "uri": "repobrief://frozen/a"},
+                    },
+                }
             )
             self.assertFalse(read["result"]["isError"])
             assert process.stdin is not None
@@ -2661,7 +6647,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 str(logical_manifest),
             )
 
-    def test_rebind_resource_read_manifest_rejects_non_staged_freshness_path(self) -> None:
+    def test_rebind_resource_read_manifest_rejects_non_staged_freshness_path(
+        self,
+    ) -> None:
         staged_manifest = Path("/private/staged.bundle.manifest.json")
         logical_manifest = Path("/logical/repo.bundle.manifest.json")
         value = {
@@ -2703,7 +6691,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             process = subprocess.Popen(
                 proxy_command(upstream, root),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
             self.assertIsNotNone(process.stdin)
             self.assertIsNotNone(process.stdout)
@@ -2716,22 +6706,38 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 return json.loads(process.stdout.readline())
 
             tools = roundtrip(
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
             )
             self.assertIn("result", tools)
             listed = roundtrip(
-                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
-                    "name":"repobrief_resource_read",
-                    "arguments":{"action":"list"},
-                }}
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "list"},
+                    },
+                }
             )
             self.assertFalse(listed["result"]["isError"])
-            process.stdin.write(json.dumps(
-                {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
-                    "name":"repobrief_resource_read",
-                    "arguments":{"action":"read","uri":"repobrief://frozen/a"},
-                }}
-            ).encode() + b"\n")
+            process.stdin.write(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "repobrief_resource_read",
+                            "arguments": {
+                                "action": "read",
+                                "uri": "repobrief://frozen/a",
+                            },
+                        },
+                    }
+                ).encode()
+                + b"\n"
+            )
             process.stdin.flush()
             process.stdin.close()
             stderr = process.stderr.read()
@@ -2759,40 +6765,92 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             messages = [
-                {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}},
-                {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}},
-                {"jsonrpc":"2.0","id":3,"method":"prompts/list","params":{}},
-                {"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"repobrief://frozen/a"}},
-                {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"repobrief_resource_read","arguments":{"action":"read","uri":"repobrief://frozen/a"}}},
-                {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"repobrief_resource_read","arguments":{"action":"list"}}},
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+                {"jsonrpc": "2.0", "id": 3, "method": "prompts/list", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "resources/read",
+                    "params": {"uri": "repobrief://frozen/a"},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "read", "uri": "repobrief://frozen/a"},
+                    },
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "repobrief_resource_read",
+                        "arguments": {"action": "list"},
+                    },
+                },
             ]
             payload = b"".join(json.dumps(item).encode() + b"\n" for item in messages)
             completed = subprocess.run(
                 proxy_command(upstream, root),
-                input=payload, capture_output=True, check=False, timeout=5,
+                input=payload,
+                capture_output=True,
+                check=False,
+                timeout=5,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-            responses = {item["id"]: item for item in map(json.loads, completed.stdout.decode().splitlines())}
+            responses = {
+                item["id"]: item
+                for item in map(json.loads, completed.stdout.decode().splitlines())
+            }
             self.assertEqual(set(responses[1]["result"]["capabilities"]), {"tools"})
             self.assertEqual(responses[1]["result"]["capabilities"]["tools"], {})
-            self.assertEqual({item["name"] for item in responses[2]["result"]["tools"]}, runner.ALLOWED_MCP)
+            self.assertEqual(
+                {item["name"] for item in responses[2]["result"]["tools"]},
+                runner.ALLOWED_MCP,
+            )
             self.assertIn("error", responses[3])
             self.assertIn("error", responses[4])
             self.assertTrue(responses[5]["result"]["isError"])
             self.assertFalse(responses[6]["result"]["isError"])
             frozen = json.loads(responses[6]["result"]["content"][0]["text"])
-            self.assertEqual([item["uri"] for item in frozen["resources"]], ["repobrief://frozen/a"])
+            self.assertEqual(
+                [item["uri"] for item in frozen["resources"]], ["repobrief://frozen/a"]
+            )
 
     def test_mcp_proxy_rejects_unterminated_upstream_frame(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            upstream = root / 'mcp.py'
-            response = {'jsonrpc': '2.0', 'id': 1, 'result': {'tools': treatment_tools()}}
-            upstream.write_text('import json, sys\n' 'sys.stdin.readline()\n' f'sys.stdout.write(json.dumps({response!r})); sys.stdout.flush()\n', encoding='utf-8')
-            payload = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list', 'params': {}}).encode() + b'\n'
-            completed = subprocess.run(proxy_command(upstream, root), input=payload, capture_output=True, check=False, timeout=5)
+            upstream = root / "mcp.py"
+            response = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": treatment_tools()},
+            }
+            upstream.write_text(
+                "import json, sys\n"
+                "sys.stdin.readline()\n"
+                f"sys.stdout.write(json.dumps({response!r})); sys.stdout.flush()\n",
+                encoding="utf-8",
+            )
+            payload = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode()
+                + b"\n"
+            )
+            completed = subprocess.run(
+                proxy_command(upstream, root),
+                input=payload,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
             self.assertNotEqual(completed.returncode, 0)
-            self.assertIn(b'newline terminated', completed.stderr)
+            self.assertIn(b"newline terminated", completed.stderr)
 
     def test_mcp_proxy_rejects_oversized_upstream_line_before_newline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2809,7 +6867,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             started = time.monotonic()
             completed = subprocess.run(
                 proxy_command(upstream, root),
-                input=b"", capture_output=True, check=False, timeout=8,
+                input=b"",
+                capture_output=True,
+                check=False,
+                timeout=8,
             )
             elapsed = time.monotonic() - started
             self.assertNotEqual(completed.returncode, 0)
@@ -2818,7 +6879,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             with self.assertRaises(ProcessLookupError):
                 os.kill(upstream_pid, 0)
 
-    def test_mcp_proxy_reaps_failed_upstream_without_detaching_from_provider_group(self) -> None:
+    def test_mcp_proxy_reaps_failed_upstream_without_detaching_from_provider_group(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_path = root / "upstream.state"
@@ -2831,12 +6894,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "time.sleep(30)\n",
                 encoding="utf-8",
             )
-            payload = json.dumps(
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}
-            ).encode() + b"\n"
+            payload = (
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                ).encode()
+                + b"\n"
+            )
             completed = subprocess.run(
                 proxy_command(upstream, root),
-                input=payload, capture_output=True, check=False, timeout=5,
+                input=payload,
+                capture_output=True,
+                check=False,
+                timeout=5,
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn(b"upstream-diagnostic", completed.stderr)
@@ -2875,7 +6944,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "--bundle-root",
                 str(root),
             ]
+            prepared = runner.stage_mcp_upstream(
+                runtime_root, command, manifest, authorized
+            )
             with (
+                patch.object(
+                    runner, "_prepared_mcp_upstream_from_parent", return_value=prepared
+                ),
                 patch.object(runner.subprocess, "Popen", tracked_popen),
                 patch.object(
                     runner.threading.Thread,
@@ -2899,6 +6974,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIsNotNone(observed["process"].poll())
             stage_parent = runtime_root / "repoground-mcp-upstream-runtime"
             self.assertTrue(stage_parent.is_dir())
+            # Untrusted proxy cannot delete trusted staged executable bytes.
+            self.assertEqual(len(list(stage_parent.iterdir())), 1)
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(prepared))
             self.assertEqual([], list(stage_parent.iterdir()))
 
     def test_mcp_proxy_propagates_post_spawn_keyboard_interrupt_and_reaps(self) -> None:
@@ -2928,7 +7006,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "--bundle-root",
                 str(root),
             ]
+            prepared = runner.stage_mcp_upstream(
+                runtime_root, command, manifest, authorized
+            )
             with (
+                patch.object(
+                    runner, "_prepared_mcp_upstream_from_parent", return_value=prepared
+                ),
                 patch.object(runner.subprocess, "Popen", tracked_popen),
                 patch.object(
                     runner.threading.Thread,
@@ -2949,6 +7033,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIsNotNone(observed["process"].poll())
             stage_parent = runtime_root / "repoground-mcp-upstream-runtime"
             self.assertTrue(stage_parent.is_dir())
+            # Untrusted proxy cannot delete trusted staged executable bytes.
+            self.assertEqual(len(list(stage_parent.iterdir())), 1)
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(prepared))
             self.assertEqual([], list(stage_parent.iterdir()))
 
     def test_mcp_proxy_stops_client_reader_on_error_without_stdin_eof(self) -> None:
@@ -3007,10 +7094,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIsNone(arguments["repo"])
             self.assertIsNone(arguments["stem"])
             for selector, value in (
-                ("bundle_manifest", str(sibling)), ("repo", "other/repo"), ("stem", "other")
+                ("bundle_manifest", str(sibling)),
+                ("repo", "other/repo"),
+                ("stem", "other"),
             ):
                 conflicting = {"params": {"arguments": {selector: value}}}
-                with self.subTest(selector=selector), self.assertRaises(runner.RunnerError):
+                with (
+                    self.subTest(selector=selector),
+                    self.assertRaises(runner.RunnerError),
+                ):
                     runner._pin_treatment_arguments(conflicting, manifest)
 
     def test_staged_mcp_upstream_survives_later_source_replacement(self) -> None:
@@ -3071,7 +7163,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertIsNone(runner.cleanup_staged_mcp_upstream(staged))
             self.assertFalse(runtime_dir.exists())
 
-    def test_mcp_manifest_drift_after_authorization_fails_before_private_staging(self) -> None:
+    def test_mcp_manifest_drift_after_authorization_fails_before_private_staging(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
@@ -3202,9 +7296,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 nonlocal mcp_script_reads
                 if label == "MCP script":
                     mcp_script_reads += 1
-                return original_source_read(
-                    path, label=label, max_bytes=max_bytes
-                )
+                return original_source_read(path, label=label, max_bytes=max_bytes)
 
             with patch.object(
                 runner,
@@ -3223,7 +7315,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertGreater(staged["source_tree"]["file_count"], 0)
             self.assertEqual(staged["argv"][1:3], ["-I", "-B"])
             self.assertTrue(
-                (runtime_dir / "merger" / "repoground" / "cli" / "mcp_stdio.py").is_file()
+                (
+                    runtime_dir / "merger" / "repoground" / "cli" / "mcp_stdio.py"
+                ).is_file()
             )
             staged_helper = runtime_dir / "merger" / "executable-helper.py"
             self.assertEqual(stat.S_IMODE(staged_helper.stat().st_mode), 0o700)
@@ -3397,9 +7491,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     and label == "RepoGround MCP launcher"
                 ):
                     return committed_launcher
-                return original_source_read(
-                    path, label=label, max_bytes=max_bytes
-                )
+                return original_source_read(path, label=label, max_bytes=max_bytes)
 
             try:
                 with patch.object(
@@ -3532,14 +7624,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     max_bytes=max_bytes,
                 )
 
-            with patch.object(
-                runner,
-                "MAX_MCP_SOURCE_TREE_BYTES",
-                1,
-            ), patch.object(
-                runner,
-                "_read_bound_regular_file",
-                side_effect=reject_oversized_source_read,
+            with (
+                patch.object(
+                    runner,
+                    "MAX_MCP_SOURCE_TREE_BYTES",
+                    1,
+                ),
+                patch.object(
+                    runner,
+                    "_read_bound_regular_file",
+                    side_effect=reject_oversized_source_read,
+                ),
             ):
                 with self.assertRaisesRegex(
                     runner.RunnerError,
@@ -3709,7 +7804,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         git(["config", "--unset", filter_key], source)
                     self.assertFalse(marker.exists())
 
-    def test_staged_repoground_mcp_upstream_accepts_sha256_generator_commit(self) -> None:
+    def test_staged_repoground_mcp_upstream_accepts_sha256_generator_commit(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "repoground-sha256"
@@ -3847,7 +7944,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(bindings[0]["path"], executable.resolve())
             runner._revalidate_mcp_file(bindings[0], label="MCP executable")
 
-    def test_preflight_mcp_authorization_binds_exact_program_files_before_launch(self) -> None:
+    def test_preflight_mcp_authorization_binds_exact_program_files_before_launch(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             executable = root / "python3"
@@ -3863,7 +7962,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 manifest.read_bytes()
             ).hexdigest()
             value["repobrief"]["mcp_command"] = [
-                str(executable), str(script), "--bundle-root", str(manifest)
+                str(executable),
+                str(script),
+                "--bundle-root",
+                str(manifest),
             ]
             authorized = [
                 file_identity(executable),
@@ -3887,7 +7989,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     value["repobrief"]["mcp_command"], manifest, loaded
                 )
 
-    def test_mcp_upstream_rejects_unrelated_or_drifted_manifest_authorization(self) -> None:
+    def test_mcp_upstream_rejects_unrelated_or_drifted_manifest_authorization(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             executable = Path(sys.executable).resolve()
@@ -3946,7 +8050,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 manifest.read_bytes()
             ).hexdigest()
             value["repobrief"]["mcp_command"] = [
-                str(Path(sys.executable).resolve()), str(script), "--bundle-root", str(root)
+                str(Path(sys.executable).resolve()),
+                str(script),
+                "--bundle-root",
+                str(root),
             ]
             authorized = [file_identity(Path(sys.executable)), file_identity(script)]
             state_root = write_dispatch_authorization(root, value, authorized)
@@ -3961,7 +8068,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             {"jsonrpc": 2, "id": 1, "method": "tools/list", "params": {}},
         )
         for message in cases:
-            with self.subTest(message=message), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(message=message),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 upstream = root / "mcp.py"
                 upstream.write_text("import sys\nsys.stdin.read()\n", encoding="utf-8")
@@ -3980,16 +8090,25 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             root = Path(temporary)
             upstream = root / "mcp.py"
             upstream.write_text("import sys\nsys.stdin.read()\n", encoding="utf-8")
-            payload = json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "tools/call",
-                    "params": {"name": "ask_context", "arguments": {"query": "where"}},
-                }
-            ).encode() + b"\n"
+            payload = (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "ask_context",
+                            "arguments": {"query": "where"},
+                        },
+                    }
+                ).encode()
+                + b"\n"
+            )
             completed = subprocess.run(
-                proxy_command(upstream, root), input=payload,
-                capture_output=True, check=False, timeout=5,
+                proxy_command(upstream, root),
+                input=payload,
+                capture_output=True,
+                check=False,
+                timeout=5,
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn(b"proxy stream failed", completed.stderr)
@@ -4011,19 +8130,33 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     f"print(json.dumps({{'jsonrpc':'2.0','id':2,'error':{error!r}}}), flush=True)\n",
                     encoding="utf-8",
                 )
-                payload = json.dumps(
-                    {"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}}
-                ).encode() + b"\n"
+                payload = (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "initialize",
+                            "params": {},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
                 completed = subprocess.run(
-                    proxy_command(upstream, root), input=payload,
-                    capture_output=True, check=False, timeout=5,
+                    proxy_command(upstream, root),
+                    input=payload,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(b"error response is invalid", completed.stderr)
 
     def test_mcp_proxy_rejects_type_alias_response_ids(self) -> None:
         for invalid_identifier in (True, 1.0, None, {"nested": "id"}):
-            with self.subTest(identifier=invalid_identifier), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(identifier=invalid_identifier),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 upstream = root / "mcp.py"
                 encoded = json.dumps(invalid_identifier)
@@ -4034,12 +8167,23 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "print(json.dumps({'jsonrpc':'2.0','id':INVALID,'result':{}}), flush=True)\n",
                     encoding="utf-8",
                 )
-                payload = json.dumps(
-                    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
-                ).encode() + b"\n"
+                payload = (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
                 completed = subprocess.run(
-                    proxy_command(upstream, root), input=payload,
-                    capture_output=True, check=False, timeout=5,
+                    proxy_command(upstream, root),
+                    input=payload,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(b"response envelope is invalid", completed.stderr)
@@ -4053,7 +8197,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             script = root / "server.py"
             script.write_text("pass\n", encoding="utf-8")
             for target, label, executable_flag in (
-                (executable, "MCP executable", True), (script, "MCP script", False)
+                (executable, "MCP executable", True),
+                (script, "MCP script", False),
             ):
                 link = root / (target.name + ".link")
                 link.symlink_to(target)
@@ -4063,7 +8208,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     target, label=label, executable=executable_flag
                 )
                 target.write_bytes(target.read_bytes() + b"# drift\n")
-                with self.assertRaisesRegex(runner.RunnerError, "changed during execution"):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "changed during execution"
+                ):
                     runner._revalidate_mcp_file(binding, label=label)
 
     def test_mcp_proxy_rejects_malformed_or_unknown_response_envelopes(self) -> None:
@@ -4075,7 +8222,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 999, "result": {"tools": treatment_tools()}},
         )
         for response in cases:
-            with self.subTest(response=response), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(response=response),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 upstream = root / "mcp.py"
                 upstream.write_text(
@@ -4084,20 +8234,38 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     f"print(json.dumps({response!r}), flush=True)\n",
                     encoding="utf-8",
                 )
-                payload = json.dumps(
-                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
-                ).encode() + b"\n"
+                payload = (
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/list",
+                            "params": {},
+                        }
+                    ).encode()
+                    + b"\n"
+                )
                 completed = subprocess.run(
-                    proxy_command(upstream, root), input=payload, capture_output=True,
-                    check=False, timeout=5,
+                    proxy_command(upstream, root),
+                    input=payload,
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(b"response envelope is invalid", completed.stderr)
 
     def test_mcp_proxy_rejects_explicit_null_treatment_request_id(self) -> None:
         for invalid in (
-            None, True, False, [], {}, 1.5,
-            float("inf"), float("-inf"), float("nan"),
+            None,
+            True,
+            False,
+            [],
+            {},
+            1.5,
+            float("inf"),
+            float("-inf"),
+            float("nan"),
         ):
             with self.subTest(invalid=invalid):
                 self.assertFalse(runner._valid_jsonrpc_request_id(invalid))
@@ -4118,8 +8286,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             messages = [
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
-                {"jsonrpc":"2.0","id":None,"method":"tools/call","params":{"name":"ask_context","arguments":{"query":"where"}}},
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "method": "tools/call",
+                    "params": {"name": "ask_context", "arguments": {"query": "where"}},
+                },
             ]
             completed = subprocess.run(
                 proxy_command(upstream, root),
@@ -4130,7 +8303,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             self.assertNotEqual(completed.returncode, 0)
 
-    def test_mcp_proxy_rejects_malformed_treatment_tool_result_before_forwarding(self) -> None:
+    def test_mcp_proxy_rejects_malformed_treatment_tool_result_before_forwarding(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             upstream = root / "mcp.py"
@@ -4146,17 +8321,26 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             messages = [
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
-                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask_context","arguments":{"query":"where"}}},
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "ask_context", "arguments": {"query": "where"}},
+                },
             ]
             completed = subprocess.run(
                 proxy_command(upstream, root),
                 input=b"".join(json.dumps(item).encode() + b"\n" for item in messages),
-                capture_output=True, check=False, timeout=5,
+                capture_output=True,
+                check=False,
+                timeout=5,
             )
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn(b"treatment tool result is malformed", completed.stderr)
-            responses = [json.loads(line) for line in completed.stdout.decode().splitlines()]
+            responses = [
+                json.loads(line) for line in completed.stdout.decode().splitlines()
+            ]
             self.assertNotIn(2, {item.get("id") for item in responses})
 
     def test_mcp_proxy_rejects_tool_specific_treatment_payload_drift(self) -> None:
@@ -4166,7 +8350,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ("live_freshness", {}),
         )
         for tool_name, arguments in cases:
-            with self.subTest(tool=tool_name), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(tool=tool_name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 upstream = root / "mcp.py"
                 upstream.write_text(
@@ -4181,17 +8368,28 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 messages = [
-                    {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
-                    {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool_name,"arguments":arguments}},
+                    {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/call",
+                        "params": {"name": tool_name, "arguments": arguments},
+                    },
                 ]
                 completed = subprocess.run(
                     proxy_command(upstream, root),
-                    input=b"".join(json.dumps(item).encode() + b"\n" for item in messages),
-                    capture_output=True, check=False, timeout=5,
+                    input=b"".join(
+                        json.dumps(item).encode() + b"\n" for item in messages
+                    ),
+                    capture_output=True,
+                    check=False,
+                    timeout=5,
                 )
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(b"is malformed", completed.stderr)
-                responses = [json.loads(line) for line in completed.stdout.decode().splitlines()]
+                responses = [
+                    json.loads(line) for line in completed.stdout.decode().splitlines()
+                ]
                 self.assertNotIn(2, {item.get("id") for item in responses})
 
     def test_treatment_result_accepts_pinned_tool_specific_payloads(self) -> None:
@@ -4205,7 +8403,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "repo_root": None,
             "read_only_git_probe": False,
             "implicit_refresh": False,
-            "does_not_establish": list(runner.EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH),
+            "does_not_establish": list(
+                runner.EXPECTED_REPOGROUND_FRESHNESS_DOES_NOT_ESTABLISH
+            ),
         }
         context_pack = {
             "kind": runner.EXPECTED_ASK_CONTEXT_PACK_KIND,
@@ -4222,7 +8422,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "answer_scaffold": {
                 "citation_obligations": [],
                 "caveats_to_surface": [],
-                "non_claims_to_surface": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+                "non_claims_to_surface": list(
+                    runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+                ),
             },
             "budget": {
                 "max_context_tokens": 1,
@@ -4239,8 +8441,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "truncated": False,
                 "does_not_establish_quality": True,
             },
-            "forbidden_operations": list(runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS),
-            "does_not_establish": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+            "forbidden_operations": list(
+                runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS
+            ),
+            "does_not_establish": list(
+                runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+            ),
         }
         verdict = {
             "kind": runner.EXPECTED_GROUNDING_VERDICT_KIND,
@@ -4254,7 +8460,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "diagnostics": [],
             "freshness_caveats": [],
             "availability_caveats": [],
-            "does_not_establish": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+            "does_not_establish": list(
+                runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+            ),
         }
         projection = {
             "mutation_boundary": {
@@ -4337,7 +8545,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             with self.subTest(non_staged_manifest=unexpected_path):
                 foreign["verdict"]["snapshot_ref"]["manifest_path"] = unexpected_path
                 with self.assertRaisesRegex(
-                    runner.RunnerError, "grounding snapshot manifest does not match staged manifest"
+                    runner.RunnerError,
+                    "grounding snapshot manifest does not match staged manifest",
                 ):
                     runner._validated_treatment_tool_result(
                         {
@@ -4363,13 +8572,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             external_manifest=external_manifest,
         )
         self.assertEqual(
-            rebound_ask["structuredContent"]["context_pack"]["snapshot_ref"]["manifest_path"],
+            rebound_ask["structuredContent"]["context_pack"]["snapshot_ref"][
+                "manifest_path"
+            ],
             str(external_manifest),
         )
         for unexpected_path in ("/foreign/context.json", str(external_manifest)):
             with self.subTest(ask_context_non_staged=unexpected_path):
                 invalid_ask = json.loads(json.dumps(staged_ask))
-                invalid_ask["context_pack"]["snapshot_ref"]["manifest_path"] = unexpected_path
+                invalid_ask["context_pack"]["snapshot_ref"]["manifest_path"] = (
+                    unexpected_path
+                )
                 with self.assertRaisesRegex(
                     runner.RunnerError,
                     "ask_context snapshot manifest does not match staged manifest",
@@ -4407,7 +8620,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         error = {
             "content": [{"type": "text", "text": "error"}],
             "structuredContent": {
-                "status": "error", "tool": "ask_context", "error": "boom"
+                "status": "error",
+                "tool": "ask_context",
+                "error": "boom",
             },
             "isError": True,
         }
@@ -4448,8 +8663,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             messages = [
-                {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}},
-                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask_context","arguments":{"query":"where"}}},
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "ask_context", "arguments": {"query": "where"}},
+                },
             ]
             completed = subprocess.run(
                 proxy_command(upstream, root),
@@ -4459,7 +8679,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 timeout=5,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-            responses = {item["id"]: item for item in map(json.loads, completed.stdout.decode().splitlines())}
+            responses = {
+                item["id"]: item
+                for item in map(json.loads, completed.stdout.decode().splitlines())
+            }
             self.assertEqual(
                 responses[2]["result"]["content"][0]["text"],
                 runner.canonical(responses[2]["result"]["structuredContent"]),
@@ -4477,7 +8700,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertNotEqual(staged_manifest, logical_manifest)
             self.assertEqual(staged_manifest.name, logical_manifest.name)
             self.assertIn(
-                root / "proxy-runtime" / "repoground-mcp-upstream-runtime",
+                root / "fixture-trusted-state" / "repoground-mcp-upstream-runtime",
                 staged_manifest.parents,
             )
             self.assertIsNone(arguments["repo"])
@@ -4486,9 +8709,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
     def _codex_live_freshness_evidence(self, *, root: str | None, **overrides):
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
-            manifest = bind_manifest(
-                value, Path(directory), repo_root=root
-            )
+            manifest = bind_manifest(value, Path(directory), repo_root=root)
             payload = {
                 "kind": "repobrief.live_freshness",
                 "version": "v1",
@@ -4506,26 +8727,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "current_provenance": None,
             }
             payload.update(overrides)
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "live_freshness",
-                    "arguments": {},
-                    "result": {"structured_content": payload},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "live_freshness",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "live_freshness",
+                        "arguments": {},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "live_freshness",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                }
+            ]
             return runner._repoground_evidence_from_codex_events(value, events, calls)
 
     def test_codex_unhashable_optional_freshness_is_nonfatal(self) -> None:
@@ -4559,26 +8784,29 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "snapshot_provenance": {"git_commit": COMMIT},
                 },
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "grounding_verify",
-                    "arguments": {},
-                    "result": {"structured_content": original},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "grounding_verify",
+                        "arguments": {},
+                        "result": {"structured_content": original},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
             calls = [{"sequence": 1, "name": "grounding_verify", "status": "success"}]
             with patch.object(
-                runner, "_validated_treatment_structured_payload",
+                runner,
+                "_validated_treatment_structured_payload",
                 return_value=original,
             ):
-                self.assertIsNotNone(runner._repoground_evidence_from_codex_events(
-                    value, events, calls
-                ))
+                self.assertIsNotNone(
+                    runner._repoground_evidence_from_codex_events(value, events, calls)
+                )
             for path in (
                 ("verdict", "snapshot_ref", "freshness_status"),
                 ("live_freshness", "status"),
@@ -4592,12 +8820,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                             field = field[name]
                         field[path[-1]] = bad
                         with patch.object(
-                            runner, "_validated_treatment_structured_payload",
+                            runner,
+                            "_validated_treatment_structured_payload",
                             return_value=payload,
                         ):
-                            self.assertIsNone(runner._repoground_evidence_from_codex_events(
-                                value, events, calls
-                            ))
+                            self.assertIsNone(
+                                runner._repoground_evidence_from_codex_events(
+                                    value, events, calls
+                                )
+                            )
 
     def test_codex_fresh_evidence_requires_proven_read_only_probe(self) -> None:
         valid = self._codex_live_freshness_evidence(root="/tmp/repo")
@@ -4607,7 +8838,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ("root_none", "/tmp/repo", {"repo_root": None}),
             ("root_mismatch", "/tmp/repo", {"repo_root": "/tmp/other"}),
             ("manifest_without_root", None, {}),
-            ("stale_probe_false", "/tmp/repo", {"status": "stale", "read_only_git_probe": False}),
+            (
+                "stale_probe_false",
+                "/tmp/repo",
+                {"status": "stale", "read_only_git_probe": False},
+            ),
         ):
             with self.subTest(case=case):
                 self.assertIsNone(
@@ -4710,7 +8945,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                             "range_ref": {"ref": "example"},
                         }
                     ],
-                    "budget": {"context_bytes_used": 654, "max_context_bytes": 654, "token_derived_byte_ceiling": 654},
+                    "budget": {
+                        "context_bytes_used": 654,
+                        "max_context_bytes": 654,
+                        "token_derived_byte_ceiling": 654,
+                    },
                 },
                 "live_freshness": {
                     "kind": "repobrief.live_freshness",
@@ -4724,26 +8963,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "snapshot_provenance": {"git_commit": COMMIT.upper()},
                 },
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "ask_context",
-                    "arguments": {"query": "example"},
-                    "result": {"structured_content": payload},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "ask_context",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "ask_context",
+                        "arguments": {"query": "example"},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "ask_context",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                }
+            ]
             with patch.object(
                 runner,
                 "_validated_treatment_structured_payload",
@@ -4757,14 +9000,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 {
                     "target_commit": COMMIT,
                     "bundle_commit": COMMIT,
-                    "calls": [{
-                        "sequence": 1,
-                        "tool": "ask_context",
-                        "freshness_status": "fresh",
-                        "resolved_range_count": 1,
-                        "context_bytes_used": 654,
-                        "grounding_status": None,
-                    }],
+                    "calls": [
+                        {
+                            "sequence": 1,
+                            "tool": "ask_context",
+                            "freshness_status": "fresh",
+                            "resolved_range_count": 1,
+                            "context_bytes_used": 654,
+                            "grounding_status": None,
+                        }
+                    ],
                 },
             )
 
@@ -4797,8 +9042,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         }
         for label, forbidden, valid in (
             ("valid", ["secret_read", "snapshot_create_side_effect"], True),
-            ("nested_object", ["secret_read", "snapshot_create_side_effect", {"x": 1}], False),
-            ("nested_list", ["secret_read", "snapshot_create_side_effect", ["x"]], False),
+            (
+                "nested_object",
+                ["secret_read", "snapshot_create_side_effect", {"x": 1}],
+                False,
+            ),
+            (
+                "nested_list",
+                ["secret_read", "snapshot_create_side_effect", ["x"]],
+                False,
+            ),
             ("number", ["secret_read", "snapshot_create_side_effect", 1], False),
         ):
             with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
@@ -4813,10 +9066,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "status": "ok",
                     "request_semantics": "repobrief.ask_request.v1",
                     "context_pack_semantics": "repobrief.ask_context_pack.v1",
-                    "mutation_boundary": {**base_boundary, "forbidden_operations": forbidden},
+                    "mutation_boundary": {
+                        **base_boundary,
+                        "forbidden_operations": forbidden,
+                    },
                     "does_not_establish": {
                         "ref": "repobrief.does_not_establish.default.v1",
-                        "items": list(runner.EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH),
+                        "items": list(
+                            runner.EXPECTED_REPOGROUND_FRONTDOOR_DOES_NOT_ESTABLISH
+                        ),
                     },
                     "context_pack": {
                         "kind": "repobrief.ask_context_pack",
@@ -4829,7 +9087,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         },
                         "freshness": {"status": "fresh"},
                         "resolved_ranges": [],
-                        "budget": {"context_bytes_used": 1, "max_context_bytes": 1, "token_derived_byte_ceiling": 1},
+                        "budget": {
+                            "context_bytes_used": 1,
+                            "max_context_bytes": 1,
+                            "token_derived_byte_ceiling": 1,
+                        },
                     },
                     "live_freshness": {
                         "kind": "repobrief.live_freshness",
@@ -4843,32 +9105,45 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         "snapshot_provenance": {"git_commit": COMMIT},
                     },
                 }
-                events = [{
-                    "type": "item.completed",
-                    "item": {
-                        "type": "mcp_tool_call",
-                        "server": "repobrief",
-                        "tool": "ask_context",
-                        "arguments": {"query": "example"},
-                        "result": {"structured_content": payload},
-                        "error": None,
-                        "status": "completed",
-                    },
-                }]
-                calls = [{
-                    "sequence": 1, "name": "ask_context", "status": "success",
-                    "duration_ms": 0, "input_bytes": 1, "output_bytes": 1,
-                }]
+                events = [
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "mcp_tool_call",
+                            "server": "repobrief",
+                            "tool": "ask_context",
+                            "arguments": {"query": "example"},
+                            "result": {"structured_content": payload},
+                            "error": None,
+                            "status": "completed",
+                        },
+                    }
+                ]
+                calls = [
+                    {
+                        "sequence": 1,
+                        "name": "ask_context",
+                        "status": "success",
+                        "duration_ms": 0,
+                        "input_bytes": 1,
+                        "output_bytes": 1,
+                    }
+                ]
                 with (
-                    patch.object(runner.base, "_validated_ask_context_pack", return_value=None),
                     patch.object(
-                        runner.base, "_validated_live_freshness_payload",
+                        runner.base, "_validated_ask_context_pack", return_value=None
+                    ),
+                    patch.object(
+                        runner.base,
+                        "_validated_live_freshness_payload",
                         return_value=payload["live_freshness"],
                     ),
                 ):
                     if not valid:
                         with self.assertRaises(runner.RunnerError):
-                            runner.base._validated_read_only_frontdoor_projection(payload)
+                            runner.base._validated_read_only_frontdoor_projection(
+                                payload
+                            )
                     evidence = runner._repoground_evidence_from_codex_events(
                         value, events, calls
                     )
@@ -4882,15 +9157,18 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             "artifact_role": "language_structure_json",
             "status": "resolved",
             "range_ref": {
-                "ref": "rust:fn:main", "path": "src/main.rs",
+                "ref": "rust:fn:main",
+                "path": "src/main.rs",
                 "range": {"start_line": 3, "end_line": 9},
             },
             "source_path": "src/main.rs",
             "source_line_range": {"start_line": 3, "end_line": 9},
         }
         canonical = {
-            "artifact_role": "canonical_md", "status": "resolved",
-            "range_ref": {"ref": "c1"}, "text_excerpt": "def example(): ...",
+            "artifact_role": "canonical_md",
+            "status": "resolved",
+            "range_ref": {"ref": "c1"},
+            "text_excerpt": "def example(): ...",
         }
         broken = copy.deepcopy(lang)
         broken["range_ref"]["range"]["start_line"] = True
@@ -4898,13 +9176,28 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ([lang, canonical], 2),
             ([lang], 1),
             ([{"status": "resolved"}], None),
-            ([{"status": "resolved", "range_ref": {"junk": "x"}, "text_excerpt": "fake"}], None),
-            ([{"artifact_role": "language_structure_json", "status": "resolved"}], None),
+            (
+                [
+                    {
+                        "status": "resolved",
+                        "range_ref": {"junk": "x"},
+                        "text_excerpt": "fake",
+                    }
+                ],
+                None,
+            ),
+            (
+                [{"artifact_role": "language_structure_json", "status": "resolved"}],
+                None,
+            ),
             ([broken], None),
             ([canonical, {**lang, "source_path": ""}], None),
         ]
         for ranges, expected in cases:
-            with self.subTest(ranges=ranges), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(ranges=ranges),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 value = request(condition="treatment")
                 manifest = bind_manifest(
                     value, Path(directory), commit=COMMIT.upper(), repo_root="/tmp/repo"
@@ -4925,7 +9218,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         },
                         "freshness": {"status": "fresh"},
                         "resolved_ranges": ranges,
-                        "budget": {"context_bytes_used": 10, "max_context_bytes": 10, "token_derived_byte_ceiling": 10},
+                        "budget": {
+                            "context_bytes_used": 10,
+                            "max_context_bytes": 10,
+                            "token_derived_byte_ceiling": 10,
+                        },
                     },
                     "live_freshness": {
                         "kind": "repobrief.live_freshness",
@@ -4939,22 +9236,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         "snapshot_provenance": {"git_commit": COMMIT.upper()},
                     },
                 }
-                events = [{
-                    "type": "item.completed",
-                    "item": {
-                        "type": "mcp_tool_call",
-                        "server": "repobrief",
-                        "tool": "ask_context",
-                        "arguments": {"query": "example"},
-                        "result": {"structured_content": payload},
-                        "error": None,
-                        "status": "completed",
-                    },
-                }]
-                calls = [{
-                    "sequence": 1, "name": "ask_context", "status": "success",
-                    "duration_ms": 0, "input_bytes": 1, "output_bytes": 1,
-                }]
+                events = [
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "mcp_tool_call",
+                            "server": "repobrief",
+                            "tool": "ask_context",
+                            "arguments": {"query": "example"},
+                            "result": {"structured_content": payload},
+                            "error": None,
+                            "status": "completed",
+                        },
+                    }
+                ]
+                calls = [
+                    {
+                        "sequence": 1,
+                        "name": "ask_context",
+                        "status": "success",
+                        "duration_ms": 0,
+                        "input_bytes": 1,
+                        "output_bytes": 1,
+                    }
+                ]
                 with patch.object(
                     runner,
                     "_validated_treatment_structured_payload",
@@ -4987,7 +9292,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "answer_scaffold": {
                     "citation_obligations": [],
                     "caveats_to_surface": [],
-                    "non_claims_to_surface": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+                    "non_claims_to_surface": list(
+                        runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+                    ),
                 },
                 "budget": {
                     "max_context_tokens": 4,
@@ -5004,8 +9311,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "truncated": False,
                     "does_not_establish_quality": True,
                 },
-                "forbidden_operations": list(runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS),
-                "does_not_establish": list(runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH),
+                "forbidden_operations": list(
+                    runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS
+                ),
+                "does_not_establish": list(
+                    runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
+                ),
             }
 
         cases = (
@@ -5077,22 +9388,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         "snapshot_provenance": {"git_commit": COMMIT.upper()},
                     },
                 }
-                events = [{
-                    "type": "item.completed",
-                    "item": {
-                        "type": "mcp_tool_call",
-                        "server": "repobrief",
-                        "tool": "ask_context",
-                        "arguments": {"query": "example"},
-                        "result": {"structured_content": payload},
-                        "error": None,
-                        "status": "completed",
-                    },
-                }]
-                calls = [{
-                    "sequence": 1, "name": "ask_context", "status": "success",
-                    "duration_ms": 0, "input_bytes": 1, "output_bytes": 1,
-                }]
+                events = [
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "mcp_tool_call",
+                            "server": "repobrief",
+                            "tool": "ask_context",
+                            "arguments": {"query": "example"},
+                            "result": {"structured_content": payload},
+                            "error": None,
+                            "status": "completed",
+                        },
+                    }
+                ]
+                calls = [
+                    {
+                        "sequence": 1,
+                        "name": "ask_context",
+                        "status": "success",
+                        "duration_ms": 0,
+                        "input_bytes": 1,
+                        "output_bytes": 1,
+                    }
+                ]
                 with patch.object(
                     runner,
                     "_validated_treatment_structured_payload",
@@ -5136,9 +9455,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "version": "2.0",
                 "snapshotProvenance": {"repositories": []},
             }
-            raw = json.dumps(
-                malformed, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
+            raw = json.dumps(malformed, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
             manifest.write_bytes(raw)
             value["repobrief"]["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
             payload = {
@@ -5152,35 +9471,37 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "implicit_refresh": False,
                 "snapshot_provenance": {"git_commit": COMMIT},
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "live_freshness",
-                    "arguments": {},
-                    "result": {"structured_content": payload},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "live_freshness",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "live_freshness",
+                        "arguments": {},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "live_freshness",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                }
+            ]
             with patch.object(
                 runner,
                 "_validated_treatment_structured_payload",
                 return_value=payload,
             ):
                 self.assertIsNone(
-                    runner._repoground_evidence_from_codex_events(
-                        value, events, calls
-                    )
+                    runner._repoground_evidence_from_codex_events(value, events, calls)
                 )
 
     def test_codex_rejects_conflicting_grounding_freshness(self) -> None:
@@ -5214,35 +9535,37 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "snapshot_provenance": {"git_commit": COMMIT},
                 },
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "grounding_verify",
-                    "arguments": {},
-                    "result": {"structured_content": payload},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "grounding_verify",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "grounding_verify",
+                        "arguments": {},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "grounding_verify",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                }
+            ]
             with patch.object(
                 runner,
                 "_validated_treatment_structured_payload",
                 return_value=payload,
             ):
                 self.assertIsNone(
-                    runner._repoground_evidence_from_codex_events(
-                        value, events, calls
-                    )
+                    runner._repoground_evidence_from_codex_events(value, events, calls)
                 )
 
     def test_codex_projects_bound_not_comparable_evidence(self) -> None:
@@ -5259,26 +9582,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "read_only_git_probe": False,
                 "implicit_refresh": False,
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "live_freshness",
-                    "arguments": {},
-                    "result": {"structured_content": payload},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "live_freshness",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "live_freshness",
+                        "arguments": {},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "live_freshness",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                }
+            ]
             with patch.object(
                 runner,
                 "_validated_treatment_structured_payload",
@@ -5303,23 +9630,23 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 {
                     "target_commit": COMMIT,
                     "bundle_commit": COMMIT,
-                    "calls": [{
-                        "sequence": 1,
-                        "tool": "live_freshness",
-                        "freshness_status": "not_comparable",
-                        "resolved_range_count": None,
-                        "context_bytes_used": None,
-                        "grounding_status": None,
-                    }],
+                    "calls": [
+                        {
+                            "sequence": 1,
+                            "tool": "live_freshness",
+                            "freshness_status": "not_comparable",
+                            "resolved_range_count": None,
+                            "context_bytes_used": None,
+                            "grounding_status": None,
+                        }
+                    ],
                 },
             )
 
     def test_codex_projects_strict_unknown_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
-            manifest = bind_manifest(
-                value, Path(directory), repo_root="/tmp/repo"
-            )
+            manifest = bind_manifest(value, Path(directory), repo_root="/tmp/repo")
             payload = {
                 "kind": "repobrief.live_freshness",
                 "version": "v1",
@@ -5330,26 +9657,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "read_only_git_probe": True,
                 "implicit_refresh": False,
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "live_freshness",
-                    "arguments": {},
-                    "result": {"structured_content": payload},
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "live_freshness",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "live_freshness",
+                        "arguments": {},
+                        "result": {"structured_content": payload},
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "live_freshness",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1,
+                }
+            ]
             with patch.object(
                 runner,
                 "_validated_treatment_structured_payload",
@@ -5367,9 +9698,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 return_value=payload,
             ):
                 self.assertIsNone(
-                    runner._repoground_evidence_from_codex_events(
-                        value, events, calls
-                    )
+                    runner._repoground_evidence_from_codex_events(value, events, calls)
                 )
 
             payload["repo_root"] = "/tmp/repo"
@@ -5380,9 +9709,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 return_value=payload,
             ):
                 self.assertIsNone(
-                    runner._repoground_evidence_from_codex_events(
-                        value, events, calls
-                    )
+                    runner._repoground_evidence_from_codex_events(value, events, calls)
                 )
 
     def test_malformed_outer_event_type_fails_closed_before_receipt(self) -> None:
@@ -5391,7 +9718,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         self.assertEqual(
             "success",
-            runner.receipt(value, stream(value), "transcript.jsonl", 0, now, now)["status"],
+            runner.receipt(value, stream(value), "transcript.jsonl", 0, now, now)[
+                "status"
+            ],
         )
         for malformed in ([], {}, 123, True, None):
             with self.subTest(value=repr(malformed)):
@@ -5405,9 +9734,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     runner.RunnerError,
                     r"Codex transcript line \d+ event type",
                 ):
-                    runner.receipt(
-                        value, raw, "transcript.jsonl", 0, now, now
-                    )
+                    runner.receipt(value, raw, "transcript.jsonl", 0, now, now)
 
     def test_malformed_completed_event_metadata_fails_closed(self) -> None:
         value = request(condition="treatment")
@@ -5415,7 +9742,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             with self.subTest(field=field):
                 events = [json.loads(line) for line in stream(value).splitlines()]
                 completed = next(
-                    event for event in events
+                    event
+                    for event in events
                     if event.get("type") == "item.completed"
                     and event["item"].get("type") == "command_execution"
                 )
@@ -5447,11 +9775,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     runner._repoground_evidence_from_codex_events(
                         value,
                         events,
-                        [{
-                            "sequence": 1,
-                            "name": "repobrief_resource_read",
-                            "status": "success",
-                        }],
+                        [
+                            {
+                                "sequence": 1,
+                                "name": "repobrief_resource_read",
+                                "status": "success",
+                            }
+                        ],
                     )
                 )
 
@@ -5462,20 +9792,20 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             uri = "repoground://snapshot/demo/canonical"
             resource = {
                 "contents": [{"uri": uri, "text": "\ud800", "mimeType": "text/plain"}],
-                "_meta": {"repoground": {
-                    "status": "available",
-                    "implicitRefresh": False,
-                    "snapshotContext": {},
-                    "identity": {},
-                    "liveFreshness": {},
-                }},
+                "_meta": {
+                    "repoground": {
+                        "status": "available",
+                        "implicitRefresh": False,
+                        "snapshotContext": {},
+                        "identity": {},
+                        "liveFreshness": {},
+                    }
+                },
             }
-            events = [
-                json.loads(line)
-                for line in stream(value).splitlines()
-            ]
+            events = [json.loads(line) for line in stream(value).splitlines()]
             tool_event = next(
-                event for event in events
+                event
+                for event in events
                 if event.get("type") == "item.completed"
                 and event["item"].get("type") == "command_execution"
             )
@@ -5484,10 +9814,14 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "server": "repobrief",
                 "tool": "repobrief_resource_read",
                 "arguments": {"action": "read", "uri": uri},
-                "result": {"content": [{
-                    "type": "text",
-                    "text": json.dumps(resource, sort_keys=True),
-                }]},
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(resource, sort_keys=True),
+                        }
+                    ]
+                },
                 "error": None,
                 "status": "completed",
             }
@@ -5496,9 +9830,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 for event in events
             )
             now = datetime.now(timezone.utc)
-            receipt = runner.receipt(
-                value, transcript, "transcript.jsonl", 0, now, now
-            )
+            receipt = runner.receipt(value, transcript, "transcript.jsonl", 0, now, now)
             self.assertEqual(receipt["status"], "success")
             self.assertEqual(receipt["tool_calls"][0]["status"], "success")
             self.assertNotIn("repoground_evidence", receipt)
@@ -5506,9 +9838,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
     def test_codex_projects_revision_bound_resource_read_not_list(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             value = request(condition="treatment")
-            manifest = bind_manifest(
-                value, Path(directory), repo_root="/tmp/repo"
-            )
+            manifest = bind_manifest(value, Path(directory), repo_root="/tmp/repo")
             uri = "repoground://snapshot/demo/canonical"
             live_freshness = {
                 "kind": "repobrief.live_freshness",
@@ -5522,11 +9852,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "snapshot_provenance": {"git_commit": COMMIT},
             }
             resource = {
-                "contents": [{
-                    "uri": uri,
-                    "text": "# Demo\n",
-                    "mimeType": "text/markdown",
-                }],
+                "contents": [
+                    {
+                        "uri": uri,
+                        "text": "# Demo\n",
+                        "mimeType": "text/markdown",
+                    }
+                ],
                 "_meta": {
                     "repoground": {
                         "status": "available",
@@ -5538,78 +9870,88 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 },
             }
             result = {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps(resource, sort_keys=True),
-                }]
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(resource, sort_keys=True),
+                    }
+                ]
             }
-            events = [{
-                "type": "item.completed",
-                "item": {
-                    "type": "mcp_tool_call",
-                    "server": "repobrief",
-                    "tool": "repobrief_resource_read",
-                    "arguments": {"action": "read", "uri": uri},
-                    "result": result,
-                    "error": None,
-                    "status": "completed",
-                },
-            }]
-            calls = [{
-                "sequence": 1,
-                "name": "repobrief_resource_read",
-                "status": "success",
-                "duration_ms": 0,
-                "input_bytes": 1,
-                "output_bytes": 1000,
-            }]
+            events = [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "repobrief",
+                        "tool": "repobrief_resource_read",
+                        "arguments": {"action": "read", "uri": uri},
+                        "result": result,
+                        "error": None,
+                        "status": "completed",
+                    },
+                }
+            ]
+            calls = [
+                {
+                    "sequence": 1,
+                    "name": "repobrief_resource_read",
+                    "status": "success",
+                    "duration_ms": 0,
+                    "input_bytes": 1,
+                    "output_bytes": 1000,
+                }
+            ]
             self.assertEqual(
-                runner._repoground_evidence_from_codex_events(
-                    value, events, calls
-                ),
+                runner._repoground_evidence_from_codex_events(value, events, calls),
                 {
                     "target_commit": COMMIT,
                     "bundle_commit": COMMIT,
-                    "calls": [{
-                        "sequence": 1,
-                        "tool": "repobrief_resource_read",
-                        "freshness_status": "fresh",
-                        "resolved_range_count": None,
-                        "context_bytes_used": len("# Demo\n".encode("utf-8")),
-                        "grounding_status": None,
-                    }],
+                    "calls": [
+                        {
+                            "sequence": 1,
+                            "tool": "repobrief_resource_read",
+                            "freshness_status": "fresh",
+                            "resolved_range_count": None,
+                            "context_bytes_used": len("# Demo\n".encode("utf-8")),
+                            "grounding_status": None,
+                        }
+                    ],
                 },
             )
 
             bad_surrogate_resource = json.loads(json.dumps(resource))
             bad_surrogate_resource["contents"][0]["text"] = "\ud800"
             events[0]["item"]["result"] = {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps(bad_surrogate_resource, sort_keys=True),
-                }],
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(bad_surrogate_resource, sort_keys=True),
+                    }
+                ],
             }
             self.assertIsNone(
-                runner._repoground_evidence_from_codex_events(
-                    value, events, calls
-                )
+                runner._repoground_evidence_from_codex_events(value, events, calls)
             )
 
             unknown = json.loads(json.dumps(resource))
             unknown_freshness = unknown["_meta"]["repoground"]["liveFreshness"]
-            unknown_freshness.update({
-                "status": "unknown",
-                "reason": "git_probe_failed",
-                "repo_root": "/tmp/repo",
-                "read_only_git_probe": True,
-                "implicit_refresh": False,
-            })
+            unknown_freshness.update(
+                {
+                    "status": "unknown",
+                    "reason": "git_probe_failed",
+                    "repo_root": "/tmp/repo",
+                    "read_only_git_probe": True,
+                    "implicit_refresh": False,
+                }
+            )
             unknown_freshness.pop("snapshot_provenance")
             events[0]["item"]["result"] = {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps(unknown, sort_keys=True),
-                }]
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(unknown, sort_keys=True),
+                    }
+                ]
             }
             unknown_evidence = runner._repoground_evidence_from_codex_events(
                 value, events, calls
@@ -5620,15 +9962,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
             unknown_freshness["repo_root"] = "/tmp/other-repo"
             events[0]["item"]["result"] = {
-                "content": [{
-                    "type": "text",
-                    "text": json.dumps(unknown, sort_keys=True),
-                }]
+                "content": [
+                    {
+                        "type": "text",
+                        "text": json.dumps(unknown, sort_keys=True),
+                    }
+                ]
             }
             self.assertIsNone(
-                runner._repoground_evidence_from_codex_events(
-                    value, events, calls
-                )
+                runner._repoground_evidence_from_codex_events(value, events, calls)
             )
 
             events[0]["item"]["result"] = result
@@ -5643,10 +9985,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     for field in removals:
                         freshness.pop(field)
                     events[0]["item"]["result"] = {
-                        "content": [{
-                            "type": "text",
-                            "text": json.dumps(invalid, sort_keys=True),
-                        }]
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": json.dumps(invalid, sort_keys=True),
+                            }
+                        ]
                     }
                     self.assertIsNone(
                         runner._repoground_evidence_from_codex_events(
@@ -5657,24 +10001,28 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             events[0]["item"]["result"] = result
             events[0]["item"]["arguments"] = {"action": "list"}
             self.assertIsNone(
-                runner._repoground_evidence_from_codex_events(
-                    value, events, calls
-                )
+                runner._repoground_evidence_from_codex_events(value, events, calls)
             )
 
     def test_normalize_rejects_boolean_token_counts(self) -> None:
-        for field, value in (('input_tokens', True), ('output_tokens', False)):
+        for field, value in (("input_tokens", True), ("output_tokens", False)):
             with self.subTest(field=field, value=value):
                 events = [json.loads(line) for line in stream(request()).splitlines()]
-                completed = next(event for event in events if event.get('type') == 'turn.completed')
-                completed['usage'][field] = value
-                with self.assertRaisesRegex(runner.RunnerError, 'Codex usage is invalid'):
+                completed = next(
+                    event for event in events if event.get("type") == "turn.completed"
+                )
+                completed["usage"][field] = value
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "Codex usage is invalid"
+                ):
                     runner.normalize(request(), events)
 
     def test_normalize_subtracts_cached_input_tokens_before_budget_check(self) -> None:
         value = request()
         events = [json.loads(line) for line in stream(value).splitlines()]
-        completed = next(event for event in events if event.get("type") == "turn.completed")
+        completed = next(
+            event for event in events if event.get("type") == "turn.completed"
+        )
         completed["usage"]["input_tokens"] = 100_000
         completed["usage"]["cached_input_tokens"] = 40_000
 
@@ -5693,13 +10041,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 )
                 completed["usage"]["cached_input_tokens"] = cached_input_tokens
 
-                with self.assertRaisesRegex(runner.RunnerError, "Codex usage is invalid"):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "Codex usage is invalid"
+                ):
                     runner.normalize(value, events)
 
     def test_normalize_r5_like_usage_still_exceeds_frozen_input_budget(self) -> None:
         value = request()
         events = [json.loads(line) for line in stream(value).splitlines()]
-        completed = next(event for event in events if event.get("type") == "turn.completed")
+        completed = next(
+            event for event in events if event.get("type") == "turn.completed"
+        )
         completed["usage"]["input_tokens"] = 422_147
         completed["usage"]["cached_input_tokens"] = 357_376
 
@@ -5710,7 +10062,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         value = request(condition="treatment")
         events = [json.loads(line) for line in stream(value).splitlines()]
         with self.assertRaisesRegex(
-            runner.RunnerError, "treatment used no successful RepoBrief tool or resource"
+            runner.RunnerError,
+            "treatment used no successful RepoBrief tool or resource",
         ):
             runner.normalize(value, events)
 
@@ -5741,13 +10094,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(calls[0]["status"], "success")
         self.assertEqual(normalized_answer, answer())
 
-    def test_normalize_accepts_codex_0158_repobrief_results_without_iserror(self) -> None:
+    def test_normalize_accepts_codex_0158_repobrief_results_without_iserror(
+        self,
+    ) -> None:
         cases = (
             (
                 "ask_context",
                 {"query": "finalizer"},
                 {
-                    "content": [{"type": "text", "text": "{\"status\":\"ok\"}"}],
+                    "content": [{"type": "text", "text": '{"status":"ok"}'}],
                     "structured_content": {"status": "ok", "tool": "ask_context"},
                 },
             ),
@@ -5755,7 +10110,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "live_freshness",
                 {},
                 {
-                    "content": [{"type": "text", "text": "{\"status\":\"fresh\"}"}],
+                    "content": [{"type": "text", "text": '{"status":"fresh"}'}],
                     "structured_content": {"status": "fresh"},
                 },
             ),
@@ -5763,7 +10118,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "grounding_verify",
                 {"declaration": {}},
                 {
-                    "content": [{"type": "text", "text": "{\"status\":\"warn\"}"}],
+                    "content": [{"type": "text", "text": '{"status":"warn"}'}],
                     "structured_content": {"status": "warn"},
                 },
             ),
@@ -5771,7 +10126,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "repobrief_resource_read",
                 {"action": "list"},
                 {
-                    "content": [{"type": "text", "text": "{\"resources\":[]}"}],
+                    "content": [{"type": "text", "text": '{"resources":[]}'}],
                 },
             ),
             (
@@ -5782,8 +10137,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         {
                             "type": "text",
                             "text": (
-                                "{\"_meta\":{},\"contents\":[{\"mimeType\":\"text/plain\","
-                                "\"text\":\"ok\",\"uri\":\"repobrief://frozen/a\"}]}"
+                                '{"_meta":{},"contents":[{"mimeType":"text/plain",'
+                                '"text":"ok","uri":"repobrief://frozen/a"}]}'
                             ),
                         }
                     ],
@@ -5811,15 +10166,17 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "status": "completed",
                 }
 
-                _input_tokens, _output_tokens, calls, normalized_answer = runner.normalize(
-                    value, events
+                _input_tokens, _output_tokens, calls, normalized_answer = (
+                    runner.normalize(value, events)
                 )
 
                 self.assertEqual([call["name"] for call in calls], [tool])
                 self.assertEqual(calls[0]["status"], "success")
                 self.assertEqual(normalized_answer, answer())
 
-    def test_normalize_rejects_codex_0158_unknown_structured_status_without_iserror(self) -> None:
+    def test_normalize_rejects_codex_0158_unknown_structured_status_without_iserror(
+        self,
+    ) -> None:
         cases = (
             ("ask_context", {"query": "finalizer"}, {}),
             ("ask_context", {"query": "finalizer"}, {"status": "failed"}),
@@ -5843,7 +10200,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "tool": tool,
                     "arguments": arguments,
                     "result": {
-                        "content": [{"type": "text", "text": json.dumps(structured_content)}],
+                        "content": [
+                            {"type": "text", "text": json.dumps(structured_content)}
+                        ],
                         "structured_content": structured_content,
                     },
                     "error": None,
@@ -5860,7 +10219,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         cases = (
             (
                 {"action": "read", "uri": "repobrief://frozen/a"},
-                {"content": [{"type": "text", "text": "list frozen resources before reading"}]},
+                {
+                    "content": [
+                        {"type": "text", "text": "list frozen resources before reading"}
+                    ]
+                },
             ),
             (
                 {"action": "list"},
@@ -5868,7 +10231,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "content": [
                         {
                             "type": "text",
-                            "text": "{\"code\":-32000,\"message\":\"unavailable\"}",
+                            "text": '{"code":-32000,"message":"unavailable"}',
                         }
                     ]
                 },
@@ -5880,8 +10243,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         {
                             "type": "text",
                             "text": (
-                                "{\"_meta\":{},\"contents\":[{\"mimeType\":\"text/plain\","
-                                "\"text\":\"wrong\",\"uri\":\"repobrief://frozen/other\"}]}"
+                                '{"_meta":{},"contents":[{"mimeType":"text/plain",'
+                                '"text":"wrong","uri":"repobrief://frozen/other"}]}'
                             ),
                         }
                     ]
@@ -5961,8 +10324,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerError, "paginated"):
             runner._freeze_resource_result({"resources": [], "nextCursor": "more"})
         with self.assertRaisesRegex(runner.RunnerError, "duplicate"):
-            runner._freeze_resource_result({"resources": [{"uri":"x"},{"uri":"x"}]})
-
+            runner._freeze_resource_result({"resources": [{"uri": "x"}, {"uri": "x"}]})
 
     def test_main_rejects_oversized_request_before_json_decode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -5973,11 +10335,16 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "-c",
                 bootstrap_program(),
                 str(MODULE_PATH),
-                "--request-root", str(root / "requests"),
-                "--repository-map", str(root / "repository-map.json"),
-                "--state-root", str(root / "state"),
-                "--transcript-root", str(root / "transcripts"),
-                "--provider-evidence-root", str(root / "provider-evidence"),
+                "--request-root",
+                str(root / "requests"),
+                "--repository-map",
+                str(root / "repository-map.json"),
+                "--state-root",
+                str(root / "state"),
+                "--transcript-root",
+                str(root / "transcripts"),
+                "--provider-evidence-root",
+                str(root / "provider-evidence"),
             ]
             completed = subprocess.run(
                 command,
@@ -5992,7 +10359,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 completed.stderr,
             )
 
-
     def test_staged_proxy_survives_later_source_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -6000,7 +10366,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             state_root.mkdir(mode=0o700)
             source = root / MODULE_PATH.name
             source.write_bytes(MODULE_PATH.read_bytes())
-            expected = {"name": source.name, "bytes": source.stat().st_size, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            expected = {
+                "name": source.name,
+                "bytes": source.stat().st_size,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
             with patch.object(runner, "__file__", str(source)):
                 binding = runner.stage_mcp_proxy(
                     state_root, expected, runtime_code_identity(runner.BASE_PATH)
@@ -6055,14 +10425,20 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             state_root.mkdir(mode=0o700)
             source = root / MODULE_PATH.name
             source.write_bytes(MODULE_PATH.read_bytes())
-            expected = {"name": source.name, "bytes": source.stat().st_size, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            expected = {
+                "name": source.name,
+                "bytes": source.stat().st_size,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
             with patch.object(runner, "__file__", str(source)):
                 binding = runner.stage_mcp_proxy(
                     state_root, expected, runtime_code_identity(runner.BASE_PATH)
                 )
             staged = Path(binding["path"])
             staged.write_text("# mutated stage\n", encoding="utf-8")
-            with self.assertRaisesRegex(runner.RunnerError, "proxy stage changed during execution"):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "proxy stage changed during execution"
+            ):
                 runner._revalidate_staged_mcp_proxy(binding)
             self.assertEqual(runner.cleanup_staged_mcp_proxy(binding), "RunnerError")
             self.assertTrue(staged.exists())
@@ -6074,7 +10450,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             state_root.mkdir(mode=0o700)
             source = root / MODULE_PATH.name
             source.write_bytes(MODULE_PATH.read_bytes())
-            expected = {"name": source.name, "bytes": source.stat().st_size, "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+            expected = {
+                "name": source.name,
+                "bytes": source.stat().st_size,
+                "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            }
             with patch.object(runner, "__file__", str(source)):
                 binding = runner.stage_mcp_proxy(
                     state_root, expected, runtime_code_identity(runner.BASE_PATH)
@@ -6102,8 +10482,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     proxy_path=Path(binding["path"]),
                     manifest_path=staged_manifest.resolve(),
                     mcp_runtime_root=state_root.resolve(),
+                    prepared_mcp_stage=synthetic_prepared_stage(root),
                 )
-            encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
+            encoded = next(
+                item
+                for item in command
+                if item.startswith("mcp_servers.repobrief.args=")
+            )
             proxy_args = json.loads(encoded.split("=", 1)[1])
             self.assertEqual(proxy_args[:2], ["-I", "-c"])
             self.assertEqual(proxy_args[2], bootstrap_program())
@@ -6135,7 +10520,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(runner.cleanup_staged_mcp_proxy(binding), "RunnerError")
             self.assertTrue(unexpected.exists())
 
-
     def test_codex_executable_must_match_preflight_provider_binding(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -6166,20 +10550,35 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             path = runner._runtime_code_path(name)
             original_paths[name] = path
             data = path.read_bytes()
-            code_files.append({
-                "name": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()
-            })
-        code = {"files": code_files, "bundle_sha256": runner.base._sha256_json(code_files)}
+            code_files.append(
+                {
+                    "name": name,
+                    "bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            )
+        code = {
+            "files": code_files,
+            "bundle_sha256": runner.base._sha256_json(code_files),
+        }
         with tempfile.TemporaryDirectory() as temporary:
             replacement = Path(temporary) / "repobrief_agent_benchmark_runner.py"
-            replacement.write_bytes(original_paths[replacement.name].read_bytes() + b"\n# drift\n")
+            replacement.write_bytes(
+                original_paths[replacement.name].read_bytes() + b"\n# drift\n"
+            )
+
             def runtime_path(name: str) -> Path:
                 return replacement if name == replacement.name else original_paths[name]
+
             with patch.object(runner, "_runtime_code_path", side_effect=runtime_path):
-                with self.assertRaisesRegex(runner.RunnerError, "runtime code changed after preflight"):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "runtime code changed after preflight"
+                ):
                     runner._validated_authorized_runtime_code(code)
 
-    def test_staged_manifest_survives_original_replacement_and_binds_command(self) -> None:
+    def test_staged_manifest_survives_original_replacement_and_binds_command(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
@@ -6212,8 +10611,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     proxy_path=(root / "bound-proxy.py").resolve(),
                     manifest_path=staged.resolve(),
                     mcp_runtime_root=state_root.resolve(),
+                    prepared_mcp_stage=synthetic_prepared_stage(root),
                 )
-            encoded = next(item for item in command if item.startswith("mcp_servers.repobrief.args="))
+            encoded = next(
+                item
+                for item in command
+                if item.startswith("mcp_servers.repobrief.args=")
+            )
             self.assertIn(str(staged), encoded)
             self.assertNotIn(str(manifest), encoded)
             runner._revalidate_staged_repoground_manifest(binding)
@@ -6238,9 +10642,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 file_identity(manifest),
             ]
 
-            first_stage = runner.stage_repoground_manifest(
-                state_root, authorized[-1]
-            )
+            first_stage = runner.stage_repoground_manifest(state_root, authorized[-1])
             staged_manifest = Path(first_stage["path"])
             rebound = runner._rebind_staged_manifest_authorization(
                 authorized, first_stage
@@ -6265,11 +10667,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 staged_manifest.read_bytes(),
             )
             self.assertIsNone(runner.cleanup_staged_mcp_upstream(second_stage))
-            self.assertIsNone(
-                runner.cleanup_staged_repoground_manifest(first_stage)
-            )
+            self.assertIsNone(runner.cleanup_staged_repoground_manifest(first_stage))
 
-    def test_staged_manifest_rebind_preserves_directory_bundle_authorization(self) -> None:
+    def test_staged_manifest_rebind_preserves_directory_bundle_authorization(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
@@ -6306,9 +10708,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 rebound,
             )
             self.assertIsNone(runner.cleanup_staged_mcp_upstream(second_stage))
-            self.assertIsNone(
-                runner.cleanup_staged_repoground_manifest(first_stage)
-            )
+            self.assertIsNone(runner.cleanup_staged_repoground_manifest(first_stage))
 
     def test_staged_manifest_preserves_relative_artifact_context(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -6403,9 +10803,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 file_identity(script),
                 file_identity(manifest),
             ]
-            first_stage = runner.stage_repoground_manifest(
-                state_root, authorized[-1]
-            )
+            first_stage = runner.stage_repoground_manifest(state_root, authorized[-1])
             staged_manifest = Path(first_stage["path"])
             artifact.write_text("drifted original\n", encoding="utf-8")
             rebound = runner._rebind_staged_manifest_authorization(
@@ -6434,11 +10832,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(completed.stdout, artifact_raw)
             self.assertIsNone(runner.cleanup_staged_mcp_upstream(second_stage))
-            self.assertIsNone(
-                runner.cleanup_staged_repoground_manifest(first_stage)
-            )
+            self.assertIsNone(runner.cleanup_staged_repoground_manifest(first_stage))
 
-    def test_live_dispatch_requires_terminal_success_before_second_condition(self) -> None:
+    def test_live_dispatch_requires_terminal_success_before_second_condition(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             treatment = request(condition="treatment")
@@ -6502,9 +10900,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             state = runner._validated_dispatch_event_state(
                 treatment, state_root, authorization
             )
-            self.assertEqual(
-                state["condition_intents"], ["baseline", "treatment"]
-            )
+            self.assertEqual(state["condition_intents"], ["baseline", "treatment"])
             self.assertEqual(
                 state["condition_outcomes"],
                 {"baseline": "condition-completed"},
@@ -6536,11 +10932,198 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertFalse(final_state["terminal_failure"])
             self.assertEqual(final_state["next_sequence"], 5)
 
+    def test_completed_condition_validator_failure_blocks_pair_replay(self) -> None:
+        # A completed runner condition may be rejected by pair QC, but
+        # its prior one-shot authorization must not permit treatment.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            treatment = request(condition="treatment")
+            manifest = root / "bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            treatment["repobrief"]["manifest"] = str(manifest)
+            treatment["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                manifest.read_bytes()
+            ).hexdigest()
+            baseline = request(
+                condition="baseline",
+                commit=treatment["repository"]["commit"],
+            )
+            state_root = write_dispatch_authorization(root, treatment, [])
+            authorization = runner._load_preflight_dispatch_authorization(
+                baseline, state_root
+            )["authorization"]
+            runner._record_preflight_dispatch_intent(
+                baseline, state_root, authorization
+            )
+            runner._record_preflight_dispatch_completed(
+                baseline,
+                state_root,
+                authorization,
+                {
+                    "transcript": {
+                        "sha256": "a" * 64,
+                        "bytes": 17,
+                        "artifact": "baseline.jsonl",
+                    }
+                },
+            )
+            previous = runner._validated_dispatch_event_state(
+                baseline, state_root, authorization
+            )
+            self.assertFalse(previous["terminal_failure"])
+            self.assertEqual(previous["next_sequence"], 3)
+            # Reopen the same original ledger from a fresh Python process,
+            # not a mock process nonce. A post-crash retry cannot resume after
+            # a completed condition, even if the DynamicUser/PID is reused.
+            replay_probe = r"""
+import importlib.util
+import json
+from pathlib import Path
+import sys
+module_path = Path(sys.argv[1]).resolve(strict=True)
+spec = importlib.util.spec_from_file_location(
+    "repobrief_agent_benchmark_codex_runner", module_path
+)
+guarded = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = guarded
+spec.loader.exec_module(guarded)
+request = json.loads(sys.argv[2])
+state_root = Path(sys.argv[3])
+baseline_request = json.loads(sys.argv[4])
+authorization = guarded._load_preflight_dispatch_authorization(
+    baseline_request, state_root
+)["authorization"]
+try:
+    guarded._record_preflight_dispatch_intent(
+        request, state_root, authorization
+    )
+except guarded.RunnerError as exc:
+    assert "cannot resume after process restart" in str(exc), str(exc)
+else:
+    raise AssertionError("fresh process re-dispatched a completed pair")
+print("PREVIOUS_COMPLETION_REPLAY_BLOCKED")
+"""
+            resumed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-c",
+                    replay_probe,
+                    str(MODULE_PATH),
+                    json.dumps(treatment),
+                    str(state_root),
+                    json.dumps(baseline),
+                ],
+                capture_output=True,
+                check=False,
+                timeout=15,
+            )
+            self.assertEqual(resumed.returncode, 0, resumed.stderr[-2048:])
+            self.assertEqual(resumed.stdout, b"PREVIOUS_COMPLETION_REPLAY_BLOCKED\n")
+            self.assertEqual(
+                runner._validated_dispatch_event_state(
+                    baseline, state_root, authorization
+                )["next_sequence"],
+                3,
+            )
+            event_sha = runner._record_preflight_dispatch_pair_failed(
+                baseline,
+                state_root,
+                authorization,
+                runner.RunnerError("external validator rejected receipt"),
+            )
+            state = runner._validated_dispatch_event_state(
+                baseline, state_root, authorization
+            )
+            self.assertEqual(state["next_sequence"], 4)
+            self.assertTrue(state["terminal_failure"])
+            self.assertEqual(
+                state["condition_outcomes"], {"baseline": "condition-completed"}
+            )
+            self.assertEqual(state["previous_event_sha256"], event_sha)
+            self.assertTrue((state["events_root"] / "0003-pair-failed.json").is_file())
+            self.assertEqual(
+                runner._record_preflight_dispatch_pair_failed(
+                    baseline,
+                    state_root,
+                    authorization,
+                    runner.RunnerError("another failure"),
+                ),
+                event_sha,
+            )
+            with self.assertRaisesRegex(runner.RunnerError, "terminal after failure"):
+                runner._record_preflight_dispatch_intent(
+                    treatment, state_root, authorization
+                )
+
+    def test_direct_live_provider_one_shot_verifier_missing_fail_closed(self) -> None:
+        with self.assertRaisesRegex(
+            runner.RunnerError, "external one-shot provider authorization"
+        ):
+            runner._require_external_provider_one_shot(
+                request=request(condition="baseline"),
+                authorization={"internal_dispatch_ledger": True},
+            )
+
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
+    def test_missing_external_one_shot_denies_before_login_and_workspace(self) -> None:
+        # Authorizing an internal ledger is not paid-provider consent. Even
+        # fake Codex login and checkout creation must be unreachable.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request()
+            planned_request_root(root, value)
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "repositories.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "provider-evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            with (
+                patch.object(runner, "validate_executable", return_value="/opt/codex"),
+                patch.object(
+                    runner,
+                    "_load_preflight_dispatch_authorization",
+                    return_value={
+                        "authorization": {"contract": "internal-only"},
+                        "provider_codex": {},
+                    },
+                ),
+                patch.object(runner, "_assert_authorized_codex_executable"),
+                patch.object(runner, "validate_toolchain") as toolchain,
+                patch.object(runner, "validate_chatgpt_subscription") as login,
+                patch.object(runner, "prepare_provider_evidence") as evidence,
+                patch.object(runner, "create_checkout") as checkout,
+                patch.object(runner, "_record_preflight_dispatch_intent") as intent,
+                patch.object(runner, "run_bounded") as provider,
+                self.assertRaisesRegex(
+                    runner.RunnerError, "external one-shot provider authorization"
+                ),
+            ):
+                runner.execute(value, args)
+            toolchain.assert_not_called()
+            login.assert_not_called()
+            evidence.assert_not_called()
+            checkout.assert_not_called()
+            intent.assert_not_called()
+            provider.assert_not_called()
+
     def test_failed_or_ambiguous_first_dispatch_terminalizes_pair(self) -> None:
         for provider_process_started in (False, True):
-            with self.subTest(
-                provider_process_started=provider_process_started
-            ), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(provider_process_started=provider_process_started),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 treatment = request(condition="treatment")
                 manifest = root / "bundle.manifest.json"
@@ -6553,9 +11136,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     condition="baseline",
                     commit=treatment["repository"]["commit"],
                 )
-                state_root = write_dispatch_authorization(
-                    root, treatment, []
-                )
+                state_root = write_dispatch_authorization(root, treatment, [])
                 authorization = runner._load_preflight_dispatch_authorization(
                     baseline, state_root
                 )["authorization"]
@@ -6591,9 +11172,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     failed["payload"]["outcome_ambiguous"],
                     provider_process_started,
                 )
-                self.assertIsNone(
-                    failed["payload"]["observed_cost_usd"]
-                )
+                self.assertIsNone(failed["payload"]["observed_cost_usd"])
                 with self.assertRaisesRegex(
                     runner.RunnerError,
                     "pair is terminal after failure",
@@ -6681,9 +11260,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 baseline,
                 state_root,
                 authorization,
-                runner.RunnerError(
-                    "simulated post-write directory validation failure"
-                ),
+                runner.RunnerError("simulated post-write directory validation failure"),
                 provider_process_started=False,
             )
             terminal = runner._validated_dispatch_event_state(
@@ -6757,8 +11334,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ):
                 runner._manifest_artifact_paths(manifest, manifest.read_bytes())
 
-
-    def test_raw_persistence_failure_gets_best_effort_diagnostics_without_semantics(self) -> None:
+    def test_raw_persistence_failure_gets_best_effort_diagnostics_without_semantics(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             value = request()
@@ -6779,12 +11357,15 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 "stderr_overflow": False,
             }
             now = datetime.now(timezone.utc)
-            with patch.object(
-                runner, "_write_private_dirfd", side_effect=selective_write
-            ), patch.object(
-                runner,
-                "classify_stderr",
-                side_effect=AssertionError("semantic classifier must not run"),
+            with (
+                patch.object(
+                    runner, "_write_private_dirfd", side_effect=selective_write
+                ),
+                patch.object(
+                    runner,
+                    "classify_stderr",
+                    side_effect=AssertionError("semantic classifier must not run"),
+                ),
             ):
                 with self.assertRaisesRegex(
                     runner.RunnerError, "failure_diagnostics_sha256"
@@ -6805,13 +11386,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             self.assertEqual(
                 diagnostics["raw_persisted"], {"stdout": False, "stderr": True}
             )
-            self.assertEqual(
-                diagnostics["semantic_interpretation"], "not_performed"
-            )
+            self.assertEqual(diagnostics["semantic_interpretation"], "not_performed")
             self.assertFalse(
                 (root / "provider-evidence" / names["stderr_policy"]).exists()
             )
-
 
     def test_manifest_artifact_contract_rejects_malformed_entries(self) -> None:
         cases = (
@@ -6828,7 +11406,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ),
         )
         for artifact, pattern in cases:
-            with self.subTest(artifact=artifact), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(artifact=artifact),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 manifest = root / "chosen.bundle.manifest.json"
                 manifest.write_text(
@@ -6836,12 +11417,11 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 with self.assertRaisesRegex(runner.RunnerError, pattern):
-                    runner._manifest_artifact_paths(
-                        manifest, manifest.read_bytes()
-                    )
+                    runner._manifest_artifact_paths(manifest, manifest.read_bytes())
 
-
-    def test_manifest_artifact_contract_rejects_conflicting_duplicate_paths(self) -> None:
+    def test_manifest_artifact_contract_rejects_conflicting_duplicate_paths(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             artifact = root / "brief.md"
@@ -6879,7 +11459,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             paths = runner._manifest_artifact_paths(manifest, manifest.read_bytes())
             self.assertEqual(len(paths), 1)
             self.assertEqual(paths[0][0], Path("brief.md"))
-
 
     def test_manifest_artifact_contract_enforces_aggregate_budgets(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -6929,12 +11508,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with patch.object(runner, "MAX_MCP_MANIFEST_ARTIFACTS", 1):
-                paths = runner._manifest_artifact_paths(
-                    manifest, manifest.read_bytes()
-                )
+                paths = runner._manifest_artifact_paths(manifest, manifest.read_bytes())
             self.assertEqual(len(paths), 1)
 
-    def test_staged_manifest_rejects_missing_or_nonregular_identity_artifact(self) -> None:
+    def test_staged_manifest_rejects_missing_or_nonregular_identity_artifact(
+        self,
+    ) -> None:
         for mode in ("missing", "directory", "symlink"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -6984,8 +11563,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(runner.RunnerError, pattern):
                     runner.stage_repoground_manifest(state_root, expected)
 
-
-    def test_manifest_stages_reject_declared_size_mismatch_before_content_read(self) -> None:
+    def test_manifest_stages_reject_declared_size_mismatch_before_content_read(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_root = root / "state"
@@ -7020,9 +11600,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     raise AssertionError(
                         "first stage must reject actual size before artifact content read"
                     )
-                return original_snapshot(
-                    path, label=label, max_bytes=max_bytes
-                )
+                return original_snapshot(path, label=label, max_bytes=max_bytes)
 
             with patch.object(
                 runner,
@@ -7057,9 +11635,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     raise AssertionError(
                         "second stage must reject actual size before artifact content read"
                     )
-                return original_snapshot(
-                    path, label=label, max_bytes=max_bytes
-                )
+                return original_snapshot(path, label=label, max_bytes=max_bytes)
 
             with patch.object(
                 runner,
@@ -7114,7 +11690,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             ):
                 runner.stage_repoground_manifest(state_root, expected)
 
-    def test_preflight_authorization_rejects_legacy_projected_request_hash(self) -> None:
+    def test_preflight_authorization_rejects_legacy_projected_request_hash(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             script = root / "server.py"
@@ -7123,17 +11701,30 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             manifest.write_text("{}\n", encoding="utf-8")
             value = request(condition="treatment")
             value["repobrief"]["manifest"] = str(manifest)
-            value["repobrief"]["manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
-            value["repobrief"]["mcp_command"] = [str(Path(sys.executable).resolve()), str(script), "--bundle-root", str(root)]
+            value["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                manifest.read_bytes()
+            ).hexdigest()
+            value["repobrief"]["mcp_command"] = [
+                str(Path(sys.executable).resolve()),
+                str(script),
+                "--bundle-root",
+                str(root),
+            ]
             authorized = [file_identity(Path(sys.executable)), file_identity(script)]
             state_root = write_dispatch_authorization(root, value, authorized)
-            authorization_path = next((state_root / "preflight-dispatch-ledger").glob("*/authorization.json"))
-            authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
-            authorization["binding"]["requests"]["treatment"]["sha256"] = runner.base._sha256_json(
-                runner._preflight_request_projection(value)
+            authorization_path = next(
+                (state_root / "preflight-dispatch-ledger").glob("*/authorization.json")
             )
-            authorization["contract_sha256"] = runner.base._sha256_json(authorization["binding"])
-            authorization_path.write_text(json.dumps(authorization, sort_keys=True), encoding="utf-8")
+            authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
+            authorization["binding"]["requests"]["treatment"]["sha256"] = (
+                runner.base._sha256_json(runner._preflight_request_projection(value))
+            )
+            authorization["contract_sha256"] = runner.base._sha256_json(
+                authorization["binding"]
+            )
+            authorization_path.write_text(
+                json.dumps(authorization, sort_keys=True), encoding="utf-8"
+            )
             authorization_path.chmod(0o600)
             with self.assertRaisesRegex(runner.RunnerError, "treatment request"):
                 runner._load_preflight_mcp_authorization(value, state_root)
@@ -7149,7 +11740,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             manifest = root / "chosen.bundle.manifest.json"
             manifest.write_text("{}\n", encoding="utf-8")
             authorized = [file_identity(executable), file_identity(script)]
-            with patch.object(runner.Path, "cwd", side_effect=AssertionError("runtime cwd must not resolve an authorized relative script")):
+            with patch.object(
+                runner.Path,
+                "cwd",
+                side_effect=AssertionError(
+                    "runtime cwd must not resolve an authorized relative script"
+                ),
+            ):
                 argv, bindings, _manifest_authorization = runner._bind_mcp_upstream(
                     [str(executable), "server.py", "--bundle-root", str(root)],
                     manifest,
@@ -7160,7 +11757,10 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
 
     def test_mcp_proxy_rejects_invalid_client_params_before_forwarding(self) -> None:
         for params in (None, 1, "invalid", True):
-            with self.subTest(params=params), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(params=params),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 marker = root / "forwarded"
                 upstream = root / "mcp.py"
@@ -7172,7 +11772,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "    marker.write_text(line, encoding='utf-8')\n",
                     encoding="utf-8",
                 )
-                message = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": params}
+                message = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": params,
+                }
                 completed = subprocess.run(
                     proxy_command(upstream, root),
                     input=json.dumps(message).encode() + b"\n",
@@ -7183,7 +11788,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 self.assertNotEqual(completed.returncode, 0)
                 self.assertIn(b"benchmark MCP proxy stream failed", completed.stderr)
                 self.assertFalse(marker.exists())
-
 
     def test_source_bootstrap_path_identity_comes_from_open_descriptor(self) -> None:
         source = BOOTSTRAP_PATH.read_text(encoding="utf-8")
@@ -7203,8 +11807,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(identity["path"], str(target))
         self.assertEqual(identity["name"], target.name)
 
-
-
     def test_source_bootstrap_rejects_symlinked_parent_path(self) -> None:
         source = BOOTSTRAP_PATH.read_text(encoding="utf-8")
         prefix, separator, _tail = source.rpartition("\n_main()")
@@ -7220,7 +11822,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             target.write_bytes(b"VALUE = 4\n")
             alias_parent = root / "alias"
             alias_parent.symlink_to(real_parent, target_is_directory=True)
-            with self.assertRaisesRegex(RuntimeError, "symlink-free|opened target path"):
+            with self.assertRaisesRegex(
+                RuntimeError, "symlink-free|opened target path"
+            ):
                 read_target(alias_parent / target.name)
 
     def test_source_snapshot_path_identity_comes_from_open_descriptor(self) -> None:
@@ -7246,7 +11850,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "symlink-free|opened path"):
                 runner._read_source_snapshot(alias_parent / target.name)
 
-    def test_runtime_file_snapshot_path_identity_comes_from_open_descriptor(self) -> None:
+    def test_runtime_file_snapshot_path_identity_comes_from_open_descriptor(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "manifest.json"
             target.write_bytes(b"{}\n")
@@ -7260,7 +11866,6 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(raw, b"{}\n")
         self.assertEqual(identity["path"], str(target))
         self.assertEqual(identity["sha256"], hashlib.sha256(raw).hexdigest())
-
 
     def test_runtime_file_snapshot_rejects_symlinked_parent_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -7298,16 +11903,23 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
                 "manifest_sha256": runner.FROZEN_G1_LEGACY_IDENTITY["manifest_sha256"],
                 "stem": "lenskit",
             },
-            "freshness": {"status": "not_comparable", "caveats": [
-                {"kind": "stale_snapshot", "detail": "Freshness is not comparable."}
-            ]},
+            "freshness": {
+                "status": "not_comparable",
+                "caveats": [
+                    {"kind": "stale_snapshot", "detail": "Freshness is not comparable."}
+                ],
+            },
             "availability": {"status": "unknown", "caveats": []},
             "required_reading": {
-                "status": "pass", "task_profile": "basic_repo_question",
-                "required": ["agent_reading_pack"], "recommended": ["citation_map_jsonl"],
-                "missing_required": [], "missing_recommended": [],
+                "status": "pass",
+                "task_profile": "basic_repo_question",
+                "required": ["agent_reading_pack"],
+                "recommended": ["citation_map_jsonl"],
+                "missing_required": [],
+                "missing_recommended": [],
             },
-            "retrieval_hits": [], "resolved_ranges": [],
+            "retrieval_hits": [],
+            "resolved_ranges": [],
             "answer_scaffold": {
                 "citation_obligations": ["Cite evidence."],
                 "caveats_to_surface": [
@@ -7318,23 +11930,28 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
                 ),
             },
             "budget": {
-                "max_context_tokens": 8000, "max_answer_tokens": 1200,
-                "approx_context_chars_used": 0, "truncated": False,
+                "max_context_tokens": 8000,
+                "max_answer_tokens": 1200,
+                "approx_context_chars_used": 0,
+                "truncated": False,
                 "does_not_establish_quality": True,
             },
-            "forbidden_operations": list(runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS),
+            "forbidden_operations": list(
+                runner.EXPECTED_ASK_CONTEXT_FORBIDDEN_OPERATIONS
+            ),
             "does_not_establish": list(
                 runner.EXPECTED_REPOGROUND_EVIDENCE_DOES_NOT_ESTABLISH
             ),
         }
 
-    def test_historical_g1_pack_accepted_without_inventing_modern_evidence(self) -> None:
+    def test_historical_g1_pack_accepted_without_inventing_modern_evidence(
+        self,
+    ) -> None:
         manifest = Path("/frozen/lenskit.bundle.manifest.json")
         pack = self._historical_pack(manifest)
         self.assertEqual(
-            runner._validated_frozen_g1_context_pack(
-                pack, expected_manifest=manifest
-            ), pack
+            runner._validated_frozen_g1_context_pack(pack, expected_manifest=manifest),
+            pack,
         )
         with self.assertRaises(runner.RunnerError):
             runner._validated_ask_context_pack(pack)
@@ -7381,7 +11998,9 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
                         pack, expected_manifest=manifest
                     )
 
-    def test_historical_g1_profile_is_bound_to_exact_request_not_schema_fallback(self) -> None:
+    def test_historical_g1_profile_is_bound_to_exact_request_not_schema_fallback(
+        self,
+    ) -> None:
         frozen = runner.FROZEN_G1_LEGACY_IDENTITY
         manifest = "/frozen/lenskit.bundle.manifest.json"
         req = request(condition="treatment")
@@ -7393,14 +12012,20 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
             setup={"working_tree": "clean", "fixture": "fresh-matching-snapshot"},
         )
         req["repobrief"] = {
-            "manifest": manifest, "manifest_sha256": frozen["manifest_sha256"],
+            "manifest": manifest,
+            "manifest_sha256": frozen["manifest_sha256"],
             "mcp_command": [
-                frozen["python_path"], frozen["launcher_path"],
-                "--bundle-root", manifest, "--repo-root", frozen["source_root"],
+                frozen["python_path"],
+                frozen["launcher_path"],
+                "--bundle-root",
+                manifest,
+                "--repo-root",
+                frozen["source_root"],
             ],
         }
         with patch.dict(
-            frozen, {"prompt_sha256": hashlib.sha256(req["prompt"].encode()).hexdigest()}
+            frozen,
+            {"prompt_sha256": hashlib.sha256(req["prompt"].encode()).hexdigest()},
         ):
             self.assertEqual(
                 runner._frozen_g1_mcp_profile(req), runner.MCP_PROFILE_FROZEN_G1
@@ -7425,7 +12050,9 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
                 runner.MCP_PROFILE_MODERN,
             )
 
-    def test_historical_g1_vendor_freeze_rejects_source_edits_and_symlinks(self) -> None:
+    def test_historical_g1_vendor_freeze_rejects_source_edits_and_symlinks(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             site = root / "site"
@@ -7437,19 +12064,29 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
             typing = root / "typing_extensions.py"
             typing.write_bytes(b"typing helper\\n")
             typing.chmod(0o600)
+
             def manifest_sha() -> str:
                 entries = [
-                    {"p": "jsonschema/__init__.py", "n": source.stat().st_size,
-                     "h": hashlib.sha256(source.read_bytes()).hexdigest()},
-                    {"p": "typing_extensions.py", "n": typing.stat().st_size,
-                     "h": hashlib.sha256(typing.read_bytes()).hexdigest()},
+                    {
+                        "p": "jsonschema/__init__.py",
+                        "n": source.stat().st_size,
+                        "h": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    },
+                    {
+                        "p": "typing_extensions.py",
+                        "n": typing.stat().st_size,
+                        "h": hashlib.sha256(typing.read_bytes()).hexdigest(),
+                    },
                 ]
                 return runner.sha_bytes(runner.canonical(entries).encode())
+
             with (
                 patch.object(runner, "FROZEN_G1_VENDOR_SITE_ROOT", site),
                 patch.object(runner, "FROZEN_G1_VENDOR_TYPING_EXT", typing),
                 patch.object(runner, "FROZEN_G1_VENDOR_PACKAGES", ("jsonschema",)),
-                patch.object(runner, "FROZEN_G1_VENDOR_MANIFEST_SHA256", manifest_sha()),
+                patch.object(
+                    runner, "FROZEN_G1_VENDOR_MANIFEST_SHA256", manifest_sha()
+                ),
             ):
                 entries = runner._frozen_g1_vendor_snapshot()
                 self.assertEqual(len(entries), 2)
@@ -7483,14 +12120,71 @@ class FrozenG1HistoricalMcpContractTests(unittest.TestCase):
 class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
     """Frozen G1 dependency corruption must not consume a paid one-shot."""
 
-    def test_vendor_failure_before_one_shot_intent_prevents_provider_start(self) -> None:
+    def _assert_postflight_kernel_namespace_available(self) -> None:
+        """Diagnose the exact bwrap + seccomp precondition, without a provider.
+
+        This must not replace or suppress security integration assertions:
+        any inability to create the sandbox is reported as a real failure.
+        """
+        probe = [
+            "/usr/bin/bwrap",
+            "--ro-bind",
+            "/",
+            "/",
+            "--unshare-ipc",
+            "--unshare-pid",
+            "--die-with-parent",
+            "--new-session",
+            "--tmpfs",
+            "/tmp",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--chdir",
+            "/",
+            "--",
+            runner._validated_mcp_proxy_python(),
+            "-I",
+            "-c",
+            "print('RAB_POSTFLIGHT_NAMESPACE_OK')",
+        ]
+        try:
+            result = subprocess.run(
+                runner._unix_socket_restricted_codex_argv(probe, block_network=True),
+                env=runner.base._git_environment(),
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.fail(f"postflight namespace setup unavailable: {type(exc).__name__}")
+        if (
+            result.returncode != 0
+            or result.stdout.strip() != b"RAB_POSTFLIGHT_NAMESPACE_OK"
+        ):
+            self.fail(
+                "postflight namespace setup failed before Git readback: "
+                f"rc={result.returncode}, stderr={result.stderr[:400]!r}, "
+                f"stdout={result.stdout[:160]!r}"
+            )
+
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
+    def test_vendor_failure_before_one_shot_intent_prevents_provider_start(
+        self,
+    ) -> None:
         for failure in (
             "historical G1 vendor source is unavailable or linked",
             "historical G1 vendor source digest is not frozen",
             "historical G1 vendor path is unsafe",
             "historical G1 vendor metadata is unsafe",
         ):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 value = request(condition="treatment")
                 manifest = root / "manifest.json"
@@ -7522,7 +12216,9 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                     "provider_codex": {},
                     "provider_authentication": {},
                     "repository_map_bytes": b"{}",
-                    "binding": {},
+                    "binding": {
+                        "mcp_command_files": synthetic_paired_mcp_files(legacy_g1=True)
+                    },
                     "mcp_files": [],
                     "proxy_code": {},
                     "proxy_base_code": {},
@@ -7540,7 +12236,8 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                         ("stage_mcp_proxy", {"path": str(root / "proxy.py")}),
                         ("stage_repoground_manifest", {"path": str(manifest)}),
                         ("_rebind_staged_manifest_authorization", []),
-                        ("build_command", ["codex"]),
+                        ("build_command", ["/opt/codex"]),
+                        ("_preintent_output_entry_reservation", 12),
                         ("provider_env", {}),
                         ("cleanup_codex_home", None),
                         ("cleanup_staged_mcp_proxy", None),
@@ -7551,39 +12248,44 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                         )
                     for name in (
                         "_assert_authorized_codex_executable",
+                        "_require_external_provider_one_shot",
                         "_assert_authorized_chatgpt_auth",
+                        "validate_codex_linux_sandbox_before_intent",
                         "_assert_authorized_runtime_binding",
+                        "validate_live_immutable_mounts",
                         "close_provider_evidence_plan",
                         "write_schema",
                     ):
                         stack.enter_context(patch.object(runner, name))
                     stack.enter_context(
                         patch.object(
-                            runner, "_load_preflight_dispatch_authorization",
+                            runner,
+                            "_load_preflight_dispatch_authorization",
                             return_value=dispatch,
                         )
                     )
                     stack.enter_context(
                         patch.object(
-                            runner, "_frozen_g1_mcp_profile",
+                            runner,
+                            "_frozen_g1_mcp_profile",
                             return_value=runner.MCP_PROFILE_FROZEN_G1,
                         )
                     )
                     frozen_vendor = stack.enter_context(
                         patch.object(
-                            runner, "_frozen_g1_vendor_snapshot",
+                            runner,
+                            "_frozen_g1_vendor_snapshot",
                             side_effect=runner.RunnerError(failure),
                         )
                     )
                     intent = stack.enter_context(
                         patch.object(runner, "_record_preflight_dispatch_intent")
                     )
-                    provider = stack.enter_context(
-                        patch.object(runner, "run_bounded")
-                    )
+                    provider = stack.enter_context(patch.object(runner, "run_bounded"))
                     stack.enter_context(
                         patch.object(
-                            runner.base, "attest_checkout_setup",
+                            runner.base,
+                            "attest_checkout_setup",
                             return_value={"working_tree": "clean"},
                         )
                     )
@@ -7595,18 +12297,18 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 intent.assert_not_called()
                 provider.assert_not_called()
 
-
-
     def test_frozen_g1_baseline_pair_has_exact_identity(self) -> None:
         value = request(condition="baseline")
         identity = dict(runner.FROZEN_G1_LEGACY_IDENTITY)
-        identity.update({
-            "taskset_id": value["taskset_id"],
-            "taskset_sha256": value["taskset_sha256"],
-            "case_id": value["case_id"],
-            "repository": value["repository"],
-            "prompt_sha256": hashlib.sha256(value["prompt"].encode()).hexdigest(),
-        })
+        identity.update(
+            {
+                "taskset_id": value["taskset_id"],
+                "taskset_sha256": value["taskset_sha256"],
+                "case_id": value["case_id"],
+                "repository": value["repository"],
+                "prompt_sha256": hashlib.sha256(value["prompt"].encode()).hexdigest(),
+            }
+        )
         with patch.object(runner, "FROZEN_G1_LEGACY_IDENTITY", identity):
             self.assertTrue(runner._frozen_g1_baseline_pair(value))
             for key, other in (
@@ -7616,14 +12318,20 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
             ):
                 modified = json.loads(json.dumps(value))
                 modified[key] = other
-                with self.subTest(key=key), self.assertRaisesRegex(
-                    runner.RunnerError, "baseline identity is not authorized"
+                with (
+                    self.subTest(key=key),
+                    self.assertRaisesRegex(
+                        runner.RunnerError, "baseline identity is not authorized"
+                    ),
                 ):
                     runner._frozen_g1_baseline_pair(modified)
             unrelated = json.loads(json.dumps(value))
             unrelated["case_id"] = "ordinary-modern-case"
             self.assertFalse(runner._frozen_g1_baseline_pair(unrelated))
 
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
     def test_frozen_g1_baseline_vendor_failure_blocks_first_intent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -7651,13 +12359,22 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 "provider_codex": {},
                 "provider_authentication": {},
                 "repository_map_bytes": b"{}",
-                "binding": {},
+                "binding": {
+                    "mcp_command_files": synthetic_paired_mcp_files(legacy_g1=True)
+                },
                 "mcp_files": [],
                 "proxy_code": None,
                 "proxy_base_code": None,
                 "manifest": None,
             }
             with ExitStack() as stack:
+                # This test isolates another failure boundary; the real pair
+                # reservation contract is tested independently.
+                stack.enter_context(
+                    patch.object(
+                        runner, "_preintent_output_entry_reservation", return_value=4
+                    )
+                )
                 for name, result in (
                     ("validate_executable", "/opt/codex"),
                     ("validate_toolchain", None),
@@ -7666,22 +12383,26 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                     ("prepare_provider_evidence", {"plan": True}),
                     ("create_checkout", checkout),
                     ("stage_codex_home", codex_home),
-                    ("build_command", ["codex"]),
+                    ("build_command", ["/opt/codex"]),
                     ("provider_env", {}),
                     ("cleanup_codex_home", None),
                 ):
                     stack.enter_context(patch.object(runner, name, return_value=result))
                 for name in (
                     "_assert_authorized_codex_executable",
+                    "_require_external_provider_one_shot",
                     "_assert_authorized_chatgpt_auth",
+                    "validate_codex_linux_sandbox_before_intent",
                     "_assert_authorized_runtime_binding",
+                    "validate_live_immutable_mounts",
                     "close_provider_evidence_plan",
                     "write_schema",
                 ):
                     stack.enter_context(patch.object(runner, name))
                 stack.enter_context(
                     patch.object(
-                        runner, "_load_preflight_dispatch_authorization",
+                        runner,
+                        "_load_preflight_dispatch_authorization",
                         return_value=dispatch,
                     )
                 )
@@ -7690,7 +12411,8 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 )
                 vendor = stack.enter_context(
                     patch.object(
-                        runner, "_frozen_g1_vendor_snapshot",
+                        runner,
+                        "_frozen_g1_vendor_snapshot",
                         side_effect=runner.RunnerError("historical G1 vendor missing"),
                     )
                 )
@@ -7700,7 +12422,8 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 provider = stack.enter_context(patch.object(runner, "run_bounded"))
                 stack.enter_context(
                     patch.object(
-                        runner.base, "attest_checkout_setup",
+                        runner.base,
+                        "attest_checkout_setup",
                         return_value={"working_tree": "clean"},
                     )
                 )
@@ -7709,6 +12432,393 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
             vendor.assert_called_once_with()
             intent.assert_not_called()
             provider.assert_not_called()
+
+    def test_untrusted_checkout_fsmonitor_cannot_get_parent_rpc_or_inet(self) -> None:
+        self._assert_postflight_kernel_namespace_available()
+        # A negative control proves the Git fsmonitor hook would actually run
+        # and write to private /tmp if its explicit disabling were removed.
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-postflight-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            value = request(commit=commit)
+            value["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(value, source, state)
+            script = root / "untrusted-fsmonitor"
+            script.write_text(
+                "#!/usr/bin/python3\n"
+                "from pathlib import Path\n"
+                "Path('/tmp/rab-fsmonitor-executed').write_text('YES')\n",
+                encoding="utf-8",
+            )
+            script.chmod(0o700)
+            subprocess.run(
+                [
+                    "/usr/bin/git",
+                    "-C",
+                    str(checkout),
+                    "config",
+                    "--local",
+                    "core.fsmonitor",
+                    str(script),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+            os.utime(checkout / "src" / "example.py", None)
+            target = 'scenario = {\n    "working_tree": setup,'
+            original = runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM
+            self.assertEqual(original.count(target), 1)
+            detection = (
+                "from pathlib import Path as HookPath\n"
+                "if HookPath('/tmp/rab-fsmonitor-executed').exists():\n"
+                " raise RuntimeError('Git invoked the untrusted fsmonitor')\n"
+            )
+            qualified = original.replace(target, detection + target)
+            with patch.object(runner, "_POST_PROVIDER_GIT_ISOLATED_PROGRAM", qualified):
+                attested = runner._secure_post_provider_checkout_readback(
+                    value, checkout, source
+                )
+            self.assertEqual(attested["working_tree"], "clean")
+
+            unprotected = qualified.replace(
+                '"GIT_CONFIG_KEY_0": "core.fsmonitor"',
+                '"GIT_CONFIG_KEY_0": "core.logAllRefUpdates"',
+            )
+            self.assertNotEqual(unprotected, qualified)
+            # Even when the Git fsmonitor override is removed, no command is
+            # run against the provider-writable checkout. The independent
+            # clean-filter RED test proves ordinary Git status can be forged.
+            with patch.object(
+                runner, "_POST_PROVIDER_GIT_ISOLATED_PROGRAM", unprotected
+            ):
+                attested = runner._secure_post_provider_checkout_readback(
+                    value, checkout, source
+                )
+                self.assertEqual(attested["working_tree"], "clean")
+
+    def test_postprovider_git_child_rejects_real_host_file_write(self) -> None:
+        self._assert_postflight_kernel_namespace_available()
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-postflight-ro-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            value = request(commit=commit)
+            value["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(value, source, state)
+            marker = checkout / "FORBIDDEN_POST_PROVIDER_HOST_WRITE"
+            target = 'scenario = {\n    "working_tree": setup,'
+            self.assertEqual(
+                runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM.count(target), 1
+            )
+            injection = (
+                "try:\n"
+                " (checkout / 'FORBIDDEN_POST_PROVIDER_HOST_WRITE').write_bytes(b'BAD')\n"
+                "except OSError:\n"
+                " pass\n"
+                "else:\n"
+                " raise RuntimeError('host write was allowed')\n"
+            )
+            with patch.object(
+                runner,
+                "_POST_PROVIDER_GIT_ISOLATED_PROGRAM",
+                runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM.replace(
+                    target, injection + target
+                ),
+            ):
+                result = runner._secure_post_provider_checkout_readback(
+                    value, checkout, source
+                )
+            self.assertEqual(result["working_tree"], "clean")
+            self.assertFalse(marker.exists(), "post-Git sandbox wrote a host file")
+
+    def test_git_postflight_output_flood_is_kernel_contained_and_bounded(self) -> None:
+        self._assert_postflight_kernel_namespace_available()
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-postflight-flood-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            value = request(commit=commit)
+            value["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(value, source, state)
+            anchor = 'scenario = {\n    "working_tree": setup,'
+            self.assertEqual(
+                runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM.count(anchor), 1
+            )
+            noisy = "import os\nos.write(1, b'X' * 65536)\n" + anchor
+            actual = runner.run_bounded
+            observations = []
+
+            def observe(*args, **kwargs):
+                self.assertEqual(kwargs["stdout_limit"], 8192)
+                self.assertEqual(kwargs["stderr_limit"], 8192)
+                result = actual(*args, **kwargs)
+                observations.append(result)
+                return result
+
+            with (
+                patch.object(
+                    runner,
+                    "_POST_PROVIDER_GIT_ISOLATED_PROGRAM",
+                    runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM.replace(anchor, noisy),
+                ),
+                patch.object(runner, "run_bounded", side_effect=observe),
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "post-provider Git isolation failed"
+                ):
+                    runner._secure_post_provider_checkout_readback(
+                        value, checkout, source
+                    )
+            self.assertEqual(len(observations), 1)
+            self.assertTrue(observations[0]["stdout_overflow"])
+            self.assertLessEqual(len(observations[0]["stdout"]), 8193)
+
+    def test_git_postflight_rejects_drifted_captured_base_before_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, checkout = root / "src", root / "checkout"
+            source.mkdir()
+            checkout.mkdir()
+            identity = dict(runner.base.__grabowski_source_identity__)
+            identity["sha256"] = "0" * 64
+            with (
+                patch.object(
+                    runner,
+                    "_read_source_snapshot",
+                    return_value=(b"untrusted base code", identity),
+                ),
+                patch.object(runner, "run_bounded") as child,
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "base source differs from captured code"
+                ):
+                    runner._secure_post_provider_checkout_readback(
+                        request(), checkout, source
+                    )
+                child.assert_not_called()
+
+    def test_seccomp_postprovider_mode_denies_all_socket_creation(self) -> None:
+        child = (
+            "import errno,socket\n"
+            "for family in (socket.AF_UNIX,socket.AF_INET,socket.AF_INET6):\n"
+            " try:\n"
+            "  s=socket.socket(family,socket.SOCK_STREAM);s.close()\n"
+            "  raise RuntimeError('new socket was unexpectedly allowed')\n"
+            " except OSError as error:\n"
+            "  assert error.errno==errno.EPERM,(family,error.errno)\n"
+            "print('GIT_POSTFLIGHT_NO_NETWORK_PROVEN')\n"
+        )
+        command = runner._unix_socket_restricted_codex_argv(
+            [str(Path(sys.executable).resolve()), "-I", "-c", child],
+            block_network=True,
+        )
+        process = subprocess.run(command, check=False, capture_output=True, timeout=20)
+        self.assertEqual(process.returncode, 0, process.stderr[-1000:])
+        self.assertIn(b"GIT_POSTFLIGHT_NO_NETWORK_PROVEN", process.stdout)
+
+    def test_postflight_rejects_git_clean_filter_false_clean(self) -> None:
+        # Control: Git status can be tricked into a false clean result by
+        # repository-local clean filters, despite changed tracked file bytes.
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-malicious-clean-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            value = request(commit=commit)
+            value["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(value, source, state)
+            original = (source / "src" / "example.py").read_bytes()
+            (checkout / "src" / "example.py").write_bytes(b"X" * len(original))
+            driver = root / "malicious-clean-filter"
+            driver.write_text(
+                "#!/usr/bin/python3\n"
+                "import sys\n"
+                "sys.stdout.buffer.write(" + repr(original) + ")\n",
+                encoding="utf-8",
+            )
+            driver.chmod(0o755)
+            subprocess.run(
+                [
+                    "/usr/bin/git",
+                    "-C",
+                    str(checkout),
+                    "config",
+                    "--local",
+                    "filter.rabmal.clean",
+                    str(driver),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+            (checkout / ".git" / "info" / "attributes").write_text(
+                "src/example.py filter=rabmal\n", encoding="utf-8"
+            )
+            untrusted_status = subprocess.run(
+                ["/usr/bin/git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=checkout,
+                env=runner.base._git_environment(),
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(untrusted_status.stdout, b"")
+            self.assertNotEqual(
+                (checkout / "src" / "example.py").read_bytes(), original
+            )
+            with self.assertRaisesRegex(
+                runner.RunnerError, "post-provider Git isolation failed"
+            ):
+                runner._secure_post_provider_checkout_readback(value, checkout, source)
+
+    def test_postflight_rejects_forged_detached_git_head(self) -> None:
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-malicious-head-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            value = request(commit=commit)
+            value["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(value, source, state)
+            self.assertEqual((checkout / ".git" / "HEAD").read_text().strip(), commit)
+            (checkout / ".git" / "HEAD").write_text(
+                "ref: refs/heads/forged\n", encoding="ascii"
+            )
+            with self.assertRaisesRegex(
+                runner.RunnerError, "post-provider Git isolation failed"
+            ):
+                runner._secure_post_provider_checkout_readback(value, checkout, source)
+
+    def test_postflight_dirty_fixture_bytes_and_modes_are_bound(self) -> None:
+        self._assert_postflight_kernel_namespace_available()
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-postflight-dirty-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            frozen = runner.base.FROZEN_G2_IDENTITY
+            with patch.dict(
+                frozen, {"repository": {**frozen["repository"], "commit": commit}}
+            ):
+                value = frozen_g2_request(commit=commit)
+                checkout = runner.create_checkout(value, source, state)
+                # A private scratch Git commit cannot equal the historical
+                # frozen G2 SHA. Bind the child to that same scratch commit
+                # only within this test, without changing production code.
+                original_script = runner._POST_PROVIDER_GIT_ISOLATED_PROGRAM
+                anchor = "setup = base.validated_setup(request)"
+                self.assertEqual(original_script.count(anchor), 1)
+                injected = (
+                    "base.FROZEN_G2_IDENTITY['repository'] = "
+                    "{**base.FROZEN_G2_IDENTITY['repository'], "
+                    "'commit': expected}\n"
+                )
+                with patch.object(
+                    runner,
+                    "_POST_PROVIDER_GIT_ISOLATED_PROGRAM",
+                    original_script.replace(anchor, injected + anchor),
+                ):
+                    result = runner._secure_post_provider_checkout_readback(
+                        value, checkout, source
+                    )
+                self.assertEqual(result["working_tree"], "dirty")
+                self.assertEqual(
+                    result["fixture_sha256"],
+                    runner.sha_bytes(runner.base.DIRTY_FIXTURE_BYTES),
+                )
+                dirty_path = checkout / runner.base.DIRTY_FIXTURE_NAME
+                dirty_path.write_bytes(b"forged-but-present")
+                with patch.object(
+                    runner,
+                    "_POST_PROVIDER_GIT_ISOLATED_PROGRAM",
+                    original_script.replace(anchor, injected + anchor),
+                ):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "post-provider Git isolation failed"
+                    ):
+                        runner._secure_post_provider_checkout_readback(
+                            value, checkout, source
+                        )
+
+    def test_postflight_detects_git_control_metadata_drift_after_intent(self) -> None:
+        self._assert_postflight_kernel_namespace_available()
+        scratch = ROOT / "build"
+        scratch.mkdir(mode=0o700, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="rab-postflight-controls-", dir=scratch
+        ) as directory:
+            root = Path(directory)
+            source, commit = repository(root)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            value = request(commit=commit)
+            value["setup"] = {
+                "working_tree": "clean",
+                "fixture": "fresh-matching-snapshot",
+            }
+            checkout = runner.create_checkout(value, source, state)
+            control: dict[str, str] = {}
+            runner._secure_post_provider_checkout_readback(
+                value, checkout, source, git_control_out=control
+            )
+            self.assertRegex(control["sha256"], r"^[0-9a-f]{64}$")
+            (checkout / ".git" / "config").write_text(
+                (checkout / ".git" / "config").read_text()
+                + '\n[filter "malicious"]\n\tclean = /usr/bin/true\n'
+            )
+            with self.assertRaisesRegex(
+                runner.RunnerError, "post-provider Git control metadata changed"
+            ):
+                runner._secure_post_provider_checkout_readback(
+                    value,
+                    checkout,
+                    source,
+                    expected_git_control_sha256=control["sha256"],
+                )
 
 
 if __name__ == "__main__":
