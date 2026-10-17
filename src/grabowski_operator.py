@@ -8079,6 +8079,54 @@ def _reserved_runtime_deploy_command(
     return False
 
 
+def _reserved_runtime_deploy_pinned_python_path() -> str:
+    """Reuse only the serving release venv's PyYAML, never the mutable user site.
+
+    This bounds interpreter startup imports; it is not an independent
+    attestation against a compromised same-UID serving-release installation.
+    """
+    import importlib.metadata
+    import sysconfig
+
+    prefix = Path(sys.prefix)
+    if sys.prefix == sys.base_prefix or not prefix.is_absolute():
+        raise RuntimeError("reserved runtime deploy requires an isolated serving Python")
+    if Path(sys.executable).parent.parent != prefix:
+        raise RuntimeError("reserved runtime deploy interpreter is not bound to its venv")
+    expected_python = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    try:
+        system_python = Path("/usr/bin/python3").resolve(strict=True)
+        if system_python.name != expected_python:
+            raise RuntimeError("reserved runtime worker Python ABI differs from serving runtime")
+        site = Path(sysconfig.get_path("purelib") or "")
+        expected_site = prefix / "lib" / expected_python / "site-packages"
+        if site != expected_site:
+            raise RuntimeError("reserved runtime pinned site is outside the serving venv")
+        distribution = importlib.metadata.distribution("PyYAML")
+        yaml_file = Path(distribution.locate_file("yaml/__init__.py"))
+        if distribution.version != "6.0.3" or yaml_file != site / "yaml" / "__init__.py":
+            raise RuntimeError("reserved runtime PyYAML is not the pinned serving version")
+        for directory in (prefix, site, site / "yaml"):
+            metadata = directory.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o022
+            ):
+                raise RuntimeError("reserved runtime Python dependency directory is unsafe")
+        metadata = yaml_file.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o022
+        ):
+            raise RuntimeError("reserved runtime Python dependency file is unsafe")
+    except (OSError, ImportError, ValueError) as exc:
+        raise RuntimeError("reserved runtime pinned Python site is unavailable") from exc
+    return str(site)
+
+
 def _start_job(
     argv: list[str],
     cwd: str | None = None,
@@ -8304,20 +8352,16 @@ def _start_job(
         "GRABOWSKI_JOB_FINALIZATION_PATH": finalization_contract["receipt_paths"]["finalization"],
     }
     if allow_reserved_runtime_deploy:
-        # Isolate pycache before interpreter startup, not after imports.
-        # The fixed /usr/bin/python3 worker needs pinned user-site PyYAML.
-        # This alone cannot attest mutable Python source or sourceless .pyc.
-        # Reject inherited user-manager Python environment overrides.
-        import pwd
-        user_home = pwd.getpwuid(os.getuid()).pw_dir
-        if not os.path.isabs(user_home):
-            raise RuntimeError("reserved runtime user home is invalid")
+        # The fixed system Python can import the lock-pinned serving venv
+        # packages via one explicit path; Python does not execute .pth files
+        # from PYTHONPATH. Reject the ambient user site *before startup*.
+        pinned_site = _reserved_runtime_deploy_pinned_python_path()
         environment.update({
             "PYTHONPYCACHEPREFIX": "/dev/null/grabowski-runtime-deploy",
-            "PYTHONPATH": "",
+            "PYTHONPATH": pinned_site,
             "PYTHONHOME": "",
-            "PYTHONNOUSERSITE": "",
-            "PYTHONUSERBASE": os.path.join(user_home, ".local"),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONUSERBASE": "",
             "PYTHONWARNINGS": "",
             "PYTHONSAFEPATH": "",
             "PYTHONPLATLIBDIR": "",

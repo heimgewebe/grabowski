@@ -1,13 +1,13 @@
-"""Regression for the reserved runtime worker's pre-import Python environment.
+"""Regression for the reserved delayed worker's pre-import Python environment.
 
-The cache defense must not remove an actually pinned user-site dependency
-from the system Python used by the fixed delayed worker. It does not assert
-that the user site is a generally trusted source.
+Disable the ambient user site before interpreter startup while preserving the
+already pinned serving-runtime PyYAML through one explicit isolated site path.
+This does not attest to arbitrary same-UID serving-release tampering.
 """
 from __future__ import annotations
 
 import os
-import pwd
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -19,12 +19,14 @@ from test_operator_contract import _load_operator_module
 
 
 class ReservedWorkerPythonSiteTests(unittest.TestCase):
-    def test_reserved_worker_uses_private_pycache_without_dropping_user_site(self):
+    def test_reserved_worker_rejects_user_site_and_preserves_pinned_import_path(self):
         operator = _load_operator_module()
         with tempfile.TemporaryDirectory(prefix="reserved-worker-pyyaml-test-") as tmp:
             root = Path(tmp)
             working = root / "work"
             working.mkdir()
+            trusted_site = root / "locked-site"
+            trusted_site.mkdir(mode=0o700)
             launch_result = {
                 "returncode": 0, "stdout": "started", "stderr": "",
                 "argv": [], "argv_sha256": "0" * 64, "command": "systemd-run",
@@ -37,6 +39,8 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                 patch.object(operator, "JOBS_DIR", root / "state" / "jobs"),
                 patch.object(operator.uuid, "uuid4",
                     return_value=types.SimpleNamespace(hex="aaaa1111222233334444")),
+                patch.object(operator, "_reserved_runtime_deploy_pinned_python_path",
+                    return_value=str(trusted_site), create=True),
                 patch.object(operator, "_managed_runtime_environment",
                     return_value={
                         "XDG_RUNTIME_DIR": "/run/user/1000",
@@ -71,12 +75,12 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                 "--setenv=PYTHONPYCACHEPREFIX=/dev/null/grabowski-runtime-deploy",
                 before_command,
             )
-            self.assertIn("--setenv=PYTHONPATH=", before_command)
+            self.assertIn(f"--setenv=PYTHONPATH={trusted_site}", before_command)
             self.assertIn("--setenv=PYTHONHOME=", before_command)
             # Explicitly override hostile user-manager Python environment,
             # but do not claim that the mutable user site is authenticated.
             for item in (
-                "--setenv=PYTHONNOUSERSITE=",
+                "--setenv=PYTHONNOUSERSITE=1",
                 "--setenv=PYTHONWARNINGS=",
                 "--setenv=PYTHONSAFEPATH=",
                 "--setenv=PYTHONPLATLIBDIR=",
@@ -140,12 +144,12 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                         self.assertEqual(0, safe.returncode, safe.stderr)
                         self.assertEqual("preinit-ok", safe.stdout.strip())
 
-            expected_site = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local"
-            self.assertIn(f"--setenv=PYTHONUSERBASE={expected_site}", before_command)
+            self.assertIn("--setenv=PYTHONUSERBASE=", before_command)
             self.assertEqual(
                 1, sum(arg.startswith("--setenv=PYTHONUSERBASE=") for arg in before_command)
             )
             self.assertNotIn("--setenv=PYTHONUSERBASE=/tmp/untrusted-python-site", before_command)
+            # The original worker command identity must remain unchanged.
             self.assertEqual(
                 argv[argv.index("--") + 1:],
                 operator.command_identity.systemd_escape_argv(
@@ -153,7 +157,91 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                 ),
             )
 
-    def test_private_cache_prefix_does_not_prevent_pinned_user_site_import(self):
+
+    @unittest.skipUnless(Path("/usr/bin/python3").is_file(), "system Python absent")
+    def test_reserved_worker_pinned_site_excludes_ambient_pth_and_fake_yaml(self):
+        # Actual startup semantics: .pth runs from user site before any code.
+        # The reserved launch must block it while allowing one explicit site.
+        with tempfile.TemporaryDirectory(prefix="reserved-site-injection-") as tmp:
+            root = Path(tmp)
+            trusted = root / "locked-site"
+            yaml = trusted / "yaml"
+            yaml.mkdir(parents=True)
+            (yaml / "__init__.py").write_text(
+                '__version__ = "6.0.3"\nORIGIN = "locked"\n', encoding="utf-8"
+            )
+            # PYTHONPATH is not added through site.addsitedir: even an
+            # injected .pth alongside the pinned package must not execute.
+            trusted_marker = root / "trusted-pth-executed"
+            (trusted / "unwanted.pth").write_text(
+                f"import pathlib; pathlib.Path({str(trusted_marker)!r}).write_text('bad')\n",
+                encoding="utf-8",
+            )
+            base = root / "user"
+            env = {
+                "HOME": str(root), "PATH": "/usr/bin:/bin",
+                "PYTHONUSERBASE": str(base), "PYTHONPATH": "",
+                "PYTHONNOUSERSITE": "", "PYTHONHOME": "",
+            }
+            site_path = subprocess.run(
+                ["/usr/bin/python3", "-c", "import site; print(site.getusersitepackages())"],
+                cwd=root, env=env, capture_output=True, text=True,
+                timeout=10, check=True,
+            ).stdout.strip()
+            site = Path(site_path)
+            site.mkdir(parents=True)
+            marker = root / "pth-executed"
+            (site / "injected.pth").write_text(
+                f"import pathlib; pathlib.Path({str(marker)!r}).write_text('injected')\n",
+                encoding="utf-8",
+            )
+            fake = site / "yaml"
+            fake.mkdir()
+            (fake / "__init__.py").write_text(
+                '__version__ = "6.0.3"\nORIGIN = "untrusted"\n', encoding="utf-8"
+            )
+            command = [
+                "/usr/bin/python3", "-c",
+                "import yaml; print(yaml.ORIGIN)",
+            ]
+            exposed = subprocess.run(
+                command, env=env, cwd=root, capture_output=True,
+                text=True, timeout=10,
+            )
+            self.assertEqual("untrusted", exposed.stdout.strip(), exposed.stderr)
+            self.assertTrue(marker.exists())
+            marker.unlink()
+            safe = subprocess.run(
+                command,
+                env={
+                    **env,
+                    "PYTHONNOUSERSITE": "1",
+                    "PYTHONUSERBASE": "",
+                    "PYTHONPATH": str(trusted),
+                    "PYTHONPYCACHEPREFIX": "/dev/null/grabowski-runtime-deploy",
+                },
+                cwd=root, capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(0, safe.returncode, safe.stderr)
+            self.assertEqual("locked", safe.stdout.strip())
+            self.assertFalse(marker.exists())
+            self.assertFalse(trusted_marker.exists())
+
+    @unittest.skipUnless(sys.prefix != sys.base_prefix, "serving Python is not a venv")
+    def test_pinned_serving_site_preflight_rejects_forged_package_version(self):
+        operator = _load_operator_module()
+        path = operator._reserved_runtime_deploy_pinned_python_path()
+        self.assertTrue(Path(path).is_dir())
+        self.assertEqual(Path(path).name, "site-packages")
+        with patch("importlib.metadata.distribution",
+                   return_value=types.SimpleNamespace(
+                       version="5.4.1",
+                       locate_file=lambda _: Path(path) / "yaml" / "__init__.py",
+                   )):
+            with self.assertRaisesRegex(RuntimeError, "pinned serving version"):
+                operator._reserved_runtime_deploy_pinned_python_path()
+
+    def test_cache_prefix_alone_still_admits_untrusted_user_site(self):
         # Environment-controlled user-site fixture, independent of host versions.
         with tempfile.TemporaryDirectory(prefix="reserved-worker-site-fixture-") as tmp:
             root = Path(tmp)
