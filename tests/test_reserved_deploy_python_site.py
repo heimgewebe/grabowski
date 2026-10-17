@@ -53,6 +53,8 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                         "PYTHONIOENCODING": "not-a-codec",
                         "PYTHONINTMAXSTRDIGITS": "bogus",
                         "PYTHONOPTIMIZE": "bogus",
+                        "PYTHONNODEBUGRANGES": "1",
+                        "PYTHONPERFSUPPORT": "1",
                     }),
                 patch.object(operator, "_run", return_value=launch_result) as run,
             ):
@@ -103,6 +105,8 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                 "PYTHONPROFILEIMPORTTIME": "",
                 "PYTHONASYNCIODEBUG": "",
                 "PYTHONDONTWRITEBYTECODE": "",
+                "PYTHONNODEBUGRANGES": "",
+                "PYTHONPERFSUPPORT": "",
             }
             for name, value in neutral.items():
                 self.assertEqual(1, before_command.count(f"--setenv={name}={value}"), name)

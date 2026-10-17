@@ -8345,6 +8345,8 @@ def _start_job(
             "PYTHONPROFILEIMPORTTIME": "",
             "PYTHONASYNCIODEBUG": "",
             "PYTHONDONTWRITEBYTECODE": "",
+            "PYTHONNODEBUGRANGES": "",
+            "PYTHONPERFSUPPORT": "",
         })
     if (
         decision_review_binding is not None
