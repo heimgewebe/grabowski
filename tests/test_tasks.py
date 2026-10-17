@@ -7066,6 +7066,81 @@ class TaskTests(unittest.TestCase):
             self.assertEqual("archived_task_unit_live_unverified", status["status"], status)
             inventory.assert_called_once()
 
+    def test_archived_restart_during_current_terminal_probe_is_not_verified(self) -> None:
+        self._local_terminal_readiness_store(1)
+        with tasks._task_readonly_snapshot() as reader:
+            record = dict(reader.execute("SELECT * FROM tasks LIMIT 1").fetchone())
+        before = self.database.read_bytes()
+        observation = {
+            "state": "completed",
+            "properties": {
+                "LoadState": "loaded", "ActiveState": "inactive",
+                "SubState": "dead", "Result": "success",
+                "ExecMainStatus": "0",
+            },
+            "probe": {"returncode": 0, "timed_out": False},
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1",
+                "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        live = False
+        inventory_samples: list[bool] = []
+
+        def inventory() -> bool:
+            inventory_samples.append(live)
+            return live
+
+        def observe(current: dict, *, bound_local_user: bool) -> dict:
+            nonlocal live
+            self.assertTrue(bound_local_user)
+            self.assertEqual(record["task_id"], current["task_id"])
+            live = True  # external systemd restart, no TaskStore write
+            return observation
+
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=(
+                    [record], 0,
+                    tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0,
+                ),
+            ),
+            patch.object(tasks, "_task_reconcile_ready_archived_user_unit_live",
+                         side_effect=inventory) as scan,
+            patch.object(tasks, "_observe", side_effect=observe) as probe,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_task_unit_live_unverified", status["status"], status)
+        self.assertEqual([False, True], inventory_samples)
+        self.assertEqual(2, scan.call_count)
+        probe.assert_called_once()
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_archived_post_terminal_inventory_failure_fails_closed(self) -> None:
+        self._local_terminal_readiness_store(1)
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=(
+                    [], 0,
+                    tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0,
+                ),
+            ),
+            patch.object(
+                tasks, "_task_reconcile_ready_archived_user_unit_live",
+                side_effect=[False, RuntimeError("late inventory unavailable")],
+            ) as scan,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_task_unit_observation_unavailable", status["status"])
+        self.assertEqual(2, scan.call_count)
+        self.assertEqual(before, self.database.read_bytes())
+
     def test_archived_unit_restarted_without_db_write_never_reports_ready(self) -> None:
         # A closeout projection excludes the retained row. Systemd still owns
         # the loaded unit, which a separate supported service operation can
@@ -7189,7 +7264,8 @@ class TaskTests(unittest.TestCase):
             with tasks._task_readonly_snapshot() as reader:
                 status = tasks._task_reconcile_ready_evidence_snapshot(reader)
         self.assertEqual("verified", status["status"])
-        probe.assert_called_once()
+        self.assertEqual(2, probe.call_count)
+        self.assertEqual(probe.call_args_list[0], probe.call_args_list[1])
 
     def test_reconcile_ready_publication_applies_task_scope_before_rootbroker(self) -> None:
         record = {
@@ -11236,6 +11312,67 @@ class TaskTests(unittest.TestCase):
         self.assertEqual("observation_error", peek["state"])
         self.assertTrue(peek["reconcile_required"])
         self.assertEqual("completed", peek["persisted_state"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_cancelled_allows_local_systemd_terminal_outcome(self) -> None:
+        # Cancellation is a stored policy state, not a systemd result.
+        # Quiescent terminal outcomes are compatible; live/unknown ones are not.
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='cancelled' WHERE task_id=?",
+                (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        for observed_state, systemd_result in (
+            ("completed", "success"),
+            ("failed", "exit-code"),
+            ("signalled", "signal"),
+            ("timed_out", "timeout"),
+        ):
+            with (
+                self.subTest(terminal=observed_state),
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(tasks, "_observe", return_value={
+                    "state": observed_state,
+                    "properties": {
+                        "LoadState": "loaded", "ActiveState": "inactive",
+                        "SubState": "dead", "Result": systemd_result,
+                    },
+                    "observed_at_unix": tasks._now(),
+                }),
+                patch.object(tasks, "_set_state",
+                             side_effect=AssertionError("peek must not write")),
+            ):
+                peek = tasks.grabowski_task_peek(task["task_id"])
+            self.assertEqual("cancelled", peek["state"])
+            self.assertEqual("cancelled", peek["persisted_state"])
+            self.assertFalse(peek["reconcile_required"])
+        for observed_state, expected_state in (
+            ("running", "running"),
+            ("outcome_unknown", "observation_error"),
+            ("observation_error", "observation_error"),
+        ):
+            with (
+                self.subTest(unsafe=observed_state),
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(tasks, "_observe", return_value={
+                    "state": observed_state,
+                    "properties": {"LoadState": "not-found"},
+                    "observed_at_unix": tasks._now(),
+                }),
+                patch.object(tasks, "_set_state",
+                             side_effect=AssertionError("peek must not write")),
+            ):
+                peek = tasks.grabowski_task_peek(task["task_id"])
+            self.assertEqual(expected_state, peek["state"])
+            self.assertTrue(peek["reconcile_required"])
         self.assertEqual(before, self.database.read_bytes())
 
     def test_task_peek_terminal_unknown_observation_fails_closed(self) -> None:
