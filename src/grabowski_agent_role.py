@@ -225,7 +225,7 @@ def committed_diff(repo: Path, base: str, head: str) -> bytes:
         "--binary",
         "--no-ext-diff",
         "--no-textconv",
-        f"{base.lower()}...{head.lower()}",
+        f"{base.lower()}...{head.lower()}", "--",
     )
 
 

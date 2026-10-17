@@ -139,7 +139,8 @@ def _untracked_file_fingerprint(
 
 def _dirty_preimage_sha256(repo: Path, base_head: str, head: str, branch: str) -> str:
     committed = _git_bytes(
-        repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", f"{base_head}...{head}"
+        repo, "diff", "--binary", "--no-ext-diff", "--no-textconv",
+        f"{base_head}...{head}", "--",
     )
     working = _git_bytes(
         repo, "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"

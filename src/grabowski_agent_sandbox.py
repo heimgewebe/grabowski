@@ -37,6 +37,7 @@ _GIT_COMMAND_CONFIG = (
     ("core.editor", "/bin/false"),
     ("core.pager", "cat"),
     ("sequence.editor", "/bin/false"),
+    ("interactive.diffFilter", ""),
     # Never execute a repository-selected signing program, even if commit
     # configuration is changed after the repository admission check.
     ("commit.gpgsign", "false"),
@@ -595,20 +596,21 @@ def safe_git_repository_environment(
     if result.returncode != 0 or result.stderr or len(result.stdout) > 1024 * 1024:
         raise AgentSandboxError("repository Git helper admission failed")
     # Trusted environment -c entries are included by git config --list.
-    # Allow exactly their own pinned signer entry; a repository declaration
-    # yields a second occurrence and must still fail closed.
-    trusted_signer_keys = {
+    # Allow exactly one occurrence for a trusted pinned helper key. Any
+    # repository declaration yields a second occurrence and fails closed.
+    trusted_pinned_keys = {
         "core.editor", "core.pager", "sequence.editor",
+        "interactive.difffilter",
         "commit.gpgsign", "tag.gpgsign", "gpg.program",
         "gpg.openpgp.program", "gpg.ssh.program", "gpg.x509.program",
     }
-    seen_signer_keys: set[str] = set()
+    seen_pinned_keys: set[str] = set()
     for key in result.stdout.split(b"\x00"):
         label = key.decode("utf-8", errors="surrogateescape").casefold()
-        if label in trusted_signer_keys:
-            if label in seen_signer_keys:
+        if label in trusted_pinned_keys:
+            if label in seen_pinned_keys:
                 raise AgentSandboxError("repository declares an executable Git helper")
-            seen_signer_keys.add(label)
+            seen_pinned_keys.add(label)
             continue
         if (
             (label.startswith("filter.") and label.endswith((".clean", ".smudge", ".process")))
@@ -756,8 +758,14 @@ def git_requires_filter_effect_guard(argv: list[str]) -> bool:
         # Tokens after '--' are pathspecs, never Git options: a tracked file
         # literally named '--cached' must not bypass dirty-diff isolation.
         prefix = arguments[:arguments.index("--")] if "--" in arguments else arguments
-        if any(item in {"--cached", "--staged", "--no-index"} for item in prefix):
-            return False
+        # A hex-shaped token can still be a tracked filename (not an object),
+        # particularly with mixed SHA-1/SHA-256 widths. Only a literal final
+        # '--' separates all candidate revisions from pathspecs without
+        # ambiguity. Without it, route the effect through sealed attributes.
+        if not arguments or arguments[-1] != "--":
+            return True
+        # Do not exempt cached/staged/no-index globally: no-index can read
+        # worktree files through a late-configured clean filter.
         # A 40/64-hex operand can belong to a Git option (-S/-G,
         # --anchored, --find-object, --word-diff-regex), not to a revision.
         # Only options known to consume no following argv token may keep
@@ -829,7 +837,7 @@ def _git_without_external_diff(argv: list[str]) -> list[str]:
     if subcommand == "commit" and any(
         _git_short_option_has_helper(
             option, denied=frozenset({"S", "e", "c"}),
-            operand_flags=frozenset({"m", "F", "C", "t", "o"}),
+            operand_flags=frozenset({"m", "F", "C", "t"}),
         )
         or _git_long_option_matches(
             option, "--gpg-sign", "--edit", "--reedit-message"
@@ -857,9 +865,9 @@ def _git_without_external_diff(argv: list[str]) -> list[str]:
                 or _git_short_option_has_helper(
                     option, denied=frozenset({"p", "i"} if subcommand == "add" else {"p"}),
                     operand_flags=frozenset(
-                        {"m", "F", "C", "t", "o"} if subcommand == "commit"
+                        {"m", "F", "C", "t"} if subcommand == "commit"
                         else {"b", "B", "c", "C"} if subcommand == "checkout"
-                        else {"s", "S"} if subcommand == "restore" else set()
+                        else {"s"} if subcommand == "restore" else set()
                     ),
                 )
             )

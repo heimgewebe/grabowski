@@ -52,6 +52,7 @@ class AgentSandboxGitConfigTests(unittest.TestCase):
                     ("core.editor", "/bin/false"),
                     ("core.pager", "cat"),
                     ("sequence.editor", "/bin/false"),
+                    ("interactive.diffFilter", ""),
                     ("commit.gpgsign", "false"),
                     ("tag.gpgsign", "false"),
                     ("gpg.program", "/bin/false"),

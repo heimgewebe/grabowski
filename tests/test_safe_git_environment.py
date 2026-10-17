@@ -851,10 +851,74 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
                     ),
                     "Git option-like pathspec must not suppress dirty-diff effect guard",
                 )
-        self.assertFalse(
+        self.assertTrue(
             git_requires_filter_effect_guard(["git", "diff", "--cached", "HEAD"])
         )
 
+
+
+    def test_no_index_diff_late_clean_filter_is_effect_isolated(self) -> None:
+        """A true --no-index comparison still invokes a Git clean filter."""
+        from unittest import mock
+        from grabowski_agent_workspace import _run as workspace_run
+
+        if (not hasattr(os, "memfd_create")
+                or not hasattr(os, "MFD_ALLOW_SEALING")
+                or not Path("/usr/bin/bwrap").is_file()):
+            self.skipTest("sealed-memfd/bwrap backend unavailable")
+
+        with tempfile.TemporaryDirectory(prefix="no-index-clean-regression-") as raw:
+            root = Path(raw)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=attacker\n", encoding="ascii",
+            )
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "add", ".gitattributes"],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "-c", "user.name=Fixture",
+                 "-c", "user.email=fixture@example.invalid",
+                 "commit", "-qm", "filter attributes"],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            marker, helper = root / "clean-filter-ran", root / "helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            real_run = subprocess.run
+            injected = False
+
+            def inject_at_effect(argv: list[str], *args: object, **kwargs: object):
+                nonlocal injected
+                if (not injected and argv and argv[0] in ("git", "/usr/bin/bwrap")
+                        and "diff" in argv):
+                    injected = True
+                    real_run(
+                        ["/usr/bin/git", "-C", str(repo), "config",
+                         "filter.attacker.clean", str(helper)],
+                        env=secure, check=True, capture_output=True, timeout=15,
+                    )
+                return real_run(argv, *args, **kwargs)
+
+            command = ["git", "diff", "--no-index", "--", "tracked.txt", "tracked.txt"]
+            with mock.patch("subprocess.run", side_effect=inject_at_effect):
+                protected = workspace_run(repo, command)
+            self.assertTrue(injected, "late Git-filter injection was not exercised")
+            self.assertEqual(protected["returncode"], 0, protected.get("stderr"))
+            self.assertFalse(marker.exists(), "guarded --no-index executed a clean filter")
+
+            unprotected = real_run(
+                ["/usr/bin/git", "-C", str(repo), *command[1:]],
+                env=secure, capture_output=True, timeout=15,
+            )
+            self.assertEqual(unprotected.returncode, 0, unprotected.stderr)
+            self.assertTrue(marker.exists(), "real Git control did not call filter")
 
 
     def test_sha_option_operand_does_not_bypass_filter_guard(self) -> None:
@@ -877,8 +941,27 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
                 )
 
         for arguments in (
+            ("--binary", "--no-ext-diff", "--no-textconv", first, second, "--"),
+            ("--name-status", first + ".." + second, "--"),
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertFalse(git_requires_filter_effect_guard(["git", "diff", *arguments]))
+
+        # Two hex-looking names or a range are not necessarily Git objects.
+        # A final '--' must prove where revision interpretation ends.
+        for arguments in (
             ("--binary", "--no-ext-diff", "--no-textconv", first, second),
             ("--name-status", first + ".." + second),
+            (first, second, "--", "tracked.txt"),
+            (first, second, "--", "--cached"),
+        ):
+            with self.subTest(ambiguous=arguments):
+                self.assertTrue(git_requires_filter_effect_guard(["git", "diff", *arguments]))
+
+        # Every --cached/--staged/--no-index form fails closed. In
+        # particular, --no-index can invoke worktree clean filters even for
+        # equal input paths on real Git (see the effect-time regression below).
+        for arguments in (
             ("--cached", "--name-only", second),
             ("--cached", "-S", first, second),
             ("-S", first, "--cached", second),
@@ -886,7 +969,7 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
             ("--no-index", "first.txt", "second.txt"),
         ):
             with self.subTest(arguments=arguments):
-                self.assertFalse(git_requires_filter_effect_guard(["git", "diff", *arguments]))
+                self.assertTrue(git_requires_filter_effect_guard(["git", "diff", *arguments]))
 
     def test_sha_shaped_pickaxe_really_triggers_late_filter_without_guard(self) -> None:
         """An effect-time clean filter must remain inert after the option fix."""
@@ -962,6 +1045,143 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
             self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
             self.assertTrue(marker.exists(), "real Git negative control did not trigger")
 
+
+
+    def test_native_hex_shaped_filenames_never_bypass_git_filter_guard(self) -> None:
+        """SHA-1 Git treats SHA-256-width tokens as filenames, not commits."""
+        from unittest import mock
+        import grabowski_operator as operator
+        from grabowski_agent_sandbox import git_requires_filter_effect_guard
+
+        if (not hasattr(os, "memfd_create")
+                or not hasattr(os, "MFD_ALLOW_SEALING")
+                or not Path("/usr/bin/bwrap").is_file()):
+            self.skipTest("sealed-memfd/bwrap backend unavailable")
+
+        with tempfile.TemporaryDirectory(prefix="native-hex-diff-") as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            subprocess.run(
+                ["/usr/bin/git", "init", "-q", "-b", "main", str(repo)],
+                env=secure, check=True, capture_output=True,
+            )
+            first, second = "a" * 64, "b" * 64
+            (repo / ".gitattributes").write_text("* filter=attacker\n", encoding="ascii")
+            (repo / first).write_text("before first\n", encoding="ascii")
+            (repo / second).write_text("before second\n", encoding="ascii")
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "add", "."],
+                env=secure, check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo),
+                 "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                 "commit", "-qm", "base"], env=secure, check=True, capture_output=True,
+            )
+            (repo / first).write_text("dirty first\n", encoding="ascii")
+            (repo / second).write_text("dirty second\n", encoding="ascii")
+            marker, helper = root / "clean-filter-ran", root / "helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            command = ["diff", first, second]
+            self.assertTrue(
+                git_requires_filter_effect_guard(["git", "-C", str(repo), *command]),
+                "a 64-hex tracked filename was accepted as a Git commit",
+            )
+            original_run = operator._run
+            injected = False
+
+            def inject_at_effect(argv: list[str], **kwargs: object):
+                nonlocal injected
+                if not injected and "diff" in argv:
+                    injected = True
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo), "config",
+                         "filter.attacker.clean", str(helper)],
+                        env=secure, check=True, capture_output=True,
+                    )
+                return original_run(argv, **kwargs)
+
+            with (
+                mock.patch.object(operator, "_require_operator_mutation", return_value=None),
+                mock.patch.object(operator, "_run", side_effect=inject_at_effect),
+            ):
+                protected = operator.grabowski_git(str(repo), command)
+            self.assertTrue(injected, "native Git effect-time injection was not reached")
+            self.assertEqual(protected["returncode"], 0, protected.get("stderr"))
+            self.assertFalse(marker.exists(), "native Git executed a late clean helper")
+
+            uncontrolled = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), *command],
+                env=secure, capture_output=True, timeout=15,
+            )
+            self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
+            self.assertTrue(marker.exists(), "unprotected hex-path control missed the helper")
+
+    def test_pure_sha1_sha256_diffs_with_separator_need_no_info_directory(self) -> None:
+        """Disambiguated immutable diffs must work without an attributes mount."""
+        import shutil
+        from grabowski_agent_sandbox import safe_git_filter_effect, git_requires_filter_effect_guard
+
+        with tempfile.TemporaryDirectory(prefix="pure-sha-diff-") as directory:
+            root = Path(directory)
+            secure = safe_git_environment()
+            for object_format in ("sha1", "sha256"):
+                with self.subTest(object_format=object_format):
+                    repo = root / object_format
+                    subprocess.run(
+                        ["/usr/bin/git", "init", "-q", "-b", "main",
+                         "--object-format=" + object_format, str(repo)],
+                        env=secure, check=True, capture_output=True,
+                    )
+                    tracked = repo / "tracked.txt"
+                    tracked.write_text("before\n", encoding="ascii")
+                    subprocess.run(
+                        ["/usr/bin/git", "-C", str(repo), "add", "tracked.txt"],
+                        env=secure, check=True, capture_output=True,
+                    )
+                    commit_prefix = [
+                        "/usr/bin/git", "-C", str(repo),
+                        "-c", "user.name=Fixture",
+                        "-c", "user.email=fixture@example.invalid",
+                    ]
+                    subprocess.run(
+                        [*commit_prefix, "commit", "-qm", "base"],
+                        env=secure, check=True, capture_output=True,
+                    )
+                    previous = subprocess.check_output(
+                        ["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"],
+                        env=secure, text=True, timeout=15,
+                    ).strip()
+                    tracked.write_text("after\n", encoding="ascii")
+                    subprocess.run(
+                        [*commit_prefix, "commit", "-qam", "update"],
+                        env=secure, check=True, capture_output=True,
+                    )
+                    current = subprocess.check_output(
+                        ["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"],
+                        env=secure, text=True, timeout=15,
+                    ).strip()
+                    self.assertEqual(len(previous), len(current))
+                    self.assertEqual(len(previous), 40 if object_format == "sha1" else 64)
+                    shutil.rmtree(repo / ".git" / "info")
+                    command = [
+                        "git", "-C", str(repo), "diff", "--binary",
+                        "--no-ext-diff", "--no-textconv", previous, current, "--",
+                    ]
+                    self.assertFalse(git_requires_filter_effect_guard(command))
+                    with safe_git_filter_effect(repo, command) as (argv, environment, fds):
+                        self.assertNotEqual(argv[0], "/usr/bin/bwrap")
+                        result = subprocess.run(
+                            argv, env=environment, pass_fds=fds,
+                            capture_output=True, timeout=15,
+                        )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(b"+after", result.stdout)
 
     def test_native_work_acquire_git_diff_blocks_late_external_driver(self) -> None:
         """Native host Git must preserve committed patch bytes without executing a helper."""
@@ -1777,6 +1997,7 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
         }
         self.assertEqual(pairs["core.pager"], "cat")
         self.assertEqual(pairs["sequence.editor"], "/bin/false")
+        self.assertEqual(pairs["interactive.diffFilter"], "")
         with tempfile.TemporaryDirectory(prefix="pr1522-helper-config-") as tmp:
             repo = Path(tmp) / "repo"
             self._two_commit_repo(repo, secure)
@@ -1804,6 +2025,10 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
             ("commit", "-aS", "-m", "message"),
             ("commit", "-ae", "-m", "message"),
             ("commit", "-acHEAD", "-m", "message"),
+            ("commit", "-op", "-m", "message"),
+            ("commit", "-oS", "-m", "message"),
+            ("commit", "-oe", "-m", "message"),
+            ("restore", "-Sp", "--", "tracked.txt"),
             ("tag", "-as", "-m", "message", "v1"),
             ("tag", "-auattacker", "-m", "message", "v1"),
             ("tag", "--si", "v1"),

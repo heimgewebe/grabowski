@@ -3685,7 +3685,8 @@ def _git_snapshot(manifest: dict[str, Any], runner: CommandRunner) -> dict[str, 
     status_lines = [os.fsdecode(item) for item in bytes(status_result["stdout"]).split(b"\x00") if item]
     committed_diff = _checked_bytes(
         worktree,
-        ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv", f"{base_head}...{head}"],
+        ["git", "diff", "--binary", "--no-ext-diff", "--no-textconv",
+         f"{base_head}...{head}", "--"],
         label="committed diff",
     )
     working_diff = _checked_bytes(
