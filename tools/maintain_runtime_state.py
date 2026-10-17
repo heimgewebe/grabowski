@@ -189,6 +189,26 @@ def _private_file_digest(path: Path, *, max_bytes: int) -> tuple[int, str]:
         os.close(descriptor)
     return metadata.st_size, digest.hexdigest()
 
+def _archive_internal_manifest_shape_preflight(path: Path) -> None:
+    """Count exemption is not an exemption from evidence safety checks.
+
+    Retryable archive-manifest.json must be a small, private regular file.
+    Check its shape without opening a FIFO or following a symlink.
+    """
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or metadata.st_size > MAX_JSON_BYTES
+    ):
+        raise RuntimeError(
+            f"archive internal manifest must be one bounded private "
+            f"owner-controlled regular file: {path}"
+        )
+
+
 def _archive_file_shape_preflight(directory: Path) -> None:
     """Classify unsafe terminal-job archives without hashing their whole contents.
 
@@ -199,6 +219,7 @@ def _archive_file_shape_preflight(directory: Path) -> None:
     files = 0
     for path in directory.rglob("*"):
         if path == directory / "archive-manifest.json":
+            _archive_internal_manifest_shape_preflight(path)
             continue
         if path.is_symlink():
             raise RuntimeError(f"archive source contains a symlink: {path}")
@@ -1176,6 +1197,7 @@ def _archive_file_manifest(directory: Path) -> list[dict[str, Any]]:
     files: list[dict[str, Any]] = []
     for path in sorted(directory.rglob("*")):
         if path == directory / "archive-manifest.json":
+            _archive_internal_manifest_shape_preflight(path)
             continue
         if path.is_symlink():
             raise RuntimeError(f"archive source contains a symlink: {path}")
@@ -1206,12 +1228,17 @@ def _write_json_atomic(
     if path.is_symlink():
         raise RuntimeError(f"receipt path may not be a symlink: {path}")
     if path.exists():
-        metadata = path.stat()
+        metadata = path.lstat()
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
             or metadata.st_uid != os.getuid()
             or stat.S_IMODE(metadata.st_mode) & 0o077
+            or (
+                replace_existing
+                and path.name == "archive-manifest.json"
+                and metadata.st_size > MAX_JSON_BYTES
+            )
         ):
             raise RuntimeError(f"existing evidence is not owner-controlled: {path}")
         if not replace_existing:
