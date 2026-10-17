@@ -341,6 +341,11 @@ def synthetic_prepared_stage(root: Path) -> dict:
         "runtime_dir": str(root / "unused-stage"),
         "argv": ["/bin/true", "--bundle-root", str(root / "unused-manifest")],
         "manifest_binding": {"path": str(root / "unused-manifest")},
+        "metadata_binding": {
+            "path": str(root / "unused-stage" / runner.MCP_STAGE_METADATA_NAME),
+            "identity": [0, 0, 0, 0],
+            "sha256": "0" * 64,
+        },
     }
 
 
@@ -389,7 +394,7 @@ def proxy_command(
     prepared = runner.stage_mcp_upstream(
         state, upstream_argv, staged_manifest, authorized
     )
-    encoded = runner.canonical(runner._mcp_stage_wire(prepared))
+    encoded = runner.canonical(runner._mcp_stage_wire(prepared["metadata_binding"]))
     command = [
         sys.executable,
         "-I",
@@ -2696,9 +2701,9 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                     "treatment", expected_manifest, mcp_script=script
                 ),
                 # Schema+home, proxy, first manifest and three artifacts+
-                # parent dirs, second upstream root/stage, its eight files and
-                # nine distinct nested directories. The prior code reserved 17.
-                4 + 4 + 3 + 3 + 3 + 2 + 8 + 9,
+                # parent dirs, second upstream root/stage, its nine files
+                # (including immutable metadata) and nine nested directories.
+                4 + 4 + 3 + 3 + 3 + 2 + 9 + 9,
             )
             snapshot.assert_called_once()
             artifacts.assert_called_once()
@@ -3285,7 +3290,8 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 command = proxy_command(
                     upstream, source, staging_state=state, wrap=False
                 )
-                stage = json.loads(command[-1])
+                reference = json.loads(command[-1])
+                stage = json.loads(Path(reference["path"]).read_text(encoding="utf-8"))
                 staged_script = Path(stage["bindings"][1]["path"])
                 sandbox = runner._provider_pid_namespaced_codex_argv(
                     command,
@@ -4454,6 +4460,40 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
         ):
             self.assertIn(name, treatment)
 
+    def test_treatment_large_mcp_closure_metadata_does_not_overflow_argv(self) -> None:
+        # RED on the former inline source_tree_bindings transport: one -c
+        # argument exceeds Linux MAX_ARG_STRLEN before Codex is ever started.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            staged = synthetic_prepared_stage(root)
+            long_relative = "/".join(["long-" + "a" * 180] * 10)
+            staged["source_tree_bindings"] = [
+                {
+                    "path": str(root / long_relative / f"module-{i:04d}.py"),
+                    "identity": [1, i + 1, 1, 0o100600],
+                    "sha256": "a" * 64,
+                }
+                for i in range(1400)
+            ]
+            with patch.object(
+                runner, "_validated_mcp_proxy_python", return_value="/fixture/python3"
+            ):
+                command = runner.build_command(
+                    request(condition="treatment"),
+                    "/opt/codex",
+                    root / "checkout",
+                    root / "schema.json",
+                    root / "codex-home",
+                    authorized_mcp_files=[],
+                    proxy_path=root / "proxy.py",
+                    manifest_path=root / "manifest.json",
+                    mcp_runtime_root=root,
+                    prepared_mcp_stage=staged,
+                )
+            lengths = [len(argument.encode("utf-8")) + 1 for argument in command]
+            self.assertLess(max(lengths), 128 * 1024)
+            self.assertLess(sum(lengths), 1024 * 1024)
+
     def test_build_commands_isolates_baseline_and_treatment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -5165,7 +5205,9 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 *,
                 mcp_script: Path | None = None,
                 legacy_g1: bool = False,
+                state_root: Path | None = None,
             ) -> int:
+                self.assertEqual(state_root, args.state_root)
                 reserved.append(condition)
                 if condition == "baseline":
                     return 4
@@ -7104,6 +7146,114 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     self.assertRaises(runner.RunnerError),
                 ):
                     runner._pin_treatment_arguments(conflicting, manifest)
+
+    def test_mcp_stage_metadata_integrity_alias_and_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            manifest = root / "bound.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            script = root / "stdio.py"
+            script.write_text("pass\n", encoding="utf-8")
+            auth = [
+                file_identity(Path(sys.executable)),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            staged = runner.stage_mcp_upstream(
+                state,
+                [
+                    str(Path(sys.executable).resolve()),
+                    str(script),
+                    "--bundle-root",
+                    str(manifest),
+                ],
+                manifest,
+                auth,
+            )
+            reference = staged["metadata_binding"]
+            metadata = Path(reference["path"])
+            self.assertEqual(
+                metadata, Path(staged["runtime_dir"]) / runner.MCP_STAGE_METADATA_NAME
+            )
+            self.assertEqual(stat.S_IMODE(metadata.stat().st_mode), 0o600)
+            self.assertEqual(metadata.stat().st_nlink, 1)
+            payload = runner._read_bound_mcp_stage_metadata(reference)
+            document = json.loads(payload)
+            self.assertNotIn("metadata_binding", document)
+            self.assertEqual(
+                payload,
+                runner.canonical(
+                    runner._mcp_stage_wire(
+                        {
+                            key: value
+                            for key, value in staged.items()
+                            if key != "metadata_binding"
+                        }
+                    )
+                ).encode("utf-8"),
+            )
+            runner._revalidate_staged_mcp_upstream(staged)
+            for broken in (
+                {**reference, "sha256": "f" * 64},
+                {**reference, "identity": [1, 2, 3, 4]},
+            ):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "metadata identity or digest mismatch"
+                ):
+                    runner._read_bound_mcp_stage_metadata(broken)
+            alias = root / "writable-hardlink"
+            os.link(metadata, alias)
+            with self.assertRaisesRegex(runner.RunnerError, "metadata is unsafe"):
+                runner._revalidate_staged_mcp_upstream(staged)
+            self.assertEqual(runner.cleanup_staged_mcp_upstream(staged), "RunnerError")
+            alias.unlink()
+            original = metadata.read_bytes()
+            metadata.write_bytes(original + b" ")
+            with self.assertRaises(runner.RunnerError):
+                runner._revalidate_staged_mcp_upstream(staged)
+            self.assertEqual(runner.cleanup_staged_mcp_upstream(staged), "RunnerError")
+            metadata.write_bytes(original)
+            unexpected = Path(staged["runtime_dir"]) / "extra.py"
+            unexpected.write_text("pass\n", encoding="utf-8")
+            with self.assertRaisesRegex(runner.RunnerError, "unexpected entries"):
+                runner._revalidate_staged_mcp_upstream(staged)
+            unexpected.unlink()
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(staged))
+
+    def test_mcp_stage_metadata_size_and_other_exec_args_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            manifest = root / "bound.bundle.manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            script = root / "stdio.py"
+            script.write_text("pass\n", encoding="utf-8")
+            args = [
+                str(Path(sys.executable).resolve()),
+                str(script),
+                "--bundle-root",
+                str(manifest),
+            ]
+            authorized = [
+                file_identity(Path(sys.executable)),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            with patch.object(runner, "MAX_MCP_STAGE_METADATA_BYTES", 32):
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "pre-intent byte budget"
+                ):
+                    runner.stage_mcp_upstream(state, args, manifest, authorized)
+            self.assertEqual(
+                list((state / "repoground-mcp-upstream-runtime").iterdir()), []
+            )
+        with self.assertRaisesRegex(runner.RunnerError, "per-string bound"):
+            runner._validate_provider_exec_argv_budget(
+                ["/bin/true", "x" * (128 * 1024)], {}
+            )
 
     def test_staged_mcp_upstream_survives_later_source_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

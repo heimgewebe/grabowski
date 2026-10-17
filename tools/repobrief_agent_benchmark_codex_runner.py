@@ -517,6 +517,8 @@ MAX_PROVIDER_EXECUTABLE_BYTES = 512 * 1024 * 1024
 MAX_MCP_SOURCE_TREE_FILES = 4096
 MAX_MCP_SOURCE_TREE_BYTES = 64 * 1024 * 1024
 MAX_MCP_SOURCE_TREE_LISTING_BYTES = 32 * 1024 * 1024
+MAX_MCP_STAGE_METADATA_BYTES = 64 * 1024 * 1024
+MCP_STAGE_METADATA_NAME = "stage-metadata.json"
 MAX_MCP_MANIFEST_ARTIFACTS = 4096
 MAX_MCP_MANIFEST_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_AUTH_BYTES = 64 * 1024
@@ -2395,6 +2397,7 @@ def _preintent_output_entry_reservation(
     *,
     mcp_script: Path | None = None,
     legacy_g1: bool = False,
+    state_root: Path | None = None,
 ) -> int:
     """Reserve both MCP stages and their exact source/manifest parent directories.
 
@@ -2443,6 +2446,7 @@ def _preintent_output_entry_reservation(
         raise RunnerError("pre-intent RepoGround MCP source closure is unavailable")
     vendor_entries = _frozen_g1_vendor_snapshot() if legacy_g1 else []
     upstream_files = [
+        Path(MCP_STAGE_METADATA_NAME),
         Path("executable") / "mcp-python",
         Path("script") / script_name,
         Path("manifest") / manifest.name,
@@ -2476,6 +2480,20 @@ def _preintent_output_entry_reservation(
             upstream_directories.add(relative.parts[:depth])
     if len(upstream_files) != len(set(upstream_files)):
         raise RunnerError("pre-intent upstream MCP stage has duplicate file paths")
+    # Pessimistic envelope for UTF-8/JSON-escaped absolute stage paths and
+    # worst-case inode/size/mode fields. Baseline checks the future Treatment
+    # before its first one-shot intent, not merely before Treatment intent.
+    prospective_root = (
+        (state_root if state_root is not None else Path("/tmp/repobrief-test-state"))
+        / "repoground-mcp-upstream-runtime"
+        / ("upstream-" + "0" * 24)
+    )
+    metadata_upper_bound = 1024 * 1024 + sum(
+        512 + len(json.dumps(str(prospective_root / relative), ensure_ascii=True))
+        for relative in upstream_files
+    )
+    if metadata_upper_bound > MAX_MCP_STAGE_METADATA_BYTES:
+        raise RunnerError("pre-intent MCP stage metadata exceeds its byte budget")
 
     # Four proxy-stage entries, three initial manifest-stage entries,
     # then the second upstream stage's two private parent directories,
@@ -7188,7 +7206,7 @@ def stage_mcp_upstream(
                     staged_argv[1:1] = ["-I", "-B"]
 
         _directory_fd_matches(stage_root, stage_fd)
-        return {
+        stage: dict[str, Any] = {
             "argv": staged_argv,
             "bindings": staged_bindings,
             "manifest_binding": staged_manifest_binding,
@@ -7207,6 +7225,25 @@ def stage_mcp_upstream(
             "runtime_dir": stage_root,
             "runtime_identity": _private_directory_identity(os.fstat(stage_fd)),
         }
+        # The hostile provider receives a small immutable reference, never
+        # thousands of source_tree_bindings inside one Codex -c argument.
+        metadata_raw = canonical(_mcp_stage_wire(stage)).encode("utf-8")
+        if len(metadata_raw) > MAX_MCP_STAGE_METADATA_BYTES:
+            raise RunnerError("MCP stage metadata exceeds its pre-intent byte budget")
+        metadata_relative = Path(MCP_STAGE_METADATA_NAME)
+        _write_private_relative_file(
+            stage_fd, metadata_relative, metadata_raw, mode=0o600
+        )
+        metadata_binding = _bind_mcp_file(
+            stage_root / metadata_relative,
+            label="MCP stage metadata",
+            executable=False,
+        )
+        if metadata_binding["sha256"] != sha_bytes(metadata_raw):
+            raise RunnerError("MCP stage metadata changed during preparation")
+        stage["metadata_binding"] = metadata_binding
+        _directory_fd_matches(stage_root, stage_fd)
+        return stage
     except BaseException:
         if stage_fd is not None:
             try:
@@ -7222,19 +7259,86 @@ def stage_mcp_upstream(
             os.close(stage_fd)
 
 
+def _read_bound_mcp_stage_metadata(binding: Mapping[str, Any]) -> bytes:
+    """Read one create-only stage record through a bounded non-symlink path."""
+    if not isinstance(binding, Mapping) or set(binding) != {
+        "path",
+        "identity",
+        "sha256",
+    }:
+        raise RunnerError("MCP stage metadata reference is invalid")
+    # The trusted parent holds Paths; the serialized child reference uses str.
+    path_text = binding["path"]
+    if isinstance(path_text, Path):
+        path_text = str(path_text)
+    identity = binding["identity"]
+    expected_sha = binding["sha256"]
+    if (
+        not isinstance(path_text, str)
+        or not Path(path_text).is_absolute()
+        or Path(path_text).name != MCP_STAGE_METADATA_NAME
+        or not isinstance(identity, (tuple, list))
+        or len(identity) != 4
+        or any(type(number) is not int for number in identity)
+        or not isinstance(expected_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None
+    ):
+        raise RunnerError("MCP stage metadata reference is invalid")
+    path = Path(path_text)
+    if os.path.normpath(path_text) != path_text:
+        raise RunnerError("MCP stage metadata path is not normalized")
+    try:
+        linked = path.lstat()
+    except OSError as exc:
+        raise RunnerError("MCP stage metadata is unavailable") from exc
+    if (
+        not stat.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.geteuid()
+        or linked.st_nlink != 1
+        or stat.S_IMODE(linked.st_mode) != 0o600
+        or linked.st_size < 0
+        or linked.st_size > MAX_MCP_STAGE_METADATA_BYTES
+    ):
+        raise RunnerError("MCP stage metadata is unsafe or exceeds its bound")
+    raw = _read_bound_regular_file(
+        path, label="MCP stage metadata", max_bytes=MAX_MCP_STAGE_METADATA_BYTES
+    )
+    after = path.lstat()
+    actual = (after.st_dev, after.st_ino, after.st_size, after.st_mode)
+    if (
+        actual != tuple(identity)
+        or (linked.st_dev, linked.st_ino, linked.st_size, linked.st_mode) != actual
+        or sha_bytes(raw) != expected_sha
+    ):
+        raise RunnerError("MCP stage metadata identity or digest mismatch")
+    return raw
+
+
 def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
     bindings = binding.get("bindings")
     manifest_binding = binding.get("manifest_binding")
     manifest_artifact_bindings = binding.get("manifest_artifact_bindings")
     source_tree_bindings = binding.get("source_tree_bindings")
+    metadata_binding = binding.get("metadata_binding")
     if (
-        not isinstance(bindings, list)
+        not isinstance(metadata_binding, Mapping)
+        or not isinstance(bindings, list)
         or not bindings
         or not isinstance(manifest_binding, Mapping)
         or not isinstance(manifest_artifact_bindings, list)
         or not isinstance(source_tree_bindings, list)
     ):
         raise RunnerError("staged MCP upstream binding is invalid")
+    if Path(str(metadata_binding.get("path"))) != (
+        Path(binding["runtime_dir"]) / MCP_STAGE_METADATA_NAME
+    ):
+        raise RunnerError("MCP stage metadata escaped its private runtime root")
+    raw = _read_bound_mcp_stage_metadata(metadata_binding)
+    stage_without_reference = {
+        key: value for key, value in binding.items() if key != "metadata_binding"
+    }
+    if raw != canonical(_mcp_stage_wire(stage_without_reference)).encode("utf-8"):
+        raise RunnerError("MCP stage metadata content differs from parent binding")
     for index, file_binding in enumerate(bindings):
         label = "MCP executable" if index == 0 else "MCP script"
         current = _bind_mcp_file(
@@ -7286,6 +7390,7 @@ def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
             manifest_binding,
             *manifest_artifact_bindings,
             *source_tree_bindings,
+            metadata_binding,
         ],
     )
 
@@ -7299,6 +7404,7 @@ def cleanup_staged_mcp_upstream(binding: Mapping[str, Any]) -> str | None:
             binding["manifest_binding"],
             *binding["manifest_artifact_bindings"],
             *binding["source_tree_bindings"],
+            binding["metadata_binding"],
         ]:
             Path(file_binding["path"]).relative_to(runtime_dir)
         shutil.rmtree(runtime_dir)
@@ -7401,12 +7507,44 @@ def _prepared_mcp_upstream_from_parent(
     All executable bytes are staged before provider intent. This child never
     writes executable files or trusts a final digest to cover a transient edit.
     """
+    if not isinstance(stage_text, str) or len(stage_text.encode("utf-8")) > 8192:
+        raise RunnerError("MCP stage metadata reference exceeds its argv bound")
     try:
-        stage = json.loads(stage_text)
+        reference = json.loads(stage_text)
     except (TypeError, ValueError) as exc:
-        raise RunnerError("MCP upstream requires parent-prepared stage") from exc
-    if not isinstance(stage, dict) or not isinstance(stage.get("argv"), list):
+        raise RunnerError("MCP stage metadata reference is invalid") from exc
+    if not isinstance(reference, dict):
+        raise RunnerError("MCP stage metadata reference is invalid")
+    # Check the physical/read-only stage root before opening the metadata
+    # file: no provider-writable aliases or dynamic CODEX_HOME transport.
+    metadata_path = Path(str(reference.get("path")))
+    expected_parent = manifest.parents[2] / "repoground-mcp-upstream-runtime"
+    if (
+        not manifest.is_absolute()
+        or metadata_path.name != MCP_STAGE_METADATA_NAME
+        or metadata_path.parent.parent != expected_parent
+        or not metadata_path.parent.name.startswith("upstream-")
+        or not hasattr(os, "ST_RDONLY")
+    ):
+        raise RunnerError("MCP stage metadata is outside its authorized root")
+    for path in (metadata_path.parent, metadata_path, manifest):
+        try:
+            if not os.statvfs(path).f_flag & os.ST_RDONLY:
+                raise RunnerError("MCP stage metadata is provider-writable")
+        except OSError as exc:
+            raise RunnerError("MCP stage metadata mount is unavailable") from exc
+    raw = _read_bound_mcp_stage_metadata(reference)
+    try:
+        stage = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise RunnerError("MCP upstream stage metadata is not JSON") from exc
+    if (
+        not isinstance(stage, dict)
+        or "metadata_binding" in stage
+        or not isinstance(stage.get("argv"), list)
+    ):
         raise RunnerError("MCP upstream requires parent-prepared stage")
+    stage["metadata_binding"] = reference
     try:
         root = Path(stage["runtime_dir"])
         state = manifest.parents[2]
@@ -7432,7 +7570,7 @@ def _prepared_mcp_upstream_from_parent(
         raise RunnerError("MCP prepared-stage physical binding is invalid") from exc
     if not hasattr(os, "ST_RDONLY"):
         raise RunnerError("MCP prepared stage requires kernel readonly evidence")
-    for path in (root, manifest, staged_manifest):
+    for path in (root, manifest, staged_manifest, metadata_path):
         try:
             if not os.statvfs(path).f_flag & os.ST_RDONLY:
                 raise RunnerError("MCP prepared stage is provider-writable")
@@ -8307,6 +8445,9 @@ def build_command(
         upstream = _treatment_mcp_upstream_command(
             request, checkout, source, manifest_path
         )
+        metadata_reference = prepared_mcp_stage.get("metadata_binding")
+        if not isinstance(metadata_reference, Mapping):
+            raise RunnerError("treatment requires bound MCP stage metadata")
         logical_manifest = Path(str(binding.get("manifest"))).expanduser()
         if not logical_manifest.is_absolute():
             raise RunnerError("treatment logical manifest path must be absolute")
@@ -8321,7 +8462,7 @@ def build_command(
             str(logical_manifest),
             str(binding["manifest_sha256"]),
             canonical(list(authorized_mcp_files)),
-            canonical(_mcp_stage_wire(prepared_mcp_stage)),
+            canonical(_mcp_stage_wire(dict(metadata_reference))),
         ]
         mcp_profile = _frozen_g1_mcp_profile(request)
         if mcp_profile == MCP_PROFILE_FROZEN_G1:
@@ -8339,6 +8480,37 @@ def build_command(
             "mcp_servers.repobrief.enabled_tools=" + canonical(sorted(ALLOWED_MCP)),
         ]
     return command
+
+
+def _validate_provider_exec_argv_budget(
+    argv: Sequence[str], environment: Mapping[str, str]
+) -> None:
+    """Never spend one-shot intent on an OS-rejected argument or environment."""
+    if sys.platform != "linux":
+        raise RunnerError("provider exec budget requires Linux")
+    try:
+        per_argument = min(os.sysconf("SC_PAGESIZE") * 32, 128 * 1024)
+        total_limit = os.sysconf("SC_ARG_MAX")
+    except (OSError, ValueError) as exc:
+        raise RunnerError("provider exec argument limits unavailable") from exc
+    if per_argument <= 0 or total_limit <= 0:
+        raise RunnerError("provider exec argument limits are invalid")
+    try:
+        sizes = [len(arg.encode("utf-8")) + 1 for arg in argv]
+        env_sizes = [
+            len(key.encode("utf-8")) + len(value.encode("utf-8")) + 2
+            for key, value in environment.items()
+        ]
+    except (AttributeError, UnicodeError) as exc:
+        raise RunnerError("provider exec argument encoding is invalid") from exc
+    if not sizes or max([*sizes, *env_sizes], default=0) >= per_argument:
+        raise RunnerError("provider exec argument exceeds Linux per-string bound")
+    # Count argv/env pointer slots and leave room for kernel/loader overhead.
+    if (
+        sum(sizes) + sum(env_sizes) + 8 * (len(sizes) + len(env_sizes) + 32)
+        >= total_limit - 32768
+    ):
+        raise RunnerError("provider exec arguments exceed Linux process budget")
 
 
 def _enable_child_subreaper() -> None:
@@ -9897,6 +10069,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
             dispatch_authorization.get("manifest"),
             mcp_script=mcp_script,
             legacy_g1=legacy_g1,
+            state_root=args.state_root,
         )
         if request["condition"] == "baseline":
             # Reserve entire future Treatment executable closure, including
@@ -9906,6 +10079,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 dispatch_authorization["binding"].get("manifest"),
                 mcp_script=mcp_script,
                 legacy_g1=legacy_g1,
+                state_root=args.state_root,
             )
 
         def check_preallocation_mounts(future_pair_entries: int = 0) -> None:
@@ -10081,6 +10255,12 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     # before irreversible provider intent; the provider child
                     # independently checks its own kernel-readonly view.
                     _revalidate_staged_mcp_upstream(upstream_stage)
+                provider_argv = _unix_socket_restricted_codex_argv(
+                    _provider_pid_namespaced_codex_argv(command, **pid_sandbox),
+                    provider_pid_namespace=True,
+                )
+                provider_environment = provider_env(codex=codex, codex_home=codex_home)
+                _validate_provider_exec_argv_budget(provider_argv, provider_environment)
                 _require_external_provider_one_shot(
                     request=request,
                     authorization=dispatch_authorization["authorization"],
@@ -10096,14 +10276,11 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 # allowances in the outer systemd service lifetime.
                 provider_started_at = utc_now()
                 capture = run_bounded(
-                    _unix_socket_restricted_codex_argv(
-                        _provider_pid_namespaced_codex_argv(command, **pid_sandbox),
-                        provider_pid_namespace=True,
-                    ),
+                    provider_argv,
                     cwd=checkout,
                     timeout_seconds=int(request["budgets"]["wall_seconds"]),
                     stdin_data=(prompt_for(request) + "\n").encode("utf-8"),
-                    environment=provider_env(codex=codex, codex_home=codex_home),
+                    environment=provider_environment,
                     process_started_callback=mark_provider_process_started,
                 )
                 provider_ended_at = utc_now()
