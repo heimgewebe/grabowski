@@ -2039,7 +2039,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
         self.assertEqual(missing["grabowski_audit_analyze"], ["audit_read"])
         self.assertEqual(
             missing["grabowski_checkout_binding_terminal_preview"],
-            ["git_cli", "github_cli"],
+            ["git_cli", "github_cli", "resource_lease"],
         )
         self.assertEqual(
             missing["grabowski_checkout_binding_terminal_apply"],

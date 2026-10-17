@@ -204,10 +204,22 @@ def read_regular_bytes(path: Path, *, max_bytes: int | None = None) -> bytes:
                 f"archive file exceeds server-owned read bound: {path.name}"
             )
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
-            payload = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
+            # Preallocating max_bytes + 1 can consume tens of MiB even when
+            # the real archive file is just a few KiB. The fd size is already
+            # checked against max_bytes; read one byte beyond that size only
+            # to detect concurrent append/truncation without false success.
+            payload = (
+                handle.read()
+                if max_bytes is None
+                else handle.read(metadata.st_size + 1)
+            )
         if max_bytes is not None and len(payload) > max_bytes:
             raise LifecycleEvidenceIntegrityError(
                 f"archive file exceeds server-owned read bound: {path.name}"
+            )
+        if max_bytes is not None and len(payload) != metadata.st_size:
+            raise LifecycleEvidenceIntegrityError(
+                f"archive file changed during bounded read: {path.name}"
             )
         return payload
     finally:

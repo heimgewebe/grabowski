@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import sys
+import shutil
+import sqlite3
+import tempfile
 import threading
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -13,6 +17,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import grabowski_current_work_surface as surface
+import grabowski_checkouts as checkouts_module
 
 
 REPOSITORY = "/home/alex/repos/grabowski"
@@ -830,7 +835,10 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             }
 
         errors: list[dict] = []
-        checkouts = SimpleNamespace(checkout_inventory=inventory)
+        checkouts = SimpleNamespace(
+            checkout_inventory=inventory,
+            _strict_inventory_readonly_scope=nullcontext,
+        )
         with patch.object(surface, "_module", return_value=checkouts):
             payloads = surface._checkout_payloads([REPOSITORY], errors)
 
@@ -863,6 +871,67 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_current_work_checkout_inventory_never_creates_wal_shm(self) -> None:
+        # Current Work calls the internal inventory, not the public wrapper.
+        # Verify the READ_ONLY boundary even when SQLite would write SHM.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / "source.sqlite3"
+            writer = sqlite3.connect(source)
+            try:
+                self.assertEqual(
+                    writer.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal"
+                )
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute("CREATE TABLE proof(value INTEGER)")
+                writer.execute("INSERT INTO proof VALUES(42)")
+                writer.commit()
+                source_wal = Path(str(source) + "-wal")
+                self.assertGreater(source_wal.stat().st_size, 32)
+
+                for scenario in ("wal_without_shm", "orphaned_shm"):
+                    with self.subTest(scenario=scenario):
+                        database = directory / (scenario + ".sqlite3")
+                        shutil.copyfile(source, database)
+                        if scenario == "wal_without_shm":
+                            shutil.copyfile(source_wal, Path(str(database) + "-wal"))
+                        else:
+                            Path(str(database) + "-shm").write_bytes(
+                                b"orphaned-shm-marker"
+                            )
+                        before = {
+                            path.name: path.read_bytes()
+                            for path in directory.iterdir()
+                            if path.name.startswith(database.name)
+                        }
+
+                        def inventory(repository: str, **_kwargs: object) -> dict:
+                            connection = checkouts_module._readonly_connection(database)
+                            if connection is not None:
+                                connection.close()
+                            return {"repository": repository, "worktrees": []}
+
+                        checkouts = SimpleNamespace(
+                            checkout_inventory=inventory,
+                            _strict_inventory_readonly_scope=(
+                                checkouts_module._strict_inventory_readonly_scope
+                            ),
+                        )
+                        errors: list[dict] = []
+                        with patch.object(surface, "_module", return_value=checkouts):
+                            payloads = surface._checkout_payloads([REPOSITORY], errors)
+                        self.assertEqual(payloads[0]["truncated"], True)
+                        self.assertEqual(errors[0]["source"], "checkouts")
+                        self.assertEqual(errors[0]["error"], "RuntimeError")
+                        after = {
+                            path.name: path.read_bytes()
+                            for path in directory.iterdir()
+                            if path.name.startswith(database.name)
+                        }
+                        self.assertEqual(before, after)
+            finally:
+                writer.close()
 
     def test_reconciliation_source_uses_bounded_git_timeout(self) -> None:
         seen: dict[str, object] = {}
@@ -906,7 +975,10 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             return {"repository": repository, "worktrees": [{"path": repository}]}
 
         errors: list[dict] = []
-        checkouts = SimpleNamespace(checkout_inventory=inventory)
+        checkouts = SimpleNamespace(
+            checkout_inventory=inventory,
+            _strict_inventory_readonly_scope=nullcontext,
+        )
         with patch.object(surface, "_module", return_value=checkouts):
             payloads = surface._checkout_payloads([REPOSITORY, missing], errors)
 

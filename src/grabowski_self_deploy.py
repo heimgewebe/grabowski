@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import fcntl
 import hashlib
 import json
@@ -4008,7 +4008,7 @@ def _release_auto_deploy_source_retention(retention: dict[str, Any]) -> bool:
         for value in required[2:]
     ):
         return False
-    with checkouts._database() as connection:
+    with closing(checkouts._database()) as connection, connection:
         deleted = connection.execute(
             """
             DELETE FROM retention
