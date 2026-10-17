@@ -1339,8 +1339,19 @@ def _assert_no_live_task_process(record: dict[str, Any]) -> dict[str, Any]:
     probe = observation.get("probe")
     if not isinstance(properties, dict) or not isinstance(probe, dict):
         raise TaskAttentionIntegrityError("task archive process observation is incomplete")
-    if probe.get("outcome_unknown"):
-        raise TaskAttentionIntegrityError("task archive process observation outcome is unknown")
+    # A failed, incomplete or truncated systemd show response can contain
+    # plausible inactive properties in its prefix; it is not liveness truth.
+    if (
+        type(probe.get("returncode")) is not int
+        or probe["returncode"] != 0
+        or probe.get("outcome_unknown") is not False
+        or probe.get("timed_out") is not False
+        or probe.get("stdout_truncated") is not False
+        or probe.get("stderr_truncated") is not False
+    ):
+        raise TaskAttentionIntegrityError(
+            "task archive process observation outcome is unknown or incomplete"
+        )
     active_state = properties.get("ActiveState")
     if active_state in {"active", "activating", "reloading", "deactivating"}:
         raise TaskAttentionConflictError(

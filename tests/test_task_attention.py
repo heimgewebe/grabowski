@@ -235,7 +235,11 @@ class TaskAttentionTests(unittest.TestCase):
                 "ActiveState": "inactive",
                 "SubState": "dead",
             },
-            "probe": {"returncode": 0, "outcome_unknown": False},
+            "probe": {
+                "returncode": 0, "outcome_unknown": False,
+                "timed_out": False, "stdout_truncated": False,
+                "stderr_truncated": False,
+            },
         }
 
     def _parameters(self, record: dict[str, object], **overrides: object) -> dict[str, object]:
@@ -2319,7 +2323,11 @@ class TaskAttentionTests(unittest.TestCase):
                 "ActiveState": "active",
                 "SubState": "running",
             },
-            "probe": {"returncode": 0, "outcome_unknown": False},
+            "probe": {
+                "returncode": 0, "outcome_unknown": False,
+                "timed_out": False, "stdout_truncated": False,
+                "stderr_truncated": False,
+            },
         }
 
         with patch.object(tasks, "_observe", return_value=live), self.assertRaisesRegex(
@@ -2327,6 +2335,36 @@ class TaskAttentionTests(unittest.TestCase):
             "still live",
         ):
             attention.execute_closeout_archive(self._archive_parameters(record))
+
+    def test_archive_liveness_rejects_incomplete_systemd_probes(self) -> None:
+        record = self._completed_task()
+        observation = self._inactive_process_observation()
+        before = self.database.read_bytes()
+        for field, invalid_value in (
+            ("returncode", 1),
+            ("timed_out", True),
+            ("stdout_truncated", True),
+            ("stderr_truncated", True),
+            ("outcome_unknown", True),
+        ):
+            with self.subTest(invalid_field=field):
+                failed_probe = {**observation["probe"], field: invalid_value}
+                with patch.object(tasks, "_observe", return_value={
+                    **observation, "probe": failed_probe,
+                }), self.assertRaises(attention.TaskAttentionIntegrityError):
+                    attention._assert_no_live_task_process(record)
+        for missing_field in (
+            "returncode", "timed_out", "stdout_truncated",
+            "stderr_truncated", "outcome_unknown",
+        ):
+            with self.subTest(missing_field=missing_field):
+                incomplete_probe = dict(observation["probe"])
+                del incomplete_probe[missing_field]
+                with patch.object(tasks, "_observe", return_value={
+                    **observation, "probe": incomplete_probe,
+                }), self.assertRaises(attention.TaskAttentionIntegrityError):
+                    attention._assert_no_live_task_process(record)
+        self.assertEqual(before, self.database.read_bytes())
 
     def test_closeout_archive_blocks_reacquired_task_resource_lease(self) -> None:
         resource_key = "component:test-task-closeout-archive"
