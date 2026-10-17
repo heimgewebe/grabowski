@@ -8345,9 +8345,13 @@ def _start_job(
             "PYTHONPROFILEIMPORTTIME": "",
             "PYTHONASYNCIODEBUG": "",
             "PYTHONDONTWRITEBYTECODE": "",
-            "PYTHONNODEBUGRANGES": "",
-            "PYTHONPERFSUPPORT": "",
+            "PYTHONPERFSUPPORT": "0",
         })
+        # CPython treats NODEBUGRANGES as a presence-only switch: NAME= is
+        # still enabled. UnsetEnvironment runs *last* in systemd.exec, after
+        # all user-manager inheritance and transient unit Environment=.
+        environment.pop("PYTHONNODEBUGRANGES", None)
+        systemd_argv.append("--property=UnsetEnvironment=PYTHONNODEBUGRANGES")
     if (
         decision_review_binding is not None
         and scope.get("decision_review_provenance", {}).get("schema_version") == 2

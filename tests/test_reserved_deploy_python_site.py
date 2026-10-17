@@ -105,11 +105,16 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                 "PYTHONPROFILEIMPORTTIME": "",
                 "PYTHONASYNCIODEBUG": "",
                 "PYTHONDONTWRITEBYTECODE": "",
-                "PYTHONNODEBUGRANGES": "",
-                "PYTHONPERFSUPPORT": "",
+                "PYTHONPERFSUPPORT": "0",
             }
             for name, value in neutral.items():
                 self.assertEqual(1, before_command.count(f"--setenv={name}={value}"), name)
+            # PYTHONNODEBUGRANGES is presence-only, so even NAME= is unsafe.
+            self.assertIn("--property=UnsetEnvironment=PYTHONNODEBUGRANGES", before_command)
+            self.assertFalse(any(
+                arg.startswith("--setenv=PYTHONNODEBUGRANGES=")
+                for arg in before_command
+            ))
             # Probe actual interpreter preinitialization with -S solely to
             # prevent tests from loading any user-site .pth or bytecode.
             if Path("/usr/bin/python3").is_file():
