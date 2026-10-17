@@ -7141,6 +7141,56 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(2, scan.call_count)
         self.assertEqual(before, self.database.read_bytes())
 
+    def test_archived_inventory_race_rechecks_both_sqlite_revisions(self) -> None:
+        self._local_terminal_readiness_store(1)
+        original_task = tasks._task_reconcile_revision_contract
+        original_resource = tasks.resources._resource_reconcile_revision_contract
+        before = self.database.read_bytes()
+        for store in ("task", "resource"):
+            phase = {"calls": 0, "changed": False}
+
+            def observe_inventory() -> bool:
+                phase["calls"] += 1
+                phase["changed"] = phase["calls"] == 2
+                return False
+
+            def revision_after_check(value):
+                revision = value["revision"]
+                return {**value, "revision": "a" * 64 if revision != "a" * 64 else "b" * 64}
+
+            def task_revision(conn, **kwargs):
+                value = original_task(conn, **kwargs)
+                return revision_after_check(value) if store == "task" and phase["changed"] else value
+
+            def resource_revision(conn, **kwargs):
+                value = original_resource(conn, **kwargs)
+                return revision_after_check(value) if store == "resource" and phase["changed"] else value
+
+            with (
+                self.subTest(store=store),
+                patch.object(
+                    tasks, "_task_reconcile_ready_local_terminal_rows",
+                    return_value=([], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0),
+                ),
+                patch.object(
+                    tasks, "_task_reconcile_ready_archived_user_unit_live",
+                    side_effect=observe_inventory,
+                ),
+                patch.object(
+                    tasks, "_task_reconcile_revision_contract",
+                    side_effect=task_revision,
+                ),
+                patch.object(
+                    tasks.resources, "_resource_reconcile_revision_contract",
+                    side_effect=resource_revision,
+                ),
+            ):
+                with tasks._task_readonly_snapshot() as reader:
+                    result = tasks._task_reconcile_ready_evidence_snapshot(reader)
+            self.assertEqual("stale", result["status"], result)
+            self.assertEqual(2, phase["calls"])
+        self.assertEqual(before, self.database.read_bytes())
+
     def test_archived_unit_restarted_without_db_write_never_reports_ready(self) -> None:
         # A closeout projection excludes the retained row. Systemd still owns
         # the loaded unit, which a separate supported service operation can
@@ -11343,6 +11393,11 @@ class TaskTests(unittest.TestCase):
                         "SubState": "dead", "Result": systemd_result,
                     },
                     "observed_at_unix": tasks._now(),
+                    "probe": {"returncode": 0, "timed_out": False},
+                    "observer": {
+                        "kind": "bound-local-user-systemd-show-v1",
+                        "transport": "local",
+                    },
                 }),
                 patch.object(tasks, "_set_state",
                              side_effect=AssertionError("peek must not write")),
@@ -11373,6 +11428,48 @@ class TaskTests(unittest.TestCase):
                 peek = tasks.grabowski_task_peek(task["task_id"])
             self.assertEqual(expected_state, peek["state"])
             self.assertTrue(peek["reconcile_required"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_cancelled_peek_does_not_certify_deactivating_unit(self) -> None:
+        task = self._start()["task"]
+        with tasks._database_connection() as conn:
+            conn.execute(
+                "UPDATE tasks SET state='cancelled' WHERE task_id=?",
+                (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        for observed, unit_result in (
+            ("completed", "success"), ("signalled", "signal"),
+            ("timed_out", "timeout"), ("failed", "exit-code"),
+        ):
+            with (
+                self.subTest(observed=observed),
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(tasks, "_observe", return_value={
+                    "state": observed,
+                    "properties": {
+                        "LoadState": "loaded", "ActiveState": "deactivating",
+                        "SubState": "stop-sigterm", "Result": unit_result,
+                    },
+                    "probe": {"returncode": 0, "timed_out": False},
+                    "observer": {
+                        "kind": "bound-local-user-systemd-show-v1",
+                        "transport": "local",
+                    },
+                    "observed_at_unix": tasks._now(),
+                }),
+                patch.object(
+                    tasks, "_set_state",
+                    side_effect=AssertionError("READ_ONLY must not write"),
+                ),
+            ):
+                result = tasks.grabowski_task_peek(task["task_id"])
+            self.assertEqual("observation_error", result["state"])
+            self.assertTrue(result["reconcile_required"])
+            self.assertEqual("cancelled", result["persisted_state"])
         self.assertEqual(before, self.database.read_bytes())
 
     def test_task_peek_terminal_unknown_observation_fails_closed(self) -> None:
