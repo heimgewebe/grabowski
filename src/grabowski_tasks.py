@@ -7715,10 +7715,38 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
         }
         result["reconcile_required"] = True
         return result
-    result["state"] = _effective_observed_state(record, observation["state"])
+    observed_state = str(observation["state"])
     result["last_observation"] = observation
     result["observation_mode"] = "unpersisted_readonly_probe"
-    result["reconcile_required"] = result["state"] != record["state"]
+    # A stored successful terminal result must not mask a new, contradictory
+    # terminal systemd result. Preserve the stored audit truth separately but
+    # expose the conflict as nonterminal until authorized reconciliation.
+    if (
+        _is_terminal_state(str(record["state"]))
+        and observed_state not in {"running", str(record["state"])}
+    ):
+        result["state"] = "observation_error"
+        result["observation_unavailable_reason"] = "persisted_terminal_outcome_conflict"
+        result["systemd_unit_health"] = {
+            "status": "unknown",
+            "reason": "persisted_terminal_outcome_conflict",
+        }
+        result["reconcile_required"] = True
+        return result
+    result["state"] = _effective_observed_state(record, observed_state)
+    result["systemd_unit_health"] = _task_systemd_unit_health(
+        result["state"], observation
+    )
+    # A verified launching -> running transition remains active throughout.
+    # It does not create an uncertain prior outcome or justify blocking a
+    # sibling Workspace role, and a READ_ONLY peek must not persist it.
+    result["reconcile_required"] = (
+        result["state"] != record["state"]
+        and not (
+            record["state"] == "launching"
+            and result["state"] == "running"
+        )
+    )
     return result
 
 
@@ -12254,7 +12282,7 @@ class TaskReconcileReadyLocalTerminalBudgetExceeded(RuntimeError):
 
 def _task_reconcile_ready_local_terminal_rows(
     connection: sqlite3.Connection,
-) -> tuple[list[dict[str, Any]], int, int]:
+) -> tuple[list[dict[str, Any]], int, int, int]:
     projection = _task_current_projection(readiness_bounded=True)
     bindings = projection.get("archived_task_bindings")
     if not isinstance(bindings, dict) or len(bindings) > TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT:
@@ -12288,6 +12316,7 @@ def _task_reconcile_ready_local_terminal_rows(
     selected: list[dict[str, Any]] = []
     current_local = 0
     non_local = 0
+    archived_unobservable = 0
     host_transports: dict[str, str] = {}
     try:
         for examined, raw in enumerate(cursor, start=1):
@@ -12299,7 +12328,25 @@ def _task_reconcile_ready_local_terminal_rows(
             current = lifecycle_projection.bounded_current_task_projection(
                 [_task_archive_record(record)], projection=projection,
             )
-            if not current or _is_root_systemd_backend(record):
+            if not current:
+                # Projection exclusion cannot prove a retained systemd unit
+                # is not still restartable. Root or remote units cannot be
+                # certified from a local read-only systemctl inventory.
+                if (
+                    _is_root_systemd_backend(record)
+                    or _execution_backend(record) != "systemd-user"
+                    or _systemd_scope(record) != "user"
+                ):
+                    archived_unobservable += 1
+                else:
+                    host = str(record["host"])
+                    if host not in host_transports:
+                        _, target, _ = _resolve_task_dispatch_host(host)
+                        host_transports[host] = str(target.get("transport") or "")
+                    if host_transports[host] != "local":
+                        archived_unobservable += 1
+                continue
+            if _is_root_systemd_backend(record):
                 continue
             if _execution_backend(record) != "systemd-user" or _systemd_scope(record) != "user":
                 raise RuntimeError("Local terminal task has unsupported systemd authority")
@@ -12325,7 +12372,7 @@ def _task_reconcile_ready_local_terminal_rows(
     if not 0 <= headroom <= TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT:
         raise RuntimeError("Readiness archive history exceeds safety budget")
     if non_local:
-        return selected, non_local, headroom
+        return selected, non_local, headroom, archived_unobservable
     if current_local > TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT:
         raise TaskReconcileReadyLocalTerminalBudgetExceeded(
             "observation",
@@ -12333,7 +12380,63 @@ def _task_reconcile_ready_local_terminal_rows(
             archive_excess=current_local - TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT,
             archive_headroom=headroom,
         )
-    return selected, 0, headroom
+    return selected, 0, headroom, archived_unobservable
+
+
+TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_BYTES = 256 * 1024
+
+
+def _task_reconcile_ready_archived_user_unit_live() -> bool:
+    """Observe a bounded user-systemd unit inventory without dispatch or writes.
+
+    A local archived task may be restarted without changing its SQLite row or
+    reconciliation revision. One local-only inventory covers loaded task units,
+    including those absent from the current archive projection; any ambiguous
+    or truncated output fails closed rather than certifying readiness.
+    """
+    result = operator._run(
+        [
+            "systemctl", "--user", "list-units", "--all",
+            "--type=service", "--no-legend", "--plain", "--no-pager",
+            "grabowski-task-*.service",
+        ],
+        cwd=operator.HOME,
+        timeout_seconds=30,
+        max_output_bytes=TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_BYTES,
+    )
+    if (
+        not isinstance(result, dict)
+        or type(result.get("returncode")) is not int
+        or result["returncode"] != 0
+        or result.get("timed_out") is not False
+        or result.get("outcome_unknown")
+        or result.get("stdout_truncated") is not False
+        or result.get("stderr_truncated") is not False
+        or not isinstance(result.get("stdout"), str)
+    ):
+        raise RuntimeError("Archived task unit inventory is unavailable")
+    for raw in result["stdout"].splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if re.fullmatch(r"[0-9]+ loaded units listed\.", line):
+            continue
+        fields = line.split(maxsplit=5)
+        if fields and fields[0] == "●":
+            fields.pop(0)
+        if len(fields) < 4 or re.fullmatch(
+            r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service",
+            fields[0],
+        ) is None:
+            raise RuntimeError("Archived task unit inventory is ambiguous")
+        _unit, load, active, sub = fields[:4]
+        if active in {"active", "activating", "reloading", "deactivating"}:
+            return True
+        if active not in {"inactive", "failed"} or sub not in {"dead", "failed"}:
+            raise RuntimeError("Archived task unit state is ambiguous")
+        if load not in {"loaded", "not-found", "masked", "bad-setting"}:
+            raise RuntimeError("Archived task unit load state is ambiguous")
+    return False
 
 
 def _task_reconcile_ready_local_terminal_observed(
@@ -12483,7 +12586,24 @@ def _task_reconcile_ready_evidence_snapshot(
         # fresh, strictly non-dispatching read-only observation.
         (
             local_terminal_records, non_local_terminal_count, archive_headroom,
+            archived_unobservable,
         ) = _task_reconcile_ready_local_terminal_rows(task_connection)
+        if archived_unobservable:
+            # Rootbroker and SSH observations would have effects that READ_ONLY
+            # is not authorized to perform. Never certify those archived units.
+            return {
+                "status": "archived_terminal_transport_unverified",
+                "archived_unobservable_count": archived_unobservable,
+            }
+        archive_inventory_probed = (
+            archive_headroom < TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT
+        )
+        if archive_inventory_probed:
+            try:
+                if _task_reconcile_ready_archived_user_unit_live():
+                    return {"status": "archived_task_unit_live_unverified"}
+            except (RuntimeError, OSError, ValueError, TypeError):
+                return {"status": "archived_task_unit_observation_unavailable"}
         if non_local_terminal_count:
             # No remote execution or dispatch in a READ_ONLY readiness query.
             # A valid remote closeout requires an authorized fresh live probe.
@@ -12496,7 +12616,7 @@ def _task_reconcile_ready_evidence_snapshot(
             observed = _observe(record, bound_local_user=True)
             if not _task_reconcile_ready_local_terminal_observed(record, observed):
                 return {"status": "local_terminal_live_unverified"}
-        if local_terminal_records:
+        if local_terminal_records or archive_inventory_probed:
             # External probes run after the first SQLite snapshot; a resume
             # during the probe must not be certified using an old task row.
             with _task_readonly_snapshot() as fresh:
