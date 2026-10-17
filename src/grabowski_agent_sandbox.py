@@ -1,24 +1,59 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import selectors
 import shutil
 import signal
 import stat
 import subprocess
 import tempfile
-from typing import Iterable
+from typing import Iterable, Iterator
 
 BWRAP = Path(os.environ.get("GRABOWSKI_BWRAP_BIN", "/usr/bin/bwrap"))
 TAIL_BYTES = 12000
 MAX_WRITABLE_SCOPE_ENTRIES = 100_000
+# Prevent the local Git repository from supplying executable helpers or
+# altering the network trust path. Git's environment overrides this config
+# after repository configuration has been loaded.
+_TRUSTED_GIT_SSH_COMMAND = (
+    "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none "
+    "-oProxyJump=none -oControlMaster=no -oControlPath=none "
+    "-oControlPersist=no -oForwardAgent=no -oForwardX11=no "
+    "-oPermitLocalCommand=no -oClearAllForwardings=yes "
+    "-oUpdateHostKeys=no -oKnownHostsCommand=none "
+    "-oUserKnownHostsFile=~/.ssh/known_hosts "
+    "-oStrictHostKeyChecking=yes"
+)
 _GIT_COMMAND_CONFIG = (
     ("core.hooksPath", "/dev/null"),
     ("core.fsmonitor", "false"),
+    ("core.editor", "/bin/false"),
+    ("core.pager", "cat"),
+    ("sequence.editor", "/bin/false"),
+    ("interactive.diffFilter", ""),
+    # Never execute a repository-selected signing program, even if commit
+    # configuration is changed after the repository admission check.
+    ("commit.gpgsign", "false"),
+    ("tag.gpgsign", "false"),
+    ("gpg.program", "/bin/false"),
+    ("gpg.openpgp.program", "/bin/false"),
+    ("gpg.ssh.program", "/bin/false"),
+    ("gpg.x509.program", "/bin/false"),
+    ("protocol.ext.allow", "never"),
+    ("core.sshCommand", _TRUSTED_GIT_SSH_COMMAND),
+    ("core.askPass", "/bin/false"),
+    ("credential.helper", ""),
+    ("http.proxy", ""),
+    ("http.sslVerify", "true"),
+    ("http.sslCAInfo", "/etc/ssl/certs/ca-certificates.crt"),
+    ("http.sslCAPath", "/etc/ssl/certs"),
 )
 
 
@@ -440,9 +475,47 @@ def _git_command_environment() -> dict[str, str]:
     return environment
 
 
+def _git_effect_environment() -> dict[str, str]:
+    """Bind source ancestry and CA trust at the Git process boundary."""
+    return {
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": "/dev/null/grabowski-disabled-grafts",
+        "GIT_SSL_CAINFO": "/etc/ssl/certs/ca-certificates.crt",
+        "GIT_SSL_CAPATH": "/etc/ssl/certs",
+    }
+
+
 def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
     """Return a non-interactive Git environment with executable helpers disabled."""
-    environment = dict(os.environ if base is None else base)
+    inherited = os.environ if base is None else base
+    # No caller environment is transport or executable authority. Git -C
+    # does not defeat GIT_DIR, but filtering only GIT_* is insufficient:
+    # PATH, HOME, SSH_ASKPASS, LD_PRELOAD, proxy and CA variables can also
+    # redirect or execute programs at a Git subprocess effect boundary.
+    # Preserve only inert terminal/user labels; use OS-account HOME for
+    # pinned SSH host keys and trusted system Git/SSH executables.
+    try:
+        home = pwd.getpwuid(os.geteuid()).pw_dir
+    except (KeyError, OSError) as exc:
+        raise AgentSandboxError("trusted Git process account home unavailable") from exc
+    if not os.path.isabs(home) or not os.path.isdir(home):
+        raise AgentSandboxError("trusted Git process account home invalid")
+    environment = {
+        key: value
+        for key, value in inherited.items()
+        if key in {"TERM", "LANG", "LC_CTYPE", "USER", "LOGNAME"}
+        and isinstance(value, str)
+    }
+    environment.update({
+        "HOME": home,
+        "PATH": "/usr/bin:/bin",
+        "GIT_EDITOR": "/bin/false",
+        "GIT_SEQUENCE_EDITOR": "/bin/false",
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+        "SSH_ASKPASS": "/bin/false",
+        "SSH_ASKPASS_REQUIRE": "never",
+    })
     # Flowlines exporter authentication is server-only and must never cross
     # into agent, workspace, reviewer, or writer child processes.
     for key in (
@@ -481,11 +554,492 @@ def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_ALLOW_PROTOCOL": "ssh:https:file",
+            # A URL-specific repository http.<url>.sslVerify=false beats a
+            # generic command config sslVerify=true. Until a trusted URL
+            # can be effect-bound, Git HTTPS must fail closed. GitHub SSH
+            # and local file fixtures remain available.
+            "GIT_ALLOW_PROTOCOL": "ssh:file",
+            "GIT_SSH_COMMAND": _TRUSTED_GIT_SSH_COMMAND,
+            "GIT_SSH_VARIANT": "ssh",
+            "GIT_ASKPASS": "/bin/false",
         }
     )
     environment.update(_git_command_environment())
+    environment.update(_git_effect_environment())
     return environment
+
+
+
+def safe_git_repository_environment(
+    repo: Path, base: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Fail closed before host Git can invoke local executable filters/helpers.
+
+    A repository's effective config can enable clean/smudge/process,
+    textconv/external-diff, merge or alias commands. Host Git operations
+    must not execute these under the Grabowski account.
+    """
+    environment = safe_git_environment(base)
+    checkout = Path(repo)
+    if not checkout.is_absolute() or not checkout.is_dir():
+        raise AgentSandboxError("trusted Git checkout is not an absolute directory")
+    try:
+        result = subprocess.run(
+            ["/usr/bin/git", "-C", str(checkout), "config",
+             "--list", "--name-only", "-z", "--includes"],
+            env=environment, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=15, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AgentSandboxError("repository Git helper admission unavailable") from exc
+    if result.returncode != 0 or result.stderr or len(result.stdout) > 1024 * 1024:
+        raise AgentSandboxError("repository Git helper admission failed")
+    # Trusted environment -c entries are included by git config --list.
+    # Allow exactly one occurrence for a trusted pinned helper key. Any
+    # repository declaration yields a second occurrence and fails closed.
+    trusted_pinned_keys = {
+        "core.editor", "core.pager", "sequence.editor",
+        "interactive.difffilter",
+        "commit.gpgsign", "tag.gpgsign", "gpg.program",
+        "gpg.openpgp.program", "gpg.ssh.program", "gpg.x509.program",
+    }
+    seen_pinned_keys: set[str] = set()
+    for key in result.stdout.split(b"\x00"):
+        label = key.decode("utf-8", errors="surrogateescape").casefold()
+        if label in trusted_pinned_keys:
+            if label in seen_pinned_keys:
+                raise AgentSandboxError("repository declares an executable Git helper")
+            seen_pinned_keys.add(label)
+            continue
+        if (
+            (label.startswith("filter.") and label.endswith((".clean", ".smudge", ".process")))
+            or label == "diff.external"
+            or (label.startswith("diff.") and label.endswith((".command", ".textconv")))
+            or (label.startswith("merge.") and label.endswith(".driver"))
+            or (label.startswith("submodule.") and label.endswith(".update"))
+            or label.startswith(("pager.", "interactive."))
+            or label in {"core.pager", "sequence.editor"}
+            or label.startswith("gpg.")
+            or label in {"commit.gpgsign", "tag.gpgsign"}
+            or label.endswith((".program", ".cmd", ".command"))
+            or label.startswith("alias.")
+        ):
+            raise AgentSandboxError("repository declares an executable Git helper")
+    return environment
+
+
+
+# One fail-closed parser for both effect classification and the actual Git argv.
+# A guessed global-option arity could interpret an operand as the subcommand
+# and silently omit the sealed-attribute overlay. Unknown/rebinding/indirect
+# options are not silently skipped.
+_GIT_EFFECT_SAFE_GLOBAL_FLAGS = frozenset({
+    "--no-pager", "--no-replace-objects", "--literal-pathspecs",
+    "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs",
+    "--no-optional-locks", "--no-lazy-fetch",
+})
+
+
+def _git_effect_subcommand_index(argv: list[str]) -> int:
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument in {"-C", "-c"}:
+            if index + 1 >= len(argv) or not argv[index + 1]:
+                raise AgentSandboxError("Git global option is missing its operand")
+            index += 2
+            continue
+        if argument in _GIT_EFFECT_SAFE_GLOBAL_FLAGS:
+            index += 1
+            continue
+        if argument.startswith("-"):
+            raise AgentSandboxError("Git global option is not admitted at effect")
+        return index
+    raise AgentSandboxError("Git subcommand is missing")
+
+
+def _git_validate_effect_global_bindings(repo: Path, argv: list[str]) -> None:
+    """The exact Git command must use the admitted checkout and inert CLI config.
+
+    The repository config preflight and sealed info/attributes overlay cover
+    *repo*, not another repository selected with -C. Git command-line -c
+    outranks safe GIT_CONFIG_COUNT environment pins. Deny both escapes before
+    any Git subprocess effect, including before deciding whether to bwrap.
+    """
+    if not argv or Path(argv[0]).name != "git":
+        return
+    stop = _git_effect_subcommand_index(argv)
+    try:
+        checkout = Path(repo).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise AgentSandboxError("Git execution checkout binding unavailable") from exc
+    trusted_config = {
+        key.casefold(): value for key, value in _GIT_COMMAND_CONFIG
+    }
+    trusted_config.update({
+        "advice.graftfiledeprecated": "false",
+        "pager.status": "false", "pager.diff": "false",
+        "pager.log": "false", "pager.show": "false",
+        "diff.external": "", "diff.trustexitcode": "false",
+        "protocol.file.allow": "never",
+    })
+    index = 1
+    while index < stop:
+        option = argv[index]
+        if option == "-C":
+            target = Path(argv[index + 1])
+            if not target.is_absolute():
+                raise AgentSandboxError("Git -C must bind the exact absolute checkout")
+            try:
+                observed = target.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise AgentSandboxError("Git -C checkout binding unavailable") from exc
+            if observed != checkout:
+                raise AgentSandboxError("Git -C checkout differs from admitted repository")
+            index += 2
+            continue
+        if option == "-c":
+            configured = argv[index + 1]
+            key, separator, value = configured.partition("=")
+            key = key.casefold()
+            if not separator or not key or any(
+                character in value for character in ("\x00", "\r", "\n")
+            ):
+                raise AgentSandboxError("Git CLI config assignment is not trusted")
+            if key in {"user.name", "user.email"}:
+                if not value or len(value.encode("utf-8")) > 256:
+                    raise AgentSandboxError("Git CLI identity config is not bounded")
+            elif key not in trusted_config or value != trusted_config[key]:
+                raise AgentSandboxError("Git CLI executable config override is forbidden")
+            index += 2
+            continue
+        index += 1
+
+
+def _git_long_option_matches(option: str, *denied: str) -> bool:
+    if not option.startswith("--"):
+        return False
+    flag = option.split("=", 1)[0]
+    return any(target.startswith(flag) for target in denied)
+
+
+def _git_short_option_has_helper(
+    option: str, *, denied: frozenset[str], operand_flags: frozenset[str] = frozenset(),
+) -> bool:
+    if not option.startswith("-") or option.startswith("--"):
+        return False
+    # -amMessage: 'm' consumes the remainder; letters within Message cannot
+    # accidentally become -S/-e. -aS and -ae must still be caught.
+    for flag in option[1:]:
+        if flag in denied:
+            return True
+        if flag in operand_flags:
+            return False
+    return False
+
+
+def git_requires_filter_effect_guard(argv: list[str]) -> bool:
+    """Identify host Git effects which can inspect or transform worktree bytes."""
+    if not argv or Path(argv[0]).name != "git":
+        return False
+    index = _git_effect_subcommand_index(argv)
+    subcommand = argv[index]
+    arguments = argv[index + 1:]
+    if subcommand == "cat-file":
+        # Unlike ordinary object reads, --filters executes smudge/process
+        # drivers while materializing blobs. Bind the inert attributes to Git.
+        # --textconv is denied by _git_without_external_diff before execution.
+        return any(
+            argument.startswith("--") and "--filters".startswith(argument)
+            for argument in arguments
+        )
+    if subcommand == "diff":
+        # Tokens after '--' are pathspecs, never Git options: a tracked file
+        # literally named '--cached' must not bypass dirty-diff isolation.
+        prefix = arguments[:arguments.index("--")] if "--" in arguments else arguments
+        # A hex-shaped token can still be a tracked filename (not an object),
+        # particularly with mixed SHA-1/SHA-256 widths. Only a literal final
+        # '--' separates all candidate revisions from pathspecs without
+        # ambiguity. Without it, route the effect through sealed attributes.
+        if not arguments or arguments[-1] != "--":
+            return True
+        # Do not exempt cached/staged/no-index globally: no-index can read
+        # worktree files through a late-configured clean filter.
+        # A 40/64-hex operand can belong to a Git option (-S/-G,
+        # --anchored, --find-object, --word-diff-regex), not to a revision.
+        # Only options known to consume no following argv token may keep
+        # the immutable-revision exemption. Unknown options require effect-
+        # time filter isolation; do not guess where their operands end.
+        pure_diff_options = frozenset({
+            "--no-ext-diff", "--no-textconv", "--binary", "--full-index",
+            "--patch", "-p", "--raw", "--name-only", "--name-status",
+            "--stat", "--numstat", "--shortstat", "--check", "--quiet",
+            "--exit-code", "--no-renames", "--no-color", "--color=never",
+            "--ignore-all-space", "-w", "--ignore-space-change",
+            "--ignore-blank-lines", "--ignore-space-at-eol",
+            "--ignore-cr-at-eol", "--minimal", "--patience", "--histogram",
+            "--indent-heuristic", "--no-indent-heuristic", "--text", "-a",
+        })
+        if any(
+            item.startswith("-") and item not in pure_diff_options
+            for item in prefix
+        ):
+            return True
+        # A committed two-object diff never reads worktree contents or
+        # invokes clean/smudge filters. Do not require a Git info directory
+        # solely to compare immutable SHA-1 or SHA-256 commit objects.
+        revisions = [item for item in prefix if not item.startswith("-")]
+        if (
+            len(revisions) == 2
+            and len(revisions[0]) == len(revisions[1])
+            and len(revisions[0]) in {40, 64}
+            and all(all(char in "0123456789abcdef" for char in item) for item in revisions)
+        ):
+            return False
+        if len(revisions) == 1:
+            for separator in ("...", ".."):
+                pair = revisions[0].split(separator)
+                if (
+                    len(pair) == 2
+                    and len(pair[0]) == len(pair[1])
+                    and len(pair[0]) in {40, 64}
+                    and all(all(char in "0123456789abcdef" for char in item) for item in pair)
+                ):
+                    return False
+        return True
+    if subcommand == "worktree":
+        return "add" in arguments
+    return subcommand in {
+        "add", "am", "apply", "checkout", "checkout-index", "cherry-pick",
+        "commit", "diff-files", "diff-index", "hash-object", "merge",
+        "read-tree", "rebase", "reset", "restore", "revert", "stash",
+        "status", "switch", "update-index",
+    }
+
+
+def _git_without_external_diff(argv: list[str]) -> list[str]:
+    """Suppress executable external-diff/textconv at the same Git process effect.
+
+    Git's -c and -C global options can precede the subcommand, so injecting
+    solely at argv[:2] misses real WorkAcquire/Reviewer Git invocations.
+    Ordinary built-in text/binary diff algorithms remain unchanged.
+    """
+    if not argv or Path(argv[0]).name != "git":
+        return list(argv)
+    position = _git_effect_subcommand_index(argv)
+    subcommand = argv[position]
+    # Enforce interactive/signer denial before the real Git spawn, including
+    # bundled short options and unique long-option prefixes. The sandbox's
+    # /bin/false pins remain defence-in-depth for unknown future Git behavior.
+    options = argv[position + 1:]
+    prefix = options[:options.index("--")] if "--" in options else options
+    if subcommand == "commit" and any(
+        _git_short_option_has_helper(
+            option, denied=frozenset({"S", "e", "c"}),
+            operand_flags=frozenset({"m", "F", "C", "t"}),
+        )
+        or _git_long_option_matches(
+            option, "--gpg-sign", "--edit", "--reedit-message"
+        )
+        for option in prefix
+    ):
+        raise AgentSandboxError("Git signing or editor helper is forbidden")
+    if subcommand == "tag" and any(
+        _git_short_option_has_helper(
+            option, denied=frozenset({"s", "u", "v"}),
+            operand_flags=frozenset({"m", "F", "n"}),
+        )
+        or _git_long_option_matches(
+            option, "--sign", "--local-user", "--verify"
+        )
+        for option in prefix
+    ):
+        raise AgentSandboxError("Git tag signing or verification helper is forbidden")
+    interactive_subcommands = {"add", "commit", "checkout", "reset", "restore", "stash"}
+    if subcommand in interactive_subcommands | {"rebase"} and any(
+        (
+            subcommand in interactive_subcommands
+            and (
+                _git_long_option_matches(option, "--patch")
+                or _git_short_option_has_helper(
+                    option, denied=frozenset({"p", "i"} if subcommand == "add" else {"p"}),
+                    operand_flags=frozenset(
+                        {"m", "F", "C", "t"} if subcommand == "commit"
+                        else {"b", "B", "c", "C"} if subcommand == "checkout"
+                        else {"s"} if subcommand == "restore" else set()
+                    ),
+                )
+            )
+        )
+        or (
+            subcommand in {"add", "rebase"}
+            and _git_long_option_matches(option, "--interactive")
+        )
+        or (
+            subcommand == "rebase"
+            and (
+                _git_long_option_matches(option, "--exec")
+                or _git_short_option_has_helper(
+                    option, denied=frozenset({"i", "x"}),
+                )
+            )
+        )
+        for option in prefix
+    ):
+        raise AgentSandboxError("Git interactive helper effect is forbidden")
+    # Git parses conflicting diff flags in argument order. A caller-supplied
+    # --ext-diff/--textconv after our --no-* options would re-enable execution.
+    # Also cover blame/annotate/grep/cat-file, whose own --textconv can launch
+    # executable drivers despite an otherwise read-only Git classification.
+    if subcommand in {
+        "diff", "diff-files", "diff-index", "diff-tree", "show", "log",
+        "whatchanged", "annotate", "blame", "grep", "cat-file",
+    }:
+        arguments = argv[position + 1:]
+        option_prefix = arguments[:arguments.index("--")] if "--" in arguments else arguments
+        if any(
+            option.startswith("--") and (
+                "--ext-diff".startswith(option) or option.startswith("--ext-diff")
+                or (
+                    "--textconv".startswith(option.split("=", 1)[0])
+                    and len(option.split("=", 1)[0]) > len("--text")
+                )
+                or option.startswith("--textconv=")
+            )
+            for option in option_prefix
+        ):
+            raise AgentSandboxError("Git executable diff/textconv helpers are forbidden")
+        # git grep -O/--open-files-in-pager can execute a caller-selected
+        # program even when the read-only Git environment fixes GIT_PAGER.
+        # Reject both abbreviated long and bundled short option forms.
+        if subcommand == "grep" and any(
+            (
+                option.startswith("--")
+                and "--open-files-in-pager".startswith(option.split("=", 1)[0])
+            )
+            or (
+                option.startswith("-")
+                and not option.startswith("--")
+                and "O" in option[1:]
+            )
+            for option in option_prefix
+        ):
+            raise AgentSandboxError("Git grep executable pager is forbidden")
+    if subcommand not in {
+        "diff", "diff-files", "diff-index", "diff-tree", "show", "log",
+        "whatchanged",
+    }:
+        return list(argv)
+    return [
+        *argv[: position + 1], "--no-ext-diff", "--no-textconv",
+        *argv[position + 1 :],
+    ]
+
+
+@contextmanager
+def safe_git_filter_effect(
+    repo: Path,
+    argv: list[str],
+    *,
+    base: dict[str, str] | None = None,
+) -> Iterator[tuple[list[str], dict[str, str], tuple[int, ...]]]:
+    """Pin an inert filter attribute at the Git effect, not at earlier preflight.
+
+    Native Git can run filter.* helpers when reading dirty files or checking out
+    tracked files even with --no-ext-diff. A separate config read is racy. The
+    Linux mount namespace overlays Git's highest-precedence info/attributes
+    with a sealed memfd, preserving other info files read-only. No repository
+    file is created, altered or removed by the overlay. Fail closed when that
+    effect-time binding is unavailable; never fall back to unsandboxed Git.
+    """
+    _git_validate_effect_global_bindings(repo, argv)
+    environment = safe_git_repository_environment(repo, base)
+    # Apply the diff-driver denial at the actual spawn even when no attribute
+    # overlay is needed, e.g. committed two-object SHA-1/SHA-256 diffs.
+    effect_argv = _git_without_external_diff(argv)
+    if not git_requires_filter_effect_guard(effect_argv):
+        yield effect_argv, environment, ()
+        return
+    if not hasattr(os, "memfd_create") or not hasattr(os, "MFD_ALLOW_SEALING"):
+        raise AgentSandboxError("effect-bound Git filter isolation unsupported")
+    if not Path("/usr/bin/bwrap").is_file():
+        raise AgentSandboxError("effect-bound Git filter isolation unavailable")
+    probe = subprocess.run(
+        ["/usr/bin/git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-path", "info/attributes"],
+        env=environment, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False,
+    )
+    if probe.returncode != 0 or probe.stderr or len(probe.stdout) > 4096:
+        raise AgentSandboxError("Git attribute source identity unavailable")
+    try:
+        raw_attribute_path = os.fsdecode(probe.stdout).rstrip("\n")
+        attribute_path = Path(raw_attribute_path)
+        if not attribute_path.is_absolute():
+            attribute_path = Path(repo) / attribute_path
+        info = attribute_path.parent
+        if (
+            not attribute_path.is_absolute()
+            or attribute_path.name != "attributes"
+            or not info.is_dir()
+            or info.is_symlink()
+        ):
+            raise ValueError("unsafe Git attribute path")
+        entries = sorted(info.iterdir())
+        if len(entries) > 128:
+            raise ValueError("Git info directory exceeds safe mount budget")
+        # Only ordinary Git info entries can be preserved in the overlay.
+        # Symlinks/active special files fail closed rather than reinterpreted.
+        siblings: list[Path] = []
+        original = b""
+        for entry in entries:
+            metadata = entry.lstat()
+            if entry.name == "attributes":
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+                    raise ValueError("unsafe Git info attributes")
+                descriptor = os.open(entry, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+                try:
+                    original = os.read(descriptor, 1024 * 1024 + 1)
+                finally:
+                    os.close(descriptor)
+                if len(original) > 1024 * 1024:
+                    raise ValueError("Git info attributes exceed bound")
+            elif stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode):
+                siblings.append(entry)
+            else:
+                raise ValueError("unsafe Git info entry")
+        # Last matching Git attribute wins. Preserve preceding benign
+        # attribute semantics, but prevent any clean/smudge/process driver.
+        # Restore Git's built-in merge handling, never a repository-defined
+        # executable merge driver. Keep diff attributes unchanged to preserve
+        # binary/text patch semantics; --no-ext-diff/--no-textconv guard those.
+        inert = original + (b"" if not original or original.endswith(b"\n") else b"\n") + b"* -filter !merge\n"
+        fd = os.memfd_create("grabowski-git-inert-attrs", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise AgentSandboxError("Git attribute effect admission failed") from exc
+    try:
+        os.write(fd, inert)
+        fcntl.fcntl(
+            fd, fcntl.F_ADD_SEALS,
+            fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK |
+            fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE,
+        )
+        os.lseek(fd, 0, os.SEEK_SET)
+        command = [
+            "/usr/bin/bwrap", "--die-with-parent",
+            "--bind", "/", "/",
+            "--dev-bind", "/dev", "/dev",
+            "--tmpfs", str(info),
+        ]
+        for entry in siblings:
+            command.extend(("--ro-bind", str(entry), str(entry)))
+        command.extend((
+            "--ro-bind-data", str(fd), str(attribute_path),
+            "--", "/usr/bin/git", *effect_argv[1:],
+        ))
+        yield command, environment, (fd,)
+    finally:
+        os.close(fd)
 
 
 def runtime_sandbox_argv(arguments: list[str]) -> list[str]:
@@ -981,9 +1535,12 @@ def minimal_sandbox_argv(
             "--setenv",
             "GIT_OPTIONAL_LOCKS",
             "0",
+            "--setenv",
+            "GIT_ALLOW_PROTOCOL",
+            "ssh:file",
         ]
     )
-    for key, value in _git_command_environment().items():
+    for key, value in (*_git_command_environment().items(), *_git_effect_environment().items()):
         arguments.extend(["--setenv", key, value])
     arguments.extend(
         [

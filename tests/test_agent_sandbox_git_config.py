@@ -46,11 +46,56 @@ class AgentSandboxGitConfigTests(unittest.TestCase):
                 workspace = root / ("writer" if writable else "reader")
                 workspace.mkdir()
                 environment = self.sandbox_environment(workspace, writable=writable)
-                self.assertEqual(environment["GIT_CONFIG_COUNT"], "2")
-                self.assertEqual(environment["GIT_CONFIG_KEY_0"], "core.hooksPath")
-                self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "/dev/null")
-                self.assertEqual(environment["GIT_CONFIG_KEY_1"], "core.fsmonitor")
-                self.assertEqual(environment["GIT_CONFIG_VALUE_1"], "false")
+                expected_overrides = (
+                    ("core.hooksPath", "/dev/null"),
+                    ("core.fsmonitor", "false"),
+                    ("core.editor", "/bin/false"),
+                    ("core.pager", "cat"),
+                    ("sequence.editor", "/bin/false"),
+                    ("interactive.diffFilter", ""),
+                    ("commit.gpgsign", "false"),
+                    ("tag.gpgsign", "false"),
+                    ("gpg.program", "/bin/false"),
+                    ("gpg.openpgp.program", "/bin/false"),
+                    ("gpg.ssh.program", "/bin/false"),
+                    ("gpg.x509.program", "/bin/false"),
+                    ("protocol.ext.allow", "never"),
+                    (
+                        "core.sshCommand",
+                        "/usr/bin/ssh -F /dev/null -oBatchMode=yes -oProxyCommand=none "
+                        "-oProxyJump=none -oControlMaster=no -oControlPath=none "
+                        "-oControlPersist=no -oForwardAgent=no -oForwardX11=no "
+                        "-oPermitLocalCommand=no -oClearAllForwardings=yes "
+                        "-oUpdateHostKeys=no -oKnownHostsCommand=none "
+                        "-oUserKnownHostsFile=~/.ssh/known_hosts "
+                        "-oStrictHostKeyChecking=yes",
+                    ),
+                    ("core.askPass", "/bin/false"),
+                    ("credential.helper", ""),
+                    ("http.proxy", ""),
+                    ("http.sslVerify", "true"),
+                    ("http.sslCAInfo", "/etc/ssl/certs/ca-certificates.crt"),
+                    ("http.sslCAPath", "/etc/ssl/certs"),
+                )
+                self.assertEqual(
+                    environment["GIT_CONFIG_COUNT"], str(len(expected_overrides))
+                )
+                actual_overrides = tuple(
+                    (
+                        environment[f"GIT_CONFIG_KEY_{index}"],
+                        environment[f"GIT_CONFIG_VALUE_{index}"],
+                    )
+                    for index in range(len(expected_overrides))
+                )
+                self.assertEqual(actual_overrides, expected_overrides)
+                for key, expected in (
+                    ("GIT_ALLOW_PROTOCOL", "ssh:file"),
+                    ("GIT_NO_REPLACE_OBJECTS", "1"),
+                    ("GIT_GRAFT_FILE", "/dev/null/grabowski-disabled-grafts"),
+                    ("GIT_SSL_CAINFO", "/etc/ssl/certs/ca-certificates.crt"),
+                    ("GIT_SSL_CAPATH", "/etc/ssl/certs"),
+                ):
+                    self.assertEqual(environment[key], expected)
                 self.assertNotIn("GIT_CONFIG_GLOBAL", environment)
                 self.assertNotIn("GIT_CONFIG_NOSYSTEM", environment)
 

@@ -2232,15 +2232,23 @@ class GrokReviewRoleTests(unittest.TestCase):
 
     def test_object_format_probe_rejects_successful_git_with_stderr(self) -> None:
         from types import SimpleNamespace
-        with mock.patch(
-            "subprocess.run",
-            return_value=SimpleNamespace(
+
+        def fake_git(argv: list[str], **_: object) -> SimpleNamespace:
+            # The new repository guard probes configuration before the
+            # object-format read. Keep that probe harmless and ensure the
+            # malicious diagnostic belongs to the format Git effect.
+            if "config" in argv:
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+            self.assertIn("rev-parse", argv)
+            return SimpleNamespace(
                 returncode=0, stdout=b"sha1\n",
                 stderr=b"attacker-controlled Git diagnostic\n",
-            ),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "stderr"):
-                role._repo_git_object_format(Path("/tmp/imaginary-checkout"))
+            )
+
+        with tempfile.TemporaryDirectory(prefix="review-object-format-") as raw:
+            with mock.patch("subprocess.run", side_effect=fake_git):
+                with self.assertRaisesRegex(RuntimeError, "stderr"):
+                    role._repo_git_object_format(Path(raw))
 
     def test_storage_format_probe_ignores_ambient_git_directory_redirects(self) -> None:
         import subprocess
