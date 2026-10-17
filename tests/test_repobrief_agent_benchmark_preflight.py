@@ -3419,7 +3419,7 @@ class FrozenG2PreflightProofTests(unittest.TestCase):
 
 
 class CodexSameUnitPairContractTests(unittest.TestCase):
-    """Verify pair admission and ordering without running Codex or a provider."""
+    """Simulated pair-control-flow tests; never live USD or spend authorization evidence."""
 
     @staticmethod
     def _requests() -> tuple[dict, dict]:
@@ -3506,7 +3506,10 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
-            mock.patch.object(codex_preflight.core, "load_pair") as load,
+            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
+            mock.patch.object(
+                codex_preflight.core, "load_pair", return_value=self._requests()
+            ) as load,
             mock.patch.object(codex_preflight, "authorize_pair") as authorize,
             mock.patch.object(codex_preflight.codex_runner, "execute") as execute,
         ):
@@ -3514,7 +3517,32 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
                 codex_preflight.core.PreflightError, "external one-shot"
             ):
                 codex_preflight.execute_authorized_pair(**self._kwargs())
-            load.assert_not_called()
+            load.assert_called_once_with(self._kwargs()["request_root"], "bound-pair")
+            authorize.assert_not_called()
+            execute.assert_not_called()
+
+    def test_unenforceable_real_codex_cost_never_authorizes_or_dispatches(self) -> None:
+        # Use the real pre-spend denial: no mocked USD, no internal ledger,
+        # no external verifier invocation and no provider process.
+        with (
+            mock.patch.object(
+                codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
+            ),
+            mock.patch.object(
+                codex_preflight.core, "load_pair", return_value=self._requests()
+            ) as load,
+            mock.patch.object(
+                codex_preflight, "_require_external_provider_one_shot"
+            ) as external,
+            mock.patch.object(codex_preflight, "authorize_pair") as authorize,
+            mock.patch.object(codex_preflight.codex_runner, "execute") as execute,
+        ):
+            with self.assertRaisesRegex(
+                codex_preflight.core.PreflightError, "pair cost ceiling unenforceable"
+            ):
+                codex_preflight.execute_authorized_pair(**self._kwargs())
+            load.assert_called_once()
+            external.assert_not_called()
             authorize.assert_not_called()
             execute.assert_not_called()
 
@@ -3524,6 +3552,7 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
+            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)
@@ -3562,6 +3591,7 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
+            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)
@@ -3638,6 +3668,7 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
+            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)
@@ -3682,6 +3713,7 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
+            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)
@@ -3924,6 +3956,7 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
+            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)
@@ -3975,6 +4008,7 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
+            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)
@@ -4031,6 +4065,7 @@ class CodexSameUnitPairContractTests(unittest.TestCase):
             mock.patch.object(
                 codex_preflight, "_ENTRYPOINT_BOOTSTRAP_IDENTITY", {"name": "test"}
             ),
+            mock.patch.object(codex_preflight, "_require_enforceable_codex_pair_cost"),
             mock.patch.object(codex_preflight, "_require_external_provider_one_shot"),
             mock.patch.object(
                 codex_preflight.core, "load_pair", return_value=(baseline, treatment)

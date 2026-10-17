@@ -14,6 +14,7 @@ call and are the supported way to qualify the contract before a one-shot run.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import ctypes
 import fcntl
 from datetime import datetime, timezone
@@ -37,7 +38,7 @@ import tempfile
 import sys
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 SOURCE_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
@@ -9563,6 +9564,72 @@ def _require_external_provider_one_shot(
     )
 
 
+# Not a CLI flag, environment token or durable authorization. This ephemeral
+# state exists only in the trusted preflight process after the pair was fully
+# bound and authorized. A separate Python interpreter has no active scope.
+_ACTIVE_IN_PROCESS_PAIR = threading.local()
+
+
+@contextmanager
+def _in_process_pair_dispatch_scope(
+    *, authorization: Mapping[str, Any], ordered: Sequence[Mapping[str, Any]]
+) -> Iterator[None]:
+    """Permit exactly two ordered conditions in one trusted Python process."""
+    pair = tuple(ordered)
+    if len(pair) != 2 or {item.get("condition") for item in pair} != {
+        "baseline",
+        "treatment",
+    }:
+        raise RunnerError("in-process pair must contain both conditions")
+    pair_id = pair[0].get("pair_id")
+    hashes = {str(item["condition"]): base._sha256_json(item) for item in pair}
+    if (
+        not isinstance(pair_id, str)
+        or not pair_id
+        or any(item.get("pair_id") != pair_id for item in pair)
+        or not isinstance(authorization, Mapping)
+        or authorization.get("status") != "authorized"
+        or authorization.get("pair_id") != pair_id
+        or authorization.get("request_sha256") != hashes
+    ):
+        raise RunnerError("in-process pair authorization identity mismatch")
+    if getattr(_ACTIVE_IN_PROCESS_PAIR, "state", None) is not None:
+        raise RunnerError("nested in-process provider pair is forbidden")
+    _ACTIVE_IN_PROCESS_PAIR.state = {
+        "pid": os.getpid(),
+        "pair_id": pair_id,
+        "conditions": tuple(
+            (str(item["condition"]), hashes[str(item["condition"])]) for item in pair
+        ),
+        "next": 0,
+    }
+    try:
+        yield
+    finally:
+        _ACTIVE_IN_PROCESS_PAIR.state = None
+
+
+def _require_in_process_pair_condition(request: Mapping[str, Any]) -> None:
+    """Fail before opening a ledger, consuming workspaces, login or dispatch."""
+    state = getattr(_ACTIVE_IN_PROCESS_PAIR, "state", None)
+    if not isinstance(state, dict) or state.get("pid") != os.getpid():
+        raise RunnerError("direct live provider condition requires in-process pair")
+    index = state["next"]
+    sequence = state["conditions"]
+    if (
+        index >= len(sequence)
+        or (
+            request.get("condition"),
+            base._sha256_json(request),
+        )
+        != sequence[index]
+        or request.get("pair_id") != state["pair_id"]
+    ):
+        raise RunnerError("in-process pair condition order or identity mismatch")
+    # A failed first condition consumes this process-local slot; never replay.
+    state["next"] = index + 1
+
+
 def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     validate_request(request)
     _validated_live_mode(
@@ -9572,6 +9639,8 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
         allow_live_provider=args.allow_live_provider,
         codex_command_sha256=args.codex_command_sha256,
     )
+    if args.stream_fixture is None:
+        _require_in_process_pair_condition(request)
     base.load_planned_request(request, args.request_root)
     synthetic = args.stream_fixture is not None
 

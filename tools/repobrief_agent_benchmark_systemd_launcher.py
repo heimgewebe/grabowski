@@ -209,77 +209,97 @@ def probe_argv(run_id: str) -> list[str]:
     )
 
 
+_LIVE_RUNTIME_CODE_NAMES = (
+    "repobrief_agent_benchmark_preflight_core.py",
+    "repobrief_agent_benchmark_codex_preflight.py",
+    "repobrief_agent_benchmark_runner.py",
+    "repobrief_agent_benchmark_source_bootstrap.py",
+    "repobrief_agent_benchmark_codex_runner.py",
+)
+
+
+def _root_owned_source(path: Path, *, maximum: int) -> bytes:
+    if not path.is_absolute() or ".." in path.parts:
+        raise LauncherError("live source path is not canonical")
+    directories: list[int] = []
+    source: int | None = None
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        current = os.open("/", flags)
+        directories.append(current)
+        for component in path.parts[1:-1]:
+            current = os.open(component, flags, dir_fd=current)
+            directories.append(current)
+            info = os.fstat(current)
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                raise LauncherError("live source parent is not root-owned immutable")
+        source = os.open(
+            path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=current
+        )
+        before = os.fstat(source)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_mode & 0o022
+            or not 0 < before.st_size <= maximum
+        ):
+            raise LauncherError("live source is not root-owned immutable")
+        raw = bytearray()
+        while len(raw) <= maximum:
+            chunk = os.read(source, min(65536, maximum + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(source)
+        linked = os.stat(path.name, dir_fd=current, follow_symlinks=False)
+
+        def identity(x: os.stat_result) -> tuple[int, ...]:
+            return (
+                x.st_dev,
+                x.st_ino,
+                x.st_mode,
+                x.st_uid,
+                x.st_size,
+                x.st_mtime_ns,
+                x.st_ctime_ns,
+            )
+
+        if (
+            len(raw) != before.st_size
+            or len(raw) > maximum
+            or identity(before) != identity(after)
+            or identity(before) != identity(linked)
+        ):
+            raise LauncherError("live source changed during immutable capture")
+        return bytes(raw)
+    except OSError as exc:
+        raise LauncherError("trusted staged live source unavailable") from exc
+    finally:
+        if source is not None:
+            os.close(source)
+        for fd in reversed(directories):
+            os.close(fd)
+
+
 def _frozen_bootstrap_program(runner: Path) -> str:
     """Capture root-owned installed bootstrap bytes, never a developer source."""
-    bootstrap = runner.with_name("repobrief_agent_benchmark_source_bootstrap.py")
-
-    def trusted_source(path: Path, *, maximum: int) -> bytes:
-        if not path.is_absolute() or ".." in path.parts:
-            raise LauncherError("live source path is not canonical")
-        directories: list[int] = []
-        source: int | None = None
-        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
-        try:
-            current = os.open("/", flags)
-            directories.append(current)
-            for component in path.parts[1:-1]:
-                current = os.open(component, flags, dir_fd=current)
-                directories.append(current)
-                info = os.fstat(current)
-                if info.st_uid != 0 or info.st_mode & 0o022:
-                    raise LauncherError(
-                        "live source parent is not root-owned immutable"
-                    )
-            source = os.open(
-                path.name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=current
-            )
-            before = os.fstat(source)
-            if (
-                not stat.S_ISREG(before.st_mode)
-                or before.st_uid != 0
-                or before.st_mode & 0o022
-                or not 0 < before.st_size <= maximum
-            ):
-                raise LauncherError("live source is not root-owned immutable")
-            raw = bytearray()
-            while len(raw) <= maximum:
-                chunk = os.read(source, min(65536, maximum + 1 - len(raw)))
-                if not chunk:
-                    break
-                raw.extend(chunk)
-            after = os.fstat(source)
-            linked = os.stat(path.name, dir_fd=current, follow_symlinks=False)
-
-            def identity(x: os.stat_result) -> tuple[int, ...]:
-                return (
-                    x.st_dev,
-                    x.st_ino,
-                    x.st_mode,
-                    x.st_uid,
-                    x.st_size,
-                    x.st_mtime_ns,
-                    x.st_ctime_ns,
-                )
-
-            if (
-                len(raw) != before.st_size
-                or len(raw) > maximum
-                or identity(before) != identity(after)
-                or identity(before) != identity(linked)
-            ):
-                raise LauncherError("live source changed during immutable capture")
-            return bytes(raw)
-        except OSError as exc:
-            raise LauncherError("trusted staged live source unavailable") from exc
-        finally:
-            if source is not None:
-                os.close(source)
-            for fd in reversed(directories):
-                os.close(fd)
-
-    # Reject arbitrary owner-writable runner code before printing a live plan.
-    trusted_source(runner, maximum=16 * 1024 * 1024)
-    raw = trusted_source(bootstrap, maximum=1024 * 1024)
+    # Root-owned entrypoint and bootstrap alone are insufficient: their
+    # import-time Python siblings execute before the runtime mount admission.
+    # Keep this exact set aligned with the runner's authorized code bundle.
+    if runner.name not in {
+        "repobrief_agent_benchmark_codex_runner.py",
+        "repobrief_agent_benchmark_codex_preflight.py",
+    }:
+        raise LauncherError("live benchmark entrypoint is not qualified")
+    captures = {}
+    for name in _LIVE_RUNTIME_CODE_NAMES:
+        captures[name] = _root_owned_source(
+            runner.with_name(name),
+            maximum=1024 * 1024
+            if name == "repobrief_agent_benchmark_source_bootstrap.py"
+            else 16 * 1024 * 1024,
+        )
+    raw = captures["repobrief_agent_benchmark_source_bootstrap.py"]
     try:
         program = raw.decode("utf-8")
     except UnicodeDecodeError as exc:

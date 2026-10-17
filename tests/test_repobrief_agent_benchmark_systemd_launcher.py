@@ -7,6 +7,7 @@ import io
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -318,6 +319,103 @@ class RootSystemdLauncherTests(unittest.TestCase):
             launcher._frozen_bootstrap_program(
                 Path("/tmp/nonexistent/repobrief_agent_benchmark_codex_runner.py")
             )
+
+    def test_live_plan_checks_all_root_owned_imported_sources(self) -> None:
+        target = Path("/usr/local/libexec/repobrief_agent_benchmark_codex_runner.py")
+        required = {
+            "repobrief_agent_benchmark_preflight_core.py",
+            "repobrief_agent_benchmark_codex_preflight.py",
+            "repobrief_agent_benchmark_runner.py",
+            "repobrief_agent_benchmark_source_bootstrap.py",
+            "repobrief_agent_benchmark_codex_runner.py",
+        }
+        inspected: list[str] = []
+
+        def trusted(path: Path, *, maximum: int) -> bytes:
+            inspected.append(path.name)
+            self.assertEqual(path.parent, target.parent)
+            self.assertGreater(maximum, 0)
+            return b"print('captured')\n"
+
+        with patch.object(launcher, "_root_owned_source", side_effect=trusted):
+            command = launcher.live_runner_plan(
+                "closed",
+                target,
+                Path("/requests"),
+                Path("/map.json"),
+                Path("/usr/local/bin/codex"),
+                "a" * 64,
+            )
+        self.assertEqual(set(inspected), required)
+        self.assertEqual(len(inspected), len(required))
+        self.assertIn("print('captured')\n", command)
+
+        def compromised(path: Path, *, maximum: int) -> bytes:
+            if path.name == "repobrief_agent_benchmark_preflight_core.py":
+                raise launcher.LauncherError("live source is not root-owned immutable")
+            return b"print('captured')\n"
+
+        with (
+            patch.object(launcher, "_root_owned_source", side_effect=compromised),
+            self.assertRaisesRegex(launcher.LauncherError, "root-owned immutable"),
+        ):
+            launcher.live_runner_plan(
+                "closed",
+                target,
+                Path("/requests"),
+                Path("/map.json"),
+                Path("/usr/local/bin/codex"),
+                "a" * 64,
+                allow_live_provider=True,
+            )
+
+    def test_pair_plan_checks_all_transitive_source_files(self) -> None:
+        target = Path("/usr/local/libexec/repobrief_agent_benchmark_codex_runner.py")
+        inspected: list[str] = []
+
+        def trusted(path: Path, *, maximum: int) -> bytes:
+            inspected.append(path.name)
+            if path.name == "repobrief_agent_benchmark_runner.py":
+                raise launcher.LauncherError("live source is not root-owned immutable")
+            return b"print('captured')\n"
+
+        with (
+            patch.object(launcher, "_root_owned_source", side_effect=trusted),
+            self.assertRaisesRegex(launcher.LauncherError, "root-owned immutable"),
+        ):
+            launcher.live_pair_plan(
+                "bound",
+                target,
+                target.with_name("repobrief_agent_benchmark_codex_preflight.py"),
+                Path("/requests"),
+                Path("/map.json"),
+                Path("/usr/local/bin/codex"),
+                "a" * 64,
+                "bound:case:r1",
+                Path("/validator.json"),
+                "1.00",
+                allow_live_provider=True,
+            )
+        self.assertIn("repobrief_agent_benchmark_runner.py", inspected)
+
+    def test_real_root_owned_source_and_untrusted_writable_sibling(self) -> None:
+        # Exercise the real descriptor/ownership code, not a mocked predicate.
+        # /usr/bin/env is a pre-installed root-owned file on Linux test hosts.
+        system_file = Path("/usr/bin/env")
+        if not system_file.is_file() or system_file.is_symlink():
+            self.skipTest("host lacks a regular /usr/bin/env")
+        raw = launcher._root_owned_source(system_file, maximum=16 * 1024 * 1024)
+        self.assertGreater(len(raw), 0)
+
+        # This writable sibling must be denied without executing its content.
+        with tempfile.TemporaryDirectory(prefix="rab-source-closure-") as root:
+            sibling = Path(root) / "repobrief_agent_benchmark_runner.py"
+            sibling.write_text(
+                "raise RuntimeError('untrusted import ran')\\n", encoding="utf-8"
+            )
+            sibling.chmod(0o666)
+            with self.assertRaisesRegex(launcher.LauncherError, "root-owned immutable"):
+                launcher._root_owned_source(sibling, maximum=1024 * 1024)
 
     def test_arbitrary_relative_executable_rejected(self) -> None:
         with self.assertRaises(launcher.LauncherError):

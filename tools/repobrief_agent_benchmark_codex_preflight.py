@@ -351,7 +351,33 @@ def authorize_pair(
     )
 
 
-def _require_external_provider_one_shot(*, pair_id: str) -> None:
+def _require_enforceable_codex_pair_cost(
+    *, pair_id: str, request_sha256: dict[str, str], max_cost_usd: Decimal
+) -> None:
+    """Block paid Codex pairs before internal grants or irreversible intent.
+
+    Subscription turn.completed reports tokens, not verified USD. Mocked dollar
+    values and a CLI price flag cannot satisfy a pair-level spending ceiling.
+    Future providers must implement observed USD *and* a pre-spend reservation
+    for each condition before this denial may be removed.
+    """
+    if (
+        not isinstance(pair_id, str)
+        or not pair_id
+        or set(request_sha256) != {"baseline", "treatment"}
+        or not isinstance(max_cost_usd, Decimal)
+        or not max_cost_usd.is_finite()
+        or not Decimal("0") < max_cost_usd <= Decimal("1.00")
+    ):
+        raise core.PreflightError("paired provider cost contract is invalid")
+    raise core.PreflightError(
+        "pair cost ceiling unenforceable: Codex subscription stream reports no verified USD"
+    )
+
+
+def _require_external_provider_one_shot(
+    *, pair_id: str, request_sha256: dict[str, str], max_cost_usd: Decimal
+) -> None:
     """Keep paired live dispatch closed until a trusted external verifier exists.
 
     Internal authorize_pair(), cost flags, credentials and root-systemd
@@ -542,14 +568,24 @@ def execute_authorized_pair(
         raise core.PreflightError(
             "paired dispatch requires immutable preflight bootstrap"
         )
-    _require_external_provider_one_shot(pair_id=pair_id)
+    # Load the exact frozen pair before evaluating the independently issued
+    # grant. Neither a CLI ceiling nor internal pair ledger can grant spend.
+    baseline, treatment = core.load_pair(request_root, pair_id)
+    requests = {
+        "baseline": core._sha256_json(baseline),
+        "treatment": core._sha256_json(treatment),
+    }
+    _require_enforceable_codex_pair_cost(
+        pair_id=pair_id, request_sha256=requests, max_cost_usd=max_cost_usd
+    )
+    _require_external_provider_one_shot(
+        pair_id=pair_id, request_sha256=requests, max_cost_usd=max_cost_usd
+    )
 
     authorization: dict[str, Any] | None = None
-    requests: dict[str, str] = {}
     results: dict[str, dict[str, Any]] = {}
     last_completed_request: dict[str, Any] | None = None
     try:
-        baseline, treatment = core.load_pair(request_root, pair_id)
         authorization = authorize_pair(
             pair_id=pair_id,
             request_root=request_root,
@@ -563,10 +599,6 @@ def execute_authorized_pair(
             max_cost_usd=max_cost_usd,
             validator_command=validator_command,
         )
-        requests = {
-            "baseline": core._sha256_json(baseline),
-            "treatment": core._sha256_json(treatment),
-        }
         if (
             not isinstance(authorization, dict)
             or authorization.get("status") != "authorized"
@@ -596,36 +628,39 @@ def execute_authorized_pair(
             raise core.PreflightError("paired provider cost ceiling is invalid")
         authorized_total = max_cost_usd
         observed = Decimal("0")
-        for request in ordered:
-            condition = str(request["condition"])
-            # Keep the previous completion until the current condition has
-            # durably completed; failures before its intent must close the
-            # prior condition's original one-shot pair ledger.
-            receipt = codex_runner.execute(request, arguments)
-            last_completed_request = request
-            results[condition] = _validated_condition_receipt(
-                request=request,
-                receipt=receipt,
-                request_root=request_root,
-                evidence_root=evidence_root,
-                transcript_root=transcript_root,
-                validator_command=validator_command,
-            )
-            try:
-                condition_cost = Decimal(results[condition]["observed_cost_usd"])
-            except (InvalidOperation, TypeError, KeyError, ValueError) as exc:
-                raise core.PreflightError(
-                    "paired provider cost is not verified"
-                ) from exc
-            if not condition_cost.is_finite() or condition_cost < 0:
-                raise core.PreflightError("paired provider cost is not verified")
-            observed += condition_cost
-            # Crucial: reject an overspent first condition BEFORE another
-            # irreversible treatment or baseline provider intent.
-            if not observed.is_finite() or observed > authorized_total:
-                raise core.PreflightError(
-                    "paired provider cost exceeds authorized budget"
+        with codex_runner._in_process_pair_dispatch_scope(
+            authorization=authorization, ordered=ordered
+        ):
+            for request in ordered:
+                condition = str(request["condition"])
+                # Keep the previous completion until the current condition has
+                # durably completed; failures before its intent must close the
+                # prior condition's original one-shot pair ledger.
+                receipt = codex_runner.execute(request, arguments)
+                last_completed_request = request
+                results[condition] = _validated_condition_receipt(
+                    request=request,
+                    receipt=receipt,
+                    request_root=request_root,
+                    evidence_root=evidence_root,
+                    transcript_root=transcript_root,
+                    validator_command=validator_command,
                 )
+                try:
+                    condition_cost = Decimal(results[condition]["observed_cost_usd"])
+                except (InvalidOperation, TypeError, KeyError, ValueError) as exc:
+                    raise core.PreflightError(
+                        "paired provider cost is not verified"
+                    ) from exc
+                if not condition_cost.is_finite() or condition_cost < 0:
+                    raise core.PreflightError("paired provider cost is not verified")
+                observed += condition_cost
+                # Crucial: reject an overspent first condition BEFORE another
+                # irreversible treatment or baseline provider intent.
+                if not observed.is_finite() or observed > authorized_total:
+                    raise core.PreflightError(
+                        "paired provider cost exceeds authorized budget"
+                    )
         if set(results) != {"baseline", "treatment"}:
             raise core.PreflightError("paired dispatch is incomplete")
         ledger = _attest_completed_pair_ledger(

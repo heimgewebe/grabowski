@@ -3468,6 +3468,121 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 ):
                     runner._unix_socket_restricted_codex_argv(value)
 
+    def test_real_nested_codex_sandbox_kernel_positive_and_negative(self) -> None:
+        """Exercise outer and inner PID, user, seccomp and mount isolation.
+
+        The executable named codex is a controlled local stub, never a provider.
+        This is a host-kernel proof, not production installed-toolchain proof.
+        """
+        if sys.platform != "linux" or not Path("/usr/bin/bwrap").is_file():
+            self.skipTest("Linux bubblewrap is required")
+        inner = (
+            "import os,sys,subprocess\nfrom pathlib import Path\n"
+            "source,state,home,outer_pid,outer_user=sys.argv[1:]\n"
+            "fields=dict(x.split(':',1) for x in "
+            "Path('/proc/self/status').read_text().splitlines() if ':' in x)\n"
+            "assert fields['Seccomp'].strip()=='2',fields['Seccomp']\n"
+            "assert fields['NoNewPrivs'].strip()=='1',fields['NoNewPrivs']\n"
+            "assert os.readlink('/proc/self/ns/pid')!=outer_pid\n"
+            "assert os.readlink('/proc/self/ns/user')!=outer_user\n"
+            "assert os.statvfs(source).f_flag & os.ST_RDONLY\n"
+            "assert os.statvfs(state).f_flag & os.ST_RDONLY\n"
+            "assert not os.statvfs(home).f_flag & os.ST_RDONLY\n"
+            "(Path(home)/'nested-marker').write_text('ok')\n"
+            "assert subprocess.run(['/bin/true'],check=False).returncode==0\n"
+            "print('NESTED_BOUNDARY_VERIFIED')\n"
+        )
+        for reject in (False, True):
+            with (
+                self.subTest(nested_stub_fails=reject),
+                tempfile.TemporaryDirectory(
+                    prefix="rab-nested-kernel-", dir=str(Path.home())
+                ) as temporary,
+            ):
+                root = Path(temporary)
+                source = root / "source"
+                source.mkdir()
+                epoch = root / "epoch"
+                epoch.mkdir()
+                outputs = {
+                    name: epoch / name
+                    for name in ("state", "transcripts", "evidence", "reports")
+                }
+                for folder in outputs.values():
+                    folder.mkdir(mode=0o700)
+                session = outputs["state"] / "codex-runtime" / ("session-" + "a" * 24)
+                session.mkdir(parents=True, mode=0o700)
+                (session / "tmp").mkdir(mode=0o700)
+                trusted_event = outputs["state"] / "trusted-event"
+                trusted_event.write_text("unchanged", encoding="ascii")
+                stub = root / "codex"
+                if reject:
+                    stub_code = (
+                        "#!/usr/bin/python3\nimport sys\n"
+                        "assert sys.argv[1]=='sandbox' and "
+                        "sys.argv[-2:]==['--','/bin/true']\n"
+                        "raise SystemExit(41)\n"
+                    )
+                else:
+                    stub_code = (
+                        "#!/usr/bin/python3\n"
+                        "import os,subprocess,sys\n"
+                        "assert sys.argv[1]=='sandbox' and "
+                        "sys.argv[-2:]==['--','/bin/true']\n"
+                        "home=os.environ['CODEX_HOME']\n"
+                        f"inner={inner!r}\n"
+                        f"source={str(source)!r}\n"
+                        f"state={str(outputs['state'])!r}\n"
+                        "command=['/usr/bin/bwrap','--unshare-user',"
+                        "'--unshare-pid','--ro-bind','/','/',"
+                        "'--bind',home,home,'--proc','/proc',"
+                        "'--dev','/dev','--','/usr/bin/python3',"
+                        "'-I','-c',inner,source,state,home,"
+                        "os.readlink('/proc/self/ns/pid'),"
+                        "os.readlink('/proc/self/ns/user')]\n"
+                        "result=subprocess.run(command,capture_output=True,"
+                        "check=False,timeout=12)\n"
+                        "if result.returncode: "
+                        "sys.stderr.buffer.write(result.stderr[-2048:])\n"
+                        "raise SystemExit(result.returncode)\n"
+                    )
+                stub.write_text(stub_code, encoding="utf-8")
+                stub.chmod(0o700)
+                kwargs = {
+                    "source": source,
+                    "state_root": outputs["state"],
+                    "transcript_root": outputs["transcripts"],
+                    "evidence_root": outputs["evidence"],
+                    "report_root": outputs["reports"],
+                    "codex_home": session,
+                    "cwd": source,
+                    "codex_command": str(stub),
+                }
+                with (
+                    patch.object(
+                        runner,
+                        "provider_env",
+                        return_value={
+                            "HOME": str(session),
+                            "CODEX_HOME": str(session),
+                        },
+                    ),
+                    patch.object(
+                        runner, "_record_preflight_dispatch_intent"
+                    ) as provider_intent,
+                ):
+                    if reject:
+                        with self.assertRaisesRegex(
+                            runner.RunnerError,
+                            "nested Codex sandbox smoke failed before intent",
+                        ):
+                            runner._assert_provider_pid_namespace_ready(**kwargs)
+                    else:
+                        runner._assert_provider_pid_namespace_ready(**kwargs)
+                    provider_intent.assert_not_called()
+                self.assertEqual(trusted_event.read_text(encoding="ascii"), "unchanged")
+                self.assertEqual((session / "nested-marker").exists(), not reject)
+
     def test_linux_sandbox_smoke_is_filtered_without_provider_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4399,6 +4514,83 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             self.assertFalse((root / "transcripts").exists())
             self.assertFalse((root / "provider-evidence").exists())
 
+    def test_direct_live_baseline_denies_before_request_ledger_or_provider(
+        self,
+    ) -> None:
+        # Real P3 gate: no CLI token may consume a single unmatched pair.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "map.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            with (
+                patch.object(runner.base, "load_planned_request") as planned,
+                patch.object(runner, "validate_executable") as executable,
+                patch.object(
+                    runner, "_load_preflight_dispatch_authorization"
+                ) as ledger,
+                patch.object(runner, "validate_chatgpt_subscription") as login,
+                patch.object(runner, "run_bounded") as provider,
+                self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "direct live provider condition requires in-process pair",
+                ),
+            ):
+                runner.execute(request(), args)
+            planned.assert_not_called()
+            executable.assert_not_called()
+            ledger.assert_not_called()
+            login.assert_not_called()
+            provider.assert_not_called()
+            for folder in ("state", "transcripts", "evidence"):
+                self.assertFalse((root / folder).exists())
+
+    def test_in_process_pair_scope_rejects_order_drift_and_replays(self) -> None:
+        baseline, treatment = request(), request(condition="treatment")
+        authorization = {
+            "status": "authorized",
+            "pair_id": baseline["pair_id"],
+            "request_sha256": {
+                "baseline": runner.base._sha256_json(baseline),
+                "treatment": runner.base._sha256_json(treatment),
+            },
+        }
+        with runner._in_process_pair_dispatch_scope(
+            authorization=authorization, ordered=(baseline, treatment)
+        ):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "order or identity mismatch"
+            ):
+                runner._require_in_process_pair_condition(treatment)
+            runner._require_in_process_pair_condition(baseline)
+            with self.assertRaisesRegex(
+                runner.RunnerError, "order or identity mismatch"
+            ):
+                runner._require_in_process_pair_condition(baseline)
+            runner._require_in_process_pair_condition(treatment)
+            with self.assertRaisesRegex(
+                runner.RunnerError, "order or identity mismatch"
+            ):
+                runner._require_in_process_pair_condition(treatment)
+        with self.assertRaisesRegex(
+            runner.RunnerError, "direct live provider condition"
+        ):
+            runner._require_in_process_pair_condition(baseline)
+
+    # The legacy fixture below isolates a deeper executable identity gate.
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
     def test_bad_live_executable_hash_fails_before_workspace_consumption(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4428,6 +4620,9 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             self.assertFalse((root / "transcripts").exists())
             self.assertFalse((root / "provider-evidence").exists())
 
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
     def test_live_baseline_requires_dispatch_authorization_before_codex_status_or_launch(
         self,
     ) -> None:
@@ -4462,6 +4657,9 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             login_status.assert_not_called()
             provider_launch.assert_not_called()
 
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
     def test_live_mount_drift_blocks_before_workspace_and_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4553,6 +4751,9 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             provider.assert_not_called()
             self.assertFalse((root / "state" / "codex-workspaces").exists())
 
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
     def test_execute_wires_irreversible_effect_callbacks_into_failure_ledger(
         self,
     ) -> None:
@@ -10120,6 +10321,9 @@ print("PREVIOUS_COMPLETION_REPLAY_BLOCKED")
                 authorization={"internal_dispatch_ledger": True},
             )
 
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
     def test_missing_external_one_shot_denies_before_login_and_workspace(self) -> None:
         # Authorizing an internal ledger is not paid-provider consent. Even
         # fake Codex login and checkout creation must be unreachable.
@@ -11220,6 +11424,9 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 f"stdout={result.stdout[:160]!r}"
             )
 
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
     def test_vendor_failure_before_one_shot_intent_prevents_provider_start(
         self,
     ) -> None:
@@ -11375,6 +11582,9 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
             unrelated["case_id"] = "ordinary-modern-case"
             self.assertFalse(runner._frozen_g1_baseline_pair(unrelated))
 
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
     def test_frozen_g1_baseline_vendor_failure_blocks_first_intent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
