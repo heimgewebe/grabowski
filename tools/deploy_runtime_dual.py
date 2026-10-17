@@ -6018,7 +6018,9 @@ def _start_green_operator(
             f"{core.HOME / 'repos'} "
             f"{core.HOME / 'grabowski-workspace'}"
         ),
-        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        # bwrap needs NETLINK_ROUTE to initialize its isolated network namespace.
+        # Only this trusted operator receives AF_NETLINK; agent egress is separate.
+        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         "--property=LockPersonality=yes",
         "--property=MemoryDenyWriteExecute=yes",
         "--property=RestrictRealtime=yes",

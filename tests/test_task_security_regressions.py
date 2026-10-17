@@ -1,0 +1,4355 @@
+"""Head-bound P1/P2 security regressions independent of PR1409's leased test file.
+
+The original dirty RED checkout remains untouched. Test infrastructure is
+reused from test_tasks rather than duplicating the persistent-task fixtures.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+import unittest
+from unittest.mock import patch
+
+import test_tasks as fixture
+
+
+tasks = fixture.tasks
+router = fixture.coding_agent_router
+LOCAL_HOST = fixture.LOCAL_HOST
+
+
+class TaskSecurityRegressionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.fixtures = fixture.TaskTests(
+            "test_native_task_effect_classification_covers_local_and_remote_agents"
+        )
+        self.fixtures.setUp()
+        self.addCleanup(self.fixtures.tearDown)
+        self.root = self.fixtures.root
+
+    @staticmethod
+    def _admission() -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "coding_agent_pre_dispatch_admission",
+            "applicable": True,
+            "admitted": True,
+            "reason_code": "admitted",
+            "argv_sha256": "1" * 64,
+            "admission_sha256": "2" * 64,
+            "reservation": {"status": "not_reserved", "atomic": False},
+        }
+
+    def _start_claude(self) -> str:
+        argv = ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(tasks, "_launch", return_value=fixture._launcher()),
+            patch.object(
+                tasks, "_require_recovery_gate",
+                return_value={"checked_at_unix": 147},
+            ),
+            patch.object(
+                router, "coding_agent_pre_dispatch_admission",
+                return_value=self._admission(),
+            ),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resume_policy="verify-then-retry",
+            )
+        return str(result["task"]["task_id"])
+
+    def _assert_denied_before_resume_effects(
+        self, task_id: str, *, message: str
+    ) -> None:
+        failed = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": fixture._launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        attempt_before = int(tasks._row_raw(task_id)["attempt"])
+        with (
+            patch.object(tasks, "_observe", return_value=failed),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_require_recovery_gate",
+                return_value={"checked_at_unix": 148},
+            ),
+            patch.object(
+                router, "coding_agent_pre_dispatch_admission",
+                return_value=self._admission(),
+            ) as admission,
+            patch.object(tasks, "_launch") as launch,
+            patch.object(tasks.resources, "renew_resources") as renew,
+            patch.object(tasks.resources, "acquire_resources") as acquire,
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, message):
+                tasks.grabowski_task_resume(task_id)
+        admission.assert_not_called()
+        launch.assert_not_called()
+        renew.assert_not_called()
+        acquire.assert_not_called()
+        self.assertEqual(attempt_before, tasks._row_raw(task_id)["attempt"])
+
+    def test_codex_ambiguous_workspace_flags_fail_before_launch(self) -> None:
+        other = str(self.root.parent)
+        invalid = (
+            ["-C", str(self.root), "--cd", other],
+            ["--cd", str(self.root), "-C", other],
+            ["--cd=" + str(self.root), "--cd=" + other],
+            ["-C", str(self.root), "-C", other],
+            ["-C" + str(self.root), "-C", other],
+            ["--add-dir", other],
+            ["--add-dir=" + other],
+            ["--worktree"],
+            ["-p", "unchecked-profile"],
+            ["--output-last-message", other],
+            ["-c", 'sandbox_workspace_write.writable_roots=["/tmp/extra"]'],
+            ["--config=default_permissions=\":danger-full-access\""],
+            ["-s", "danger-full-access"],
+            ["--dangerously-bypass-approvals-and-sandbox"],
+        )
+        for flags in invalid:
+            argv = ["/opt/codex", *flags, "exec", "prompt"]
+            with (
+                self.subTest(argv=argv),
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Codex"):
+                    tasks._mutating_agent_workspace(
+                        "local", argv, cwd=str(self.root)
+                    )
+
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            for valid in (
+                ["-C", str(self.root)],
+                ["-C" + str(self.root)],
+                ["--cd", str(self.root)],
+                ["--cd=" + str(self.root)],
+                ["-C=" + str(self.root)],
+            ):
+                with self.subTest(valid=valid):
+                    self.assertEqual(
+                        tasks._mutating_agent_workspace(
+                            "local", ["/opt/codex", *valid, "exec", "prompt"],
+                            cwd=str(self.root),
+                        ),
+                        str(self.root),
+                    )
+            self.assertEqual(
+                tasks._mutating_agent_workspace(
+                    "local",
+                    ["/opt/codex", "-C", str(self.root), "--", "--cd", other],
+                    cwd=str(self.root),
+                ),
+                str(self.root),
+            )
+
+        argv = ["/opt/codex", "-C", str(self.root), "--cd", other, "exec", "x"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(
+                tasks, "_require_recovery_gate",
+                return_value={"checked_at_unix": 151},
+            ),
+            patch.object(tasks, "_dispatch") as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Codex"):
+                tasks.grabowski_task_start(
+                    "local", argv, cwd=str(self.root), runtime_seconds=60
+                )
+        dispatch.assert_not_called()
+        self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_coding_agent_resume_rejects_spoofed_effect_profiles(self) -> None:
+        task_id = self._start_claude()
+        baseline = json.loads(tasks._row_raw(task_id)["launcher_json"])
+        for profile in (
+            "unknown", "remote_write", "read_only", "repository_write", None
+        ):
+            with self.subTest(effect_profile=profile):
+                launcher = json.loads(json.dumps(baseline))
+                if profile is None:
+                    launcher["task_effect_classification"].pop("effect_profile")
+                else:
+                    launcher["task_effect_classification"]["effect_profile"] = profile
+                with tasks._database_connection() as db:
+                    db.execute(
+                        "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                        (tasks._canonical_json(launcher), task_id),
+                    )
+                self._assert_denied_before_resume_effects(
+                    task_id, message="effect profile"
+                )
+
+    def test_original_agent_anchor_rejects_disguised_nonagent_resume(self) -> None:
+        task_id = self._start_claude()
+        fake_argv = ["/bin/echo", "hello"]
+        with tasks._database_connection() as db:
+            db.execute(
+                """UPDATE tasks
+                   SET argv_json=?, argv_sha256=?, launcher_json=?
+                   WHERE task_id=?""",
+                (
+                    tasks._canonical_json(fake_argv),
+                    tasks.command_identity.argv_sha256(fake_argv),
+                    tasks._canonical_json({}),
+                    task_id,
+                ),
+            )
+        self._assert_denied_before_resume_effects(
+            task_id, message="agent identity"
+        )
+
+    def test_missing_start_anchor_blocks_resume(self) -> None:
+        task_id = self._start_claude()
+        with tasks._database_connection() as db:
+            db.execute(
+                "DELETE FROM metadata WHERE key=?",
+                (f"{tasks.TASK_EFFECT_START_KEY_PREFIX}{task_id}",),
+            )
+        self._assert_denied_before_resume_effects(
+            task_id, message="original start decision is missing"
+        )
+
+    def test_missing_anchor_with_disguised_agent_cannot_be_legacy_nonagent(self) -> None:
+        task_id = self._start_claude()
+        fake_argv = [
+            "/bin/bash", "-c",
+            "/opt/claude --permission-mode plan -p prompt",
+        ]
+        with tasks._database_connection() as db:
+            db.execute(
+                "DELETE FROM metadata WHERE key=?",
+                (f"{tasks.TASK_EFFECT_START_KEY_PREFIX}{task_id}",),
+            )
+            db.execute(
+                "UPDATE tasks SET argv_json=?, argv_sha256=?, launcher_json=? "
+                "WHERE task_id=?",
+                (
+                    tasks._canonical_json(fake_argv),
+                    tasks.command_identity.argv_sha256(fake_argv),
+                    tasks._canonical_json({}),
+                    task_id,
+                ),
+            )
+        # Missing original identity cannot become a legacy exemption merely
+        # because mutable argv/launcher fields were rewritten.
+        with self.assertRaisesRegex(RuntimeError, "original start decision"):
+            tasks._verified_task_effect_start(
+                tasks._row_raw(task_id), command=fake_argv
+            )
+
+    def test_task_and_start_anchor_roll_back_in_same_transaction(self) -> None:
+        argv = ["/opt/claude", "--permission-mode", "plan", "-p", "prompt"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(tasks, "_dispatch") as dispatch,
+            patch.object(
+                tasks, "_require_recovery_gate",
+                return_value={"checked_at_unix": 147},
+            ),
+            patch.object(
+                router, "coding_agent_pre_dispatch_admission",
+                return_value=self._admission(),
+            ),
+            patch.object(
+                tasks, "_register_task_reconcile_sequence",
+                side_effect=RuntimeError("injected before transaction commit"),
+            ),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected before transaction commit"):
+                tasks.grabowski_task_start(
+                    "local", argv, cwd=str(self.root), runtime_seconds=60,
+                    resume_policy="verify-then-retry",
+                )
+        dispatch.assert_not_called()
+        with tasks._database_connection() as db:
+            task_count = db.execute("SELECT count(*) FROM tasks").fetchone()[0]
+            anchor_count = db.execute(
+                "SELECT count(*) FROM metadata WHERE key LIKE 'task_effect_start:%'"
+            ).fetchone()[0]
+        self.assertEqual((task_count, anchor_count), (0, 0))
+
+
+    def test_operation_identity_active_bound_lease_requires_fresh_maintenance(self) -> None:
+        # A fresh unit observation does not attest an unchanged resource lease.
+        # A deduplicated task must not be returned when its lease check fails.
+        task_id = "f" * 24
+        stored = {
+            "task_id": task_id,
+            "state": "running",
+            "resume_policy": "verify-then-retry",
+            "resource_keys_json": json.dumps([f"repo:{self.root}"]),
+        }
+        operation_identity = {"operation_identity_sha256": "a" * 64}
+        with (
+            patch.object(
+                tasks, "_latest_task_for_operation_identity", return_value=stored
+            ),
+            patch.object(
+                tasks, "_task_has_fresh_active_observation", return_value=True
+            ),
+            patch.object(
+                tasks, "grabowski_task_status",
+                side_effect=RuntimeError("lease maintenance failed"),
+            ) as status,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "lease maintenance failed"):
+                tasks._resolve_task_operation_identity(
+                    operation_identity,
+                    supersedes_task_id="",
+                    supersedes_receipt_sha256="",
+                    force_new_reason="",
+                )
+        status.assert_called_once_with(task_id)
+
+
+
+    def test_kernel_sandbox_denies_host_abstract_unix_but_allows_inet(self) -> None:
+        """Actual AF_UNIX abstract host-write attempt under an opaque bwrap child.
+
+        AF_INET socket creation must still work for legitimate remote APIs.
+        Only a newly created synthetic listener inside this test is contacted.
+        """
+        import os
+        import socket
+        import subprocess
+
+        tasks.agent_sandbox.require_bwrap()
+        workspace = self.root / "abstract-namespace-probe"
+        workspace.mkdir()
+        name = "pr1386-synthetic-abstract-" + str(os.getpid())
+        code = (
+            "import errno,sys,socket,json\n"
+            "tcp=socket.socket(socket.AF_INET,socket.SOCK_STREAM);tcp.close()\n"
+            "try:\n"
+            " local=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n"
+            " local.connect('\\0'+sys.argv[1])\n"
+            " local.sendall(b'SYNTHETIC-ONLY')\n"
+            " print(json.dumps({'tcp':'ALLOWED','host_unix':'CONNECTED'}))\n"
+            "except OSError as exc:\n"
+            " print(json.dumps({'tcp':'ALLOWED','host_unix':'BLOCKED','errno':exc.errno}))\n"
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind("\0" + name)
+            listener.listen(1)
+            record = {
+                "task_id": "opaque-abstract-ipc",
+                "host": "local", "cwd": str(workspace),
+            }
+            with (
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(
+                    tasks, "_verified_task_effect_start",
+                    return_value={"effect_profile": "unknown"},
+                ),
+            ):
+                argv = tasks._task_sandboxed_command_argv(
+                    record, ["/usr/bin/python3", "-I", "-c", code, name],
+                )
+            result = subprocess.run(
+                tasks.agent_sandbox.runtime_sandbox_argv(argv),
+                capture_output=True, text=True, check=False, timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout.strip())
+            if output.get("host_unix") == "CONNECTED":
+                listener.settimeout(2)
+                with listener.accept()[0] as connection:
+                    self.assertEqual(connection.recv(64), b"SYNTHETIC-ONLY")
+            self.assertEqual(output["tcp"], "ALLOWED")
+            self.assertEqual(output["host_unix"], "BLOCKED")
+            self.assertEqual(output.get("errno"), 1)
+
+
+    def test_local_capture_execstart_never_reopens_owner_mutable_script(self) -> None:
+        """Kernel-filtered task must not start behind owner-replaceable capture file."""
+        identifier = "a" * 24
+        record = {
+            "task_id": identifier,
+            "host": "local",
+            "unit": tasks._task_unit(identifier, 1),
+            "authoritative_unit": tasks._task_unit(identifier, 1),
+            "argv_json": tasks._canonical_json(["/usr/bin/true"]),
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+            patch.object(
+                tasks, "_task_output_paths",
+                return_value={"directory": self.root / "captured"},
+            ),
+        ):
+            capture = tasks._task_output_capture_argv(record)
+        self.assertEqual(
+            capture[:4],
+            [tasks.TASK_OUTPUT_CAPTURE_PYTHON, "-I", "-S", "-c"],
+        )
+        self.assertNotIn(str(tasks._task_output_capture_script_path()), capture)
+        self.assertNotIn(tasks.TASK_OUTPUT_CAPTURE_CODE, capture)
+        self.assertIn(tasks.agent_sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE, capture)
+        self.assertLess(
+            max(len(value.encode("utf-8")) for value in capture),
+            tasks.TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES,
+        )
+        # The source/argv test above alone cannot detect a syntactically
+        # invalid bootstrap: execute the real pinned argv, without systemd
+        # or a mutable disk launcher, and verify bounded captured output.
+        output_directory = self.root / "capture-pinned-real-exec"
+        direct_argv = tasks._task_output_capture_pinned_argv(
+            str(output_directory),
+            [sys.executable, "-c", "print('capture-pinned-ok')"],
+        )
+        # Swap the owner-writable legacy file before invoking the captured argv.
+        # Its payload may not execute even though the file remains stageable.
+        staged = tasks._task_output_capture_script()
+        staged.write_text("raise SystemExit(93)\n", encoding="utf-8")
+        actual = subprocess.run(
+            direct_argv, capture_output=True, text=True, check=False, timeout=20,
+        )
+        self.assertEqual(actual.returncode, 0, actual.stderr[-1000:])
+        self.assertIn(
+            "capture-pinned-ok",
+            (output_directory / "stdout.log").read_text(encoding="utf-8"),
+        )
+        tampered = list(direct_argv)
+        tampered[6] = ("A" if tampered[6][0] != "A" else "B") + tampered[6][1:]
+        tampered_directory = self.root / "tampered-capture-never-created"
+        tampered[6 + int(tampered[5])] = str(tampered_directory)
+        refused = subprocess.run(
+            tampered, capture_output=True, text=True, check=False, timeout=20,
+        )
+        self.assertEqual(refused.returncode, 125, refused.stderr[-1000:])
+        self.assertFalse(tampered_directory.exists())
+
+    def test_untrusted_task_unit_must_restrict_host_abstract_unix_sockets(self) -> None:
+        """The real systemd child argv must carry the already E2E-tested gate.
+
+        Bubblewrap shares the host network namespace: --unshare-ipc alone does
+        not block abstract AF_UNIX. Unlike a synthetic systemd property check,
+        this verifies that output capture launches the *filtered* bwrap child.
+        The independent kernel test proves that its filter actually denies
+        AF_UNIX; this assertion binds that binary path to the task unit.
+        """
+        identifier = "a" * 24
+        argv = ["/usr/bin/true"]
+        record = {
+            "task_id": identifier,
+            "host": "local",
+            "unit": tasks._task_unit(identifier, 1),
+            "authoritative_unit": tasks._task_unit(identifier, 1),
+            "argv_json": tasks._canonical_json(argv),
+            "argv_sha256": tasks.command_identity.argv_sha256(argv),
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "cpu_weight": 100,
+            "io_weight": 100,
+            "memory_max_bytes": None,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+            patch.object(
+                tasks, "_task_output_paths",
+                return_value={"directory": self.root / "captured"},
+            ),
+        ):
+            captured = tasks._task_output_capture_argv(record)
+        sandbox = tasks.agent_sandbox
+        expected_prefix = [
+            sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+            sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
+            str(sandbox.require_bwrap()),
+        ]
+        chunk_count = int(captured[5])
+        self.assertGreaterEqual(chunk_count, 1)
+        self.assertLessEqual(chunk_count, 16)
+        sandbox_offset = 9 + chunk_count
+        self.assertEqual(captured[sandbox_offset:sandbox_offset + 6], expected_prefix)
+        self.assertLess(len(captured[sandbox_offset + 4].encode("utf-8")), 4096)
+        self.assertEqual(
+            captured[sandbox_offset + 4],
+            sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
+        )
+        with patch.object(tasks, "_task_output_capture_argv", return_value=captured):
+            command = tasks._launch_argv(record, include_managed_runtime=False)
+        self.assertEqual(
+            command[command.index("--") + 1:],
+            tasks.command_identity.systemd_escape_argv(captured),
+        )
+        self.assertNotIn("--property=RestrictAddressFamilies=AF_UNIX", command)
+
+    def test_seccomp_launcher_source_is_pinned_in_systemd_argv(self) -> None:
+        """Delayed exec must not reopen a same-UID replaceable script path."""
+        sandbox = tasks.agent_sandbox
+        argv = sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
+        self.assertEqual(
+            argv[:5],
+            [
+                sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+                sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE,
+            ],
+        )
+        self.assertEqual(argv[5:], [str(sandbox.require_bwrap()), "--version"])
+        self.assertLess(len(argv[4].encode("utf-8")), 4096)
+        with self.assertRaisesRegex(sandbox.AgentSandboxError, "unrecognized"):
+            sandbox.runtime_sandbox_argv(
+                [*argv[:4], "raise SystemExit(0)", *argv[5:]]
+            )
+
+    def test_runtime_sandbox_rewraps_bare_bwrap_and_rejects_forged_launcher(self) -> None:
+        """Legacy bare bwrap callers cannot drop the kernel filter by mistake."""
+        sandbox = tasks.agent_sandbox
+        resolved = str(sandbox.require_bwrap())
+        argv = sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
+        self.assertEqual(
+            argv[:6],
+            [sandbox.SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c",
+             sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE, resolved],
+        )
+        self.assertEqual(argv[6:], ["--version"])
+        with self.assertRaisesRegex(sandbox.AgentSandboxError, "unrecognized"):
+            sandbox.runtime_sandbox_argv(
+                [sandbox.SANDBOX_LAUNCH_PYTHON, "-c", "print('bypass')"]
+            )
+
+    def test_seccomp_script_is_private_content_addressed_and_tamper_fails_closed(self) -> None:
+        """The host launcher is staged privately and never trusts a changed file."""
+        import hashlib
+        import os
+        import stat
+
+        sandbox = tasks.agent_sandbox
+        with patch.object(sandbox.Path, "home", return_value=self.root):
+            script = sandbox._host_seccomp_launcher_path()
+            self.assertEqual(
+                script.name,
+                "seccomp-" + hashlib.sha256(
+                    sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE.encode("utf-8")
+                ).hexdigest() + ".py",
+            )
+            self.assertEqual(script.read_text(), sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE)
+            self.assertEqual(stat.S_IMODE(script.lstat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(script.parent.lstat().st_mode), 0o700)
+            self.assertEqual(sandbox._host_seccomp_launcher_path(), script)
+            expected = sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"])
+            script.write_text("raise SystemExit(0)\n")
+            with self.assertRaisesRegex(sandbox.AgentSandboxError, "identity drifted"):
+                sandbox._host_seccomp_launcher_path()
+            # Delayed exec no longer opens this mutable path at all.
+            self.assertEqual(
+                sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"]),
+                expected,
+            )
+            script.unlink()
+            os.symlink(self.root / "foreign.py", script)
+            with self.assertRaisesRegex(sandbox.AgentSandboxError, "cannot be staged"):
+                sandbox._host_seccomp_launcher_path()
+            self.assertEqual(
+                sandbox.runtime_sandbox_argv(["/untrusted/bwrap", "--version"]),
+                expected,
+            )
+
+
+    def test_kernel_seccomp_inherits_into_exec_and_blocks_raw_socket_bypass(self) -> None:
+        """A second exec and high-domain-bit raw syscalls keep the kernel ban."""
+        import os
+        import subprocess
+
+        if os.uname().machine not in {"x86_64", "aarch64"}:
+            self.skipTest("raw socket syscall numbers need a known Linux ABI")
+        workspace = self.root / "seccomp-inherited"
+        workspace.mkdir()
+        code = (
+            "import ctypes,json,os,socket,subprocess\n"
+            "nr={'x86_64':41,'aarch64':198}[os.uname().machine]\n"
+            "libc=ctypes.CDLL(None,use_errno=True)\n"
+            "ret=libc.syscall(ctypes.c_long(nr),ctypes.c_ulong((1<<32)|1),"
+            "ctypes.c_long(socket.SOCK_STREAM),ctypes.c_long(0))\n"
+            "failure=ctypes.get_errno()\n"
+            "sub=subprocess.run(['/bin/sh','-c',"
+            "\"/usr/bin/python3 -I -c 'import socket; socket.socket(socket.AF_UNIX)'\""
+            "],capture_output=True,text=True)\n"
+            "print(json.dumps({'ret':ret,'errno':failure,"
+            "'child_denied':sub.returncode!=0 and '[Errno 1]' in sub.stderr}))\n"
+        )
+        record = {"task_id": "opaque-raw-syscall", "host": "local", "cwd": str(workspace)}
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_verified_task_effect_start",
+                         return_value={"effect_profile": "unknown"}),
+        ):
+            command = tasks._task_sandboxed_command_argv(
+                record, ["/usr/bin/python3", "-I", "-c", code],
+            )
+        result = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(command),
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcome = json.loads(result.stdout.strip())
+        self.assertEqual(outcome["ret"], -1)
+        self.assertEqual(outcome["errno"], 1)
+        self.assertTrue(outcome["child_denied"], outcome)
+
+    def test_kernel_sandbox_blocks_io_uring_async_socket_escape(self) -> None:
+        """AF_UNIX socket() filtering must also deny io_uring async socket IO.
+
+        Linux 5.19+ can create sockets via IORING_OP_SOCKET without making a
+        socket syscall. Forbid a new ring so the syscall filter is not bypassed.
+        This probes the actual kernel rather than a mocked wrapper string.
+        """
+        import os
+        import subprocess
+
+        if os.uname().machine not in {"x86_64", "aarch64"}:
+            self.skipTest("io_uring_setup syscall 425 requires a known Linux ABI")
+        directory = self.root / "seccomp-io-uring"
+        directory.mkdir()
+        payload = (
+            "import ctypes,json,os\n"
+            "libc=ctypes.CDLL(None,use_errno=True)\n"
+            "params=ctypes.create_string_buffer(256)\n"
+            "ret=libc.syscall(ctypes.c_long(425),ctypes.c_uint(2),ctypes.byref(params))\n"
+            "errno=ctypes.get_errno()\n"
+            "if ret>=0: os.close(ret)\n"
+            "print(json.dumps({'ret':ret,'errno':errno}))\n"
+        )
+        record = {"task_id": "opaque-io-uring", "host": "local", "cwd": str(directory)}
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_verified_task_effect_start",
+                         return_value={"effect_profile": "unknown"}),
+        ):
+            child = tasks._task_sandboxed_command_argv(
+                record, ["/usr/bin/python3", "-I", "-c", payload],
+            )
+        result = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(child),
+            capture_output=True, text=True, check=False, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout.strip())
+        self.assertEqual(data["ret"], -1, data)
+        self.assertEqual(data["errno"], 1, data)
+
+
+    def test_unavailable_seccomp_library_fails_closed_before_exec(self) -> None:
+        """Fault-injected libseccomp absence may not reach bubblewrap or child."""
+        import subprocess
+
+        sandbox = tasks.agent_sandbox
+        sandbox.require_bwrap()
+        candidate = sandbox.minimal_sandbox_argv(
+            workspace=self.root,
+            command=["/usr/bin/true"],
+            workspace_writable=False,
+        )
+        argv = sandbox.runtime_sandbox_argv(candidate)
+        # A separate, explicitly test-only Python script proves the fail-closed
+        # behavior without weakening the production digest-bound path.
+        fake = self.root / "absent-libseccomp-probe.py"
+        fake.write_text(
+            sandbox._HOST_UNIX_DENY_LAUNCH_SOURCE.replace(
+                "libseccomp.so.2", "pr1386-deliberately-missing-seccomp.so.2"
+            )
+        )
+        # Fault injection changes the *source bytes*, not a stale script path.
+        argv[4] = fake.read_text()
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn("AF_UNIX sandbox enforcement unavailable", result.stderr)
+        # A changed inline policy cannot impersonate the bound trusted source.
+        with self.assertRaisesRegex(sandbox.AgentSandboxError, "unrecognized"):
+            sandbox.runtime_sandbox_argv(argv)
+
+
+    def test_kernel_untrusted_child_denies_io_uring_setup(self) -> None:
+        """io_uring can submit socket operations outside syscall seccomp gates.
+
+        This synthetic kernel-level regression tests setup denial while keeping
+        AF_INET socket creation usable for remote model APIs. No outside host
+        sockets or filesystem state are touched.
+        """
+        import subprocess
+
+        sandbox = tasks.agent_sandbox
+        sandbox.require_bwrap()
+        directory = self.root / "untrusted-io-uring"
+        directory.mkdir()
+        code = (
+            "import ctypes,os,socket,json\n"
+            "tcp=socket.socket(socket.AF_INET,socket.SOCK_STREAM);tcp.close()\n"
+            "libc=ctypes.CDLL(None,use_errno=True)\n"
+            "fd=libc.syscall(ctypes.c_long(425),ctypes.c_uint(2),"
+            "ctypes.create_string_buffer(256))\n"
+            "err=ctypes.get_errno()\n"
+            "print(json.dumps({'fd':fd,'errno':err,'inet':'ALLOWED'}))\n"
+            "fd>=0 and os.close(fd)\n"
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_verified_task_effect_start",
+                         return_value={"effect_profile": "unknown"}),
+        ):
+            sandbox_argv = tasks._task_sandboxed_command_argv(
+                {"task_id": "untrusted-ring", "host": "local", "cwd": str(directory)},
+                ["/usr/bin/python3", "-I", "-c", code],
+            )
+        result = subprocess.run(
+            sandbox.runtime_sandbox_argv(sandbox_argv),
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcome = json.loads(result.stdout.strip())
+        self.assertEqual(outcome["inet"], "ALLOWED")
+        self.assertEqual(outcome["fd"], -1, outcome)
+        self.assertEqual(outcome["errno"], 1, outcome)
+
+
+    def test_real_systemd_revoked_lease_stops_live_cgroup(self) -> None:
+        """An actual, still-running user-systemd task must stop on lease loss.
+
+        This starts only a bounded synthetic sleep process. Verify the unit
+        was active before losing authority, then inactive/dead after stop.
+        No mock, production unit, or shared filesystem marker is involved.
+        """
+        import subprocess
+        import uuid
+
+        available = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if available.returncode != 0:
+            self.skipTest("user systemd bus unavailable; run E2E on Heim-PC")
+        identifier = uuid.uuid4().hex[:24]
+        unit = tasks._task_unit(identifier, 1)
+        argv_digest = "a" * 64
+        description = tasks.operator._systemd_safe_description(
+            "task", unit, argv_digest,
+        )
+        launched = subprocess.run(
+            ["systemd-run", "--user", "--description=" + description,
+             "--unit=" + unit,
+             "--property=Type=exec",
+             "--property=KillMode=control-group",
+             "--property=RuntimeMaxSec=12s",
+             "--", "/usr/bin/sleep", "12"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        self.assertEqual(launched.returncode, 0, launched.stderr)
+        try:
+            deadline = time.monotonic() + 4
+            pre_active = False
+            while time.monotonic() < deadline:
+                observed = subprocess.run(
+                    ["systemctl", "--user", "show", unit,
+                     "--property=ActiveState", "--property=SubState"],
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+                if "ActiveState=active\n" in observed.stdout:
+                    pre_active = True
+                    break
+                time.sleep(0.05)
+            self.assertTrue(pre_active, "synthetic unit was never running")
+            key = f"path:{self.root / 'revoked-writer-scope'}"
+            record = {
+                "task_id": identifier, "unit": unit,
+                "authoritative_unit": unit, "host": "local",
+                "attempt": 1, "argv_sha256": argv_digest,
+                "execution_backend": "systemd-user",
+                "systemd_scope": "user", "runtime_seconds": 12,
+                "lease_owner_id": f"task:{identifier}",
+                "resource_keys_json": tasks._canonical_json([key]),
+            }
+            # Reproduce the real lost-registry failure, not an invented
+            # replacement fleet host. The already-active unit is attested
+            # through systemd's exact persisted task id and argv digest.
+            with patch.object(
+                tasks.fleet, "fleet_host",
+                side_effect=RuntimeError("Fleet registry missing: isolated test HOME"),
+            ), patch.object(
+                tasks.operator, "_require_operator_mutation",
+                wraps=tasks.operator._require_operator_mutation,
+            ) as authorize:
+                maintenance = tasks._maintain_record_resources(record, "running")
+            authorize.assert_called_once()
+            self.assertEqual(authorize.call_args.args, ("durable_job",))
+            self.assertEqual(authorize.call_args.kwargs["service"], unit)
+            self.assertIsNotNone(maintenance)
+            self.assertIs(maintenance["maintained"], False)
+            self.assertIs(maintenance["stop_verified"], True, maintenance)
+            self.assertEqual(maintenance["state_override"], "cancelled")
+            after = subprocess.run(
+                ["systemctl", "--user", "show", unit,
+                 "--property=ActiveState", "--property=SubState",
+                 "--property=MainPID"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            self.assertIn("ActiveState=inactive\n", after.stdout)
+            self.assertIn("SubState=dead\n", after.stdout)
+            self.assertIn("MainPID=0\n", after.stdout)
+            self.assertIsNone(tasks.resources.inspect_resource(key))
+        finally:
+            subprocess.run(
+                ["systemctl", "--user", "stop", unit],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+
+
+    def test_kernel_user_systemd_ipaddressdeny_blocks_loopback(self) -> None:
+        """Kernel proof that a user task cannot talk to the host loopback.
+
+        Network E2E is run only when the user-systemd bus is available. The
+        synthetic listener and unit are ephemeral. An accepted TCP connect or
+        ignored AddressDeny is a RED security finding, never treated as pass.
+        """
+        import errno
+        import socket
+        import subprocess
+        import uuid
+
+        probe = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if probe.returncode != 0:
+            self.skipTest("target-host user-systemd bus unavailable")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            port = listener.getsockname()[1]
+            unit = f"grabowski-test-loopback-{uuid.uuid4().hex[:12]}.service"
+            source = (
+                "import errno,socket,sys\n"
+                "c=socket.socket(socket.AF_INET,socket.SOCK_STREAM)\n"
+                "code=c.connect_ex(('127.0.0.1',int(sys.argv[1])))\n"
+                "print('DENIED' if code in (errno.EPERM,errno.EACCES)"
+                " else 'BYPASS_'+str(code))\n"
+                "c.close()\n"
+            )
+            try:
+                result = subprocess.run(
+                    [
+                        "systemd-run", "--user", "--wait", "--pipe", "--collect",
+                        "--unit=" + unit, "--property=Type=exec",
+                        "--property=IPAddressDeny=localhost",
+                        "--", "/usr/bin/python3", "-I", "-c", source, str(port),
+                    ],
+                    capture_output=True, text=True, timeout=35, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("DENIED", result.stdout, result.stdout)
+                self.assertNotIn("BYPASS_", result.stdout, result.stdout)
+            finally:
+                subprocess.run(
+                    ["systemctl", "--user", "stop", unit],
+                    capture_output=True, text=True, timeout=10, check=False,
+                )
+
+
+    def test_missing_fleet_wrong_local_unit_identity_never_stops(self) -> None:
+        task_id = "b" * 24
+        record = {
+            "task_id": task_id,
+            "unit": tasks._task_unit(task_id, 1),
+            "authoritative_unit": tasks._task_unit(task_id, 1),
+            "host": "local",
+            "attempt": 1,
+            "argv_sha256": "c" * 64,
+            "execution_backend": "systemd-user",
+            "systemd_scope": "user",
+        }
+        wrong = {
+            "returncode": 0,
+            "stdout": (
+                f"Id={record['unit']}\\n"
+                "Description=forged or unrelated task\\n"
+                "LoadState=loaded\\nActiveState=active\\n"
+                "SubState=running\\nMainPID=54321\\n"
+            ),
+        }
+        with patch.object(tasks.operator, "_run", return_value=wrong), patch.object(
+            tasks.operator, "_run_mutating_user_systemd_unit"
+        ) as stop:
+            with self.assertRaisesRegex(
+                RuntimeError, "not the attested task"
+            ):
+                tasks._attested_local_revoked_task_unit(record)
+        stop.assert_not_called()
+
+
+    def test_revoked_task_stop_fails_closed_under_operator_blockade(self) -> None:
+        """Read-only observation may not bypass mutation/audit safety gates."""
+        task_id = self._start_claude()
+        record = tasks._row_raw(task_id)
+        keys = tasks._record_resource_keys(record)
+        self.assertTrue(keys)
+        tasks.resources.release_resources(
+            str(record["lease_owner_id"]), keys
+        )
+        with patch.object(
+            tasks.operator, "_require_operator_mutation",
+            side_effect=PermissionError("test blockade denies mutation"),
+        ) as authorize, patch.object(
+            tasks.operator, "_run_mutating_user_systemd_unit"
+        ) as stop, patch.object(
+            tasks.privileged, "root_task_systemd_request"
+        ) as root_stop, patch.object(
+            tasks, "_dispatch"
+        ) as dispatch:
+            maintenance = tasks._maintain_record_resources(record, "running")
+        self.assertIsNotNone(maintenance)
+        assert maintenance is not None
+        self.assertFalse(maintenance["maintained"])
+        self.assertEqual(maintenance["mode"], "revoked_stop_unverified")
+        self.assertEqual(maintenance["state_override"], "outcome_unknown")
+        self.assertFalse(maintenance["stop_verified"])
+        self.assertIn("blockade denies mutation", maintenance["stop_error"])
+        authorize.assert_called_once()
+        self.assertEqual(authorize.call_args.args, ("durable_job",))
+        self.assertEqual(authorize.call_args.kwargs["task_id"], task_id)
+        self.assertEqual(
+            authorize.call_args.kwargs["service"], record["unit"]
+        )
+        stop.assert_not_called()
+        root_stop.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertFalse(tasks.resources.inspect_resources(keys))
+
+
+    def test_pending_terminalization_recovery_checks_per_task_scopes(self) -> None:
+        """A targeted hard stop aborts recovery before any cursor or state writes."""
+        task_id = self._start_claude()
+        record = tasks._row_raw(task_id)
+        scoped = {
+            "path": record["cwd"], "repo": record["cwd"],
+            "task_id": task_id, "owner_id": record["lease_owner_id"],
+            "service": tasks._authoritative_unit(record),
+            "host": record["host"],
+        }
+        page = {
+            "terminalizations": [{"task_id": task_id}],
+            "examined": 1,
+            "cycle_completed": True,
+            "cursor_after": None,
+            "high_water": None,
+        }
+        for field in scoped:
+            with self.subTest(blocked_scope=field):
+                checks = []
+
+                def require(capability, **kwargs):
+                    checks.append((capability, dict(kwargs)))
+                    if kwargs.get(field) == scoped[field]:
+                        raise PermissionError("blocked scoped terminalization")
+
+                with (
+                    patch.object(
+                        tasks.operator, "_require_operator_mutation",
+                        side_effect=require,
+                    ),
+                    patch.object(tasks, "_load_terminalization_recovery_cycle", return_value=None),
+                    patch.object(tasks.resources, "pending_task_terminalizations", return_value=page),
+                    patch.object(tasks, "_validate_terminalization_recovery_page"),
+                    patch.object(tasks, "_save_terminalization_recovery_cycle") as save,
+                    patch.object(tasks, "_apply_terminalization_projection", return_value={"task_id": task_id}) as project,
+                    self.assertRaisesRegex(PermissionError, "blocked scoped terminalization"),
+                ):
+                    tasks._recover_pending_task_terminalizations()
+                self.assertTrue(checks)
+                self.assertEqual(checks[0], ("durable_job", scoped))
+                project.assert_not_called()
+                save.assert_not_called()
+
+
+
+    def test_task_list_requires_mutation_gate_before_recovery(self) -> None:
+        """The historical READ_ONLY route replays terminalizations and cursor.
+
+        A kill-switch / invalid audit chain must refuse the normal task list
+        before any journal recovery, DB projection or state changes.
+        """
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=PermissionError("task-list blockade"),
+            ) as authorize,
+            patch.object(
+                tasks, "_recover_pending_task_terminalizations",
+            ) as recover,
+            patch.object(tasks, "_task_current_projection") as projection,
+        ):
+            with self.assertRaisesRegex(PermissionError, "task-list blockade"):
+                tasks.grabowski_task_list(limit=1)
+        authorize.assert_called_once()
+        self.assertEqual(authorize.call_args.args, ("durable_job",))
+        recover.assert_not_called()
+        projection.assert_not_called()
+
+    def test_task_list_schema_only_survives_mutation_blockade(self) -> None:
+        """A pure schema inventory is still safe without write authority."""
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=PermissionError("blockade"),
+            ) as authorize,
+            patch.object(
+                tasks, "_recover_pending_task_terminalizations",
+            ) as recover,
+        ):
+            result = tasks.grabowski_task_list(schema_only=True)
+        self.assertEqual(result["store"], "tasks")
+        self.assertIs(result["mutation_performed"], False)
+        authorize.assert_not_called()
+        recover.assert_not_called()
+
+    def test_task_status_scoped_blockade_denies_before_lease_renewal(self) -> None:
+        """A task-id-only preflight cannot match workspace/host hard stops.
+
+        Require both the early global/task check and a scope-complete check
+        after durable record lookup, before any observation or lease effect.
+        """
+        task_id = self._start_claude()
+        record = tasks._row_raw(task_id)
+        expected = {
+            "path": record["cwd"],
+            "repo": record["cwd"],
+            "task_id": task_id,
+            "owner_id": record["lease_owner_id"],
+            "host": record["host"],
+            "service": tasks._authoritative_unit(record),
+        }
+        for field in ("path", "repo", "owner_id", "host", "service"):
+            with self.subTest(blocked_scope=field):
+                calls = []
+                def require(capability, **kwargs):
+                    calls.append((capability, dict(kwargs)))
+                    if kwargs.get(field) == expected[field]:
+                        raise PermissionError("scoped status blockade")
+                with patch.object(
+                    tasks.operator, "_require_operator_mutation",
+                    side_effect=require,
+                ), patch.object(
+                    tasks, "_row", wraps=tasks._row
+                ) as recover, patch.object(
+                    tasks, "_observe"
+                ) as observe, patch.object(
+                    tasks.resources, "renew_resources"
+                ) as renew, patch.object(
+                    tasks, "_set_state"
+                ) as persist:
+                    with self.assertRaisesRegex(
+                        PermissionError, "scoped status blockade"
+                    ):
+                        tasks.grabowski_task_status(task_id)
+                self.assertGreaterEqual(len(calls), 2)
+                self.assertEqual(calls[0][0], "durable_job")
+                self.assertEqual(calls[0][1].get("task_id"), task_id)
+                for key, value in expected.items():
+                    self.assertEqual(calls[1][1].get(key), value, key)
+                recover.assert_not_called()
+                observe.assert_not_called()
+                renew.assert_not_called()
+                persist.assert_not_called()
+
+
+    def test_task_status_requires_mutation_gate_before_record_or_lease_access(self) -> None:
+        """A status read is a write-capable lease and lifecycle operation.
+
+        Kill-switch or audit-chain denial must occur before terminalization
+        recovery, active-lease renewal and any user-systemd observation.
+        """
+        task_id = "d" * 24
+        with patch.object(
+            tasks.operator, "_require_operator_mutation",
+            side_effect=PermissionError("status mutation blockade"),
+        ) as authorize, patch.object(
+            tasks, "_row"
+        ) as row, patch.object(
+            tasks, "_observe"
+        ) as observe, patch.object(
+            tasks.resources, "renew_resources"
+        ) as renew, patch.object(
+            tasks, "_set_state"
+        ) as persist:
+            with self.assertRaisesRegex(
+                PermissionError, "status mutation blockade"
+            ):
+                tasks.grabowski_task_status(task_id)
+        authorize.assert_called_once()
+        self.assertEqual(authorize.call_args.args, ("durable_job",))
+        self.assertEqual(authorize.call_args.kwargs["task_id"], task_id)
+        row.assert_not_called()
+        observe.assert_not_called()
+        renew.assert_not_called()
+        persist.assert_not_called()
+
+
+
+    def test_task_status_scoped_blockade_cannot_migrate_legacy_store(self) -> None:
+        """The scope identity read must not upgrade an old DB before denial."""
+        task_id, _ = self.fixtures._create_task_schema_version("2")
+        database = self.fixtures.database
+        before_bytes = database.read_bytes()
+        before_names = sorted(p.name for p in database.parent.iterdir() if p.name != "tasks.mutation.lock")
+
+        def deny_scoped(capability, **context):
+            if context.get("path") == str(self.root):
+                raise PermissionError("legacy store scoped blockade")
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation", side_effect=deny_scoped),
+            patch.object(tasks, "_row") as recover,
+            patch.object(tasks, "_observe") as observe,
+        ):
+            with self.assertRaisesRegex(PermissionError, "legacy store scoped blockade"):
+                tasks.grabowski_task_status(task_id)
+        recover.assert_not_called()
+        observe.assert_not_called()
+        self.assertEqual(before_bytes, database.read_bytes())
+        self.assertEqual(before_names, sorted(p.name for p in database.parent.iterdir() if p.name != "tasks.mutation.lock"))
+        with tasks._inventory_readonly_sqlite(database) as connection:
+            self.assertEqual("2", tasks._task_schema_version(connection))
+        self.assertEqual([], self.fixtures._task_migration_backups())
+
+    def test_task_status_scoped_blockade_cannot_repair_permissions_or_wal(self) -> None:
+        """Even a current DB may be modified by _database journal/chmod setup."""
+        import sqlite3
+        import stat
+
+        task_id = self._start_claude()
+        record = tasks._row_raw(task_id)
+        database = tasks.TASK_DB
+        with sqlite3.connect(database) as connection:
+            self.assertEqual("delete", connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0])
+        self.assertFalse(tasks.Path(f"{database}-wal").exists())
+        database.chmod(0o640)
+        before_bytes = database.read_bytes()
+
+        def deny_scoped(capability, **context):
+            if context.get("path") == record["cwd"]:
+                raise PermissionError("current store scoped blockade")
+
+        try:
+            with (
+                patch.object(tasks.operator, "_require_operator_mutation", side_effect=deny_scoped),
+                patch.object(tasks, "_row") as recover,
+                patch.object(tasks, "_observe") as observe,
+            ):
+                with self.assertRaisesRegex(PermissionError, "current store scoped blockade"):
+                    tasks.grabowski_task_status(task_id)
+            recover.assert_not_called()
+            observe.assert_not_called()
+            self.assertEqual(0o640, stat.S_IMODE(database.stat().st_mode))
+            self.assertEqual(before_bytes, database.read_bytes())
+            self.assertFalse(tasks.Path(f"{database}-wal").exists())
+            with sqlite3.connect(database) as connection:
+                self.assertEqual("delete", connection.execute("PRAGMA journal_mode").fetchone()[0])
+        finally:
+            database.chmod(0o600)
+
+    def test_task_status_identity_probe_rejects_symlinked_database(self) -> None:
+        """Read-only identity probes must retain the database path trust checks."""
+        task_id = self._start_claude()
+        database = tasks.TASK_DB
+        target = database.with_name(database.name + ".untrusted")
+        database.rename(target)
+        database.symlink_to(target)
+        before_bytes = target.read_bytes()
+        try:
+            with patch.object(tasks, "_observe") as observe:
+                with self.assertRaises(PermissionError):
+                    tasks.grabowski_task_status(task_id)
+            observe.assert_not_called()
+            self.assertEqual(before_bytes, target.read_bytes())
+        finally:
+            database.unlink()
+            target.rename(database)
+
+    def test_task_status_uses_effective_legacy_owner_for_scope_gate(self) -> None:
+        """NULL persisted owner must not bypass owner-scoped mutation blocks."""
+        task_id = self._start_claude()
+        with tasks._database_connection() as connection:
+            connection.execute("UPDATE tasks SET lease_owner_id=NULL WHERE task_id=?", (task_id,))
+        expected_owner = tasks._lease_owner(task_id)
+        self.assertIsNone(tasks._row_raw(task_id)["lease_owner_id"])
+
+        def deny_owner(capability, **context):
+            if context.get("owner_id") == expected_owner:
+                raise PermissionError("effective legacy owner blocked")
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation", side_effect=deny_owner),
+            patch.object(tasks, "_row") as recover,
+            patch.object(tasks, "_observe") as observe,
+            patch.object(tasks.resources, "renew_resources") as renew,
+        ):
+            with self.assertRaisesRegex(PermissionError, "effective legacy owner blocked"):
+                tasks.grabowski_task_status(task_id)
+        recover.assert_not_called()
+        observe.assert_not_called()
+        renew.assert_not_called()
+
+    def test_pending_terminalization_recovery_uses_effective_legacy_owner(self) -> None:
+        """Legacy NULL owner denial must fail closed before any cursor update."""
+        task_id = self._start_claude()
+        with tasks._database_connection() as connection:
+            connection.execute("UPDATE tasks SET lease_owner_id=NULL WHERE task_id=?", (task_id,))
+        effective_owner = tasks._lease_owner(task_id)
+        page = {
+            "terminalizations": [{"task_id": task_id}],
+            "examined": 1, "cycle_completed": True,
+            "cursor_after": None, "high_water": None,
+        }
+
+        def deny_owner(capability, **context):
+            if context.get("owner_id") == effective_owner:
+                raise PermissionError("legacy recovery owner blocked")
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation", side_effect=deny_owner),
+            patch.object(tasks, "_load_terminalization_recovery_cycle", return_value=None),
+            patch.object(tasks.resources, "pending_task_terminalizations", return_value=page),
+            patch.object(tasks, "_validate_terminalization_recovery_page"),
+            patch.object(tasks, "_save_terminalization_recovery_cycle") as save,
+            patch.object(tasks, "_apply_terminalization_projection") as project,
+            self.assertRaisesRegex(PermissionError, "legacy recovery owner blocked"),
+        ):
+            tasks._recover_pending_task_terminalizations()
+        project.assert_not_called()
+        save.assert_not_called()
+
+
+    def test_pending_resource_page_rejects_scoped_blockade_before_wal_and_chmod(self) -> None:
+        """Resource page read may not repair the store before task scope is allowed."""
+        import sqlite3
+        import stat
+
+        pending = self.fixtures._prepare_pending_terminalization()
+        task_id = str(pending["task_id"])
+        database = self.fixtures.resource_database
+        with sqlite3.connect(database) as connection:
+            self.assertEqual(
+                "delete", connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+            )
+        self.assertFalse(tasks.Path(f"{database}-wal").exists())
+        database.chmod(0o640)
+        before = database.read_bytes()
+
+        def require(_capability, **scope):
+            if scope.get("task_id") == task_id and scope.get("path") == str(self.root):
+                raise PermissionError("resource page scoped blockade")
+
+        try:
+            with patch.object(
+                tasks.operator, "_require_operator_mutation", side_effect=require
+            ):
+                with self.assertRaisesRegex(
+                    PermissionError, "resource page scoped blockade"
+                ):
+                    tasks._recover_pending_task_terminalizations(limit=1)
+            self.assertEqual(before, database.read_bytes())
+            self.assertEqual(0o640, stat.S_IMODE(database.stat().st_mode))
+            self.assertFalse(tasks.Path(f"{database}-wal").exists())
+            with sqlite3.connect(database) as connection:
+                self.assertEqual(
+                    "delete", connection.execute("PRAGMA journal_mode").fetchone()[0]
+                )
+        finally:
+            database.chmod(0o600)
+
+    def test_pending_resource_page_legacy_schema_denied_without_migration(self) -> None:
+        """A v2 resource store may not become v3 before blocked task admission."""
+        import sqlite3
+        from contextlib import closing
+
+        pending = self.fixtures._prepare_pending_terminalization()
+        task_id = str(pending["task_id"])
+        database = self.fixtures.resource_database
+        with closing(sqlite3.connect(database)) as connection:
+            for index in (
+                "task_terminalizations_pending_idx",
+                "task_authority_adoptions_expiry_idx",
+            ):
+                connection.execute(f"DROP INDEX IF EXISTS {index}")
+            connection.execute(
+                "UPDATE metadata SET value='2' WHERE key='schema_version'"
+            )
+            connection.commit()
+        before = database.read_bytes()
+
+        def require(_capability, **scope):
+            if scope.get("task_id") == task_id and scope.get("path") == str(self.root):
+                raise PermissionError("legacy resources scoped blockade")
+
+        with patch.object(
+            tasks.operator, "_require_operator_mutation", side_effect=require
+        ):
+            with self.assertRaisesRegex(
+                PermissionError, "legacy resources scoped blockade"
+            ):
+                tasks._recover_pending_task_terminalizations(limit=1)
+        with tasks.resources._resource_inventory_readonly_sqlite(database) as connection:
+            self.assertEqual("2", tasks.resources._resource_schema_version(connection))
+        self.assertEqual(before, database.read_bytes())
+        self.assertEqual(
+            [],
+            list(database.parent.glob(f"{database.name}.schema-*.backup")),
+        )
+
+    def test_resource_pending_existence_probe_preserves_current_wal_and_mode(self) -> None:
+        """Reconcile eligibility reads may not chmod or enable WAL."""
+        import sqlite3
+        import stat
+        from contextlib import closing
+
+        self.fixtures._prepare_pending_terminalization()
+        database = self.fixtures.resource_database
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(
+                "delete", connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+            )
+        self.assertFalse(tasks.Path(f"{database}-wal").exists())
+        database.chmod(0o640)
+        before = database.read_bytes()
+        try:
+            self.assertTrue(tasks.resources.pending_task_terminalizations_exist())
+            self.assertEqual(before, database.read_bytes())
+            self.assertEqual(0o640, stat.S_IMODE(database.stat().st_mode))
+            self.assertFalse(tasks.Path(f"{database}-wal").exists())
+        finally:
+            database.chmod(0o600)
+
+    def test_resource_pending_existence_probe_preserves_legacy_schema(self) -> None:
+        """Reconcile existence reads cannot silently migrate resource v2."""
+        import sqlite3
+        from contextlib import closing
+
+        self.fixtures._prepare_pending_terminalization()
+        database = self.fixtures.resource_database
+        with closing(sqlite3.connect(database)) as connection:
+            for index in (
+                "task_terminalizations_pending_idx",
+                "task_authority_adoptions_expiry_idx",
+            ):
+                connection.execute(f"DROP INDEX IF EXISTS {index}")
+            connection.execute(
+                "UPDATE metadata SET value='2' WHERE key='schema_version'"
+            )
+            connection.commit()
+        before = database.read_bytes()
+        self.assertTrue(tasks.resources.pending_task_terminalizations_exist())
+        with tasks.resources._resource_inventory_readonly_sqlite(database) as connection:
+            self.assertEqual("2", tasks.resources._resource_schema_version(connection))
+        self.assertEqual(before, database.read_bytes())
+
+    def test_recovery_projection_service_scopes_are_authorized_before_write(self) -> None:
+        """Recovery cannot project a successor unit blocked by a service hard stop."""
+        transition = self.fixtures._prepare_pending_terminalization()
+        task_id = str(transition["task_id"])
+        record = tasks._row_raw(task_id)
+        current_unit = tasks._authoritative_unit(record)
+        successor_unit = tasks._task_unit(task_id, int(record["attempt"]) + 1)
+        self.assertNotEqual(successor_unit, current_unit)
+        for changed_field in ("unit", "authoritative_unit"):
+            with self.subTest(projected_field=changed_field):
+                projected = dict(transition["task_projection"])
+                projected[changed_field] = successor_unit
+                page = {
+                    "terminalizations": [{**transition, "task_projection": projected}],
+                    "examined": 1,
+                    "cycle_completed": True,
+                    "cursor_after": None,
+                    "high_water": None,
+                }
+                checked = []
+
+                def authorize(_capability, **context):
+                    checked.append(context.get("service"))
+                    if context.get("service") == successor_unit:
+                        raise PermissionError("projected service blockade")
+
+                with (
+                    patch.object(tasks.operator, "_require_operator_mutation", side_effect=authorize),
+                    patch.object(tasks.resources, "pending_task_terminalizations", return_value=page),
+                    patch.object(tasks, "_save_terminalization_recovery_cycle") as save,
+                    patch.object(tasks, "_apply_terminalization_projection") as project,
+                    self.assertRaisesRegex(PermissionError, "projected service blockade"),
+                ):
+                    tasks._recover_pending_task_terminalizations(limit=1)
+                self.assertIn(current_unit, checked)
+                self.assertIn(successor_unit, checked)
+                project.assert_not_called()
+                save.assert_not_called()
+
+    def test_pending_resource_wal_preflight_does_not_create_host_tempfiles(self) -> None:
+        """A scoped-denied WAL page must be read with zero host temp snapshots."""
+        import sqlite3
+        from unittest.mock import patch
+
+        pending = self.fixtures._prepare_pending_terminalization()
+        task_id = str(pending["task_id"])
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            self.assertEqual(
+                "wal", writer.execute("PRAGMA journal_mode").fetchone()[0]
+            )
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                ("wal_reader_kernel_probe", "snapshot"),
+            )
+            wal = tasks.Path(str(database) + "-wal")
+            self.assertTrue(wal.exists())
+            self.assertGreater(wal.stat().st_size, 32)
+            before = {
+                path.name: (path.stat().st_mode, path.stat().st_size,
+                            path.stat().st_mtime_ns, path.read_bytes())
+                for path in database.parent.iterdir() if path.is_file()
+            }
+
+            def deny_scope(_capability, **context):
+                if context.get("task_id") == task_id:
+                    raise PermissionError("resource WAL pending scope blocked")
+
+            with (
+                patch.object(
+                    tasks.resources.sqlite_store.tempfile, "TemporaryDirectory",
+                    side_effect=AssertionError("unauthorized host tempfile created"),
+                ),
+                patch.object(
+                    tasks.operator, "_require_operator_mutation",
+                    side_effect=deny_scope,
+                ),
+                self.assertRaisesRegex(
+                    PermissionError, "resource WAL pending scope blocked"
+                ),
+            ):
+                tasks._recover_pending_task_terminalizations(limit=1)
+            after = {
+                path.name: (path.stat().st_mode, path.stat().st_size,
+                            path.stat().st_mtime_ns, path.read_bytes())
+                for path in database.parent.iterdir() if path.is_file()
+            }
+            self.assertEqual(before, after)
+        finally:
+            writer.close()
+
+    def test_recovery_batch_preflights_later_denial_before_earlier_projection(self) -> None:
+        """A second blocked task must not permit the first task's durable effects."""
+        pending = [
+            self.fixtures._prepare_pending_terminalization(
+                prepared_at_unix=100 + index
+            )
+            for index in range(2)
+        ]
+        ids = [str(item["task_id"]) for item in pending]
+        before = {task_id: tasks._row_raw(task_id) for task_id in ids}
+        blocked = ids[1]
+        admission_order = []
+
+        def require(_capability, **scope):
+            if scope.get("path") == str(self.root):
+                admission_order.append(scope["task_id"])
+                if scope["task_id"] == blocked:
+                    raise PermissionError("second page task scoped blockade")
+
+        with patch.object(
+            tasks.operator, "_require_operator_mutation", side_effect=require
+        ):
+            with self.assertRaisesRegex(
+                PermissionError, "second page task scoped blockade"
+            ):
+                tasks._recover_pending_task_terminalizations(limit=2)
+        self.assertEqual(ids, admission_order)
+        for task_id in ids:
+            self.assertEqual(before[task_id], tasks._row_raw(task_id))
+            self.assertEqual(
+                "leases_revoked",
+                tasks.resources.task_terminalization_record(task_id)["phase"],
+            )
+
+
+    def test_pending_resource_wal_snapshot_includes_uncheckpointed_task_journal(self) -> None:
+        """A zero-host-write snapshot must not silently ignore valid WAL-only rows."""
+        import sqlite3
+
+        self._start_claude()  # Initialize current resource schema and checkpoint it.
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            self.assertEqual("wal", writer.execute("PRAGMA journal_mode").fetchone()[0])
+            self.assertGreaterEqual(writer.execute("SELECT COUNT(*) FROM metadata").fetchone()[0], 1)
+            pending = self.fixtures._prepare_pending_terminalization()
+            task_id = str(pending["task_id"])
+            wal = tasks.Path(str(database) + "-wal")
+            self.assertTrue(wal.exists())
+            self.assertGreater(wal.stat().st_size, 32)
+
+            with sqlite3.connect(
+                database.absolute().as_uri() + "?mode=ro&immutable=1",
+                uri=True,
+            ) as stale:
+                self.assertIsNone(
+                    stale.execute(
+                        "SELECT task_id FROM task_terminalizations WHERE task_id=?",
+                        (task_id,),
+                    ).fetchone(),
+                    "positive fixture must really contain an uncheckpointed WAL row",
+                )
+            with patch.object(
+                tasks.resources.sqlite_store.tempfile,
+                "TemporaryDirectory",
+                side_effect=AssertionError("WAL snapshot wrote to host tmp"),
+            ):
+                page = tasks.resources.pending_task_terminalizations(limit=10)
+            self.assertIn(task_id, [row["task_id"] for row in page["terminalizations"]])
+        finally:
+            writer.close()
+
+    def test_missing_wal_kernel_sandbox_fails_closed_without_store_mutation(self) -> None:
+        """No bwrap means denial; a pre-gate WAL read may not silently fall back."""
+        import sqlite3
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                ("wal_missing_bwrap_probe", "1"),
+            )
+            self.assertTrue(tasks.Path(str(database) + "-wal").exists())
+            before = database.read_bytes()
+            with patch.object(
+                tasks.resources.sqlite_store.subprocess,
+                "Popen",
+                side_effect=FileNotFoundError("fake bwrap missing"),
+            ):
+                with self.assertRaises(tasks.resources.ResourceSchemaInventoryChanged):
+                    tasks.resources.pending_task_terminalizations(limit=1)
+            self.assertEqual(before, database.read_bytes())
+        finally:
+            writer.close()
+
+    def test_wal_snapshot_helper_uses_private_network_and_file_only_mounts(self) -> None:
+        """The actual helper launch exposes no host network or DB siblings."""
+        import sqlite3
+        import subprocess
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                ("wal_helper_kernel_isolation_probe", "1"),
+            )
+            original_popen = subprocess.Popen
+            with patch.object(
+                tasks.resources.sqlite_store.subprocess,
+                "Popen", wraps=original_popen,
+            ) as launch:
+                tasks.resources.pending_task_terminalizations(limit=1)
+            self.assertTrue(launch.called)
+            argv = launch.call_args.args[0]
+            self.assertIn("--unshare-net", argv)
+            self.assertIn("--tmpfs", argv)
+            self.assertIn("/snapshot", argv)
+            self.assertNotIn(str(database.parent.absolute()), argv)
+            self.assertNotIn(str(database.absolute()), argv)
+            self.assertNotIn(str(tasks.Path(str(database) + "-wal").absolute()), argv)
+            inherited = launch.call_args.kwargs["pass_fds"]
+            self.assertEqual(len(inherited), 2)
+            self.assertEqual(argv.count("--ro-bind-data"), 2)
+            for descriptor, target in zip(
+                inherited, ("/snapshot/input.db", "/snapshot/input.db-wal")
+            ):
+                target_index = argv.index(target)
+                self.assertEqual(
+                    argv[target_index - 2: target_index + 1],
+                    ["--ro-bind-data", str(descriptor), target],
+                )
+                self.assertNotIn(f"/proc/self/fd/{descriptor}", argv)
+            # Data is copied from verified FDs inside bwrap, not from a
+            # pathname which could have vanished or been substituted.
+        finally:
+            writer.close()
+
+    def test_wal_source_identity_is_pinned_across_same_uid_path_swap(self) -> None:
+        """Bwrap must consume validated FDs, not spoofed pathname replacements."""
+        import os
+        import sqlite3
+        import subprocess
+        import time
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        wal = tasks.Path(str(database) + "-wal")
+        foreign = database.with_name("foreign-p1.sqlite3")
+        foreign_wal = tasks.Path(str(foreign) + "-wal")
+        original_hold = database.with_name("held-source-p1.sqlite3")
+        original_wal_hold = tasks.Path(str(original_hold) + "-wal")
+
+        writer = sqlite3.connect(database, isolation_level=None)
+        attacker = None
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                ("wal_pinned_source_probe", "genuine"),
+            )
+            with sqlite3.connect(foreign) as clone:
+                writer.backup(clone)
+            attacker = sqlite3.connect(foreign, isolation_level=None)
+            attacker.execute("PRAGMA wal_autocheckpoint=0")
+            self.assertEqual(
+                attacker.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal"
+            )
+            attacker.execute(
+                "UPDATE metadata SET value=? WHERE key=?",
+                ("spoofed", "wal_pinned_source_probe"),
+            )
+            self.assertTrue(wal.exists())
+            self.assertTrue(foreign_wal.exists())
+            original_inode = database.stat().st_ino
+            foreign_inode = foreign.stat().st_ino
+            launch = subprocess.Popen
+            observed = []
+
+            def swap_while_bwrap_binds(argv, **kwargs):
+                passed = kwargs["pass_fds"]
+                self.assertEqual(len(passed), 2)
+                self.assertEqual(os.fstat(passed[0]).st_ino, original_inode)
+                self.assertNotEqual(os.fstat(passed[0]).st_ino, foreign_inode)
+                observed.append(tuple(passed))
+                os.replace(database, original_hold)
+                os.replace(wal, original_wal_hold)
+                os.replace(foreign, database)
+                os.replace(foreign_wal, wal)
+                try:
+                    child = launch(argv, **kwargs)
+                    time.sleep(0.1)
+                    return child
+                finally:
+                    os.replace(database, foreign)
+                    os.replace(wal, foreign_wal)
+                    os.replace(original_hold, database)
+                    os.replace(original_wal_hold, wal)
+
+            # The descriptor pins the genuine source. Rename also changes
+            # inode ctime, so the final identity gate MUST deny the snapshot.
+            with (
+                patch.object(
+                    tasks.resources.sqlite_store.subprocess,
+                    "Popen", side_effect=swap_while_bwrap_binds,
+                ),
+                self.assertRaises(tasks.resources.ResourceSchemaInventoryChanged),
+            ):
+                with tasks.resources.sqlite_store.preauthorization_readonly_sqlite(
+                    database,
+                    error_type=tasks.resources.ResourceSchemaInventoryChanged,
+                ) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT value FROM metadata WHERE key=?",
+                            ("wal_pinned_source_probe",),
+                        ).fetchone()[0],
+                        "genuine",
+                    )
+            self.assertEqual(len(observed), 1)
+            self.assertEqual(database.stat().st_ino, original_inode)
+        finally:
+            if attacker is not None:
+                attacker.close()
+            writer.close()
+
+    def test_wal_unlinked_after_fd_open_still_reaches_pinned_sqlite_image(self) -> None:
+        """An unlinked WAL fd remains readable inside bwrap; authority still denies drift."""
+        import sqlite3
+        import subprocess
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        wal = tasks.Path(f"{database}-wal")
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                ("wal_unlinked_fd_probe", "pinned"),
+            )
+            self.assertTrue(wal.exists())
+            original_popen = subprocess.Popen
+            reached_query = []
+
+            def unlink_after_pin(argv, **kwargs):
+                self.assertEqual(len(kwargs["pass_fds"]), 2)
+                wal.unlink()
+                return original_popen(argv, **kwargs)
+
+            with (
+                patch.object(
+                    tasks.resources.sqlite_store.subprocess,
+                    "Popen", side_effect=unlink_after_pin,
+                ),
+                self.assertRaises(tasks.resources.ResourceSchemaInventoryChanged),
+            ):
+                with tasks.resources.sqlite_store.preauthorization_readonly_sqlite(
+                    database, error_type=tasks.resources.ResourceSchemaInventoryChanged,
+                ) as connection:
+                    reached_query.append(
+                        connection.execute(
+                            "SELECT value FROM metadata WHERE key=?",
+                            ("wal_unlinked_fd_probe",),
+                        ).fetchone()[0]
+                    )
+            # Even if the authoritative WAL pathname vanishes, the verified
+            # descriptor data remains readable. The final identity assertion
+            # still fails closed; it must not silently authorize the changed store.
+            self.assertEqual(reached_query, ["pinned"])
+        finally:
+            writer.close()
+
+    def test_wal_snapshot_never_replays_schema_expressions_in_operator(self) -> None:
+        """Compact malicious CHECK constraints may not execute in the main Python process."""
+        import sqlite3
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute(
+                "CREATE TABLE hostile_check (value TEXT "
+                "CHECK(length(randomblob(1048576)) > 0))"
+            )
+            writer.execute("PRAGMA ignore_check_constraints=ON")
+            writer.execute("INSERT INTO hostile_check VALUES (?)", ("legitimate",))
+            writer.execute("PRAGMA ignore_check_constraints=OFF")
+            writer.execute(
+                "INSERT INTO metadata(key,value) VALUES (?,?)",
+                ("wal_pinned_ddl_probe", "legitimate"),
+            )
+            self.assertTrue(tasks.Path(str(database) + "-wal").exists())
+            real_connect = sqlite3.connect
+
+            # The old iterdump+executescript restores arbitrary expressions in
+            # the host, and therefore invokes sqlite3.connect(':memory:').
+            # Only the isolated child may construct/execute SQLite statements.
+            with patch.object(
+                tasks.resources.sqlite_store.sqlite3, "connect",
+                side_effect=AssertionError("untrusted SQL executed in host"),
+            ):
+                with tasks.resources.sqlite_store.preauthorization_readonly_sqlite(
+                    database,
+                    error_type=tasks.resources.ResourceSchemaInventoryChanged,
+                ) as connection:
+                    self.assertEqual(
+                        connection.execute("SELECT value FROM hostile_check").fetchone()[0],
+                        "legitimate",
+                    )
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT value FROM metadata WHERE key=?",
+                            ("wal_pinned_ddl_probe",),
+                        ).fetchone()[0], "legitimate",
+                    )
+            self.assertIsNotNone(real_connect)
+        finally:
+            writer.close()
+
+    def test_wal_child_startup_failure_reports_only_bounded_reason(self) -> None:
+        """A dead WAL helper identifies the failing boundary without raw child stderr."""
+        import os
+        import time
+        from types import SimpleNamespace
+
+        output_read, output_write = os.pipe()
+        error_read, error_write = os.pipe()
+        try:
+            os.write(
+                error_write,
+                b"bwrap: loopback: Failed to create NETLINK_ROUTE socket: "
+                b"Address family not supported by protocol PRIVATE_SENTINEL\n",
+            )
+        finally:
+            os.close(output_write)
+            os.close(error_write)
+        with (
+            os.fdopen(output_read, "rb", buffering=0) as output,
+            os.fdopen(error_read, "rb", buffering=0) as errors,
+        ):
+            child = SimpleNamespace(
+                stdout=output, stderr=errors, poll=lambda: 1,
+            )
+            with self.assertRaisesRegex(ValueError, "sandbox-network") as caught:
+                tasks.resources.sqlite_store._WALReadConnection(
+                    child,
+                    deadline=time.monotonic() + 2,
+                    error_type=tasks.resources.ResourceSchemaInventoryChanged,
+                )
+            self.assertNotIn("PRIVATE_SENTINEL", str(caught.exception))
+
+    def test_wal_snapshot_closes_sqlite_child_before_releasing_wal(self) -> None:
+        """A successful bounded WAL read should close its helper normally."""
+        import sqlite3
+        import subprocess
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute(
+                "INSERT INTO metadata(key,value) VALUES (?, ?)",
+                ("wal_child_graceful_exit_probe", "ready"),
+            )
+            self.assertTrue(tasks.Path(str(database) + "-wal").exists())
+            started = []
+            actual_popen = subprocess.Popen
+
+            def track_launch(*argv, **kwargs):
+                process = actual_popen(*argv, **kwargs)
+                started.append(process)
+                return process
+
+            with patch.object(
+                tasks.resources.sqlite_store.subprocess, "Popen",
+                side_effect=track_launch,
+            ):
+                with tasks.resources.sqlite_store.preauthorization_readonly_sqlite(
+                    database,
+                    error_type=tasks.resources.ResourceSchemaInventoryChanged,
+                ) as connection:
+                    row = connection.execute(
+                        "SELECT value FROM metadata WHERE key=?",
+                        ("wal_child_graceful_exit_probe",),
+                    ).fetchone()
+                    self.assertEqual(row[0], "ready")
+            self.assertEqual(len(started), 1)
+            self.assertEqual(
+                started[0].returncode, 0,
+                "a successful reader must close normally, not by SIGKILL",
+            )
+        finally:
+            writer.close()
+
+    def test_wal_snapshot_preserves_scoped_authorization_denial(self) -> None:
+        """A caller's path/service PermissionError must not turn into an inventory retry."""
+        import sqlite3
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute(
+                "INSERT INTO metadata(key,value) VALUES (?,?)",
+                ("preauth_caller_denial_probe", "1"),
+            )
+            self.assertTrue(tasks.Path(str(database) + "-wal").exists())
+            with self.assertRaisesRegex(
+                PermissionError, "exact scoped authorization denied",
+            ):
+                with tasks.resources.sqlite_store.preauthorization_readonly_sqlite(
+                    database,
+                    error_type=tasks.resources.ResourceSchemaInventoryChanged,
+                ) as connection:
+                    self.assertEqual(connection.execute(
+                        "SELECT value FROM metadata WHERE key=?",
+                        ("preauth_caller_denial_probe",),
+                    ).fetchone()[0], "1")
+                    raise PermissionError("exact scoped authorization denied")
+        finally:
+            writer.close()
+
+    def test_wal_snapshot_output_limit_fails_closed(self) -> None:
+        """Even an oversized valid SQLite dump may not escape the output cap."""
+        import sqlite3
+
+        self._start_claude()
+        database = self.fixtures.resource_database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                ("wal_helper_oversized_probe", "x" * 4096),
+            )
+            before = database.read_bytes()
+            with patch.object(
+                tasks.resources.sqlite_store,
+                "_PREAUTH_WAL_MAX_DUMP_BYTES", 256,
+            ):
+                with self.assertRaises(tasks.resources.ResourceSchemaInventoryChanged):
+                    tasks.resources.pending_task_terminalizations(limit=1)
+            self.assertEqual(before, database.read_bytes())
+        finally:
+            writer.close()
+
+    def test_task_wal_cursor_and_scope_preflight_never_copy_to_host_tmp(self) -> None:
+        """Both task recovery cursor and status identity must read WAL without host writes."""
+        import sqlite3
+
+        task_id = self._start_claude()
+        database = self.fixtures.database
+        writer = sqlite3.connect(database, isolation_level=None)
+        try:
+            self.assertEqual("wal", writer.execute("PRAGMA journal_mode").fetchone()[0])
+            writer.execute(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                ("task_wal_kernel_snapshot_probe", "1"),
+            )
+            wal = tasks.Path(str(database) + "-wal")
+            self.assertTrue(wal.exists())
+            self.assertGreater(wal.stat().st_size, 32)
+            before = {
+                path.name: (path.stat().st_size, path.stat().st_mtime_ns, path.read_bytes())
+                for path in database.parent.iterdir() if path.is_file()
+            }
+
+            def deny(_capability, **scope):
+                if scope.get("task_id") == task_id and scope.get("path") == str(self.root):
+                    raise PermissionError("WAL task status scoped blockade")
+
+            with patch.object(
+                tasks.sqlite_store.tempfile,
+                "TemporaryDirectory",
+                side_effect=AssertionError("preauthorization task WAL host tmp write"),
+            ):
+                self.assertIsNone(tasks._load_terminalization_recovery_cycle())
+                with (
+                    patch.object(tasks.operator, "_require_operator_mutation", side_effect=deny),
+                    self.assertRaisesRegex(
+                        PermissionError, "WAL task status scoped blockade"
+                    ),
+                ):
+                    tasks.grabowski_task_status(task_id)
+            after = {
+                path.name: (path.stat().st_size, path.stat().st_mtime_ns, path.read_bytes())
+                for path in database.parent.iterdir() if path.is_file()
+            }
+            self.assertEqual(before, after)
+        finally:
+            writer.close()
+
+    def test_recovery_cursor_legacy_store_is_readonly_before_scoped_gate(self) -> None:
+        """Blocked legacy task-list must not migrate after denied cursor lookup."""
+        task_id, _ = self.fixtures._create_task_schema_version("2")
+        database = self.fixtures.database
+        before = database.read_bytes()
+        observed_versions = []
+        page = {
+            "terminalizations": [{"task_id": task_id}],
+            "examined": 1, "cycle_completed": True,
+            "cursor_after": None, "high_water": None,
+        }
+
+        def require(capability, **context):
+            if context.get("task_id") == task_id and context.get("path") == str(self.root):
+                with tasks._inventory_readonly_sqlite(database) as connection:
+                    version = tasks._task_schema_version(connection)
+                observed_versions.append(version)
+                if version != "2":
+                    raise AssertionError("recovery cursor migrated legacy task before scope gate")
+                raise PermissionError("legacy task recovery scoped blockade")
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation", side_effect=require),
+            patch.object(tasks.resources, "pending_task_terminalizations", return_value=page),
+            patch.object(tasks, "_validate_terminalization_recovery_page"),
+            patch.object(tasks, "_task_current_projection") as project_list,
+            patch.object(tasks, "_apply_terminalization_projection") as project,
+            self.assertRaisesRegex(PermissionError, "legacy task recovery scoped blockade"),
+        ):
+            tasks.grabowski_task_list(limit=1)
+        self.assertEqual(["2"], observed_versions)
+        project.assert_not_called()
+        project_list.assert_not_called()
+        self.assertEqual(before, database.read_bytes())
+        with tasks._inventory_readonly_sqlite(database) as connection:
+            self.assertEqual("2", tasks._task_schema_version(connection))
+        self.assertEqual([], self.fixtures._task_migration_backups())
+
+
+    def test_recovery_cursor_read_does_not_initialize_missing_store(self) -> None:
+        """A cursor lookup is not authority to create task database metadata."""
+        database = self.fixtures.database
+        self.assertFalse(database.exists())
+        self.assertIsNone(tasks._load_terminalization_recovery_cycle())
+        self.assertFalse(database.exists())
+
+    def test_recovery_cursor_read_does_not_repair_current_store_wal_or_mode(self) -> None:
+        """Even current-schema read may not chmod or recreate WAL before scoped checks."""
+        import sqlite3
+        import stat
+
+        self._start_claude()
+        database = tasks.TASK_DB
+        with sqlite3.connect(database) as connection:
+            self.assertEqual("delete", connection.execute("PRAGMA journal_mode=DELETE").fetchone()[0])
+        self.assertFalse(tasks.Path(f"{database}-wal").exists())
+        database.chmod(0o640)
+        before = database.read_bytes()
+        try:
+            self.assertIsNone(tasks._load_terminalization_recovery_cycle())
+            self.assertEqual(before, database.read_bytes())
+            self.assertEqual(0o640, stat.S_IMODE(database.stat().st_mode))
+            self.assertFalse(tasks.Path(f"{database}-wal").exists())
+            with sqlite3.connect(database) as connection:
+                self.assertEqual("delete", connection.execute("PRAGMA journal_mode").fetchone()[0])
+        finally:
+            database.chmod(0o600)
+
+    def test_revoked_running_task_lease_cannot_be_silently_reacquired(self) -> None:
+        """A current unit observation is not authority to restore a lost lease.
+
+        This uses a synthetic still-running unit and a real private resource
+        database. Revocation must be followed by a verified stop/reconcile,
+        never an implicit writable regrant during task_status().
+        """
+        import sqlite3
+
+        task_id = self._start_claude()
+        record = tasks._row_raw(task_id)
+        keys = tasks._record_resource_keys(record)
+        self.assertTrue(keys)
+        with sqlite3.connect(self.fixtures.resource_database) as database:
+            database.execute(
+                "DELETE FROM leases WHERE resource_key IN ("
+                + ",".join("?" for _ in keys) + ")",
+                keys,
+            )
+        self.assertFalse(tasks.resources.inspect_resources(keys))
+        observed_running = {
+            "state": "running",
+            "properties": {
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+                "Result": "success",
+            },
+            "observer": {"kind": "test", "execution_backend": "systemd-user"},
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(tasks, "_observe", return_value=observed_running),
+            patch.object(
+                tasks.resources, "acquire_resources",
+                wraps=tasks.resources.acquire_resources,
+            ) as regrant,
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            status = tasks.grabowski_task_status(task_id)
+        # Stopping a revoked task may itself acquire a narrow service-unit
+        # lease. Only reacquisition of the *revoked writable task keys* is
+        # forbidden; a stop-control lease is not a renewed writer grant.
+        for call in regrant.call_args_list:
+            acquired_keys = call.args[1] if len(call.args) > 1 else []
+            self.assertTrue(set(acquired_keys).isdisjoint(keys), acquired_keys)
+        maintenance = status["lease_maintenance"]
+        self.assertIsInstance(maintenance, dict)
+        self.assertIs(maintenance["maintained"], False)
+        # A visible, still-running unit with no grant remains a live writer.
+        # A failed renewal alone is not a cgroup-stop or reconciliation proof.
+        self.assertNotEqual(status["state"], "running")
+        self.assertIsNone(tasks.resources.inspect_resource(keys[0]))
+
+
+    def test_env_split_short_clusters_do_not_bypass_codex_guard(self) -> None:
+        commands = (
+            ["/usr/bin/env", "-iS", "codex exec prompt"],
+            ["/usr/bin/env", "-Scodex", "exec", "prompt"],
+            ["/usr/bin/env", "-vS", "codex exec prompt"],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_codex_indirect_prefixers_do_not_bypass_guard(self) -> None:
+        commands = (
+            ["/usr/bin/time", "-p", "codex", "exec", "prompt"],
+            ["sudo", "-n", "codex", "exec", "prompt"],
+            ["doas", "codex", "exec", "prompt"],
+            ["/usr/bin/busybox", "sh", "-c", "codex exec prompt"],
+            ["/usr/bin/busybox", "env", "codex", "exec", "prompt"],
+            ["/lib64/ld-linux-x86-64.so.2", "/opt/codex", "exec", "prompt"],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_symlinked_prefix_launcher_aliases_must_not_hide_codex(self) -> None:
+        for name, target, args in (
+            ("alias-env", "/usr/bin/env", ["-iS", "codex exec prompt"]),
+            ("alias-time", "/usr/bin/time", ["-p", "codex", "exec", "prompt"]),
+        ):
+            alias = self.root / name
+            alias.symlink_to(target)
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        [str(alias), *args]
+                    )
+        alias = self.root / "alias-env-good"
+        alias.symlink_to("/usr/bin/env")
+        tasks._require_direct_codex_filesystem_sandbox([
+            str(alias), "CARGO_TARGET_DIR=/tmp/project-codex/target",
+            "cargo", "test"
+        ])
+
+    def test_shell_alias_indirect_codex_is_denied(self) -> None:
+        """Shell aliases must not bypass coding-agent filesystem admission."""
+        commands = (
+            ["/bin/bash", "-O", "expand_aliases", "-c",
+             "alias x=codex\\nx exec prompt".replace("\\\\n", "\\n")],
+            ["/bin/bash", "-c",
+             "shopt -s expand_aliases; alias x='codex exec'; x prompt"],
+            ["/bin/bash", "-Oexpand_aliases", "-c",
+             "alias x='codex exec'; x prompt"],
+            ["/bin/bash", "-c", "alias x=codex; x exec prompt"],
+            ["/bin/bash", "-c", "unalias x; printf ok"],
+            ["/bin/bash", "-c", "shopt -s expand_aliases; printf ok"],
+            ["/bin/bash", "-O", "expand_aliases", "-c", "printf ok"],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Codex.*filesystem sandbox"
+                ):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+        # A harmless quoted word is data, not an alias definition.
+        tasks._require_direct_codex_filesystem_sandbox(
+            ["/bin/bash", "-c", "printf 'alias x=codex'"]
+        )
+
+    def test_env_exported_bash_functions_cannot_hide_codex(self) -> None:
+        """GNU env accepts Bash function exports containing '%' in names."""
+        blocked = (
+            ["env", "BASH_FUNC_x%%=() { codex exec prompt; }", "bash", "-c", "x"],
+            ["/usr/bin/env", "-i", "BASH_FUNC_x%%=() { codex exec prompt; }",
+             "/bin/bash", "-c", "x"],
+            ["env", "BASH_FUNC_x%%=() { /usr/bin/true; }", "bash", "-c", "x"],
+            ["env", "BASH_FUNC_x%%=() { codex exec prompt; }", "cargo", "test"],
+            ["env", "bad.key=foo", "bash", "-c", "printf ok"],
+        )
+        for argv in blocked:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+        for safe in (
+            ["/usr/bin/env", "HOME=/tmp/project-codex", "cargo", "test"],
+            ["env", "FOO=bar", "/bin/bash", "-c", "printf ok"],
+        ):
+            with self.subTest(safe=safe):
+                tasks._require_direct_codex_filesystem_sandbox(safe)
+
+    def test_shell_builtin_prefixes_do_not_hide_codex(self) -> None:
+        commands = (
+            "exec -a harmless codex exec prompt",
+            "command -p codex exec prompt",
+            "eval 'codex exec prompt'",
+            "builtin eval 'codex exec prompt'",
+            "bash -c 'exec -a harmless codex exec prompt'",
+        )
+        for source in commands:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/bin/bash", "-c", source]
+                    )
+
+    def test_shell_builtin_cargo_and_printed_text_remain_allowed(self) -> None:
+        for source in (
+            "exec -a label cargo test",
+            "command -p cargo test",
+            "eval 'printf codex'",
+            "printf 'codex exec prompt'",
+        ):
+            with self.subTest(source=source):
+                tasks._require_direct_codex_filesystem_sandbox(
+                    ["/bin/bash", "-c", source]
+                )
+
+    def test_sudo_assignment_prefix_cannot_hide_indirect_codex(self) -> None:
+        # Prefixed environment assignments are not the executable. Both
+        # wrappers must still inspect the child command before any task effect.
+        for argv in (
+            ["sudo", "-n", "HOME=/tmp", "codex", "exec", "prompt"],
+            ["sudo", "-u", "tester", "X=1", "codex", "exec", "prompt"],
+            ["doas", "-n", "HOME=/tmp", "codex", "exec", "prompt"],
+            ["/usr/bin/env", "HOME=/tmp", "sudo", "-n",
+             "X=1", "/usr/bin/env", "-S", "codex exec prompt"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_sudo_assignment_preserves_non_agent_cargo(self) -> None:
+        for wrapper in ("sudo", "doas"):
+            with self.subTest(wrapper=wrapper):
+                tasks._require_direct_codex_filesystem_sandbox([
+                    wrapper, "-n", "HOME=/tmp/project-codex",
+                    "cargo", "build", "--manifest-path",
+                    str(self.root / "project-codex" / "Cargo.toml"),
+                ])
+
+    def test_prefix_launchers_preserve_non_agent_cargo_and_build_paths(self) -> None:
+        commands = (
+            ["timeout", "30", "cargo", "build", "--manifest-path",
+             str(self.root / "project-codex" / "Cargo.toml")],
+            ["nice", "-n", "10", "cargo", "build", "--manifest-path",
+             str(self.root / "project-codex" / "Cargo.toml")],
+            ["stdbuf", "-oL", "cargo", "build", "--manifest-path",
+             str(self.root / "project-codex" / "Cargo.toml")],
+            ["nohup", "/bin/bash", str(self.root / "project-codex" / "build.sh")],
+            ["setsid", "/bin/bash", str(self.root / "project-codex" / "build.sh")],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_prefixed_codex_remains_denied(self) -> None:
+        for argv in (
+            ["timeout", "30", "codex", "exec", "prompt"],
+            ["nice", "-n", "10", "codex", "exec", "prompt"],
+            ["stdbuf", "-oL", "codex", "exec", "prompt"],
+            ["nohup", "codex", "exec", "prompt"],
+            ["setsid", "codex", "exec", "prompt"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_shell_control_flow_still_detects_literal_codex(self) -> None:
+        for command in (
+            "while true; do codex exec prompt; done",
+            "if true; then codex exec prompt; fi",
+        ):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/bin/bash", "-c", command]
+                    )
+
+    def test_reviewer_p1_grouped_shell_codex_launches_are_denied(self) -> None:
+        for source in (
+            "{ codex exec prompt; }",
+            "function run(){ codex exec prompt; }; run",
+            "echo ok; { codex exec prompt; }",
+            "if true; then { codex exec prompt; }; fi",
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/bin/bash", "-c", source]
+                    )
+
+    def test_reviewer_p1_shell_command_substitution_is_not_argv_data(self) -> None:
+        for source in (
+            'printf "$(codex exec prompt)"',
+            "echo " + chr(96) + "codex exec prompt" + chr(96),
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/bin/bash", "-c", source]
+                    )
+
+        for source in (
+            'printf "$(printf codex)"',
+            "printf 'codex exec prompt'",
+        ):
+            with self.subTest(source=source):
+                tasks._require_direct_codex_filesystem_sandbox(
+                    ["/bin/bash", "-c", source]
+                )
+
+    def test_reviewer_p1_bash_coprocess_and_ansi_quote_exec_cannot_hide_codex(self) -> None:
+        for source in (
+            "coproc codex exec prompt",
+            "$'codex' exec prompt",
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/bin/bash", "-c", source]
+                    )
+        for source in (
+            "printf $'codex'",
+            "printf 'coproc codex exec'",
+        ):
+            with self.subTest(source=source):
+                tasks._require_direct_codex_filesystem_sandbox(
+                    ["/bin/bash", "-c", source]
+                )
+
+    def test_reviewer_p1_env_optional_signal_flags_cannot_hide_codex(self) -> None:
+        # GNU env --block-signal takes an OPTIONAL attached argument.
+        # The separated form "--block-signal SIGTERM codex" attempts to exec
+        # SIGTERM (exit 127), not codex, so is not an executable bypass.
+        executable = (
+            ["/usr/bin/env", "--block-signal=SIGTERM", "codex", "exec", "prompt"],
+            ["/usr/bin/env", "--default-signal=TERM", "codex", "exec", "prompt"],
+            ["/usr/bin/env", "--ignore-signal=PIPE", "codex", "exec", "prompt"],
+            ["/usr/bin/env", "-S",
+             "--block-signal=TERM codex exec prompt"],
+        )
+        for argv in executable:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        # Signal option values do not by themselves make cargo a Codex launch.
+        for argv in (
+            ["/usr/bin/env", "--block-signal=TERM", "cargo", "build"],
+            ["/usr/bin/env", "--default-signal=TERM", "cargo", "test"],
+        ):
+            with self.subTest(non_agent=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_reviewer_p1_busybox_shell_applets_cannot_hide_codex(self) -> None:
+        for shell in ("ash", "hush"):
+            with self.subTest(shell=shell):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/usr/bin/busybox", shell, "-c", "codex exec prompt"]
+                    )
+
+    def test_reviewer_p1_perl_ruby_option_clusters_cannot_hide_codex(self) -> None:
+        for argv in (
+            ["perl", "-p", "-e", "system('codex exec')"],
+            ["perl", "-pe", "system('codex exec')"],
+            ["ruby", "-p", "-e", "system('codex exec')"],
+            ["ruby", "-pe", "system('codex exec')"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_reviewer_p1_renamed_python_and_loader_are_detected(self) -> None:
+        for name, target, args in (
+            ("alias-python-guard", "/usr/bin/python3.12",
+             ["-c", "import os; os.execvp('codex', ['codex', 'exec'])"]),
+            ("alias-loader-guard", "/lib64/ld-linux-x86-64.so.2",
+             ["/opt/codex", "exec", "prompt"]),
+        ):
+            alias = self.root / name
+            alias.symlink_to(target)
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox([str(alias), *args])
+
+    def test_grouping_non_agent_literal_arguments_are_preserved(self) -> None:
+        for argv in (
+            ["/bin/bash", "-c", "{ printf 'codex exec prompt'; }"],
+            ["/bin/bash", "-c", "function f(){ printf codex; }; f"],
+            ["/usr/bin/busybox", "ash", "-c", "printf 'codex exec prompt'"],
+        ):
+            with self.subTest(argv=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_legitimate_codex_named_paths_are_not_entrypoints(self) -> None:
+        commands = (
+            ["/usr/bin/python3", "-m", "grabowski_agent_writer", "--repository",
+             str(self.root / "project-codex")],
+            ["/bin/bash", str(self.root / "project-codex" / "build.sh")],
+            ["/bin/bash", "-c", "printf hello", "--", str(self.root / "project-codex")],
+            ["sudo", "-n", "/bin/bash", str(self.root / "project-codex" / "build.sh")],
+            ["/usr/bin/time", "-p", "cargo", "build", "--manifest-path",
+             str(self.root / "project-codex" / "Cargo.toml")],
+            ["/usr/bin/env", "-iS", "python -m grabowski_agent_writer"
+             " --repository /tmp/project-codex"],
+            ["/usr/bin/busybox", "sh", "-c", "printf project-codex"],
+            ["/bin/bash", "-c", "printf codex"],
+            ["/bin/bash", "-c", "echo codex"],
+            ["/usr/bin/node", str(self.root / "project-codex" / "build.js"),
+             "--label", "codex"],
+            ["ruby", str(self.root / "project-codex" / "build.rb")],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_env_split_codex_fails_before_dispatch_or_persistence(self) -> None:
+        argv = ["/usr/bin/env", "-iS", "codex exec prompt"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=argv),
+            patch.object(tasks, "_require_recovery_gate",
+                         return_value={"checked_at_unix": 150}),
+            patch.object(tasks, "_dispatch", return_value=fixture._launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                tasks.grabowski_task_start(
+                    "local", argv, cwd=str(self.root), runtime_seconds=60
+                )
+        dispatch.assert_not_called()
+        with tasks._database_connection() as db:
+            count = db.execute("SELECT count(*) FROM tasks").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_computed_shell_agent_entrypoints_require_isolation(self) -> None:
+        # A literal argv scan does not see the actual exec target created
+        # through variables, substitutions, or dynamic Python invocation.
+        for source in (
+            'agent=codex; "$agent" exec prompt',
+            'eval "$(printf co)$(printf dex) exec prompt"',
+            'python -c \'import os; os.execvp("co"+"dex", ["co"+"dex", "exec"])\'',
+        ):
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(
+                        ["/bin/bash", "-c", source]
+                    )
+
+    def test_computed_interpreter_agent_entrypoints_require_isolation(self) -> None:
+        # These are inert source strings. No agent or interpreter is executed.
+        for argv in (
+            ["python3", "-c",
+             "import os; os.execvp('co'+'dex', ['co'+'dex','exec'])"],
+            ["node", "-e",
+             "require('child_process').spawnSync('co'+'dex',['exec'])"],
+            ["ruby", "-e", "system('co'+'dex', 'exec')"],
+            ["perl", "-e", "system('co' . 'dex', 'exec')"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_print_only_interpreter_code_can_mention_codex(self) -> None:
+        # A command name appearing only as printable text is not an exec.
+        for argv in (
+            ["python3", "-c", "print('codex')"],
+            ["node", "-e", "console.log('codex')"],
+            ["ruby", "-e", "puts 'codex'"],
+            ["perl", "-e", "print 'codex'"],
+        ):
+            with self.subTest(argv=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
+    def test_interpolated_print_strings_cannot_hide_computed_codex(self) -> None:
+        # Ruby and Perl evaluate interpolations inside double-quoted strings.
+        # These payloads are only passed as strings to the admission guard.
+        for argv in (
+            ["ruby", "-e", "puts \"#{system('co' + 'dex', 'exec')}\""],
+            ["perl", "-e", "print \"@{[system('co' . 'dex', 'exec')]}\""],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        for argv in (
+            ["ruby", "-e", "puts 'codex'"],
+            ["perl", "-e", "print 'codex'"],
+        ):
+            with self.subTest(harmless=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
+    def test_preload_environment_must_not_bypass_coding_agent_isolation(self) -> None:
+        # All commands here are inert strings inspected only by the admission
+        # guard. None of the preload files exists in the fixture or is run.
+        # Each variable can load executable code before a harmless argv body.
+        commands = (
+            ["env", "BASH_ENV=/tmp/preload.sh",
+             "bash", "-c", "printf safe"],
+            ["env", "PYTHONPATH=/tmp/preload",
+             "python3", "-c", "print('safe')"],
+            ["env", "NODE_OPTIONS=--require=/tmp/preload.js",
+             "node", "-e", "console.log('safe')"],
+            ["env", "RUBYOPT=-r/tmp/preload.rb",
+             "ruby", "-e", "puts 'safe'"],
+            ["env", "PERL5OPT=-MInjected",
+             "perl", "-e", "print 'safe'"],
+        )
+        for argv in commands:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(
+                    RuntimeError, "Codex.*filesystem sandbox"
+                ):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        for argv in (
+            ["env", "CARGO_TARGET_DIR=/tmp/project-codex", "cargo", "test"],
+            ["env", "FOO=bar", "bash", "-c", "printf safe"],
+        ):
+            with self.subTest(allowed=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
+    def test_nested_preload_environment_bypasses_are_rejected(self) -> None:
+        # Test *admission* only; no shell, sudo or interpreter is executed.
+        dangerous = (
+            ["env", "-S", "NODE_OPTIONS=--require=/tmp/preload.js node -e 'console.log(1)'"],
+            ["env", "--", "PYTHONPATH=/tmp/preload", "python3", "-c", "print('safe')"],
+            ["env", "LD_PRELOAD=/tmp/preload.so", "cargo", "test"],
+            ["sudo", "-n", "BASH_ENV=/tmp/preload.sh", "bash", "-c", "printf safe"],
+            ["doas", "RUBYOPT=-r/tmp/preload.rb", "ruby", "-e", "puts 'safe'"],
+            ["bash", "-c", "BASH_ENV=/tmp/preload.sh bash -c 'printf safe'"],
+            ["bash", "-c", "export BASH_ENV=/tmp/preload.sh; bash -c 'printf safe'"],
+            ["bash", "-c", "declare -x NODE_OPTIONS=--require=/tmp/preload.js; node -e 'console.log(1)'"],
+        )
+        for argv in dangerous:
+            with self.subTest(dangerous=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        for argv in (
+            ["sudo", "-n", "FOO=bar", "bash", "-c", "printf safe"],
+            ["bash", "-c", "export FOO=bar; printf safe"],
+        ):
+            with self.subTest(allowed=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
+    def test_interpreter_preload_flags_cannot_run_unverified_code(self) -> None:
+        # Preload modules run *before* a harmless inline body. Inspect only;
+        # never run or create the named payload files in this fixture.
+        dangerous = (
+            ["node", "--require", "/tmp/unsafe.js", "-e", "console.log('safe')"],
+            ["node", "--require=/tmp/unsafe.js", "-e", "console.log('safe')"],
+            ["node", "--import", "/tmp/unsafe.mjs", "-e", "console.log('safe')"],
+            ["node", "--loader=/tmp/unsafe.mjs", "-e", "console.log('safe')"],
+            ["ruby", "-r", "/tmp/unsafe.rb", "-e", "puts 'safe'"],
+            ["perl", "-r", "/tmp/unsafe.pl", "-e", "print 'safe'"],
+        )
+        for argv in dangerous:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        for argv in (
+            ["node", "-e", "console.log('safe')"],
+            ["ruby", "-e", "puts 'safe'"],
+            ["perl", "-e", "print 'safe'"],
+        ):
+            with self.subTest(allowed=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
+    def test_elf_loader_preload_and_library_override_rejected(self) -> None:
+        # Admission-only fixtures: no ELF loader or shared object is executed.
+        # Library search overrides can load arbitrary constructors just like
+        # explicit --preload/--audit, even if the target binary is harmless.
+        dangerous = (
+            ["ld-linux-x86-64.so.2", "--preload", "/tmp/inject.so", "/bin/true"],
+            ["ld-linux-x86-64.so.2", "--preload=/tmp/inject.so", "/bin/true"],
+            ["ld-linux-x86-64.so.2", "--audit", "/tmp/inject.so", "/bin/true"],
+            ["ld-linux-x86-64.so.2", "--audit=/tmp/inject.so", "/bin/true"],
+            ["ld.so", "--library-path", "/tmp/untrusted", "/bin/true"],
+            ["ld.so", "--library-path=/tmp/untrusted", "/bin/true"],
+            ["env", "-i", "ld.so", "--preload", "/tmp/inject.so", "/bin/true"],
+            ["bash", "-c", "ld.so --preload /tmp/inject.so /bin/true"],
+        )
+        for argv in dangerous:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        for argv in (
+            ["ld.so", "--verify", "/bin/true"],
+            ["ld.so", "--list", "/bin/true"],
+            ["env", "FOO=bar", "ld.so", "--verify", "/bin/true"],
+        ):
+            with self.subTest(allowed=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
+    def test_unverified_command_carrier_and_attached_python_source(self) -> None:
+        # Admission-only. No CLI, script, dynamic loader or coding agent starts.
+        dangerous = (
+            ["python3", "-cimport os;os.execvp('co'+'dex', ['co'+'dex','exec'])"],
+            ["python3", "-I", "-cimport os;os.execvp('co'+'dex', ['co'+'dex','exec'])"],
+            ["bash", "--rcfile", "/tmp/user-config.sh", "-ic", "printf safe"],
+            ["bash", "--init-file", "/tmp/user-config.sh", "-ic", "printf safe"],
+            ["systemd-run", "--user", "codex", "exec", "prompt"],
+            ["xargs", "codex", "exec", "prompt"],
+            ["script", "-c", "codex exec prompt", "/dev/null"],
+            ["flock", "/tmp/lock", "codex", "exec", "prompt"],
+            ["watch", "-n", "1", "codex", "exec", "prompt"],
+            ["unshare", "codex", "exec", "prompt"],
+            ["nsenter", "--target", "1", "codex", "exec", "prompt"],
+            ["setpriv", "codex", "exec", "prompt"],
+            ["runuser", "-u", "test", "--", "codex", "exec", "prompt"],
+            ["su", "-c", "codex exec prompt"],
+            ["ionice", "-c", "3", "bash", "-c", "codex exec prompt"],
+            ["taskset", "-c", "0", "codex", "exec", "prompt"],
+            ["chrt", "--fifo", "1", "codex", "exec", "prompt"],
+            ["sudo", "-E", "bash", "-c", "printf safe"],
+            ["doas", "-E", "bash", "-c", "printf safe"],
+        )
+        for argv in dangerous:
+            with self.subTest(argv=argv):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks._require_direct_codex_filesystem_sandbox(argv)
+
+        # Normal literal interpreter output and non-agent command data stay
+        # permissible through this narrow name-based admission guard.
+        for argv in (
+            ["python3", "-cprint('safe')"],
+            ["python3", "-I", "-cprint('safe')"],
+            ["env", "FOO=bar", "cargo", "test"],
+            ["bash", "-c", "printf safe"],
+        ):
+            with self.subTest(allowed=argv):
+                tasks._require_direct_codex_filesystem_sandbox(argv)
+
+
+    def test_busybox_applet_alias_is_checked_at_actual_command_position(self) -> None:
+        # A symlinked BusyBox applet uses argv[0] as the applet selector.
+        # It does NOT expect an explicit argv[1] applet name.
+        alias = self.root / "env"
+        alias.symlink_to("/usr/bin/busybox")
+        argv = [str(alias), "FOO=bar", "codex", "exec", "prompt"]
+        with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+            tasks._require_direct_codex_filesystem_sandbox(argv)
+
+    def test_opaque_launcher_rejected_before_dispatch_or_task_insert(self) -> None:
+        # Synthetic task start only. No command is launched.
+        for argv in (
+            ["systemd-run", "--user", "codex", "exec", "prompt"],
+            ["python3", "-cimport os;os.execvp('co'+'dex',['co'+'dex','exec'])"],
+        ):
+            with (
+                self.subTest(argv=argv),
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(tasks, "_validate_command", return_value=argv),
+                patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 166}),
+                patch.object(tasks, "_dispatch") as dispatch,
+                patch.object(tasks, "_launch") as launch,
+                patch.object(tasks.resources, "acquire_resources") as acquire,
+                patch.object(tasks.base, "_append_audit"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Codex.*filesystem sandbox"):
+                    tasks.grabowski_task_start(
+                        "local", argv, cwd=str(self.root), runtime_seconds=60
+                    )
+                dispatch.assert_not_called()
+                launch.assert_not_called()
+                acquire.assert_not_called()
+                with tasks._database_connection() as connection:
+                    count = connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+                self.assertEqual(count, 0)
+
+
+
+    def test_unknown_or_renamed_executable_must_run_below_os_write_boundary(self) -> None:
+        # Only build argv: never run a renamed executable, interpreter or agent.
+        # Read-only-by-default local tasks may not inherit the host filesystem.
+        for executable in ("/usr/bin/true", "/tmp/renamed-codex", "/tmp/opaque-script"):
+            with (
+                self.subTest(executable=executable),
+                patch.object(
+                    tasks, "_task_output_paths",
+                    return_value={"directory": self.root / "captured"},
+                ),
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(
+                    tasks, "_verified_task_effect_start",
+                    return_value={"effect_profile": "unknown", "agent_executable": None},
+                ),
+            ):
+                captured = tasks._task_output_capture_argv(
+                    {
+                        "task_id": "opaque-test",
+                        "argv_json": json.dumps([executable, "--data"]),
+                        "cwd": str(self.root),
+                        "host": "local",
+                    }
+                )
+                self.assertIn("/usr/bin/bwrap", captured)
+                self.assertIn("--ro-bind", captured)
+                self.assertIn(str(self.root), captured)
+
+    def test_nonagent_resume_identity_is_not_mutable_classification(self) -> None:
+        original = ["/bin/echo", "original"]
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_validate_command", return_value=original),
+            patch.object(tasks, "_dispatch", return_value=fixture._launcher()),
+            patch.object(
+                tasks, "_require_recovery_gate",
+                return_value={"checked_at_unix": 151},
+            ),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            result = tasks.grabowski_task_start(
+                "local", original, cwd=str(self.root), runtime_seconds=60,
+                effect_profile="read_only",
+            )
+        task_id = str(result["task"]["task_id"])
+        injected = ["/bin/echo", "changed"]
+        with tasks._database_connection() as db:
+            db.execute(
+                "UPDATE tasks SET argv_json=?, argv_sha256=? WHERE task_id=?",
+                (
+                    tasks._canonical_json(injected),
+                    tasks.command_identity.argv_sha256(injected),
+                    task_id,
+                ),
+            )
+        with self.assertRaisesRegex(RuntimeError, "original|identity|effect"):
+            tasks._verified_task_effect_start(tasks._row_raw(task_id), command=injected)
+
+
+    def test_write_mount_requires_live_exact_owned_path_lease(self) -> None:
+        # A benign binary may write only where the lease grants a mount.
+        allowed = self.root / "build"
+        allowed.mkdir()
+        command = ["/usr/bin/true"]
+        record = {
+            "task_id": "bounded-write-test",
+            "host": "local",
+            "cwd": str(self.root),
+            "lease_owner_id": "task:bounded-write-test",
+            "runtime_seconds": 60,
+            "argv_json": json.dumps(command),
+        }
+        lease = f"path:{allowed}"
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "workspace_write"},
+            ),
+            patch.object(tasks, "_record_resource_keys", return_value=[lease]),
+            patch.object(
+                tasks.resources, "inspect_resources",
+                return_value={
+                    lease: {
+                        "owner_id": "task:bounded-write-test",
+                        "expires_at_unix": tasks._now() + 600,
+                    }
+                },
+            ),
+        ):
+            sandbox = tasks._task_sandboxed_command_argv(record, command)
+        position = sandbox.index("--bind")
+        self.assertEqual(sandbox[position + 1: position + 3], [str(allowed)] * 2)
+        self.assertIn("--ro-bind", sandbox)
+        self.assertNotIn("--bind", sandbox[position + 3:])
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_verified_task_effect_start",
+                         return_value={"effect_profile": "workspace_write"}),
+            patch.object(tasks, "_record_resource_keys", return_value=[lease]),
+            patch.object(tasks.resources, "inspect_resources", return_value={
+                lease: {
+                    "owner_id": "task:bounded-write-test",
+                    "expires_at_unix": tasks._now() + 30,
+                }
+            }),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "lease lifetime"):
+                tasks._task_sandboxed_command_argv(record, command)
+
+        for live_owner in (None, "foreign:task"):
+            with (
+                self.subTest(owner=live_owner),
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(
+                    tasks, "_verified_task_effect_start",
+                    return_value={"effect_profile": "workspace_write"},
+                ),
+                patch.object(tasks, "_record_resource_keys", return_value=[lease]),
+                patch.object(
+                    tasks.resources, "inspect_resources",
+                    return_value={lease: {"owner_id": live_owner}},
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "foreign path leases"):
+                    tasks._task_sandboxed_command_argv(record, command)
+
+    def test_actual_readonly_bwrap_denies_write_open_without_modifying_contents(self) -> None:
+        # Controlled kernel exercise. The test never writes through the opened FD.
+        import errno
+        import subprocess
+        from pathlib import Path
+
+        sandbox = tasks.agent_sandbox
+        try:
+            sandbox.require_bwrap()
+        except sandbox.AgentSandboxError:
+            self.skipTest("bubblewrap not installed on this test host")
+        target = Path(self.root) / "readonly-probe.txt"
+        target.write_text("unchanged", encoding="utf-8")
+        code = (
+            "import errno,os,sys\n"
+            "try:\n"
+            " fd=os.open(sys.argv[1],os.O_WRONLY);os.close(fd);sys.exit(27)\n"
+            "except OSError as exc:\n"
+            " print(exc.errno);sys.exit(0 if exc.errno==errno.EROFS else 26)\n"
+        )
+        argv = sandbox.runtime_sandbox_argv(
+            sandbox.minimal_sandbox_argv(
+                workspace=Path(self.root),
+                command=["/usr/bin/python3", "-c", code, str(target)],
+                workspace_writable=False,
+            )
+        )
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=20, check=False,
+        )
+        if completed.returncode != 0 and "No permissions to create" in completed.stderr:
+            self.skipTest("kernel does not permit namespaces in this runner")
+        self.assertEqual(
+            completed.returncode, 0,
+            f"missing EROFS: rc={completed.returncode} stdout={completed.stdout} stderr={completed.stderr}",
+        )
+        self.assertEqual(completed.stdout.strip(), str(errno.EROFS))
+        self.assertEqual(target.read_text(encoding="utf-8"), "unchanged")
+
+
+    def test_local_runtime_executable_gets_exact_read_only_venv_mount(self) -> None:
+        venv_root = self.root / "private-runtime"
+        runtime = venv_root / "bin" / "python"
+        runtime.parent.mkdir(parents=True)
+        runtime.write_text("test interpreter placeholder", encoding="utf-8")
+        command = [str(runtime), "-I", "-c", "pass"]
+        record = {"task_id": "venv-check", "host": "local", "cwd": str(self.root)}
+        with (
+            patch.object(tasks, "GRABOWSKI_RUNTIME_PYTHON", runtime),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            sandbox = tasks._task_sandboxed_command_argv(record, command)
+        mounts = [sandbox[i:i + 3] for i in range(len(sandbox) - 2)]
+        self.assertIn(["--ro-bind", str(venv_root), str(venv_root)], mounts)
+        self.assertNotIn(["--bind", str(venv_root), str(venv_root)], mounts)
+        self.assertIn("--clearenv", sandbox)
+
+    def test_linked_git_common_dir_requires_two_way_bounded_backlinks(self) -> None:
+        home = self.root / "test-home"
+        common = home / "repos" / "owned" / ".git"
+        gitdir = common / "worktrees" / "fixture"
+        gitdir.mkdir(parents=True)
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        marker = workspace / ".git"
+        marker.write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+        (gitdir / "gitdir").write_text(f"{marker}\n", encoding="utf-8")
+        (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+        command = ["/usr/bin/true"]
+        record = {"task_id": "linked-check", "host": "local", "cwd": str(workspace)}
+        with (
+            patch.object(tasks.operator, "HOME", home),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "read_only"},
+            ),
+        ):
+            self.assertEqual(tasks._task_linked_git_common_dir(workspace), common)
+            argv = tasks._task_sandboxed_command_argv(record, command)
+            mounts = [argv[i:i + 3] for i in range(len(argv) - 2)]
+            self.assertIn(["--ro-bind", str(common), str(common)], mounts)
+            self.assertNotIn(["--bind", str(common), str(common)], mounts)
+            (gitdir / "gitdir").write_text(
+                str(self.root / "foreign" / ".git") + "\n", encoding="utf-8",
+            )
+            self.assertIsNone(tasks._task_linked_git_common_dir(workspace))
+            rejected = tasks._task_sandboxed_command_argv(record, command)
+            denied_mounts = [rejected[i:i + 3] for i in range(len(rejected) - 2)]
+            self.assertNotIn(["--ro-bind", str(common), str(common)], denied_mounts)
+            (gitdir / "gitdir").write_text(f"{marker}\n", encoding="utf-8")
+            honest_marker = workspace / "real-git-marker"
+            honest_marker.write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+            marker.unlink()
+            marker.symlink_to(honest_marker)
+            self.assertIsNone(tasks._task_linked_git_common_dir(workspace))
+            marker.unlink()
+            marker.write_text("gitdir: " + "x" * 4097, encoding="utf-8")
+            self.assertIsNone(tasks._task_linked_git_common_dir(workspace))
+            # Git backlink inspection must never block when .git is swapped for a FIFO.
+            import os
+            import subprocess
+            import sys
+            from pathlib import Path
+
+            marker.unlink()
+            os.mkfifo(marker)
+            helper_probe = (
+                "import sys\n"
+                "from pathlib import Path\n"
+                "sys.dont_write_bytecode = True\n"
+                f"sys.path.insert(0, {str(Path(tasks.__file__).resolve().parent)!r})\n"
+                "import grabowski_tasks as tasks\n"
+                "print(tasks._task_linked_git_common_dir(Path(sys.argv[1])))\n"
+            )
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", helper_probe, str(workspace)],
+                capture_output=True, text=True, check=False, timeout=3,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "None")
+
+
+    def test_nested_framework_writer_needs_a_scoped_outer_writable_mount(self) -> None:
+        """Exercise a real writer process, not only its assembled bwrap argv.
+
+        This fixture synthesizes task lease truth only for command construction.
+        It does not establish admission authority for a production task.
+        """
+        import subprocess
+        from pathlib import Path
+
+        try:
+            tasks.agent_sandbox.require_bwrap()
+        except tasks.agent_sandbox.AgentSandboxError:
+            self.skipTest("target-host bubblewrap is unavailable")
+        runtime = Path(tasks.GRABOWSKI_RUNTIME_PYTHON)
+        if not runtime.is_file():
+            self.skipTest("Grabowski runtime Python is unavailable on this host")
+
+        repo = self.root / "writer-kernel-e2e"
+        repo.mkdir()
+        allowed = repo / "allowed"
+        allowed.mkdir()
+
+        def git(*arguments: str) -> str:
+            result = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), *arguments],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+        git("init", "-b", "topic")
+        protected = repo / "protected.txt"
+        protected.write_text("immutable baseline", encoding="utf-8")
+        git("add", "--", "protected.txt")
+        git(
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "user.name=Sandbox Test",
+            "-c", "user.email=sandbox-test@localhost",
+            "commit", "-m", "scratch",
+        )
+        head = git("rev-parse", "HEAD")
+        output = allowed / "writer-receipt.json"
+        created = allowed / "created.txt"
+        inner_code = (
+            "import errno,os,sys\n"
+            "try:\n"
+            " fd=os.open(sys.argv[1],os.O_WRONLY);os.close(fd);raise RuntimeError('outside writable')\n"
+            "except OSError as exc:\n"
+            " assert exc.errno==errno.EROFS,exc\n"
+            "with open(sys.argv[2],'w',encoding='utf-8') as f:f.write('bounded effect')\n"
+        )
+        writer = [
+            str(runtime), "-m", "grabowski_agent_writer",
+            "--repository", str(repo),
+            "--expected-base-head", head,
+            "--expected-branch", "topic",
+            "--allowed-path", "allowed",
+            "--output", str(output),
+            "--", "/usr/bin/python3", "-I", "-c", inner_code,
+            str(protected), str(created),
+        ]
+        record = {
+            "task_id": "sandbox-writer-test",
+            "host": "local",
+            "cwd": str(repo),
+            "lease_owner_id": "task:sandbox-writer-test",
+            "runtime_seconds": 60,
+        }
+        local = {"transport": "local", "target": "local"}
+
+        # Unknown effects never gain write rights from a module name.
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=local),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            read_only = tasks._task_sandboxed_command_argv(record, writer)
+        blocked = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(read_only),
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        if "No permissions to create" in blocked.stderr:
+            self.skipTest("target-host kernel disallows user namespaces")
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("Read-only file system", blocked.stderr)
+        self.assertFalse(output.exists())
+        self.assertEqual(git("status", "--porcelain"), "")
+
+        # A synthetic exact live path lease permits the real nested writer
+        # and its create-only receipt, without exposing sibling paths.
+        lease = f"path:{allowed}"
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=local),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "workspace_write"},
+            ),
+            patch.object(tasks, "_record_resource_keys", return_value=[lease]),
+            patch.object(
+                tasks.resources, "inspect_resources",
+                return_value={
+                    lease: {
+                        "owner_id": "task:sandbox-writer-test",
+                        "expires_at_unix": tasks._now() + 600,
+                    },
+                },
+            ),
+        ):
+            confined_writer = tasks._task_sandboxed_command_argv(record, writer)
+        completed = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(confined_writer),
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(output.is_file())
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(payload.get("role"), "writer")
+        self.assertEqual(payload.get("returncode"), 0)
+        self.assertEqual(payload.get("head_before"), payload.get("head_after"))
+        self.assertEqual(payload.get("head_before"), head)
+        self.assertEqual(protected.read_text(encoding="utf-8"), "immutable baseline")
+        self.assertEqual(created.read_text(encoding="utf-8"), "bounded effect")
+        after = git("status", "--porcelain", "--untracked-files=all")
+        self.assertIn("allowed/created.txt", after)
+        self.assertNotIn("protected.txt", after)
+
+
+    def test_framework_role_receipt_requires_exact_outer_output_mount(self) -> None:
+        """A read-only role still needs an independently authorized receipt sink.
+
+        The narrow output lease below is synthetic and does not stand in for
+        production task admission or the workspace lifecycle authority.
+        """
+        import subprocess
+        from pathlib import Path
+        import grabowski_agent_role as agent_role
+
+        try:
+            tasks.agent_sandbox.require_bwrap()
+        except tasks.agent_sandbox.AgentSandboxError:
+            self.skipTest("target-host bubblewrap is unavailable")
+        runtime = Path(tasks.GRABOWSKI_RUNTIME_PYTHON)
+        if not runtime.is_file():
+            self.skipTest("Grabowski runtime Python is unavailable on this host")
+
+        repo = self.root / "role-kernel-e2e"
+        repo.mkdir()
+        output_root = repo / "output"
+        output_root.mkdir(mode=0o700)
+
+        def git(*arguments: str) -> str:
+            result = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), *arguments],
+                capture_output=True, text=True, timeout=20, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.strip()
+
+        git("init", "-b", "topic")
+        git(
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "user.name=Sandbox Test",
+            "-c", "user.email=sandbox-test@localhost",
+            "commit", "--allow-empty", "-m", "scratch",
+        )
+        head = git("rev-parse", "HEAD")
+        bound_head, diff_digest, dirty = agent_role.current_binding(repo, head)
+        self.assertEqual(bound_head, head)
+        self.assertFalse(dirty)
+
+        output = output_root / "role-receipt.json"
+        command = [
+            str(runtime), "-m", "grabowski_agent_role",
+            "--role", "tests",
+            "--repository", str(repo),
+            "--expected-head", head,
+            "--expected-base-head", head,
+            "--expected-diff-sha256", diff_digest,
+            "--expected-dirty", "false",
+            "--output", str(output),
+            "--", "/usr/bin/true",
+        ]
+        record = {
+            "task_id": "sandbox-role-test",
+            "host": "local",
+            "cwd": str(repo),
+            "lease_owner_id": "task:sandbox-role-test",
+            "runtime_seconds": 60,
+        }
+        local = {"transport": "local", "target": "local"}
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=local),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            read_only = tasks._task_sandboxed_command_argv(record, command)
+        blocked = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(read_only),
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        if "No permissions to create" in blocked.stderr:
+            self.skipTest("target-host kernel disallows user namespaces")
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("Read-only file system", blocked.stderr)
+        self.assertFalse(output.exists())
+
+        receipt_lease = f"path:{output_root}"
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=local),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "workspace_write"},
+            ),
+            patch.object(
+                tasks, "_record_resource_keys", return_value=[receipt_lease],
+            ),
+            patch.object(
+                tasks.resources, "inspect_resources",
+                return_value={
+                    receipt_lease: {
+                        "owner_id": "task:sandbox-role-test",
+                        "expires_at_unix": tasks._now() + 600,
+                    },
+                },
+            ),
+        ):
+            allowed = tasks._task_sandboxed_command_argv(record, command)
+        result = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(allowed),
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(output.is_file())
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(payload.get("role"), "tests")
+        self.assertEqual(payload.get("returncode"), 0)
+        self.assertEqual(payload.get("head_before"), head)
+        self.assertEqual(payload.get("head_after"), head)
+
+
+    def test_opaque_executor_module_needs_verified_origin(self) -> None:
+        """A Python module name cannot itself exempt a local child from bwrap.
+
+        The synthetic classification models an unrecognized task. This test
+        does not pretend to establish the reserved executor's server authority.
+        """
+        command = [
+            "/usr/bin/python3",
+            "-m",
+            "grabowski_bureau_runtime_refresh_executor",
+            "--not-an-authorized-intent",
+        ]
+        record = {
+            "task_id": "untrusted-executor-module",
+            "host": "local",
+            "cwd": str(self.root),
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            try:
+                result = tasks._task_sandboxed_command_argv(record, command)
+            except (RuntimeError, PermissionError):
+                return  # Fail-closed denial is also safe.
+        self.assertNotEqual(result, command, "module name alone bypassed bwrap")
+        self.assertIn("--ro-bind", result)
+
+    def test_opaque_default_operator_home_is_not_mounted_as_readable_workspace(
+        self,
+    ) -> None:
+        """Default cwd may not disclose an entire operator home to a child."""
+        from pathlib import Path
+
+        home = self.root / "operator-home"
+        home.mkdir(mode=0o700)
+        (home / ".private-fixture").write_text("never expose", encoding="utf-8")
+        record = {"task_id": "opaque-home", "host": "local", "cwd": str(home)}
+        with (
+            patch.object(tasks.operator, "HOME", home),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            sandbox = tasks._task_sandboxed_command_argv(record, ["/usr/bin/true"])
+        mounted = [sandbox[i : i + 3] for i in range(len(sandbox) - 2)]
+        self.assertFalse(
+            ["--ro-bind", str(home), str(home)] in mounted,
+            "read-only is not confidential: operator home was disclosed",
+        )
+
+
+    def test_opaque_parent_cwd_cannot_expose_entire_operator_home(self) -> None:
+        """Actual kernel probe for workspace ancestor mounts, including root.
+
+        A caller-selected parent directory must not be able to expose HOME as
+        part of a larger read-only workspace. Synthetic secrets only.
+        """
+        import subprocess
+        from pathlib import Path
+
+        tasks.agent_sandbox.require_bwrap()
+        home = self.root / "private-operator-home-below-cwd"
+        home.mkdir(mode=0o700)
+        secret = home / "private.txt"
+        secret.write_text("owned-test-secret", encoding="utf-8")
+        code = (
+            "from pathlib import Path\n"
+            "import sys\n"
+            "secret=Path(sys.argv[1])\n"
+            "print('LEAKED' if secret.is_file() and "
+            "secret.read_text(encoding='utf-8')=='owned-test-secret' else 'HIDDEN')\n"
+        )
+        record = {
+            "task_id": "opaque-home-parent",
+            "host": "local", "cwd": str(self.root),
+        }
+        with (
+            patch.object(tasks.operator, "HOME", home),
+            patch.object(Path, "home", return_value=home),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            try:
+                candidate = tasks._task_sandboxed_command_argv(
+                    record, ["/usr/bin/python3", "-I", "-c", code, str(secret)],
+                )
+            except tasks.agent_sandbox.AgentSandboxError as exc:
+                self.assertIn("private operator home", str(exc))
+            else:
+                observed = subprocess.run(
+                    tasks.agent_sandbox.runtime_sandbox_argv(candidate),
+                    capture_output=True, text=True, check=False, timeout=20,
+                )
+                self.assertEqual(observed.returncode, 0, observed.stderr)
+                self.assertEqual(observed.stdout.strip(), "HIDDEN")
+
+        # Do not bind the real host root in a test. Its policy denial must be
+        # verified before kernel execution, using only a synthetic home.
+        with patch.object(Path, "home", return_value=home):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "private operator home",
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(
+                    workspace=Path("/"),
+                    command=["/usr/bin/true"], workspace_writable=False,
+                )
+
+
+    def test_opaque_task_cwd_must_not_reveal_private_home_subdirectory(self) -> None:
+        """Kernel check: a different cwd is not authority to read operator secrets.
+
+        The fixture changes only self-owned temporary files. Fail-closed
+        rejection and an isolated mount with no private source are both safe.
+        """
+        import subprocess
+        from pathlib import Path
+
+        tasks.agent_sandbox.require_bwrap()
+        home = self.root / "operator-home-private"
+        home.mkdir(mode=0o700)
+        private_dirs = (
+            home / ".ssh",
+            home / ".config" / "grabowski",
+            home / ".local" / "state" / "grabowski",
+        )
+        command_code = (
+            "from pathlib import Path\n"
+            "import sys\n"
+            "private=Path(sys.argv[1])\n"
+            "print('LEAKED' if private.is_file() and "
+            "private.read_text(encoding='utf-8')=='fixture-only' else 'HIDDEN')\n"
+        )
+        for private in private_dirs:
+            private.mkdir(parents=True, mode=0o700)
+            secret = private / "secret.txt"
+            secret.write_text("fixture-only", encoding="utf-8")
+            record = {
+                "task_id": "opaque-private-cwd",
+                "host": "local", "cwd": str(private),
+            }
+            with (
+                self.subTest(private=str(private)),
+                patch.object(tasks.operator, "HOME", home),
+                patch.object(Path, "home", return_value=home),
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(
+                    tasks, "_verified_task_effect_start",
+                    return_value={"effect_profile": "unknown"},
+                ),
+            ):
+                try:
+                    candidate = tasks._task_sandboxed_command_argv(
+                        record, ["/usr/bin/python3", "-I", "-c", command_code, str(secret)],
+                    )
+                except tasks.agent_sandbox.AgentSandboxError as exc:
+                    self.assertIn("private operator home", str(exc))
+                else:
+                    observed = subprocess.run(
+                        tasks.agent_sandbox.runtime_sandbox_argv(candidate),
+                        capture_output=True, text=True, check=False, timeout=20,
+                    )
+                    self.assertEqual(observed.returncode, 0, observed.stderr)
+                    self.assertEqual(observed.stdout.strip(), "HIDDEN")
+
+        # The repository collection root is not itself a bounded checkout;
+        # an exact checkout below it remains visible and read-only.
+        repositories = home / "repos"
+        checkout = repositories / "scoped-checkout"
+        checkout.mkdir(parents=True, mode=0o700)
+        with (
+            patch.object(tasks.operator, "HOME", home),
+            patch.object(Path, "home", return_value=home),
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks, "_verified_task_effect_start",
+                return_value={"effect_profile": "unknown"},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "private operator home",
+            ):
+                tasks._task_sandboxed_command_argv(
+                    {"task_id": "opaque-repos-root", "host": "local", "cwd": str(repositories)},
+                    ["/usr/bin/true"],
+                )
+            bounded = tasks._task_sandboxed_command_argv(
+                {"task_id": "opaque-checkout", "host": "local", "cwd": str(checkout)},
+                ["/usr/bin/true"],
+            )
+        mounts = [bounded[i:i + 3] for i in range(len(bounded) - 2)]
+        self.assertIn(["--ro-bind", str(checkout), str(checkout)], mounts)
+
+
+    def test_external_role_receipt_is_an_isolated_kernel_mount(self) -> None:
+        """A real read-only role can atomically publish only into a fresh
+        private output sink outside its read-only Git checkout.
+
+        This proves the kernel boundary, not server task-admission authority.
+        """
+        import subprocess
+        import sys
+        from pathlib import Path
+        import grabowski_agent_role as agent_role
+
+        tasks.agent_sandbox.require_bwrap()
+        # make test isolates HOME; the real selected Python runtime is not below it.
+        runtime = Path(sys.executable)
+        self.assertTrue(runtime.is_file(), "selected test runtime missing from target host")
+
+        repo = self.root / "isolated-role-source"
+        repo.mkdir()
+        protected_repo_file = repo / "protected.txt"
+        protected_repo_file.write_text("repository is immutable", encoding="utf-8")
+
+        def git(*args: str) -> str:
+            completed = subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), *args],
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return completed.stdout.strip()
+
+        git("init", "-b", "role-fixture")
+        git("add", "--", "protected.txt")
+        git(
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "user.name=Fixture",
+            "-c", "user.email=fixture@localhost",
+            "commit", "-m", "baseline",
+        )
+        head = git("rev-parse", "HEAD")
+        bound_head, diff_sha256, dirty = agent_role.current_binding(repo, head)
+        self.assertEqual(bound_head, head)
+        self.assertFalse(dirty)
+
+        state_root = self.root / "private-role-state"
+        state_root.mkdir(mode=0o700)
+        protected_state_file = state_root / "manifest.json"
+        protected_state_file.write_text("controller only", encoding="utf-8")
+        receipt_dir = state_root / "one-attempt"
+        receipt_dir.mkdir(mode=0o700)
+        external_receipt = receipt_dir / "receipt.json"
+        sandbox_receipt = Path("/tmp/grabowski-scoped-role-receipt/receipt.json")
+        # Real isolated role execution cannot depend on the host's mutable
+        # PYTHONPATH or an editable package installation. CI uses a pinned
+        # checkout, so bind only its verified source directory read-only.
+        role_source = Path(agent_role.__file__).resolve(strict=True).parent
+        role_mount = Path("/opt/grabowski-test-role-code")
+        command = [
+            str(runtime), str(role_mount / "grabowski_agent_role.py"),
+            "--role", "tests", "--repository", str(repo),
+            "--expected-head", head,
+            "--expected-base-head", head,
+            "--expected-diff-sha256", diff_sha256,
+            "--expected-dirty", "false",
+            "--output", str(sandbox_receipt),
+            "--", "/usr/bin/true",
+        ]
+        runtime_root = runtime.parent.parent
+        parents = sorted(
+            (parent for parent in runtime_root.parents if parent != Path("/")),
+            key=lambda item: (len(item.parts), str(item)),
+        )
+        kwargs = {
+            "workspace": repo,
+            "command": command,
+            "workspace_writable": False,
+            "extra_read_only": (
+                (runtime_root, runtime_root),
+                (role_source, role_mount),
+            ),
+            "extra_directories": tuple(parents) + (role_mount.parent,),
+        }
+        # The production writer checkout is outside HOME=/tmp, but this
+        # disposable test repository resides beneath /tmp. Give the synthetic
+        # outer role an equally private, disjoint HOME so the inner sandbox
+        # still enforces the actual worktree/receipt kernel boundaries.
+        # This is test-only environment modeling, never a runtime exemption.
+        def fixture_home(argv: list[str]) -> list[str]:
+            separator = argv.index("--")
+            return [
+                *argv[:separator],
+                "--setenv", "HOME", "/tmp/grabowski-fixture-home",
+                *argv[separator:],
+            ]
+
+        # A role may write into its private /tmp, but without a host bind the
+        # result disappears with the namespace: this is not a valid receipt.
+        no_host_receipt = fixture_home(
+            tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
+        )
+        ephemeral = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(no_host_receipt),
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        # A generic read-only task may not act as an implicit trusted role:
+        # the inner wrapper sees the outer RO checkout as a mount boundary.
+        self.assertNotEqual(ephemeral.returncode, 0, ephemeral.stderr)
+        self.assertIn("mount boundary", ephemeral.stderr)
+        self.assertFalse(external_receipt.exists())
+
+        bounded = tasks.agent_sandbox.minimal_sandbox_argv(
+            **kwargs,
+            extra_read_write_directories=((
+                receipt_dir, sandbox_receipt.parent,
+            ),),
+        )
+        self.assertIn(
+            ["--bind", str(receipt_dir), str(sandbox_receipt.parent)],
+            [bounded[index:index + 3] for index in range(len(bounded) - 2)],
+        )
+        completed = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(fixture_home(bounded)),
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("mount boundary", completed.stderr)
+        self.assertFalse(external_receipt.exists())
+
+        # Separately, the exact trusted wrapper can apply its own inner
+        # immutable checkout sandbox, then atomically emit an authorized
+        # private host receipt. This does NOT provide task-start permission:
+        # a server-side intent/lease must still authorize such a route.
+        trusted = [
+            str(runtime), str(role_source / "grabowski_agent_role.py"),
+            *command[2:],
+        ]
+        trusted[trusted.index("--output") + 1] = str(external_receipt)
+        inner = subprocess.run(
+            trusted,
+            capture_output=True, text=True, timeout=40, check=False,
+        )
+        self.assertEqual(inner.returncode, 0, inner.stderr)
+        self.assertTrue(external_receipt.is_file())
+        payload = json.loads(external_receipt.read_text(encoding="utf-8"))
+        self.assertEqual(payload["role"], "tests")
+        self.assertEqual(payload["returncode"], 0)
+        self.assertEqual(payload["head_before"], head)
+        self.assertEqual(payload["head_after"], head)
+        self.assertEqual(git("status", "--porcelain"), "")
+        self.assertEqual(
+            protected_repo_file.read_text(encoding="utf-8"),
+            "repository is immutable",
+        )
+        self.assertEqual(
+            protected_state_file.read_text(encoding="utf-8"),
+            "controller only",
+        )
+        # A reused attempt directory must never silently be bound for another
+        # role after its receipt has been written.
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "empty|fresh",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=((
+                    receipt_dir, sandbox_receipt.parent,
+                ),),
+            )
+
+
+    def test_external_receipt_directory_rejects_kernel_mount_alias(self) -> None:
+        """A private-looking receipt dir may be a bind alias to other host state.
+
+        The mount-root and nested-mount probes are synthetic; the following
+        Linux test checks the actual kernel mountinfo representation.
+        """
+        from pathlib import Path
+
+        workspace = self.root / "receipt-mount-alias-source"
+        workspace.mkdir()
+        receipt = self.root / "receipt-mount-alias-sink"
+        receipt.mkdir(mode=0o700)
+        args = {
+            "workspace": workspace,
+            "command": ["/usr/bin/true"],
+            "workspace_writable": False,
+            "extra_read_write_directories": (
+                (receipt, Path("/tmp/grabowski-scoped-receipt")),
+            ),
+        }
+        for mounted in (receipt, receipt / "nested-mount"):
+            with self.subTest(mounted=str(mounted)), patch.object(
+                tasks.agent_sandbox, "_kernel_mount_points",
+                return_value=frozenset({mounted}),
+            ):
+                with self.assertRaisesRegex(
+                    tasks.agent_sandbox.AgentSandboxError, "mount boundary",
+                ):
+                    tasks.agent_sandbox.minimal_sandbox_argv(**args)
+
+        # Even read-only host sources may conceal a foreign mount alias;
+        # missing mountinfo must now deny all visible host source mounts.
+        with patch.object(
+            tasks.agent_sandbox, "_kernel_mount_points",
+            side_effect=tasks.agent_sandbox.AgentSandboxError("mountinfo unavailable"),
+        ):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "mountinfo unavailable",
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(
+                    workspace=workspace, command=["/usr/bin/true"],
+                    workspace_writable=False,
+                )
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "mountinfo unavailable",
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(**args)
+
+    def test_read_only_workspace_must_not_expose_live_host_unix_socket(self) -> None:
+        """A ro-bind does not itself grant safe read-only IPC semantics."""
+        import socket
+        import subprocess
+
+        tasks.agent_sandbox.require_bwrap()
+        workspace = self.root / "synthetic-local-socket-workspace"
+        workspace.mkdir()
+        endpoint = workspace / "private-control.sock"
+        program = (
+            "import socket,sys\n"
+            "sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n"
+            "try:\n"
+            " sock.connect(sys.argv[1])\n"
+            " sock.sendall(b'SYNTHETIC-ONLY')\n"
+            " print('CONNECTED')\n"
+            "except OSError:\n"
+            " print('BLOCKED')\n"
+            "finally:\n"
+            " sock.close()\n"
+        )
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(str(endpoint))
+            listener.listen(1)
+            try:
+                argv = tasks.agent_sandbox.minimal_sandbox_argv(
+                    workspace=workspace,
+                    command=["/usr/bin/python3", "-I", "-c", program, str(endpoint)],
+                    workspace_writable=False,
+                )
+            except tasks.agent_sandbox.AgentSandboxError as exc:
+                self.assertIn("IPC", str(exc))
+                return
+            result = subprocess.run(
+                tasks.agent_sandbox.runtime_sandbox_argv(argv),
+                capture_output=True, text=True, check=False, timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if result.stdout.strip() == "CONNECTED":
+                listener.settimeout(2)
+                with listener.accept()[0] as client:
+                    self.assertEqual(client.recv(64), b"SYNTHETIC-ONLY")
+            self.assertEqual(result.stdout.strip(), "BLOCKED")
+
+
+    def test_read_only_dependencies_must_not_expose_host_ipc(self) -> None:
+        """Git metadata and extra read-only directories are also host mounts."""
+        import os
+        from pathlib import Path
+
+        workspace = self.root / "ipc-dependency-workspace"
+        workspace.mkdir()
+        common = self.root / "synthetic-git-common"
+        common.mkdir()
+        auxiliary = self.root / "synthetic-readonly-runtime"
+        auxiliary.mkdir()
+        for directory, option in (
+            (common, {"git_common_dir": common}),
+            (auxiliary, {"extra_read_only": ((auxiliary, auxiliary),)}),
+        ):
+            with self.subTest(source=str(directory)):
+                endpoint = directory / "hidden-control.fifo"
+                os.mkfifo(endpoint, mode=0o600)
+                with self.assertRaisesRegex(
+                    tasks.agent_sandbox.AgentSandboxError, "IPC",
+                ):
+                    tasks.agent_sandbox.minimal_sandbox_argv(
+                        workspace=workspace,
+                        command=["/usr/bin/true"], workspace_writable=False,
+                        **option,
+                    )
+                endpoint.unlink()
+
+        nested = workspace / "nested"
+        nested.mkdir()
+        os.mkfifo(nested / "hidden-control.fifo", mode=0o600)
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "IPC",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=workspace,
+                command=["/usr/bin/true"], workspace_writable=False,
+            )
+
+
+    def test_read_only_mount_sources_reject_same_device_kernel_aliases(self) -> None:
+        """Read-only does not mean confidential when a host bind replaces a source."""
+        from pathlib import Path
+
+        workspace = self.root / "ro-alias-workspace"
+        workspace.mkdir()
+        nested = workspace / "foreign-mount"
+        nested.mkdir()
+        common = self.root / "ro-git-common"
+        common.mkdir()
+        auxiliary = self.root / "ro-external-library"
+        auxiliary.mkdir()
+        for source_root, mounted, options in (
+            (workspace, workspace, {}),
+            (workspace, nested, {}),
+            (common, common, {"git_common_dir": common}),
+            (
+                auxiliary, auxiliary,
+                {"extra_read_only": ((auxiliary, auxiliary),)},
+            ),
+        ):
+            with self.subTest(mounted=str(mounted)), patch.object(
+                tasks.agent_sandbox, "_kernel_mount_points",
+                return_value=frozenset({mounted}),
+            ):
+                with self.assertRaisesRegex(
+                    tasks.agent_sandbox.AgentSandboxError, "mount boundary",
+                ):
+                    tasks.agent_sandbox.minimal_sandbox_argv(
+                        workspace=workspace,
+                        command=["/usr/bin/true"],
+                        workspace_writable=False,
+                        **options,
+                    )
+
+    def test_real_kernel_read_only_nested_bind_alias_is_rejected(self) -> None:
+        """Reject a nested same-device foreign mount in a ro-bound cwd."""
+        import subprocess
+        from pathlib import Path
+
+        tasks.agent_sandbox.require_bwrap()
+        workspace = self.root / "ro-nested-alias"
+        workspace.mkdir()
+        nested = workspace / "foreign-state"
+        nested.mkdir()
+        outside = self.root / "foreign-secret-state"
+        outside.mkdir()
+        (outside / "private.txt").write_text(
+            "read-only is not confidential", encoding="utf-8"
+        )
+        self.assertEqual(workspace.stat().st_dev, outside.stat().st_dev)
+        module = Path(tasks.agent_sandbox.__file__).resolve(strict=True)
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.dont_write_bytecode = True\n"
+            "sys.path.insert(0, '/opt')\n"
+            "import grabowski_agent_sandbox as sandbox\n"
+            "try:\n"
+            " sandbox.minimal_sandbox_argv(\n"
+            "  workspace=Path('/mnt/ro-nested-alias'),\n"
+            "  command=['/usr/bin/true'], workspace_writable=False,\n"
+            " )\n"
+            "except sandbox.AgentSandboxError as exc:\n"
+            " print('REJECTED:' + str(exc))\n"
+            "else:\n"
+            " print('ACCEPTED')\n"
+        )
+        outer = [
+            str(tasks.agent_sandbox.require_bwrap()),
+            "--die-with-parent", "--new-session", "--unshare-pid",
+            "--unshare-ipc", "--unshare-uts", "--cap-drop", "ALL",
+            "--ro-bind", "/usr", "/usr",
+            "--symlink", "usr/bin", "/bin",
+            "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib64", "/lib64",
+            "--proc", "/proc", "--dev", "/dev",
+            "--ro-bind", str(self.root), "/mnt",
+            "--bind", str(outside), "/mnt/ro-nested-alias/foreign-state",
+            "--ro-bind", str(module), "/opt/grabowski_agent_sandbox.py",
+            "--", "/usr/bin/python3", "-I", "-c", script,
+        ]
+        checked = subprocess.run(
+            outer, capture_output=True, text=True, check=False, timeout=40,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertIn("mount boundary", checked.stdout)
+        self.assertNotIn("ACCEPTED", checked.stdout)
+
+
+    def test_read_only_ipc_scan_budget_fails_closed(self) -> None:
+        """A huge caller-selected tree cannot bypass bounded prelaunch checks."""
+        workspace = self.root / "readonly-budget"
+        workspace.mkdir()
+        (workspace / "regular.txt").write_text("safe", encoding="utf-8")
+        with patch.object(tasks.agent_sandbox, "MAX_READ_ONLY_SCOPE_ENTRIES", 0):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "entry budget",
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(
+                    workspace=workspace,
+                    command=["/usr/bin/true"], workspace_writable=False,
+                )
+
+
+    def test_real_kernel_same_device_receipt_mount_alias_denied(self) -> None:
+        """Reject a host receipt sink that is a same-device bind-mount alias."""
+        import subprocess
+        from pathlib import Path
+
+        tasks.agent_sandbox.require_bwrap()
+        workspace = self.root / "receipt-kernel-source"
+        workspace.mkdir()
+        receipt = self.root / "receipt-kernel-sink"
+        receipt.mkdir(mode=0o700)
+        outside = self.root / "other-private-empty"
+        outside.mkdir(mode=0o700)
+        self.assertEqual(receipt.stat().st_dev, outside.stat().st_dev)
+        sandbox_file = Path(tasks.agent_sandbox.__file__).resolve(strict=True)
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.dont_write_bytecode = True\n"
+            "sys.path.insert(0, '/opt')\n"
+            "import grabowski_agent_sandbox as sandbox\n"
+            "try:\n"
+            " sandbox.minimal_sandbox_argv(\n"
+            "  workspace=Path('/mnt/receipt-kernel-source'),\n"
+            "  command=['/usr/bin/true'], workspace_writable=False,\n"
+            "  extra_read_write_directories=[(\n"
+            "   Path('/mnt/receipt-kernel-sink'),\n"
+            "   Path('/tmp/grabowski-scoped-receipt'))],\n"
+            " )\n"
+            "except sandbox.AgentSandboxError as exc:\n"
+            " print('REJECTED:' + str(exc))\n"
+            "else:\n"
+            " print('ACCEPTED')\n"
+        )
+        outer = [
+            str(tasks.agent_sandbox.require_bwrap()),
+            "--die-with-parent", "--new-session",
+            "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            "--cap-drop", "ALL",
+            "--ro-bind", "/usr", "/usr",
+            "--symlink", "usr/bin", "/bin",
+            "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib64", "/lib64",
+            "--proc", "/proc", "--dev", "/dev",
+            "--ro-bind", str(self.root), "/mnt",
+            "--bind", str(outside), "/mnt/receipt-kernel-sink",
+            "--ro-bind", str(sandbox_file), "/opt/grabowski_agent_sandbox.py",
+            "--", "/usr/bin/python3", "-I", "-c", script,
+        ]
+        checked = subprocess.run(
+            outer, capture_output=True, text=True, check=False, timeout=40,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertIn("mount boundary", checked.stdout)
+
+
+    def test_external_receipt_bind_rejects_unsafe_source_or_target(self) -> None:
+        """Fail closed on forged external RW sinks and overlapping mounts."""
+        from pathlib import Path
+
+        source_workspace = self.root / "read-only-source"
+        source_workspace.mkdir()
+        state = self.root / "operator-private"
+        state.mkdir(mode=0o700)
+        fresh = state / "fresh-attempt"
+        fresh.mkdir(mode=0o700)
+        kwargs = {
+            "workspace": source_workspace,
+            "command": ["/usr/bin/true"],
+            "workspace_writable": False,
+        }
+
+        second = state / "second-attempt"
+        second.mkdir(mode=0o700)
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "one|too many",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=(
+                    (fresh, Path("/tmp/grabowski-first-receipt")),
+                    (second, Path("/tmp/grabowski-second-receipt")),
+                ),
+            )
+
+        for unsafe in (
+            Path("/etc/receipt"),
+            Path("/tmp"),
+            Path("/tmp/ordinary-dir"),
+            Path("/tmp/grabowski-a/../b"),
+        ):
+            with self.subTest(target=str(unsafe)):
+                with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+                    tasks.agent_sandbox.minimal_sandbox_argv(
+                        **kwargs, extra_read_write_directories=((fresh, unsafe),),
+                    )
+
+        nested = source_workspace / "do-not-expose"
+        nested.mkdir(mode=0o700)
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "overlaps",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=((
+                    nested, Path("/tmp/grabowski-nested"),
+                ),),
+            )
+
+        # A writable alias into an independently RO-mounted Git common-dir
+        # or runtime tree would defeat the read-only kernel promise.
+        git_common = self.root / "git-common"
+        git_common.mkdir(mode=0o700)
+        git_shadow = git_common / "private-shadow"
+        git_shadow.mkdir(mode=0o700)
+        with self.assertRaisesRegex(tasks.agent_sandbox.AgentSandboxError, "read-only|overlap"):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                git_common_dir=git_common,
+                extra_read_write_directories=((
+                    git_shadow, Path("/tmp/grabowski-git-shadow"),
+                ),),
+            )
+        runtime_root = self.root / "readonly-runtime"
+        runtime_root.mkdir(mode=0o700)
+        runtime_shadow = runtime_root / "private-shadow"
+        runtime_shadow.mkdir(mode=0o700)
+        with self.assertRaisesRegex(tasks.agent_sandbox.AgentSandboxError, "read-only|overlap"):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_only=((runtime_root, runtime_root),),
+                extra_read_write_directories=((
+                    runtime_shadow, Path("/tmp/grabowski-runtime-shadow"),
+                ),),
+            )
+
+        misplaced = state / "not-private"
+        misplaced.mkdir(mode=0o755)
+        misplaced.chmod(0o755)  # umask=0077 must not turn this negative fixture private.
+        with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=((
+                    misplaced, Path("/tmp/grabowski-untrusted"),
+                ),),
+            )
+
+        link = state / "linked"
+        link.symlink_to(fresh, target_is_directory=True)
+        with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=((
+                    link, Path("/tmp/grabowski-linked"),
+                ),),
+            )
+        missing = state / "missing"
+        with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=((
+                    missing, Path("/tmp/grabowski-missing"),
+                ),),
+            )
+        parent_link = self.root / "redirected-parent"
+        parent_link.symlink_to(state, target_is_directory=True)
+        with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write_directories=((
+                    parent_link / "fresh-attempt", Path("/tmp/grabowski-parent-link"),
+                ),),
+            )
+
+        private_file = state / "protected-credential"
+        private_file.write_text("no sibling RW", encoding="utf-8")
+        private_file.chmod(0o600)
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "overlaps",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                **kwargs,
+                extra_read_write=((
+                    private_file, Path("/tmp/grabowski-output/credential"),
+                ),),
+                extra_read_write_directories=((
+                    fresh, Path("/tmp/grabowski-output"),
+                ),),
+            )
+
+
+    def test_extra_mount_targets_reject_parent_traversal(self) -> None:
+        """An apparent /tmp path must not remount a protected /etc target."""
+        from pathlib import Path
+
+        worktree = self.root / "mount-target-traversal"
+        worktree.mkdir()
+        private_file = self.root / "mount-private-file"
+        private_file.write_text("private", encoding="utf-8")
+        private_file.chmod(0o600)
+        forged_target = Path("/tmp/../etc/passwd")
+        cases = (
+            ("read_only", {"extra_read_only": ((private_file, forged_target),)}),
+            ("fd_data", {"extra_read_only_data_fds": ((0, forged_target),)}),
+            ("read_write", {"extra_read_write": ((private_file, forged_target),)}),
+        )
+        for kind, extra in cases:
+            with self.subTest(kind=kind):
+                with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+                    tasks.agent_sandbox.minimal_sandbox_argv(
+                        workspace=worktree,
+                        command=["/usr/bin/true"],
+                        workspace_writable=False,
+                        **extra,
+                    )
+
+    def test_opaque_home_can_be_invisible_to_real_kernel_child(self) -> None:
+        """A default operator-home cwd must be hidden, not merely read-only.
+
+        This exercises an opt-in primitive on the real Linux kernel.
+        Separate trusted task admission must later select it for opaque cwd=None.
+        """
+        from pathlib import Path
+        import subprocess
+
+        home = self.root / "opaque-home"
+        home.mkdir(mode=0o700)
+        private_file = home / "private-token.txt"
+        private_file.write_text("operator-only", encoding="utf-8")
+        child_code = (
+            "import os,sys\n"
+            "print(os.getcwd())\n"
+            "sys.exit(0 if os.getcwd()=='/tmp' and "
+            "not os.path.lexists(sys.argv[1]) else 33)\n"
+        )
+        sandbox = tasks.agent_sandbox.minimal_sandbox_argv(
+            workspace=home,
+            command=["/usr/bin/python3", "-I", "-c", child_code, str(private_file)],
+            workspace_writable=False,
+            mount_workspace=False,
+        )
+        self.assertNotIn(
+            ["--ro-bind", str(home), str(home)],
+            [sandbox[i:i + 3] for i in range(len(sandbox) - 2)],
+        )
+        completed = subprocess.run(
+            tasks.agent_sandbox.runtime_sandbox_argv(sandbox),
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "/tmp")
+        self.assertEqual(private_file.read_text(encoding="utf-8"), "operator-only")
+
+        writable = home / "write"
+        writable.mkdir(mode=0o700)
+        with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=home, command=["/usr/bin/true"],
+                workspace_writable=True, writable_paths=(writable,),
+                mount_workspace=False,
+            )
+        with self.assertRaises(tasks.agent_sandbox.AgentSandboxError):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=home, command=["/usr/bin/true"],
+                workspace_writable=False, git_common_dir=home,
+                mount_workspace=False,
+            )
+        # A hidden home must not reappear through another sandbox target.
+        private_file.chmod(0o600)
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "hidden workspace",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=home, command=["/usr/bin/true"],
+                workspace_writable=False, mount_workspace=False,
+                extra_read_only=((private_file, Path("/tmp/grabowski-secret-read")),),
+            )
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "hidden workspace",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=home, command=["/usr/bin/true"],
+                workspace_writable=False, mount_workspace=False,
+                extra_read_write=((private_file, Path("/tmp/grabowski-secret-write")),),
+            )
+
+
+    def test_writable_file_mount_cannot_alias_read_only_sources(self) -> None:
+        """Even a private individual file cannot be RW-aliased into a read-only tree."""
+        from pathlib import Path
+
+        workspace = self.root / "readonly-source"
+        workspace.mkdir()
+        git_common = self.root / "readonly-git-common"
+        git_common.mkdir()
+        runtime_root = self.root / "readonly-runtime"
+        runtime_root.mkdir()
+        for name, protected_root, options in (
+            ("workspace", workspace, {}),
+            ("git", git_common, {"git_common_dir": git_common}),
+            ("runtime", runtime_root, {
+                "extra_read_only": ((runtime_root, runtime_root),),
+            }),
+        ):
+            with self.subTest(source=name):
+                private = protected_root / "private.txt"
+                private.write_text("unchanged", encoding="utf-8")
+                private.chmod(0o600)
+                with self.assertRaisesRegex(
+                    tasks.agent_sandbox.AgentSandboxError, "read-only|overlap",
+                ):
+                    tasks.agent_sandbox.minimal_sandbox_argv(
+                        workspace=workspace,
+                        command=["/usr/bin/true"],
+                        workspace_writable=False,
+                        extra_read_write=((
+                            private, Path("/tmp/grabowski-private-file-alias"),
+                        ),),
+                        **options,
+                    )
+                self.assertEqual(private.read_text(encoding="utf-8"), "unchanged")
+
+
+    def test_writable_scope_rejects_cross_device_root_alias(self) -> None:
+        """A bounded lease does not attest a mounted alias beneath its workspace."""
+        import os
+        from pathlib import Path
+
+        workspace = self.root / "device-boundary-workspace"
+        workspace.mkdir()
+        allowed = workspace / "allowed"
+        allowed.mkdir()
+        original_stat = Path.stat
+
+        def mounted_root_stat(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+            observed = original_stat(path, *args, **kwargs)
+            if path != allowed:
+                return observed
+            fields = list(observed)
+            fields[2] = int(observed.st_dev) + 1
+            return os.stat_result(fields)
+
+        kwargs = {
+            "workspace": workspace,
+            "command": ["/usr/bin/true"],
+            "workspace_writable": True,
+            "writable_paths": (allowed,),
+        }
+        normal = tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
+        self.assertIn(
+            ["--bind", str(allowed), str(allowed)],
+            [normal[i:i + 3] for i in range(len(normal) - 2)],
+        )
+        with patch.object(Path, "stat", mounted_root_stat):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "filesystem boundary"
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
+
+
+
+
+    def test_nonhome_workspace_does_not_require_a_mounted_operator_home(self) -> None:
+        """A nested kernel namespace has no host HOME, but can still attest mounts."""
+        from pathlib import Path
+
+        workspace = self.root / "isolated-nonhome-workspace"
+        workspace.mkdir()
+        absent_home = self.root / "unmounted-operator-home"
+        self.assertFalse(absent_home.exists())
+        with patch.object(Path, "home", return_value=absent_home):
+            argv = tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=workspace, command=["/usr/bin/true"],
+                workspace_writable=False,
+            )
+        self.assertIn(
+            ["--ro-bind", str(workspace), str(workspace)],
+            [argv[index:index + 3] for index in range(len(argv) - 2)],
+        )
+
+    def test_writable_scope_rejects_mount_alias_at_workspace_root(self) -> None:
+        """A same-device bind at workspace root is not identity evidence."""
+        from pathlib import Path
+
+        workspace = self.root / "alias-worktree-root"
+        workspace.mkdir()
+        allowed = workspace / "allowed"
+        allowed.mkdir()
+        with patch.object(
+            tasks.agent_sandbox, "_kernel_mount_points",
+            return_value=frozenset({workspace}),
+        ):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "mount boundary",
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(
+                    workspace=workspace,
+                    command=["/usr/bin/true"], workspace_writable=True,
+                    writable_paths=(allowed,),
+                )
+
+    def test_real_kernel_same_device_workspace_root_alias_denied(self) -> None:
+        """Check the actual mountinfo reason, not merely any preflight denial."""
+        import subprocess
+        from pathlib import Path
+
+        tasks.agent_sandbox.require_bwrap()
+        workspace = self.root / "real-alias-workspace"
+        workspace.mkdir()
+        allowed = workspace / "allowed"
+        allowed.mkdir()
+        unrelated = self.root / "unrelated-same-device"
+        unrelated.mkdir()
+        (unrelated / "allowed").mkdir()
+        self.assertEqual(workspace.stat().st_dev, unrelated.stat().st_dev)
+        sandbox_file = Path(tasks.agent_sandbox.__file__).resolve(strict=True)
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.dont_write_bytecode = True\n"
+            "sys.path.insert(0, '/opt')\n"
+            "import grabowski_agent_sandbox as sandbox\n"
+            "try:\n"
+            " sandbox.minimal_sandbox_argv(\n"
+            "  workspace=Path('/mnt/real-alias-workspace'),\n"
+            "  command=['/usr/bin/true'], workspace_writable=True,\n"
+            "  writable_paths=[Path('/mnt/real-alias-workspace/allowed')],\n"
+            " )\n"
+            "except sandbox.AgentSandboxError as exc:\n"
+            " print('REJECTED:' + str(exc))\n"
+            "else:\n"
+            " print('ACCEPTED')\n"
+        )
+        outer = [
+            str(tasks.agent_sandbox.require_bwrap()),
+            "--die-with-parent", "--new-session", "--unshare-pid",
+            "--unshare-ipc", "--unshare-uts", "--cap-drop", "ALL",
+            "--ro-bind", "/usr", "/usr",
+            "--symlink", "usr/bin", "/bin",
+            "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib64", "/lib64",
+            "--proc", "/proc", "--dev", "/dev",
+            "--ro-bind", str(self.root), "/mnt",
+            "--bind", str(unrelated), "/mnt/real-alias-workspace",
+            "--ro-bind", str(sandbox_file), "/opt/grabowski_agent_sandbox.py",
+            "--", "/usr/bin/python3", "-I", "-c", script,
+        ]
+        checked = subprocess.run(
+            outer, capture_output=True, text=True, check=False, timeout=40,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertIn("mount boundary", checked.stdout)
+        self.assertNotIn("ACCEPTED", checked.stdout)
+
+
+    def test_writable_mountinfo_missing_or_unbounded_fails_closed(self) -> None:
+        """Unobservable kernel mount identity denies all visible host mounts."""
+        from pathlib import Path
+
+        workspace = self.root / "mountinfo-workspace"
+        workspace.mkdir()
+        allowed = workspace / "allowed"
+        allowed.mkdir()
+        kwargs = {
+            "workspace": workspace,
+            "command": ["/usr/bin/true"],
+            "workspace_writable": True,
+            "writable_paths": (allowed,),
+        }
+        with patch("builtins.open", side_effect=OSError("mountinfo missing")):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "mount identity is unavailable"
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "mount identity is unavailable"
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(
+                    workspace=workspace,
+                    command=["/usr/bin/true"],
+                    workspace_writable=False,
+                )
+        with patch.object(tasks.agent_sandbox, "MAX_MOUNTINFO_BYTES", 1):
+            with self.assertRaisesRegex(
+                tasks.agent_sandbox.AgentSandboxError, "mount identity.*budget"
+            ):
+                tasks.agent_sandbox.minimal_sandbox_argv(**kwargs)
+
+
+    def test_real_kernel_same_device_bind_mount_is_not_a_writer_scope(self) -> None:
+        """An alternate same-device mount root cannot inherit one path lease."""
+        import subprocess
+        from pathlib import Path
+
+        tasks.agent_sandbox.require_bwrap()
+        workspace = self.root / "same device workspace"
+        workspace.mkdir()
+        allowed = workspace / "allowed"
+        allowed.mkdir()
+        outside = self.root / "outside-bind-root"
+        outside.mkdir()
+        (outside / "private.txt").write_text("protected", encoding="utf-8")
+        self.assertEqual(workspace.stat().st_dev, outside.stat().st_dev)
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.dont_write_bytecode = True\n"
+            "sys.path.insert(0, '/opt')\n"
+            "import grabowski_agent_sandbox as sandbox\n"
+            "try:\n"
+            "    sandbox.minimal_sandbox_argv(\n"
+            "        workspace=Path('/mnt/same device workspace'),\n"
+            "        command=['/usr/bin/true'], workspace_writable=True,\n"
+            "        writable_paths=[Path('/mnt/same device workspace/allowed')],\n"
+            "    )\n"
+            "except sandbox.AgentSandboxError as exc:\n"
+            "    print('REJECTED:' + str(exc))\n"
+            "else:\n"
+            "    print('ACCEPTED')\n"
+        )
+        sandbox_module = Path(tasks.agent_sandbox.__file__).resolve(strict=True)
+        outer = [
+            str(tasks.agent_sandbox.require_bwrap()),
+            "--die-with-parent", "--new-session",
+            "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            "--cap-drop", "ALL",
+            "--ro-bind", "/usr", "/usr",
+            "--symlink", "usr/bin", "/bin",
+            "--symlink", "usr/lib", "/lib",
+            "--symlink", "usr/lib64", "/lib64",
+            "--proc", "/proc", "--dev", "/dev",
+            "--ro-bind", str(self.root), "/mnt",
+            "--bind", str(outside), "/mnt/same device workspace/allowed",
+            "--ro-bind", str(sandbox_module), "/opt/grabowski_agent_sandbox.py",
+            "--", "/usr/bin/python3", "-I", "-c", script,
+        ]
+        run = subprocess.run(
+            outer, capture_output=True, text=True, check=False, timeout=40
+        )
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn("mount boundary", run.stdout)
+
+
+    def test_git_metadata_must_not_be_a_bounded_writable_path(self) -> None:
+        """An owned path lease must not make repository bookkeeping writable."""
+        workspace = self.root / "git-metadata-scope"
+        workspace.mkdir()
+        gitdir = workspace / ".git"
+        gitdir.mkdir()
+        config = gitdir / "config"
+        config.write_text("[core]\\n", encoding="utf-8")
+        for target in (gitdir, config):
+            with self.subTest(target=str(target)):
+                with self.assertRaisesRegex(
+                    tasks.agent_sandbox.AgentSandboxError, "Git|git|metadata",
+                ):
+                    tasks.agent_sandbox.minimal_sandbox_argv(
+                        workspace=workspace,
+                        command=["/usr/bin/true"],
+                        workspace_writable=True,
+                        writable_paths=(target,),
+                    )
+        parent = workspace / "allowed-parent"
+        parent.mkdir()
+        nested_git = parent / ".git"
+        nested_git.mkdir()
+        (nested_git / "config").write_text("[core]\\n", encoding="utf-8")
+        with self.assertRaisesRegex(
+            tasks.agent_sandbox.AgentSandboxError, "Git|git|metadata",
+        ):
+            tasks.agent_sandbox.minimal_sandbox_argv(
+                workspace=workspace,
+                command=["/usr/bin/true"],
+                workspace_writable=True,
+                writable_paths=(parent,),
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

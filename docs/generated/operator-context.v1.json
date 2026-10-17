@@ -1503,13 +1503,16 @@
       "category": "task",
       "description": "Observe one persistent task and refresh its recorded state.",
       "effects": [
-        "state-refresh"
+        "state-refresh",
+        "lease-renewal",
+        "terminalization-recovery",
+        "possible-process-stop"
       ],
       "id": "grabowski_task_status",
-      "purpose": "Observe one persistent task and refresh its recorded state.",
-      "read_only": true,
-      "reversibility": "not-applicable",
-      "risk_class": "low",
+      "purpose": "Refresh one task, maintain its leases, and conditionally stop a revoked task unit.",
+      "read_only": false,
+      "reversibility": "conditional",
+      "risk_class": "high",
       "tool": "grabowski_task_status"
     },
     {
@@ -1555,12 +1558,15 @@
     {
       "category": "task",
       "description": "List persistent tasks or inspect store-schema compatibility read-only.",
-      "effects": [],
+      "effects": [
+        "state-refresh",
+        "terminalization-recovery"
+      ],
       "id": "grabowski_task_list",
-      "purpose": "List recent persistent task records with optional state filtering.",
-      "read_only": true,
-      "reversibility": "not-applicable",
-      "risk_class": "low",
+      "purpose": "List persistent tasks and recover pending terminalizations in normal views.",
+      "read_only": false,
+      "reversibility": "conditional",
+      "risk_class": "medium",
       "tool": "grabowski_task_list"
     },
     {
@@ -3670,7 +3676,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "2e158ca751ea852a8191e978d4689b4fc39fb351120f08423dbf126faf934a3c"
+      "sha256": "f82126a195cc247425b44281a841d6e029dc9e7e587434ae08a29c71c125d9d3"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3800,7 +3806,7 @@
       "src/grabowski_systemkatalog.py": "e3ec4884b3dd367b8970b3143432cab0fea5fe55963292806001f5df535c83f9",
       "src/grabowski_task_attention.py": "a16d4b045bef23bf78ad3df0c4c58d91a304dc9a83b6e757fb1b0f88754ad6f3",
       "src/grabowski_task_reconcile.py": "64dc6195c9d0cb3435d192e4715a0d4d5679b9f1904057308366f4e2f2e9bbea",
-      "src/grabowski_tasks.py": "b616d105e72f21a3230b0f045cb97596f5c0cf9440eab3d2ae947e4fffaa160a",
+      "src/grabowski_tasks.py": "6dc57fea536652fc5ea55c85eb3cdae9d7e1b10f90268d431b63ff57f34d19ce",
       "src/grabowski_terminal_convergence.py": "8f172a65b2af1dbca3d5b226a18e82df3ca5229ca5f4ae8b2ab1792506c69195",
       "src/grabowski_text_artifact_reconcile.py": "b302be1dbb101abbf825732bfe41658c13ac64417c2a6034326e57409daa4772",
       "src/grabowski_transport_assertion.py": "20d75d1f94c1d0273108c36eed8c58aa85e55a30b73546c4ac8af8a835fb8c8e",

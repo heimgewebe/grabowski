@@ -1199,6 +1199,21 @@ def _migrate_resource_schema_v2(connection: sqlite3.Connection) -> None:
     _publish_resource_lease_contract(connection)
 
 
+class _ClosingResourceConnection(sqlite3.Connection):
+    """Close after a database context; sqlite3's default __exit__ only commits.
+
+    A still-referenced connection can retain WAL/SHM locks until GC, which is
+    not an authority or lifetime boundary (including under Python 3.12).
+    Explicit non-context users keep ordinary connection semantics.
+    """
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def _connect_existing_resource_database() -> sqlite3.Connection:
     if RESOURCE_DB.is_symlink():
         raise PermissionError(f"Resource database may not be a symlink: {RESOURCE_DB}")
@@ -1207,6 +1222,7 @@ def _connect_existing_resource_database() -> sqlite3.Connection:
         uri=True,
         timeout=10,
         isolation_level=None,
+        factory=_ClosingResourceConnection,
     )
     if RESOURCE_DB.is_symlink():
         connection.close()
@@ -1252,7 +1268,7 @@ def _database() -> sqlite3.Connection:
         if observed == "3":
             return _open_current_resource_database()
         connection = (
-            sqlite3.connect(RESOURCE_DB, timeout=10, isolation_level=None)
+            sqlite3.connect(RESOURCE_DB, timeout=10, isolation_level=None, factory=_ClosingResourceConnection)
             if observed is None
             else _connect_existing_resource_database()
         )
@@ -4006,6 +4022,64 @@ def _task_terminalization_cursor(
     return value
 
 
+@contextmanager
+def _pending_terminalization_readonly_connection() -> Iterator[sqlite3.Connection | None]:
+    """Inspect pending work without migrating or repairing resource-store state.
+
+    Scoped task admission happens after this snapshot is collected. A normal
+    _database() read may rewrite the authoritative store (WAL, chmod, migration,
+    lease/reconcile metadata); only a verified immutable/WAL snapshot is safe.
+    """
+    if RESOURCE_DB.parent.is_symlink():
+        raise PermissionError("Resource state directory may not be a symlink")
+    wal_path = Path(f"{RESOURCE_DB}-wal")
+    try:
+        status = RESOURCE_DB.lstat()
+    except FileNotFoundError:
+        if wal_path.exists() or wal_path.is_symlink():
+            raise RuntimeError("Resource database is missing but WAL is present")
+        yield None
+        return
+    if RESOURCE_DB.is_symlink():
+        raise PermissionError(f"Resource database may not be a symlink: {RESOURCE_DB}")
+    if not stat.S_ISREG(status.st_mode):
+        raise PermissionError("Resource database must be a regular file")
+    if status.st_size == 0:
+        if wal_path.exists() or wal_path.is_symlink():
+            raise RuntimeError("Empty resource database has an unexpected WAL")
+        yield None
+        return
+    try:
+        with sqlite_store.preauthorization_readonly_sqlite(
+            RESOURCE_DB, error_type=ResourceSchemaInventoryChanged
+        ) as connection:
+            version = _resource_schema_version(connection)
+            if version == "1":
+                # Schema 1 has no terminalization journal. Inspect its actual
+                # shape rather than opening it for a schema upgrade.
+                _validate_resource_schema_legacy(connection)
+                yield None
+            elif version == "2":
+                _validate_resource_schema_v2(connection)
+                yield connection
+            elif version == "3":
+                _validate_resource_schema_current(
+                    connection, require_lease_contract=False
+                )
+                yield connection
+            else:
+                raise RuntimeError("Unsupported resource database schema")
+    except sqlite3.DatabaseError as exc:
+        detail = str(exc).lower()
+        if "locked" in detail or "busy" in detail:
+            raise RuntimeError(
+                "Resource database is busy; retry after the active writer completes"
+            ) from exc
+        raise RuntimeError(
+            "Resource database is corrupt; restore a verified backup before retrying"
+        ) from exc
+
+
 def pending_task_terminalizations(
     *,
     limit: int,
@@ -4024,7 +4098,17 @@ def pending_task_terminalizations(
         raise ValueError("cursor requires high_water")
     if after is not None and after > boundary:
         raise ValueError("cursor cannot be greater than high_water")
-    with _database() as connection:
+    with _pending_terminalization_readonly_connection() as connection:
+        if connection is None:
+            return {
+                "terminalizations": [],
+                "limit": limit,
+                "examined": 0,
+                "cursor_before": after,
+                "cursor_after": None,
+                "high_water": boundary,
+                "cycle_completed": True,
+            }
         if boundary is None:
             boundary_row = connection.execute(
                 "SELECT prepared_at_unix, task_id FROM task_terminalizations "
@@ -4097,7 +4181,9 @@ def pending_task_terminalizations_exist(
         raise ValueError("cursor requires high_water")
     if after is not None and after > boundary:
         raise ValueError("cursor cannot be greater than high_water")
-    with _database() as connection:
+    with _pending_terminalization_readonly_connection() as connection:
+        if connection is None:
+            return False
         if boundary is None:
             return (
                 connection.execute(

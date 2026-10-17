@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import fcntl
@@ -31,6 +31,7 @@ import grabowski_resources as resources
 import grabowski_nonconflict as nonconflict
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
+import grabowski_agent_sandbox as agent_sandbox
 import grabowski_bureau_runtime_refresh_executor as bureau_runtime_refresh_executor
 import grabowski_lifecycle_projection as lifecycle_projection
 import grabowski_sqlite_store as sqlite_store
@@ -1041,7 +1042,6 @@ TASK_EFFECT_PROFILES = frozenset({
 MUTATING_AGENT_EXECUTABLES = frozenset(
     {"agy", "claude", "cline", "codex", "grok", "grok-cli", "opencode", "openhands"}
 )
-READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
 TASK_EFFECT_CLASSIFICATION_POLICY_VERSION = 1
 TASK_EFFECT_CLASSIFICATION_SURFACE = "task_start"
 TASK_EXECUTION_BACKENDS = {"systemd-user", "systemd-root-broker"}
@@ -2017,10 +2017,14 @@ def _connect_existing_task_database() -> sqlite3.Connection:
     return connection
 
 
-def _open_current_task_database() -> sqlite3.Connection:
+def _open_current_task_database(
+    *, before_write: Callable[[sqlite3.Connection], None] | None = None,
+) -> sqlite3.Connection:
     connection = _connect_existing_task_database()
     connection.row_factory = sqlite3.Row
     try:
+        if before_write is not None:
+            before_write(connection)
         if _task_schema_version(connection) != "5":
             raise RuntimeError(
                 "Task database schema changed while opening; retry with a compatible runtime"
@@ -2038,22 +2042,38 @@ def _open_current_task_database() -> sqlite3.Connection:
         raise
 
 
-def _database() -> sqlite3.Connection:
+def _database(
+    *,
+    before_write: Callable[[sqlite3.Connection], None] | None = None,
+    before_preflight: Callable[[], None] | None = None,
+) -> sqlite3.Connection:
     parent = TASK_DB.parent
     if parent.is_symlink():
         raise PermissionError(f"Task state directory may not be a symlink: {parent}")
+    if before_preflight is not None:
+        # A scoped terminalization already obtained a verified, isolated,
+        # read-only identity and an explicit authority decision. The generic
+        # integrity preflight below calls host SQLite and may create WAL/SHM
+        # before the *opened* row has been authorized. Open an existing DB
+        # without an SQL read, reauthorize its row through before_write, and
+        # only then validate and configure its current schema. Legacy stores
+        # fail closed here rather than migrating ahead of row authorization.
+        before_preflight()
+        if before_write is None:
+            raise ValueError("guarded task database opening requires row authorization")
+        return _open_current_task_database(before_write=before_write)
     parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if TASK_DB.is_symlink():
         raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
 
     observed = _preflight_task_store(verify_integrity=False)
     if observed == "5":
-        return _open_current_task_database()
+        return _open_current_task_database(before_write=before_write)
 
     with _schema_directory_lock(parent):
         observed = _preflight_task_store(verify_integrity=False)
         if observed == "5":
-            return _open_current_task_database()
+            return _open_current_task_database(before_write=before_write)
         connection = (
             sqlite3.connect(TASK_DB, timeout=10)
             if observed is None
@@ -2061,6 +2081,8 @@ def _database() -> sqlite3.Connection:
         )
         connection.row_factory = sqlite3.Row
         try:
+            if before_write is not None:
+                before_write(connection)
             connection.execute("BEGIN IMMEDIATE")
             version = _task_schema_version(connection)
             if version not in {None, "1", "2", "3", "4", "5"}:
@@ -3745,8 +3767,10 @@ def _resource_keys(values: list[str] | None) -> list[str]:
 
 def _argument_value(argv: list[str], *names: str) -> str | None:
     for index, item in enumerate(argv):
+        if item == "--":
+            break
         if item in names:
-            if index + 1 >= len(argv):
+            if index + 1 >= len(argv) or argv[index + 1] == "--":
                 return None
             return argv[index + 1]
         for name in names:
@@ -3803,6 +3827,842 @@ def _workspace_has_git_marker(workspace: str) -> bool:
     return not marker.is_symlink() and (marker.is_file() or marker.is_dir())
 
 
+
+def _codex_workspace_argument(argv: list[str]) -> str | None:
+    """Parse one CLI-declared root for lease coordination, not OS isolation.
+
+    Codex user config and inherited permissions are not attested here. The
+    independent direct-execution guard must still reject unsandboxed agents.
+    """
+    workspace: str | None = None
+    execution_mode: str | None = None
+    sandbox_declared = False
+    first_exec_positional = True
+    explicit_prompt_delimiter = False
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            if execution_mode is None and index + 1 >= len(argv):
+                raise RuntimeError("Codex command lacks a verified execution mode")
+            explicit_prompt_delimiter = True
+            break
+        if (
+            token == "--worktree"
+            or token.startswith("--worktree=")
+            or token == "--add-dir"
+            or token.startswith("--add-dir=")
+        ):
+            raise RuntimeError(
+                "Codex working directory cannot be authorized with extra writable roots"
+            )
+        # Config overlays, profile files, remote app servers and output files
+        # can change the effective write surface without changing -C/--cd.
+        if (
+            token in {
+                "-p", "--profile", "-o", "--output-last-message",
+                "--remote", "--remote-auth-token-env",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
+            }
+            or token.startswith((
+                "--profile=", "--output-last-message=",
+                "--remote=", "--remote-auth-token-env=",
+            ))
+            or (
+                token.startswith(("-p", "-o"))
+                and not token.startswith("--")
+            )
+        ):
+            raise RuntimeError(
+                "Codex working directory cannot be authorized with unverified write controls"
+            )
+        # Harmless model selection stays supported; all unverified configuration
+        # keys are denied because they can modify sandbox/write-root policy.
+        config_override: str | None = None
+        if token in {"-c", "--config"}:
+            if index + 1 >= len(argv):
+                raise RuntimeError("Codex config option is missing its value")
+            config_override = argv[index + 1]
+            index += 2
+        elif token.startswith("--config="):
+            config_override = token[len("--config="):]
+            index += 1
+        elif token.startswith("-c") and token != "-C":
+            config_override = token[2:].removeprefix("=")
+            index += 1
+        if config_override is not None:
+            key, separator, value = config_override.partition("=")
+            if (
+                separator != "="
+                or not value
+                or key not in {"model", "model_reasoning_effort", "model_verbosity"}
+            ):
+                raise RuntimeError(
+                    "Codex working directory cannot be authorized with unverified config"
+                )
+            continue
+        if token in {"-s", "--sandbox"}:
+            if index + 1 >= len(argv) or argv[index + 1] not in {
+                "read-only", "workspace-write",
+            }:
+                raise RuntimeError("Codex sandbox must be workspace-confined")
+            if sandbox_declared:
+                raise RuntimeError("Codex sandbox declarations are ambiguous")
+            sandbox_declared = True
+            index += 2
+            continue
+        if token.startswith("--sandbox=") or (
+            token.startswith("-s") and not token.startswith("--")
+        ):
+            mode = (
+                token[len("--sandbox="):]
+                if token.startswith("--sandbox=")
+                else token[2:].removeprefix("=")
+            )
+            if mode not in {"read-only", "workspace-write"}:
+                raise RuntimeError("Codex sandbox must be workspace-confined")
+            if sandbox_declared:
+                raise RuntimeError("Codex sandbox declarations are ambiguous")
+            sandbox_declared = True
+            index += 1
+            continue
+        # Workspace leases never authorize administrative commands, direct
+        # approval bypasses, or feature-driven changes to the CLI write surface.
+        if token in {
+            "--enable", "--disable", "--approve-for-me",
+            "-a", "--ask-for-approval", "--oss", "--local-provider",
+        } or token.startswith((
+            "--enable=", "--disable=", "--ask-for-approval=",
+            "--local-provider=",
+        )):
+            raise RuntimeError(
+                "Codex command cannot be authorized with unverified write controls"
+            )
+        if token in {
+            "-m", "--model", "-i", "--image", "--color",
+            "--output-schema", "--thread-source",
+        }:
+            if index + 1 >= len(argv) or not argv[index + 1] or argv[index + 1].startswith("-"):
+                raise RuntimeError("Codex option is missing its value")
+            index += 2
+            continue
+        if token.startswith((
+            "--model=", "--image=", "--color=",
+            "--output-schema=", "--thread-source=",
+        )) or (token.startswith(("-m", "-i")) and not token.startswith("--")):
+            index += 1
+            continue
+        if token in {"-C", "--cd"}:
+            if index + 1 >= len(argv):
+                raise RuntimeError("Codex working directory option is missing its path")
+            candidate = argv[index + 1]
+            index += 2
+        elif token.startswith("--cd="):
+            candidate = token[len("--cd="):]
+            index += 1
+        elif token.startswith("-C") and token != "-C":
+            candidate = token[2:]
+            if candidate.startswith("="):
+                candidate = candidate[1:]
+            index += 1
+        else:
+            # Before the payload, allow only the two coding-agent execution
+            # entrypoints. Administrative and historical-session subcommands
+            # can write outside the leased checkout, regardless of -C.
+            if token.startswith("-"):
+                if token not in {
+                    "--strict-config", "--json", "--ephemeral",
+                    "--ignore-user-config", "--no-daemon", "--no-alt-screen",
+                }:
+                    raise RuntimeError("Codex command has an unverified CLI option")
+                index += 1
+                continue
+            if execution_mode is None:
+                if token not in {"exec", "review"}:
+                    raise RuntimeError(
+                        "Codex command is outside verified workspace execution modes"
+                    )
+                execution_mode = token
+            elif execution_mode == "exec" and first_exec_positional:
+                if token in {"resume", "fork"}:
+                    raise RuntimeError(
+                        "Codex resumed or forked sessions lack verified workspace identity"
+                    )
+                first_exec_positional = False
+            index += 1
+            continue
+        if not candidate or candidate.startswith("-"):
+            raise RuntimeError("Codex working directory option has an invalid path")
+        if workspace is not None:
+            raise RuntimeError("Codex working directory has ambiguous declarations")
+        workspace = candidate
+    if execution_mode is None and not explicit_prompt_delimiter:
+        raise RuntimeError("Codex command lacks a verified execution mode")
+    return workspace
+
+
+def _require_direct_codex_filesystem_sandbox(argv: list[str]) -> None:
+    """Deny recognizable Codex entrypoints without an attested OS boundary.
+
+    Repository leases coordinate writes; they are not filesystem isolation.
+    Also reject known indirect launchers before reuse, task INSERT, or resume.
+    An arbitrary opaque script cannot be proven confined by inspecting argv:
+    this guard does not replace the separately sandboxed agent-writer route.
+    """
+    if not argv:
+        return
+
+    def codex_entrypoint(token: str) -> bool:
+        value = token.casefold().replace("\\", "/")
+        binary = value.rsplit("/", 1)[-1]
+        return (
+            re.fullmatch(r"codex(?:[._-][a-z0-9][a-z0-9._-]*)?", binary)
+            is not None
+            or "@openai/codex" in value
+        )
+
+
+
+    def harmless_inline_source(source: str, language: str) -> bool:
+        """Accept literal output only; never authorize an arbitrary program."""
+        if len(source) > 2048:
+            return False
+        if language == "python":
+            import ast
+
+            try:
+                tree = ast.parse(source, mode="exec")
+            except SyntaxError:
+                return False
+            return bool(tree.body) and all(
+                isinstance(node, ast.Expr)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "print"
+                and not node.value.keywords
+                and all(isinstance(arg, ast.Constant) for arg in node.value.args)
+                for node in tree.body
+            )
+        literal = r"""(?:'[^'\n]{0,1024}'|"[^"\n]{0,1024}")"""
+        # Ruby #{...} and Perl @{[...]} execute inside double-quoted
+        # strings. Only a single-quoted literal proves pure print output.
+        non_interpolated_literal = r"'[^'\n]{0,1024}'"
+        patterns = {
+            "node": rf"console\.log\(\s*{literal}\s*\)\s*;?",
+            "nodejs": rf"console\.log\(\s*{literal}\s*\)\s*;?",
+            "ruby": rf"puts\s+{non_interpolated_literal}\s*;?",
+            "perl": rf"print\s+{non_interpolated_literal}\s*;?",
+        }
+        return re.fullmatch(patterns[language], source.strip()) is not None
+
+    # These variables can execute attacker-controlled code before a nominally
+    # harmless command body runs. argv inspection cannot attest that code.
+    preload_hook_variables = frozenset({
+        "BASH_ENV", "ENV", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
+        "NODE_OPTIONS", "NODE_PATH", "RUBYOPT", "RUBYLIB", "PERL5OPT",
+        "PERL5LIB", "LD_PRELOAD", "LD_AUDIT",
+    })
+
+    def reject_unverified_preload_assignment(token: str) -> None:
+        key, separator, _ = token.partition("=")
+        if separator and key in preload_hook_variables:
+            raise RuntimeError(
+                "Codex filesystem sandbox cannot verify executable environment preload"
+            )
+
+    def shell_embedded_sources(source: str) -> list[str]:
+        """Inspect executable substitutions, including inside double quotes."""
+        embedded: list[str] = []
+        quote: str | None = None
+        cursor = 0
+        while cursor < len(source):
+            current = source[cursor]
+            if current == "\\":
+                cursor += 2
+                continue
+            if quote == "'":
+                if current == "'":
+                    quote = None
+                cursor += 1
+                continue
+            if current == "'" and quote is None:
+                quote = "'"
+                cursor += 1
+                continue
+            if current == '"':
+                quote = None if quote == '"' else '"'
+                cursor += 1
+                continue
+            if current == chr(96):
+                end = source.find(chr(96), cursor + 1)
+                if end < 0:
+                    raise RuntimeError("Codex filesystem sandbox cannot verify shell substitution")
+                embedded.append(source[cursor + 1:end])
+                cursor = end + 1
+                continue
+            if source.startswith("$(", cursor):
+                depth = 1
+                end = cursor + 2
+                while end < len(source) and depth:
+                    if source[end] == "(":
+                        depth += 1
+                    elif source[end] == ")":
+                        depth -= 1
+                    end += 1
+                if depth:
+                    raise RuntimeError("Codex filesystem sandbox cannot verify shell substitution")
+                embedded.append(source[cursor + 2:end - 1])
+                cursor = end
+                continue
+            cursor += 1
+        return embedded
+
+    executable = Path(argv[0]).name.casefold()
+    try:
+        resolved_executable = str(Path(argv[0]).resolve(strict=False))
+    except (OSError, RuntimeError):
+        # An unresolvable explicit path cannot prove a non-Codex executable.
+        resolved_executable = argv[0]
+    wrappers = {
+        "env", "timeout", "nice", "nohup", "stdbuf", "ionice",
+        "taskset", "setsid", "chrt", "sh", "bash", "dash", "zsh",
+        "fish", "node", "nodejs", "npx", "npm", "pnpm", "bun",
+        "bunx", "yarn", "corepack", "uv", "uvx", "perl", "ruby",
+        "time", "sudo", "doas", "busybox",
+    }
+    # Commands that can execute an arbitrary, dynamically selected child must
+    # not gain write authority by passing a superficial argv token scan. The
+    # separately sandboxed agent-writer route is required for these launchers.
+    unverified_carriers = frozenset({
+        "systemd-run", "xargs", "script", "flock", "watch",
+        "unshare", "nsenter", "setpriv", "runuser", "su",
+        "ionice", "taskset", "chrt",
+        "npx", "npm", "pnpm", "bun", "bunx", "yarn",
+        "corepack", "uv", "uvx",
+    })
+    # A filesystem symlink may rename a known prefix launcher. Recognize
+    # its resolved executable before interpreting argv; argv0 alone is not
+    # authority for selecting a less restrictive command path.
+    resolved_binary = Path(resolved_executable).name.casefold()
+    if resolved_binary == "busybox" and executable != "busybox":
+        # BusyBox symlink applets choose the child program from argv[0],
+        # not argv[1]. Treating it as a literal busybox invocation would
+        # skip the actual applet's command/assignment parsing.
+        if executable in {"ash", "hush"}:
+            executable = "sh"
+        elif executable not in wrappers and executable not in unverified_carriers:
+            raise RuntimeError(
+                "Codex filesystem sandbox cannot verify BusyBox applet alias"
+            )
+    elif (
+        resolved_binary in wrappers
+        or resolved_binary in unverified_carriers
+        or re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)?)?", resolved_binary)
+        or resolved_binary == "ld.so"
+        or re.fullmatch(r"ld-linux[^/]*\.so(?:\.[0-9]+)*", resolved_binary)
+    ):
+        executable = resolved_binary
+    if executable in unverified_carriers:
+        raise RuntimeError(
+            "Codex filesystem sandbox cannot verify opaque command launcher"
+        )
+    python_interpreter = re.fullmatch(
+        r"python(?:[0-9]+(?:\.[0-9]+)?)?", executable
+    ) is not None
+    interpreter = (
+        executable in wrappers
+        or python_interpreter
+        or executable == "ld.so"
+        or re.fullmatch(r"ld-linux[^/]*\.so(?:\.[0-9]+)*", executable) is not None
+    )
+    token_pattern = re.compile(
+        r"(?<![a-zA-Z0-9_])(?:@openai/codex|codex(?:[._-][a-zA-Z0-9._-]+)?)"
+        r"(?![a-zA-Z0-9_])",
+        flags=re.IGNORECASE,
+    )
+    # env accepts assignments before the executable. A writable-root variable
+    # can contain the word "codex" merely because the checkout is named that;
+    # scanning it as a command would block unrelated cargo/build tasks.
+    if executable == "env" and not codex_entrypoint(resolved_executable):
+        index = 1
+        while index < len(argv):
+            item = argv[index]
+            # Parse GNU env split strings into actual argv rather than
+            # treating incidental codex-named argument values as executables.
+            split_short = re.fullmatch(r"-[iv0]*S(.*)", item)
+            if (
+                item == "--split-string"
+                or item.startswith("--split-string=")
+                or split_short is not None
+            ):
+                import shlex
+
+                if item == "--split-string" or (
+                    split_short is not None and not split_short.group(1)
+                ):
+                    if index + 1 >= len(argv):
+                        raise RuntimeError("Codex filesystem sandbox cannot verify env -S without a payload")
+                    split_payload = argv[index + 1]
+                    rest = argv[index + 2:]
+                else:
+                    split_payload = (
+                        item.partition("=")[2]
+                        if item.startswith("--split-string=")
+                        else split_short.group(1)
+                    )
+                    rest = argv[index + 1:]
+                try:
+                    tokens = shlex.split(split_payload, posix=True)
+                except ValueError as exc:
+                    raise RuntimeError("Codex filesystem sandbox cannot verify env -S payload") from exc
+                _require_direct_codex_filesystem_sandbox(["env", *tokens, *rest])
+                return
+            if item in {"-u", "--unset", "-C", "--chdir", "-a", "--argv0"}:
+                index += 2
+                continue
+            # GNU env signal actions accept an optional value only when
+            # joined by '='; a following word is the executable, not a value.
+            if item in {"--block-signal", "--default-signal", "--ignore-signal"}:
+                index += 1
+                continue
+            if item.startswith(("--block-signal=", "--default-signal=", "--ignore-signal=")):
+                index += 1
+                continue
+            if item in {"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}:
+                index += 1
+                continue
+            if item == "--":
+                index += 1
+                continue
+            if "=" in item:
+                # GNU env accepts non-identifier assignment keys, including
+                # exported Bash functions named BASH_FUNC_name%%. Bash imports
+                # and executes these before -c, hiding the actual Codex child.
+                # Never reinterpret a non-identifier assignment as a benign
+                # executable. A privileged agent route must attest it first.
+                assignment_key = item.split("=", 1)[0]
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", assignment_key) is None:
+                    raise RuntimeError(
+                        "Codex filesystem sandbox cannot verify env function assignments"
+                    )
+                reject_unverified_preload_assignment(item)
+                index += 1
+                continue
+            if item.startswith("-"):
+                raise RuntimeError("Codex filesystem sandbox cannot verify env options")
+            # Recurse through nested env and known launchers; only a command
+            # entrypoint (not an arbitrary environment value) is executable.
+            _require_direct_codex_filesystem_sandbox(argv[index:])
+            return
+        return
+    # These launchers execute a child argv. Only the child command position
+    # determines its executable; option values and later arguments are data.
+    loader = executable == "ld.so" or re.fullmatch(
+        r"ld-linux[^/]*\.so(?:\.[0-9]+)*", executable
+    ) is not None
+    if executable == "busybox":
+        start = 2 if argv[1:2] == ["--"] else 1
+        if start < len(argv) and not argv[start].startswith("-"):
+            applet = argv[start]
+            # These are shell applets rather than standalone executables.
+            # Their -c payload must pass the same recursive shell guard.
+            if applet in {"ash", "hush"}:
+                _require_direct_codex_filesystem_sandbox(["sh", *argv[start + 1:]])
+            else:
+                _require_direct_codex_filesystem_sandbox(argv[start:])
+        elif start < len(argv) and argv[start] not in {"--help", "--list", "--list-full"}:
+            raise RuntimeError("Codex filesystem sandbox cannot verify busybox options")
+        return
+    if executable in {"timeout", "nice", "stdbuf", "nohup", "setsid"}:
+        # These programs run a child argv after their own option payloads.
+        # A codex-named build directory is not an executable position.
+        start = 1
+        while start < len(argv):
+            option = argv[start]
+            if option == "--":
+                start += 1
+                break
+            if not option.startswith("-") or option == "-":
+                break
+            if executable == "timeout":
+                flags = {"-f", "--foreground", "-p", "--preserve-status", "-v", "--verbose"}
+                needs_value = {"-s", "--signal", "-k", "--kill-after"}
+                attached = any(option.startswith(v + "=") for v in needs_value if v.startswith("--"))
+                attached = attached or (option.startswith(("-s", "-k")) and len(option) > 2)
+            elif executable == "nice":
+                flags = set()
+                needs_value = {"-n", "--adjustment"}
+                attached = option.startswith("--adjustment=") or (
+                    len(option) > 2 and option.startswith("-n")
+                ) or (len(option) > 1 and option[1:].isdigit())
+            elif executable == "stdbuf":
+                flags = set()
+                needs_value = {"-i", "-o", "-e"}
+                attached = len(option) > 2 and option[:2] in needs_value
+            elif executable == "setsid":
+                flags = {"-c", "-f", "-w", "--ctty", "--fork", "--wait"}
+                needs_value = set()
+                attached = False
+            else:
+                flags = set()
+                needs_value = set()
+                attached = False
+            if option in flags or attached:
+                start += 1
+            elif option in needs_value and start + 1 < len(argv):
+                start += 2
+            else:
+                raise RuntimeError(
+                    "Codex filesystem sandbox cannot verify prefix-launcher options"
+                )
+        if executable == "timeout":
+            # The first non-option word is always the duration.
+            start += 1
+        if start < len(argv):
+            _require_direct_codex_filesystem_sandbox(argv[start:])
+        return
+    if executable in {"time", "sudo", "doas"} or loader:
+        start = 1
+        while start < len(argv):
+            option = argv[start]
+            if option == "--":
+                start += 1
+                break
+            if not option.startswith("-") or option == "-":
+                break
+            if executable == "time":
+                simple = {"-p", "--portability", "-v", "--verbose", "-q",
+                          "--quiet", "-a", "--append"}
+                takes_value = {"-o", "--output", "-f", "--format"}
+                attached = option.startswith(("-o", "-f")) and len(option) > 2
+                attached = attached or option.startswith(("--output=", "--format="))
+            elif loader:
+                # Search overrides, preloads and auditors can load executable
+                # shared objects before the nominal child binary is reached.
+                unverified_library_options = {
+                    "--library-path", "--preload", "--audit", "--inhibit-rpath",
+                    "--glibc-hwcaps-prepend", "--glibc-hwcaps-mask",
+                }
+                if option in unverified_library_options or any(
+                    option.startswith(name + "=")
+                    for name in unverified_library_options
+                ):
+                    raise RuntimeError(
+                        "Codex filesystem sandbox cannot verify executable ELF loader libraries"
+                    )
+                simple = {"--list", "--verify", "--inhibit-cache", "--list-diagnostics"}
+                takes_value = {"--argv0"}
+                attached = option.startswith("--argv0=")
+            else:
+                # Preserved inherited environment can activate executable
+                # preload hooks without any NAME=value token in argv.
+                if option in {"-E", "--preserve-env"} or option.startswith("--preserve-env="):
+                    raise RuntimeError(
+                        "Codex filesystem sandbox cannot verify preserved environment"
+                    )
+                simple = {"-n", "-H", "-k", "-K", "-S", "-b", "-P",
+                          "--non-interactive", "--login",
+                          "--set-home", "--reset-timestamp"}
+                takes_value = {"-u", "-g", "-C", "-p", "-D", "-r", "-t",
+                               "--user", "--group", "--chdir",
+                               "--close-from", "--prompt", "--role", "--type"}
+                attached = any(option.startswith(name + "=") for name in takes_value if name.startswith("--"))
+                attached = attached or (len(option) > 2 and option[:2] in {"-u", "-g", "-C", "-p", "-D", "-r", "-t"})
+            if option in simple or attached:
+                start += 1
+                continue
+            if option in takes_value and start + 1 < len(argv):
+                start += 2
+                continue
+            raise RuntimeError(
+                "Codex filesystem sandbox cannot verify prefix-launcher options"
+            )
+        if executable in {"sudo", "doas"}:
+            # sudo accepts NAME=value assignments before the command.
+            # Neither assignment keys nor values attest the executable.
+            while start < len(argv) and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*=.*", argv[start]
+            ):
+                reject_unverified_preload_assignment(argv[start])
+                start += 1
+        if start < len(argv):
+            _require_direct_codex_filesystem_sandbox(argv[start:])
+        return
+    # Shell script filenames and the scoped writer's workspace roots are
+    # data, not program names. Keep literal -c payloads under inspection.
+    payload_tokens = argv[1:]
+    if executable in {"sh", "bash", "dash", "zsh", "fish"}:
+        # Interactive shell startup files execute before otherwise safe -c
+        # arguments. Reject them instead of inspecting only the -c body.
+        for shell_option in argv[1:]:
+            if shell_option in {"--rcfile", "--init-file"} or shell_option.startswith(
+                ("--rcfile=", "--init-file=")
+            ):
+                raise RuntimeError(
+                    "Codex filesystem sandbox cannot verify shell startup file"
+                )
+            if not shell_option.startswith("-") or (
+                not shell_option.startswith("--") and "c" in shell_option[1:]
+            ):
+                break
+        shell_code = None
+        for index, option in enumerate(argv[1:-1], 1):
+            if (
+                option.startswith("-")
+                and not option.startswith("--")
+                and "c" in option[1:]
+            ):
+                shell_code = argv[index + 1]
+                break
+        if shell_code is not None:
+            # Aliases are expanded by the shell before the inspected command
+            # positions execute. Even an alias inherited through shell startup
+            # can redirect a harmless-looking command into Codex. Do not
+            # authorize Bash alias-expansion options on this untrusted route.
+            for index, option in enumerate(argv[1:-1], 1):
+                if executable == "bash" and (
+                    option in {"-Oexpand_aliases", "+Oexpand_aliases"}
+                    or (
+                        option in {"-O", "+O"}
+                        and index + 1 < len(argv)
+                        and argv[index + 1] == "expand_aliases"
+                    )
+                ):
+                    raise RuntimeError(
+                        "Codex filesystem sandbox cannot verify shell alias expansion"
+                    )
+            # Substitution executes a child even when the argument is quoted.
+            for embedded in shell_embedded_sources(shell_code):
+                _require_direct_codex_filesystem_sandbox(["sh", "-c", embedded])
+            # Dynamic eval can construct an executable after admission.
+            if re.search(r"\beval\b", shell_code) and (
+                "$" in shell_code or chr(96) in shell_code
+            ):
+                raise RuntimeError("Codex filesystem sandbox cannot verify dynamic shell eval")
+            # Only command positions of a literal shell payload are entrypoints.
+            # A path or text argument containing "codex" is not a program.
+            import shlex
+
+            lexer = shlex.shlex(
+                shell_code, posix=True, punctuation_chars=";&|(){}\n"
+            )
+            lexer.whitespace = " \t\r"
+            lexer.whitespace_split = True
+            try:
+                shell_tokens = list(lexer)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Codex filesystem sandbox cannot verify shell payload"
+                ) from exc
+            segment: list[str] = []
+            for token in [*shell_tokens, ";"]:
+                if token and all(char in ";&|(){}\n" for char in token):
+                    offset = 0
+                    while offset < len(segment) and re.fullmatch(
+                        r"[A-Za-z_][A-Za-z0-9_]*=.*", segment[offset]
+                    ):
+                        reject_unverified_preload_assignment(segment[offset])
+                        offset += 1
+                    # Builtins change the command position. Parse their
+                    # literal options instead of mistaking -a/-p for programs.
+                    while offset < len(segment):
+                        prefix = segment[offset]
+                        if prefix in {
+                            "if", "elif", "while", "until", "then", "do",
+                            "else", "!", "builtin", "{", "}", "coproc",
+                        }:
+                            offset += 1
+                            continue
+                        if prefix in {"alias", "unalias", "shopt"}:
+                            # Alias definitions/changes and shopt expansion
+                            # options turn token-based inspection into a bypass.
+                            raise RuntimeError(
+                                "Codex filesystem sandbox cannot verify shell alias commands"
+                            )
+                        if prefix in {"export", "declare", "typeset", "readonly", "local"}:
+                            # Builtins can install hooks for later commands.
+                            for assignment in segment[offset + 1:]:
+                                if assignment.split("=", 1)[0] in preload_hook_variables:
+                                    raise RuntimeError(
+                                        "Codex filesystem sandbox cannot verify executable environment preload"
+                                    )
+                            offset = len(segment)
+                            break
+                        if prefix == "function":
+                            offset += 2
+                            if offset < len(segment) and segment[offset] == "()":
+                                offset += 1
+                            continue
+                        # Expansions inside a command word can form Codex after lexical inspection.
+                        if "$" in prefix or chr(96) in prefix:
+                            raise RuntimeError(
+                                "Codex filesystem sandbox cannot verify dynamic shell command"
+                            )
+                        if prefix == "exec":
+                            offset += 1
+                            while offset < len(segment) and segment[offset].startswith("-"):
+                                option = segment[offset]
+                                if option in {"-c", "-l", "--"}:
+                                    offset += 1
+                                    if option == "--":
+                                        break
+                                elif option == "-a" and offset + 1 < len(segment):
+                                    offset += 2
+                                else:
+                                    raise RuntimeError(
+                                        "Codex filesystem sandbox cannot verify shell exec options"
+                                    )
+                            continue
+                        if prefix == "command":
+                            offset += 1
+                            while offset < len(segment) and segment[offset] == "-p":
+                                offset += 1
+                            if offset < len(segment) and segment[offset] in {"-v", "-V"}:
+                                # The query-only forms of command do not exec.
+                                offset = len(segment)
+                            continue
+                        if prefix in {"source", "."}:
+                            raise RuntimeError(
+                                "Codex filesystem sandbox cannot verify sourced shell code"
+                            )
+                        if prefix == "eval":
+                            _require_direct_codex_filesystem_sandbox(
+                                ["bash", "-c", " ".join(segment[offset + 1:])]
+                            )
+                            offset = len(segment)
+                        break
+                    if offset < len(segment):
+                        _require_direct_codex_filesystem_sandbox(
+                            segment[offset:]
+                        )
+                    segment = []
+                else:
+                    segment.append(token)
+            return
+        payload_tokens = (
+            [argv[1]] if len(argv) > 1 and codex_entrypoint(argv[1]) else []
+        )
+    elif python_interpreter:
+        module_index = 1
+        while module_index < len(argv) and argv[module_index] in {
+            "-I", "-B", "-S", "-E", "-s", "-u",
+        }:
+            module_index += 1
+        # Python accepts both -c 'code' and -ccode. Validate the latter
+        # with the same AST, never by scanning for the literal word codex.
+        code_flag = argv[module_index] if module_index < len(argv) else ""
+        if code_flag == "-c" or code_flag.startswith("-c"):
+            if code_flag == "-c":
+                if len(argv) <= module_index + 1:
+                    raise RuntimeError("Codex filesystem sandbox cannot verify Python inline code")
+                source = argv[module_index + 1]
+            else:
+                source = code_flag[2:]
+            if not harmless_inline_source(source, "python"):
+                raise RuntimeError("Codex filesystem sandbox cannot verify Python inline code")
+            payload_tokens = []
+        elif (
+            len(argv) > module_index + 1
+            and argv[module_index] == "-m"
+            and argv[module_index + 1] == "grabowski_agent_writer"
+        ):
+            payload_tokens = []
+        elif len(argv) > 1 and not argv[1].startswith("-"):
+            payload_tokens = (
+                [argv[1]] if codex_entrypoint(argv[1]) else []
+            )
+    elif executable in {"node", "nodejs", "ruby", "perl"}:
+        # Script paths and arguments are data. Only an executable script,
+        # an inline code payload or a preloaded executable module can launch
+        # Codex directly. Unknown interpreter flags fail closed.
+        payload_tokens = []
+        inline_code_index: int | None = None
+        index = 1
+        while index < len(argv):
+            item = argv[index]
+            if item == "--":
+                index += 1
+                break
+            # Perl/Ruby -p is a per-line loop flag, unlike Node -p which
+            # supplies an expression. Combined -pe contains executable code.
+            if executable in {"perl", "ruby"} and item in {"-p", "-n"}:
+                index += 1
+                continue
+            combined_code = (
+                re.fullmatch(r"-[pnwla]+e(.*)", item)
+                if executable in {"perl", "ruby"} else None
+            )
+            if combined_code is not None:
+                inline = combined_code.group(1)
+                if not inline:
+                    if index + 1 >= len(argv):
+                        raise RuntimeError("Codex filesystem sandbox cannot verify interpreter code")
+                    inline = argv[index + 1]
+                payload_tokens.append(inline)
+                inline_code_index = len(payload_tokens) - 1
+                break
+            if item in {"-e", "--eval"} or (
+                executable in {"node", "nodejs"} and item in {"-p", "--print"}
+            ):
+                if index + 1 >= len(argv):
+                    raise RuntimeError(
+                        "Codex filesystem sandbox cannot verify interpreter code"
+                    )
+                payload_tokens.append(argv[index + 1])
+                inline_code_index = len(payload_tokens) - 1
+                index += 2
+                break
+            if item.startswith("--eval=") or (
+                executable in {"node", "nodejs"} and item.startswith("--print=")
+            ) or (item.startswith("-e") and len(item) > 2) or (
+                executable in {"node", "nodejs"} and item.startswith("-p") and len(item) > 2
+            ):
+                payload_tokens.append(
+                    item.partition("=")[2] if item.startswith("--") else item[2:]
+                )
+                inline_code_index = len(payload_tokens) - 1
+                break
+            # Every explicit preload can execute code before a harmless
+            # inline body. A non-Codex module name is not sandbox evidence.
+            if item in {"-r", "--require", "--import", "--loader"} or item.startswith(
+                ("--require=", "--import=", "--loader=")
+            ):
+                raise RuntimeError(
+                    "Codex filesystem sandbox cannot verify interpreter preload"
+                )
+            if item in {"-I", "--no-warnings", "--no-deprecation",
+                        "--experimental-modules", "--disable-gems", "-w", "-W"}:
+                index += 1
+                continue
+            if item.startswith("-"):
+                raise RuntimeError(
+                    "Codex filesystem sandbox cannot verify interpreter options"
+                )
+            break
+        if inline_code_index is not None:
+            inline_code = payload_tokens.pop(inline_code_index)
+            if not harmless_inline_source(inline_code, executable):
+                raise RuntimeError("Codex filesystem sandbox cannot verify interpreter inline code")
+        if index < len(argv):
+            if codex_entrypoint(argv[index]):
+                payload_tokens.append(argv[index])
+    if (
+        codex_entrypoint(argv[0])
+        or codex_entrypoint(resolved_executable)
+        or (
+            interpreter and any(
+                codex_entrypoint(item) or token_pattern.search(item) is not None
+                for item in payload_tokens
+            )
+        )
+    ):
+        raise RuntimeError(
+            "Codex direct task has no attested filesystem sandbox; "
+            "use the scoped grabowski_agent_writer route"
+        )
+
+
 def _mutating_agent_workspace(
     host: str,
     argv: list[str],
@@ -3813,14 +4673,8 @@ def _mutating_agent_workspace(
         return None
     executable = Path(argv[0]).name.lower()
     if executable == "codex":
-        sandbox = _argument_value(argv, "--sandbox", "-s")
-        if sandbox in READ_ONLY_AGENT_MODES:
-            return None
-        return _local_workspace_path(_argument_value(argv, "-C", "--cd"), cwd=cwd)
+        return _local_workspace_path(_codex_workspace_argument(argv), cwd=cwd)
     if executable in MUTATING_AGENT_EXECUTABLES - {"codex"}:
-        permission_mode = _argument_value(argv, "--permission-mode")
-        if permission_mode in READ_ONLY_AGENT_MODES:
-            return None
         return _local_workspace_path(None, cwd=cwd)
     # Framework-managed writers already hold a workspace-level lease owned by
     # their workspace lifecycle. Inferring a second task-owned lease here would
@@ -3838,14 +4692,6 @@ def _validate_task_effect_profile(value: str | None) -> str | None:
     return value
 
 
-def _agent_read_only(argv: list[str], executable: str) -> bool:
-    if "--read-only" in argv:
-        return True
-    if executable == "codex":
-        return _argument_value(argv, "--sandbox", "-s") in READ_ONLY_AGENT_MODES
-    return _argument_value(argv, "--permission-mode") in READ_ONLY_AGENT_MODES
-
-
 def _classify_task_effect(
     *,
     transport: str,
@@ -3856,7 +4702,6 @@ def _classify_task_effect(
     explicit = _validate_task_effect_profile(explicit_effect_profile)
     executable = Path(argv[0]).name.lower()
     declared_agent = executable in MUTATING_AGENT_EXECUTABLES
-    read_only_mode = declared_agent and _agent_read_only(argv, executable)
 
     if declared_agent and explicit == "unknown":
         raise ValueError(
@@ -3877,7 +4722,7 @@ def _classify_task_effect(
         }
 
     if transport != "local":
-        derived = "read_only" if read_only_mode else "remote_write"
+        derived = "remote_write"
         if explicit is not None and explicit != derived:
             raise ValueError(
                 f"effect_profile={explicit} conflicts with derived agent profile {derived}"
@@ -3887,22 +4732,6 @@ def _classify_task_effect(
             "policy_version": TASK_EFFECT_CLASSIFICATION_POLICY_VERSION,
             "surface": TASK_EFFECT_CLASSIFICATION_SURFACE,
             "effect_profile": derived,
-            "agent_executable": executable,
-            "classification_source": (
-                "explicit" if explicit is not None else "agent_command"
-            ),
-        }
-
-    if read_only_mode:
-        if explicit is not None and explicit != "read_only":
-            raise ValueError(
-                f"effect_profile={explicit} conflicts with read-only agent mode"
-            )
-        return {
-            "schema_version": 1,
-            "policy_version": TASK_EFFECT_CLASSIFICATION_POLICY_VERSION,
-            "surface": TASK_EFFECT_CLASSIFICATION_SURFACE,
-            "effect_profile": "read_only",
             "agent_executable": executable,
             "classification_source": (
                 "explicit" if explicit is not None else "agent_command"
@@ -3987,6 +4816,135 @@ def _record_task_effect_classification(
         return None
     value = launcher.get("task_effect_classification")
     return dict(value) if isinstance(value, dict) else None
+
+
+
+TASK_EFFECT_START_KEY_PREFIX = "task_effect_start:"
+
+
+def _store_task_effect_start(
+    connection: sqlite3.Connection,
+    record: dict[str, Any],
+    *,
+    classification: dict[str, Any],
+    transport: str,
+) -> None:
+    """Create-only, atomically with the initial task row, before dispatch."""
+    original = {
+        "schema_version": 1,
+        "task_id": record["task_id"],
+        "argv_sha256": record["argv_sha256"],
+        "agent_executable": classification["agent_executable"],
+        "host": record["host"],
+        "transport": transport,
+        "cwd": record["cwd"],
+        "classification": dict(classification),
+    }
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?)",
+        (
+            f"{TASK_EFFECT_START_KEY_PREFIX}{record['task_id']}",
+            _canonical_json(original),
+        ),
+    )
+
+
+def _verified_task_effect_start(
+    record: dict[str, Any], *, command: list[str] | None = None,
+    enforce_transport_at_execution: bool = False,
+) -> dict[str, Any] | None:
+    """Fail closed for coding agents if their create-only start decision drifts."""
+    if command is None:
+        try:
+            command = json.loads(str(record["argv_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("persisted agent identity is invalid") from exc
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(item, str) for item in command)
+    ):
+        raise RuntimeError("persisted agent identity is invalid")
+    executable = Path(command[0]).name.lower()
+    launcher_classification = _record_task_effect_classification(record)
+    agent_known = (
+        executable in MUTATING_AGENT_EXECUTABLES
+        or (
+            launcher_classification is not None
+            and launcher_classification.get("agent_executable")
+            in MUTATING_AGENT_EXECUTABLES
+        )
+    )
+    # Do not decide whether the original task was an agent using mutable
+    # argv_json/launcher_json: both can be spoofed to hide an agent attempt.
+    with _database_connection() as connection:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (f"{TASK_EFFECT_START_KEY_PREFIX}{record['task_id']}",),
+        ).fetchone()
+    if row is None:
+        # Mutable legacy-looking argv/launcher fields cannot prove an
+        # original non-agent effect. Allow observation but never re-execute
+        # an unanchored historical or tampered task.
+        raise RuntimeError("unverified agent effect: original start decision is missing")
+    try:
+        original = json.loads(str(row["value"]))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("unverified agent effect: original start decision is invalid") from exc
+    if (
+        not isinstance(original, dict)
+        or set(original) != {
+            "schema_version", "task_id", "argv_sha256", "agent_executable",
+            "host", "transport", "cwd", "classification",
+        }
+        or type(original["schema_version"]) is not int
+        or original["schema_version"] != 1
+        or original["task_id"] != record["task_id"]
+        or original["host"] != record["host"]
+        or original["cwd"] != record["cwd"]
+        or not isinstance(original["classification"], dict)
+    ):
+        raise RuntimeError("unverified agent effect: original start decision is invalid")
+    # All persisted commands must retain their create-only command/effect/
+    # transport identity; a renamed agent may look like a non-agent.
+    if original["agent_executable"] is None and not agent_known:
+        if (
+            command_identity.argv_sha256(command) != original["argv_sha256"]
+            or str(record["argv_sha256"]) != original["argv_sha256"]
+        ):
+            raise RuntimeError("persisted nonagent identity disagrees with original argv")
+        if (
+            enforce_transport_at_execution
+            and original["transport"] != fleet.fleet_host(str(record["host"]))["transport"]
+        ):
+            raise RuntimeError("original nonagent effect transport no longer matches host")
+        if launcher_classification != original["classification"]:
+            raise RuntimeError("persisted nonagent effect profile disagrees with original start decision")
+        return dict(original["classification"])
+    if (
+        command_identity.argv_sha256(command) != original["argv_sha256"]
+        or str(record["argv_sha256"]) != original["argv_sha256"]
+    ):
+        raise RuntimeError("persisted agent identity disagrees with original argv")
+    original_executable = original["agent_executable"]
+    if original_executable is None:
+        if agent_known or original["classification"].get("agent_executable") is not None:
+            raise RuntimeError("persisted agent identity mismatches original start decision")
+    elif (
+        not isinstance(original_executable, str)
+        or original_executable not in MUTATING_AGENT_EXECUTABLES
+        or original_executable != executable
+    ):
+        raise RuntimeError("persisted agent identity mismatches original start decision")
+    if original["transport"] != fleet.fleet_host(str(record["host"]))["transport"]:
+        raise RuntimeError("original agent effect transport no longer matches host")
+    if launcher_classification is None:
+        raise RuntimeError("unverified agent effect: launcher classification is missing")
+    if launcher_classification.get("agent_executable") != original_executable:
+        raise RuntimeError("persisted agent identity mismatches original executable")
+    if launcher_classification != original["classification"]:
+        raise RuntimeError("persisted agent effect profile disagrees with original start decision")
+    return dict(original["classification"])
 
 
 def _server_verified_task_read_route(
@@ -5731,6 +6689,191 @@ def _effective_observed_state(record: dict[str, Any], observed_state: str) -> st
     return stored_state if _is_terminal_state(stored_state) else observed_state
 
 
+def _attested_local_revoked_task_unit(
+    record: dict[str, Any], *, post_stop: bool = False,
+) -> dict[str, Any]:
+    """Read an exact local task unit without treating a missing fleet as authority.
+
+    Stop-only recovery for a previously persisted literal local task. This
+    never authorizes a start, resume, network route, or a restored resource lease.
+    """
+    task_id = _validate_task_id(str(record["task_id"]))
+    attempt = record.get("attempt")
+    if (
+        record.get("host") != "local"
+        or _execution_backend(record) != "systemd-user"
+        or _systemd_scope(record) != "user"
+        or type(attempt) is not int
+        or attempt < 1
+        or _authoritative_unit(record) != _task_unit(task_id, attempt)
+    ):
+        raise RuntimeError("missing-fleet fallback lacks local task identity")
+    unit = _authoritative_unit(record)
+    description = operator._systemd_safe_description(
+        "task", unit, str(record["argv_sha256"]),
+    )
+    result = operator._run(
+        [
+            "systemctl", "--user", "show", unit, "--no-pager",
+            "--property=Id", "--property=Description",
+            "--property=LoadState", "--property=ActiveState",
+            "--property=SubState", "--property=MainPID",
+        ],
+        cwd=operator.HOME, timeout_seconds=30, max_output_bytes=8192,
+    )
+    if (
+        result.get("returncode") != 0
+        or result.get("outcome_unknown") is True
+        or not isinstance(result.get("stdout"), str)
+    ):
+        raise RuntimeError("missing-fleet local unit observation unavailable")
+    properties: dict[str, str] = {}
+    for line in result["stdout"].splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            properties[key] = value
+    disappeared = (
+        post_stop
+        and properties.get("LoadState") == "not-found"
+        and properties.get("ActiveState") == "inactive"
+        and properties.get("SubState") == "dead"
+        and properties.get("MainPID") == "0"
+    )
+    if (
+        properties.get("Id") != unit
+        or not disappeared
+        and (
+            properties.get("Description") != description
+            or properties.get("LoadState") != "loaded"
+        )
+    ):
+        raise RuntimeError("missing-fleet local unit is not the attested task")
+    stopped = (
+        properties.get("ActiveState") in {"inactive", "failed"}
+        and properties.get("SubState") in {"dead", "failed"}
+        and properties.get("MainPID") == "0"
+    )
+    return {
+        "state": "cancelled" if stopped else "running",
+        "properties": properties,
+        "observer": {"kind": "attested-local-systemd-stop-recovery-v1"},
+        "observed_at_unix": _now(),
+    }
+
+
+def _stop_task_after_lease_revocation(record: dict[str, Any]) -> dict[str, Any]:
+    """Stop the authoritative systemd cgroup before treating a lost lease as inert.
+
+    A running process cannot regain write authority through a status read.
+    Neither a stop request nor a reported state alone is proof: require the
+    actual unit to have left the active/deactivating states after the stop.
+    """
+    result: dict[str, Any] | None = None
+    observed: dict[str, Any] | None = None
+    error: str | None = None
+    try:
+        unit = _authoritative_unit(record)
+        # This function is reachable from task_status. Observation alone is
+        # not stop authority. A blockade or invalid audit MUST prohibit the
+        # dispatch and leave an explicitly uncertain task outcome.
+        operator._require_operator_mutation(
+            "durable_job",
+            path=(record.get("cwd") if isinstance(record.get("cwd"), str) else None),
+            task_id=_validate_task_id(str(record["task_id"])),
+            owner_id=str(record.get("lease_owner_id") or _lease_owner(record["task_id"])),
+            service=unit,
+            host=str(record["host"]),
+        )
+        if _is_root_systemd_backend(record):
+            result = privileged.root_task_systemd_request(
+                _root_task_payload(record, "stop"), timeout_seconds=60,
+            )
+        else:
+            host, target, _ = _resolve_task_dispatch_host(str(record["host"]))
+            if target["transport"] == "local":
+                result = operator._run_mutating_user_systemd_unit(
+                    unit, "stop", mutation_timeout_seconds=60,
+                    max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+                )
+            else:
+                result = _dispatch(
+                    host, ["systemctl", "--user", "stop", unit],
+                    timeout_seconds=60,
+                )
+        if (
+            isinstance(result, dict)
+            and result.get("returncode") == 0
+            and result.get("outcome_unknown") is not True
+        ):
+            observed = _observe(record)
+    except Exception as exc:
+        error = _redact_reason(f"{type(exc).__name__}: {exc}")
+        # Fleet configuration can disappear after an admitted local task has
+        # started. That must not leave a still-running cgroup uncontrolled.
+        # The alternate path requires the *exact* local unit description.
+        if isinstance(exc, RuntimeError) and str(exc).startswith("Fleet registry missing:"):
+            try:
+                before = _attested_local_revoked_task_unit(record)
+                if before["state"] == "running":
+                    result = operator._run_mutating_user_systemd_unit(
+                        _authoritative_unit(record), "stop",
+                        mutation_timeout_seconds=60,
+                        max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+                    )
+                    if (
+                        isinstance(result, dict)
+                        and result.get("returncode") == 0
+                        and result.get("outcome_unknown") is not True
+                    ):
+                        observed = _attested_local_revoked_task_unit(
+                            record, post_stop=True,
+                        )
+                        error = None
+                else:
+                    result = {"returncode": 0, "outcome_unknown": False}
+                    observed = before
+                    error = None
+            except Exception as fallback_exc:
+                error = _redact_reason(
+                    f"{type(exc).__name__}: {exc}; "
+                    f"local-stop-recovery={type(fallback_exc).__name__}: {fallback_exc}"
+                )
+    properties = observed.get("properties") if isinstance(observed, dict) else None
+    stop_verified = bool(
+        isinstance(properties, dict)
+        and properties.get("ActiveState") in {"inactive", "failed"}
+        and properties.get("SubState") in {"dead", "failed"}
+        and observed.get("state") not in {"running", "outcome_unknown"}
+    )
+    return {
+        "stop_verified": stop_verified,
+        "state_override": "cancelled" if stop_verified else "outcome_unknown",
+        "stop_returncode": result.get("returncode") if isinstance(result, dict) else None,
+        "stop_outcome_unknown": (
+            result.get("outcome_unknown") if isinstance(result, dict) else None
+        ),
+        "post_stop_active_state": (
+            properties.get("ActiveState") if isinstance(properties, dict) else None
+        ),
+        "post_stop_sub_state": (
+            properties.get("SubState") if isinstance(properties, dict) else None
+        ),
+        "stop_error": error,
+    }
+
+
+def _enforced_lease_state(
+    observed_state: str, maintenance: dict[str, Any] | None,
+) -> str:
+    """Use explicit cgroup-stop proof or preserve outcome uncertainty."""
+    if isinstance(maintenance, dict) and maintenance.get("maintained") is False:
+        override = maintenance.get("state_override")
+        if override in {"cancelled", "outcome_unknown"}:
+            return str(override)
+        return "outcome_unknown"
+    return observed_state
+
+
 @_serialize_task_mutation
 def _maintain_record_resources(
     record: dict[str, Any],
@@ -5751,58 +6894,24 @@ def _maintain_record_resources(
             "mode": "renewed",
             "expires_at_unix": (
                 min(int(item["expires_at_unix"]) for item in leases)
-                if leases
-                else None
+                if leases else None
             ),
         }
-    except (resources.ResourceLeaseMissing, resources.ResourceLeaseExpired):
-        # A lease may be missing or have expired between observations. Reacquire
-        # only when the resource is still free; a foreign owner remains a hard
-        # conflict.
-        try:
-            repository_resource = _task_repository_resource(keys)
-            implicit_workspace_resource = _record_implicit_workspace_resource(
-                record, repository_resource
-            )
-            repository_scope_manifest = _record_repository_scope_manifest(
-                record, repository_resource
-            )
-            acquired = resources.acquire_resources(
-                owner,
-                keys,
-                purpose=f"persistent task {record['task_id']}",
-                ttl_seconds=ttl,
-                metadata=_task_lease_metadata(
-                    task_id=str(record["task_id"]),
-                    host=str(record["host"]),
-                    attempt=int(record["attempt"]),
-                    repository_resource=repository_resource,
-                    implicit_workspace_resource=implicit_workspace_resource,
-                    repository_scope_manifest=repository_scope_manifest,
-                    recovered_after_expiry=True,
-                ),
-                _preserve_live_same_owner=True,
-            )
-        except Exception as exc:
-            return {
-                "maintained": False,
-                "mode": "failed",
-                "error": _redact_reason(f"{type(exc).__name__}: {exc}"),
-            }
-        return {
-            "maintained": True,
-            "mode": "reconciled" if acquired.get("preserved") else "reacquired",
-            "expires_at_unix": acquired.get("expires_at_unix"),
-        }
     except Exception as exc:
-        # Ownership drift is evidence, not a reason to hide task status. Keep
-        # the task observable and surface the lease failure explicitly.
+        # Revocation, expiry, foreign takeover or unavailable authority must
+        # never be silently healed for a possibly still-running unit. Only
+        # explicit, separately authenticated recovery may acquire a new grant.
+        stop = _stop_task_after_lease_revocation(record)
         return {
             "maintained": False,
-            "mode": "failed",
+            "mode": (
+                "revoked_stopped"
+                if stop["stop_verified"]
+                else "revoked_stop_unverified"
+            ),
             "error": _redact_reason(f"{type(exc).__name__}: {exc}"),
+            **stop,
         }
-
 
 def _validate_command(argv: list[str]) -> list[str]:
     command = operator._validate_argv(argv, cwd=operator.HOME)
@@ -6006,16 +7115,12 @@ def _task_output_capture_script_path() -> Path:
 
 
 def _task_output_capture_script() -> Path:
-    """Materialize the output capture wrapper on this host and return its path.
+    """Stage the legacy/remote capture wrapper, never local ExecStart code.
 
-    The wrapper must not be handed to the interpreter with ``-c``. systemd
-    serializes every transient unit back to disk, and a single ExecStart
-    argument of ``TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES`` bytes or more cannot
-    be re-read from that file. The unit then loads as ``bad-setting`` after the
-    next daemon-reload, so its status can no longer be read back and its
-    remains can no longer be cleaned up. The file name carries the payload
-    digest, so a changed wrapper writes a new file instead of mutating a path
-    that a running task may still be executing.
+    Local task ExecStart uses _task_output_capture_pinned_argv, with trusted
+    source hash-bound across bounded argument chunks. This owner-writable
+    file remains a remote-transport compatibility artifact and must not be
+    executed before the local task's kernel sandbox.
     """
     payload = TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")
     path = _task_output_capture_script_path()
@@ -6109,9 +7214,319 @@ def _stage_task_output_capture_script(host: str, *, transport: str) -> dict[str,
     }
 
 
+def _task_small_owned_git_file(path: Path) -> str:
+    """Read one exact regular Git metadata file through a bounded O_NOFOLLOW fd."""
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("Git backlink nofollow support is unavailable")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or not 1 <= metadata.st_size <= 4096
+        ):
+            raise ValueError("Git backlink is not a bounded owned regular file")
+        value = os.read(fd, 4097)
+        if len(value) != metadata.st_size:
+            raise ValueError("Git backlink changed during read")
+        return value.decode("utf-8").strip()
+    finally:
+        os.close(fd)
+
+
+def _task_linked_git_common_dir(workspace: Path) -> Path | None:
+    """Read an exact linked-checkout backlink, not a caller-provided Git path.
+
+    The .git file and its external gitdir must agree in both directions before
+    a directory outside the read-only workspace becomes visible to the child.
+    Invalid or unversioned workspaces receive no external Git bind.
+    """
+    marker = workspace / ".git"
+    try:
+        reference = _task_small_owned_git_file(marker)
+        if not reference.startswith("gitdir: "):
+            return None
+        gitdir_path = Path(reference.removeprefix("gitdir: "))
+        if not gitdir_path.is_absolute() or gitdir_path.is_symlink():
+            return None
+        gitdir = gitdir_path.resolve(strict=True)
+        if gitdir.parent.name != "worktrees" or gitdir.parent.parent.name != ".git":
+            return None
+        common = gitdir.parent.parent
+        if common.is_symlink() or not common.is_dir():
+            return None
+        if not common.is_relative_to((operator.HOME / "repos").resolve(strict=True)):
+            return None
+        marker_backlink = Path(_task_small_owned_git_file(gitdir / "gitdir"))
+        common_backlink = _task_small_owned_git_file(gitdir / "commondir")
+        if (
+            marker_backlink.resolve(strict=True) != marker.resolve(strict=True)
+            or (gitdir / common_backlink).resolve(strict=True) != common
+        ):
+            return None
+        return common
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def _verified_runtime_refresh_executor_launch(
+    record: dict[str, Any], command: list[str]
+) -> None:
+    """Require the stored Bureau intent, exact task attempt and live unit-bound leases.
+
+    The executable module name establishes no authority. Only the server-issued
+    reserved request, its durable launch binding and matching live lease metadata
+    can admit this explicit host-write exception to the user namespace sandbox.
+    """
+    if not record.get("unit") and not record.get("authoritative_unit"):
+        raise PermissionError("Bureau executor task has no verified unit")
+    task_id = str(record["task_id"])
+    unit = _authoritative_unit(record)
+    if (
+        record.get("host") != "local"
+        or record.get("cwd") != str(operator.HOME)
+        or record.get("execution_backend") != "systemd-user"
+        or record.get("systemd_scope") != "user"
+        or record.get("resume_policy") != "never"
+        or type(record.get("attempt")) is not int
+        or record["attempt"] != 1
+        or record.get("lease_owner_id") != _lease_owner(task_id)
+        or record.get("argv_json") != _canonical_json(command)
+        or record.get("argv_sha256") != command_identity.argv_sha256(command)
+    ):
+        raise PermissionError("Bureau executor task has no verified original launch authority")
+    request = bureau_runtime_refresh_executor.parse_executor_module_request(command)
+    if command != bureau_runtime_refresh_executor.build_executor_command(
+        request, runtime_python=GRABOWSKI_RUNTIME_PYTHON
+    ):
+        raise PermissionError("Bureau executor command is not the server-issued command")
+    intent = bureau_runtime_refresh_executor.load_bound_intent(request)
+    approval = bureau_runtime_refresh_executor.validate_authority_execution_contract(
+        intent
+    )
+    expected = _runtime_refresh_prelaunch_lease_binding_request(
+        request, intent, approval, task_id, unit
+    )
+    try:
+        launcher = json.loads(record["launcher_json"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PermissionError("Bureau executor launch receipt is missing") from exc
+    if not isinstance(launcher, dict):
+        raise PermissionError("Bureau executor launch receipt is invalid")
+    binding = launcher.get("runtime_refresh_executor_lease_binding")
+    if not isinstance(binding, dict) or set(binding) != {
+        "schema_version", "kind", "intent_sha256", "request_sha256",
+        "binding_sha256", "binding_plan_sha256", "journal_sha256",
+        "executor_unit", "resource_count", "resource_keys_sha256",
+        "minimum_remaining_seconds", "evidence_sha256",
+    }:
+        raise PermissionError("Bureau executor has no persisted server lease binding")
+    material = {key: value for key, value in binding.items() if key != "evidence_sha256"}
+    if (
+        binding["schema_version"] != 1
+        or binding["kind"] != "grabowski_bureau_runtime_refresh_prelaunch_lease_binding"
+        or binding["evidence_sha256"] != _sha256_json(material)
+        or binding["intent_sha256"] != expected["intent_sha256"]
+        or binding["request_sha256"] != expected["request_sha256"]
+        or binding["executor_unit"] != unit
+        or binding["resource_count"] != len(expected["resource_keys"])
+        or binding["resource_keys_sha256"] != _sha256_json(expected["resource_keys"])
+        or binding["minimum_remaining_seconds"] != expected["minimum_remaining_seconds"]
+        or any(
+            not isinstance(binding[key], str) or SHA256.fullmatch(binding[key]) is None
+            for key in ("binding_sha256", "binding_plan_sha256", "journal_sha256")
+        )
+    ):
+        raise PermissionError("Bureau executor persisted lease binding has drifted")
+    keys = expected["resource_keys"]
+    if not 1 <= len(keys) <= 128:
+        raise PermissionError("Bureau executor has an unsupported resource scope")
+    with resources._database() as connection:
+        rows = connection.execute(
+            "SELECT * FROM leases WHERE resource_key IN ("
+            + ",".join("?" for _ in keys) + ") ORDER BY resource_key",
+            keys,
+        ).fetchall()
+    if len(rows) != len(keys):
+        raise PermissionError("Bureau executor is missing live resource leases")
+    minimum_expiry = _now() + int(record["runtime_seconds"]) + 10
+    for key, row in zip(keys, rows, strict=True):
+        metadata = resources._row_metadata(row)
+        _, observed_sha256 = resources._metadata(metadata)
+        if (
+            row["resource_key"] != key
+            or row["owner_id"] != expected["lease_owner"]
+            or row["expires_at_unix"] <= minimum_expiry
+            or row["metadata_sha256"] != observed_sha256
+            or metadata.get("intent_sha256") != expected["intent_sha256"]
+            or metadata.get("approval_task_id") != expected["lease_task_id"]
+            or metadata.get("executor_unit") != unit
+        ):
+            raise PermissionError("Bureau executor no longer holds its live unit-bound leases")
+
+
+def _task_sandboxed_command_argv(
+    record: dict[str, Any], command: list[str]
+) -> list[str]:
+    """Confine the untrusted child, not the trusted host-side output capture.
+
+    A process name and caller-declared effect are not confinement evidence.
+    This function is called for every local user-service attempt, including
+    re-launches, after verifying the immutable create-only start decision.
+    """
+    classification = _verified_task_effect_start(
+        record, command=command, enforce_transport_at_execution=True
+    )
+    if classification is None:
+        raise RuntimeError("task execution has no verified effect classification")
+    effect = classification["effect_profile"]
+    transport = fleet.fleet_host(str(record["host"]))["transport"]
+    if transport != "local":
+        if effect in {"read_only", "workspace_write", "repository_write"}:
+            raise RuntimeError("remote task has no verified filesystem sandbox")
+        # Non-local tasks retain a distinct non-isolated authority contract.
+        return command
+
+    if bureau_runtime_refresh_executor.is_executor_module_command(command):
+        if effect not in {"unknown", "host_write"}:
+            raise RuntimeError("reserved executor has conflicting effect profile")
+        _verified_runtime_refresh_executor_launch(record, command)
+        return command
+    if effect not in {"read_only", "unknown", "workspace_write", "repository_write"}:
+        raise RuntimeError("local task effect requires a verified sandbox route")
+
+    workspace = Path(str(record["cwd"]))
+    hide_operator_home = workspace.resolve(strict=True) == operator.HOME.resolve(strict=True)
+    if hide_operator_home and effect in {"workspace_write", "repository_write"}:
+        raise RuntimeError("operator home cannot be a writable task workspace")
+    writable_paths: list[Path] = []
+    if effect in {"workspace_write", "repository_write"}:
+        resource_keys = _record_resource_keys(record)
+        write_keys: list[str] = []
+        for key in resource_keys:
+            if not key.startswith("path:"):
+                continue
+            allowed = Path(key.removeprefix("path:"))
+            if allowed != workspace and allowed.is_relative_to(workspace):
+                write_keys.append(key)
+                writable_paths.append(allowed)
+        if not write_keys:
+            raise RuntimeError("workspace writer requires bounded path leases")
+        owner = str(record.get("lease_owner_id") or _lease_owner(record["task_id"]))
+        active = resources.inspect_resources(write_keys)
+        if any(active.get(key, {}).get("owner_id") != owner for key in write_keys):
+            raise RuntimeError("workspace writer has missing or foreign path leases")
+        runtime_seconds = record.get("runtime_seconds")
+        if type(runtime_seconds) is not int or runtime_seconds <= 0:
+            raise RuntimeError("workspace writer has no bounded task runtime")
+        # Systemd runs at most RuntimeMaxSec, then needs 10s to stop the cgroup.
+        # Refuse mounts whose underlying live authority could expire earlier.
+        min_expiry = _now() + runtime_seconds + 10
+        if any(
+            type(active[key].get("expires_at_unix")) is not int
+            or active[key]["expires_at_unix"] <= min_expiry
+            for key in write_keys
+        ):
+            raise RuntimeError("workspace writer lease lifetime is shorter than runtime and stop grace")
+
+    # Read-only dependencies are strictly selected by the server's own runtime
+    # binary or an exact two-way linked-checkout backlink. Neither binding
+    # grants a new writable mount, regardless of a caller-declared effect.
+    read_only: list[tuple[Path, Path]] = []
+    external_directories: set[Path] = set()
+    if command[0] == str(GRABOWSKI_RUNTIME_PYTHON):
+        if hide_operator_home:
+            raise RuntimeError("operator home task cannot expose a private Python runtime")
+        runtime_root = GRABOWSKI_RUNTIME_PYTHON.parent.parent
+        read_only.append((runtime_root, runtime_root))
+        external_directories.update(
+            parent for parent in runtime_root.parents if parent != Path("/")
+        )
+    git_common_dir = None if hide_operator_home else _task_linked_git_common_dir(workspace)
+    if git_common_dir is not None:
+        external_directories.update(
+            parent for parent in git_common_dir.parents if parent != Path("/")
+        )
+
+    # No host bind is writable by default. A recognized executable, copied
+    # binary, interpreter script or unknown carrier receives the same mount
+    # restrictions. bwrap must execute successfully; no naked-command fallback.
+    return agent_sandbox.minimal_sandbox_argv(
+        workspace=workspace,
+        command=command,
+        workspace_writable=bool(writable_paths),
+        mount_workspace=not hide_operator_home,
+        writable_paths=writable_paths,
+        git_common_dir=git_common_dir,
+        extra_read_only=read_only,
+        extra_directories=sorted(external_directories, key=str),
+    )
+
+
+def _task_output_capture_pinned_argv(
+    directory: str, command: list[str],
+) -> list[str]:
+    """Bind the trusted local capture code in immutable ExecStart arguments.
+
+    systemd cannot persist a >=4096-byte *single* argument, so split only
+    the operator-owned source into bounded base64 chunks. The short fixed
+    Python bootstrap embeds its expected SHA-256 and fails closed on any
+    altered chunk. Unlike a staged owner-writable script, no file is reopened
+    before the outer capture program executes outside the task sandbox.
+    """
+    encoded_source = TASK_OUTPUT_CAPTURE_CODE.encode("utf-8")
+    if not 1 <= len(encoded_source) <= 32 * 1024:
+        raise RuntimeError("Task capture inline source exceeds fixed size limit")
+    digest = hashlib.sha256(encoded_source).hexdigest()
+    encoded = base64.b64encode(encoded_source).decode("ascii")
+    chunk_size = 3072
+    chunks = [
+        encoded[offset:offset + chunk_size]
+        for offset in range(0, len(encoded), chunk_size)
+    ]
+    if not 1 <= len(chunks) <= 16:
+        raise RuntimeError("Task capture source has unsupported chunk count")
+    bootstrap = (
+        "import base64,hashlib,sys\n"
+        "n=int(sys.argv[1])\n"
+        "if not 1<=n<=16 or len(sys.argv)<n+6:raise SystemExit(125)\n"
+        "try: raw=base64.b64decode(''.join(sys.argv[2:2+n]),validate=True)\n"
+        "except (ValueError,TypeError):raise SystemExit(125)\n"
+        "if len(raw)>32768 or hashlib.sha256(raw).hexdigest()!=" + repr(digest) + ":raise SystemExit(125)\n"
+        "sys.argv=['-c',*sys.argv[2+n:]]\n"
+        "exec(compile(raw.decode('utf-8'),'<grabowski-capture>','exec'),{'__name__':'__main__'})\n"
+    )
+    argv = [
+        TASK_OUTPUT_CAPTURE_PYTHON,
+        "-I", "-S", "-c", bootstrap, str(len(chunks)), *chunks,
+        directory, str(TASK_OUTPUT_MAX_BYTES), str(TASK_OUTPUT_TAIL_BYTES),
+        *command,
+    ]
+    if any(
+        not isinstance(arg, str)
+        or len(arg.encode("utf-8")) >= TASK_OUTPUT_CAPTURE_ARGUMENT_MAX_BYTES
+        or chr(0) in arg
+        for arg in argv
+    ):
+        raise RuntimeError("Task capture argv exceeds systemd persistence bounds")
+    return argv
+
+
 def _task_output_capture_argv(record: dict[str, Any]) -> list[str]:
     command = json.loads(record["argv_json"])
+    command = _task_sandboxed_command_argv(record, command)
     paths = _task_output_paths(record)
+    # Remote hosts keep their distinct typed staging protocol. Only local
+    # sandboxed tasks previously executed the replaceable capture script in
+    # front of the kernel-confined inner command.
+    transport = (
+        fleet.fleet_host(str(record["host"]))["transport"]
+        if record.get("host") else "local"
+    )
+    if transport == "local":
+        return _task_output_capture_pinned_argv(str(paths["directory"]), command)
     return [
         TASK_OUTPUT_CAPTURE_PYTHON,
         str(_task_output_capture_script_path()),
@@ -6776,14 +8191,27 @@ def _launch(record: dict[str, Any]) -> dict[str, Any]:
             "launch_not_dispatched": True,
             "privileged_broker": None,
         }
-    return _dispatch(
-        record["host"],
-        _launch_argv(
+    try:
+        launch_argv = _launch_argv(
             record,
             include_managed_runtime=target["transport"] == "local",
-        ),
-        timeout_seconds=60,
-    )
+        )
+    except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+        # A failed sandbox/lease/identity preflight is an undispatched attempt,
+        # never a request to retry the original command without isolation.
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": _redact_reason(f"{type(exc).__name__}: {exc}"),
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "root_truth_observable": False,
+            "outcome_unknown": False,
+            "launch_not_dispatched": True,
+            "privileged_broker": None,
+        }
+    return _dispatch(record["host"], launch_argv, timeout_seconds=60)
 
 
 def _launch_state(result: dict[str, Any]) -> str:
@@ -6801,6 +8229,33 @@ def _row_raw(task_id: str) -> dict[str, Any]:
     if row is None:
         raise ValueError(f"Unknown task: {identifier}")
     return dict(row)
+
+
+
+def _row_scope_identity_readonly(task_id: str) -> dict[str, Any]:
+    """Read mutation-gate scope without touching the authoritative task store.
+
+    _row_raw uses _database(), which may migrate the schema, create WAL and
+    indexes, or chmod files before a scoped blockade has been checked. The
+    authority reader uses immutable access or an isolated read-only WAL
+    snapshot without any host temporary files
+    and rejects changed source identities without opening a write connection.
+    """
+    identifier = _validate_task_id(task_id)
+    if TASK_DB.parent.is_symlink():
+        raise PermissionError(f"Task state directory may not be a symlink: {TASK_DB.parent}")
+    if TASK_DB.is_symlink():
+        raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
+    with sqlite_store.preauthorization_readonly_sqlite(
+        TASK_DB, error_type=TaskSchemaInventoryChanged
+    ) as connection:
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (identifier,)
+        ).fetchone()
+        record = dict(row) if row is not None else None
+    if record is None:
+        raise ValueError(f"Unknown task: {identifier}")
+    return record
 
 
 def _terminal_projection(
@@ -6837,6 +8292,53 @@ def _terminal_projection(
     }
 
 
+def _require_terminalization_projection_scope(
+    record: dict[str, Any], task_id: str, projection: dict[str, Any]
+) -> None:
+    """Authorize the current task scope and every projected systemd unit."""
+    admission = {
+        "path": record["cwd"],
+        "repo": record["cwd"],
+        "task_id": task_id,
+        "owner_id": record.get("lease_owner_id") or _lease_owner(task_id),
+        "host": record["host"],
+    }
+    checked_services: set[str] = set()
+    for service in (
+        _authoritative_unit(record),
+        _validate_unit(str(projection["unit"])),
+        _validate_unit(str(projection["authoritative_unit"])),
+    ):
+        if service not in checked_services:
+            operator._require_operator_mutation(
+                "durable_job", service=service, **admission
+            )
+            checked_services.add(service)
+
+
+def _terminalization_source_identity() -> tuple[sqlite_store.FileIdentity | None, ...]:
+    """Read source and WAL sidecar identities without SQLite or host writes.
+
+    Between snapshot authorization and the writable connection, a new WAL,
+    SHM or database inode invalidates the authorization. This check also
+    precedes the first query on a writable SQLite connection, since a SELECT
+    itself can create a host-side -shm for an uncheckpointed WAL.
+    """
+    identities: list[sqlite_store.FileIdentity | None] = []
+    for path in (TASK_DB, Path(str(TASK_DB) + "-wal"), Path(str(TASK_DB) + "-shm")):
+        try:
+            status = path.lstat()
+        except FileNotFoundError:
+            if path == TASK_DB:
+                raise TaskSchemaInventoryChanged("Task database disappeared before authorization")
+            identities.append(None)
+            continue
+        if not stat.S_ISREG(status.st_mode):
+            raise TaskSchemaInventoryChanged("Task database identity changed before authorization")
+        identities.append(sqlite_store.status_identity(status))
+    return tuple(identities)
+
+
 def _apply_terminalization_projection(
     terminalization: dict[str, Any], *, recovered: bool = False
 ) -> dict[str, Any]:
@@ -6856,7 +8358,37 @@ def _apply_terminalization_projection(
     transition_sha256 = terminalization.get("transition_sha256")
     if not isinstance(transition_sha256, str) or SHA256.fullmatch(transition_sha256) is None:
         raise RuntimeError("Task terminalization digest is invalid")
-    with _database_connection() as connection:
+    # _database_connection() may repair schema, create WAL/SHM or chmod the
+    # task DB. Record the DB/WAL/SHM identity before the safe read-only
+    # snapshot: even a SELECT on a writable WAL connection can create -shm.
+    source_identity = _terminalization_source_identity()
+    preflight_record = _row_scope_identity_readonly(task_id)
+    _require_terminalization_projection_scope(preflight_record, task_id, projection)
+    def check_source_before_preflight() -> None:
+        if _terminalization_source_identity() != source_identity:
+            raise TaskSchemaInventoryChanged("Task store changed after scoped preauthorization")
+
+    check_source_before_preflight()
+
+    def check_open_connection(connection: sqlite3.Connection) -> None:
+        # Check for post-authorization source drift before the first query.
+        # The actual opened row is still reauthorized before any UPDATE.
+        opened_source = _terminalization_source_identity()
+        # Do not issue even a SELECT if a WAL or SHM sidecar appeared
+        # since the scope was admitted; that SELECT could itself create SHM.
+        if opened_source != source_identity:
+            raise TaskSchemaInventoryChanged("Task store changed before writable row check")
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown task: {task_id}")
+        _require_terminalization_projection_scope(dict(row), task_id, projection)
+
+    with _database_connection(
+        before_write=check_open_connection,
+        before_preflight=check_source_before_preflight,
+    ) as connection:
         connection.execute("BEGIN IMMEDIATE")
         current = connection.execute(
             "SELECT * FROM tasks WHERE task_id=?", (task_id,)
@@ -6865,6 +8397,10 @@ def _apply_terminalization_projection(
             connection.rollback()
             raise ValueError(f"Unknown task: {task_id}")
         current_record = dict(current)
+        # Page/status preauthorization may refer to a different pathname
+        # image. Authorize the row bound to THIS writable connection before
+        # committing its projection, receipt or resource-store effects.
+        _require_terminalization_projection_scope(current_record, task_id, projection)
         existing_digest = current_record.get("terminalization_sha256")
         if existing_digest not in {None, transition_sha256}:
             connection.rollback()
@@ -6991,11 +8527,39 @@ def _terminalization_recovery_position(
 
 
 def _load_terminalization_recovery_cycle() -> dict[str, Any] | None:
-    with _database_connection() as connection:
-        row = connection.execute(
-            "SELECT value FROM metadata WHERE key=?",
-            (TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,),
-        ).fetchone()
+    # The cursor is needed before per-task path/owner/host/service admission.
+    # _database() is NOT a read-only operation: it may initialize or migrate
+    # the store, create WAL/index metadata and chmod the database. Never open
+    # it while selecting tasks whose scoped mutation authority is unknown.
+    if TASK_DB.parent.is_symlink():
+        raise PermissionError("Task state directory may not be a symlink")
+    try:
+        database_status = TASK_DB.lstat()
+    except FileNotFoundError:
+        return None
+    if TASK_DB.is_symlink():
+        raise PermissionError(f"Task database may not be a symlink: {TASK_DB}")
+    if not stat.S_ISREG(database_status.st_mode):
+        raise PermissionError("Task database must be a regular file")
+    if database_status.st_size == 0:
+        return None
+    try:
+        with sqlite_store.preauthorization_readonly_sqlite(
+            TASK_DB, error_type=TaskSchemaInventoryChanged
+        ) as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,),
+            ).fetchone()
+    except sqlite3.DatabaseError as exc:
+        detail = str(exc).lower()
+        if "locked" in detail or "busy" in detail:
+            raise RuntimeError(
+                "Task database is busy; retry after the active writer completes"
+            ) from exc
+        raise RuntimeError(
+            "Task database is corrupt; restore a verified backup before retrying"
+        ) from exc
     if row is None:
         return None
     try:
@@ -7139,6 +8703,42 @@ def _recover_pending_task_terminalizations(
         cursor_before=cursor_before,
         high_water=high_water,
     )
+    # Preflight the *entire* page before its first projection. In a mixed
+    # allowed/blocked batch, committing an early task would violate the
+    # later task's scoped hard-stop even if the cursor itself were untouched.
+    # Any scope or identity failure aborts the batch with no projection writes.
+    for terminalization in page["terminalizations"]:
+        task_id = str(terminalization["task_id"])
+        task_record = _row_scope_identity_readonly(task_id)
+        # Deny the already-persisted scope before inspecting any untrusted
+        # projection. A denied identity must win over malformed journal data.
+        persisted_service = _authoritative_unit(task_record)
+        admission = {
+            "path": task_record["cwd"],
+            "repo": task_record["cwd"],
+            "task_id": task_record["task_id"],
+            "owner_id": task_record.get("lease_owner_id") or _lease_owner(task_id),
+            "host": task_record["host"],
+        }
+        operator._require_operator_mutation(
+            "durable_job", service=persisted_service, **admission
+        )
+        projection = terminalization.get("task_projection")
+        if not isinstance(projection, dict) or projection.get("task_id") != task_id:
+            raise RuntimeError("Task terminalization projection identity is invalid")
+        # A crashed resume may project a successor unit. Authorize both its
+        # unit and authoritative_unit before the first page-wide mutation.
+        projected_services = (
+            _validate_unit(projection["unit"]),
+            _validate_unit(projection["authoritative_unit"]),
+        )
+        checked_services = {persisted_service}
+        for service in projected_services:
+            if service not in checked_services:
+                checked_services.add(service)
+                operator._require_operator_mutation(
+                    "durable_job", service=service, **admission
+                )
     recovered: list[str] = []
     failed: list[dict[str, str]] = []
     for terminalization in page["terminalizations"]:
@@ -7148,6 +8748,11 @@ def _recover_pending_task_terminalizations(
                 terminalization,
                 recovered=True,
             )
+        except PermissionError:
+            # A late denial after page-wide preauthorization is an authority
+            # change, not an isolated poison record. Never advance the cursor
+            # or apply later projections under the stale batch admission.
+            raise
         except Exception as exc:
             failed.append(
                 {
@@ -7342,8 +8947,14 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
 
 
 @contextmanager
-def _database_connection() -> Iterator[sqlite3.Connection]:
-    connection = _database()
+def _database_connection(
+    *,
+    before_write: Callable[[sqlite3.Connection], None] | None = None,
+    before_preflight: Callable[[], None] | None = None,
+) -> Iterator[sqlite3.Connection]:
+    connection = _database(
+        before_write=before_write, before_preflight=before_preflight
+    )
     try:
         with connection:
             yield connection
@@ -8484,9 +10095,11 @@ def _resolve_task_operation_identity(
         return {"reuse": None, "reuse_reason": None, "retry_binding": None}
     now = _now()
     if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
-        if not _task_has_fresh_active_observation(latest, now=now):
-            grabowski_task_status(str(latest["task_id"]))
-            latest = _row_raw(str(latest["task_id"]))
+        # A fresh unit observation does not prove that the repository writer
+        # lease is still owned. Use the existing lease-maintaining reuse check.
+        latest = _refresh_active_execution_reuse_record(
+            latest, allow_active_reuse=True
+        )
         if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
             if any(retry_fields):
                 raise ValueError("active operation identity cannot be superseded")
@@ -8672,6 +10285,8 @@ def grabowski_task_start(
         command,
         cwd=working_directory,
     )
+    # Fail before operation reuse, lease acquisition, task INSERT or dispatch.
+    _require_direct_codex_filesystem_sandbox(command)
     task_effect_classification = _classify_task_effect(
         transport=str(target["transport"]),
         argv=command,
@@ -8779,7 +10394,7 @@ def grabowski_task_start(
     reused_record = operation_resolution["reuse"]
     if reused_record is not None:
         reused_classification = _project_task_effect_classification(
-            _record_task_effect_classification(reused_record),
+            _verified_task_effect_start(reused_record),
             fallback=task_effect_classification,
         )
         reuse_audit = {
@@ -9005,7 +10620,7 @@ def grabowski_task_start(
         if execution_reuse_reason is None:
             raise RuntimeError("execution reuse reason is missing")
         reused_classification = _project_task_effect_classification(
-            _record_task_effect_classification(execution_reuse),
+            _verified_task_effect_start(execution_reuse),
             fallback=task_effect_classification,
         )
         reuse_audit = {
@@ -9395,6 +11010,11 @@ def grabowski_task_start(
             """,
                 record,
             )
+            _store_task_effect_start(
+                connection, record,
+                classification=task_effect_classification,
+                transport=str(target["transport"]),
+            )
             _register_task_reconcile_sequence(connection, task_id)
             connection.commit()
     except Exception as exc:
@@ -9610,6 +11230,14 @@ def grabowski_task_start(
                 "Bureau runtime-refresh launch produced an unsupported journal state"
             )
     lease_maintenance = _maintain_record_resources(stored, state)
+    revised_state = _enforced_lease_state(state, lease_maintenance)
+    if revised_state != state:
+        stored = _set_state(
+            task_id, revised_state,
+            observation={"lease_maintenance": lease_maintenance,
+                         "pre_revocation_state": state},
+        )
+        state = revised_state
     audit = {
         "timestamp_unix": _now(),
         "operation": "task-start",
@@ -9687,14 +11315,39 @@ def grabowski_task_start(
 
 @_serialize_task_mutation
 def grabowski_task_status(task_id: str) -> dict[str, Any]:
-    """Observe one persistent task and refresh its recorded state."""
-    operator._require_operator_capability("durable_job")
+    """Observe one persistent task and refresh its recorded state.
+
+    Status may renew task leases, recover persisted terminalization and stop an
+    active cgroup on authority loss. It is a mutation, not a read-only probe.
+    """
+    operator._require_operator_mutation(
+        "durable_job", task_id=_validate_task_id(task_id),
+    )
+    # _row may replay a pending terminalization, including durable writes.
+    # Read only the persisted identity first, enforce every scope, and THEN
+    # allow recovery. Recheck after recovery to reject unit/attempt drift.
+    def require_scoped(record: dict[str, Any]) -> None:
+        operator._require_operator_mutation(
+            "durable_job",
+            path=record["cwd"],
+            repo=record["cwd"],
+            task_id=record["task_id"],
+            owner_id=record.get("lease_owner_id") or _lease_owner(record["task_id"]),
+            service=_authoritative_unit(record),
+            host=record["host"],
+        )
+
+    require_scoped(_row_scope_identity_readonly(task_id))
     record = _row(task_id)
+    require_scoped(record)
     observation = _observe(record)
     effective_state = _effective_observed_state(record, observation["state"])
     lease_maintenance = _maintain_record_resources(record, effective_state)
     if lease_maintenance is not None:
         observation["lease_maintenance"] = lease_maintenance
+        observation["state"] = _enforced_lease_state(
+            observation["state"], lease_maintenance,
+        )
     stored = _set_state(
         task_id,
         observation["state"],
@@ -9872,6 +11525,7 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
     lease_maintenance = _maintain_record_resources(record, effective_state)
     if lease_maintenance is not None:
         cancel_observation["lease_maintenance"] = lease_maintenance
+        state = _enforced_lease_state(state, lease_maintenance)
     stored = _set_state(task_id, state, observation=cancel_observation)
     audit = {
         "timestamp_unix": _now(),
@@ -9921,6 +11575,9 @@ def grabowski_task_resume(
     if record["resume_policy"] == "manual" and _interrupted_recovery_context is None:
         raise PermissionError("Task resume policy does not permit automatic retry")
     command = json.loads(record["argv_json"])
+    task_effect_classification = _verified_task_effect_start(record, command=command)
+    # Legacy tasks receive no implicit exemption from the filesystem boundary.
+    _require_direct_codex_filesystem_sandbox(command)
     recovery_gate = _require_recovery_gate(command)
     observation = _observe(record)
     if observation["state"] == "running":
@@ -9960,16 +11617,55 @@ def grabowski_task_resume(
         if retained_retry_binding is not None:
             recovery_launcher_bindings["retry_binding"] = retained_retry_binding
     coding_agent_pre_dispatch_admission: dict[str, Any] | None = None
-    task_effect_classification = _record_task_effect_classification(record)
-    agent_executable = (
+    command_executable = Path(command[0]).name.lower()
+    persisted_executable = (
         task_effect_classification.get("agent_executable")
-        if task_effect_classification is not None
-        else Path(command[0]).name.lower()
+        if task_effect_classification is not None else None
     )
-    if (
-        agent_executable in MUTATING_AGENT_EXECUTABLES
-        and fleet.fleet_host(str(record["host"]))["transport"] == "local"
-    ):
+    # The original command identity is server-bound at task creation. Neither
+    # a replacement executable nor a forged stored agent name can evade it.
+    if command_identity.argv_sha256(command) != str(record["argv_sha256"]):
+        raise RuntimeError("persisted agent identity disagrees with original argv")
+    agent_executable = command_executable
+    agent_known = (
+        command_executable in MUTATING_AGENT_EXECUTABLES
+        or persisted_executable in MUTATING_AGENT_EXECUTABLES
+    )
+    if agent_known:
+        if task_effect_classification is None:
+            raise RuntimeError("unverified agent effect in legacy resume")
+        if (
+            command_executable not in MUTATING_AGENT_EXECUTABLES
+            or persisted_executable != command_executable
+        ):
+            raise RuntimeError("persisted agent identity mismatches current executable")
+        transport = fleet.fleet_host(str(record["host"]))["transport"]
+        write_profiles = (
+            {"workspace_write", "repository_write"}
+            if transport == "local" else {"remote_write"}
+        )
+        if task_effect_classification.get("effect_profile") not in write_profiles:
+            raise RuntimeError("persisted agent effect profile is not write-capable")
+        if transport == "local":
+            workspace = _mutating_agent_workspace(
+                str(record["host"]), command, cwd=str(record["cwd"])
+            )
+            covering_keys = (
+                _workspace_lease_resource_keys(
+                    workspace, _record_resource_keys(record)
+                )
+                if workspace is not None else []
+            )
+            expected_owner = _lease_owner(task_id)
+            if str(record.get("lease_owner_id")) != expected_owner:
+                raise RuntimeError("persisted agent workspace lease owner mismatch")
+            active_leases = resources.inspect_resources(covering_keys)
+            if not covering_keys or not any(
+                active_leases.get(key, {}).get("owner_id") == expected_owner
+                for key in covering_keys
+            ):
+                raise RuntimeError("persisted agent workspace lease is missing or foreign")
+    if agent_known and transport == "local":
         import grabowski_coding_agent_router as coding_agent_router
 
         candidate_admission = coding_agent_router.coding_agent_pre_dispatch_admission(
@@ -10044,6 +11740,10 @@ def grabowski_task_resume(
             launcher={
                 "pending": True,
                 **(
+                    {"task_effect_classification": dict(task_effect_classification)}
+                    if task_effect_classification is not None else {}
+                ),
+                **(
                     {
                         "coding_agent_pre_dispatch_admission": dict(
                             coding_agent_pre_dispatch_admission
@@ -10098,6 +11798,11 @@ def grabowski_task_resume(
                 "reconciled" if lease_result.get("preserved") else "reacquired"
             )
     launcher = _launch(candidate)
+    if task_effect_classification is not None:
+        launcher = {
+            **launcher,
+            "task_effect_classification": dict(task_effect_classification),
+        }
     if coding_agent_pre_dispatch_admission is not None:
         launcher = {
             **launcher,
@@ -10126,6 +11831,14 @@ def grabowski_task_resume(
         attempt=attempt,
     )
     lease_maintenance = _maintain_record_resources(stored, state)
+    revised_state = _enforced_lease_state(state, lease_maintenance)
+    if revised_state != state:
+        stored = _set_state(
+            task_id, revised_state,
+            observation={"lease_maintenance": lease_maintenance,
+                         "pre_revocation_state": state},
+        )
+        state = revised_state
     audit = {
         "timestamp_unix": _now(),
         "operation": "task-resume",
@@ -11721,6 +13434,9 @@ def _reconcile_tasks_refresh_locked(
         lease_maintenance = _maintain_record_resources(record, effective_state)
         if lease_maintenance is not None:
             observation["lease_maintenance"] = lease_maintenance
+            observation["state"] = _enforced_lease_state(
+                observation["state"], lease_maintenance,
+            )
         stored = _set_state(
             record["task_id"],
             observation["state"],
@@ -11942,6 +13658,9 @@ def reconcile_tasks_resume(
         lease_maintenance = _maintain_record_resources(record, effective_state)
         if lease_maintenance is not None:
             observation["lease_maintenance"] = lease_maintenance
+            observation["state"] = _enforced_lease_state(
+                observation["state"], lease_maintenance,
+            )
         stored = _set_state(
             record["task_id"],
             observation["state"],
@@ -12236,6 +13955,10 @@ def grabowski_task_list(
                 "schema_only cannot be combined with task-list filters or projections"
             )
         return _task_schema_inventory()
+    # Normal listing can replay pending terminalization writes and persist its
+    # recovery cursor, even when callers intend to observe state only.
+    # A pure schema-only inventory above remains the only read-only route.
+    operator._require_operator_mutation("durable_job")
     if view == "managed_cargo_evidence":
         if state is not None or cursor is not None or fields is not None:
             raise ValueError(
@@ -12592,7 +14315,8 @@ async def _grabowski_task_start_tool(
     )
 
 
-@mcp.tool(name="grabowski_task_status", annotations=READ_ONLY)
+# Task status can stop a revoked unit; advertise its actual effect class.
+@mcp.tool(name="grabowski_task_status", annotations=MUTATING)
 async def _grabowski_task_status_tool(task_id: str) -> dict[str, Any]:
     """Observe one persistent task and refresh its recorded state."""
     operator._require_operator_capability("durable_job")
@@ -12643,7 +14367,7 @@ async def _grabowski_task_resume_tool(task_id: str) -> dict[str, Any]:
     return await asyncio.to_thread(grabowski_task_resume, task_id)
 
 
-@mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_task_list", annotations=MUTATING)
 async def _grabowski_task_list_tool(
     limit: int = DEFAULT_TASK_LIST_LIMIT,
     state: str | None = None,

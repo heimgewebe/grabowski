@@ -2153,6 +2153,52 @@
       }
     }
   },
+  "security_reclassifications": {
+    "grabowski_task_list": {
+      "baseline_sha256": "14021cf8ae4016e51b2a3c35aa473cf8894e28996435568006d59f869240b915",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "task",
+        "effects": [
+          "state-refresh",
+          "terminalization-recovery"
+        ],
+        "read_only": false,
+        "reversibility": "conditional",
+        "risk_class": "medium",
+        "tool": "grabowski_task_list"
+      },
+      "rationale": "A normal task-list call can replay pending terminalization and persist the recovery cursor; the schema-only branch alone is read-only.",
+      "evidence_refs": [
+        "pr:heimgewebe/grabowski#1386",
+        "test:test_task_list_recovery_requires_mutation_gate_first",
+        "test:test_task_list_schema_inventory_does_not_need_mutation_authority"
+      ]
+    },
+    "grabowski_task_status": {
+      "baseline_sha256": "ba95d919769c0e626cd698adf624e06a854e62408ce4f521f9acd1abb8580f01",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "task",
+        "effects": [
+          "lease-renewal",
+          "possible-process-stop",
+          "state-refresh",
+          "terminalization-recovery"
+        ],
+        "read_only": false,
+        "reversibility": "conditional",
+        "risk_class": "high",
+        "tool": "grabowski_task_status"
+      },
+      "rationale": "Task status may renew live leases, replay terminalization state and stop a revoked systemd unit; both task-wide and scope-complete mutation admission are mandatory.",
+      "evidence_refs": [
+        "pr:heimgewebe/grabowski#1386",
+        "test:test_task_status_requires_mutation_gate_before_record_or_lease_access",
+        "test:test_task_status_scoped_blockade_denies_before_lease_renewal"
+      ]
+    }
+  },
   "baseline": {
     "tool_count": 125,
     "tool_names_sha256": "a84638ec397aa635aa55546d579f009c237f64ffed39eafe2bff525762f46418",

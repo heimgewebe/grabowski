@@ -14,8 +14,192 @@ import tempfile
 from typing import Iterable
 
 BWRAP = Path(os.environ.get("GRABOWSKI_BWRAP_BIN", "/usr/bin/bwrap"))
+SANDBOX_LAUNCH_PYTHON = "/usr/bin/python3"
+# Host-side *trusted* launcher: install a libseccomp rule before execing bwrap.
+# The filter survives exec and all descendants, blocks host abstract AF_UNIX
+# socket creation, and keeps AF_INET/AF_INET6 available for remote APIs.
+# Missing libseccomp or failed filter installation is a hard launch denial.
+# This does not itself isolate localhost TCP or revoke a running task lease.
+_HOST_UNIX_DENY_LAUNCH_SOURCE = """\
+import ctypes
+import os
+import stat
+import sys
+
+class _ArgCmp(ctypes.Structure):
+    _fields_ = [
+        ("arg", ctypes.c_uint),
+        ("op", ctypes.c_int),
+        ("datum_a", ctypes.c_uint64),
+        ("datum_b", ctypes.c_uint64),
+    ]
+
+if (len(sys.argv) < 3 or not os.path.isabs(sys.argv[1])
+        or os.path.islink(sys.argv[1]) or not os.path.isfile(sys.argv[1])
+        or not os.access(sys.argv[1], os.X_OK)):
+    raise SystemExit(126)
+
+try:
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("seccomp is Linux-only")
+    multiarch = {
+        "x86_64": "x86_64-linux-gnu",
+        "aarch64": "aarch64-linux-gnu",
+    }.get(os.uname().machine)
+    if not multiarch:
+        raise RuntimeError("unsupported seccomp architecture")
+    # Never load a library from a task-controlled directory or loader search.
+    # A missing trusted system library fails closed rather than launching bwrap.
+    candidates = (
+        "/lib/" + multiarch + "/libseccomp.so.2",
+        "/usr/lib/" + multiarch + "/libseccomp.so.2",
+        "/lib64/libseccomp.so.2",
+        "/usr/lib64/libseccomp.so.2",
+    )
+    lib = None
+    for candidate in candidates:
+        try:
+            info = os.stat(candidate)
+            if (stat.S_ISREG(info.st_mode) and info.st_uid == 0
+                    and info.st_mode & 0o022 == 0):
+                lib = ctypes.CDLL(candidate)
+                break
+        except OSError:
+            pass
+    if lib is None:
+        raise RuntimeError("trusted libseccomp is unavailable")
+    lib.seccomp_init.argtypes = [ctypes.c_uint32]
+    lib.seccomp_init.restype = ctypes.c_void_p
+    lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    lib.seccomp_syscall_resolve_name.restype = ctypes.c_int
+    lib.seccomp_rule_add_array.argtypes = [
+        ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int,
+        ctypes.c_uint, ctypes.POINTER(_ArgCmp),
+    ]
+    lib.seccomp_rule_add_array.restype = ctypes.c_int
+    lib.seccomp_load.argtypes = [ctypes.c_void_p]
+    lib.seccomp_load.restype = ctypes.c_int
+    ctx = lib.seccomp_init(0x7fff0000)
+    syscall = lib.seccomp_syscall_resolve_name(b"socket")
+    # SCMP_CMP_MASKED_EQ checks the low 32 bits; a malicious raw syscall may
+    # otherwise set high bits that Linux discards when casting domain to int.
+    rule = _ArgCmp(0, 7, 0xffffffff, 1)
+    if (not ctx or syscall < 0
+            or lib.seccomp_rule_add_array(
+                ctx, 0x00050001, syscall, 1, ctypes.byref(rule)
+            ) != 0):
+        raise RuntimeError("AF_UNIX seccomp rule unavailable")
+    # A process can create sockets asynchronously through IORING_OP_SOCKET
+    # without invoking socket(2). Prevent new io_uring rings and attempts to
+    # operate inherited rings: otherwise the AF_UNIX rule is bypassable.
+    for name in (b"io_uring_setup", b"io_uring_enter", b"io_uring_register"):
+        syscall = lib.seccomp_syscall_resolve_name(name)
+        if (syscall < 0
+                or lib.seccomp_rule_add_array(
+                    ctx, 0x00050001, syscall, 0, None
+                ) != 0):
+            raise RuntimeError("async socket seccomp rule unavailable")
+    if ctypes.CDLL(None).prctl(38, 1, 0, 0, 0) != 0:
+        raise RuntimeError("no_new_privs unavailable")
+    if lib.seccomp_load(ctx) != 0:
+        raise RuntimeError("AF_UNIX seccomp install failed")
+    lib.seccomp_release.argtypes = [ctypes.c_void_p]
+    lib.seccomp_release(ctx)
+except (OSError, RuntimeError, TypeError, ValueError, AttributeError):
+    sys.stderr.write("grabowski: AF_UNIX sandbox enforcement unavailable\\n")
+    raise SystemExit(125)
+
+os.execv(sys.argv[1], sys.argv[1:])
+"""
+
+
+def _host_seccomp_launcher_argv() -> list[str]:
+    """Bind exact trusted libseccomp code into the delayed-exec systemd argv.
+
+    An owner-private script path can be replaced by a same-UID process after
+    validation but before asynchronous systemd exec. A literal Python -c
+    argument is part of the persisted command identity, not a re-opened file.
+    Enforce systemd's single-argument limit without a file-based fallback.
+    """
+    source = _HOST_UNIX_DENY_LAUNCH_SOURCE
+    if not source or chr(0) in source or len(source.encode("utf-8")) >= 4096:
+        raise AgentSandboxError("trusted seccomp source exceeds systemd argv limit")
+    return [SANDBOX_LAUNCH_PYTHON, "-I", "-S", "-c", source]
+
+
+def _host_seccomp_launcher_path() -> Path:
+    """Legacy private-script diagnostic; never used by a production launcher.
+
+    The active systemd/agent path uses _host_seccomp_launcher_argv instead.
+    This helper remains only for explicit compatibility/security diagnostics;
+    a mutable script path must never decide the executed seccomp policy.
+    """
+    content = _HOST_UNIX_DENY_LAUNCH_SOURCE.encode("utf-8")
+    digest = hashlib.sha256(content).hexdigest()
+    root = Path.home() / ".local/state/grabowski/task-sandbox-launchers"
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = root.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise AgentSandboxError("sandbox launcher root is not owner-private")
+        path = root / f"seccomp-{digest}.py"
+        try:
+            descriptor = os.open(
+                path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except FileNotFoundError:
+            descriptor, temporary = tempfile.mkstemp(
+                dir=root, prefix=".seccomp-", suffix=".tmp",
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+            except BaseException:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+                raise
+            descriptor = os.open(
+                path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        try:
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size != len(content)
+                or os.read(descriptor, len(content) + 1) != content
+            ):
+                raise AgentSandboxError("sandbox launcher script identity drifted")
+        finally:
+            os.close(descriptor)
+        if len(str(path).encode("utf-8")) >= 4096:
+            raise AgentSandboxError("sandbox launcher path exceeds systemd limit")
+        return path
+    except OSError as exc:
+        raise AgentSandboxError("trusted sandbox launcher cannot be staged") from exc
+
+
 TAIL_BYTES = 12000
 MAX_WRITABLE_SCOPE_ENTRIES = 100_000
+MAX_READ_ONLY_SCOPE_ENTRIES = 100_000
+MAX_MOUNTINFO_BYTES = 1_048_576
+MAX_MOUNTINFO_ENTRIES = 4096
 _GIT_COMMAND_CONFIG = (
     ("core.hooksPath", "/dev/null"),
     ("core.fsmonitor", "false"),
@@ -489,13 +673,23 @@ def safe_git_environment(base: dict[str, str] | None = None) -> dict[str, str]:
 
 
 def runtime_sandbox_argv(arguments: list[str]) -> list[str]:
-    """Bind execution to the validated, resolved bubblewrap binary."""
+    """Resolve bwrap while binding vetted seccomp source into executable argv.
+
+    No direct bwrap compatibility call may silently bypass the filter.
+    """
     if not arguments:
         raise AgentSandboxError("sandbox argv is empty")
     result = list(arguments)
-    result[0] = str(require_bwrap())
+    launcher = _host_seccomp_launcher_argv()
+    if result[:4] == launcher[:4]:
+        if len(result) < len(launcher) + 1 or result[:len(launcher)] != launcher:
+            raise AgentSandboxError("unrecognized AF_UNIX sandbox launcher")
+        result[len(launcher)] = str(require_bwrap())
+    else:
+        if result[0] == SANDBOX_LAUNCH_PYTHON:
+            raise AgentSandboxError("unrecognized AF_UNIX sandbox launcher")
+        result = [*launcher, str(require_bwrap()), *result[1:]]
     return result
-
 
 @dataclass(frozen=True)
 class BoundedCapture:
@@ -595,6 +789,8 @@ def _validate_writable_tree(target: Path) -> None:
                         raise AgentSandboxError(
                             f"writable path crosses a filesystem boundary: {entry.path}"
                         )
+                    if entry.name == ".git":
+                        raise AgentSandboxError("Git metadata may not occur inside a writable sandbox scope")
                     if stat.S_ISLNK(item.st_mode):
                         continue
                     if stat.S_ISDIR(item.st_mode):
@@ -612,6 +808,60 @@ def _validate_writable_tree(target: Path) -> None:
             raise
         except OSError as exc:
             raise AgentSandboxError(f"writable path is not stable: {directory}") from exc
+
+
+def _reject_exposed_host_ipc_tree(worktree: Path) -> None:
+    """Never ro-bind an arbitrary cwd containing live host IPC/device nodes.
+
+    A read-only VFS mount still permits AF_UNIX connect and FIFO I/O. Inspect
+    the full tree with a bounded budget; skip symlink targets because they do
+    not add host mounts by themselves. Missing or unstable entries fail closed.
+    This check does not replace server-owned task/role authority or remove the
+    remaining same-UID path-replacement race before bwrap executes.
+    """
+    # A foreign bind of another host directory into the mounted source is a
+    # confidentiality boundary even when all its entries are regular files and
+    # st_dev remains unchanged. Missing mountinfo also denies the host bind.
+    if any(
+        mount == worktree or mount.is_relative_to(worktree)
+        for mount in _kernel_mount_points()
+    ):
+        raise AgentSandboxError(
+            f"read-only host source includes a kernel mount boundary: {worktree}"
+        )
+    pending = [worktree]
+    entries_seen = 0
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    entries_seen += 1
+                    if entries_seen > MAX_READ_ONLY_SCOPE_ENTRIES:
+                        raise AgentSandboxError(
+                            "read-only workspace IPC inspection exceeds its entry budget"
+                        )
+                    try:
+                        metadata = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise AgentSandboxError(
+                            f"read-only workspace IPC entry is not stable: {entry.path}"
+                        ) from exc
+                    if stat.S_ISDIR(metadata.st_mode):
+                        pending.append(Path(entry.path))
+                    elif not (
+                        stat.S_ISREG(metadata.st_mode)
+                        or stat.S_ISLNK(metadata.st_mode)
+                    ):
+                        raise AgentSandboxError(
+                            f"read-only workspace exposes a host IPC or device entry: {entry.path}"
+                        )
+        except AgentSandboxError:
+            raise
+        except OSError as exc:
+            raise AgentSandboxError(
+                f"read-only workspace IPC inspection failed: {directory}"
+            ) from exc
 
 
 def _grosser_adler_inbox_root() -> Path:
@@ -804,17 +1054,56 @@ def _adler_inbox_sandbox_binding(worktree: Path) -> tuple[tuple[tuple[Path, Path
     return ((source, target),), directories
 
 
+def _kernel_mount_points() -> frozenset[Path]:
+    """Read bounded Linux mount identity; st_dev alone misses same-device bind mounts."""
+    try:
+        with open("/proc/self/mountinfo", "rb") as stream:
+            raw = stream.read(MAX_MOUNTINFO_BYTES + 1)
+    except OSError as exc:
+        raise AgentSandboxError("Linux mount identity is unavailable") from exc
+    if not raw or len(raw) > MAX_MOUNTINFO_BYTES or not raw.endswith(b"\n"):
+        raise AgentSandboxError("Linux mount identity is missing or exceeds its budget")
+    mounts: set[Path] = set()
+    for line in raw.splitlines():
+        head, separator, _tail = line.partition(b" - ")
+        fields = head.split(b" ")
+        if not separator or len(fields) < 6:
+            raise AgentSandboxError("Linux mount identity contains a malformed entry")
+        encoded_path = fields[4]
+        for escape, actual in (
+            (b"\\040", b" "),
+            (b"\\011", b"\t"),
+            (b"\\012", b"\n"),
+            (b"\\134", b"\\"),
+        ):
+            encoded_path = encoded_path.replace(escape, actual)
+        mount = Path(os.fsdecode(encoded_path))
+        if not mount.is_absolute() or ".." in mount.parts or "\x00" in str(mount):
+            raise AgentSandboxError("Linux mount identity contains an unsafe mountpoint")
+        mounts.add(mount)
+        if len(mounts) > MAX_MOUNTINFO_ENTRIES:
+            raise AgentSandboxError("Linux mount identity exceeds its entry budget")
+    return frozenset(mounts)
+
+
 def _normalized_writable_paths(worktree: Path, values: Iterable[Path]) -> list[Path]:
     candidates: list[Path] = []
+    workspace_device = worktree.stat().st_dev
     for value in values:
         target = _safe_existing_path(value, "writable_path")
         try:
-            target.relative_to(worktree)
+            relative = target.relative_to(worktree)
         except ValueError as exc:
             raise AgentSandboxError(f"writable path escapes workspace: {target}") from exc
+        if ".git" in relative.parts:
+            raise AgentSandboxError("Git metadata may not be a writable sandbox scope")
         if target == worktree:
             raise AgentSandboxError("whole-workspace writable bind is not allowed")
         metadata = target.stat()
+        if metadata.st_dev != workspace_device:
+            raise AgentSandboxError(
+                f"writable path root crosses a filesystem boundary: {target}"
+            )
         if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
             raise AgentSandboxError(f"writable path must be a regular file or directory: {target}")
         candidates.append(target)
@@ -824,8 +1113,22 @@ def _normalized_writable_paths(worktree: Path, values: Iterable[Path]) -> list[P
         if any(candidate == parent or candidate.is_relative_to(parent) for parent in collapsed):
             continue
         collapsed.append(candidate)
-    for candidate in collapsed:
-        _validate_writable_tree(candidate)
+    if collapsed:
+        mount_points = _kernel_mount_points()
+        for candidate in collapsed:
+            if any(
+                mount == worktree
+                or mount.is_relative_to(candidate)
+                or (
+                    mount.is_relative_to(worktree)
+                    and candidate.is_relative_to(mount)
+                )
+                for mount in mount_points
+            ):
+                raise AgentSandboxError(
+                    f"writable scope includes a kernel mount boundary: {candidate}"
+                )
+            _validate_writable_tree(candidate)
     return collapsed
 
 
@@ -836,9 +1139,11 @@ def minimal_sandbox_argv(
     workspace_writable: bool,
     writable_paths: Iterable[Path] = (),
     git_common_dir: Path | None = None,
+    mount_workspace: bool = True,
     extra_read_only: Iterable[tuple[Path, Path]] = (),
     extra_read_only_data_fds: Iterable[tuple[int, Path]] = (),
     extra_read_write: Iterable[tuple[Path, Path]] = (),
+    extra_read_write_directories: Iterable[tuple[Path, Path]] = (),
     extra_directories: Iterable[Path] = (),
 ) -> list[str]:
     """Build the sandbox argv without requiring bubblewrap on the build host.
@@ -855,7 +1160,37 @@ def minimal_sandbox_argv(
         directory=True,
     )
     writable = _normalized_writable_paths(worktree, writable_paths)
-    adler_read_only, adler_directories = _adler_inbox_sandbox_binding(worktree)
+    if not isinstance(mount_workspace, bool):
+        raise AgentSandboxError("mount_workspace must be a boolean")
+    if mount_workspace:
+        # cwd is caller-selected, not evidence that an opaque child may read
+        # the operator's private HOME. Expose only a concrete checkout below
+        # HOME/repos; all other home descendants require a distinct verified
+        # authority route rather than a broad read-only mount.
+        try:
+            home = Path.home().resolve(strict=False)
+        except OSError as exc:
+            raise AgentSandboxError("operator home identity is unavailable") from exc
+        repositories = home / "repos"
+        if home.is_relative_to(worktree) or (
+            worktree.is_relative_to(home)
+            and (
+                worktree == repositories
+                or not worktree.is_relative_to(repositories)
+            )
+        ):
+            raise AgentSandboxError(
+                "private operator home cannot be a visible task workspace"
+            )
+    if not mount_workspace and (workspace_writable or writable or common is not None):
+        raise AgentSandboxError("hidden workspace cannot be writable or expose Git metadata")
+    if mount_workspace:
+        _reject_exposed_host_ipc_tree(worktree)
+    if common is not None and not common.is_relative_to(worktree):
+        _reject_exposed_host_ipc_tree(common)
+    adler_read_only, adler_directories = (
+        _adler_inbox_sandbox_binding(worktree) if mount_workspace else ((), ())
+    )
     if workspace_writable and not writable:
         raise AgentSandboxError("writer sandbox requires at least one bounded writable path")
     if not workspace_writable and writable:
@@ -903,18 +1238,34 @@ def minimal_sandbox_argv(
         _bind_file(arguments, path)
     _bind_fixed_system_file(arguments, "/etc/resolv.conf")
     _bind_dir(arguments, "/etc/ssl/certs")
-    arguments.extend(["--ro-bind", str(worktree), str(worktree)])
+    if mount_workspace:
+        arguments.extend(["--ro-bind", str(worktree), str(worktree)])
     for target in writable:
         arguments.extend(["--bind", str(target), str(target)])
     if common is not None and common != worktree:
         arguments.extend(["--ro-bind", str(common), str(common)])
     seen_targets = {str(worktree), *(str(item) for item in writable)}
+    read_only_sources = {worktree}
     if common is not None:
         seen_targets.add(str(common))
+        read_only_sources.add(common)
     for source_value, target_value in (*adler_read_only, *tuple(extra_read_only)):
         source = _safe_existing_path(source_value, "extra_read_only source")
-        if not target_value.is_absolute() or "\x00" in str(target_value):
-            raise AgentSandboxError("extra_read_only target must be absolute")
+        if source.is_dir() and not source.is_relative_to(worktree):
+            _reject_exposed_host_ipc_tree(source)
+        if not mount_workspace and (
+            source == worktree
+            or source.is_relative_to(worktree)
+            or worktree.is_relative_to(source)
+        ):
+            raise AgentSandboxError("extra read-only source overlaps hidden workspace")
+        read_only_sources.add(source)
+        if (
+            not target_value.is_absolute()
+            or "\x00" in str(target_value)
+            or ".." in target_value.parts
+        ):
+            raise AgentSandboxError("extra_read_only target must be an absolute safe path")
         target = str(target_value)
         if target in seen_targets:
             raise AgentSandboxError(f"duplicate sandbox target: {target}")
@@ -942,10 +1293,24 @@ def minimal_sandbox_argv(
         arguments.extend(["--perms", "0400", "--ro-bind-data", str(fd_value), target])
     for source_value, target_value in extra_read_write:
         source = _private_regular_file(source_value, "extra_read_write source")
+        if not mount_workspace and (
+            source == worktree
+            or source.is_relative_to(worktree)
+            or worktree.is_relative_to(source)
+        ):
+            raise AgentSandboxError("extra writable source overlaps hidden workspace")
+        if any(
+            source == protected
+            or source.is_relative_to(protected)
+            or protected.is_relative_to(source)
+            for protected in read_only_sources
+        ):
+            raise AgentSandboxError("extra writable file overlaps a read-only mount source")
         target_path = Path(target_value)
         if (
             not target_path.is_absolute()
             or "\x00" in str(target_path)
+            or ".." in target_path.parts
             or target_path == Path("/tmp")
             or not target_path.is_relative_to(Path("/tmp"))
         ):
@@ -955,6 +1320,70 @@ def minimal_sandbox_argv(
         target = str(target_path)
         if target in seen_targets:
             raise AgentSandboxError(f"duplicate sandbox target: {target}")
+        seen_targets.add(target)
+        arguments.extend(["--bind", str(source), target])
+    # A workspace role writes its create-only receipt atomically and therefore
+    # needs a writable directory, not only a writable file. The caller must
+    # authenticate the exact task/role/attempt before requesting this mount.
+    # This primitive only admits one initially empty owner-private directory
+    # *outside* the read-only source workspace and exposes it under /tmp.
+    receipt_bindings = tuple(extra_read_write_directories)
+    if len(receipt_bindings) > 1:
+        raise AgentSandboxError("only one external receipt directory is allowed")
+    for source_value, target_value in receipt_bindings:
+        source_candidate = Path(source_value).expanduser()
+        if not source_candidate.is_absolute() or source_candidate.is_symlink():
+            raise AgentSandboxError("external receipt source must be an absolute non-symlink directory")
+        try:
+            canonical_source = source_candidate.resolve(strict=True)
+        except OSError as exc:
+            raise AgentSandboxError("external receipt source is unavailable") from exc
+        if source_candidate.absolute() != canonical_source:
+            raise AgentSandboxError("external receipt source must be a canonical non-symlink directory")
+        source = _private_directory(source_candidate, "external receipt directory")
+        if any(
+            source == protected
+            or source.is_relative_to(protected)
+            or protected.is_relative_to(source)
+            for protected in read_only_sources
+        ):
+            raise AgentSandboxError("external receipt directory overlaps a read-only mount source")
+        source_info = source.stat()
+        if stat.S_IMODE(source_info.st_mode) & 0o700 != 0o700:
+            raise AgentSandboxError("external receipt directory requires owner rwx")
+        # An empty private-looking sink may be a bind mount onto an unrelated
+        # host directory (including another bind on the same device). Treat
+        # every nested mount boundary as foreign writable authority.
+        if any(
+            mount == source or mount.is_relative_to(source)
+            for mount in _kernel_mount_points()
+        ):
+            raise AgentSandboxError(
+                "external receipt directory includes a kernel mount boundary"
+            )
+        try:
+            with os.scandir(source) as entries:
+                if next(entries, None) is not None:
+                    raise AgentSandboxError("external receipt directory must be fresh and empty")
+        except OSError as exc:
+            raise AgentSandboxError("external receipt directory cannot be safely inspected") from exc
+        target_path = Path(target_value)
+        target = str(target_path)
+        if (
+            not target_path.is_absolute()
+            or target_path.parent != Path("/tmp")
+            or not target_path.name.startswith("grabowski-")
+            or len(target_path.name) > 128
+            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-_" for character in target_path.name)
+        ):
+            raise AgentSandboxError("external receipt target must be one private /tmp/grabowski-* directory")
+        if any(
+            Path(existing) == target_path
+            or Path(existing).is_relative_to(target_path)
+            or target_path.is_relative_to(Path(existing))
+            for existing in seen_targets
+        ):
+            raise AgentSandboxError("external receipt target overlaps an existing sandbox mount")
         seen_targets.add(target)
         arguments.extend(["--bind", str(source), target])
     arguments.extend(
@@ -988,12 +1417,12 @@ def minimal_sandbox_argv(
     arguments.extend(
         [
             "--chdir",
-            str(worktree),
+            str(worktree) if mount_workspace else "/tmp",
             "--",
             *command,
         ]
     )
-    return arguments
+    return [*_host_seccomp_launcher_argv(), *arguments]
 
 
 def _append_tail(buffer: bytearray, chunk: bytes, limit: int = TAIL_BYTES) -> None:
