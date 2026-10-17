@@ -82,6 +82,8 @@ class PrReviewGateRiskPathExpansionTests(unittest.TestCase):
             "src/grabowski_agent_role.py",
             "src/grabowski_operations.py",
             "src/grabowski_artifacts.py",
+            "src/grabowski_merge_guard.py",
+            "src/grabowski_decision_reviews.py",
         ):
             with self.subTest(path=path):
                 result = pr_review_gate.evaluate_review_gate(_state(path), self_review=_self_review(path))
