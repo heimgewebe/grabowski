@@ -12406,7 +12406,7 @@ def _task_reconcile_ready_archived_user_unit_live() -> bool:
     """
     result = operator._run(
         [
-            "systemctl", "--user", "list-units", "--all",
+            "systemctl", "--user", "list-units", "--all", "--full",
             "--type=service", "--no-legend", "--plain", "--no-pager",
             "grabowski-task-*.service",
         ],

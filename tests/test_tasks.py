@@ -7278,6 +7278,10 @@ class TaskTests(unittest.TestCase):
                     )
                 self.assertEqual("systemctl", run.call_args.args[0][0])
                 self.assertIn("--all", run.call_args.args[0])
+                # systemctl may ellipsize long unit names at narrow COLUMNS
+                # unless --full is explicitly requested; the parser requires
+                # every unit name to remain complete for fail-closed liveness.
+                self.assertIn("--full", run.call_args.args[0])
                 self.assertEqual(30, run.call_args.kwargs["timeout_seconds"])
 
     def test_archived_unit_inventory_rejects_truncation_and_unknown_units(self) -> None:
