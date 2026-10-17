@@ -6964,6 +6964,57 @@ class TaskTests(unittest.TestCase):
         # Within the scan budget, archiving exactly the excess always fits.
         self.assertLessEqual(status["archive_excess"], status["archive_headroom"])
 
+    def test_remote_terminal_cohort_has_bounded_count_and_zero_local_probes(self) -> None:
+        self._local_terminal_readiness_store(33)
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh"}, False),
+            ),
+            patch.object(
+                tasks, "_observe",
+                side_effect=AssertionError("remote units cannot be local-probed"),
+            ) as probe,
+            patch.object(
+                tasks, "_dispatch",
+                side_effect=AssertionError("READ_ONLY must not dispatch"),
+            ) as dispatch,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual(
+            {
+                "status": "local_terminal_transport_unverified",
+                "non_local_terminal_count": 33,
+                "archive_headroom": tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT,
+            },
+            status,
+        )
+        probe.assert_not_called()
+        dispatch.assert_not_called()
+
+    def test_remote_terminal_cohort_reports_exhausted_history_budget(self) -> None:
+        self._local_terminal_readiness_store(2)
+        with (
+            patch.object(tasks, "TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT", 0),
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh"}, False),
+            ),
+            patch.object(tasks, "_observe") as probe,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual(
+            {
+                "status": "local_terminal_transport_unverified",
+                "non_local_terminal_count": 2,
+                "archive_headroom": 0,
+            },
+            status,
+        )
+        probe.assert_not_called()
+
     def test_reconcile_ready_publication_applies_task_scope_before_rootbroker(self) -> None:
         record = {
             "task_id": "c" * 24,

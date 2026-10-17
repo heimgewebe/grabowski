@@ -6614,17 +6614,36 @@ def _operator_system_overview(
             "terminal readiness budget fits within the archive history budget"
         )
     elif reconciliation_evidence.get("status") == "local_terminal_transport_unverified":
-        # A persisted terminal task resolves to a non-local (e.g. SSH)
-        # fleet host. READ_ONLY cannot bind that unit to a live local
-        # observation, and reconciliation cannot make a remote transport
-        # locally verifiable. Only authorized live remote observation,
-        # followed by archiving independently verified terminal tasks,
-        # can shrink this cohort.
-        next_action = (
-            "inspect current remote-host terminal tasks with authorized live "
-            "observation; archive independently verified terminal tasks "
-            "through the authorized task-closeout-archive workflow"
-        )
+        # A remote unit cannot be certified by the local read-only observer.
+        # Only recommend archive when a complete bounded cohort fits within
+        # the remaining archive history; otherwise fail closed.
+        remote_count = reconciliation_evidence.get("non_local_terminal_count")
+        headroom = reconciliation_evidence.get("archive_headroom")
+        if (
+            type(remote_count) is int and remote_count > 0
+            and type(headroom) is int and headroom >= remote_count
+        ):
+            next_action = (
+                "inspect current remote-host terminal tasks with authorized live "
+                f"observation; archive exactly {remote_count} independently verified "
+                "terminal tasks through the authorized task-closeout-archive workflow, "
+                "no more, within the remaining archive-history budget"
+            )
+        elif type(remote_count) is int and remote_count > 0 and type(headroom) is int:
+            next_action = (
+                "inspect current remote-host terminal tasks with authorized live "
+                f"observation; {remote_count} non-local tasks exceed the remaining "
+                f"archive-history headroom of {headroom}; do not archive further; "
+                "escalate authorized bounded compaction of retained task history "
+                "and archive projection before relying on readiness"
+            )
+        else:
+            next_action = (
+                "inspect current remote-host terminal tasks with authorized live "
+                "observation; no verified non-local cohort size and archive headroom "
+                "are available, so do not archive until a bounded budget check "
+                "proves complete closeout is possible"
+            )
     elif reconciliation_evidence.get("status") != "verified":
         next_action = "reconcile live task outcomes through an authorized mutation-capable path"
     elif obligations.get("integrity_error_count"):

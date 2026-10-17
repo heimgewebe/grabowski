@@ -1043,6 +1043,8 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 "reconciliation_performed": False,
                 "reconciliation_evidence": {
                     "status": "local_terminal_transport_unverified",
+                    "non_local_terminal_count": 1,
+                    "archive_headroom": 1,
                 },
             },
         )
@@ -1081,6 +1083,60 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertIn("live", next_action)
         self.assertIn("task-closeout-archive", next_action)
         self.assertNotIn("reconcile live task outcomes", next_action)
+
+    def test_overview_remote_archival_requires_verified_sufficient_headroom(self) -> None:
+        # One less than needed, exhausted and missing evidence never recommend
+        # closeout archives that would exceed the bounded archive history.
+        for remote_count, headroom, expected in (
+            (2, 1, "compaction"),
+            (1, 0, "compaction"),
+            (None, None, "budget check"),
+        ):
+            with self.subTest(remote_count=remote_count, headroom=headroom):
+                evidence = {"status": "local_terminal_transport_unverified"}
+                if remote_count is not None:
+                    evidence["non_local_terminal_count"] = remote_count
+                if headroom is not None:
+                    evidence["archive_headroom"] = headroom
+                fake_tasks = SimpleNamespace(
+                    grabowski_task_list=lambda **_kwargs: {
+                        "state_counts": {"completed": 2},
+                        "projection_counts": {"active": 0, "terminal": 2, "attention": 0},
+                        "projection_counts_overlap": False,
+                        "unknown_state_count": 0,
+                        "state_counts_complete": True,
+                        "reconciliation_performed": False,
+                        "reconciliation_evidence": evidence,
+                    },
+                )
+                fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)
+                fake_obligations = SimpleNamespace(
+                    list_obligations=lambda _parameters: {
+                        "record_count": 0, "integrity_errors": [], "scan_truncated": False,
+                    },
+                )
+                with mock.patch.dict("sys.modules", {
+                    "grabowski_tasks": fake_tasks,
+                    "grabowski_resources": fake_resources,
+                    "grabowski_operator_obligation": fake_obligations,
+                }):
+                    result = grabowski_mcp._operator_system_overview(
+                        runtime_healthy=True,
+                        normal_mutation_path_ready=True,
+                        coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                        client_snapshot={
+                            "observable": True, "fresh": True, "matched": True,
+                            "server_loopback_schema_contract_matches": True,
+                            "platform_publication_state": "platform_converged",
+                            "platform_publication_pending": False,
+                        },
+                    )
+                self.assertFalse(result["operator_ready"])
+                action = result["recommended_next_action"].lower()
+                self.assertIn("remote", action)
+                self.assertIn("do not archive", action)
+                self.assertIn(expected, action)
+                self.assertNotIn("task-closeout-archive", action)
 
     def test_operator_system_overview_keeps_execution_ready_when_publication_is_pending(self) -> None:
         fake_tasks = SimpleNamespace(
