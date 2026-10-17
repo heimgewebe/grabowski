@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 import fcntl
 import importlib.util
@@ -14,7 +15,10 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = ROOT / "tools" / "deploy_runtime.py"
+TOOLS = ROOT / "tools"
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+MODULE_PATH = TOOLS / "deploy_runtime.py"
 TEST_AGENT_INSTRUCTIONS = (
     "Grabowski agent-facing contract grabowski-agent-facing-contract-v1 "
     "(schema 1).\n"
@@ -33,6 +37,7 @@ def load_module():
 
 
 deploy_runtime = load_module()
+import deploy_runtime_dual as dual
 TEST_AGENT_INSTRUCTIONS_IDENTITY = deploy_runtime.agent_instructions_identity(
     TEST_AGENT_INSTRUCTIONS
 )
@@ -2360,6 +2365,157 @@ class DeployRuntimeTests(unittest.TestCase):
             ),
             ["mcp_protocol_version"],
         )
+
+
+class LegacyProductiveApplyAdmissionTests(unittest.TestCase):
+    """No test-only fixture grants R3, Captain or productive authority."""
+
+    SERVING = "a" * 40
+    TARGET = "b" * 40
+
+    def _args(self, *, head=None, lock_file=None):
+        return types.SimpleNamespace(
+            repo=ROOT,
+            runtime=Path("/synthetic/runtime"),
+            profile_path=Path("/synthetic/profile"),
+            lock_file=lock_file if lock_file is not None else deploy_runtime.DEFAULT_LOCK_FILE,
+            timeout=1,
+            check=False,
+            apply=True,
+            expected_head=head,
+        )
+
+    def _route(self, head):
+        selector = {
+            "selector_sha256": "2" * 64,
+            "generation": 2,
+            "selected_slot": "canonical",
+            "upstream_port": 18181,
+            "runtime_binding_sha256": "1" * 64,
+            "release_id": "synthetic-serving",
+            "repo_head": head,
+        }
+        ingress = {
+            "selector_sha256": selector["selector_sha256"],
+            "selector_generation": selector["generation"],
+            "selected_slot": selector["selected_slot"],
+            "upstream_port": selector["upstream_port"],
+            "runtime_binding_sha256": selector["runtime_binding_sha256"],
+            "release_id": selector["release_id"],
+            "repo_head": selector["repo_head"],
+        }
+        material = {"authoritative": True, "selector": selector, "ingress": ingress}
+        return {**material, "readback_sha256": dual._json_sha256(material)}
+
+    def test_apply_without_exact_expected_head_rejected_before_preflight(self):
+        with (
+            patch.object(deploy_runtime, "parse_args", return_value=self._args()),
+            patch.object(deploy_runtime, "preflight_apply") as preflight,
+            patch.object(deploy_runtime, "deployment_lock") as lock,
+            patch.object(deploy_runtime, "deploy") as effect,
+        ):
+            self.assertEqual(1, deploy_runtime.main())
+        preflight.assert_not_called()
+        lock.assert_not_called()
+        effect.assert_not_called()
+
+    def test_apply_with_noncanonical_lock_rejected_before_preflight(self):
+        with (
+            patch.object(deploy_runtime, "parse_args", return_value=self._args(
+                head=self.SERVING, lock_file=Path("/synthetic/alternate.lock"),
+            )),
+            patch.object(deploy_runtime, "preflight_apply") as preflight,
+            patch.object(deploy_runtime, "deployment_lock") as lock,
+            patch.object(deploy_runtime, "deploy") as effect,
+        ):
+            self.assertEqual(1, deploy_runtime.main())
+        preflight.assert_not_called()
+        lock.assert_not_called()
+        effect.assert_not_called()
+
+    def test_changed_source_denied_under_lock_before_legacy_deploy(self):
+        events = []
+
+        @contextmanager
+        def locked(_path):
+            events.append("lock-enter")
+            try:
+                yield
+            finally:
+                events.append("lock-exit")
+
+        def observed():
+            events.append("trusted-readback")
+            return self._route(self.SERVING)
+
+        with (
+            patch.object(deploy_runtime, "parse_args", return_value=self._args(head=self.TARGET)),
+            patch.object(deploy_runtime, "preflight_apply"),
+            patch.object(deploy_runtime, "deployment_lock", side_effect=locked),
+            patch.object(
+                deploy_runtime, "snapshot_from_git",
+                return_value=types.SimpleNamespace(repo_head=self.TARGET),
+            ),
+            patch.object(dual, "observe_authoritative_routing", side_effect=observed),
+            patch.object(deploy_runtime, "deploy") as effect,
+        ):
+            self.assertEqual(1, deploy_runtime.main())
+        self.assertEqual(["lock-enter", "trusted-readback", "lock-exit"], events)
+        effect.assert_not_called()
+
+    def test_unchanged_source_requires_locked_readback_and_binds_core_deploy(self):
+        events = []
+
+        @contextmanager
+        def locked(_path):
+            events.append("lock-enter")
+            try:
+                yield
+            finally:
+                events.append("lock-exit")
+
+        def observed():
+            events.append("trusted-readback")
+            return self._route(self.SERVING)
+
+        def deployment(*_args, **_kwargs):
+            events.append("deploy")
+
+        args = self._args(head=self.SERVING)
+        with (
+            patch.object(deploy_runtime, "parse_args", return_value=args),
+            patch.object(deploy_runtime, "preflight_apply"),
+            patch.object(deploy_runtime, "deployment_lock", side_effect=locked),
+            patch.object(
+                deploy_runtime, "snapshot_from_git",
+                return_value=types.SimpleNamespace(repo_head=self.SERVING),
+            ),
+            patch.object(dual, "observe_authoritative_routing", side_effect=observed),
+            patch.object(deploy_runtime, "deploy", side_effect=deployment) as effect,
+        ):
+            self.assertEqual(0, deploy_runtime.main())
+        self.assertEqual(
+            ["lock-enter", "trusted-readback", "deploy", "lock-exit"], events,
+        )
+        effect.assert_called_once_with(
+            ROOT, args.runtime, args.profile_path, timeout_seconds=1,
+            expected_head=self.SERVING,
+        )
+
+    def test_git_head_drift_between_locked_admission_and_effect_blocks_build(self):
+        with (
+            patch.object(
+                deploy_runtime, "snapshot_from_git",
+                return_value=types.SimpleNamespace(repo_head=self.TARGET),
+            ),
+            patch.object(deploy_runtime, "build_release") as effect,
+        ):
+            with self.assertRaisesRegex(deploy_runtime.DeployError, "expected_head"):
+                deploy_runtime.deploy(
+                    ROOT, Path("/synthetic/runtime"), Path("/synthetic/profile"),
+                    timeout_seconds=1, expected_head=self.SERVING,
+                )
+        effect.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -3165,8 +3165,24 @@ def deploy(
     profile_path: Path,
     *,
     timeout_seconds: int,
+    expected_head: str | None = None,
 ) -> None:
+    """Low-level deploy primitive; callers must hold the canonical deploy lock.
+
+    Main() supplies an effect-time trusted source admission under that lock.
+    The extra HEAD check binds this independently refreshed Git snapshot to the
+    precise target that was authorized, before any release-building effect.
+    """
     snapshot = snapshot_from_git(repo)
+    if expected_head is not None and (
+        not isinstance(expected_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None
+        or snapshot.repo_head != expected_head
+    ):
+        fail(
+            "Legacy deployment snapshot differs from exact expected_head",
+            phase="expected-head",
+        )
     runtime = require_runtime_replaceable(runtime)
     live_entrypoint = require_profile_matches_contract(profile_path, runtime, snapshot.contract)
     initial_service = observe_service()
@@ -3408,6 +3424,10 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_LOCK_FILE,
     )
+    parser.add_argument(
+        "--expected-head",
+        help="Exact lowercase Git source head required for productive --apply.",
+    )
     parser.add_argument("--timeout", type=int, default=40)
 
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -3424,16 +3444,38 @@ def main() -> int:
     lock_file = absolute_no_resolve(args.lock_file)
 
     try:
+        expected_head = getattr(args, "expected_head", None)
         if args.check:
+            if expected_head is not None:
+                fail("--expected-head is only valid with --apply")
             check(repo, runtime)
         else:
+            if (
+                not isinstance(expected_head, str)
+                or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head)
+                is None
+            ):
+                fail("productive --apply requires a valid exact --expected-head")
+            if lock_file != DEFAULT_LOCK_FILE:
+                fail(
+                    "release admission blocked: legacy --apply requires "
+                    "canonical deployment lock"
+                )
             preflight_apply(repo, runtime, profile_path)
             with deployment_lock(lock_file):
+                # Import at effect-time, not during dual-module initialization:
+                # deploy_runtime_dual imports this core module itself.
+                import deploy_runtime_dual as dual
+
+                dual.require_locked_release_source_admission(
+                    expected_head=expected_head
+                )
                 deploy(
                     repo,
                     runtime,
                     profile_path,
                     timeout_seconds=args.timeout,
+                    expected_head=expected_head,
                 )
     except DeployError as exc:
         print(

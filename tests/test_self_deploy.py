@@ -9431,16 +9431,25 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         error = RUNNER.deploy_dual.ProductionBlueGreenReceiptPersistenceError(
             receipt, OSError("receipt full")
         )
+        # This synthetic receipt-persistence test assumes an already admitted
+        # release; it does not exercise or relax production release admission.
         with patch.object(
             RUNNER.deploy_dual,
             "run_production_blue_green_cutover",
             side_effect=error,
-        ):
+        ), patch.object(
+            RUNNER,
+            "require_effect_time_release_admission",
+            return_value={"status": "test-fixture-already-admitted"},
+        ) as admission:
             result = RUNNER.run_productive_blue_green(
                 repo=Path("/tmp/repository"),
                 expected_head="f" * 40,
                 source_identity_sha256="cd" * 32,
             )
+        admission.assert_called_once_with(
+            expected_head="f" * 40, source_identity_sha256="cd" * 32
+        )
         self.assertEqual(result["outcome"], "completed")
         self.assertFalse(result["receipt_persisted"])
         self.assertIsNone(result["receipt_path"])

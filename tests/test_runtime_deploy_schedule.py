@@ -47,6 +47,30 @@ def runtime_binding(release_id: str, repo_head: str) -> dict[str, str]:
     }
 
 
+def already_serving_authoritative_route(head: str = HEAD_GREEN) -> dict:
+    """Synthetic unchanged-serving ingress; never a Captain/R3 permit."""
+    selector = {
+        "selector_sha256": "2" * 64,
+        "generation": 2,
+        "selected_slot": "canonical",
+        "upstream_port": 18181,
+        "runtime_binding_sha256": "1" * 64,
+        "repo_head": head,
+        "release_id": "synthetic-serving-release",
+    }
+    ingress = {
+        "selector_sha256": selector["selector_sha256"],
+        "selector_generation": selector["generation"],
+        "selected_slot": selector["selected_slot"],
+        "upstream_port": selector["upstream_port"],
+        "runtime_binding_sha256": selector["runtime_binding_sha256"],
+        "repo_head": selector["repo_head"],
+        "release_id": selector["release_id"],
+    }
+    material = {"authoritative": True, "selector": selector, "ingress": ingress}
+    return {**material, "readback_sha256": dual._json_sha256(material)}
+
+
 class RoutingSelectorTests(unittest.TestCase):
     def test_selector_is_private_two_target_cas_with_hash_readback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -504,6 +528,10 @@ class ProductionRecoverySemanticsTests(unittest.TestCase):
         with (
             mock.patch.object(dual.core, "deployment_lock", return_value=nullcontext()),
             mock.patch.object(
+                dual, "observe_authoritative_routing",
+                return_value=already_serving_authoritative_route(),
+            ),
+            mock.patch.object(
                 dual, "prepare_production_blue_green_runtime", return_value=runtime
             ),
             mock.patch.object(
@@ -534,6 +562,10 @@ class ProductionRecoverySemanticsTests(unittest.TestCase):
 
         with (
             mock.patch.object(dual.core, "deployment_lock", return_value=nullcontext()),
+            mock.patch.object(
+                dual, "observe_authoritative_routing",
+                return_value=already_serving_authoritative_route(),
+            ),
             mock.patch.object(
                 dual, "prepare_production_blue_green_runtime", return_value=runtime
             ) as prepare,
@@ -647,6 +679,10 @@ class ProductionRecoverySemanticsTests(unittest.TestCase):
         with (
             mock.patch.object(dual.core, "deployment_lock", return_value=nullcontext()),
             mock.patch.object(
+                dual, "observe_authoritative_routing",
+                return_value=already_serving_authoritative_route(),
+            ),
+            mock.patch.object(
                 dual, "prepare_production_blue_green_runtime", return_value=runtime
             ),
             mock.patch.object(
@@ -685,6 +721,10 @@ class ProductionRecoverySemanticsTests(unittest.TestCase):
 
         with (
             mock.patch.object(dual.core, "deployment_lock", return_value=nullcontext()),
+            mock.patch.object(
+                dual, "observe_authoritative_routing",
+                return_value=already_serving_authoritative_route(),
+            ),
             mock.patch.object(
                 dual,
                 "prepare_production_blue_green_runtime",

@@ -237,12 +237,34 @@ def emit(phase: str, **fields: Any) -> None:
     print(json.dumps({"timestamp_unix": int(time.time()), "phase": phase, **fields}, ensure_ascii=False, sort_keys=True), flush=True)
 
 
-def git_environment() -> dict[str, str]:
-    environment = dict(os.environ)
-    environment.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat", "PAGER": "cat", "NO_COLOR": "1"})
-    for key in ("GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_ASKPASS", "SSH_ASKPASS"):
-        environment.pop(key, None)
+def _hermetic_git_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Bind all worker Git reads and validation children to their checkout.
+
+    Inherited Git variables can redirect the index/object store, inject
+    configuration, apply replacement commits or trigger lazy network reads.
+    Even read-only preflight and validation must not trust that ambient state.
+    This is Git-process isolation, *not* Captain or release authorization.
+    """
+    for key in tuple(environment):
+        if key.startswith("GIT_"):
+            environment.pop(key, None)
+    environment.pop("SSH_ASKPASS", None)
+    environment.update({
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+        "NO_COLOR": "1",
+    })
     return environment
+
+
+def git_environment() -> dict[str, str]:
+    return _hermetic_git_environment(dict(os.environ))
 
 
 def child_environment() -> dict[str, str]:
@@ -947,16 +969,7 @@ def wait_for_deployment_window(
 
 
 def _validation_environment(validation_root: Path) -> dict[str, str]:
-    environment = deploy_core.pip_env()
-    environment.update(
-        {
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_PAGER": "cat",
-            "PAGER": "cat",
-            "NO_COLOR": "1",
-        }
-    )
+    environment = _hermetic_git_environment(deploy_core.pip_env())
     for key in (
         "GIT_EXTERNAL_DIFF",
         "GIT_DIFF_OPTS",
@@ -1694,12 +1707,127 @@ def run_midcutover_resume(*, repo: Path, decision: dict[str, Any]) -> dict[str, 
     return {**result, "summary": summary}
 
 
+
+def require_effect_time_release_admission(
+    *, expected_head: str, source_identity_sha256: str,
+) -> dict[str, Any]:
+    """Fail closed at the *delayed effect* boundary, not only at scheduling.
+
+    This is deliberately a conservative interim guard. A source-changing
+    release needs a separately protected, origin-bound Captain decision and a
+    fresh whole-release R3/CI reconciliation. The current user-owned scheduler
+    intent and arbitrary worker argv do not establish that authority. Never
+    interpret their mere presence, a review PR number, or a self-hashed JSON
+    object as a permit to perform a productive cutover.
+    """
+    if not isinstance(expected_head, str) or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None:
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: invalid exact target source head"
+        )
+    if (
+        not isinstance(source_identity_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_identity_sha256) is None
+    ):
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: invalid source identity"
+        )
+    observed = deploy_dual.observe_authoritative_routing()
+    if not isinstance(observed, dict) or observed.get("authoritative") is not True:
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: serving route is not authoritative"
+        )
+    ingress = observed.get("ingress")
+    selector = observed.get("selector")
+    if not isinstance(ingress, dict) or not isinstance(selector, dict):
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: serving provenance is incomplete"
+        )
+    serving_head = ingress.get("repo_head")
+    serving_release_id = ingress.get("release_id")
+    selected_slot = selector.get("selected_slot")
+    slot_port = (
+        deploy_dual.transport_ingress.ROUTING_SLOTS.get(selected_slot)
+        if isinstance(selected_slot, str)
+        else None
+    )
+    binding_sha256 = selector.get("runtime_binding_sha256")
+    selector_sha256 = selector.get("selector_sha256")
+    generation = selector.get("generation")
+    if (
+        not isinstance(serving_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", serving_head) is None
+        or not isinstance(serving_release_id, str)
+        or not serving_release_id.strip()
+        or len(serving_release_id.encode("utf-8")) > 512
+        # A pair of missing fields is not an identity: None == None must
+        # never constitute positive release admission.
+        or slot_port is None
+        or selector.get("selected_slot") != ingress.get("selected_slot")
+        or type(selector.get("upstream_port")) is not int
+        or selector.get("upstream_port") != slot_port
+        or ingress.get("upstream_port") != slot_port
+        or type(generation) is not int
+        or generation < 1
+        or ingress.get("selector_generation") != generation
+        or not isinstance(selector_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", selector_sha256) is None
+        or ingress.get("selector_sha256") != selector_sha256
+        or not isinstance(binding_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", binding_sha256) is None
+        or ingress.get("runtime_binding_sha256") != binding_sha256
+        or selector.get("repo_head") != serving_head
+        or selector.get("release_id") != serving_release_id
+    ):
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: serving identity is incomplete or contradictory"
+        )
+    # A readback hash is an integrity consistency check, not an authority
+    # signature. The trusted ingress observer above proves route authority.
+    material = {
+        "authoritative": True,
+        "selector": selector,
+        "ingress": ingress,
+    }
+    if observed.get("readback_sha256") != canonical_json_sha256(material):
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: serving readback identity mismatch"
+        )
+    if serving_head != expected_head:
+        raise RecoveryClassificationBlocked(
+            "release admission blocked: source-changing productive cutover "
+            "requires a protected Captain release decision and fresh "
+            "independent R3/CI proof at this effect boundary"
+        )
+    return {
+        "schema_version": 1,
+        "status": "already-serving-exact-source",
+        "serving_repo_head": serving_head,
+        "serving_release_id": serving_release_id,
+        "target_repo_head": expected_head,
+        "source_identity_sha256": source_identity_sha256,
+        "ingress_readback_sha256": observed["readback_sha256"],
+        "does_not_establish": [
+            "Captain deployment authorization",
+            "historical merge review",
+            "authority for a source-changing release",
+        ],
+    }
+
+
+
 def run_productive_blue_green(
     *,
     repo: Path,
     expected_head: str,
     source_identity_sha256: str,
 ) -> dict[str, Any]:
+    # The scheduled job may have waited, validated and been overtaken by a
+    # different serving release. A scheduler-time R3/Captain PASS is not a
+    # durable effect-time capability.
+    require_effect_time_release_admission(
+        expected_head=expected_head,
+        source_identity_sha256=source_identity_sha256,
+    )
     try:
         result = deploy_dual.run_production_blue_green_cutover(
             repo=repo,
