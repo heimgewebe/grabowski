@@ -3638,8 +3638,10 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
     def _documented_nested_userns_policy_denial(
         bubblewrap: subprocess.CompletedProcess[bytes],
         syscall_witness: subprocess.CompletedProcess[bytes],
+        *,
+        apparmor_profile_attested: bool = False,
     ) -> bool:
-        """A kernel-denied nested userns needs two independent host signals."""
+        """Classify only independently evidenced bwrap sandbox-host policy denial."""
         return (
             bubblewrap.returncode == 1
             and bubblewrap.stdout == b""
@@ -3647,9 +3649,44 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 b"bwrap: No permissions to create new namespace"
             )
             and syscall_witness.returncode == 0
-            and syscall_witness.stdout.strip() == b"NESTED_USERNS_SYSCALL_DENIED"
             and syscall_witness.stderr == b""
+            and (
+                syscall_witness.stdout.strip() == b"NESTED_USERNS_SYSCALL_DENIED"
+                or (
+                    apparmor_profile_attested
+                    and syscall_witness.stdout.strip()
+                    == b"NESTED_USERNS_SYSCALL_ALLOWED"
+                )
+            )
         )
+
+    @staticmethod
+    def _verified_bwrap_apparmor_profile() -> bool:
+        """Demand the exact Ubuntu distribution-installed bwrap profile.
+
+        A successful raw CLONE_NEWUSER syscall does NOT prove that Bubblewrap's
+        own AppArmor profile can create a nested namespace. This is a
+        test-runner capability classification, never a live-provider grant.
+        """
+        setting = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        packaged = Path("/usr/share/apparmor/extra-profiles/bwrap-userns-restrict")
+        loaded_copy = Path("/etc/apparmor.d/bwrap-userns-restrict")
+        try:
+            if setting.read_bytes().strip() != b"1":
+                return False
+            for entry in (packaged, loaded_copy):
+                info = entry.lstat()
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != 0
+                    or info.st_mode & 0o022
+                    or info.st_size <= 0
+                    or info.st_size > 256 * 1024
+                ):
+                    return False
+            return packaged.read_bytes() == loaded_copy.read_bytes()
+        except OSError:
+            return False
 
     def test_nested_userns_skip_requires_independent_kernel_denial(self) -> None:
         """A generic bwrap failure must not mask a broken positive sandbox."""
@@ -3664,6 +3701,17 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             [], 0, b"NESTED_USERNS_SYSCALL_DENIED\n", b""
         )
         self.assertTrue(self._documented_nested_userns_policy_denial(denied, witness))
+        permitted = subprocess.CompletedProcess(
+            [], 0, b"NESTED_USERNS_SYSCALL_ALLOWED\n", b""
+        )
+        self.assertFalse(
+            self._documented_nested_userns_policy_denial(denied, permitted)
+        )
+        self.assertTrue(
+            self._documented_nested_userns_policy_denial(
+                denied, permitted, apparmor_profile_attested=True
+            )
+        )
         for probe, syscall in (
             (subprocess.CompletedProcess([], 1, b"", b"bwrap: file missing"), witness),
             (subprocess.CompletedProcess([], 2, b"", denied.stderr), witness),
@@ -3706,6 +3754,51 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             self._assert_real_nested_codex_sandbox_kernel(reject=True)
         self.assertEqual(observed, ["nested-denial", "syscall-denial", "nested-denial"])
 
+    def test_apparmor_bwrap_denial_still_runs_negative_kernel_proof(self) -> None:
+        """Distro AppArmor may deny nested bwrap while raw unshare succeeds."""
+        denied = subprocess.CompletedProcess(
+            [], 1, b"", b"bwrap: No permissions to create new namespace\n"
+        )
+        permitted = subprocess.CompletedProcess(
+            [], 0, b"NESTED_USERNS_SYSCALL_ALLOWED\n", b""
+        )
+        real_run = subprocess.run
+        observed: list[str] = []
+
+        def simulated_apparmor_host(argv, *args, **kwargs):
+            if argv and argv[0] == "/usr/bin/bwrap":
+                if "--unshare-user" in argv:
+                    observed.append("nested-denied")
+                    return denied
+                if "NESTED_USERNS_SYSCALL_DENIED" in argv[-1]:
+                    observed.append("raw-allowed")
+                    return permitted
+            return real_run(argv, *args, **kwargs)
+
+        with patch.object(subprocess, "run", side_effect=simulated_apparmor_host):
+            with patch.object(
+                self, "_verified_bwrap_apparmor_profile", return_value=False
+            ):
+                with self.assertRaises(AssertionError):
+                    self._assert_real_nested_codex_sandbox_kernel(reject=False)
+            with patch.object(
+                self, "_verified_bwrap_apparmor_profile", return_value=True
+            ) as attested:
+                with self.assertRaises(unittest.SkipTest):
+                    self._assert_real_nested_codex_sandbox_kernel(reject=False)
+                self._assert_real_nested_codex_sandbox_kernel(reject=True)
+            attested.assert_called_once_with()
+        self.assertEqual(
+            observed,
+            [
+                "nested-denied",
+                "raw-allowed",
+                "nested-denied",
+                "raw-allowed",
+                "nested-denied",
+            ],
+        )
+
     def _assert_real_nested_codex_sandbox_kernel(self, *, reject: bool) -> None:
         """Exercise outer and inner PID, user, seccomp and mount isolation.
 
@@ -3717,9 +3810,10 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
         # Ubuntu's bwrap-userns-restrict AppArmor profile allows one sandbox
         # level but deliberately denies a *second* user namespace below it.
         # Probe that precise outer->inner capability without trusted runner
-        # code or provider calls. Only a kernel permission-denied result may
-        # skip the positive nested subcase; unexpected errors still fail CI.
-        # The negative nested Codex-failure path always runs.
+        # code or provider calls. A denied syscall OR an exact distribution
+        # AppArmor bwrap policy plus separately successful raw syscall may
+        # classify the host as unsuitable for the positive nested subcase.
+        # Unexpected errors still fail CI, and negative Codex tests ALWAYS run.
         try:
             nested_kernel_probe = subprocess.run(
                 [
@@ -3774,6 +3868,8 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 "error=ctypes.get_errno()\n"
                 "if result==-1 and error in (errno.EPERM,errno.EACCES):\n"
                 " print('NESTED_USERNS_SYSCALL_DENIED')\n"
+                "elif result==0:\n"
+                " print('NESTED_USERNS_SYSCALL_ALLOWED')\n"
                 "else:\n"
                 " print(f'UNEXPECTED_USERNS_RESULT={result},errno={error}')\n"
                 " sys.exit(86)\n"
@@ -3806,14 +3902,24 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 self.fail(
                     f"nested kernel syscall witness unavailable: {type(exc).__name__}"
                 )
+            kernel_permitted = (
+                syscall_witness.returncode == 0
+                and syscall_witness.stdout.strip() == b"NESTED_USERNS_SYSCALL_ALLOWED"
+            )
+            apparmor_attested = (
+                kernel_permitted and self._verified_bwrap_apparmor_profile()
+            )
             if self._documented_nested_userns_policy_denial(
-                nested_kernel_probe, syscall_witness
+                nested_kernel_probe,
+                syscall_witness,
+                apparmor_profile_attested=apparmor_attested,
             ):
                 self.skipTest(
-                    "CONFIRMED HOST POLICY: Bubblewrap plus independent "
-                    "CLONE_NEWUSER syscall deny nested user namespaces. "
-                    "The positive provider-free production kernel proof "
-                    "remains MANDATORY on a supported target host."
+                    "CONFIRMED UNSUPPORTED HOST: nested Bubblewrap namespace "
+                    "denied, with an independent syscall witness and, where "
+                    "the syscall works, a verified restrictive AppArmor profile. "
+                    "The provider-free positive production kernel proof "
+                    "remains MANDATORY on the supported target host."
                 )
             self.fail(
                 "nested kernel preflight failed without independent proof "
