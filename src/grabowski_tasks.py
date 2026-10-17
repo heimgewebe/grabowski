@@ -7730,7 +7730,9 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
         and not (
             record["state"] == "cancelled"
             and observed_state in {"completed", "failed", "signalled", "timed_out"}
-            and _task_reconcile_ready_local_terminal_observed(record, observation)
+            and _task_reconcile_ready_local_terminal_observed(
+                record, observation, cancelled_quiescence_only=True
+            )
         )
     ):
         result["state"] = "observation_error"
@@ -12448,7 +12450,8 @@ def _task_reconcile_ready_archived_user_unit_live() -> bool:
 
 
 def _task_reconcile_ready_local_terminal_observed(
-    record: dict[str, Any], observed: Any,
+    record: dict[str, Any], observed: Any, *,
+    cancelled_quiescence_only: bool = False,
 ) -> bool:
     if not isinstance(observed, dict):
         return False
@@ -12496,6 +12499,16 @@ def _task_reconcile_ready_local_terminal_observed(
     ):
         return False
     result = props.get("Result")
+    if cancelled_quiescence_only:
+        # A cancelled task's policy outcome is already historical truth.
+        # For a confirmed quiescent bound unit, do not narrow the accepted
+        # systemd failure reasons to the separate readiness whitelist:
+        # oom-kill, start-limit-hit and future terminal reasons are not live.
+        return (
+            record.get("state") == "cancelled"
+            and isinstance(result, str)
+            and bool(result)
+        )
     allowed = {
         "completed": {"success"},
         "failed": {"exit-code", "resources", "protocol", "watchdog"},
