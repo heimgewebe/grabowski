@@ -50,6 +50,8 @@ MAX_JOB_RUNTIME_SECONDS = 2_592_000
 JOB_RUNTIME_GRACE_SECONDS = 300
 SYSTEMD_SHOW_CHUNK_SIZE = 100
 MAX_ARCHIVE_FILES = 32
+MAX_ARCHIVE_ENTRIES = 256
+MAX_ARCHIVE_DEPTH = 16
 MAX_ARCHIVE_FILE_BYTES = 128 * 1024 * 1024
 MAX_JSON_BYTES = 128 * 1024
 MAX_WORKER_LEASE_KEYS = 32
@@ -209,6 +211,34 @@ def _archive_internal_manifest_shape_preflight(path: Path) -> None:
         )
 
 
+def _archive_bounded_entries(directory: Path) -> list[Path]:
+    """Bound archive traversal before sorting, hashing or changing unit state.
+
+    Directory and reserved-manifest entries count too. os.scandir streams
+    names without materializing an attacker-sized directory, and no symbolic
+    link may serve as a traversal root.
+    """
+    pending: list[tuple[Path, int]] = [(directory, 0)]
+    paths: list[Path] = []
+    while pending:
+        parent, depth = pending.pop()
+        _private_directory(parent)
+        with os.scandir(parent) as children:
+            for child in children:
+                path = Path(child.path)
+                paths.append(path)
+                if len(paths) > MAX_ARCHIVE_ENTRIES:
+                    raise RuntimeError("archive source exceeds the entry-count bound")
+                if depth + 1 > MAX_ARCHIVE_DEPTH:
+                    raise RuntimeError("archive source exceeds the depth bound")
+                if child.is_symlink():
+                    raise RuntimeError(f"archive source contains a symlink: {path}")
+                if child.is_dir(follow_symlinks=False):
+                    _private_directory(path)
+                    pending.append((path, depth + 1))
+    return sorted(paths)
+
+
 def _archive_file_shape_preflight(directory: Path) -> None:
     """Classify unsafe terminal-job archives without hashing their whole contents.
 
@@ -217,7 +247,7 @@ def _archive_file_shape_preflight(directory: Path) -> None:
     """
     directory = _private_directory(directory)
     files = 0
-    for path in directory.rglob("*"):
+    for path in _archive_bounded_entries(directory):
         if path == directory / "archive-manifest.json":
             _archive_internal_manifest_shape_preflight(path)
             continue
@@ -1195,7 +1225,7 @@ def build_plan(
 def _archive_file_manifest(directory: Path) -> list[dict[str, Any]]:
     directory = _private_directory(directory)
     files: list[dict[str, Any]] = []
-    for path in sorted(directory.rglob("*")):
+    for path in _archive_bounded_entries(directory):
         if path == directory / "archive-manifest.json":
             _archive_internal_manifest_shape_preflight(path)
             continue

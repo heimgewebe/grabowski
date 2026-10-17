@@ -955,9 +955,12 @@ class RuntimeRetentionTests(unittest.TestCase):
         # budget or prevent an unrelated safe job from progressing.
         cases = (
             ("symlink", "symlink"),
+            ("hidden-symlink", "symlink"),
+            ("directory-symlink", "symlink"),
             ("hardlink", "private owner-controlled regular file"),
             ("world-readable", "private owner-controlled regular file"),
             ("file-count", "file-count bound"),
+            ("directory-count", "entry-count bound"),
         )
         for shape, reason in cases:
             with self.subTest(unsafe_source=shape):
@@ -975,11 +978,14 @@ class RuntimeRetentionTests(unittest.TestCase):
                     stderr.write_bytes(original)
                     stderr.chmod(0o600)
                     metadata_before = (bad / "metadata.json").read_bytes()
-                    extra = bad / "extra.log"
+                    extra = bad / (".hidden-link" if shape == "hidden-symlink" else "extra.log")
                     outside = root / "independent-evidence.log"
-                    if shape == "symlink":
+                    if shape in {"symlink", "hidden-symlink"}:
                         outside.write_bytes(b"external evidence must survive\n")
                         extra.symlink_to(outside)
+                    elif shape == "directory-symlink":
+                        outside.mkdir(mode=0o700)
+                        extra.symlink_to(outside, target_is_directory=True)
                     elif shape == "hardlink":
                         os.link(stderr, extra)
                     elif shape == "world-readable":
@@ -987,12 +993,17 @@ class RuntimeRetentionTests(unittest.TestCase):
                     elif shape == "file-count":
                         extra.write_bytes(b"counted, never deleted\n")
                         extra.chmod(0o600)
+                    elif shape == "directory-count":
+                        for number in range(12):
+                            (bad / f"subdir-{number:02d}").mkdir(mode=0o700)
 
                     states = {unit: self._state(unit) for unit in (bad_unit, good_unit)}
                     # Both jobs have three normal files. For file-count only,
                     # the bad job's fourth file exceeds the limit.
                     limit = 3 if shape == "file-count" else RETENTION.MAX_ARCHIVE_FILES
-                    with patch.object(RETENTION, "MAX_ARCHIVE_FILES", limit):
+                    with patch.object(RETENTION, "MAX_ARCHIVE_FILES", limit), patch.object(
+                        RETENTION, "MAX_ARCHIVE_ENTRIES", 10, create=True
+                    ):
                         plan = RETENTION.build_plan(
                             minimum_job_age_seconds=50,
                             max_archive_jobs=2,
@@ -1031,19 +1042,24 @@ class RuntimeRetentionTests(unittest.TestCase):
                     self.assertEqual(stderr.read_bytes(), original)
                     self.assertEqual((bad / "metadata.json").read_bytes(), metadata_before)
                     self.assertTrue(bad.is_dir())
-                    if shape == "symlink":
+                    if shape in {"symlink", "hidden-symlink"}:
                         self.assertTrue(extra.is_symlink())
                         self.assertEqual(
                             outside.read_bytes(), b"external evidence must survive\n"
                         )
+                    elif shape == "directory-symlink":
+                        self.assertTrue(extra.is_symlink())
+                        self.assertTrue(outside.is_dir())
                     elif shape == "hardlink":
                         self.assertTrue(extra.samefile(stderr))
                         self.assertEqual(extra.read_bytes(), original)
                         self.assertEqual(stderr.stat().st_nlink, 2)
                     elif shape == "world-readable":
                         self.assertEqual(stderr.stat().st_mode & 0o777, 0o644)
-                    else:
+                    elif shape == "file-count":
                         self.assertEqual(extra.read_bytes(), b"counted, never deleted\n")
+                    else:
+                        self.assertTrue((bad / "subdir-00").is_dir())
 
     def test_stale_internal_archive_manifest_does_not_exhaust_file_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
