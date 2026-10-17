@@ -5969,7 +5969,11 @@ class TaskTests(unittest.TestCase):
             return {
                 "state": "completed",
                 "observer": {"kind": "root-systemd-broker-show-v1"},
-                "probe": {"returncode": 0, "outcome_unknown": False},
+                "probe": {
+                    "returncode": 0, "outcome_unknown": False,
+                    "timed_out": False, "stdout_truncated": False,
+                    "stderr_truncated": False, "root_truth_observable": True,
+                },
                 "observed_at_unix": tasks._now(),
                 "properties": {
                     "LoadState": "loaded", "ActiveState": "inactive",
@@ -6030,7 +6034,11 @@ class TaskTests(unittest.TestCase):
             return {
                 "state": "completed",
                 "observer": {"kind": "root-systemd-broker-show-v1"},
-                "probe": {"returncode": 0, "outcome_unknown": False},
+                "probe": {
+                    "returncode": 0, "outcome_unknown": False,
+                    "timed_out": False, "stdout_truncated": False,
+                    "stderr_truncated": False, "root_truth_observable": True,
+                },
                 "observed_at_unix": tasks._now(),
                 "properties": {
                     "LoadState": "loaded", "ActiveState": "inactive",
@@ -6176,7 +6184,11 @@ class TaskTests(unittest.TestCase):
             return {
                 "state": "completed",
                 "observer": {"kind": "root-systemd-broker-show-v1"},
-                "probe": {"returncode": 0, "outcome_unknown": False},
+                "probe": {
+                    "returncode": 0, "outcome_unknown": False,
+                    "timed_out": False, "stdout_truncated": False,
+                    "stderr_truncated": False, "root_truth_observable": True,
+                },
                 "observed_at_unix": tasks._now(),
                 "properties": {
                     "LoadState": "loaded", "ActiveState": "inactive",
@@ -6383,7 +6395,11 @@ class TaskTests(unittest.TestCase):
                            "Names": tasks._row_raw(task_id)["unit"],
                            "InvocationID": "a" * 32},
             "observer": {"kind": "root-systemd-broker-show-v1"},
-            "probe": {"returncode": 0, "outcome_unknown": False},
+            "probe": {
+                "returncode": 0, "outcome_unknown": False,
+                "timed_out": False, "stdout_truncated": False,
+                "stderr_truncated": False, "root_truth_observable": True,
+            },
             "observed_at_unix": tasks._now(),
         }
         with (
@@ -7544,11 +7560,41 @@ class TaskTests(unittest.TestCase):
                 "ExecMainCode": "1", "ExecMainStatus": "0",
                 "Id": unit, "Names": unit, "InvocationID": "a" * 32,
             },
-            "probe": {"returncode": 0, "outcome_unknown": False},
+            "probe": {
+                "returncode": 0, "outcome_unknown": False,
+                "timed_out": False, "stdout_truncated": False,
+                "stderr_truncated": False, "root_truth_observable": True,
+            },
             "observer": {"kind": "root-systemd-broker-show-v1"},
             "observed_at_unix": tasks._now(),
         }
         self.assertTrue(tasks._task_reconcile_ready_rootbroker_terminal_observed(record, observed))
+        # Success-looking systemctl properties from an incomplete broker
+        # response must not certify privileged process quiescence.
+        for invalid_field in ("timed_out", "stdout_truncated", "stderr_truncated"):
+            with self.subTest(invalid_probe=invalid_field):
+                self.assertFalse(tasks._task_reconcile_ready_rootbroker_terminal_observed(
+                    record, {**observed, "probe": {
+                        **observed["probe"], invalid_field: True,
+                    }},
+                ))
+        self.assertFalse(tasks._task_reconcile_ready_rootbroker_terminal_observed(
+            record, {**observed, "probe": {
+                **observed["probe"], "root_truth_observable": False,
+            }},
+        ))
+        # Missing, not just explicitly failed, broker status fields are
+        # insufficient authority for a positive readonly readiness proof.
+        for missing_field in (
+            "timed_out", "stdout_truncated", "stderr_truncated",
+            "root_truth_observable",
+        ):
+            with self.subTest(missing_probe=missing_field):
+                incomplete_probe = dict(observed["probe"])
+                del incomplete_probe[missing_field]
+                self.assertFalse(tasks._task_reconcile_ready_rootbroker_terminal_observed(
+                    record, {**observed, "probe": incomplete_probe},
+                ))
         self.assertFalse(tasks._task_reconcile_ready_rootbroker_terminal_observed(
             record, {**observed, "properties": {
                 **observed["properties"], "ActiveState": "active",
@@ -7711,7 +7757,11 @@ class TaskTests(unittest.TestCase):
             with self.subTest(label=label):
                 observation = {
                     "state": "completed", "properties": props,
-                    "probe": {"returncode": 0, "outcome_unknown": False},
+                    "probe": {
+                        "returncode": 0, "outcome_unknown": False,
+                        "timed_out": False, "stdout_truncated": False,
+                        "stderr_truncated": False, "root_truth_observable": True,
+                    },
                     "observer": {"kind": "root-systemd-broker-show-v1"},
                     "observed_at_unix": tasks._now(),
                 }
@@ -7755,7 +7805,11 @@ class TaskTests(unittest.TestCase):
                 "LoadState": "loaded", "ActiveState": "inactive", "SubState": "dead",
                 "Result": "success", "ExecMainStatus": "0",
             },
-            "probe": {"returncode": 0, "outcome_unknown": False},
+            "probe": {
+                "returncode": 0, "outcome_unknown": False,
+                "timed_out": False, "stdout_truncated": False,
+                "stderr_truncated": False, "root_truth_observable": True,
+            },
             "observer": {"kind": "root-systemd-broker-show-v1"},
             "observed_at_unix": tasks._now(),
         }

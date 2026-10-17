@@ -11915,7 +11915,16 @@ def _task_reconcile_ready_rootbroker_terminal_observed(
         return False
     if not isinstance(probe, dict) or type(probe.get("returncode")) is not int:
         return False
-    if probe["returncode"] != 0 or probe.get("outcome_unknown"):
+    # The broker may return an apparently coherent prefix even when its
+    # response was truncated or its privileged truth was unobservable.
+    if (
+        probe["returncode"] != 0
+        or probe.get("outcome_unknown") is not False
+        or probe.get("timed_out") is not False
+        or probe.get("stdout_truncated") is not False
+        or probe.get("stderr_truncated") is not False
+        or probe.get("root_truth_observable") is not True
+    ):
         return False
     observed_at = observed.get("observed_at_unix")
     now = _now()
