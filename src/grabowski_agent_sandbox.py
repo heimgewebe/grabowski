@@ -758,6 +758,26 @@ def git_requires_filter_effect_guard(argv: list[str]) -> bool:
         prefix = arguments[:arguments.index("--")] if "--" in arguments else arguments
         if any(item in {"--cached", "--staged", "--no-index"} for item in prefix):
             return False
+        # A 40/64-hex operand can belong to a Git option (-S/-G,
+        # --anchored, --find-object, --word-diff-regex), not to a revision.
+        # Only options known to consume no following argv token may keep
+        # the immutable-revision exemption. Unknown options require effect-
+        # time filter isolation; do not guess where their operands end.
+        pure_diff_options = frozenset({
+            "--no-ext-diff", "--no-textconv", "--binary", "--full-index",
+            "--patch", "-p", "--raw", "--name-only", "--name-status",
+            "--stat", "--numstat", "--shortstat", "--check", "--quiet",
+            "--exit-code", "--no-renames", "--no-color", "--color=never",
+            "--ignore-all-space", "-w", "--ignore-space-change",
+            "--ignore-blank-lines", "--ignore-space-at-eol",
+            "--ignore-cr-at-eol", "--minimal", "--patience", "--histogram",
+            "--indent-heuristic", "--no-indent-heuristic", "--text", "-a",
+        })
+        if any(
+            item.startswith("-") and item not in pure_diff_options
+            for item in prefix
+        ):
+            return True
         # A committed two-object diff never reads worktree contents or
         # invokes clean/smudge filters. Do not require a Git info directory
         # solely to compare immutable SHA-1 or SHA-256 commit objects.

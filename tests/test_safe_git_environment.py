@@ -857,6 +857,112 @@ class SafeGitEnvironmentIsolationTests(unittest.TestCase):
 
 
 
+    def test_sha_option_operand_does_not_bypass_filter_guard(self) -> None:
+        """A Git diff option operand that looks like a SHA is not a commit."""
+        from grabowski_agent_sandbox import git_requires_filter_effect_guard
+
+        first, second = "a" * 40, "b" * 40
+        for arguments in (
+            ("-S", first, second),
+            ("-G", first, second),
+            ("--anchored", first, second),
+            ("--word-diff-regex", first, second),
+            ("--find-object", first, second),
+            ("-S" + first, second),
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertTrue(
+                    git_requires_filter_effect_guard(["git", "diff", *arguments]),
+                    "SHA-shaped option operand was mistaken for an immutable diff",
+                )
+
+        for arguments in (
+            ("--binary", "--no-ext-diff", "--no-textconv", first, second),
+            ("--name-status", first + ".." + second),
+            ("--cached", "--name-only", second),
+            ("--cached", "-S", first, second),
+            ("-S", first, "--cached", second),
+            ("--staged", "--stat"),
+            ("--no-index", "first.txt", "second.txt"),
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertFalse(git_requires_filter_effect_guard(["git", "diff", *arguments]))
+
+    def test_sha_shaped_pickaxe_really_triggers_late_filter_without_guard(self) -> None:
+        """An effect-time clean filter must remain inert after the option fix."""
+        from unittest import mock
+        from grabowski_agent_workspace import _run as workspace_run
+
+        # This positive overlay test is meaningful only where Linux can seal
+        # memfds and bubblewrap is installed. Unsupported runtimes must still
+        # reject the guarded Git effect (not fall back to an unsafe subprocess).
+        if (not hasattr(os, "memfd_create")
+                or not hasattr(os, "MFD_ALLOW_SEALING")
+                or not Path("/usr/bin/bwrap").is_file()):
+            self.skipTest("effect-time sealed-memfd/bwrap backend unavailable")
+
+        with tempfile.TemporaryDirectory(prefix="sha-pickaxe-filter-regression-") as raw:
+            root = Path(raw)
+            repo = root / "repo"
+            secure = safe_git_environment()
+            self._two_commit_repo(repo, secure)
+            (repo / ".gitattributes").write_text(
+                "tracked.txt filter=attacker\n", encoding="ascii",
+            )
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "add", ".gitattributes"],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(repo), "-c", "user.name=Fixture",
+                 "-c", "user.email=fixture@example.invalid",
+                 "commit", "-qm", "filter attributes"],
+                env=secure, check=True, capture_output=True, timeout=15,
+            )
+            parent = subprocess.check_output(
+                ["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD^"],
+                env=secure, timeout=15, text=True,
+            ).strip()
+            head = subprocess.check_output(
+                ["/usr/bin/git", "-C", str(repo), "rev-parse", "HEAD"],
+                env=secure, timeout=15, text=True,
+            ).strip()
+            (repo / "tracked.txt").write_text("dirty worktree bytes\n", encoding="ascii")
+            marker, helper = root / "clean-filter-ran", root / "helper"
+            helper.write_text(
+                "#!/bin/sh\n: > " + shlex.quote(str(marker)) + "\ncat\n",
+                encoding="ascii",
+            )
+            helper.chmod(0o700)
+            real_run = subprocess.run
+            injected = False
+
+            def configure_at_git_effect(argv: list[str], *args: object, **kwargs: object):
+                nonlocal injected
+                if (not injected and argv and argv[0] in ("git", "/usr/bin/bwrap")
+                        and "diff" in argv):
+                    injected = True
+                    real_run(
+                        ["/usr/bin/git", "-C", str(repo), "config",
+                         "filter.attacker.clean", str(helper)],
+                        env=secure, check=True, capture_output=True, timeout=15,
+                    )
+                return real_run(argv, *args, **kwargs)
+
+            with mock.patch("subprocess.run", side_effect=configure_at_git_effect):
+                protected = workspace_run(repo, ["git", "diff", "-S", parent, head])
+            self.assertTrue(injected, "late filter setup did not execute")
+            self.assertEqual(protected["returncode"], 0, protected.get("stderr"))
+            self.assertFalse(marker.exists(), "SHA-shaped -S bypassed effect-time isolation")
+
+            uncontrolled = real_run(
+                ["/usr/bin/git", "-C", str(repo), "diff", "-S", parent, head],
+                env=secure, capture_output=True, timeout=15,
+            )
+            self.assertEqual(uncontrolled.returncode, 0, uncontrolled.stderr)
+            self.assertTrue(marker.exists(), "real Git negative control did not trigger")
+
+
     def test_native_work_acquire_git_diff_blocks_late_external_driver(self) -> None:
         """Native host Git must preserve committed patch bytes without executing a helper."""
         from unittest import mock
