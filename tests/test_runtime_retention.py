@@ -4,6 +4,7 @@ from contextlib import nullcontext
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -947,6 +948,100 @@ class RuntimeRetentionTests(unittest.TestCase):
                 for item in plan["blocked"]
             ))
             self.assertEqual(stderr.read_bytes(), original)
+
+    def test_unsafe_terminal_archive_source_preserves_evidence_and_allows_safe_batch(self) -> None:
+        # An unsafe old terminal job must never consume the archive/reset
+        # budget or prevent an unrelated safe job from progressing.
+        cases = (
+            ("symlink", "symlink"),
+            ("hardlink", "private owner-controlled regular file"),
+            ("world-readable", "private owner-controlled regular file"),
+            ("file-count", "file-count bound"),
+        )
+        for shape, reason in cases:
+            with self.subTest(unsafe_source=shape):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    jobs = root / "jobs"
+                    bad_name = "grabowski-job-000000000001"
+                    good_name = "grabowski-job-000000000002"
+                    bad_unit = bad_name + ".service"
+                    good_unit = good_name + ".service"
+                    bad = self._job(jobs, bad_name, 100)
+                    self._job(jobs, good_name, 101)
+                    stderr = bad / "stderr.log"
+                    original = b"retain the unsafe job's terminal evidence\n"
+                    stderr.write_bytes(original)
+                    stderr.chmod(0o600)
+                    metadata_before = (bad / "metadata.json").read_bytes()
+                    extra = bad / "extra.log"
+                    outside = root / "independent-evidence.log"
+                    if shape == "symlink":
+                        outside.write_bytes(b"external evidence must survive\n")
+                        extra.symlink_to(outside)
+                    elif shape == "hardlink":
+                        os.link(stderr, extra)
+                    elif shape == "world-readable":
+                        stderr.chmod(0o644)
+                    elif shape == "file-count":
+                        extra.write_bytes(b"counted, never deleted\n")
+                        extra.chmod(0o600)
+
+                    states = {unit: self._state(unit) for unit in (bad_unit, good_unit)}
+                    # Both jobs have three normal files. For file-count only,
+                    # the bad job's fourth file exceeds the limit.
+                    limit = 3 if shape == "file-count" else RETENTION.MAX_ARCHIVE_FILES
+                    with patch.object(RETENTION, "MAX_ARCHIVE_FILES", limit):
+                        plan = RETENTION.build_plan(
+                            minimum_job_age_seconds=50,
+                            max_archive_jobs=2,
+                            now=1_000,
+                            jobs_root=jobs,
+                            archive_root=root / "archive",
+                            receipt_root=root / "receipts",
+                            task_db=root / "missing.sqlite3",
+                            failed_units=[bad_unit, good_unit],
+                            unit_states=states,
+                        )
+                        _, _, _, prepared = RETENTION._prepare_archives(plan)
+
+                    blocked_reasons = [
+                        item["reason"] for item in plan["blocked"]
+                        if item["unit"] == bad_unit
+                    ]
+                    self.assertEqual(len(blocked_reasons), 1)
+                    self.assertIn(reason, blocked_reasons[0])
+                    self.assertNotIn(
+                        bad_unit, [item["unit"] for item in plan["archive_jobs"]]
+                    )
+                    self.assertNotIn(bad_unit, plan["reset_failed_units"])
+                    self.assertEqual(
+                        [item["unit"] for item in plan["archive_jobs"]], [good_unit]
+                    )
+                    self.assertEqual(
+                        [item["record"]["unit"] for item in prepared], [good_unit]
+                    )
+                    self.assertEqual(plan["reset_failed_units"], [good_unit])
+                    self.assertEqual(plan["archive_deferred_count"], 0)
+
+                    # Planning/preparation must preserve every unsafe source,
+                    # link and permission. Never repair, delete or truncate.
+                    self.assertEqual(stderr.read_bytes(), original)
+                    self.assertEqual((bad / "metadata.json").read_bytes(), metadata_before)
+                    self.assertTrue(bad.is_dir())
+                    if shape == "symlink":
+                        self.assertTrue(extra.is_symlink())
+                        self.assertEqual(
+                            outside.read_bytes(), b"external evidence must survive\n"
+                        )
+                    elif shape == "hardlink":
+                        self.assertTrue(extra.samefile(stderr))
+                        self.assertEqual(extra.read_bytes(), original)
+                        self.assertEqual(stderr.stat().st_nlink, 2)
+                    elif shape == "world-readable":
+                        self.assertEqual(stderr.stat().st_mode & 0o777, 0o644)
+                    else:
+                        self.assertEqual(extra.read_bytes(), b"counted, never deleted\n")
 
     def test_periodic_noop_keeps_oversized_artifact_blocker_visible(self) -> None:
         blocked = [{"unit": "grabowski-job-000000000001.service",
