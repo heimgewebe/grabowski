@@ -90,6 +90,9 @@ class TaskAttentionTests(unittest.TestCase):
             patch.object(tasks, "TASK_DB", self.database),
             patch.object(tasks, "TASK_OUTCOMES_DIR", self.outcomes),
             patch.object(tasks.resources, "RESOURCE_DB", self.resource_database),
+            # Archive admission resolves the stored host outside task start.
+            # Keep that local test authority explicit and hermetic.
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
             patch.object(tasks.base, "AUDIT_LOG", self.audit_log),
             patch.object(attention.alert_outbox, "enqueue_and_schedule"),
             patch.object(
