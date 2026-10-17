@@ -7724,6 +7724,13 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
     if (
         _is_terminal_state(str(record["state"]))
         and observed_state not in {"running", str(record["state"])}
+        # Cancellation is a policy result, not a systemd Result. A coherent
+        # quiescent terminal unit may report any actual systemd terminal
+        # outcome; unknown/active observations remain untrusted.
+        and not (
+            record["state"] == "cancelled"
+            and observed_state in {"completed", "failed", "signalled", "timed_out"}
+        )
     ):
         result["state"] = "observation_error"
         result["observation_unavailable_reason"] = "persisted_terminal_outcome_conflict"
@@ -12635,8 +12642,18 @@ def _task_reconcile_ready_evidence_snapshot(
                 )
             if resource_now is None or resource_now["revision"] != proof["resource_revision"]:
                 return {"status": "stale"}
-        # External systemd probes can outlast the proof TTL. Recheck the
-        # proof age after all live observations and revision validations.
+        # Systemd can restart an archived unit without changing either
+        # SQLite revision. A first inventory read cannot certify the interval
+        # spent observing up to 32 retained terminal units or rereading DBs.
+        # Recheck the single bounded local inventory immediately before
+        # certification; missing/ambiguous output remains fail-closed.
+        if archive_inventory_probed:
+            try:
+                if _task_reconcile_ready_archived_user_unit_live():
+                    return {"status": "archived_task_unit_live_unverified"}
+            except (RuntimeError, OSError, ValueError, TypeError):
+                return {"status": "archived_task_unit_observation_unavailable"}
+        # A slow second systemd probe can itself outlast the proof TTL.
         if not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS:
             return {"status": "invalid_or_stale"}
         return {"status": "verified", "reconciled_at_unix": timestamp}
