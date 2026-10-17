@@ -7730,6 +7730,7 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
         and not (
             record["state"] == "cancelled"
             and observed_state in {"completed", "failed", "signalled", "timed_out"}
+            and _task_reconcile_ready_local_terminal_observed(record, observation)
         )
     ):
         result["state"] = "observation_error"
@@ -12653,6 +12654,29 @@ def _task_reconcile_ready_evidence_snapshot(
                     return {"status": "archived_task_unit_live_unverified"}
             except (RuntimeError, OSError, ValueError, TypeError):
                 return {"status": "archived_task_unit_observation_unavailable"}
+        # A task start may commit its launching row during the final
+        # systemd inventory, before the new unit appears in list-units.
+        # Only fresh READ_ONLY revisions after that external probe can
+        # certify that the proof still describes both task and lease stores.
+        if archive_inventory_probed:
+            with _task_readonly_snapshot() as final_tasks:
+                final_task_revision = _task_reconcile_revision_contract(final_tasks)
+            if final_task_revision["revision"] != proof["task_revision"]:
+                return {"status": "stale"}
+            with resources._resource_readonly_snapshot() as final_resources:
+                final_resource_revision = resources._resource_reconcile_revision_contract(
+                    final_resources
+                )
+                final_pending = final_resources.execute(
+                    "SELECT 1 FROM task_terminalizations "
+                    "WHERE phase='leases_revoked' LIMIT 1"
+                ).fetchone()
+            if (
+                final_resource_revision is None
+                or final_pending is not None
+                or final_resource_revision["revision"] != proof["resource_revision"]
+            ):
+                return {"status": "stale"}
         # A slow second systemd probe can itself outlast the proof TTL.
         if not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS:
             return {"status": "invalid_or_stale"}
