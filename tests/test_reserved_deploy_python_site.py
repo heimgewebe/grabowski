@@ -193,9 +193,8 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
             )
             # PYTHONPATH is not added through site.addsitedir: even an
             # injected .pth alongside the pinned package must not execute.
-            trusted_marker = root / "trusted-pth-executed"
             (trusted / "unwanted.pth").write_text(
-                f"import pathlib; pathlib.Path({str(trusted_marker)!r}).write_text('bad')\n",
+                "import os; os.environ['GRABOWSKI_PTH_TRUSTED_EXECUTED']='1'\n",
                 encoding="utf-8",
             )
             base = root / "user"
@@ -211,9 +210,8 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
             ).stdout.strip()
             site = Path(site_path)
             site.mkdir(parents=True)
-            marker = root / "pth-executed"
             (site / "injected.pth").write_text(
-                f"import pathlib; pathlib.Path({str(marker)!r}).write_text('injected')\n",
+                "import os; os.environ['GRABOWSKI_PTH_USER_EXECUTED']='1'\n",
                 encoding="utf-8",
             )
             fake = site / "yaml"
@@ -223,15 +221,15 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
             )
             command = [
                 "/usr/bin/python3", "-c",
-                "import yaml; print(yaml.ORIGIN)",
+                "import os,yaml; print(yaml.ORIGIN, "
+                "os.environ.get('GRABOWSKI_PTH_USER_EXECUTED', 'absent'), "
+                "os.environ.get('GRABOWSKI_PTH_TRUSTED_EXECUTED', 'absent'))",
             ]
             exposed = subprocess.run(
                 command, env=env, cwd=root, capture_output=True,
                 text=True, timeout=10,
             )
-            self.assertEqual("untrusted", exposed.stdout.strip(), exposed.stderr)
-            self.assertTrue(marker.exists())
-            marker.unlink()
+            self.assertEqual("untrusted 1 absent", exposed.stdout.strip(), exposed.stderr)
             safe = subprocess.run(
                 command,
                 env={
@@ -244,9 +242,7 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                 cwd=root, capture_output=True, text=True, timeout=10,
             )
             self.assertEqual(0, safe.returncode, safe.stderr)
-            self.assertEqual("locked", safe.stdout.strip())
-            self.assertFalse(marker.exists())
-            self.assertFalse(trusted_marker.exists())
+            self.assertEqual("locked absent absent", safe.stdout.strip(), safe.stderr)
 
     @unittest.skipUnless(sys.prefix != sys.base_prefix, "serving Python is not a venv")
     def test_pinned_serving_site_preflight_rejects_forged_package_version(self):
