@@ -1929,6 +1929,99 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertTrue(result["cycle_completed"])
         self.assertIsNone(result["cursor_after"])
 
+    def test_closeout_archive_rejects_privileged_task_before_external_probe(self) -> None:
+        record = self._completed_task()
+        before = self.database.read_bytes()
+        with (
+            patch.object(tasks, "_is_root_systemd_backend", return_value=True),
+            patch.object(
+                tasks, "_observe",
+                side_effect=AssertionError("must not probe unsupported archive target"),
+            ) as probe,
+            self.assertRaisesRegex(
+                attention.TaskAttentionConflictError, "retirement.*required",
+            ),
+        ):
+            attention.execute_closeout_archive(self._archive_parameters(record))
+        probe.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+
+    def test_closeout_archive_rejects_ssh_task_before_external_probe(self) -> None:
+        record = self._completed_task()
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh"}, False),
+            ),
+            patch.object(
+                tasks, "_observe",
+                side_effect=AssertionError("must not dispatch unsupported archive target"),
+            ) as probe,
+            self.assertRaisesRegex(
+                attention.TaskAttentionConflictError, "retirement.*required",
+            ),
+        ):
+            attention.execute_closeout_archive(self._archive_parameters(record))
+        probe.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+
+    def test_archive_classification_rejects_remote_before_external_sources(self) -> None:
+        record = self._completed_task()
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh"}, False),
+            ),
+            patch.object(
+                attention, "_assert_no_live_task_resource_leases",
+                side_effect=AssertionError("must not probe resource leases"),
+            ),
+            patch.object(
+                attention, "_assert_no_live_task_process",
+                side_effect=AssertionError("must not probe remote unit"),
+            ),
+            self.assertRaisesRegex(
+                attention.TaskAttentionConflictError, "retirement.*required",
+            ),
+        ):
+            attention._task_archive_classification(
+                record,
+                expected_lifecycle_receipt_sha256=record["lifecycle_receipt_sha256"],
+                archived=False,
+            )
+
+    def test_closeout_archive_existing_projection_replays_after_transport_change(self) -> None:
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with patch.object(
+            tasks, "_observe", return_value=self._inactive_process_observation(),
+        ):
+            first = attention.execute_closeout_archive(parameters)
+        self.assertFalse(first["already_archived"])
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh"}, False),
+            ),
+            patch.object(
+                tasks, "_observe",
+                side_effect=AssertionError("idempotent replay must not reprobe"),
+            ) as probe,
+        ):
+            again = attention.execute_closeout_archive(parameters)
+        probe.assert_not_called()
+        self.assertTrue(again["already_archived"])
+        self.assertTrue(again["idempotent_replay"])
+        self.assertEqual(
+            first["projection"]["projection_sha256"],
+            again["projection"]["projection_sha256"],
+        )
+
     def test_closeout_archive_completed_task_writes_segment_and_projection_idempotently(self) -> None:
         record = self._completed_task()
         parameters = self._archive_parameters(record)

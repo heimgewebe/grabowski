@@ -1359,6 +1359,35 @@ def _assert_no_live_task_process(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _require_safe_archive_transport(record: dict[str, Any]) -> None:
+    """Do not create an archive that READ_ONLY can never certify.
+
+    Until #1556 supplies an authorized retirement/compaction protocol,
+    Rootbroker or SSH terminal task archival can permanently strand global
+    readiness. Their live process checks would also require external effects.
+    Preserve idempotent replay of pre-existing archives, but reject new
+    irreversible projection switches for unsupported task authorities.
+    """
+    if (
+        tasks._is_root_systemd_backend(record)
+        or tasks._execution_backend(record) != "systemd-user"
+        or tasks._systemd_scope(record) != "user"
+    ):
+        raise TaskAttentionConflictError(
+            "privileged task archive retirement proof is required (#1556)"
+        )
+    try:
+        _, target, _ = tasks._resolve_task_dispatch_host(str(record["host"]))
+    except (RuntimeError, ValueError, TypeError, KeyError, OSError) as exc:
+        raise TaskAttentionIntegrityError(
+            "task archive host authority is unavailable"
+        ) from exc
+    if target.get("transport") != "local":
+        raise TaskAttentionConflictError(
+            "remote task archive retirement proof is required (#1556)"
+        )
+
+
 def _task_archive_classification(
     record: dict[str, Any],
     *,
@@ -1368,6 +1397,8 @@ def _task_archive_classification(
 ) -> dict[str, Any]:
     import grabowski_lifecycle_evidence as lifecycle_evidence
 
+    if not archived:
+        _require_safe_archive_transport(record)
     archive_record, record_sha256, _source_store_sha256 = _task_archive_source_binding(record)
     now_unix = int(time.time())
     lease_source = _assert_no_live_task_resource_leases(record, now_unix=now_unix)
@@ -2818,6 +2849,10 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
             ],
         }
 
+    # Keep the already-archived replay path above available for recovery.
+    # A new unsupported projection switch would permanently block read-only
+    # operator readiness, even after the systemd unit has become quiescent.
+    _require_safe_archive_transport(record)
     now_unix = int(time.time())
     retention_boundary_unix = _assert_task_archive_retention(
         record,
