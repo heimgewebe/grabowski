@@ -7191,6 +7191,57 @@ class TaskTests(unittest.TestCase):
             self.assertEqual(2, phase["calls"])
         self.assertEqual(before, self.database.read_bytes())
 
+    def test_archived_inventory_checks_live_units_even_without_archive_bindings(self) -> None:
+        # A left-over task unit may survive a reset/drained archive index.
+        # No SQLite revision or archive binding proves external quiescence.
+        self._local_terminal_readiness_store(1)
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=([], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT, 0),
+            ),
+            patch.object(
+                tasks, "_task_reconcile_ready_archived_user_unit_live",
+                return_value=True,
+            ) as inventory,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                result = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_task_unit_live_unverified", result["status"])
+        inventory.assert_called_once()
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_archived_unit_restarted_during_final_database_rereads_is_not_ready(self) -> None:
+        # The third bounded systemd snapshot detects an external restart
+        # after the preceding SQLite task/resource revision reads.
+        self._local_terminal_readiness_store(1)
+        before = self.database.read_bytes()
+        seen = []
+
+        def inventory() -> bool:
+            seen.append(len(seen) + 1)
+            return len(seen) == 3
+
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=(
+                    [], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0,
+                ),
+            ),
+            patch.object(
+                tasks, "_task_reconcile_ready_archived_user_unit_live",
+                side_effect=inventory,
+            ) as scans,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                result = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_task_unit_live_unverified", result["status"])
+        self.assertEqual([1, 2, 3], seen)
+        self.assertEqual(3, scans.call_count)
+        self.assertEqual(before, self.database.read_bytes())
+
     def test_archived_unit_restarted_without_db_write_never_reports_ready(self) -> None:
         # A closeout projection excludes the retained row. Systemd still owns
         # the loaded unit, which a separate supported service operation can
@@ -7318,8 +7369,11 @@ class TaskTests(unittest.TestCase):
             with tasks._task_readonly_snapshot() as reader:
                 status = tasks._task_reconcile_ready_evidence_snapshot(reader)
         self.assertEqual("verified", status["status"])
-        self.assertEqual(2, probe.call_count)
+        # The same bounded inventory is observed before terminal probes,
+        # after those probes, and after the final SQLite revision rereads.
+        self.assertEqual(3, probe.call_count)
         self.assertEqual(probe.call_args_list[0], probe.call_args_list[1])
+        self.assertEqual(probe.call_args_list[1], probe.call_args_list[2])
 
     def test_reconcile_ready_publication_applies_task_scope_before_rootbroker(self) -> None:
         record = {

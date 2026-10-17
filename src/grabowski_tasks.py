@@ -12620,9 +12620,10 @@ def _task_reconcile_ready_evidence_snapshot(
                 "status": "archived_terminal_transport_unverified",
                 "archived_unobservable_count": archived_unobservable,
             }
-        archive_inventory_probed = (
-            archive_headroom < TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT
-        )
+        # A drained or absent archive projection does not prove that no
+        # user-systemd task unit was left behind after a reset or closeout.
+        # Always observe one bounded complete local unit inventory.
+        archive_inventory_probed = True
         if archive_inventory_probed:
             try:
                 if _task_reconcile_ready_archived_user_unit_live():
@@ -12694,7 +12695,18 @@ def _task_reconcile_ready_evidence_snapshot(
                 or final_resource_revision["revision"] != proof["resource_revision"]
             ):
                 return {"status": "stale"}
-        # A slow second systemd probe can itself outlast the proof TTL.
+        # The second inventory cannot cover a systemd-only restart during
+        # the last (possibly slow) task/resource SQLite rechecks above.
+        # Make the final external operation one more bounded local inventory;
+        # a live unit at that observation must never yield verified.
+        if archive_inventory_probed:
+            try:
+                if _task_reconcile_ready_archived_user_unit_live():
+                    return {"status": "archived_task_unit_live_unverified"}
+            except (RuntimeError, OSError, ValueError, TypeError):
+                return {"status": "archived_task_unit_observation_unavailable"}
+        # Every external systemd observation may outlast the proof TTL;
+        # this remains a fresh read-only snapshot, not a future guarantee.
         if not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS:
             return {"status": "invalid_or_stale"}
         return {"status": "verified", "reconciled_at_unix": timestamp}
