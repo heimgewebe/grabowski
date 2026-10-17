@@ -1515,6 +1515,18 @@ def _critical_inventory_proven_pre_effect_refusal(
         or invoked.get("stderr_truncated") is not False
     ):
         return None
+    def _canonical_lower_hex(value: object, length: int) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == length
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    if (
+        not _canonical_lower_hex(invoked.get("request_id"), 32)
+        or not _canonical_lower_hex(invoked.get("reference_sha256"), 64)
+    ):
+        return None
     response = invoked.get("broker_response")
     if not isinstance(response, dict) or set(response) != {
         "schema_version", "kind", "request_id", "reference_sha256",
@@ -1840,6 +1852,7 @@ def grabowski_critical_user_data_inventory(
             and unit_state.get("load") == "not-found"
             and unit_state.get("active") == "inactive"
             and unit_state.get("sub") == "dead"
+            and unit_state.get("result") == "success"
         )
     if (
         pre_effect_refusal is not None

@@ -2770,5 +2770,129 @@ def collect_inventory(contract_path, *, classification_only=False, max_exclusion
                 )
 
 
+    def test_preclaim_refusal_rejects_noncanonical_reference_ids(self) -> None:
+        """A matching but malformed request ID is not a broker attestation."""
+        base = {
+            "request_id": "a" * 32,
+            "reference_sha256": "b" * 64,
+            "broker_client_timed_out": False,
+            "broker_client_transport_error": None,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "broker_response": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_pre_effect_refusal.v1",
+                "request_id": "a" * 32,
+                "reference_sha256": "b" * 64,
+                "action": "critical_user_data_inventory",
+                "phase": "pre_claim",
+                "claim_started": False,
+                "dispatch_started": False,
+                "reason_code": "peer_authority",
+            },
+        }
+        self.assertEqual(
+            privileged._critical_inventory_proven_pre_effect_refusal(base),
+            "peer_authority",
+        )
+        for key, malformed in (
+            ("request_id", "a" * 31),
+            ("request_id", "A" * 32),
+            ("request_id", None),
+            ("reference_sha256", "b" * 63),
+            ("reference_sha256", "B" * 64),
+            ("reference_sha256", 42),
+        ):
+            candidate = {
+                **base, key: malformed,
+                "broker_response": {**base["broker_response"], key: malformed},
+            }
+            with self.subTest(key=key, malformed=malformed):
+                self.assertIsNone(
+                    privileged._critical_inventory_proven_pre_effect_refusal(candidate)
+                )
+
+    def test_preclaim_refusal_requires_pristine_systemd_result(self) -> None:
+        """Failed/unknown prior units cannot become retry-safe no-effect proof."""
+        scanner = helper.AUTHORIZED_SCANNER_SHA256
+        contract = helper.AUTHORIZED_CONTRACT_SHA256
+
+        def status_invoked(request_id: str, unit_result: str) -> dict[str, object]:
+            status = {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_status.v1",
+                "status": "not-started",
+                "scanner_sha256": scanner,
+                "contract_sha256": contract,
+                "unit": "grabowski-inventory.service",
+                "unit_state": {
+                    "load": "not-found", "active": "inactive",
+                    "sub": "dead", "result": unit_result,
+                },
+                "result_sha256": None,
+            }
+            return {
+                "request_id": request_id,
+                "reference_sha256": "e" * 64,
+                "broker_client_timed_out": False,
+                "broker_client_transport_error": None,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "broker_response": {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": json.dumps(status),
+                },
+            }
+
+        start = {
+            "request_id": "b" * 32,
+            "reference_sha256": "c" * 64,
+            "broker_client_timed_out": False,
+            "broker_client_transport_error": None,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "broker_response": {
+                "schema_version": 1,
+                "kind": "grabowski.critical_user_data_inventory_pre_effect_refusal.v1",
+                "request_id": "b" * 32,
+                "reference_sha256": "c" * 64,
+                "action": "critical_user_data_inventory",
+                "phase": "pre_claim",
+                "claim_started": False,
+                "dispatch_started": False,
+                "reason_code": "peer_authority",
+            },
+        }
+        for previous, current in (
+            ("exit-code", "success"),
+            ("success", "timeout"),
+            ("failed", "failed"),
+            ("unknown", "success"),
+        ):
+            with (
+                self.subTest(previous=previous, current=current),
+                mock.patch.object(
+                    privileged, "_invoke_mainpid_privileged_reference",
+                    side_effect=[
+                        status_invoked("a" * 32, previous),
+                        start,
+                        status_invoked("d" * 32, current),
+                    ],
+                ) as transport,
+                mock.patch.object(
+                    privileged.operator, "_require_operator_mutation",
+                    return_value=None,
+                ),
+            ):
+                result = privileged.grabowski_critical_user_data_inventory(
+                    "start", scanner, contract
+                )
+                self.assertEqual(transport.call_count, 3)
+                self.assertEqual(result["outcome"], "outcome_unknown")
+                self.assertFalse(result["retry_safe"])
+                self.assertTrue(result["readback_required"])
+
+
 if __name__ == "__main__":
     unittest.main()
