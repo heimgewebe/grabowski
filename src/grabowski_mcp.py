@@ -6613,6 +6613,22 @@ def _operator_system_overview(
             "authorized task-closeout-archive workflow, no more, so the local "
             "terminal readiness budget fits within the archive history budget"
         )
+    elif reconciliation_evidence.get("status") == "archived_task_unit_live_unverified":
+        next_action = (
+            "inspect unexpectedly active user-systemd task units through "
+            "authorized live observation; stop only after applicable task "
+            "and service scope gates, then reconcile before trusting readiness"
+        )
+    elif reconciliation_evidence.get("status") in {
+        "archived_terminal_transport_unverified",
+        "archived_task_unit_observation_unavailable",
+    }:
+        next_action = (
+            "restore bounded authorized live observation of archived privileged "
+            "or remote terminal units and inspect unavailable local systemd "
+            "inventory before trusting readiness; repeated reconciliation "
+            "or archival alone cannot establish quiescence"
+        )
     elif reconciliation_evidence.get("status") == "local_terminal_transport_unverified":
         # A remote unit cannot be certified by the local read-only observer.
         # Only recommend archive when a complete bounded cohort fits within

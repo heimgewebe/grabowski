@@ -9070,6 +9070,70 @@ class AgentWorkspaceTests(unittest.TestCase):
                     self.assertIsNone(persisted["tasks"][missing])
                     self.assertEqual({}, persisted["task_start_intents"])
 
+    def test_collect_real_launching_to_running_allows_sibling_start(self) -> None:
+        # Persisted launching is a legitimate active-to-active transition.
+        # The genuine read-only TaskStore peek must not block Workspace Collect.
+        task_id = self._persist_sibling_for_collect_admission()
+        with workspace.tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='launching' WHERE task_id=?", (task_id,)
+            )
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        manifest["tasks"]["tests"] = task_id
+        workspace._write_manifest(manifest)
+        before_store = workspace.tasks.TASK_DB.read_bytes()
+        real_peek = workspace.tasks.grabowski_task_peek
+        seen = []
+        class SiblingAdmitted(Exception):
+            pass
+
+        def live_peek(identifier: str) -> dict:
+            result = real_peek(identifier)
+            if identifier == task_id:
+                seen.append(result)
+            return result
+
+        def start_sibling(_manifest: dict, role: str, _snapshot: dict) -> dict:
+            self.assertEqual("review", role)
+            raise SiblingAdmitted()
+
+        with (
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_status",
+                return_value={"task_id": "writer-task", "state": "completed", "terminal": True},
+            ),
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                return_value=("heim-pc", {"transport": "local"}, False),
+            ),
+            mock.patch.object(
+                workspace.tasks, "_observe",
+                return_value={
+                    "state": "running", "properties": {},
+                    "observed_at_unix": workspace.tasks._now(),
+                },
+            ),
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_peek", side_effect=live_peek,
+            ),
+            mock.patch.object(
+                workspace, "_role_toolchain_preflight",
+                side_effect=passing_toolchain_preflight,
+            ),
+            mock.patch.object(workspace, "_start_role_task", side_effect=start_sibling),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            with self.assertRaises(SiblingAdmitted):
+                workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertGreaterEqual(len(seen), 2, seen)
+        self.assertTrue(all(row["persisted_state"] == "launching" for row in seen))
+        self.assertTrue(all(row["state"] == "running" for row in seen))
+        self.assertTrue(all(row["reconcile_required"] is False for row in seen))
+        self.assertEqual(before_store, workspace.tasks.TASK_DB.read_bytes())
+
     def test_collect_real_task_state_writer_waits_for_locked_live_peek_and_launch(self) -> None:
         task_id = self._persist_sibling_for_collect_admission()
         manifest = self.manifest()

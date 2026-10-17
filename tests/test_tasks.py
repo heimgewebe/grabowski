@@ -7015,6 +7015,182 @@ class TaskTests(unittest.TestCase):
         )
         probe.assert_not_called()
 
+    def test_archived_terminal_reactivation_cannot_reuse_fresh_sqlite_proof(self) -> None:
+        with patch.dict(os.environ, {
+            "GRABOWSKI_TASK_ARCHIVE_ROOT": str(self.task_archive_root),
+            "GRABOWSKI_TASK_PROJECTION_ROOT": str(self.task_projection_root),
+        }):
+            # True end-to-end regression: closeout archives the retained row and
+            # a fresh authorized reconciliation republishes a valid SQLite proof;
+            # systemd can then restart the now-unobserved unit without a DB write.
+            started = self._start()["task"]
+            task_id = str(started["task_id"])
+            self._archive_and_project_tasks([task_id])
+            complete = {
+                "mode": "refresh", "task_id": "", "scanned": 0,
+                "refreshed": [], "released": [], "resumed": [], "blocked": [],
+                "batch": {
+                    "cycle_completed": True, "cursor_before": None,
+                    "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                    "terminalization_recovery": {
+                        "cycle_completed": True, "cursor_before": None, "failed": [],
+                    },
+                },
+            }
+            with (
+                patch.object(tasks.operator, "_require_operator_mutation"),
+                patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=complete),
+                patch.object(tasks.base, "_append_audit"),
+            ):
+                tasks._task_reconcile_refresh_after_guard("")
+            unit = f"grabowski-task-{task_id}-a1.service"
+            with (
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(
+                    tasks.operator, "_run",
+                    return_value={
+                        "returncode": 0,
+                        "stdout": f"{unit} loaded active running restarted task\\n",
+                        "stderr": "", "timed_out": False, "stdout_truncated": False, "stderr_truncated": False,
+                    },
+                ) as inventory,
+                patch.object(tasks, "_observe", side_effect=AssertionError(
+                    "archived task must not enter the ordinary local 32-unit probe"
+                )),
+            ):
+                with tasks._task_readonly_snapshot() as reader:
+                    status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+            self.assertEqual("archived_task_unit_live_unverified", status["status"], status)
+            inventory.assert_called_once()
+
+    def test_archived_unit_restarted_without_db_write_never_reports_ready(self) -> None:
+        # A closeout projection excludes the retained row. Systemd still owns
+        # the loaded unit, which a separate supported service operation can
+        # start without updating the TaskStore.
+        self._local_terminal_readiness_store(1)
+        unit = f"grabowski-task-{'a' * 24}-a1.service"
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=(
+                    [], 0,
+                    tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1,
+                    0,
+                ),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                return_value={
+                    "returncode": 0,
+                    "stdout": f"{unit} loaded active running restarted archived unit\\n",
+                    "stderr": "", "timed_out": False, "stdout_truncated": False, "stderr_truncated": False,
+                },
+            ) as probe,
+            patch.object(tasks, "_observe",
+                         side_effect=AssertionError("archived unit is not a current row")),
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_task_unit_live_unverified", status["status"])
+        probe.assert_called_once()
+
+    def test_archived_unit_inventory_absent_or_malformed_fails_closed(self) -> None:
+        self._local_terminal_readiness_store(1)
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=([], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                return_value={"returncode": 0, "stdout": "garbage", "timed_out": False, "stdout_truncated": False, "stderr_truncated": False},
+            ),
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_task_unit_observation_unavailable", status["status"])
+
+    def test_archived_remote_or_privileged_unit_fails_closed_without_side_effect(self) -> None:
+        self._local_terminal_readiness_store(1)
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=([], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 1),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                side_effect=AssertionError("no local inventory can certify remote or root unit"),
+            ) as probe,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("archived_terminal_transport_unverified", status["status"])
+        probe.assert_not_called()
+
+    def test_archived_user_unit_inventory_classifies_real_systemd_states(self) -> None:
+        unit = "grabowski-task-" + "c" * 24 + "-a1.service"
+        for load, active, sub, live in (
+            ("loaded", "active", "running", True),
+            ("loaded", "inactive", "dead", False),
+            ("loaded", "failed", "failed", False),
+            ("bad-setting", "failed", "failed", False),
+        ):
+            with self.subTest(load=load, active=active, sub=sub):
+                with patch.object(
+                    tasks.operator, "_run",
+                    return_value={
+                        "returncode": 0,
+                        "stdout": f"{unit} {load} {active} {sub} historical task\\n",
+                        "stderr": "", "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False,
+                    },
+                ) as run:
+                    self.assertEqual(
+                        live, tasks._task_reconcile_ready_archived_user_unit_live()
+                    )
+                self.assertEqual("systemctl", run.call_args.args[0][0])
+                self.assertIn("--all", run.call_args.args[0])
+                self.assertEqual(30, run.call_args.kwargs["timeout_seconds"])
+
+    def test_archived_unit_inventory_rejects_truncation_and_unknown_units(self) -> None:
+        for stdout, truncated in (
+            ("", True),
+            ("not-grabowski-task.service loaded inactive dead other\\n", False),
+            ("grabowski-task-" + "d" * 24 + "-a1.service loaded unknown running\\n", False),
+        ):
+            with self.subTest(stdout=stdout, truncated=truncated):
+                with patch.object(tasks.operator, "_run", return_value={
+                    "returncode": 0, "stdout": stdout,
+                    "stdout_truncated": truncated, "stderr_truncated": False, "timed_out": False,
+                }):
+                    with self.assertRaises(RuntimeError):
+                        tasks._task_reconcile_ready_archived_user_unit_live()
+
+    def test_archived_inactive_loaded_units_still_allow_current_readiness(self) -> None:
+        self._local_terminal_readiness_store(1)
+        unit = f"grabowski-task-{'b' * 24}-a1.service"
+        with (
+            patch.object(
+                tasks, "_task_reconcile_ready_local_terminal_rows",
+                return_value=([], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0),
+            ),
+            patch.object(
+                tasks.operator, "_run",
+                return_value={
+                    "returncode": 0,
+                    "stdout": f"{unit} loaded inactive dead archived unit\\n",
+                    "stderr": "", "timed_out": False, "stdout_truncated": False, "stderr_truncated": False,
+                },
+            ) as probe,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual("verified", status["status"])
+        probe.assert_called_once()
+
     def test_reconcile_ready_publication_applies_task_scope_before_rootbroker(self) -> None:
         record = {
             "task_id": "c" * 24,
@@ -11003,6 +11179,93 @@ class TaskTests(unittest.TestCase):
                 self.assertTrue(public["reconcile_required"])
                 self.assertEqual("unpersisted_readonly_probe", public["observation_mode"])
                 self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_active_launching_to_running_is_not_uncertain(self) -> None:
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='launching' WHERE task_id=?", (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(
+                tasks, "_observe",
+                return_value={
+                    "state": "running",
+                    "properties": {"LoadState": "loaded", "ActiveState": "active"},
+                    "observed_at_unix": tasks._now(),
+                },
+            ),
+            patch.object(tasks, "_set_state",
+                         side_effect=AssertionError("peek must not write")),
+        ):
+            peek = tasks.grabowski_task_peek(task["task_id"])
+        self.assertEqual("running", peek["state"])
+        self.assertEqual("launching", peek["persisted_state"])
+        self.assertFalse(peek["reconcile_required"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_terminal_outcome_conflict_is_not_masked(self) -> None:
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?", (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local"}, False),
+            ),
+            patch.object(
+                tasks, "_observe",
+                return_value={
+                    "state": "failed",
+                    "properties": {"LoadState": "loaded", "ActiveState": "failed"},
+                    "observed_at_unix": tasks._now(),
+                },
+            ),
+            patch.object(tasks, "_set_state",
+                         side_effect=AssertionError("peek must not write")),
+        ):
+            peek = tasks.grabowski_task_peek(task["task_id"])
+        self.assertEqual("observation_error", peek["state"])
+        self.assertTrue(peek["reconcile_required"])
+        self.assertEqual("completed", peek["persisted_state"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_terminal_unknown_observation_fails_closed(self) -> None:
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?",
+                (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        for observed in ("outcome_unknown", "interrupted", "observation_error"):
+            with self.subTest(observed=observed):
+                with (
+                    patch.object(
+                        tasks, "_resolve_task_dispatch_host",
+                        return_value=("local", {"transport": "local"}, False),
+                    ),
+                    patch.object(tasks, "_observe", return_value={
+                        "state": observed,
+                        "properties": {"LoadState": "not-found"},
+                        "observed_at_unix": tasks._now(),
+                    }),
+                    patch.object(tasks, "_set_state",
+                                 side_effect=AssertionError("peek may not write")),
+                ):
+                    result = tasks.grabowski_task_peek(task["task_id"])
+                self.assertEqual("observation_error", result["state"])
+                self.assertTrue(result["reconcile_required"])
+                self.assertEqual("completed", result["persisted_state"])
+        self.assertEqual(before, self.database.read_bytes())
 
     def test_local_task_peek_transport_flip_cannot_dispatch_ssh(self) -> None:
         created = self._start()["task"]
