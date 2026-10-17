@@ -4,6 +4,7 @@ from contextlib import nullcontext
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -908,6 +909,328 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(len(plan["archive_jobs"]), 2)
             self.assertEqual(plan["archive_eligible_count"], 3)
             self.assertEqual(plan["archive_deferred_count"], 1)
+
+    def test_oversized_terminal_stderr_does_not_stall_other_job_archives(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            oversized_name = "grabowski-job-000000000001"
+            good_name = "grabowski-job-000000000002"
+            bad_unit = oversized_name + ".service"
+            good_unit = good_name + ".service"
+            oversized = self._job(jobs, oversized_name, 100)
+            self._job(jobs, good_name, 101)
+            stderr = oversized / "stderr.log"
+            original = b"preserve terminal error evidence\n" * 100
+            stderr.write_bytes(original)
+            stderr.chmod(0o600)
+            states = {unit: self._state(unit) for unit in (bad_unit, good_unit)}
+            with patch.object(RETENTION, "MAX_ARCHIVE_FILE_BYTES", 1_024):
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50,
+                    max_archive_jobs=2,
+                    now=1_000,
+                    jobs_root=jobs,
+                    archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=root / "missing.sqlite3",
+                    failed_units=[bad_unit, good_unit],
+                    unit_states=states,
+                )
+                with patch.object(RETENTION, "_systemd_unit_states", return_value=states):
+                    _, _, _, prepared = RETENTION._prepare_archives(plan)
+            self.assertEqual([item["unit"] for item in plan["archive_jobs"]], [good_unit])
+            self.assertEqual([item["record"]["unit"] for item in prepared], [good_unit])
+            self.assertNotIn(bad_unit, plan["reset_failed_units"])
+            self.assertEqual(plan["reset_failed_units"], [good_unit])
+            self.assertEqual(plan["archive_deferred_count"], 0)
+            self.assertTrue(any(
+                item["unit"] == bad_unit and "bounded" in item["reason"]
+                for item in plan["blocked"]
+            ))
+            self.assertEqual(stderr.read_bytes(), original)
+
+    def test_unsafe_terminal_archive_source_preserves_evidence_and_allows_safe_batch(self) -> None:
+        # An unsafe old terminal job must never consume the archive/reset
+        # budget or prevent an unrelated safe job from progressing.
+        cases = (
+            ("symlink", "symlink"),
+            ("hardlink", "private owner-controlled regular file"),
+            ("world-readable", "private owner-controlled regular file"),
+            ("file-count", "file-count bound"),
+        )
+        for shape, reason in cases:
+            with self.subTest(unsafe_source=shape):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    jobs = root / "jobs"
+                    bad_name = "grabowski-job-000000000001"
+                    good_name = "grabowski-job-000000000002"
+                    bad_unit = bad_name + ".service"
+                    good_unit = good_name + ".service"
+                    bad = self._job(jobs, bad_name, 100)
+                    self._job(jobs, good_name, 101)
+                    stderr = bad / "stderr.log"
+                    original = b"retain the unsafe job's terminal evidence\n"
+                    stderr.write_bytes(original)
+                    stderr.chmod(0o600)
+                    metadata_before = (bad / "metadata.json").read_bytes()
+                    extra = bad / "extra.log"
+                    outside = root / "independent-evidence.log"
+                    if shape == "symlink":
+                        outside.write_bytes(b"external evidence must survive\n")
+                        extra.symlink_to(outside)
+                    elif shape == "hardlink":
+                        os.link(stderr, extra)
+                    elif shape == "world-readable":
+                        stderr.chmod(0o644)
+                    elif shape == "file-count":
+                        extra.write_bytes(b"counted, never deleted\n")
+                        extra.chmod(0o600)
+
+                    states = {unit: self._state(unit) for unit in (bad_unit, good_unit)}
+                    # Both jobs have three normal files. For file-count only,
+                    # the bad job's fourth file exceeds the limit.
+                    limit = 3 if shape == "file-count" else RETENTION.MAX_ARCHIVE_FILES
+                    with patch.object(RETENTION, "MAX_ARCHIVE_FILES", limit):
+                        plan = RETENTION.build_plan(
+                            minimum_job_age_seconds=50,
+                            max_archive_jobs=2,
+                            now=1_000,
+                            jobs_root=jobs,
+                            archive_root=root / "archive",
+                            receipt_root=root / "receipts",
+                            task_db=root / "missing.sqlite3",
+                            failed_units=[bad_unit, good_unit],
+                            unit_states=states,
+                        )
+                        with patch.object(RETENTION, "_systemd_unit_states", return_value=states):
+                            _, _, _, prepared = RETENTION._prepare_archives(plan)
+
+                    blocked_reasons = [
+                        item["reason"] for item in plan["blocked"]
+                        if item["unit"] == bad_unit
+                    ]
+                    self.assertEqual(len(blocked_reasons), 1)
+                    self.assertIn(reason, blocked_reasons[0])
+                    self.assertNotIn(
+                        bad_unit, [item["unit"] for item in plan["archive_jobs"]]
+                    )
+                    self.assertNotIn(bad_unit, plan["reset_failed_units"])
+                    self.assertEqual(
+                        [item["unit"] for item in plan["archive_jobs"]], [good_unit]
+                    )
+                    self.assertEqual(
+                        [item["record"]["unit"] for item in prepared], [good_unit]
+                    )
+                    self.assertEqual(plan["reset_failed_units"], [good_unit])
+                    self.assertEqual(plan["archive_deferred_count"], 0)
+
+                    # Planning/preparation must preserve every unsafe source,
+                    # link and permission. Never repair, delete or truncate.
+                    self.assertEqual(stderr.read_bytes(), original)
+                    self.assertEqual((bad / "metadata.json").read_bytes(), metadata_before)
+                    self.assertTrue(bad.is_dir())
+                    if shape == "symlink":
+                        self.assertTrue(extra.is_symlink())
+                        self.assertEqual(
+                            outside.read_bytes(), b"external evidence must survive\n"
+                        )
+                    elif shape == "hardlink":
+                        self.assertTrue(extra.samefile(stderr))
+                        self.assertEqual(extra.read_bytes(), original)
+                        self.assertEqual(stderr.stat().st_nlink, 2)
+                    elif shape == "world-readable":
+                        self.assertEqual(stderr.stat().st_mode & 0o777, 0o644)
+                    else:
+                        self.assertEqual(extra.read_bytes(), b"counted, never deleted\n")
+
+    def test_stale_internal_archive_manifest_does_not_exhaust_file_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs = root / "jobs"
+            retry_name = "grabowski-job-000000000001"
+            good_name = "grabowski-job-000000000002"
+            retry_unit = retry_name + ".service"
+            good_unit = good_name + ".service"
+            retry_job = self._job(jobs, retry_name, 100)
+            self._job(jobs, good_name, 101)
+            stale_manifest = retry_job / "archive-manifest.json"
+            original = b'{"retry":true}\n'
+            stale_manifest.write_bytes(original)
+            stale_manifest.chmod(0o600)
+            states = {unit: self._state(unit) for unit in (retry_unit, good_unit)}
+            with patch.object(RETENTION, "MAX_ARCHIVE_FILES", 3):
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50,
+                    max_archive_jobs=2,
+                    now=1_000,
+                    jobs_root=jobs,
+                    archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=root / "missing.sqlite3",
+                    failed_units=[retry_unit, good_unit],
+                    unit_states=states,
+                )
+                with patch.object(RETENTION, "_systemd_unit_states", return_value=states):
+                    _, _, _, prepared = RETENTION._prepare_archives(plan)
+            self.assertEqual(
+                [item["unit"] for item in plan["archive_jobs"]],
+                [retry_unit, good_unit],
+            )
+            self.assertEqual(
+                [item["record"]["unit"] for item in prepared],
+                [retry_unit, good_unit],
+            )
+            self.assertNotIn(retry_unit, [item["unit"] for item in plan["blocked"]])
+            self.assertEqual(plan["reset_failed_units"], [retry_unit, good_unit])
+            self.assertEqual(stale_manifest.read_bytes(), original)
+
+    def test_unsafe_internal_archive_manifest_preserves_evidence_and_safe_job(self) -> None:
+        # The manifest is exempt from the payload COUNT, not file-shape checks.
+        # A dangerous reserved-name entry must not consume/reset the batch.
+        for shape in ("symlink", "hardlink", "world-readable", "oversized", "directory", "fifo"):
+            with self.subTest(unsafe_manifest=shape), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                jobs = root / "jobs"
+                bad_name = "grabowski-job-000000000001"
+                good_name = "grabowski-job-000000000002"
+                bad_unit = bad_name + ".service"
+                good_unit = good_name + ".service"
+                bad = self._job(jobs, bad_name, 100)
+                self._job(jobs, good_name, 101)
+                manifest = bad / "archive-manifest.json"
+                outside = root / "external-evidence"
+                original = b"external evidence must be preserved\n"
+                if shape in {"symlink", "hardlink"}:
+                    outside.write_bytes(original)
+                    outside.chmod(0o600)
+                    if shape == "symlink":
+                        manifest.symlink_to(outside)
+                    else:
+                        os.link(outside, manifest)
+                elif shape == "world-readable":
+                    manifest.write_bytes(original)
+                    manifest.chmod(0o644)
+                elif shape == "oversized":
+                    manifest.write_bytes(b"x" * (RETENTION.MAX_JSON_BYTES + 1))
+                    manifest.chmod(0o600)
+                elif shape == "directory":
+                    manifest.mkdir(mode=0o700)
+                else:
+                    os.mkfifo(manifest, mode=0o600)
+                states = {unit: self._state(unit) for unit in (bad_unit, good_unit)}
+                with patch.object(RETENTION, "MAX_ARCHIVE_FILES", 3):
+                    plan = RETENTION.build_plan(
+                        minimum_job_age_seconds=50, max_archive_jobs=1, now=1_000,
+                        jobs_root=jobs, archive_root=root / "archive",
+                        receipt_root=root / "receipts", task_db=root / "missing.sqlite3",
+                        failed_units=[bad_unit, good_unit], unit_states=states,
+                    )
+                    self.assertEqual(
+                        [item["unit"] for item in plan["archive_jobs"]], [good_unit]
+                    )
+                    self.assertEqual(plan["reset_failed_units"], [good_unit])
+                    blocked = [item for item in plan["blocked"] if item["unit"] == bad_unit]
+                    self.assertEqual(len(blocked), 1)
+                    with patch.object(RETENTION, "_systemd_unit_states", return_value=states):
+                        _, _, _, prepared = RETENTION._prepare_archives(plan)
+                    self.assertEqual(
+                        [item["record"]["unit"] for item in prepared], [good_unit]
+                    )
+                self.assertTrue((bad / "metadata.json").is_file())
+                if shape == "symlink":
+                    self.assertTrue(manifest.is_symlink())
+                    self.assertEqual(outside.read_bytes(), original)
+                elif shape == "hardlink":
+                    self.assertTrue(manifest.samefile(outside))
+                    self.assertEqual(outside.read_bytes(), original)
+                    self.assertEqual(manifest.stat().st_nlink, 2)
+                elif shape == "world-readable":
+                    self.assertEqual(manifest.read_bytes(), original)
+                    self.assertEqual(manifest.stat().st_mode & 0o777, 0o644)
+                elif shape == "oversized":
+                    self.assertEqual(manifest.stat().st_size, RETENTION.MAX_JSON_BYTES + 1)
+                elif shape == "directory":
+                    self.assertTrue(manifest.is_dir())
+                else:
+                    self.assertTrue(manifest.exists())
+                    self.assertFalse(manifest.is_file())
+
+    def test_manifest_replaced_with_symlink_after_plan_blocks_before_apply_effect(self) -> None:
+        # Apply must revalidate even when the original plan was admissible.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            jobs = root / "jobs"
+            name = "grabowski-job-000000000001"
+            unit = name + ".service"
+            bad = self._job(jobs, name, 100)
+            manifest = bad / "archive-manifest.json"
+            manifest.write_bytes(b"old safe retry marker\n")
+            manifest.chmod(0o600)
+            states = {unit: self._state(unit)}
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, max_archive_jobs=1, now=1_000,
+                jobs_root=jobs, archive_root=root / "archive",
+                receipt_root=root / "receipts", task_db=root / "missing.sqlite3",
+                failed_units=[unit], unit_states=states,
+            )
+            self.assertEqual(len(plan["archive_jobs"]), 1)
+            outside = root / "outside-immutable-evidence"
+            outside.write_bytes(b"outside must not change\n")
+            manifest.unlink()
+            manifest.symlink_to(outside)
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: None
+            fake_self_deploy._write_deploy_index = Mock()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict(
+                "sys.modules",
+                {"grabowski_self_deploy": fake_self_deploy, "grabowski_mcp": fake_base},
+            ), patch.object(RETENTION, "_systemd_unit_states", return_value=states), patch.object(
+                RETENTION, "_run", reset,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "symlink|private|manifest"):
+                    RETENTION.apply_plan(plan, expected_plan_sha256=plan["plan_sha256"])
+            self.assertTrue((jobs / name).is_dir())
+            self.assertFalse((root / "archive" / name).exists())
+            self.assertTrue(manifest.is_symlink())
+            self.assertEqual(outside.read_bytes(), b"outside must not change\n")
+            reset.assert_not_called()
+            fake_base._append_audit.assert_not_called()
+
+    def test_oversized_stale_archive_manifest_cannot_be_replaced_at_effect_time(self) -> None:
+        # The last atomic writer boundary must reject unsafe original evidence.
+        with tempfile.TemporaryDirectory() as tmp:
+            private_root = Path(tmp) / "job"
+            private_root.mkdir(mode=0o700)
+            path = private_root / "archive-manifest.json"
+            original = b"x" * (RETENTION.MAX_JSON_BYTES + 1)
+            path.write_bytes(original)
+            path.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "existing evidence is not owner-controlled"):
+                RETENTION._write_json_atomic(
+                    path, {"schema_version": 1}, replace_existing=True
+                )
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_periodic_noop_keeps_oversized_artifact_blocker_visible(self) -> None:
+        blocked = [{"unit": "grabowski-job-000000000001.service",
+                    "reason": "archive source is too large"}]
+        plan = {"plan_sha256": "f" * 64, "reset_failed_units": [],
+                "archive_jobs": [], "blocked": blocked}
+        with patch.object(RETENTION, "build_plan", side_effect=[plan, plan]), patch.object(
+            RETENTION, "_apply_periodic_worktree_hygiene", return_value={"completed": True}
+        ):
+            result = RETENTION.apply_periodic_plan()
+        self.assertTrue(result["completed"])
+        self.assertFalse(result["mutated"])
+        self.assertEqual(result["preserved_blocked_units"], blocked)
 
     def test_oversized_job_registry_keeps_task_reset_planning_available(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

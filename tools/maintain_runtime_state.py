@@ -189,6 +189,59 @@ def _private_file_digest(path: Path, *, max_bytes: int) -> tuple[int, str]:
         os.close(descriptor)
     return metadata.st_size, digest.hexdigest()
 
+def _archive_internal_manifest_shape_preflight(path: Path) -> None:
+    """Count exemption is not an exemption from evidence safety checks.
+
+    Retryable archive-manifest.json must be a small, private regular file.
+    Check its shape without opening a FIFO or following a symlink.
+    """
+    metadata = path.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or metadata.st_size > MAX_JSON_BYTES
+    ):
+        raise RuntimeError(
+            f"archive internal manifest must be one bounded private "
+            f"owner-controlled regular file: {path}"
+        )
+
+
+def _archive_file_shape_preflight(directory: Path) -> None:
+    """Classify unsafe terminal-job archives without hashing their whole contents.
+
+    This is advisory planning only. The existing archive apply path must still
+    re-open, hash, and compare every candidate under its deployment lock.
+    """
+    directory = _private_directory(directory)
+    files = 0
+    for path in directory.rglob("*"):
+        if path == directory / "archive-manifest.json":
+            _archive_internal_manifest_shape_preflight(path)
+            continue
+        if path.is_symlink():
+            raise RuntimeError(f"archive source contains a symlink: {path}")
+        if path.is_dir():
+            _private_directory(path)
+            continue
+        files += 1
+        if files > MAX_ARCHIVE_FILES:
+            raise RuntimeError("archive source exceeds the file-count bound")
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_size > MAX_ARCHIVE_FILE_BYTES
+        ):
+            raise RuntimeError(
+                f"file must be one bounded private owner-controlled regular file: {path}"
+            )
+
+
 
 def _failed_units() -> list[str]:
     result = _run(["systemctl", "--user", "--failed", "--no-legend", "--plain"])
@@ -1021,12 +1074,18 @@ def build_plan(
         key=lambda record: (record["created_at_unix"], record["unit"]),
     )
     archive_candidates: list[dict[str, Any]] = []
-    archive_collisions: set[str] = set()
+    archive_blocked_units: set[str] = set()
     for record in eligible:
         destination = archive_root / record["job_name"]
         if destination.exists() or destination.is_symlink():
-            archive_collisions.add(record["unit"])
+            archive_blocked_units.add(record["unit"])
             block(record["unit"], "archive destination already exists")
+            continue
+        try:
+            _archive_file_shape_preflight(jobs_root / record["job_name"])
+        except (RuntimeError, OSError) as exc:
+            archive_blocked_units.add(record["unit"])
+            block(record["unit"], f"archive source preflight blocked: {exc}")
             continue
         archive_candidates.append(record)
     archive_jobs = archive_candidates[:max_archive_jobs]
@@ -1059,7 +1118,7 @@ def build_plan(
             if not record["terminal"]:
                 block(unit, "failed job terminality is not proven")
                 continue
-            if unit in archive_collisions:
+            if unit in archive_blocked_units:
                 continue
             if record["archive"] and unit not in selected_archive_units:
                 deferred_failed_units.append({
@@ -1138,6 +1197,7 @@ def _archive_file_manifest(directory: Path) -> list[dict[str, Any]]:
     files: list[dict[str, Any]] = []
     for path in sorted(directory.rglob("*")):
         if path == directory / "archive-manifest.json":
+            _archive_internal_manifest_shape_preflight(path)
             continue
         if path.is_symlink():
             raise RuntimeError(f"archive source contains a symlink: {path}")
@@ -1168,12 +1228,17 @@ def _write_json_atomic(
     if path.is_symlink():
         raise RuntimeError(f"receipt path may not be a symlink: {path}")
     if path.exists():
-        metadata = path.stat()
+        metadata = path.lstat()
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
             or metadata.st_uid != os.getuid()
             or stat.S_IMODE(metadata.st_mode) & 0o077
+            or (
+                replace_existing
+                and path.name == "archive-manifest.json"
+                and metadata.st_size > MAX_JSON_BYTES
+            )
         ):
             raise RuntimeError(f"existing evidence is not owner-controlled: {path}")
         if not replace_existing:
@@ -2259,6 +2324,7 @@ def apply_periodic_plan(
             "plan_sha256": current["plan_sha256"],
             "completed": True,
             "mutated": False,
+            "preserved_blocked_units": current.get("blocked", []),
         }
     else:
         runtime_result = apply_plan(
