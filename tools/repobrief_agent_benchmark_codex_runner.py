@@ -2390,22 +2390,27 @@ def _assert_private_output_tree_scan(
 
 
 def _preintent_output_entry_reservation(
-    condition: str, expected_manifest: Mapping[str, Any] | None
+    condition: str,
+    expected_manifest: Mapping[str, Any] | None,
+    *,
+    mcp_script: Path | None = None,
+    legacy_g1: bool = False,
 ) -> int:
-    """Reserve every known entry added after the clone scan, before intent.
+    """Reserve both MCP stages and their exact source/manifest parent directories.
 
-    The final workspace directory replaces the disposable staging directory,
-    so the rename itself does not grow the scan. The answer schema adds one
-    file, and Codex's runtime home adds its parent, session directory, and
-    auth.json. Treatment additionally stages its two proxy source files and
-    the complete, bounded manifest artifact hierarchy in private leaves.
-    Actual artifact paths, not only their count, determine nested directories.
+    All checks run before workspace allocation and the first paired provider
+    intent, including baseline's future treatment. A later successful
+    postflight scan cannot refund an already-spent one-shot authorization.
     """
     reservation = 4  # answer-schema.json + codex-runtime/session/auth.json
     if condition == "baseline":
         return reservation
     if condition != "treatment" or not isinstance(expected_manifest, Mapping):
         raise RunnerError("pre-intent manifest binding is missing")
+    if not isinstance(mcp_script, Path) or not mcp_script.is_absolute():
+        raise RunnerError("pre-intent MCP script binding is missing")
+    if type(legacy_g1) is not bool:
+        raise RunnerError("pre-intent MCP profile is invalid")
     manifest = Path(str(expected_manifest.get("path"))).expanduser()
     current, raw = _runtime_file_snapshot(
         manifest, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
@@ -2413,20 +2418,78 @@ def _preintent_output_entry_reservation(
     if canonical(current) != canonical(dict(expected_manifest)):
         raise RunnerError("pre-intent manifest binding changed")
     artifacts = _manifest_artifact_paths(manifest, raw)
-    nested_directories: set[tuple[str, ...]] = set()
+
+    # First stage: repoground-manifest-runtime/bundle-*/<artifact>.
+    manifest_directories: set[tuple[str, ...]] = set()
     for relative, _candidate, _size, _sha256 in artifacts:
-        # A staged artifact sits beneath state_root/runtime-dir/stage-dir.
-        # More than 31 pathname components creates a parent directory
-        # deeper than the exact post-allocation scan's depth-32 ceiling.
         if len(relative.parts) > 31:
             raise RunnerError(
                 "pre-intent manifest artifact tree depth exceeds scan limit"
             )
         for depth in range(1, len(relative.parts)):
-            nested_directories.add(relative.parts[:depth])
-    # codex-mcp-proxy-runtime/stage/two files; then
-    # repoground-manifest-runtime/bundle/manifest plus artifacts and parents.
-    return reservation + 4 + 3 + len(artifacts) + len(nested_directories)
+            manifest_directories.add(relative.parts[:depth])
+
+    # The trusted parent makes an additional, independent upstream snapshot:
+    # executable/script, manifest/artifacts, entire RepoGround Python source,
+    # and, only for frozen G1, pinned vendor modules. Verify those bytes and
+    # parent paths now, not after the baseline provider has already spent.
+    script_name = "repobrief-mcp-stdio.py" if legacy_g1 else "repoground-mcp-stdio.py"
+    if mcp_script.name != script_name:
+        raise RunnerError("pre-intent MCP script does not match the bound profile")
+    source_tree = _repoground_source_tree_snapshot(mcp_script, raw, legacy_g1=legacy_g1)
+    if not isinstance(source_tree, Mapping) or not isinstance(
+        source_tree.get("entries"), list
+    ):
+        raise RunnerError("pre-intent RepoGround MCP source closure is unavailable")
+    vendor_entries = _frozen_g1_vendor_snapshot() if legacy_g1 else []
+    upstream_files = [
+        Path("executable") / "mcp-python",
+        Path("script") / script_name,
+        Path("manifest") / manifest.name,
+        *(Path("manifest") / relative for relative, *_rest in artifacts),
+    ]
+    for entry in source_tree["entries"]:
+        if not isinstance(entry, Mapping) or not isinstance(
+            entry.get("relative"), Path
+        ):
+            raise RunnerError("pre-intent RepoGround MCP source path invalid")
+        upstream_files.append(entry["relative"])
+    for entry in vendor_entries:
+        if not isinstance(entry, Mapping) or not isinstance(
+            entry.get("relative"), Path
+        ):
+            raise RunnerError("pre-intent historical G1 dependency path invalid")
+        upstream_files.append(Path("vendor") / entry["relative"])
+
+    upstream_directories: set[tuple[str, ...]] = set()
+    for relative in upstream_files:
+        if (
+            relative.is_absolute()
+            or not relative.parts
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or len(relative.parts) > 31
+        ):
+            raise RunnerError(
+                "pre-intent upstream MCP stage tree depth or path invalid"
+            )
+        for depth in range(1, len(relative.parts)):
+            upstream_directories.add(relative.parts[:depth])
+    if len(upstream_files) != len(set(upstream_files)):
+        raise RunnerError("pre-intent upstream MCP stage has duplicate file paths")
+
+    # Four proxy-stage entries, three initial manifest-stage entries,
+    # then the second upstream stage's two private parent directories,
+    # executable/script/manifest/artifact/source/vendor files and directories.
+    return (
+        reservation
+        + 4
+        + 3
+        + len(artifacts)
+        + len(manifest_directories)
+        + 2
+        + len(upstream_files)
+        + len(upstream_directories)
+    )
 
 
 def validate_live_immutable_mounts(
@@ -9813,14 +9876,36 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
     preallocate_check: Callable[[], None] | None = None
     if dispatch_authorization is not None:
         assert codex is not None
+        # A baseline's own authorization contains the future Treatment
+        # MCP executable/script/manifest closure, even though no MCP tool
+        # is called in baseline. Validate and reserve that *before* spending
+        # the baseline one-shot. Benchmark source and MCP source need not
+        # be the same repository.
+        future_mcp_files = _normalized_authorized_mcp_files(
+            dispatch_authorization["binding"].get("mcp_command_files")
+        )
+        if len(future_mcp_files) < 2:
+            raise RunnerError("pre-intent paired MCP launcher binding is incomplete")
+        mcp_script = Path(future_mcp_files[1]["path"])
+        legacy_g1 = (
+            _frozen_g1_baseline_pair(request)
+            if request["condition"] == "baseline"
+            else _frozen_g1_mcp_profile(request) == MCP_PROFILE_FROZEN_G1
+        )
         pending_output_entries = _preintent_output_entry_reservation(
-            str(request["condition"]), dispatch_authorization.get("manifest")
+            str(request["condition"]),
+            dispatch_authorization.get("manifest"),
+            mcp_script=mcp_script,
+            legacy_g1=legacy_g1,
         )
         if request["condition"] == "baseline":
-            # Reserve treatment's bound manifest/runtime entries BEFORE
-            # baseline's irreversible provider call for this same pair.
+            # Reserve entire future Treatment executable closure, including
+            # the second immutable MCP stage, before baseline provider intent.
             pending_output_entries += _preintent_output_entry_reservation(
-                "treatment", dispatch_authorization["binding"].get("manifest")
+                "treatment",
+                dispatch_authorization["binding"].get("manifest"),
+                mcp_script=mcp_script,
+                legacy_g1=legacy_g1,
             )
 
         def check_preallocation_mounts(future_pair_entries: int = 0) -> None:

@@ -344,6 +344,20 @@ def synthetic_prepared_stage(root: Path) -> dict:
     }
 
 
+def synthetic_paired_mcp_files(*, legacy_g1: bool = False) -> list[dict]:
+    """Only mock paired authorization metadata; never a real live grant."""
+    script = "repobrief-mcp-stdio.py" if legacy_g1 else "repoground-mcp-stdio.py"
+    return [
+        {"path": "/test-only/python3", "bytes": 1, "sha256": "0" * 64, "mode": "0o700"},
+        {
+            "path": "/test-only/scripts/" + script,
+            "bytes": 1,
+            "sha256": "1" * 64,
+            "mode": "0o600",
+        },
+    ]
+
+
 def proxy_command(
     upstream: Path,
     root: Path,
@@ -2650,15 +2664,13 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
         self.assertEqual(
             runner._preintent_output_entry_reservation("baseline", None), 4
         )
-        expected_manifest = {
-            "path": "/bundle/manifest.json",
-            "sha256": "a" * 64,
-        }
+        expected_manifest = {"path": "/bundle/manifest.json", "sha256": "a" * 64}
         manifest_files = [
             (Path("a/one"), Path("/source/a/one"), 10, "0" * 64),
             (Path("a/two"), Path("/source/a/two"), 10, "1" * 64),
             (Path("b/c/three"), Path("/source/b/c/three"), 10, "2" * 64),
         ]
+        script = Path("/src/scripts/repoground-mcp-stdio.py")
         with (
             patch.object(
                 runner,
@@ -2666,33 +2678,48 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 return_value=(dict(expected_manifest), b"manifest"),
             ) as snapshot,
             patch.object(
+                runner, "_manifest_artifact_paths", return_value=manifest_files
+            ) as artifacts,
+            patch.object(
                 runner,
-                "_manifest_artifact_paths",
-                return_value=manifest_files,
-            ) as manifest_paths,
+                "_repoground_source_tree_snapshot",
+                return_value={
+                    "entries": [
+                        {"relative": Path("merger/a.py")},
+                        {"relative": Path("merger/repoground/cli/mcp_stdio.py")},
+                    ]
+                },
+            ) as source_tree,
         ):
             self.assertEqual(
                 runner._preintent_output_entry_reservation(
-                    "treatment", expected_manifest
+                    "treatment", expected_manifest, mcp_script=script
                 ),
-                # schema + runtime home + proxy + manifest stage plus the
-                # three staged artifacts and three distinct nested folders.
-                4 + 4 + 3 + 3 + 3,
+                # Schema+home, proxy, first manifest and three artifacts+
+                # parent dirs, second upstream root/stage, its eight files and
+                # nine distinct nested directories. The prior code reserved 17.
+                4 + 4 + 3 + 3 + 3 + 2 + 8 + 9,
             )
             snapshot.assert_called_once()
-            manifest_paths.assert_called_once()
+            artifacts.assert_called_once()
+            source_tree.assert_called_once_with(script, b"manifest", legacy_g1=False)
         with self.assertRaisesRegex(
             runner.RunnerError, "pre-intent manifest binding is missing"
         ):
             runner._preintent_output_entry_reservation("treatment", None)
+        with self.assertRaisesRegex(
+            runner.RunnerError, "pre-intent MCP script binding is missing"
+        ):
+            runner._preintent_output_entry_reservation("treatment", expected_manifest)
 
     def test_preintent_rejects_deep_manifest_artifact_before_workspace(self) -> None:
-        # The staged bundle lives two directory levels below state_root.
-        # A relative file with 32 components creates a parent at depth 33,
-        # which the final output scanner rejects after one-use reservation.
+        # The second immutable upstream stage adds a manifest/ directory.
+        # It must reject a relative 31-component file even when the first
+        # manifest stage alone could have fit the depth-32 output scanner.
         binding = {"path": "/bundle/manifest.json", "sha256": "a" * 64}
-        valid = Path(*(["nested"] * 30 + ["artifact.dat"]))
-        too_deep = Path(*(["nested"] * 31 + ["artifact.dat"]))
+        script = Path("/src/scripts/repoground-mcp-stdio.py")
+        valid = Path(*(["nested"] * 29 + ["artifact.dat"]))
+        too_deep = Path(*(["nested"] * 30 + ["artifact.dat"]))
         with (
             patch.object(
                 runner,
@@ -2700,19 +2727,64 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 return_value=(dict(binding), b"manifest"),
             ),
             patch.object(runner, "_manifest_artifact_paths") as artifacts,
+            patch.object(
+                runner,
+                "_repoground_source_tree_snapshot",
+                return_value={"entries": [{"relative": Path("merger/a.py")}]},
+            ),
         ):
             artifacts.return_value = [(valid, Path("/bundle") / valid, 1, "b" * 64)]
             self.assertGreater(
-                runner._preintent_output_entry_reservation("treatment", binding),
+                runner._preintent_output_entry_reservation(
+                    "treatment", binding, mcp_script=script
+                ),
                 0,
             )
             artifacts.return_value = [
                 (too_deep, Path("/bundle") / too_deep, 1, "b" * 64)
             ]
             with self.assertRaisesRegex(
-                runner.RunnerError, "manifest artifact tree depth"
+                runner.RunnerError, "upstream MCP stage tree depth"
             ):
-                runner._preintent_output_entry_reservation("treatment", binding)
+                runner._preintent_output_entry_reservation(
+                    "treatment", binding, mcp_script=script
+                )
+
+    def test_preintent_upstream_source_tree_depth_and_aliases_fail_closed(self) -> None:
+        # An upstream source with a deep path or duplicate name could make the
+        # one-shot checkout fail only after its identity had been consumed.
+        binding = {"path": "/bundle/manifest.json", "sha256": "a" * 64}
+        script = Path("/src/scripts/repoground-mcp-stdio.py")
+        with (
+            patch.object(
+                runner,
+                "_runtime_file_snapshot",
+                return_value=(dict(binding), b"manifest"),
+            ),
+            patch.object(runner, "_manifest_artifact_paths", return_value=[]),
+            patch.object(runner, "_repoground_source_tree_snapshot") as tree,
+        ):
+            tree.return_value = {
+                "entries": [
+                    {"relative": Path("merger") / Path(*(["a"] * 30)) / "deep.py"}
+                ]
+            }
+            with self.assertRaisesRegex(
+                runner.RunnerError, "upstream MCP stage tree depth"
+            ):
+                runner._preintent_output_entry_reservation(
+                    "treatment", binding, mcp_script=script
+                )
+            tree.return_value = {
+                "entries": [
+                    {"relative": Path("merger/a.py")},
+                    {"relative": Path("merger/a.py")},
+                ]
+            }
+            with self.assertRaisesRegex(runner.RunnerError, "duplicate file paths"):
+                runner._preintent_output_entry_reservation(
+                    "treatment", binding, mcp_script=script
+                )
 
     def test_create_checkout_regular_tracked_files_remain_usable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -3562,6 +3634,78 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 ):
                     runner._unix_socket_restricted_codex_argv(value)
 
+    @staticmethod
+    def _documented_nested_userns_policy_denial(
+        bubblewrap: subprocess.CompletedProcess[bytes],
+        syscall_witness: subprocess.CompletedProcess[bytes],
+    ) -> bool:
+        """A kernel-denied nested userns needs two independent host signals."""
+        return (
+            bubblewrap.returncode == 1
+            and bubblewrap.stdout == b""
+            and bubblewrap.stderr.startswith(
+                b"bwrap: No permissions to create new namespace"
+            )
+            and syscall_witness.returncode == 0
+            and syscall_witness.stdout.strip() == b"NESTED_USERNS_SYSCALL_DENIED"
+            and syscall_witness.stderr == b""
+        )
+
+    def test_nested_userns_skip_requires_independent_kernel_denial(self) -> None:
+        """A generic bwrap failure must not mask a broken positive sandbox."""
+        denied = subprocess.CompletedProcess(
+            [],
+            1,
+            b"",
+            b"bwrap: No permissions to create new namespace, likely because "
+            b"the kernel does not allow non-privileged user namespaces.\n",
+        )
+        witness = subprocess.CompletedProcess(
+            [], 0, b"NESTED_USERNS_SYSCALL_DENIED\n", b""
+        )
+        self.assertTrue(self._documented_nested_userns_policy_denial(denied, witness))
+        for probe, syscall in (
+            (subprocess.CompletedProcess([], 1, b"", b"bwrap: file missing"), witness),
+            (subprocess.CompletedProcess([], 2, b"", denied.stderr), witness),
+            (subprocess.CompletedProcess([], 1, b"unexpected", denied.stderr), witness),
+            (denied, subprocess.CompletedProcess([], 1, b"", b"EPERM")),
+            (
+                denied,
+                subprocess.CompletedProcess([], 0, b"NESTED_USERNS_ALLOWED\n", b""),
+            ),
+        ):
+            with self.subTest(probe=probe, syscall=syscall):
+                self.assertFalse(
+                    self._documented_nested_userns_policy_denial(probe, syscall)
+                )
+
+    def test_nested_userns_denial_never_skips_negative_kernel_case(self) -> None:
+        """Simulate GitHub's policy and prove negative runs despite positive SKIP."""
+        denied = subprocess.CompletedProcess(
+            [], 1, b"", b"bwrap: No permissions to create new namespace\n"
+        )
+        witness = subprocess.CompletedProcess(
+            [], 0, b"NESTED_USERNS_SYSCALL_DENIED\n", b""
+        )
+        real_run = subprocess.run
+        observed = []
+
+        def simulate_host(argv, *args, **kwargs):
+            if argv and argv[0] == "/usr/bin/bwrap":
+                if "--unshare-user" in argv:
+                    observed.append("nested-denial")
+                    return denied
+                if argv and "NESTED_USERNS_SYSCALL_DENIED" in argv[-1]:
+                    observed.append("syscall-denial")
+                    return witness
+            return real_run(argv, *args, **kwargs)
+
+        with patch.object(subprocess, "run", side_effect=simulate_host):
+            with self.assertRaises(unittest.SkipTest):
+                self._assert_real_nested_codex_sandbox_kernel(reject=False)
+            self._assert_real_nested_codex_sandbox_kernel(reject=True)
+        self.assertEqual(observed, ["nested-denial", "syscall-denial", "nested-denial"])
+
     def _assert_real_nested_codex_sandbox_kernel(self, *, reject: bool) -> None:
         """Exercise outer and inner PID, user, seccomp and mount isolation.
 
@@ -3616,20 +3760,70 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             "utf-8", errors="replace"
         )
         nested_userns_available = nested_kernel_probe.returncode == 0
-        if (
-            not nested_userns_available
-            and not reject
-            and not any(
-                marker in kernel_denial.lower()
-                for marker in ("permission denied", "operation not permitted")
+        if not nested_userns_available and not reject:
+            # Bubblewrap's error is not itself sufficient to skip a security
+            # test: independently test CLONE_NEWUSER from inside the same
+            # outer PID/mount namespace. No provider executable is started.
+            syscall_program = (
+                "import ctypes,errno,sys\n"
+                "libc=ctypes.CDLL(None,use_errno=True)\n"
+                "unshare=libc.unshare\n"
+                "unshare.argtypes=[ctypes.c_int]\n"
+                "unshare.restype=ctypes.c_int\n"
+                "result=unshare(0x10000000)  # CLONE_NEWUSER\n"
+                "error=ctypes.get_errno()\n"
+                "if result==-1 and error in (errno.EPERM,errno.EACCES):\n"
+                " print('NESTED_USERNS_SYSCALL_DENIED')\n"
+                "else:\n"
+                " print(f'UNEXPECTED_USERNS_RESULT={result},errno={error}')\n"
+                " sys.exit(86)\n"
             )
-        ):
+            try:
+                syscall_witness = subprocess.run(
+                    [
+                        "/usr/bin/bwrap",
+                        "--ro-bind",
+                        "/",
+                        "/",
+                        "--unshare-pid",
+                        "--unshare-ipc",
+                        "--die-with-parent",
+                        "--proc",
+                        "/proc",
+                        "--dev",
+                        "/dev",
+                        "--",
+                        "/usr/bin/python3",
+                        "-I",
+                        "-c",
+                        syscall_program,
+                    ],
+                    capture_output=True,
+                    check=False,
+                    timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                self.fail(
+                    f"nested kernel syscall witness unavailable: {type(exc).__name__}"
+                )
+            if self._documented_nested_userns_policy_denial(
+                nested_kernel_probe, syscall_witness
+            ):
+                self.skipTest(
+                    "CONFIRMED HOST POLICY: Bubblewrap plus independent "
+                    "CLONE_NEWUSER syscall deny nested user namespaces. "
+                    "The positive provider-free production kernel proof "
+                    "remains MANDATORY on a supported target host."
+                )
             self.fail(
-                "nested kernel preflight failed for an unclassified reason: "
-                f"returncode={nested_kernel_probe.returncode}, "
-                f"stderr={kernel_denial!r}, "
-                f"stdout={nested_kernel_probe.stdout[-512:]!r}. "
-                "Do not skip before classifying the actual runner policy."
+                "nested kernel preflight failed without independent proof "
+                "of an unsupported host capability: "
+                f"bwrap_returncode={nested_kernel_probe.returncode}, "
+                f"bwrap_stderr={kernel_denial!r}, "
+                f"bwrap_stdout={nested_kernel_probe.stdout[-512:]!r}; "
+                f"syscall_returncode={syscall_witness.returncode}, "
+                f"syscall_stdout={syscall_witness.stdout[-256:]!r}, "
+                f"syscall_stderr={syscall_witness.stderr[-512:]!r}."
             )
         inner = (
             "import os,sys,subprocess\nfrom pathlib import Path\n"
@@ -3653,12 +3847,6 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 prefix="rab-nested-kernel-", dir=str(Path.home())
             ) as temporary,
         ):
-            if not reject and not nested_userns_available:
-                self.skipTest(
-                    "host AppArmor/kernel denies nested user namespaces; "
-                    "positive provider-free smoke remains mandatory on "
-                    "the supported production qualification host"
-                )
             root = Path(temporary)
             source = root / "source"
             source.mkdir()
@@ -4830,6 +5018,109 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
     @patch.object(
         runner, "_require_in_process_pair_condition", new=lambda _request: None
     )
+    def test_baseline_reserves_future_upstream_stage_before_any_provider_effect(
+        self,
+    ) -> None:
+        """A too-large Treatment closure must block before Baseline spends its one-shot."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = request(condition="baseline")
+            planned_request_root(root, value)
+            args = Namespace(
+                request_root=root / "requests",
+                repository_map=root / "repositories.json",
+                state_root=root / "state",
+                transcript_root=root / "transcripts",
+                provider_evidence_root=root / "provider-evidence",
+                codex_command="/opt/codex",
+                codex_command_sha256="1" * 64,
+                allow_live_provider=True,
+                stream_fixture=None,
+                stderr_fixture=None,
+                fixture_returncode=0,
+            )
+            bound_script = Path("/test-only/scripts/repoground-mcp-stdio.py")
+            future_manifest = {"path": "/bundle/manifest.json", "sha256": "a" * 64}
+            dispatch = {
+                "authorization": {"contract": "isolated-test-only"},
+                "provider_codex": {},
+                "provider_authentication": {},
+                "repository_map_bytes": b"{}",
+                "binding": {
+                    "mcp_command_files": synthetic_paired_mcp_files(),
+                    "manifest": future_manifest,
+                },
+            }
+            reserved: list[str] = []
+
+            def reserve(
+                condition: str,
+                manifest: object,
+                *,
+                mcp_script: Path | None = None,
+                legacy_g1: bool = False,
+            ) -> int:
+                reserved.append(condition)
+                if condition == "baseline":
+                    return 4
+                self.assertEqual(condition, "treatment")
+                self.assertEqual(manifest, future_manifest)
+                self.assertEqual(mcp_script, bound_script)
+                self.assertFalse(legacy_g1)
+                raise runner.RunnerError(
+                    "future full upstream MCP stage exceeds pre-spend budget"
+                )
+
+            with ExitStack() as stack:
+                for name, value_to_return in (
+                    ("validate_executable", "/opt/codex"),
+                    ("validate_toolchain", None),
+                    ("_repository_root_from_authorized_map_bytes", root),
+                    ("_load_preflight_dispatch_authorization", dispatch),
+                ):
+                    stack.enter_context(
+                        patch.object(runner, name, return_value=value_to_return)
+                    )
+                for name in (
+                    "_assert_authorized_codex_executable",
+                    "_require_external_provider_one_shot",
+                    "_assert_authorized_runtime_binding",
+                ):
+                    stack.enter_context(patch.object(runner, name))
+                stage_headroom = stack.enter_context(
+                    patch.object(
+                        runner,
+                        "_preintent_output_entry_reservation",
+                        side_effect=reserve,
+                    )
+                )
+                login = stack.enter_context(
+                    patch.object(runner, "validate_chatgpt_subscription")
+                )
+                mounts = stack.enter_context(
+                    patch.object(runner, "validate_live_immutable_mounts")
+                )
+                evidence = stack.enter_context(
+                    patch.object(runner, "prepare_provider_evidence")
+                )
+                checkout = stack.enter_context(patch.object(runner, "create_checkout"))
+                intent = stack.enter_context(
+                    patch.object(runner, "_record_preflight_dispatch_intent")
+                )
+                provider = stack.enter_context(patch.object(runner, "run_bounded"))
+                with self.assertRaisesRegex(
+                    runner.RunnerError, "future full upstream MCP stage"
+                ):
+                    runner.execute(value, args)
+            self.assertEqual(reserved, ["baseline", "treatment"])
+            self.assertEqual(stage_headroom.call_count, 2)
+            for forbidden in (login, mounts, evidence, checkout, intent, provider):
+                forbidden.assert_not_called()
+            self.assertFalse((root / "state" / "codex-workspaces").exists())
+
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
     def test_live_mount_drift_blocks_before_workspace_and_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4853,7 +5144,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 "provider_codex": {},
                 "provider_authentication": {},
                 "repository_map_bytes": b"{}",
-                "binding": {},
+                "binding": {"mcp_command_files": synthetic_paired_mcp_files()},
             }
             with ExitStack() as stack:
                 # This test isolates another failure boundary; the real pair
@@ -4953,7 +5244,10 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 "provider_codex": {},
                 "provider_authentication": {},
                 "repository_map_bytes": b"{}",
-                "binding": {"report_out": str(root / "reports" / "preflight.json")},
+                "binding": {
+                    "report_out": str(root / "reports" / "preflight.json"),
+                    "mcp_command_files": synthetic_paired_mcp_files(),
+                },
             }
 
             execution_order: list[str] = []
@@ -5134,7 +5428,10 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 "provider_codex": {},
                 "provider_authentication": {},
                 "repository_map_bytes": b"{}",
-                "binding": {"report_out": str(root / "reports" / "preflight.json")},
+                "binding": {
+                    "report_out": str(root / "reports" / "preflight.json"),
+                    "mcp_command_files": synthetic_paired_mcp_files(),
+                },
             }
             start = datetime(2026, 10, 17, tzinfo=timezone.utc)
             clock = {"now": start, "provider_done": False}
@@ -11813,7 +12110,9 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                     "provider_codex": {},
                     "provider_authentication": {},
                     "repository_map_bytes": b"{}",
-                    "binding": {},
+                    "binding": {
+                        "mcp_command_files": synthetic_paired_mcp_files(legacy_g1=True)
+                    },
                     "mcp_files": [],
                     "proxy_code": {},
                     "proxy_base_code": {},
@@ -11954,7 +12253,9 @@ class FrozenG1VendorBeforeDispatchTests(unittest.TestCase):
                 "provider_codex": {},
                 "provider_authentication": {},
                 "repository_map_bytes": b"{}",
-                "binding": {},
+                "binding": {
+                    "mcp_command_files": synthetic_paired_mcp_files(legacy_g1=True)
+                },
                 "mcp_files": [],
                 "proxy_code": None,
                 "proxy_base_code": None,

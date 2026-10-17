@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
@@ -124,7 +125,15 @@ print("CROSS_PROCESS_VM_DENIED", flush=True)
             "from pathlib import Path\n"
             "sys.path.insert(0,str(Path.cwd()/'tools'))\n"
             "import repobrief_agent_benchmark_codex_runner as runner\n"
-            "runner._assert_trusted_runner_nondumpable()\n"
+            "try:\n"
+            " runner._assert_trusted_runner_nondumpable()\n"
+            "except runner.RunnerError as exc:\n"
+            " if not Path('/proc/sys/kernel/yama/ptrace_scope').is_file() "
+            "and 'ptrace policy unavailable' in str(exc):\n"
+            "  print('KERNEL_PARENT_YAMA_MISSING_FAIL_CLOSED')\n"
+            "  sys.exit(0)\n"
+            " raise\n"
+            "assert Path('/proc/sys/kernel/yama/ptrace_scope').is_file()\n"
             "libc=ctypes.CDLL(None,use_errno=True)\n"
             "assert libc.prctl(3,0,0,0,0)==0\n"
             "print('KERNEL_PARENT_NON_DUMPABLE')\n"
@@ -144,7 +153,21 @@ print("CROSS_PROCESS_VM_DENIED", flush=True)
             0,
             msg=(completed.stdout + completed.stderr).decode(errors="replace")[-1200:],
         )
-        self.assertIn(b"KERNEL_PARENT_NON_DUMPABLE", completed.stdout)
+        expected = (
+            b"KERNEL_PARENT_NON_DUMPABLE"
+            if Path("/proc/sys/kernel/yama/ptrace_scope").is_file()
+            else b"KERNEL_PARENT_YAMA_MISSING_FAIL_CLOSED"
+        )
+        self.assertIn(expected, completed.stdout)
+
+    def test_missing_yama_fails_closed_before_nondumpable_mutation(self):
+        # No prctl changes to the unittest process: the test-only Yama
+        # read fails before _assert_trusted_runner_nondumpable can call prctl.
+        with mock.patch.object(Path, "read_bytes", side_effect=FileNotFoundError):
+            with self.assertRaisesRegex(
+                runner.RunnerError, "kernel ptrace policy unavailable"
+            ):
+                runner._assert_trusted_runner_nondumpable()
 
     def test_real_codex_version_starts_inside_filter_when_installed(self):
         """Exercise Tokio startup on a real CLI without credentials or provider calls."""
