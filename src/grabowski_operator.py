@@ -8324,6 +8324,27 @@ def _start_job(
             "PYTHONINSPECT": "",
             "PYTHONSTARTUP": "",
             "PYTHONBREAKPOINT": "0",
+            # systemd manager environment is inherited before this Python
+            # process starts. Mask CPython's preinitialization controls,
+            # not just import-path variables: malformed values can be fatal.
+            # Keep hash randomization rather than selecting a fixed seed.
+            "PYTHONHASHSEED": "random",
+            "PYTHONMALLOC": "",
+            "PYTHONUTF8": "",
+            "PYTHONCOERCECLOCALE": "",
+            "PYTHONIOENCODING": "",
+            "PYTHONINTMAXSTRDIGITS": "",
+            "PYTHONDEBUG": "",
+            "PYTHONOPTIMIZE": "",
+            "PYTHONUNBUFFERED": "",
+            "PYTHONVERBOSE": "",
+            "PYTHONFAULTHANDLER": "",
+            "PYTHONDEVMODE": "",
+            "PYTHONWARNDEFAULTENCODING": "",
+            "PYTHONTRACEMALLOC": "",
+            "PYTHONPROFILEIMPORTTIME": "",
+            "PYTHONASYNCIODEBUG": "",
+            "PYTHONDONTWRITEBYTECODE": "",
         })
     if (
         decision_review_binding is not None

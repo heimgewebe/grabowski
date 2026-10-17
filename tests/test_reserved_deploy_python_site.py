@@ -47,6 +47,12 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                         "PYTHONPLATLIBDIR": "foreign",
                         "PYTHONINSPECT": "1",
                         "PYTHONSTARTUP": "/tmp/untrusted-startup",
+                        "PYTHONHASHSEED": "bogus",
+                        "PYTHONMALLOC": "bogus",
+                        "PYTHONUTF8": "bogus",
+                        "PYTHONIOENCODING": "not-a-codec",
+                        "PYTHONINTMAXSTRDIGITS": "bogus",
+                        "PYTHONOPTIMIZE": "bogus",
                     }),
                 patch.object(operator, "_run", return_value=launch_result) as run,
             ):
@@ -77,6 +83,54 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                 "--setenv=PYTHONBREAKPOINT=0",
             ):
                 self.assertIn(item, before_command)
+            # A manager-level invalid Python setting must be overridden
+            # before the fixed /usr/bin/python3 processes any user code.
+            neutral = {
+                "PYTHONHASHSEED": "random",
+                "PYTHONMALLOC": "",
+                "PYTHONUTF8": "",
+                "PYTHONIOENCODING": "",
+                "PYTHONINTMAXSTRDIGITS": "",
+                "PYTHONCOERCECLOCALE": "",
+                "PYTHONDEBUG": "",
+                "PYTHONOPTIMIZE": "",
+                "PYTHONUNBUFFERED": "",
+                "PYTHONVERBOSE": "",
+                "PYTHONFAULTHANDLER": "",
+                "PYTHONDEVMODE": "",
+                "PYTHONWARNDEFAULTENCODING": "",
+                "PYTHONTRACEMALLOC": "",
+                "PYTHONPROFILEIMPORTTIME": "",
+                "PYTHONASYNCIODEBUG": "",
+                "PYTHONDONTWRITEBYTECODE": "",
+            }
+            for name, value in neutral.items():
+                self.assertEqual(1, before_command.count(f"--setenv={name}={value}"), name)
+            # Probe actual interpreter preinitialization with -S solely to
+            # prevent tests from loading any user-site .pth or bytecode.
+            if Path("/usr/bin/python3").is_file():
+                for name in ("PYTHONHASHSEED", "PYTHONMALLOC"):
+                    with self.subTest(inherited=name):
+                        poisoned = {"PATH": os.environ.get("PATH", "/usr/bin"),
+                                    "HOME": str(root), name: "bogus"}
+                        command = ["/usr/bin/python3", "-S", "-c", "print('preinit-ok')"]
+                        unsafe = subprocess.run(
+                            command, cwd=root, env=poisoned,
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        self.assertNotEqual(0, unsafe.returncode)
+                        admitted = dict(poisoned)
+                        for option in before_command:
+                            if option.startswith("--setenv="):
+                                key, _, value = option[len("--setenv="):].partition("=")
+                                admitted[key] = value
+                        safe = subprocess.run(
+                            command, cwd=root, env=admitted,
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        self.assertEqual(0, safe.returncode, safe.stderr)
+                        self.assertEqual("preinit-ok", safe.stdout.strip())
+
             expected_site = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".local"
             self.assertIn(f"--setenv=PYTHONUSERBASE={expected_site}", before_command)
             self.assertEqual(
