@@ -2438,6 +2438,64 @@ class CaptainMcpIngressRegressionTests(unittest.TestCase):
         self.assertFalse(grips._server_captain_dispatch_admitted(params))
         self.assertIsNone(grips._SERVER_CAPTAIN_INGRESS.get())
 
+    def test_cloned_authenticated_mcp_ingress_cannot_mint_second_captain_origin(self) -> None:
+        """One accepted frontdoor action issues at most one runtime origin."""
+        from contextvars import copy_context
+
+        mcp_server = real_deploy.base
+        params = self._fixture()
+        head = "b" * 40
+        seen: list[bool] = []
+
+        def observed_captain(_mod, _spec, admitted, *_args):
+            seen.append(real_deploy._accepted_captain_origin_matches(
+                head, admitted["release_review_pr"]
+            ))
+            return {"receipt_status": "passed"}
+
+        def dispatch_from_mcp(name, admitted, **kwargs):
+            self.assertEqual("captain-run", name)
+            self.assertTrue(kwargs["allow_mutation"])
+            cloned = copy_context()
+            grips._run_captain_run(Mock(), admitted, {}, Mock(), Mock())
+            cloned.run(grips._run_captain_run, Mock(), admitted, {}, Mock(), Mock())
+            return {"receipt": {"status": "passed"},
+                    "output": {"receipt_status": "passed"}}
+
+        action = {"action": "runtime-deploy", "target": {
+            "adapter": "grabowski-self", "service": "grabowski-mcp",
+            "runtime_target": "heim-pc",
+        }}
+        with (
+            patch.object(mcp_server, "_require_mutations_enabled"),
+            patch.object(mcp_server, "_session_grip_policy_decision", return_value={
+                "allowed": True, "session_profile": {"profile": "trusted-owner"},
+            }),
+            patch.object(mcp_server, "_captain_audit_intent", return_value={
+                "audit_chain_valid": True, "audit_record_sha256": "a" * 64,
+            }),
+            patch.object(mcp_server, "_captain_audit_completion", return_value={
+                "audit_chain_valid": True, "audit_record_sha256": "b" * 64,
+            }),
+            patch.object(grips, "_captain_actions", return_value=[action]),
+            patch.object(grips, "_captain_authority_gates", return_value=(
+                [{"id": "test", "status": "pass"}], {}
+            )),
+            patch.object(grips, "_captain_execution_intent_review",
+                         return_value=({"intent_sha256": "1" * 64}, [])),
+            patch.object(grips, "_runtime_deploy_expected_head", return_value=head),
+            patch.object(grips.grabowski_grip_orchestration,
+                         "run_captain_run", side_effect=observed_captain),
+            patch.object(grips, "grip_run", side_effect=dispatch_from_mcp),
+        ):
+            mcp_server._grip_run_core(
+                "captain-run", params, profile="captain", allow_mutation=True,
+                ctx=types.SimpleNamespace(session=object()),
+            )
+        self.assertEqual([True, False], seen)
+        self.assertFalse(grips._CAPTAIN_ACCEPTED_RUNTIME_TICKETS)
+        self.assertFalse(grips._SERVER_CAPTAIN_INGRESS_ACTIVE)
+
     def test_forged_audit_and_generic_actor_cannot_mint_server_captain_origin(self) -> None:
         actor = grips.grabowski_merge_guard.issue_server_runtime_actor_identity(
             object(), profile="trusted-owner"
@@ -2543,6 +2601,97 @@ class CaptainEffectClaimRegressionTests(unittest.TestCase):
             clone.run(real_deploy._claim_captain_schedule_effect, head, review)
         self.assertIsNone(real_deploy._CAPTAIN_RUNTIME_RELEASE_SCOPE.get())
         self.assertIsNone(real_deploy._CAPTAIN_ACCEPTED_ACTION.get())
+
+    def test_captain_scope_admission_refusal_is_definite_pre_effect(self) -> None:
+        """A refused scope enter never constitutes an attempted scheduler call."""
+        head = "b" * 40
+        actor = grips.grabowski_merge_guard.issue_server_runtime_actor_identity(
+            object(), profile="trusted-owner"
+        )
+        ticket = object()
+        grips._CAPTAIN_ACCEPTED_RUNTIME_TICKETS[ticket] = (head, 1460, "1" * 64)
+        action = {"action": "runtime-deploy", "target": {
+            "adapter": "grabowski-self", "service": "grabowski-mcp",
+            "runtime_target": "heim-pc",
+        }}
+        with (
+            real_deploy._accepted_captain_runtime_action(
+                head, 1460, server_actor_identity=actor,
+                execution_intent_sha256="1" * 64, accepted_dispatch_ticket=ticket,
+            ),
+            patch.object(grips, "_runtime_deploy_expected_head", return_value=head),
+            patch.object(grips, "_runtime_deploy_delay_seconds", return_value=8),
+            patch.object(grips, "_runtime_deploy_source_parameters",
+                         return_value=(None, None)),
+            patch.object(grips, "_captain_runtime_deploy_target_errors",
+                         return_value=[]),
+            patch.object(grips, "_runtime_deploy_self_preflight",
+                         return_value={"ready": True, "job_prefix": "grabowski-job-"}),
+            patch.object(real_deploy, "_require_release_source_admission",
+                         side_effect=real_deploy.DeploySchedulePreEffectRefusal(
+                             "independent R3 missing"
+                         )),
+            patch.object(grips, "_runtime_deploy_self_schedule") as schedule,
+        ):
+            result = grips._run_captain_runtime_deploy(
+                action, {"release_review_pr": 1460}
+            )
+        self.assertTrue(result.get("pre_effect_refusal"))
+        self.assertTrue(result.get("definitely_not_scheduled"))
+        self.assertFalse(result["execution_attempted"])
+        self.assertFalse(result["execution_invoked"])
+        self.assertFalse(result.get("mutation_outcome_unknown", False))
+        schedule.assert_not_called()
+
+    def test_final_dispatch_admission_rechecks_lease_and_source_identity(self) -> None:
+        """A source/serving drift before deploy index must fail closed."""
+        head = "b" * 40
+        initial = {
+            "status": "non-runtime-documentation",
+            "target_repo_head": head,
+            "serving_repo_head": "a" * 40,
+            "changed_path_count": 1,
+            "independent_review_required": False,
+        }
+        drifted = {**initial, "serving_repo_head": "c" * 40}
+        source_id = {
+            "canonical_repository": str(real_deploy.CANONICAL_REPOSITORY),
+            "source_kind": "detached", "identity_sha256": "d" * 64,
+        }
+        with (
+            patch.object(real_deploy, "_require_release_source_admission",
+                         return_value=initial),
+            patch.object(real_deploy, "_require_release_source_admission_under_lease",
+                         side_effect=[initial, drifted]) as leased,
+            patch.object(real_deploy, "_claim_captain_schedule_effect"),
+            patch.object(real_deploy, "_deploy_schedule_lock",
+                         return_value=nullcontext()),
+            patch.object(real_deploy, "_fresh_public_github_main", return_value=head),
+            patch.object(real_deploy, "_deployment_source_preflight", return_value=(
+                Path("/tmp/pr1460-source"), Path("/bin/true"), source_id
+            )),
+            patch.object(real_deploy, "inflight_runtime_job_evidence",
+                         return_value={"error": None, "inflight_units": []}),
+            patch.object(real_deploy.privileged, "ensure_rootbroker_authority",
+                         return_value={"success": True, "effect_started": False}),
+            patch.object(real_deploy, "_deploy_command", return_value=["true"]),
+            patch.object(real_deploy, "_matching_inflight_deploy_job",
+                         return_value=None),
+            patch.object(real_deploy, "_append_deploy_audit") as audit,
+            patch.object(real_deploy, "_write_deploy_index") as index,
+            patch.object(real_deploy.operator, "_start_job") as job,
+        ):
+            with self.assertRaisesRegex(
+                real_deploy.DeploySchedulePreEffectRefusal, "identity drift"
+            ):
+                real_deploy._grabowski_runtime_deploy_schedule_impl(
+                    head, delay_seconds=8, source_repository="/tmp/pr1460-source",
+                    source_lease_owner_id="fixture:source", local_mutation_tracker={},
+                )
+        self.assertEqual(2, leased.call_count)
+        audit.assert_not_called()
+        index.assert_not_called()
+        job.assert_not_called()
 
     def test_replay_refusal_precedes_public_main_and_rootbroker_effects(self) -> None:
         head = "b" * 40

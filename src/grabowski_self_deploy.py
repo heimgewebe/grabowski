@@ -6804,12 +6804,41 @@ def _grabowski_runtime_deploy_schedule_impl(
             # Persist a server-observed admission *identity* alongside the
             # launch intent. No caller-supplied PASS or reviewer text is
             # accepted as a scheduling capability or deployment receipt.
-            admitted = _require_release_source_admission(expected_head)
+            # Re-read the actual ODB/ref/checkout identity under fresh exact
+            # leases, rather than allowing an unleased Git diff at the
+            # index/job boundary. Requiring the same source/review binding
+            # rejects drift while Rootbroker or source setup was in flight.
+            admitted = _require_release_source_admission_under_lease(
+                expected_head
+            )
             if not isinstance(admitted, dict) or not isinstance(
-                admitted.get("status"), str
+                admitted_under_lease, dict
             ):
                 raise DeploySchedulePreEffectRefusal(
-                    "release admission blocked: final server evidence malformed"
+                    "release admission blocked: final leased evidence malformed"
+                )
+            binding_fields = (
+                "status", "independent_review_required",
+                "target_head", "target_repo_head",
+                "serving_head", "serving_repo_head", "serving_release_id",
+                "changed_path_count", "release_review_identity_sha256",
+            )
+            if (
+                any(
+                    admitted.get(field) != admitted_under_lease.get(field)
+                    for field in binding_fields
+                )
+                or (
+                    admitted.get("review", {}).get("review_pr")
+                    if isinstance(admitted.get("review"), dict) else None
+                ) != (
+                    admitted_under_lease.get("review", {}).get("review_pr")
+                    if isinstance(admitted_under_lease.get("review"), dict)
+                    else None
+                )
+            ):
+                raise DeploySchedulePreEffectRefusal(
+                    "release admission blocked: final leased source identity drift"
                 )
             intent["release_admission"] = {
                 "source": "server-revalidated-at-scheduler-dispatch",

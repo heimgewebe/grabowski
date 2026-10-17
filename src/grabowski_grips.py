@@ -14,6 +14,7 @@ import re
 import stat as statmod
 import subprocess
 import sys
+import threading
 import time
 from typing import Any, Callable, Iterator
 from urllib.parse import quote, urlsplit
@@ -16683,6 +16684,7 @@ def _run_captain_runtime_deploy(
         return execution_result
     review_pr = parameters.get("release_review_pr")
     from grabowski_self_deploy import (
+        DeploySchedulePreEffectRefusal,
         _accepted_captain_origin_matches,
         _require_release_source_admission,
     )
@@ -16743,8 +16745,6 @@ def _run_captain_runtime_deploy(
         return execution_result
     execution_result["preflight"] = preflight
     execution_result["preflight_passed"] = True
-    execution_result["execution_invoked"] = True
-    execution_result["execution_attempted"] = True
     try:
         # A positive release-review record is not a direct scheduler
         # capability. Only this Captain-dispatched call may hold the short
@@ -16759,6 +16759,10 @@ def _run_captain_runtime_deploy(
 
             release_scope = nullcontext()
         with release_scope:
+            # Scope enter revalidates R3/CI/identity and may refuse before
+            # any schedule invocation. Do not classify that as an unknown job.
+            execution_result["execution_invoked"] = True
+            execution_result["execution_attempted"] = True
             schedule = (
                 _runtime_deploy_self_schedule(expected_head, delay_seconds)
                 if source_repository is None
@@ -16770,7 +16774,7 @@ def _run_captain_runtime_deploy(
                 )
             )
         execution_result["command_returned"] = True
-    except RuntimeDeployPreEffectRefusal as exc:
+    except (RuntimeDeployPreEffectRefusal, DeploySchedulePreEffectRefusal) as exc:
         local_mutation_evidence = getattr(exc, "local_mutation_evidence", None)
         if local_mutation_evidence is None:
             execution_result["execution_invoked"] = False
@@ -18086,6 +18090,10 @@ _SERVER_CAPTAIN_INGRESS: ContextVar[tuple[object, str, str, str] | None] = Conte
     "grabowski_server_captain_ingress", default=None
 )
 _SERVER_CAPTAIN_INGRESS_ACTIVE: set[object] = set()
+# Consuming an MCP dispatch must be atomic across copied ContextVars, sibling
+# threads and nested Captain calls. The server ingress authorizes one ticket,
+# not an arbitrary number of later Captain origins from that same context.
+_SERVER_CAPTAIN_INGRESS_CLAIM_LOCK = threading.Lock()
 # A non-serializable, single-use ticket is minted by the accepted MCP dispatch,
 # not by this contextmanager from hashable actor/audit metadata.
 _CAPTAIN_MCP_INGRESS_TICKETS: dict[object, tuple[str, str, str]] = {}
@@ -18129,7 +18137,8 @@ def _server_captain_dispatch_scope(
             "accepted Captain MCP ingress ticket is invalid or already consumed"
         )
     marker = object()
-    _SERVER_CAPTAIN_INGRESS_ACTIVE.add(marker)
+    with _SERVER_CAPTAIN_INGRESS_CLAIM_LOCK:
+        _SERVER_CAPTAIN_INGRESS_ACTIVE.add(marker)
     reset = _SERVER_CAPTAIN_INGRESS.set((
         marker, actor["identity_sha256"], request_digest, audit_digest
     ))
@@ -18137,7 +18146,8 @@ def _server_captain_dispatch_scope(
         yield
     finally:
         _SERVER_CAPTAIN_INGRESS.reset(reset)
-        _SERVER_CAPTAIN_INGRESS_ACTIVE.discard(marker)
+        with _SERVER_CAPTAIN_INGRESS_CLAIM_LOCK:
+            _SERVER_CAPTAIN_INGRESS_ACTIVE.discard(marker)
 
 
 def _server_captain_dispatch_admitted(parameters: dict[str, Any]) -> bool:
@@ -18159,6 +18169,20 @@ def _server_captain_dispatch_admitted(parameters: dict[str, Any]) -> bool:
         and _is_hex_sha(scope[3], lengths=(64,))
     )
 
+
+def _claim_server_captain_ingress_once(parameters: dict[str, Any]) -> bool:
+    """Consume the authenticated ingress before issuing a runtime origin.
+
+    ContextVar snapshots carry the marker, but cannot claim it twice. This
+    check and the shared-set removal are performed under a single lock.
+    """
+    with _SERVER_CAPTAIN_INGRESS_CLAIM_LOCK:
+        if not _server_captain_dispatch_admitted(parameters):
+            return False
+        scope = _SERVER_CAPTAIN_INGRESS.get()
+        assert scope is not None
+        _SERVER_CAPTAIN_INGRESS_ACTIVE.remove(scope[0])
+        return True
 
 
 def _consume_accepted_runtime_ticket(
@@ -18208,7 +18232,7 @@ def _run_captain_run(
             if (
                 not _captain_blocked_reasons(gates)
                 and not errors
-                and _server_captain_dispatch_admitted(parameters)
+                and _claim_server_captain_ingress_once(parameters)
             ):
                 from grabowski_self_deploy import _accepted_captain_runtime_action
 
