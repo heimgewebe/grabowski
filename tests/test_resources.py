@@ -3353,6 +3353,19 @@ class ResourceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "start_after_key"):
             resources.list_resources(owner_id=owner, start_after_key="bad\x00key")
 
+    def test_owner_keyset_cursor_accepts_native_8192_byte_resource_key(self) -> None:
+        owner = "operator:long-cursor-boundary"
+        resources.acquire_resources(
+            owner, ["component:long-cursor-present"], purpose="cursor bound test",
+        )
+        maximum = "path:/" + "x" * (8192 - len("path:/"))
+        self.assertEqual(8192, len(maximum.encode("utf-8")))
+        self.assertEqual([], resources.list_resources(
+            owner_id=owner, start_after_key=maximum,
+        ))
+        with self.assertRaisesRegex(ValueError, "start_after_key"):
+            resources.list_resources(owner_id=owner, start_after_key=maximum + "x")
+
     def test_live_same_owner_reentry_is_identity_bound_and_never_shortens(self) -> None:
         key = "component:same-owner-reentry"
         with patch.object(resources, "_now", return_value=100):

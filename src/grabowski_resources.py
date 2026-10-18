@@ -8119,7 +8119,7 @@ def list_resources(
         not isinstance(start_after_key, str)
         or not start_after_key
         or "\x00" in start_after_key
-        or len(start_after_key.encode("utf-8")) > 4096
+        or len(start_after_key.encode("utf-8")) > 8192
     ):
         raise ValueError("start_after_key must be a bounded opaque resource key")
     parameters: list[Any] = []

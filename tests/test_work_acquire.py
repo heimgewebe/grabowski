@@ -600,6 +600,77 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(result["decision"], "HARD_BLOCK")
         ensure.assert_not_called()
 
+    def test_multibatch_owner_readback_pages_full_1000_and_hard_limit(self) -> None:
+        owner = "lane:" + "d" * 32
+        required = [f"component:required-{i:03d}" for i in range(78)]
+        receipt = self.acquired(owner, required)
+        acquisitions = [{"receipt": receipt}]
+        for total in (1000, 1001, 4096, 4097):
+            with self.subTest(total=total):
+                other_keys = [
+                    f"component:extra-{i:04d}" for i in range(total - len(required))
+                ]
+                live = sorted(
+                    self.acquired(owner, other_keys)["leases"] + receipt["leases"],
+                    key=lambda lease: lease["resource_key"],
+                )
+                observed_pages: list[tuple[int, str | None]] = []
+
+                def inventory(*, owner_id, limit, start_after_key=None, **_kwargs):
+                    self.assertEqual(owner_id, owner)
+                    observed_pages.append((limit, start_after_key))
+                    return [
+                        row for row in live
+                        if start_after_key is None or row["resource_key"] > start_after_key
+                    ][:limit]
+
+                if total > work_acquire.MAX_TERMINAL_OWNER_OBSERVED_LEASES:
+                    with self.assertRaisesRegex(
+                        work_acquire.LeaseAcquisitionOutcomeUnknown,
+                        "exceeds bounded view",
+                    ):
+                        work_acquire._verify_multibatch_live_lease_generations(
+                            owner_id=owner, required_keys=required,
+                            acquisitions=acquisitions, inventory_fn=inventory,
+                        )
+                else:
+                    work_acquire._verify_multibatch_live_lease_generations(
+                        owner_id=owner, required_keys=required,
+                        acquisitions=acquisitions, inventory_fn=inventory,
+                    )
+                self.assertEqual(1000, observed_pages[0][0])
+                self.assertEqual(1000, len(live[:1000]))
+                self.assertGreaterEqual(len(observed_pages), 2)
+                self.assertEqual(live[999]["resource_key"], observed_pages[1][1])
+
+    def test_multibatch_readback_pages_after_full_8192_byte_key(self) -> None:
+        owner = "lane:" + "e" * 32
+        required = [f"component:required-{i:03d}" for i in range(78)]
+        long_key = "path:/" + "x" * (8192 - len("path:/"))
+        prefix = [f"component:earlier-{i:04d}" for i in range(921)]
+        live = sorted(
+            self.acquired(owner, required + prefix + [long_key, "port:4321"])["leases"],
+            key=lambda lease: lease["resource_key"],
+        )
+        self.assertEqual(1001, len(live))
+        self.assertEqual(long_key, live[999]["resource_key"])
+        cursors = []
+
+        def inventory(*, limit, start_after_key=None, **_kwargs):
+            cursors.append(start_after_key)
+            return [
+                lease for lease in live
+                if start_after_key is None or lease["resource_key"] > start_after_key
+            ][:limit]
+
+        work_acquire._verify_multibatch_live_lease_generations(
+            owner_id=owner,
+            required_keys=required,
+            acquisitions=[{"receipt": self.acquired(owner, required)}],
+            inventory_fn=inventory,
+        )
+        self.assertEqual([None, long_key], cursors)
+
     def test_large_scope_atomic_batches(self) -> None:
         for total in (63, 64, 65, 78):
             with self.subTest(total=total):

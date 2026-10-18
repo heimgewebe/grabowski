@@ -1007,7 +1007,7 @@ def _terminal_resource_key_list(
             or not value
             or value != value.strip()
             or "\x00" in value
-            or len(value.encode("utf-8")) > 4096
+            or len(value.encode("utf-8")) > 8192
         ):
             raise TerminalLeaseConvergenceError(f"{label} contains an invalid resource key")
         normalized.append(value)
@@ -3361,20 +3361,41 @@ def _verify_multibatch_live_lease_generations(
             expected[key] = snapshot
     if sorted(expected) != required_keys:
         raise LeaseAcquisitionOutcomeUnknown("multi-batch lease receipts are incomplete")
-    rows = inventory_fn(
-        owner_id=owner_id, include_expired=False, limit=MAX_OWNER_LEASE_LIST_PAGE,
-    )
-    # A full page may be truncated; never infer a complete owner generation
-    # from a potentially incomplete bounded readback.
-    if not isinstance(rows, list) or len(rows) >= MAX_OWNER_LEASE_LIST_PAGE:
-        raise LeaseAcquisitionOutcomeUnknown("live owner lease inventory is incomplete")
     observed: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        snapshot = _lease_snapshot(row, owner_id=owner_id)
-        key = snapshot["resource_key"]
-        if key in observed:
-            raise LeaseAcquisitionOutcomeUnknown("duplicate live owner lease")
-        observed[key] = snapshot
+    start_after_key: str | None = None
+    while True:
+        remaining = MAX_TERMINAL_OWNER_OBSERVED_LEASES - len(observed)
+        # Probe one extra row at the hard owner bound: exactly 4096 valid
+        # generations are allowed, but a truncated 4097th must fail closed.
+        limit = min(MAX_OWNER_LEASE_LIST_PAGE, max(1, remaining))
+        kwargs: dict[str, Any] = {
+            "owner_id": owner_id, "include_expired": False, "limit": limit,
+        }
+        if start_after_key is not None:
+            kwargs["start_after_key"] = start_after_key
+        page = inventory_fn(**kwargs)
+        if not isinstance(page, list) or len(page) > limit:
+            raise LeaseAcquisitionOutcomeUnknown("live owner lease page is invalid")
+        if remaining == 0:
+            if page:
+                raise LeaseAcquisitionOutcomeUnknown(
+                    "live owner lease inventory exceeds bounded view"
+                )
+            break
+        page_snapshots = sorted(
+            (_lease_snapshot(row, owner_id=owner_id) for row in page),
+            key=lambda item: item["resource_key"],
+        )
+        for snapshot in page_snapshots:
+            key = snapshot["resource_key"]
+            if (start_after_key is not None and key <= start_after_key) or key in observed:
+                raise LeaseAcquisitionOutcomeUnknown(
+                    "live owner lease inventory contains duplicate or unordered keys"
+                )
+            observed[key] = snapshot
+            start_after_key = key
+        if len(page) < limit:
+            break
     now = int(time.time())
     for key, snapshot in expected.items():
         if (
