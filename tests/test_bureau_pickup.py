@@ -5639,9 +5639,12 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(canonical, effective_binding)
         self.assertIsNone(successor_proof_obligation)
         select_binding.assert_called_once_with(self.default_registry_binding)
-        authorize.assert_called_once_with(
-            "bureau_mutation", path=canonical["identity"]["registry_root"]
-        )
+        # Bureau mutation and nested resource inspection each retain their own gate.
+        bureau_call = mock.call("bureau_mutation", path=canonical["identity"]["registry_root"])
+        resource_call = mock.call("resource_lease")
+        self.assertEqual(1, authorize.call_args_list.count(bureau_call))
+        self.assertGreaterEqual(authorize.call_args_list.count(resource_call), 1)
+        self.assertEqual(len(authorize.call_args_list), authorize.call_args_list.count(bureau_call) + authorize.call_args_list.count(resource_call))
         heartbeat.assert_called_once()
         heartbeat_args = heartbeat.call_args.args
         self.assertEqual(canonical, heartbeat_args[3])

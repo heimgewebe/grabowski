@@ -108,6 +108,72 @@ class LifecycleProjectionTests(unittest.TestCase):
         self.assertTrue(revalidation["ready_for_effect"])
         return plan, revalidation
 
+    def test_readiness_projection_budget_rejects_switch_overflow_before_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            projection_root = root / "projection"
+            projection_root.mkdir()
+            for index in range(3):
+                (projection_root / f"switch-{index:064x}.json").write_text("{}")
+            with self.assertRaisesRegex(
+                projection.LifecycleProjectionIntegrityError, "budget"
+            ):
+                projection.load_task_archive_projection(
+                    projection_root=projection_root,
+                    archive_root=root / "archives",
+                    max_switches=2,
+                    max_archived_bindings=2,
+                    max_total_records_bytes=1024,
+                    max_total_switch_bytes=1024,
+                )
+
+    def test_readiness_projection_budget_rejects_archive_segment_before_large_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive_root = root / "archives"
+            projection_root = root / "projection"
+            records = [self.task("task-a"), self.task("task-b")]
+            archived = self.write_archive(archive_root, records)
+            plan, revalidation = self.switch_contract(
+                projection_root, ["task-a", "task-b"]
+            )
+            projection.apply_task_archive_projection_switch(
+                Path(archived["segment_dir"]),
+                projection_root=projection_root, plan=plan,
+                revalidation=revalidation, applied_at_unix=1501,
+            )
+            with self.assertRaises(projection.LifecycleProjectionIntegrityError):
+                projection.load_task_archive_projection(
+                    projection_root=projection_root,
+                    archive_root=archive_root,
+                    max_switches=2,
+                    max_archived_bindings=2,
+                    max_total_records_bytes=1,
+                    max_total_switch_bytes=16 * 1024,
+                )
+            with self.assertRaisesRegex(
+                projection.LifecycleProjectionIntegrityError, "budget"
+            ):
+                projection.load_task_archive_projection(
+                    projection_root=projection_root,
+                    archive_root=archive_root,
+                    max_switches=2,
+                    max_archived_bindings=1,
+                    max_total_records_bytes=1024 * 1024,
+                    max_total_switch_bytes=16 * 1024,
+                )
+            positive = projection.load_task_archive_projection(
+                projection_root=projection_root,
+                archive_root=archive_root,
+                max_switches=2,
+                max_archived_bindings=2,
+                max_total_records_bytes=1024 * 1024,
+                max_total_switch_bytes=16 * 1024,
+            )
+            self.assertEqual(
+                {"task-a", "task-b"}, set(positive["archived_task_bindings"])
+            )
+
     def test_apply_load_and_current_view_are_hash_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

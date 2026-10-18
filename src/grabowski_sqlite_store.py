@@ -67,6 +67,7 @@ def copy_regular_file(
     *,
     error_type: type[ChangedError],
     message: str = INVENTORY_CHANGED_MESSAGE,
+    max_bytes: int | None = None,
 ) -> FileIdentity:
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
@@ -84,7 +85,13 @@ def copy_regular_file(
         before = status_identity(before_status)
         with os.fdopen(os.dup(descriptor), "rb") as source_handle:
             with target.open("xb") as target_handle:
+                copied = 0
                 while chunk := source_handle.read(COPY_CHUNK_BYTES):
+                    # A source that grows while it is streamed never writes
+                    # past the caller's budget.
+                    copied += len(chunk)
+                    if max_bytes is not None and copied > max_bytes:
+                        raise _changed(error_type, message)
                     target_handle.write(chunk)
         os.chmod(target, 0o600)
         target_status = os.lstat(target)
@@ -137,9 +144,19 @@ def inventory_readonly_sqlite(
     temporary_prefix: str,
     error_type: type[ChangedError],
     message: str = INVENTORY_CHANGED_MESSAGE,
+    allow_wal_copy: bool = True,
+    max_copy_bytes: int | None = None,
 ) -> Iterator[sqlite3.Connection]:
     wal_path = Path(str(path) + "-wal")
     wal_present = wal_path.exists() or wal_path.is_symlink()
+    shm_path = Path(str(path) + "-shm")
+    if not allow_wal_copy and (
+        wal_present or shm_path.exists() or shm_path.is_symlink()
+    ):
+        raise _changed(
+            error_type,
+            "Strict read-only snapshot unavailable while SQLite WAL sidecars exist",
+        )
     if not wal_present:
         before_identity = file_identity(path)
         connection = sqlite3.connect(
@@ -161,6 +178,8 @@ def inventory_readonly_sqlite(
             )
             if wal_path.exists() or wal_path.is_symlink():
                 raise _changed(error_type, message)
+            if not allow_wal_copy and (shm_path.exists() or shm_path.is_symlink()):
+                raise _changed(error_type, message)
         return
 
     with tempfile.TemporaryDirectory(prefix=temporary_prefix) as temporary_directory:
@@ -171,12 +190,18 @@ def inventory_readonly_sqlite(
             snapshot,
             error_type=error_type,
             message=message,
+            max_bytes=max_copy_bytes,
         )
         wal_identity = copy_regular_file(
             wal_path,
             snapshot_wal,
             error_type=error_type,
             message=message,
+            max_bytes=(
+                None
+                if max_copy_bytes is None
+                else max_copy_bytes - database_identity[2]
+            ),
         )
         connection = sqlite3.connect(snapshot, timeout=1)
         connection.row_factory = sqlite3.Row

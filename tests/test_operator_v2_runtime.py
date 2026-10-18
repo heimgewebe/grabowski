@@ -1443,7 +1443,10 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             patch.object(
                 grabowski_mcp,
                 "_captain_audit_intent",
-                return_value={"audit_record_sha256": "a" * 64},
+                return_value={
+                    "audit_chain_valid": True,
+                    "audit_record_sha256": "a" * 64,
+                },
             ),
             patch.object(
                 grabowski_mcp,
@@ -2039,7 +2042,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
         self.assertEqual(missing["grabowski_audit_analyze"], ["audit_read"])
         self.assertEqual(
             missing["grabowski_checkout_binding_terminal_preview"],
-            ["git_cli", "github_cli"],
+            ["git_cli", "github_cli", "resource_lease"],
         )
         self.assertEqual(
             missing["grabowski_checkout_binding_terminal_apply"],
@@ -4237,11 +4240,6 @@ class CaptainAuditTrailTests(unittest.TestCase):
                 },
             ),
             patch.object(
-                grabowski_mcp.grabowski_merge_guard,
-                "issue_server_runtime_actor_identity",
-                return_value={"identity": "server"},
-            ),
-            patch.object(
                 grabowski_mcp,
                 "_captain_audit_intent",
                 return_value={
@@ -4284,7 +4282,6 @@ class CaptainAuditTrailTests(unittest.TestCase):
             patch.object(grabowski_mcp, "_require_capability"),
             patch.object(grabowski_mcp, "_require_mutations_enabled"),
             patch.object(grabowski_mcp, "_session_grip_policy_decision", return_value={"allowed": True, "session_profile": {"profile": "test"}}),
-            patch.object(grabowski_mcp.grabowski_merge_guard, "issue_server_runtime_actor_identity", return_value={"identity": "server"}),
             patch.object(grabowski_mcp, "_captain_audit_intent", return_value={"audit_chain_valid": True, "audit_record_sha256": "a" * 64}),
             patch.object(grabowski_mcp, "_captain_audit_completion", return_value={"audit_chain_valid": True, "audit_record_sha256": "b" * 64}) as completion,
             patch.object(grabowski_mcp.grabowski_grips, "grip_run", return_value=grip_result),

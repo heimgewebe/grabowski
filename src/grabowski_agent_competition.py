@@ -1111,6 +1111,7 @@ def _start_reconciliation(identifier: str, intent: dict[str, Any]) -> dict[str, 
                 limit=START_RECONCILE_PAGE_LIMIT,
                 view="standard",
                 cursor=cursor,
+                read_only=True,
             )
         except Exception:
             return {"state": "task_registry_unavailable", "matches": [], "task": None}
@@ -2665,7 +2666,7 @@ def grabowski_agent_competition_status(competition_id: str) -> dict[str, Any]:
         if task_id is None and isinstance(reconciliation.get("task"), dict):
             task_id = reconciliation["task"].get("task_id")
         if isinstance(task_id, str):
-            task_status = tasks.grabowski_task_status(task_id)
+            task_status = tasks.grabowski_task_peek(task_id)
             bounded_task = {
                 key: task_status.get(key)
                 for key in ("task_id", "unit", "attempt", "state", "updated_at_unix", "resume_policy")
@@ -2708,7 +2709,7 @@ def grabowski_agent_competition_status(competition_id: str) -> dict[str, Any]:
             ],
         }
     manifest = _validated_manifest(competition_id)
-    task_status = tasks.grabowski_task_status(manifest["task_id"])
+    task_status = tasks.grabowski_task_peek(manifest["task_id"])
     receipt = _receipt(competition_id, manifest)
     task_state = task_status.get("state")
     if receipt is not None:
@@ -2720,7 +2721,11 @@ def grabowski_agent_competition_status(competition_id: str) -> dict[str, Any]:
     elif task_state == "completed":
         lifecycle_state = "candidate_output_missing_or_invalid"
         phase = "candidate_validation"
-    elif task_state in {"failed", "cancelled", "timed_out", "signalled", "outcome_unknown"}:
+    elif task_state in {"outcome_unknown", "observation_error"}:
+        # Uncertain execution or unavailable live observation is not terminal.
+        lifecycle_state = "provider_outcome_unknown"
+        phase = "task_observation"
+    elif task_state in {"failed", "cancelled", "timed_out", "signalled"}:
         lifecycle_state = f"provider_{task_state}"
         phase = "provider_terminal"
     else:

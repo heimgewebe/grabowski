@@ -2117,6 +2117,12 @@ class GripFoundationTests(unittest.TestCase):
         for item in listed:
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
+        for preview_grip in (
+            "checkout-binding-terminal-preview",
+            "checkout-binding-identity-rebind-preview",
+            "checkout-owner-handoff-preview",
+        ):
+            self.assertEqual("mutating", specs[preview_grip]["effect"])
         self.assertEqual("read_only", specs["repo-orient"]["effect"])
         self.assertEqual("read_only", specs["browser-semantic-observe"]["effect"])
         self.assertEqual("mutating", specs["browser-semantic-act"]["effect"])
@@ -2154,6 +2160,9 @@ class GripFoundationTests(unittest.TestCase):
             "checkout-binding-terminal-apply",
             "checkout-binding-identity-rebind-apply",
             "checkout-owner-handoff-apply",
+            "checkout-binding-terminal-preview",
+            "checkout-binding-identity-rebind-preview",
+            "checkout-owner-handoff-preview",
         ):
             self.assertEqual("worktree_admin", specs[name]["operation_effect_class"])
             self.assertEqual("worktree-admin", specs[name]["operation_class"])
@@ -2368,7 +2377,7 @@ class GripFoundationTests(unittest.TestCase):
             navigation_target="https://example.invalid/",
         )
 
-    def test_checkout_binding_terminal_preview_grip_is_read_only_and_delegates(self) -> None:
+    def test_checkout_binding_terminal_preview_grip_requires_mutation_and_delegates(self) -> None:
         checkout_key = "a" * 64
         preview = {
             "schema_version": 1,
@@ -2386,15 +2395,22 @@ class GripFoundationTests(unittest.TestCase):
             "grabowski_checkouts.grabowski_checkout_binding_terminal_preview",
             return_value=preview,
         ) as terminal_preview:
+            blocked = grips.grip_run(
+                "checkout-binding-terminal-preview",
+                {"checkout_key": checkout_key},
+            )
+            self.assertEqual("blocked", blocked["status"])
+            terminal_preview.assert_not_called()
             result = grips.grip_run(
                 "checkout-binding-terminal-preview",
                 {"checkout_key": checkout_key},
+                allow_mutation=True,
             )
         self.assertEqual("passed", result["status"])
         self.assertEqual("passed", result["output"]["receipt_status"])
         terminal_preview.assert_called_once_with(checkout_key)
         checks = {item["id"]: item for item in result["receipt"]["checks"]}
-        self.assertEqual("pass", checks["preview-read-only"]["status"])
+        self.assertEqual("pass", checks["preview-effect-gated"]["status"])
         self.assertEqual("pass", checks["preview-digest-bound"]["status"])
 
     def test_checkout_binding_terminal_preview_blocks_missing_repository(self) -> None:
@@ -2406,6 +2422,7 @@ class GripFoundationTests(unittest.TestCase):
             result = grips.grip_run(
                 "checkout-binding-terminal-preview",
                 {"checkout_key": checkout_key},
+                allow_mutation=True,
             )
         self.assertEqual("blocked", result["status"])
         self.assertIn("repository missing", result["output"]["error"])
@@ -3035,9 +3052,16 @@ class GripFoundationTests(unittest.TestCase):
         ) as rebind_preview, patch(
             "grabowski_checkouts.grabowski_checkout_binding_terminal_preview"
         ) as terminal_preview:
+            blocked = grips.grip_run(
+                "checkout-binding-identity-rebind-preview",
+                {"checkout_key": checkout_key},
+            )
+            self.assertEqual("blocked", blocked["status"])
+            rebind_preview.assert_not_called()
             result = grips.grip_run(
                 "checkout-binding-identity-rebind-preview",
                 {"checkout_key": checkout_key},
+                allow_mutation=True,
             )
         self.assertEqual("passed", result["status"])
         self.assertEqual("passed", result["output"]["receipt_status"])
@@ -3088,6 +3112,7 @@ class GripFoundationTests(unittest.TestCase):
             result = grips.grip_run(
                 "checkout-binding-identity-rebind-preview",
                 {"checkout_key": checkout_key},
+                allow_mutation=True,
             )
         self.assertEqual("passed", result["status"])
         checks = {item["id"]: item for item in result["receipt"]["checks"]}
@@ -3299,7 +3324,12 @@ class GripFoundationTests(unittest.TestCase):
             "expected_branch": "topic",
         }
         with patch("grabowski_checkouts.checkout_owner_handoff_preview", return_value=preview) as handoff:
-            result = grips.grip_run("checkout-owner-handoff-preview", parameters)
+            denied = grips.grip_run("checkout-owner-handoff-preview", parameters)
+            self.assertEqual("blocked", denied["status"])
+            handoff.assert_not_called()
+            result = grips.grip_run(
+                "checkout-owner-handoff-preview", parameters, allow_mutation=True
+            )
         self.assertEqual("passed", result["status"])
         handoff.assert_called_once()
         self.assertEqual(snapshot, result["output"]["snapshot_sha256"])
@@ -12498,7 +12528,26 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             return_value=captain_independent_review_reconciliation(),
         )
         self._decision_review_patch.start()
-
+        # These historical tests cover downstream scheduler receipt behavior,
+        # not independent high-critical release authorization. A positive
+        # source classification is explicit only for these bounded fixtures.
+        if self._testMethodName in {
+            "test_captain_schedule_failure_does_not_trust_forged_local_mutation_evidence",
+            "test_captain_reused_schedule_preserves_known_local_reconciliation",
+            "test_captain_run_binds_scheduler_materialized_auto_source_identity",
+            "test_captain_run_marks_local_mutation_unknown_when_scheduler_receipt_is_invalid",
+            "test_captain_run_preserves_unknown_mutation_outcome_when_scheduler_raises",
+            "test_captain_run_schedules_registered_grabowski_self_deploy_without_claiming_completion",
+            "test_captain_runtime_deploy_pre_effect_refusal_is_definitely_not_scheduled",
+            "test_captain_runtime_deploy_pre_effect_refusal_preserves_known_local_reconciliation",
+            "test_captain_schedule_failure_preserves_known_local_reconciliation_and_uncertainty",
+        }:
+            self._noncritical_source_fixture = patch(
+                "grabowski_self_deploy._require_release_source_admission",
+                return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "independent_review_required": False},
+            )
+            self._noncritical_source_fixture.start()
+            self.addCleanup(self._noncritical_source_fixture.stop)
 
     def tearDown(self) -> None:
         self._decision_review_patch.stop()
