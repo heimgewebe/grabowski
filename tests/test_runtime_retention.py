@@ -950,6 +950,61 @@ class RuntimeRetentionTests(unittest.TestCase):
             ))
             self.assertEqual(stderr.read_bytes(), original)
 
+    def test_archive_manifest_symlink_swap_cannot_read_foreign_files(self) -> None:
+        # Reproduce an exact timing race: the source directory is exchanged
+        # after initial verification, just before the directory enumeration.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "job"
+            saved = root / "saved-original"
+            outside = root / "outside"
+            source.mkdir(mode=0o700)
+            outside.mkdir(mode=0o700)
+            original = b"job-owned archive evidence"
+            foreign = b"secret outside the archive job"
+            (source / "safe.log").write_bytes(original)
+            (outside / "safe.log").write_bytes(foreign)
+            (source / "safe.log").chmod(0o600)
+            (outside / "safe.log").chmod(0o600)
+            actual_scandir = os.scandir
+            swaps: list[bool] = []
+
+            def swap_just_before_scan(target):
+                if not swaps and (
+                    isinstance(target, int) or os.fspath(target) == str(source)
+                ):
+                    source.rename(saved)
+                    source.symlink_to(outside, target_is_directory=True)
+                    swaps.append(True)
+                return actual_scandir(target)
+
+            with patch.object(RETENTION.os, "scandir", side_effect=swap_just_before_scan):
+                with self.assertRaisesRegex(
+                    RuntimeError, "archive source directory changed during inspection"
+                ):
+                    RETENTION._archive_file_manifest(source)
+            self.assertEqual(swaps, [True])
+            self.assertEqual((outside / "safe.log").read_bytes(), foreign)
+            self.assertEqual((saved / "safe.log").read_bytes(), original)
+
+    def test_archive_rejects_nested_directories_without_following(self) -> None:
+        # A job archive needs files at its root only; do not recursively
+        # traverse job-controlled directory trees or symlink-swap windows.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "job"
+            source.mkdir(mode=0o700)
+            child = source / "subdir"
+            child.mkdir(mode=0o700)
+            item = child / "private.log"
+            item.write_bytes(b"retain, never follow")
+            item.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "nested directory"):
+                RETENTION._archive_file_shape_preflight(source)
+            with self.assertRaisesRegex(RuntimeError, "nested directory"):
+                RETENTION._archive_file_manifest(source)
+            self.assertEqual(item.read_bytes(), b"retain, never follow")
+
     def test_unsafe_terminal_archive_source_preserves_evidence_and_allows_safe_batch(self) -> None:
         # An unsafe old terminal job must never consume the archive/reset
         # budget or prevent an unrelated safe job from progressing.
@@ -960,7 +1015,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             ("hardlink", "private owner-controlled regular file"),
             ("world-readable", "private owner-controlled regular file"),
             ("file-count", "file-count bound"),
-            ("directory-count", "entry-count bound"),
+            ("directory-count", "nested directory"),
         )
         for shape, reason in cases:
             with self.subTest(unsafe_source=shape):
@@ -1219,6 +1274,22 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(outside.read_bytes(), b"outside must not change\n")
             reset.assert_not_called()
             fake_base._append_audit.assert_not_called()
+
+    def test_atomic_json_replace_never_discards_oversized_existing_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            previous = root / "other-maintenance-receipt.json"
+            data = b"x" * (RETENTION.MAX_JSON_BYTES + 1)
+            previous.write_bytes(data)
+            previous.chmod(0o600)
+            # The tempdir itself is private; bypass only _private_directory's
+            # unrelated recursive /tmp ancestor policy for this size-gate test.
+            with patch.object(RETENTION, "_private_directory", return_value=root):
+                with self.assertRaisesRegex(RuntimeError, "not owner-controlled"):
+                    RETENTION._write_json_atomic(
+                        previous, {"replacement": True}, replace_existing=True
+                    )
+            self.assertEqual(previous.read_bytes(), data)
 
     def test_oversized_stale_archive_manifest_cannot_be_replaced_at_effect_time(self) -> None:
         # The last atomic writer boundary must reject unsafe original evidence.

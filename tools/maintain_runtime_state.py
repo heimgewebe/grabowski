@@ -51,7 +51,6 @@ JOB_RUNTIME_GRACE_SECONDS = 300
 SYSTEMD_SHOW_CHUNK_SIZE = 100
 MAX_ARCHIVE_FILES = 32
 MAX_ARCHIVE_ENTRIES = 256
-MAX_ARCHIVE_DEPTH = 16
 MAX_ARCHIVE_FILE_BYTES = 128 * 1024 * 1024
 MAX_JSON_BYTES = 128 * 1024
 MAX_WORKER_LEASE_KEYS = 32
@@ -191,13 +190,16 @@ def _private_file_digest(path: Path, *, max_bytes: int) -> tuple[int, str]:
         os.close(descriptor)
     return metadata.st_size, digest.hexdigest()
 
-def _archive_internal_manifest_shape_preflight(path: Path) -> None:
+def _archive_internal_manifest_shape_preflight(
+    path: Path, *, metadata: os.stat_result | None = None
+) -> None:
     """Count exemption is not an exemption from evidence safety checks.
 
     Retryable archive-manifest.json must be a small, private regular file.
     Check its shape without opening a FIFO or following a symlink.
     """
-    metadata = path.lstat()
+    if metadata is None:
+        metadata = path.lstat()
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
@@ -211,66 +213,123 @@ def _archive_internal_manifest_shape_preflight(path: Path) -> None:
         )
 
 
-def _archive_bounded_entries(directory: Path) -> list[Path]:
-    """Bound archive traversal before sorting, hashing or changing unit state.
+def _archive_open_private_root(directory: Path) -> int:
+    """Pin a private job-directory inode; never follow its final symlink."""
+    try:
+        fd = os.open(
+            directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+    except OSError as exc:
+        raise RuntimeError(f"archive source directory is unavailable: {directory}") from exc
+    metadata = os.fstat(fd)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        os.close(fd)
+        raise RuntimeError(f"archive source directory is not private: {directory}")
+    return fd
 
-    Directory and reserved-manifest entries count too. os.scandir streams
-    names without materializing an attacker-sized directory, and no symbolic
-    link may serve as a traversal root.
+
+def _archive_require_unchanged_root(directory: Path, fd: int) -> None:
+    """Reject an archive root renamed or replaced during a pinned read."""
+    expected = os.fstat(fd)
+    try:
+        actual = directory.lstat()
+    except OSError as exc:
+        raise RuntimeError(f"archive source directory changed during inspection: {directory}") from exc
+    if (
+        not stat.S_ISDIR(actual.st_mode)
+        or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino)
+    ):
+        raise RuntimeError(f"archive source directory changed during inspection: {directory}")
+
+
+def _archive_bounded_entries(directory: Path, directory_fd: int) -> list[Path]:
+    """Enumerate a pinned flat job directory, never recursive path traversal.
+
+    Live and archived job inventories have only root-level files. Reject any
+    unexpected nested directory rather than introducing a symlinkable parent
+    whose contents could be opened outside the verified archive inode.
     """
-    pending: list[tuple[Path, int]] = [(directory, 0)]
-    paths: list[Path] = []
-    while pending:
-        parent, depth = pending.pop()
-        _private_directory(parent)
-        with os.scandir(parent) as children:
-            for child in children:
-                path = Path(child.path)
-                paths.append(path)
-                if len(paths) > MAX_ARCHIVE_ENTRIES:
-                    raise RuntimeError("archive source exceeds the entry-count bound")
-                if depth + 1 > MAX_ARCHIVE_DEPTH:
-                    raise RuntimeError("archive source exceeds the depth bound")
-                if child.is_symlink():
-                    raise RuntimeError(f"archive source contains a symlink: {path}")
-                if child.is_dir(follow_symlinks=False):
-                    _private_directory(path)
-                    pending.append((path, depth + 1))
-    return sorted(paths)
+    entries: list[Path] = []
+    with os.scandir(directory_fd) as scan:
+        for child in scan:
+            path = directory / child.name
+            entries.append(path)
+            if len(entries) > MAX_ARCHIVE_ENTRIES:
+                raise RuntimeError("archive source exceeds the entry-count bound")
+            metadata = child.stat(follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode):
+                raise RuntimeError(f"archive source contains a symlink: {path}")
+            if stat.S_ISDIR(metadata.st_mode):
+                raise RuntimeError(f"archive source contains nested directory: {path}")
+    return sorted(entries)
 
 
-def _archive_file_shape_preflight(directory: Path) -> None:
-    """Classify unsafe terminal-job archives without hashing their whole contents.
-
-    This is advisory planning only. The existing archive apply path must still
-    re-open, hash, and compare every candidate under its deployment lock.
-    """
-    directory = _private_directory(directory)
-    files = 0
-    for path in _archive_bounded_entries(directory):
-        if path == directory / "archive-manifest.json":
-            _archive_internal_manifest_shape_preflight(path)
-            continue
-        if path.is_symlink():
-            raise RuntimeError(f"archive source contains a symlink: {path}")
-        if path.is_dir():
-            _private_directory(path)
-            continue
-        files += 1
-        if files > MAX_ARCHIVE_FILES:
-            raise RuntimeError("archive source exceeds the file-count bound")
-        metadata = path.lstat()
+def _archive_private_file_digest(
+    directory_fd: int, path: Path, *, max_bytes: int
+) -> tuple[int, str]:
+    """Hash a root-level file by its pinned parent fd, not a racy path."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        fd = os.open(path.name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise RuntimeError(f"archive source file is unavailable: {path}") from exc
+    try:
+        metadata = os.fstat(fd)
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_nlink != 1
             or metadata.st_uid != os.getuid()
             or stat.S_IMODE(metadata.st_mode) & 0o077
-            or metadata.st_size > MAX_ARCHIVE_FILE_BYTES
+            or metadata.st_size > max_bytes
         ):
             raise RuntimeError(
                 f"file must be one bounded private owner-controlled regular file: {path}"
             )
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(fd, min(1024 * 1024, max_bytes + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise RuntimeError(f"archive file exceeds retention bound: {path}")
+            digest.update(chunk)
+        return metadata.st_size, digest.hexdigest()
+    finally:
+        os.close(fd)
 
+
+def _archive_file_shape_preflight(directory: Path) -> None:
+    """Classify unsafe archive shapes by pinned fd without content hashing."""
+    fd = _archive_open_private_root(directory)
+    try:
+        files = 0
+        for path in _archive_bounded_entries(directory, fd):
+            metadata = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+            if path == directory / "archive-manifest.json":
+                _archive_internal_manifest_shape_preflight(path, metadata=metadata)
+                continue
+            files += 1
+            if files > MAX_ARCHIVE_FILES:
+                raise RuntimeError("archive source exceeds the file-count bound")
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+                or metadata.st_size > MAX_ARCHIVE_FILE_BYTES
+            ):
+                raise RuntimeError(
+                    f"file must be one bounded private owner-controlled regular file: {path}"
+                )
+        _archive_require_unchanged_root(directory, fd)
+    finally:
+        os.close(fd)
 
 
 def _failed_units() -> list[str]:
@@ -1223,28 +1282,30 @@ def build_plan(
 
 
 def _archive_file_manifest(directory: Path) -> list[dict[str, Any]]:
-    directory = _private_directory(directory)
-    files: list[dict[str, Any]] = []
-    for path in _archive_bounded_entries(directory):
-        if path == directory / "archive-manifest.json":
-            _archive_internal_manifest_shape_preflight(path)
-            continue
-        if path.is_symlink():
-            raise RuntimeError(f"archive source contains a symlink: {path}")
-        if path.is_dir():
-            _private_directory(path)
-            continue
-        if len(files) >= MAX_ARCHIVE_FILES:
-            raise RuntimeError("archive source exceeds the file-count bound")
-        size, digest = _private_file_digest(path, max_bytes=MAX_ARCHIVE_FILE_BYTES)
-        files.append(
-            {
-                "path": str(path.relative_to(directory)),
-                "bytes": size,
-                "sha256": digest,
-            }
-        )
-    return files
+    fd = _archive_open_private_root(directory)
+    try:
+        files: list[dict[str, Any]] = []
+        for path in _archive_bounded_entries(directory, fd):
+            metadata = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+            if path == directory / "archive-manifest.json":
+                _archive_internal_manifest_shape_preflight(path, metadata=metadata)
+                continue
+            if stat.S_ISLNK(metadata.st_mode):
+                raise RuntimeError(f"archive source contains a symlink: {path}")
+            if stat.S_ISDIR(metadata.st_mode):
+                raise RuntimeError(f"archive source contains nested directory: {path}")
+            if len(files) >= MAX_ARCHIVE_FILES:
+                raise RuntimeError("archive source exceeds the file-count bound")
+            size, digest = _archive_private_file_digest(
+                fd, path, max_bytes=MAX_ARCHIVE_FILE_BYTES
+            )
+            files.append(
+                {"path": path.name, "bytes": size, "sha256": digest}
+            )
+        _archive_require_unchanged_root(directory, fd)
+        return files
+    finally:
+        os.close(fd)
 
 
 def _write_json_atomic(
@@ -1264,11 +1325,7 @@ def _write_json_atomic(
             or metadata.st_nlink != 1
             or metadata.st_uid != os.getuid()
             or stat.S_IMODE(metadata.st_mode) & 0o077
-            or (
-                replace_existing
-                and path.name == "archive-manifest.json"
-                and metadata.st_size > MAX_JSON_BYTES
-            )
+            or (replace_existing and metadata.st_size > MAX_JSON_BYTES)
         ):
             raise RuntimeError(f"existing evidence is not owner-controlled: {path}")
         if not replace_existing:
