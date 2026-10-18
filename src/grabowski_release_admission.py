@@ -45,15 +45,16 @@ def _github_token() -> str:
         return operator._github_pr_view_auth_token(
             str(operator.TRUSTED_GITHUB_CLI_PATH), dict(os.environ), "github.com"
         )
-    except (ImportError, AttributeError, OSError, RuntimeError, TypeError, ValueError):
-        raise ReleaseAdmissionDenied(
-            "authenticated GitHub credential unavailable"
-        ) from None
+    except Exception:
+        # A credential helper may raise an exception carrying a token or its
+        # subprocess output. Drop that exception before creating a public one.
+        pass
+    raise ReleaseAdmissionDenied("authenticated GitHub credential unavailable")
 
 
 def _github_json(path: str, *, token: str) -> tuple[dict[str, Any], str]:
     """Bounded authenticated HTTPS read; responses remain untrusted until checked."""
-    if not isinstance(token, str) or not token or any(ord(char) < 33 or ord(char) == 127 for char in token):
+    if not isinstance(token, str) or not token or any(not 33 <= ord(char) <= 126 for char in token):
         raise ReleaseAdmissionDenied("authenticated GitHub credential invalid")
     conn = http.client.HTTPSConnection(GITHUB_HOST, timeout=15)
     try:

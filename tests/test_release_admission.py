@@ -210,6 +210,48 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         self.assertNotIn("secret-fixture", str(raised.exception))
         self.assertIn("authenticated GitHub credential", str(raised.exception))
 
+    def test_unexpected_credential_lookup_errors_hide_original_exception(self):
+        import subprocess
+
+        fake = types.ModuleType("grabowski_operator")
+        fake.TRUSTED_GITHUB_CLI_PATH = Path("/usr/bin/gh")
+        failures = (
+            subprocess.CalledProcessError(
+                2, ["gh", "auth", "token"], output=b"secret-credential-canary"
+            ),
+            subprocess.TimeoutExpired(
+                ["gh", "auth", "token"], 1, output=b"secret-credential-canary"
+            ),
+            UnicodeError("secret-credential-canary"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                fake._github_pr_view_auth_token = Mock(side_effect=failure)
+                with patch.dict(sys.modules, {"grabowski_operator": fake}):
+                    with self.assertRaises(admission.ReleaseAdmissionDenied) as raised:
+                        admission._github_token()
+                self.assertEqual(
+                    "authenticated GitHub credential unavailable",
+                    str(raised.exception),
+                )
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertIsNone(raised.exception.__context__)
+
+    def test_non_ascii_credential_is_denied_before_any_network_access(self):
+        for token in ("secret-\u2603", "secret-\u00e9", "secret-\u00a0"):
+            with self.subTest(token=ascii(token)):
+                with patch.object(admission.http.client, "HTTPSConnection") as network:
+                    with self.assertRaises(admission.ReleaseAdmissionDenied) as raised:
+                        admission._github_json(
+                            f"/repos/{admission.REPOSITORY}/actions/workflows/validate.yml",
+                            token=token,
+                        )
+                self.assertEqual(
+                    "authenticated GitHub credential invalid",
+                    str(raised.exception),
+                )
+                network.assert_not_called()
+
     def test_newer_green_foreign_workflow_cannot_override_failed_canonical(self):
         paths, pages = self.fixture()
         pages[paths["run"]]["conclusion"] = "failure"
