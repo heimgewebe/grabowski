@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, ExitStack
 import base64
 import hashlib
 import inspect
@@ -6976,6 +6976,290 @@ class TaskTests(unittest.TestCase):
         ):
             with tasks._task_readonly_snapshot() as reader:
                 return tasks._task_reconcile_ready_evidence_snapshot(reader)
+
+    def test_retained_audit_fabricated_digest_with_recomputed_checksum_is_rejected(self) -> None:
+        self._retained_archive_witness()
+        with tasks._database_connection() as writer:
+            proof = json.loads(writer.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+            ).fetchone()[0])
+            proof["audit_record_sha256"] = "f" * 64
+            proof["evidence_sha256"] = tasks._sha256_json({
+                key: value for key, value in proof.items() if key != "evidence_sha256"
+            })
+            writer.execute("UPDATE metadata SET value=? WHERE key=?", (
+                tasks._canonical_json(proof), tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,
+            ))
+        self._assert_retained_audit_rejected_before_inventory()
+
+    def _assert_retained_audit_rejected_before_inventory(self):
+        with patch.object(tasks, "_task_reconcile_ready_user_unit_inventory",
+                          side_effect=AssertionError("reject audit before inventory")) as inventory:
+            status = self._retained_history_snapshot()
+        self.assertEqual("retained_audit_witness_unavailable", status["status"])
+        inventory.assert_not_called()
+
+    def _retained_audit_store_proof(self, proof):
+        proof = {key: value for key, value in proof.items() if key != "evidence_sha256"}
+        proof["evidence_sha256"] = tasks._sha256_json(proof)
+        with tasks._database_connection() as writer:
+            writer.execute("UPDATE metadata SET value=? WHERE key=?", (
+                tasks._canonical_json(proof), tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,
+            ))
+
+    def test_retained_audit_rejects_unrelated_valid_event(self) -> None:
+        _task_id, proof = self._retained_archive_witness()
+        proof["audit_record_sha256"] = tasks.base._append_audit_with_digest({
+            "operation": "unrelated-event", "timestamp_unix": proof["reconciled_at_unix"],
+        })
+        self.assertTrue(tasks.base._verify_audit_bytes(
+            self.audit_log, self.audit_log.read_bytes(), exists=True)["valid"])
+        self._retained_audit_store_proof(proof)
+        self._assert_retained_audit_rejected_before_inventory()
+
+    def test_retained_audit_binds_exact_v2_publisher_fields(self) -> None:
+        _task_id, proof = self._retained_archive_witness()
+        original = self.audit_log.read_bytes()
+        changes = {
+            "operation": "unrelated-event", "witness_sha256": "0" * 64,
+            "task_revision": "0" * 64, "resource_revision": "0" * 64,
+            "archive_projection_sha256": "0" * 64, "scope": "unrelated-scope",
+            "timestamp_unix": proof["reconciled_at_unix"] + 1, "audit_schema_version": 1,
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                records = [json.loads(line) for line in original.splitlines()]
+                previous = None
+                candidate = dict(proof)
+                for record in records:
+                    matching = record["record_sha256"] == proof["audit_record_sha256"]
+                    if matching:
+                        record[field] = value
+                    record["previous_record_sha256"] = previous
+                    record["record_sha256"] = tasks.base._audit_record_hash(record)
+                    previous = record["record_sha256"]
+                    if matching:
+                        candidate["audit_record_sha256"] = previous
+                data = b"".join(tasks.base._canonical_json_line(record) for record in records)
+                self.assertTrue(tasks.base._verify_audit_bytes(self.audit_log, data, exists=True)["valid"])
+                self.audit_log.write_bytes(data)
+                self._retained_audit_store_proof(candidate)
+                self._assert_retained_audit_rejected_before_inventory()
+
+    def test_retained_audit_missing_deleted_modified_incomplete_and_corrupt(self) -> None:
+        _task_id, proof = self._retained_archive_witness()
+        original = self.audit_log.read_bytes()
+        deleted = b"".join(line + b"\n" for line in original.splitlines()
+                           if json.loads(line)["record_sha256"] != proof["audit_record_sha256"])
+        # A valid new active head cannot prove an event that rotated out, even
+        # if its old bytes are still present elsewhere. No archive discovery.
+        self.audit_log.with_name("rotated-audit").write_bytes(original)
+        new_head = {"audit_schema_version": 2, "sequence": 1,
+                    "previous_record_sha256": None, "operation": "unrelated-event"}
+        new_head["record_sha256"] = tasks.base._audit_record_hash(new_head)
+        new_head_bytes = tasks.base._canonical_json_line(new_head)
+        self.assertTrue(tasks.base._verify_audit_bytes(self.audit_log, new_head_bytes, exists=True)["valid"])
+        for data in (None, deleted, new_head_bytes, original[:-1], original + b"{", b"\xff\n",
+                     original + b"\n", original.replace(b"witness-prepared", b"witness-tampered")):
+            with self.subTest(data=data and data[-30:]):
+                if data is None:
+                    self.audit_log.unlink()
+                else:
+                    self.audit_log.write_bytes(data)
+                    self.audit_log.chmod(0o600)
+                self._assert_retained_audit_rejected_before_inventory()
+
+    def test_retained_audit_symlink_hardlink_fifo_and_unsafe_modes(self) -> None:
+        self._retained_archive_witness()
+        original = self.audit_log.read_bytes()
+        target = self.audit_log.with_name("other-audit")
+        target.write_bytes(original)
+        target.chmod(0o600)
+        for kind in ("symlink", "hardlink", "fifo", "mode", "directory-mode", "directory-symlink"):
+            with self.subTest(kind=kind):
+                self.audit_log.unlink()
+                if kind == "symlink":
+                    self.audit_log.symlink_to(target)
+                elif kind == "hardlink":
+                    os.link(target, self.audit_log)
+                elif kind == "fifo":
+                    os.mkfifo(self.audit_log, 0o600)
+                else:
+                    self.audit_log.write_bytes(original)
+                    self.audit_log.chmod(0o644 if kind == "mode" else 0o600)
+                if kind == "directory-mode":
+                    self.audit_log.parent.chmod(0o750)
+                alias = self.root / "audit-parent-link"
+                if kind == "directory-symlink":
+                    alias.symlink_to(self.audit_log.parent, target_is_directory=True)
+                try:
+                    with (patch.object(tasks.base, "AUDIT_LOG", alias / self.audit_log.name if
+                                       kind == "directory-symlink" else self.audit_log),
+                          patch.object(tasks.os, "open", wraps=os.open) as opened):
+                        self._assert_retained_audit_rejected_before_inventory()
+                    self.assertFalse(any(str(call.args[0]) == self.audit_log.name
+                                         for call in opened.call_args_list))
+                finally:
+                    self.audit_log.parent.chmod(0o700)
+                    if alias.is_symlink():
+                        alias.unlink()
+
+    def test_retained_audit_owner_and_group_mismatch(self) -> None:
+        self._retained_archive_witness()
+        original_fstat = os.fstat
+        for inode in (self.audit_log.stat().st_ino, self.audit_log.parent.stat().st_ino):
+            for field in ("st_uid", "st_gid"):
+                with self.subTest(inode=inode, field=field):
+                    def observed(fd):
+                        value = original_fstat(fd)
+                        if value.st_ino == inode:
+                            values = {name: getattr(value, name) for name in dir(value) if name.startswith("st_")}
+                            values[field] += 1
+                            return types.SimpleNamespace(**values)
+                        return value
+                    with patch.object(tasks.os, "fstat", side_effect=observed):
+                        self._assert_retained_audit_rejected_before_inventory()
+
+    def test_retained_audit_noatime_unsupported_or_denied_never_falls_back(self) -> None:
+        self._retained_archive_witness()
+        original_open = os.open
+        attempts = []
+        def denied(path, flags, *args, **kwargs):
+            if str(path) == self.audit_log.name:
+                attempts.append(flags)
+                raise PermissionError("simulated O_NOATIME denial")
+            return original_open(path, flags, *args, **kwargs)
+        with patch.object(tasks.os, "open", side_effect=denied):
+            self._assert_retained_audit_rejected_before_inventory()
+        self.assertEqual(1, len(attempts))
+        self.assertTrue(attempts[0] & os.O_NOATIME)
+        with patch.object(tasks.os, "O_NOATIME", 0):
+            self._assert_retained_audit_rejected_before_inventory()
+
+    def test_retained_audit_append_during_each_inventory_window(self) -> None:
+        self._retained_archive_witness()
+        for window in (1, 2):
+            with self.subTest(window=window):
+                calls = 0
+                def inventory(_argv, **_kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == window:
+                        tasks.base._append_audit_with_digest({"operation": "concurrent-append"})
+                    return _launcher()
+                self.assertEqual("retained_audit_witness_changed",
+                                 self._retained_history_snapshot(probe=inventory)["status"])
+                self.assertEqual(2, calls)
+                self.assertEqual("verified", self._retained_history_snapshot()["status"])
+
+    def test_retained_audit_rotation_missing_or_corrupt_after_inventory(self) -> None:
+        self._retained_archive_witness()
+        original = self.audit_log.read_bytes()
+        for kind in ("replace", "missing", "corrupt"):
+            with self.subTest(kind=kind):
+                calls = 0
+                def inventory(_argv, **_kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        self.audit_log.unlink()
+                        if kind != "missing":
+                            self.audit_log.write_bytes(original if kind == "replace" else b"corrupt\n")
+                            self.audit_log.chmod(0o600)
+                    return _launcher()
+                self.assertNotEqual("verified", self._retained_history_snapshot(probe=inventory)["status"])
+                self.audit_log.write_bytes(original)
+                self.audit_log.chmod(0o600)
+
+    def test_retained_audit_identity_change_during_verification(self) -> None:
+        self._retained_archive_witness()
+        verify = tasks.base._verify_audit_bytes
+        original = self.audit_log.read_bytes()
+        def changed(*args, **kwargs):
+            result = verify(*args, **kwargs)
+            self.audit_log.unlink()
+            self.audit_log.write_bytes(original)
+            self.audit_log.chmod(0o600)
+            return result
+        with patch.object(tasks.base, "_verify_audit_bytes", side_effect=changed):
+            self._assert_retained_audit_rejected_before_inventory()
+
+    def test_retained_audit_byte_line_record_budgets_and_shared_deadline(self) -> None:
+        self._retained_archive_witness()
+        for target, name, limit in ((tasks.base, "MAX_AUDIT_BYTES", self.audit_log.stat().st_size - 1),
+                                    (tasks.base, "MAX_AUDIT_RECORD_BYTES", 1),
+                                    (tasks, "TASK_RECONCILE_READY_AUDIT_RECORD_LIMIT", 0)):
+            with self.subTest(budget=name), patch.object(target, name, limit):
+                self._assert_retained_audit_rejected_before_inventory()
+        verify = tasks.base._verify_audit_bytes
+        for slow_call in (1, 2):
+            clock = [time.monotonic()]
+            deadlines = []
+            calls = 0
+            def slow(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                result = verify(*args, **kwargs)
+                if calls == slow_call:
+                    clock[0] += 61
+                return result
+            def inventory(_argv, **kwargs):
+                deadlines.append(kwargs["timeout_seconds"])
+                return _launcher()
+            with (self.subTest(slow_call=slow_call),
+                  patch.object(tasks.time, "monotonic", side_effect=lambda: clock[0]),
+                  patch.object(tasks.base, "_verify_audit_bytes", side_effect=slow)):
+                self.assertEqual("retained_audit_witness_unavailable",
+                                 self._retained_history_snapshot(probe=inventory)["status"])
+            self.assertEqual(slow_call, calls)
+            self.assertEqual(0 if slow_call == 1 else 2, len(deadlines))
+
+    def test_retained_audit_valid_event_without_writes_locks_or_atime_changes(self) -> None:
+        self._retained_archive_witness()
+        lock = self.audit_log.with_name(self.audit_log.name + ".lock")
+        lock.unlink(missing_ok=True)
+        os.utime(self.audit_log, ns=(1, self.audit_log.stat().st_mtime_ns))
+        before = self.audit_log.stat()
+        names_before = sorted(str(p) for p in self.root.rglob("*"))
+        os.utime(self.audit_log.parent, ns=(1, self.audit_log.parent.stat().st_mtime_ns))
+        directory_before = self.audit_log.parent.stat()
+        original_open = os.open
+        original_builtin_open, original_io_open = open, io.open
+        opens = []
+        def readonly_open(path, flags, *args, **kwargs):
+            self.assertFalse(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
+            opens.append((str(path), flags))
+            return original_open(path, flags, *args, **kwargs)
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("READ_ONLY effect attempted")
+        def readonly_python_open(original):
+            def observed(path, mode="r", *args, **kwargs):
+                self.assertFalse(any(flag in mode for flag in "wax+"))
+                return original(path, mode, *args, **kwargs)
+            return observed
+        with ExitStack() as guards:
+            guards.enter_context(patch.object(tasks.os, "open", side_effect=readonly_open))
+            guards.enter_context(patch("builtins.open", side_effect=readonly_python_open(original_builtin_open)))
+            guards.enter_context(patch.object(io, "open", side_effect=readonly_python_open(original_io_open)))
+            for name in ("write", "mkdir", "chmod", "fchmod", "chown", "fchown", "utime",
+                         "fsync", "fdatasync", "ftruncate", "unlink", "rename", "replace"):
+                guards.enter_context(patch.object(tasks.os, name, side_effect=forbidden))
+            guards.enter_context(patch.object(tasks.fcntl, "flock", side_effect=forbidden))
+            for name in ("_audit_records_snapshot", "_verify_audit_log", "_capture_verified_audit_head",
+                         "_read_audit_status_snapshot", "_audit_coordination_lock", "_audit_parent", "_state_root"):
+                guards.enter_context(patch.object(tasks.base, name, side_effect=forbidden))
+            self.assertEqual("verified", self._retained_history_snapshot()["status"])
+        self.assertFalse(lock.exists())
+        self.assertEqual(before, self.audit_log.stat())
+        self.assertEqual(before.st_atime_ns, self.audit_log.stat().st_atime_ns)
+        self.assertEqual(directory_before, self.audit_log.parent.stat())
+        self.assertEqual(directory_before.st_atime_ns, self.audit_log.parent.stat().st_atime_ns)
+        self.assertEqual(names_before, sorted(str(p) for p in self.root.rglob("*")))
+        audit_opens = [flags for name, flags in opens if name == self.audit_log.name]
+        self.assertEqual(2, len(audit_opens))
+        required = os.O_NOATIME | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        self.assertTrue(all(flags & required == required for flags in audit_opens))
 
     def _retained_archive_witness(self):
         archive_env = patch.dict(os.environ, {

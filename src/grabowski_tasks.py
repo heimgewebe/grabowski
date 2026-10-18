@@ -12063,7 +12063,7 @@ def _publish_task_reconcile_retained_evidence(prepared: dict[str, Any]) -> None:
             # Bind the exact witness to a durable audit record before publishing.
             witness_sha256 = _sha256_json(material)
             audit_sha256 = base._append_audit_with_digest({
-                "timestamp_unix": _now(),
+                "timestamp_unix": material["reconciled_at_unix"],
                 "operation": "task-reconcile-retained-witness-prepared",
                 "witness_sha256": witness_sha256,
                 "task_revision": material["task_revision"],
@@ -12078,6 +12078,126 @@ def _publish_task_reconcile_retained_evidence(prepared: dict[str, Any]) -> None:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY, _canonical_json(proof)),
             )
+
+
+TASK_RECONCILE_READY_AUDIT_RECORD_LIMIT = 65536
+
+
+def _task_retained_audit_witness(
+    proof: dict[str, Any], *, deadline: float,
+) -> tuple[Any, ...]:
+    """Uncached, effect-free membership proof in the existing active audit head.
+
+    This unkeyed same-UID hash chain is integrity evidence, NOT cryptographic
+    publisher authentication against an actor able to rewrite that chain. Bind
+    only the exact publisher event; unrelated audit events are not signers.
+    Rotated-out events require an authorized republish, never archive searches
+    or READ_ONLY backfill. Do not call audit helpers that create paths/locks.
+    """
+    def budget() -> None:
+        if time.monotonic() > deadline:
+            raise RuntimeError("Retained audit witness deadline exceeded")
+
+    def identity(s: os.stat_result) -> tuple[int, ...]:
+        return (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid,
+                s.st_nlink, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+
+    budget()
+    path = Path(base.AUDIT_LOG)
+    if not path.is_absolute() or ".." in path.parts or not 2 <= len(path.parts) <= 64:
+        raise RuntimeError("Unsafe retained audit path")
+    required_flags = ("O_NOATIME", "O_NONBLOCK", "O_NOFOLLOW", "O_CLOEXEC", "O_PATH", "O_DIRECTORY")
+    if any(not getattr(os, name, 0) for name in required_flags):
+        raise RuntimeError("Effect-free audit observation is unsupported")
+    flags = os.O_RDONLY | os.O_NOATIME | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+    # O_PATH ancestors neither read directory contents nor update atime. Walk
+    # each component through stable descriptors so ancestor symlinks fail too.
+    descriptors: list[int] = []
+    bindings: list[tuple[int, str, int, tuple[int, ...]]] = []
+    try:
+        parent = os.open(path.anchor, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        descriptors.append(parent)
+        for index, component in enumerate(path.parts[1:-1], start=1):
+            budget()
+            directory_flags = flags if index == len(path.parts) - 2 else os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+            descriptor = os.open(component, directory_flags | os.O_DIRECTORY, dir_fd=parent)
+            descriptors.append(descriptor)
+            observed = os.fstat(descriptor)
+            bindings.append((parent, component, descriptor, identity(observed)))
+            parent = descriptor
+        directory = os.fstat(parent)
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid()
+                or directory.st_gid != os.getgid() or stat.S_IMODE(directory.st_mode) != 0o700):
+            raise RuntimeError("Unsafe retained audit directory")
+        linked = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if (not stat.S_ISREG(linked.st_mode) or linked.st_nlink != 1
+                or linked.st_uid != os.getuid() or linked.st_gid != os.getgid()
+                or stat.S_IMODE(linked.st_mode) != 0o600):
+            raise RuntimeError("Unsafe retained audit file")
+        # No fallback without O_NOATIME, including EPERM/EINVAL. NONBLOCK keeps
+        # a concurrent FIFO replacement from hanging; never read a changed inode.
+        descriptor = os.open(path.name, flags, dir_fd=parent)
+        descriptors.append(descriptor)
+        observed = os.fstat(descriptor)
+        if identity(observed) != identity(linked):
+            raise RuntimeError("Retained audit identity changed during open")
+        bindings.append((parent, path.name, descriptor, identity(observed)))
+        if not 0 < observed.st_size <= base.MAX_AUDIT_BYTES:
+            raise RuntimeError("Retained audit byte budget exceeded")
+        chunks = []
+        size = 0
+        while True:
+            budget()
+            chunk = os.read(descriptor, min(65536, base.MAX_AUDIT_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > base.MAX_AUDIT_BYTES:
+                raise RuntimeError("Retained audit byte budget exceeded")
+        data = b"".join(chunks)
+        # Bound splitlines allocation too, including CR separators in hostile
+        # bytes, before handing the bounded snapshot to the pure chain parser.
+        if (not data.endswith(b"\n") or data.count(b"\n") + data.count(b"\r")
+                > TASK_RECONCILE_READY_AUDIT_RECORD_LIMIT):
+            raise RuntimeError("Retained audit record budget or completeness failure")
+        lines = data.splitlines(keepends=True)
+        if any(len(line) > base.MAX_AUDIT_RECORD_BYTES for line in lines):
+            raise RuntimeError("Retained audit line budget exceeded")
+        budget()
+        if base._verify_audit_bytes(path, data, exists=True).get("valid") is not True:
+            raise RuntimeError("Retained audit chain is invalid")
+        budget()
+        matches = []
+        for line in lines:
+            budget()
+            record = json.loads(line)
+            if record.get("record_sha256") == proof["audit_record_sha256"]:
+                matches.append(record)
+        material = {key: value for key, value in proof.items()
+                    if key not in {"audit_record_sha256", "evidence_sha256"}}
+        if len(matches) != 1:
+            raise RuntimeError("Retained publisher event unavailable in active audit head")
+        record = matches[0]
+        if (type(record.get("audit_schema_version")) is not int or record["audit_schema_version"] != 2
+                or base._audit_record_hash(record) != proof["audit_record_sha256"]
+                or record.get("operation") != "task-reconcile-retained-witness-prepared"
+                or record.get("witness_sha256") != _sha256_json(material)
+                or type(record.get("timestamp_unix")) is not int
+                or record["timestamp_unix"] != proof["reconciled_at_unix"]
+                or any(record.get(key) != proof[key] for key in (
+                    "task_revision", "resource_revision", "archive_projection_sha256", "scope"))):
+            raise RuntimeError("Retained publisher event does not bind this witness")
+        for parent_fd, name, fd, original in bindings:
+            budget()
+            if (identity(os.fstat(fd)) != original
+                    or identity(os.stat(name, dir_fd=parent_fd, follow_symlinks=False)) != original):
+                raise RuntimeError("Retained audit identity changed")
+        budget()
+        return (tuple(original for _, _, _, original in bindings), hashlib.sha256(data).hexdigest())
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def _task_reconcile_retained_evidence_snapshot(
@@ -12101,6 +12221,10 @@ def _task_reconcile_retained_evidence_snapshot(
         or proof["evidence_sha256"] != _sha256_json(material)
     ):
         return {"status": "invalid_or_stale"}
+    try:
+        audit_identity = _task_retained_audit_witness(proof, deadline=deadline)
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return {"status": "retained_audit_witness_unavailable"}
     cohorts = _task_retained_cohorts(connection)
     if _sha256_json(cohorts) != proof["cohorts_sha256"]:
         return {"status": "stale"}
@@ -12176,6 +12300,11 @@ def _task_reconcile_retained_evidence_snapshot(
                 return {"status": "stale"}
         if local_targets() != targets:
             return {"status": "stale"}
+    try:
+        if _task_retained_audit_witness(proof, deadline=deadline) != audit_identity:
+            return {"status": "retained_audit_witness_changed"}
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return {"status": "retained_audit_witness_unavailable"}
     if (time.monotonic() > deadline
             or not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS):
         return {"status": "invalid_or_stale"}
