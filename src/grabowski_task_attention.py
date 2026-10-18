@@ -1413,8 +1413,9 @@ def _task_archive_classification(
 ) -> dict[str, Any]:
     import grabowski_lifecycle_evidence as lifecycle_evidence
 
-    if not archived:
-        _require_safe_archive_transport(record)
+    # New immutable projection switches must never bypass transport admission.
+    # Existing archived replay returns before this classification is invoked.
+    _require_safe_archive_transport(record)
     archive_record, record_sha256, _source_store_sha256 = _task_archive_source_binding(record)
     now_unix = int(time.time())
     lease_source = _assert_no_live_task_resource_leases(record, now_unix=now_unix)
@@ -3061,6 +3062,11 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
                 raise TaskAttentionConflictError(
                     "task archive projection revalidation is not ready"
                 )
+            # Fleet routing is mutable outside the task record SHA/revisions.
+            # An effect-plan proof cannot bind transport after its final check.
+            # Refuse an irreversible local->SSH projection switch if routing
+            # changed while the archive effect or plan was being prepared.
+            _require_safe_archive_transport(projection_revalidated_record)
             projection_effect = lifecycle_projection.apply_task_archive_projection_switch(
                 Path(str(archive_effect["segment_dir"])),
                 projection_root=projection_root,

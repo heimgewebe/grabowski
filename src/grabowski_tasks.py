@@ -12444,7 +12444,20 @@ def _task_reconcile_ready_local_terminal_rows(
     return selected, 0, headroom, archived_unobservable
 
 
-TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_BYTES = 256 * 1024
+# The bounded complete inventory must fit the same maximum cohort that
+# readiness permits in the archive and current-local terminal projections.
+# Restrict every line before parsing so even an adversarial unit description
+# cannot defeat the finite output cap. The total stays below the ordinary
+# 2,000,000-byte operator subprocess limit across access profiles.
+TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_LINE_BYTES = 240
+TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_LINES = (
+    TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT
+    + TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT + 2
+)
+TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_BYTES = (
+    TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_LINES
+    * (TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_LINE_BYTES + 1)
+)
 
 
 def _task_reconcile_ready_archived_user_unit_live() -> bool:
@@ -12476,7 +12489,12 @@ def _task_reconcile_ready_archived_user_unit_live() -> bool:
         or not isinstance(result.get("stdout"), str)
     ):
         raise RuntimeError("Archived task unit inventory is unavailable")
-    for raw in result["stdout"].splitlines():
+    for inspected, raw in enumerate(result["stdout"].splitlines(), start=1):
+        if (
+            inspected > TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_LINES
+            or len(raw.encode("utf-8")) > TASK_RECONCILE_READY_USER_UNIT_INVENTORY_MAX_LINE_BYTES
+        ):
+            raise RuntimeError("Archived task unit inventory exceeds bounded line budget")
         line = raw.strip()
         if not line:
             continue
@@ -12516,12 +12534,14 @@ def _task_reconcile_ready_local_terminal_observed(
         or not isinstance(probe, dict)
         or type(probe.get("returncode")) is not int
         or probe["returncode"] != 0
-        or probe.get("timed_out")
-        or probe.get("outcome_unknown")
+        or probe.get("timed_out") is not False
+        # Only local operator._run lacks outcome_unknown; it still returns
+        # explicit timeout and truncation completeness fields.
+        or probe.get("outcome_unknown") not in (None, False)
         # A partial systemctl show response cannot prove quiescence even if
         # its prefix contains plausible ActiveState/Result properties.
-        or probe.get("stdout_truncated") not in (None, False)
-        or probe.get("stderr_truncated") not in (None, False)
+        or probe.get("stdout_truncated") is not False
+        or probe.get("stderr_truncated") is not False
         or not isinstance(props, dict)
     ):
         return False

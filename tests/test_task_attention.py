@@ -2002,6 +2002,38 @@ class TaskAttentionTests(unittest.TestCase):
                 archived=False,
             )
 
+    def test_closeout_archive_rechecks_transport_before_projection_switch(self) -> None:
+        import grabowski_lifecycle_effect_plan as effect_plan
+
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        task_db_before = self.database.read_bytes()
+        routing = {"transport": "local"}
+        original_revalidate = effect_plan.revalidate_effect_plan
+
+        def fleet_switch_after_revalidation(*args: object, **kwargs: object) -> dict:
+            result = original_revalidate(*args, **kwargs)
+            self.assertTrue(result["ready_for_effect"])
+            routing["transport"] = "ssh"
+            return result
+
+        def dispatch_host(host: str) -> tuple[str, dict, bool]:
+            return host, {"transport": routing["transport"]}, False
+
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host", side_effect=dispatch_host),
+            patch.object(tasks, "_observe", return_value=self._inactive_process_observation()),
+            patch.object(effect_plan, "revalidate_effect_plan", side_effect=fleet_switch_after_revalidation),
+            self.assertRaisesRegex(attention.TaskAttentionConflictError, "remote.*retirement proof"),
+        ):
+            attention.execute_closeout_archive(parameters)
+        self.assertEqual("ssh", routing["transport"])
+        # An archive segment may already exist, but no irreversible current
+        # projection switch may exclude a now-remote task from readiness.
+        self.assertTrue(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+        self.assertEqual(task_db_before, self.database.read_bytes())
+
     def test_closeout_archive_existing_projection_replays_after_transport_change(self) -> None:
         record = self._completed_task()
         parameters = self._archive_parameters(record)

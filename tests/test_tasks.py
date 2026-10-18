@@ -194,8 +194,27 @@ class TaskTests(unittest.TestCase):
         self.resource_patch.start()
         self.admission_patch.start()
         self.start_counter = 0
+        # Isolated task stores must not depend on production user-systemd
+        # activity. Inventory-specific tests explicitly override operator._run
+        # and continue to exercise live, malformed and truncated responses.
+        original_run = tasks.operator._run
+
+        def isolated_unit_inventory(argv, *args, **kwargs):
+            if argv == [
+                "systemctl", "--user", "list-units", "--all", "--full",
+                "--type=service", "--no-legend", "--plain", "--no-pager",
+                "grabowski-task-*.service",
+            ]:
+                return _launcher()
+            return original_run(argv, *args, **kwargs)
+
+        self.unit_inventory_patch = patch.object(
+            tasks.operator, "_run", side_effect=isolated_unit_inventory,
+        )
+        self.unit_inventory_patch.start()
 
     def tearDown(self) -> None:
+        self.unit_inventory_patch.stop()
         self.admission_patch.stop()
         self.resource_patch.stop()
         self.capture_script_root_patch.stop()
@@ -5817,6 +5836,7 @@ class TaskTests(unittest.TestCase):
             )
         )
 
+    @patch.object(tasks, "_task_reconcile_ready_archived_user_unit_live", new=lambda: False)
     def test_reconcile_ready_rejects_previous_complete_phase_restarted_before_other_phases_finish(self) -> None:
         with tasks._database_connection():
             pass
@@ -6284,7 +6304,8 @@ class TaskTests(unittest.TestCase):
                     "LoadState": "loaded", "ActiveState": "inactive",
                     "SubState": "dead", "Result": "success",
                 },
-                "probe": {"returncode": 0, "timed_out": False},
+                "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
                 "observer": {
                     "kind": "bound-local-user-systemd-show-v1",
                     "transport": "local",
@@ -6639,7 +6660,8 @@ class TaskTests(unittest.TestCase):
                     "LoadState": "loaded", "ActiveState": "inactive",
                     "SubState": "dead", "Result": "success",
                 },
-                "probe": {"returncode": 0, "timed_out": False},
+                "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
                 "observer": {
                     "kind": "bound-local-user-systemd-show-v1",
                     "transport": "local",
@@ -6707,7 +6729,8 @@ class TaskTests(unittest.TestCase):
                 "SubState": "dead",
                 "Result": "success",
             },
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1",
                 "transport": "local",
@@ -6784,7 +6807,8 @@ class TaskTests(unittest.TestCase):
                 "SubState": "dead", "Result": "success",
                 "ExecMainCode": "0", "ExecMainStatus": "0",
             },
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1", "transport": "local",
             },
@@ -6893,7 +6917,8 @@ class TaskTests(unittest.TestCase):
                 "LoadState": "loaded", "ActiveState": "inactive",
                 "SubState": "dead", "Result": "success",
             },
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1", "transport": "local",
             },
@@ -6980,6 +7005,7 @@ class TaskTests(unittest.TestCase):
         # Within the scan budget, archiving exactly the excess always fits.
         self.assertLessEqual(status["archive_excess"], status["archive_headroom"])
 
+    @patch.object(tasks, "_task_reconcile_ready_archived_user_unit_live", new=lambda: False)
     def test_remote_terminal_cohort_has_bounded_count_and_zero_local_probes(self) -> None:
         self._local_terminal_readiness_store(33)
         with (
@@ -7009,6 +7035,7 @@ class TaskTests(unittest.TestCase):
         probe.assert_not_called()
         dispatch.assert_not_called()
 
+    @patch.object(tasks, "_task_reconcile_ready_archived_user_unit_live", new=lambda: False)
     def test_remote_terminal_cohort_reports_exhausted_history_budget(self) -> None:
         self._local_terminal_readiness_store(2)
         with (
@@ -7094,7 +7121,8 @@ class TaskTests(unittest.TestCase):
                 "SubState": "dead", "Result": "success",
                 "ExecMainStatus": "0",
             },
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1",
                 "transport": "local",
@@ -7365,6 +7393,37 @@ class TaskTests(unittest.TestCase):
                     with self.assertRaises(RuntimeError):
                         tasks._task_reconcile_ready_archived_user_unit_live()
 
+    def test_archive_inventory_covers_declared_history_budget_without_unbounded_lines(self) -> None:
+        cohort = (
+            tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT
+            + tasks.TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT
+        )
+        stdout = "".join(
+            f"grabowski-task-{index:024x}-a1.service loaded inactive dead archived unit\\n"
+            for index in range(cohort)
+        )
+        stdout = stdout.replace("\\n", "\n")
+        self.assertGreater(len(stdout.encode("utf-8")), 256 * 1024)
+        success = {
+            "returncode": 0, "stdout": stdout, "stderr": "",
+            "timed_out": False, "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+        with patch.object(tasks.operator, "_run", return_value=success) as run:
+            self.assertFalse(tasks._task_reconcile_ready_archived_user_unit_live())
+        self.assertGreaterEqual(
+            run.call_args.kwargs["max_output_bytes"], len(stdout.encode("utf-8"))
+        )
+        oversized_line = (
+            f"grabowski-task-{'f'*24}-a1.service loaded inactive dead "
+            + "x" * 1200 + "\n"
+        )
+        with patch.object(tasks.operator, "_run", return_value={
+            **success, "stdout": oversized_line,
+        }):
+            with self.assertRaises(RuntimeError):
+                tasks._task_reconcile_ready_archived_user_unit_live()
+
     def test_archived_inactive_loaded_units_still_allow_current_readiness(self) -> None:
         self._local_terminal_readiness_store(1)
         unit = f"grabowski-task-{'b' * 24}-a1.service"
@@ -7505,7 +7564,8 @@ class TaskTests(unittest.TestCase):
                 "SubState": "dead", "Result": "success",
                 "ExecMainStatus": "0",
             },
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1", "transport": "local",
             },
@@ -7543,6 +7603,33 @@ class TaskTests(unittest.TestCase):
                     )
         probe.assert_called_once()
         write.assert_not_called()
+
+    def test_local_terminal_requires_complete_probe_flags(self) -> None:
+        task = {**self._start()["task"], "state": "completed"}
+        observation = {
+            "state": "completed",
+            "properties": {
+                "LoadState": "loaded", "ActiveState": "inactive",
+                "SubState": "dead", "Result": "success",
+            },
+            "probe": {
+                "returncode": 0, "timed_out": False,
+                "stdout_truncated": False, "stderr_truncated": False,
+            },
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1",
+                "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        self.assertTrue(tasks._task_reconcile_ready_local_terminal_observed(task, observation))
+        for field in ("timed_out", "stdout_truncated", "stderr_truncated"):
+            with self.subTest(missing_field=field):
+                partial = dict(observation["probe"])
+                del partial[field]
+                self.assertFalse(tasks._task_reconcile_ready_local_terminal_observed(
+                    task, {**observation, "probe": partial},
+                ))
 
     def test_rootbroker_cancelled_terminal_needs_coherent_positive_unit(self) -> None:
         record = {
@@ -7640,7 +7727,8 @@ class TaskTests(unittest.TestCase):
         live = {
             "state": "running",
             "properties": {"LoadState": "loaded", "ActiveState": "active"},
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1",
                 "transport": "local",
@@ -7972,7 +8060,8 @@ class TaskTests(unittest.TestCase):
                 "LoadState": "loaded", "ActiveState": "inactive",
                 "SubState": "dead", "Result": "success",
             },
-            "probe": {"returncode": 0, "timed_out": False},
+            "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
             "observer": {
                 "kind": "bound-local-user-systemd-show-v1",
                 "transport": "local",
@@ -11566,7 +11655,8 @@ class TaskTests(unittest.TestCase):
                         "SubState": "dead", "Result": systemd_result,
                     },
                     "observed_at_unix": tasks._now(),
-                    "probe": {"returncode": 0, "timed_out": False},
+                    "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
                     "observer": {
                         "kind": "bound-local-user-systemd-show-v1",
                         "transport": "local",
@@ -11627,7 +11717,8 @@ class TaskTests(unittest.TestCase):
                         "LoadState": "loaded", "ActiveState": "deactivating",
                         "SubState": "stop-sigterm", "Result": unit_result,
                     },
-                    "probe": {"returncode": 0, "timed_out": False},
+                    "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
                     "observer": {
                         "kind": "bound-local-user-systemd-show-v1",
                         "transport": "local",
@@ -11847,7 +11938,8 @@ class TaskTests(unittest.TestCase):
                 return_value={
                     "state": "running",
                     "properties": {"LoadState": "loaded", "ActiveState": "active"},
-                    "probe": {"returncode": 0, "timed_out": False},
+                    "probe": {"returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False},
                     "observer": {"kind": "bound-local-user-systemd-show-v1", "transport": "local"},
                 },
             ) as probe,
