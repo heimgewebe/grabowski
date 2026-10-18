@@ -8106,7 +8106,10 @@ def _reserved_runtime_deploy_pinned_python_path() -> str:
         yaml_file = Path(distribution.locate_file("yaml/__init__.py"))
         if distribution.version != "6.0.3" or yaml_file != site / "yaml" / "__init__.py":
             raise RuntimeError("reserved runtime PyYAML is not the pinned serving version")
-        for directory in (prefix, site, site / "yaml"):
+        for directory in (
+            prefix, prefix / "lib", prefix / "lib" / expected_python,
+            site, site / "yaml",
+        ):
             metadata = directory.lstat()
             if (
                 not stat.S_ISDIR(metadata.st_mode)

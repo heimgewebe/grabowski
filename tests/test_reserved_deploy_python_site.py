@@ -7,6 +7,7 @@ This does not attest to arbitrary same-UID serving-release tampering.
 from __future__ import annotations
 
 import os
+import stat
 import sys
 from pathlib import Path
 import subprocess
@@ -257,6 +258,53 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                    )):
             with self.assertRaisesRegex(RuntimeError, "pinned serving version"):
                 operator._reserved_runtime_deploy_pinned_python_path()
+
+    @unittest.skipUnless(sys.prefix != sys.base_prefix, "serving Python is not a venv")
+    def test_pinned_serving_site_rejects_symlinked_intermediate_lib(self):
+        operator = _load_operator_module()
+        target = Path(sys.prefix) / "lib"
+        original_lstat = Path.lstat
+
+        def lstat_with_untrusted_middle(path, *args, **kwargs):
+            metadata = original_lstat(path, *args, **kwargs)
+            if path == target:
+                fields = list(metadata)
+                fields[0] = stat.S_IFLNK | 0o777
+                return os.stat_result(fields)
+            return metadata
+
+        with patch.object(Path, "lstat", lstat_with_untrusted_middle):
+            with self.assertRaisesRegex(RuntimeError, "directory is unsafe"):
+                operator._reserved_runtime_deploy_pinned_python_path()
+
+    @unittest.skipUnless(sys.prefix != sys.base_prefix, "serving Python is not a venv")
+    def test_pinned_site_rejects_untrusted_nested_directory_metadata(self):
+        operator = _load_operator_module()
+        lib = Path(sys.prefix) / "lib"
+        abi = lib / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        original_lstat = Path.lstat
+
+        for target in (lib, abi):
+            for hazard in ("symlink", "world-writable", "wrong-owner", "regular-file"):
+                with self.subTest(directory=str(target), hazard=hazard):
+                    def lstat_with_untrusted_metadata(path, *args, **kwargs):
+                        metadata = original_lstat(path, *args, **kwargs)
+                        if path != target:
+                            return metadata
+                        fields = list(metadata)
+                        if hazard == "symlink":
+                            fields[0] = stat.S_IFLNK | 0o777
+                        elif hazard == "world-writable":
+                            fields[0] |= 0o002
+                        elif hazard == "wrong-owner":
+                            fields[4] = os.getuid() + 1
+                        elif hazard == "regular-file":
+                            fields[0] = stat.S_IFREG | 0o600
+                        return os.stat_result(fields)
+
+                    with patch.object(Path, "lstat", lstat_with_untrusted_metadata):
+                        with self.assertRaisesRegex(RuntimeError, "directory is unsafe"):
+                            operator._reserved_runtime_deploy_pinned_python_path()
 
     def test_cache_prefix_alone_still_admits_untrusted_user_site(self):
         # Environment-controlled user-site fixture, independent of host versions.
