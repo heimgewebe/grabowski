@@ -349,6 +349,11 @@ def synthetic_prepared_stage(root: Path) -> dict:
     }
 
 
+def synthetic_parent_mcp_bridge(home: Path) -> dict[str, Path]:
+    """Build the authorized read-only parent paths, without creating pipes."""
+    return runner._mcp_parent_bridge_paths(home)
+
+
 def synthetic_paired_mcp_files(*, legacy_g1: bool = False) -> list[dict]:
     """Only mock paired authorization metadata; never a real live grant."""
     script = "repobrief-mcp-stdio.py" if legacy_g1 else "repoground-mcp-stdio.py"
@@ -395,13 +400,23 @@ def proxy_command(
         state, upstream_argv, staged_manifest, authorized
     )
     encoded = runner.canonical(runner._mcp_stage_wire(prepared["metadata_binding"]))
+    # Existing stream/filter tests call the parser function through an
+    # explicit test-only harness. The production direct proxy CLI is disabled;
+    # only the authentic parent-launched broker gets the private readiness FD.
+    fixture_code = (
+        "import json, runpy, sys\n"
+        "runner = runpy.run_path(sys.argv[1], run_name='mcp_test_fixture')\n"
+        "raise SystemExit(runner['run_mcp_proxy']("
+        "json.loads(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], "
+        "json.loads(sys.argv[6]), sys.argv[7]))\n"
+    )
     command = [
         sys.executable,
         "-I",
+        "-B",
         "-c",
-        bootstrap_program(),
+        fixture_code,
         str(MODULE_PATH),
-        "--codex-mcp-proxy",
         json.dumps(upstream_argv),
         str(staged_manifest),
         str(manifest),
@@ -416,6 +431,10 @@ def proxy_command(
         "--ro-bind",
         "/",
         "/",
+        "--unshare-pid",
+        "--die-with-parent",
+        "--proc",
+        "/proc",
         "--bind",
         str(root),
         str(root),
@@ -2703,7 +2722,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                 # Schema+home, proxy, first manifest and three artifacts+
                 # parent dirs, second upstream root/stage, its nine files
                 # (including immutable metadata) and nine nested directories.
-                4 + 4 + 3 + 3 + 3 + 2 + 9 + 9,
+                4 + 4 + 3 + 3 + 3 + 2 + 9 + 9 + 2,
             )
             snapshot.assert_called_once()
             artifacts.assert_called_once()
@@ -2716,6 +2735,234 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             runner.RunnerError, "pre-intent MCP script binding is missing"
         ):
             runner._preintent_output_entry_reservation("treatment", expected_manifest)
+
+    def test_preintent_rejects_unencodable_manifest_artifact_before_baseline(
+        self,
+    ) -> None:
+        # Linux permits raw filename bytes that canonical UTF-8 stage metadata
+        # cannot encode. Reject them before spending the Baseline one-shot.
+        if sys.platform != "linux":
+            self.skipTest("Linux surrogateescape filesystem semantics required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact_name = os.fsdecode(b"artifact-\xff")
+            content = b"artifact"
+            (root / artifact_name).write_bytes(content)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_bytes(
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "path": artifact_name,
+                                "bytes": len(content),
+                                "sha256": runner.sha_bytes(content),
+                            }
+                        ]
+                    },
+                    ensure_ascii=True,
+                ).encode("ascii")
+            )
+            manifest, _raw = runner._runtime_file_snapshot(
+                manifest_path,
+                label="RepoGround manifest",
+                max_bytes=runner.MAX_MANIFEST_BYTES,
+            )
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            with (
+                patch.object(
+                    runner,
+                    "_repoground_source_tree_snapshot",
+                    return_value={"entries": []},
+                ),
+                self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "pre-intent MCP stage metadata path is not UTF-8",
+                ),
+            ):
+                runner._preintent_output_entry_reservation(
+                    "treatment",
+                    manifest,
+                    mcp_script=Path("/src/scripts/repoground-mcp-stdio.py"),
+                    state_root=state,
+                )
+
+    def test_preintent_rejects_stage_path_longer_than_linux_pathmax(self) -> None:
+        # A real source artifact may be below PATH_MAX, while its longer
+        # private-stage prefix makes the same authorized file unreachable.
+        # Baseline must reject this before spending a one-shot authorization.
+        if sys.platform != "linux":
+            self.skipTest("Linux pathname limits required")
+        with tempfile.TemporaryDirectory(prefix="rab-len-") as temporary:
+            root = Path(temporary)
+            components = ["x" * 147 for _ in range(27)] + ["artifact.bin"]
+            relative = Path(*components)
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                for name in components[:-1]:
+                    os.mkdir(name, mode=0o700, dir_fd=descriptor)
+                    child = os.open(
+                        name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=descriptor
+                    )
+                    os.close(descriptor)
+                    descriptor = child
+                artifact = os.open(
+                    components[-1],
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=descriptor,
+                )
+                try:
+                    os.write(artifact, b"x")
+                finally:
+                    os.close(artifact)
+            finally:
+                os.close(descriptor)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            stage = (
+                state
+                / "repoground-mcp-upstream-runtime"
+                / ("upstream-" + "0" * 24)
+                / "manifest"
+                / relative
+            )
+            path_max = os.pathconf("/", "PC_PATH_MAX")
+            self.assertLess(len(os.fsencode(root / relative)), path_max)
+            self.assertGreaterEqual(len(os.fsencode(stage)), path_max)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "path": str(relative),
+                                "bytes": 1,
+                                "sha256": runner.sha_bytes(b"x"),
+                            }
+                        ]
+                    }
+                )
+            )
+            manifest, _raw = runner._runtime_file_snapshot(
+                manifest_path,
+                label="RepoGround manifest",
+                max_bytes=runner.MAX_MANIFEST_BYTES,
+            )
+            with (
+                patch.object(
+                    runner,
+                    "_repoground_source_tree_snapshot",
+                    return_value={"entries": []},
+                ),
+                self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "pre-intent MCP staged path exceeds Linux PATH_MAX",
+                ),
+            ):
+                runner._preintent_output_entry_reservation(
+                    "treatment",
+                    manifest,
+                    mcp_script=Path("/src/scripts/repoground-mcp-stdio.py"),
+                    state_root=state,
+                )
+
+    def test_preintent_4096_realistic_source_bindings_bound_serialized_stage(
+        self,
+    ) -> None:
+        # Worst legal source count with long components and UTF-8 must never
+        # spend a Baseline one-shot if the future Treatment record overflows.
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary) / "state"
+            state.mkdir(mode=0o700)
+            manifest = {"path": "/bundles/bound.manifest.json", "sha256": "a" * 64}
+            script = Path("/src/scripts/repoground-mcp-stdio.py")
+            relatives = [
+                Path("merger") / ("unicode-ä-" + "x" * 160) / f"source-{index:04d}.py"
+                for index in range(runner.MAX_MCP_SOURCE_TREE_FILES)
+            ]
+            stage_root = (
+                state / "repoground-mcp-upstream-runtime" / ("upstream-" + "0" * 24)
+            )
+            paths = [
+                Path(runner.MCP_STAGE_METADATA_NAME),
+                Path("executable/mcp-python"),
+                Path("script/repoground-mcp-stdio.py"),
+                Path("manifest/bound.manifest.json"),
+                *relatives,
+            ]
+            # 64-bit maximum fields are larger than realistic st_ino etc;
+            # this synthetic record tests serialization without launching Codex.
+            stage = {
+                "argv": [
+                    str(stage_root / "executable/mcp-python"),
+                    str(stage_root / "script/repoground-mcp-stdio.py"),
+                    "--bundle-root",
+                    str(stage_root / "manifest/bound.manifest.json"),
+                ],
+                "bindings": [],
+                "manifest_binding": {},
+                "manifest_artifact_bindings": [],
+                "source_tree": {
+                    "root": "/src",
+                    "commit": "f" * 40,
+                    "file_count": len(relatives),
+                    "total_bytes": 64 * 1024 * 1024,
+                },
+                "source_tree_bindings": [
+                    {
+                        "path": stage_root / relative,
+                        "identity": (2**64 - 1,) * 4,
+                        "sha256": "f" * 64,
+                    }
+                    for relative in relatives
+                ],
+                "runtime_dir": stage_root,
+                "runtime_identity": (2**64 - 1,) * 4,
+            }
+            payload_bytes = len(
+                runner.canonical(runner._mcp_stage_wire(stage)).encode("utf-8")
+            )
+            envelope = 1024 * 1024 + sum(
+                512 + len(json.dumps(str(stage_root / relative), ensure_ascii=True))
+                for relative in paths
+            )
+            self.assertGreater(payload_bytes, 128 * 1024)
+            self.assertLess(payload_bytes, envelope)
+            with (
+                patch.object(
+                    runner,
+                    "_runtime_file_snapshot",
+                    return_value=(dict(manifest), b"manifest"),
+                ),
+                patch.object(runner, "_manifest_artifact_paths", return_value=[]),
+                patch.object(
+                    runner,
+                    "_repoground_source_tree_snapshot",
+                    return_value={
+                        "entries": [{"relative": item} for item in relatives]
+                    },
+                ),
+            ):
+                self.assertGreater(
+                    runner._preintent_output_entry_reservation(
+                        "treatment", manifest, mcp_script=script, state_root=state
+                    ),
+                    runner.MAX_MCP_SOURCE_TREE_FILES,
+                )
+                # A smaller budget must fail during Baseline future-Treatment
+                # preflight, not inside stage_mcp_upstream after one-shot intent.
+                with patch.object(runner, "MAX_MCP_STAGE_METADATA_BYTES", envelope - 1):
+                    with self.assertRaisesRegex(
+                        runner.RunnerError, "pre-intent MCP stage metadata"
+                    ):
+                        runner._preintent_output_entry_reservation(
+                            "treatment",
+                            manifest,
+                            mcp_script=script,
+                            state_root=state,
+                        )
 
     def test_preintent_rejects_deep_manifest_artifact_before_workspace(self) -> None:
         # The second immutable upstream stage adds a manifest/ directory.
@@ -2875,6 +3122,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         manifest_path=root / "staged.bundle.manifest.json",
                         mcp_runtime_root=root / "state",
                         prepared_mcp_stage=synthetic_prepared_stage(root),
+                        mcp_bridge=synthetic_parent_mcp_bridge(root / "codex-home"),
                         source=source,
                     )
                     config = next(
@@ -2883,8 +3131,12 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                         if item.startswith("mcp_servers.repobrief.args=")
                     )
                     proxy_args = json.loads(config.split("=", 1)[1])
-                    original = json.loads(
-                        proxy_args[proxy_args.index("--codex-mcp-proxy") + 1]
+                    self.assertNotIn("--codex-mcp-proxy", proxy_args)
+                    original = runner._treatment_mcp_upstream_command(
+                        value,
+                        checkout,
+                        source,
+                        root / "staged.bundle.manifest.json",
                     )
                     self.assertEqual(
                         original[original.index("--repo-root") + 1], str(checkout)
@@ -2902,6 +3154,7 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
                             manifest_path=root / "staged.bundle.manifest.json",
                             mcp_runtime_root=root / "state",
                             prepared_mcp_stage=synthetic_prepared_stage(root),
+                            mcp_bridge=synthetic_parent_mcp_bridge(root / "codex-home"),
                             source=source,
                         )
 
@@ -4489,6 +4742,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     manifest_path=root / "manifest.json",
                     mcp_runtime_root=root,
                     prepared_mcp_stage=staged,
+                    mcp_bridge=synthetic_parent_mcp_bridge(root / "codex-home"),
                 )
             lengths = [len(argument.encode("utf-8")) + 1 for argument in command]
             self.assertLess(max(lengths), 128 * 1024)
@@ -4520,6 +4774,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     manifest_path=(root / "bound.bundle.manifest.json").resolve(),
                     mcp_runtime_root=(root / "state").resolve(),
                     prepared_mcp_stage=synthetic_prepared_stage(root),
+                    mcp_bridge=synthetic_parent_mcp_bridge(codex_home),
                 )
         baseline_joined = " ".join(baseline)
         treatment_joined = " ".join(treatment)
@@ -4569,7 +4824,12 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             ],
             [expected_enabled_tools],
         )
-        self.assertIn("--codex-mcp-proxy", treatment_joined)
+        self.assertNotIn("--codex-mcp-proxy", treatment_joined)
+        encoded = next(
+            item for item in treatment if item.startswith("mcp_servers.repobrief.args=")
+        )
+        args = json.loads(encoded.split("=", 1)[1])
+        self.assertEqual(args[3], runner._UNTRUSTED_MCP_FIFO_RELAY)
 
     def test_validate_support_executable_enforces_permissions_and_owner(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4755,6 +5015,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     manifest_path=(root / "bound.bundle.manifest.json").resolve(),
                     mcp_runtime_root=(root / "state").resolve(),
                     prepared_mcp_stage=synthetic_prepared_stage(root),
+                    mcp_bridge=synthetic_parent_mcp_bridge(codex_home),
                 )
             validate.assert_called_once_with([])
             self.assertIn(
@@ -6900,7 +7161,9 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             state_path = root / "upstream.pid"
             upstream = root / "mcp.py"
             upstream.write_text(
-                "import os, pathlib, sys, time\n"
+                "import fcntl, os, pathlib, sys, time\n"
+                f"lock = open({str(root / 'upstream.lock')!r}, 'w')\n"
+                "fcntl.flock(lock, fcntl.LOCK_EX)\n"
                 f"pathlib.Path({str(state_path)!r}).write_text(str(os.getpid()))\n"
                 f"sys.stdout.buffer.write(b'x' * ({runner.base.MAX_MCP_MESSAGE_BYTES} + 1)); sys.stdout.buffer.flush()\n"
                 "time.sleep(30)\n",
@@ -6917,9 +7180,14 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             elapsed = time.monotonic() - started
             self.assertNotEqual(completed.returncode, 0)
             self.assertLess(elapsed, 5.0)
-            upstream_pid = int(state_path.read_text())
-            with self.assertRaises(ProcessLookupError):
-                os.kill(upstream_pid, 0)
+            self.assertGreater(int(state_path.read_text()), 1)
+            # PID is relative to fresh bwrap PIDNS, not the host PID. A
+            # post-return exclusive flock proves the real upstream released
+            # its kernel handle rather than accidentally probing a host PID.
+            import fcntl
+
+            with (root / "upstream.lock").open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_mcp_proxy_reaps_failed_upstream_without_detaching_from_provider_group(
         self,
@@ -6929,7 +7197,9 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             state_path = root / "upstream.state"
             upstream = root / "mcp.py"
             upstream.write_text(
-                "import os, pathlib, sys, time\n"
+                "import fcntl, os, pathlib, sys, time\n"
+                f"lock = open({str(root / 'upstream.lock')!r}, 'w')\n"
+                "fcntl.flock(lock, fcntl.LOCK_EX)\n"
                 f"pathlib.Path({str(state_path)!r}).write_text(f'{{os.getpid()}},{{os.getpgrp()}},{{os.getpgid(os.getppid())}}')\n"
                 "sys.stderr.write('upstream-diagnostic\\n'); sys.stderr.flush()\n"
                 "sys.stdout.write('not-json\\n'); sys.stdout.flush()\n"
@@ -6952,9 +7222,12 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn(b"upstream-diagnostic", completed.stderr)
             pid, pgid, parent_pgid = map(int, state_path.read_text().split(","))
+            self.assertGreater(pid, 1)
             self.assertEqual(pgid, parent_pgid)
-            with self.assertRaises(ProcessLookupError):
-                os.kill(pid, 0)
+            import fcntl
+
+            with (root / "upstream.lock").open("rb") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_mcp_proxy_reaps_upstream_when_helper_thread_start_fails(self) -> None:
         real_popen = runner.subprocess.Popen
@@ -7147,6 +7420,504 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 ):
                     runner._pin_treatment_arguments(conflicting, manifest)
 
+    def test_direct_mcp_proxy_cli_without_trusted_parent_pipe_is_rejected(self) -> None:
+        # No child-provided Procfs, userns or ro-mount claim is provenance.
+        # The legitimate parent owns the readiness pipe and checks its bytes.
+        with (
+            patch.object(runner, "run_mcp_proxy") as unsafe_proxy,
+            patch("builtins.print") as diagnostic,
+        ):
+            self.assertEqual(
+                runner.main(
+                    [
+                        "--codex-mcp-proxy",
+                        runner.canonical(["/usr/bin/python3"]),
+                        "/tmp/manifest.json",
+                        "/tmp/manifest.json",
+                        "0" * 64,
+                        "[]",
+                        "{}",
+                    ]
+                ),
+                2,
+            )
+            unsafe_proxy.assert_not_called()
+            self.assertIn(
+                "direct Codex MCP proxy is disabled",
+                diagnostic.call_args.args[0],
+            )
+
+    def test_mcp_proxy_mountns_gate_precedes_untrusted_stage_read(self) -> None:
+        with (
+            patch.object(
+                runner,
+                "_attest_mcp_proxy_original_mount_namespace",
+                side_effect=runner.RunnerError("original mount namespace unavailable"),
+            ),
+            patch.object(runner, "_read_bound_mcp_stage_metadata") as metadata,
+            self.assertRaisesRegex(
+                runner.RunnerError, "original mount namespace unavailable"
+            ),
+        ):
+            runner._prepared_mcp_upstream_from_parent(
+                "{}", Path("/nonexistent/manifest.json")
+            )
+        metadata.assert_not_called()
+
+    def test_trusted_parent_broker_delayed_sequential_mcp_responses(self) -> None:
+        # Live bwrap, frozen source, authenticated parent-side MCP and an
+        # untrusted Codex-style relay. Nothing invokes the model or uses USD.
+        if sys.platform != "linux" or not Path("/usr/bin/bwrap").is_file():
+            self.skipTest("Linux bwrap required for parent-owned MCP kernel test")
+        with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            original = root / "bundle.manifest.json"
+            original.write_text("{}\n", encoding="utf-8")
+            upstream = root / "stdio.py"
+            upstream.write_text(
+                "import json, sys, time\n"
+                f"TOOLS = {treatment_tools()!r}\n"
+                "for raw in sys.stdin:\n"
+                "    msg = json.loads(raw)\n"
+                "    if msg.get('method') == 'tools/list':\n"
+                "        time.sleep(1.2)\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':msg['id'],"
+                "'result':{'tools':TOOLS}}), flush=True)\n"
+                "    elif msg.get('method') == 'initialize':\n"
+                "        print(json.dumps({'jsonrpc':'2.0','id':msg['id'],"
+                "'result':{'protocolVersion':'2025-06-18',"
+                "'serverInfo':{'name':'fixture','padding':'x'*200000},"
+                "'capabilities':{'tools':{}}}}), flush=True)\n",
+                encoding="utf-8",
+            )
+            python = Path(sys.executable).resolve(strict=True)
+            proxy_python = runner.MCP_PROXY_PYTHON_LINK.resolve(strict=True)
+            authorized = [
+                file_identity(path)
+                for path in dict.fromkeys((python, upstream, proxy_python))
+            ]
+            proxy_stage = runner.stage_mcp_proxy(
+                state,
+                runtime_code_identity(MODULE_PATH),
+                runtime_code_identity(runner.BASE_PATH),
+            )
+            manifest_stage = runner.stage_repoground_manifest(
+                state, file_identity(original)
+            )
+            staged_manifest = Path(manifest_stage["path"])
+            upstream_stage = runner.stage_mcp_upstream(
+                state,
+                [str(python), str(upstream), "--bundle-root", str(staged_manifest)],
+                staged_manifest,
+                authorized,
+            )
+            home = runner.stage_codex_home(state, b"{}")
+            bound = request(condition="treatment")
+            bound["repobrief"]["manifest"] = str(original)
+            bound["repobrief"]["manifest_sha256"] = hashlib.sha256(
+                original.read_bytes()
+            ).hexdigest()
+            bound["repobrief"]["mcp_command"] = [
+                str(python),
+                str(upstream),
+                "--bundle-root",
+                str(original),
+            ]
+            broker = None
+            relay = None
+            try:
+                broker = runner._start_trusted_parent_mcp_broker(
+                    bound,
+                    ROOT,
+                    ROOT,
+                    home,
+                    Path(proxy_stage["path"]),
+                    staged_manifest,
+                    authorized,
+                    upstream_stage,
+                )
+                paths = runner._mcp_parent_bridge_paths(home)
+                # Provider only sees the session home as writable; the
+                # parent owns FIFOs outside it in its read-only mount.
+                argv = [
+                    "/usr/bin/bwrap",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--unshare-pid",
+                    "--unshare-ipc",
+                    "--die-with-parent",
+                    "--proc",
+                    "/proc",
+                    "--dev",
+                    "/dev",
+                    "--tmpfs",
+                    "/tmp",
+                    "--chmod",
+                    "1777",
+                    "/tmp",
+                    "--bind",
+                    str(home),
+                    str(home),
+                    "--",
+                    str(python),
+                    "-I",
+                    "-B",
+                    "-c",
+                    runner._UNTRUSTED_MCP_FIFO_RELAY,
+                    str(paths["request"]),
+                    str(paths["response"]),
+                ]
+                # A hostile process sees a truly read-only containing mount,
+                # not merely a 0444 mode bit on a writable parent directory.
+                # It cannot rename/unlink the bound pipe, steal requests,
+                # or inject forged broker responses into the authentic FIFO.
+                permission_attack = """
+import errno, os, sys
+req, res = sys.argv[1:3]
+for action in (
+    lambda: os.unlink(req),
+    lambda: os.chmod(res, 0o600),
+    lambda: os.open(req, os.O_RDONLY | os.O_NONBLOCK),
+    lambda: os.open(res, os.O_WRONLY | os.O_NONBLOCK),
+):
+    try:
+        action()
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+            raise
+    else:
+        raise RuntimeError("provider altered authentic MCP FIFO")
+print("PARENT_FIFO_UNMODIFIABLE")
+"""
+                adversary = subprocess.run(
+                    [
+                        *argv[: argv.index("--") + 1],
+                        str(python),
+                        "-I",
+                        "-c",
+                        permission_attack,
+                        str(paths["request"]),
+                        str(paths["response"]),
+                    ],
+                    cwd=ROOT,
+                    capture_output=True,
+                    timeout=12,
+                    check=False,
+                )
+                self.assertEqual(adversary.returncode, 0, adversary.stderr)
+                self.assertIn(b"PARENT_FIFO_UNMODIFIABLE", adversary.stdout)
+
+                # Nested user/mount/PID namespaces can still forge a read-only
+                # *view* of the genuine stage; only the separate trusted parent
+                # is allowed to execute source bytes from its own mount view.
+                namespace_attack = """
+import ctypes, os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mount.argtypes = [
+    ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+    ctypes.c_ulong, ctypes.c_char_p,
+]
+if libc.mount(b'tmpfs', os.fsencode(root), b'tmpfs', 0, b'size=1048576'):
+    raise OSError(ctypes.get_errno(), "nested mount unavailable")
+fake = root / 'script' / 'stdio.py'
+fake.parent.mkdir()
+fake.write_text("FAKE_EXECUTABLE_FROM_PROVIDER_NAMESPACE")
+if libc.mount(None, os.fsencode(root), None, 33, None):
+    raise OSError(ctypes.get_errno(), "nested read-only remount failed")
+if not os.statvfs(root).f_flag & os.ST_RDONLY:
+    raise RuntimeError("forged mount is not read-only")
+if fake.read_text() != "FAKE_EXECUTABLE_FROM_PROVIDER_NAMESPACE":
+    raise RuntimeError("forged source is not visible to attacker")
+print("PROVIDER_READONLY_STAGE_FORGED")
+"""
+                nested_argv = [
+                    *argv[: argv.index("--") + 1],
+                    "/usr/bin/unshare",
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--pid",
+                    "--fork",
+                    str(python),
+                    "-I",
+                    "-c",
+                    namespace_attack,
+                    str(upstream_stage["runtime_dir"]),
+                ]
+                nested = subprocess.run(
+                    runner._unix_socket_restricted_codex_argv(
+                        nested_argv, provider_pid_namespace=True
+                    ),
+                    cwd=ROOT,
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                )
+                self.assertEqual(nested.returncode, 0, nested.stderr)
+                self.assertIn(b"PROVIDER_READONLY_STAGE_FORGED", nested.stdout)
+                self.assertIsNone(broker["process"].poll())
+
+                relay = subprocess.Popen(
+                    argv,
+                    cwd=ROOT,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self.assertIsNotNone(relay.stdin)
+                self.assertIsNotNone(relay.stdout)
+                self.assertIsNotNone(relay.stderr)
+                for number in (1, 2):
+                    started = time.monotonic()
+                    message = {
+                        "jsonrpc": "2.0",
+                        "id": number,
+                        "method": "tools/list",
+                        "params": {},
+                    }
+                    relay.stdin.write(json.dumps(message).encode() + b"\n")
+                    relay.stdin.flush()
+                    import select
+
+                    self.assertTrue(
+                        select.select([relay.stdout], [], [], 8)[0],
+                        "trusted parent broker never answered delayed request",
+                    )
+                    response = json.loads(relay.stdout.readline())
+                    self.assertEqual(response["id"], number)
+                    self.assertEqual(
+                        {item["name"] for item in response["result"]["tools"]},
+                        runner.ALLOWED_MCP,
+                    )
+                    self.assertGreater(
+                        time.monotonic() - started,
+                        0.9,
+                        "delayed response was not genuinely delayed",
+                    )
+                # More than the Linux FIFO capacity must not break the
+                # authenticated broker's response framing or lose bytes.
+                huge = {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "initialize",
+                    "params": {},
+                }
+                relay.stdin.write(json.dumps(huge).encode() + b"\n")
+                relay.stdin.flush()
+                self.assertTrue(
+                    select.select([relay.stdout], [], [], 8)[0],
+                    "large MCP response was never forwarded",
+                )
+                bulky_reply = json.loads(relay.stdout.readline())
+                self.assertEqual(bulky_reply["id"], 3)
+                self.assertEqual(
+                    bulky_reply["result"]["serverInfo"]["padding"],
+                    "x" * 200000,
+                )
+                relay.stdin.close()
+                relay.wait(timeout=5)
+                self.assertEqual(relay.returncode, 0, relay.stderr.read())
+            finally:
+                if relay is not None and relay.poll() is None:
+                    relay.kill()
+                    relay.wait(timeout=5)
+                if relay is not None:
+                    for pipe in (relay.stdin, relay.stdout, relay.stderr):
+                        if pipe is not None and not pipe.closed:
+                            pipe.close()
+                if broker is not None:
+                    self.assertIsNone(runner._stop_trusted_parent_mcp_broker(broker))
+                self.assertIsNone(runner.cleanup_staged_mcp_upstream(upstream_stage))
+                self.assertIsNone(
+                    runner.cleanup_staged_repoground_manifest(manifest_stage)
+                )
+                self.assertIsNone(runner.cleanup_staged_mcp_proxy(proxy_stage))
+                self.assertIsNone(runner.cleanup_codex_home(home))
+
+    def test_mcp_proxy_mount_attestation_is_spoofable_by_nested_pid_overlay(
+        self,
+    ) -> None:
+        # Keep the provider-free *counterexample*: this self-attestation is
+        # intentionally NOT a trustworthy proof against nested PID namespaces.
+        # The live authenticated parent-owned broker above must remain immune.
+        if (
+            sys.platform != "linux"
+            or not Path("/usr/bin/bwrap").is_file()
+            or not Path("/usr/bin/unshare").is_file()
+        ):
+            self.skipTest("Linux bwrap + unshare required")
+        program = (
+            "import ctypes, importlib.util, os, sys\n"
+            f"s=importlib.util.spec_from_file_location('rab_mntns_probe',{str(MODULE_PATH)!r})\n"
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+            "if len(sys.argv)>1 and sys.argv[1]=='overlay':\n"
+            f" target={str(ROOT / 'tools')!r}\n"
+            " if not os.statvfs(target).f_flag & os.ST_RDONLY: raise RuntimeError('not readonly')\n"
+            " libc=ctypes.CDLL(None,use_errno=True)\n"
+            " libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_char_p]\n"
+            " if libc.mount(b'tmpfs',os.fsencode(target),b'tmpfs',0,b'size=1048576')!=0:\n"
+            "  if ctypes.get_errno() in (1,13): sys.exit(77)\n"
+            "  raise RuntimeError('nested mount unavailable')\n"
+            " if libc.mount(None,os.fsencode(target),None,33,None)!=0: raise RuntimeError('readonly remount failed')\n"
+            " if not os.statvfs(target).f_flag & os.ST_RDONLY: raise RuntimeError('forged readonly not set')\n"
+            "try:\n"
+            " m._attest_mcp_proxy_original_mount_namespace()\n"
+            "except m.RunnerError:\n"
+            " if len(sys.argv)>1 and sys.argv[1]=='overlay': print('FORGED_STAGE_REJECTED')\n"
+            " else: raise\n"
+            "else:\n"
+            " if len(sys.argv)>1 and sys.argv[1]=='overlay': print('FORGED_STAGE_ADMITTED')\n"
+            " print('ORIGINAL_STAGE_ALLOWED')\n"
+        )
+        sandbox = [
+            "/usr/bin/bwrap",
+            "--ro-bind",
+            "/",
+            "/",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--die-with-parent",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--chmod",
+            "1777",
+            "/tmp",
+            "--",
+        ]
+        clean = subprocess.run(
+            [*sandbox, sys.executable, "-I", "-c", program],
+            cwd=ROOT,
+            capture_output=True,
+            timeout=18,
+            check=False,
+        )
+        if (
+            clean.returncode != 0
+            and b"bwrap: No permissions to create new namespace" in clean.stderr
+        ):
+            self.skipTest("distribution policy denies required bwrap namespace")
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertIn(b"ORIGINAL_STAGE_ALLOWED", clean.stdout)
+        for nested in (
+            [],
+            ["--pid", "--fork", "--mount-proc=/proc"],
+        ):
+            # A second PID 1 and a freshly mounted genuine procfs used to
+            # make the old /proc/self/ns/mnt == /proc/1/ns/mnt check ACCEPT.
+            with self.subTest(nested_pid=bool(nested)):
+                attacked = subprocess.run(
+                    [
+                        *sandbox,
+                        "/usr/bin/unshare",
+                        "--user",
+                        "--map-root-user",
+                        "--mount",
+                        *nested,
+                        sys.executable,
+                        "-I",
+                        "-c",
+                        program,
+                        "overlay",
+                    ],
+                    cwd=ROOT,
+                    capture_output=True,
+                    timeout=18,
+                    check=False,
+                )
+                if attacked.returncode == 77 or (
+                    attacked.returncode != 0
+                    and b"unshare failed: Operation not permitted" in attacked.stderr
+                ):
+                    self.skipTest(
+                        "nested user/mount/PID namespace unavailable on this host"
+                    )
+                self.assertEqual(attacked.returncode, 0, attacked.stderr)
+                self.assertIn(
+                    b"FORGED_STAGE_ADMITTED" if nested else b"FORGED_STAGE_REJECTED",
+                    attacked.stdout,
+                )
+
+    def test_mcp_proxy_mount_attestation_is_spoofable_by_nested_bwrap_alias(
+        self,
+    ) -> None:
+        # Preserve this real Linux bypass as positive evidence against trusting
+        # Procfs/UID/RO self-attestation; only a separate authentic parent broker
+        # is allowed to execute staged MCP program bytes.
+        if sys.platform != "linux" or not Path("/usr/bin/bwrap").is_file():
+            self.skipTest("Linux bwrap required")
+        inner = (
+            "import importlib.util, os\n"
+            f"s=importlib.util.spec_from_file_location('rab_nested_bwrap',{str(MODULE_PATH)!r})\n"
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n"
+            f"target={str(ROOT / 'tests')!r}\n"
+            "if not os.path.isfile(target+'/FORGED_MCP_PARENT_STAGE'): raise RuntimeError('fake mount missing')\n"
+            "if not os.statvfs(target).f_flag & os.ST_RDONLY: raise RuntimeError('fake mount writable')\n"
+            "print('FORGED_BIND_READONLY',flush=True)\n"
+            "try: m._attest_mcp_proxy_original_mount_namespace()\n"
+            "except m.RunnerError: print('NESTED_BWRAP_REJECTED')\n"
+            "else: print('NESTED_BWRAP_ACCEPTED')\n"
+        )
+        outer = (
+            "import pathlib, subprocess, sys\n"
+            "fake=pathlib.Path('/tmp/forged-mcp-parent-stage'); fake.mkdir()\n"
+            "(fake/'FORGED_MCP_PARENT_STAGE').write_text('untrusted')\n"
+            "cmd=['/usr/bin/bwrap','--ro-bind','/','/',"
+            "'--unshare-pid','--unshare-ipc','--die-with-parent','--proc','/proc',"
+            "'--dev','/dev','--ro-bind',str(fake),sys.argv[2],"
+            "'--tmpfs','/tmp','--chmod','1777','/tmp','--',"
+            "sys.executable,'-I','-c',sys.argv[1]]\n"
+            "r=subprocess.run(cmd,capture_output=True,timeout=10)\n"
+            "if r.returncode: print('NESTED_BWRAP_FAILED',r.stderr.decode(errors='replace'))\n"
+            "else: sys.stdout.buffer.write(r.stdout)\n"
+        )
+        completed = subprocess.run(
+            [
+                "/usr/bin/bwrap",
+                "--ro-bind",
+                "/",
+                "/",
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--die-with-parent",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--chmod",
+                "1777",
+                "/tmp",
+                "--",
+                sys.executable,
+                "-I",
+                "-c",
+                outer,
+                inner,
+                str(ROOT / "tests"),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        if (
+            completed.returncode != 0
+            and b"No permissions to create new namespace" in completed.stderr
+        ):
+            self.skipTest("distribution policy denies required bwrap namespace")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(b"FORGED_BIND_READONLY", completed.stdout)
+        self.assertIn(b"NESTED_BWRAP_ACCEPTED", completed.stdout)
+
     def test_mcp_stage_rejects_valid_stale_sibling_before_new_stage(self) -> None:
         # A previous interrupted run can leave a still-valid staged closure.
         # Admission of a second one would let hostile Codex switch the
@@ -7236,7 +8007,15 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     runner._mcp_stage_wire(selected["metadata_binding"])
                 )
                 with self.subTest(selected=Path(selected["runtime_dir"]).name):
-                    with self.assertRaisesRegex(runner.RunnerError, "sibling"):
+                    # This unit fixture runs outside the real isolated
+                    # provider PID namespace. Keep the independent sibling
+                    # rejection under test without bypassing it in production.
+                    with (
+                        patch.object(
+                            runner, "_attest_mcp_proxy_original_mount_namespace"
+                        ),
+                        self.assertRaisesRegex(runner.RunnerError, "sibling"),
+                    ):
                         runner._prepared_mcp_upstream_from_parent(
                             reference, bound_manifest
                         )
@@ -10741,6 +11520,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     manifest_path=staged_manifest.resolve(),
                     mcp_runtime_root=state_root.resolve(),
                     prepared_mcp_stage=synthetic_prepared_stage(root),
+                    mcp_bridge=synthetic_parent_mcp_bridge(codex_home),
                 )
             encoded = next(
                 item
@@ -10748,18 +11528,17 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 if item.startswith("mcp_servers.repobrief.args=")
             )
             proxy_args = json.loads(encoded.split("=", 1)[1])
-            self.assertEqual(proxy_args[:2], ["-I", "-c"])
-            self.assertEqual(proxy_args[2], bootstrap_program())
-            self.assertEqual(proxy_args[3], str(binding["path"]))
-            marker = proxy_args.index("--codex-mcp-proxy")
-            upstream = json.loads(proxy_args[marker + 1])
-            bundle_index = upstream.index("--bundle-root")
-            self.assertEqual(upstream[bundle_index + 1], str(staged_manifest.resolve()))
-            self.assertEqual(proxy_args[marker + 2], str(staged_manifest.resolve()))
+            self.assertEqual(proxy_args[:3], ["-I", "-B", "-c"])
+            self.assertEqual(proxy_args[3], runner._UNTRUSTED_MCP_FIFO_RELAY)
             self.assertEqual(
-                proxy_args[marker + 3],
-                request(condition="treatment")["repobrief"]["manifest"],
+                proxy_args[4:],
+                [
+                    str(runner._mcp_parent_bridge_paths(codex_home)["request"]),
+                    str(runner._mcp_parent_bridge_paths(codex_home)["response"]),
+                ],
             )
+            self.assertNotIn(str(binding["path"]), encoded)
+            self.assertNotIn(str(staged_manifest), encoded)
             self.assertNotIn(str(source), encoded)
             self.assertIsNone(runner.cleanup_staged_mcp_proxy(binding))
 
@@ -10870,14 +11649,23 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                     manifest_path=staged.resolve(),
                     mcp_runtime_root=state_root.resolve(),
                     prepared_mcp_stage=synthetic_prepared_stage(root),
+                    mcp_bridge=synthetic_parent_mcp_bridge(codex_home),
                 )
             encoded = next(
                 item
                 for item in command
                 if item.startswith("mcp_servers.repobrief.args=")
             )
-            self.assertIn(str(staged), encoded)
+            self.assertNotIn(str(staged), encoded)
             self.assertNotIn(str(manifest), encoded)
+            # The trusted parent (not provider argv) still pins the actual
+            # immutable bundle path before opening the broker.
+            parent_argv = runner._treatment_mcp_upstream_command(
+                request(condition="treatment"), checkout, None, staged.resolve()
+            )
+            self.assertEqual(
+                parent_argv[parent_argv.index("--bundle-root") + 1], str(staged)
+            )
             runner._revalidate_staged_repoground_manifest(binding)
             self.assertIsNone(runner.cleanup_staged_repoground_manifest(binding))
             self.assertFalse(staged.exists())

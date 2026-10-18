@@ -2513,6 +2513,25 @@ def _preintent_output_entry_reservation(
         / "repoground-mcp-upstream-runtime"
         / ("upstream-" + "0" * 24)
     )
+    # Stage serialization uses ensure_ascii=False and UTF-8. Linux paths can
+    # contain surrogateescaped bytes; an ASCII-escaped size estimate alone
+    # would admit them before Baseline but fail Treatment after one-shot intent.
+    try:
+        path_max = os.pathconf("/", "PC_PATH_MAX")
+    except (OSError, ValueError) as exc:
+        raise RunnerError("pre-intent Linux path limit unavailable") from exc
+    if type(path_max) is not int or path_max <= 0:
+        raise RunnerError("pre-intent Linux path limit is invalid")
+    try:
+        for field in (manifest, mcp_script, prospective_root, source_tree.get("root")):
+            if field is not None:
+                str(field).encode("utf-8")
+        for relative in upstream_files:
+            candidate = str(prospective_root / relative).encode("utf-8")
+            if len(candidate) >= path_max:
+                raise RunnerError("pre-intent MCP staged path exceeds Linux PATH_MAX")
+    except UnicodeEncodeError as exc:
+        raise RunnerError("pre-intent MCP stage metadata path is not UTF-8") from exc
     metadata_upper_bound = 1024 * 1024 + sum(
         512 + len(json.dumps(str(prospective_root / relative), ensure_ascii=True))
         for relative in upstream_files
@@ -2532,6 +2551,7 @@ def _preintent_output_entry_reservation(
         + 2
         + len(upstream_files)
         + len(upstream_directories)
+        + 2  # temporary MCP FIFOs in parent-owned read-only codex-runtime
     )
 
 
@@ -7560,6 +7580,65 @@ def _pin_treatment_arguments(
     arguments["stem"] = None
 
 
+def _attest_mcp_proxy_original_mount_namespace() -> None:
+    """Detect ordinary mount drift inside a trusted parent-started broker.
+
+    Nested Codex user namespaces can mount attacker bytes over a read-only
+    stage and remount them read-only.  A statvfs RO bit or an argv hash
+    cannot authenticate the original parent stage.  The fresh outer bwrap
+    PID namespace has a fixed PID 1; only that initial mount namespace
+    may read or run parent-staged MCP program bytes.  Authenticate both
+    namespace links as kernel-procfs objects on ONE mount before comparison:
+    bind-overlaid procfs names or substituted nsfs links must not pass.
+    """
+    if sys.platform != "linux" or not hasattr(os, "O_PATH"):
+        raise RunnerError("MCP proxy mount namespace attestation requires Linux")
+    opened: list[int] = []
+    try:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+        proc = os.open("/proc", directory_flags)
+        opened.append(proc)
+        mount_id = _kernel_procfs_mount_id(proc)
+        identities: list[str] = []
+        for process in ("self", "1"):
+            process_dir = os.open(
+                process,
+                directory_flags & ~os.O_NOFOLLOW
+                if process == "self"
+                else directory_flags,
+                dir_fd=proc,
+            )
+            opened.append(process_dir)
+            namespace_dir = os.open("ns", directory_flags, dir_fd=process_dir)
+            opened.append(namespace_dir)
+            namespace_link = os.open(
+                "mnt",
+                os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=namespace_dir,
+            )
+            opened.append(namespace_link)
+            if any(
+                _kernel_procfs_mount_id(fd) != mount_id
+                for fd in (process_dir, namespace_dir, namespace_link)
+            ) or not stat.S_ISLNK(os.fstat(namespace_link).st_mode):
+                raise RunnerError("MCP proxy mount namespace procfs is untrusted")
+            link = os.readlink("", dir_fd=namespace_link)
+            if re.fullmatch(r"mnt:\[[0-9]+\]", link) is None:
+                raise RunnerError("MCP proxy mount namespace link is invalid")
+            identities.append(link)
+        if identities[0] != identities[1]:
+            raise RunnerError(
+                "MCP proxy has left the parent-staged read-only mount namespace"
+            )
+    except (OSError, ValueError, AttributeError) as exc:
+        raise RunnerError(
+            "MCP proxy kernel mount namespace attestation unavailable"
+        ) from exc
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
+
+
 def _prepared_mcp_upstream_from_parent(
     stage_text: str, manifest: Path
 ) -> dict[str, Any]:
@@ -7568,6 +7647,7 @@ def _prepared_mcp_upstream_from_parent(
     All executable bytes are staged before provider intent. This child never
     writes executable files or trusts a final digest to cover a transient edit.
     """
+    _attest_mcp_proxy_original_mount_namespace()
     if not isinstance(stage_text, str) or len(stage_text.encode("utf-8")) > 8192:
         raise RunnerError("MCP stage metadata reference exceeds its argv bound")
     try:
@@ -7653,6 +7733,7 @@ def run_mcp_proxy(
     runtime_root_text: str,
     *,
     profile: str = MCP_PROFILE_MODERN,
+    trusted_ready_fd: int | None = None,
 ) -> int:
     if not upstream or any(not isinstance(item, str) or not item for item in upstream):
         raise RunnerError("invalid MCP upstream argv")
@@ -7687,8 +7768,9 @@ def run_mcp_proxy(
         manifest_metadata.st_size,
         manifest_metadata.st_mode,
     )
-    # The provider-controlled process must never stage executable bytes.
-    # The root-owned parent prepared and bound the entire closure before intent.
+    # The true runner, NOT this child's namespace/procfs introspection,
+    # authorizes source provenance by launching and owning the separate broker
+    # and checking its private readiness pipe. This check is defense-in-depth.
     upstream_stage = _prepared_mcp_upstream_from_parent(runtime_root_text, manifest)
     bound_upstream = [str(item) for item in upstream_stage["argv"]]
     staged_manifest = Path(upstream_stage["manifest_binding"]["path"])
@@ -7707,6 +7789,11 @@ def run_mcp_proxy(
             raise RunnerError("MCP upstream could not be started") from exc
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise RunnerError("MCP upstream pipes unavailable")
+        if trusted_ready_fd is not None:
+            if type(trusted_ready_fd) is not int or trusted_ready_fd < 3:
+                raise RunnerError("trusted MCP broker readiness FD is invalid")
+            os.write(trusted_ready_fd, _MCP_BROKER_READY)
+            os.close(trusted_ready_fd)
         output_lock = threading.Lock()
         state_lock = threading.Lock()
         pending_requests: dict[Any, str] = {}
@@ -8432,6 +8519,359 @@ def _treatment_mcp_upstream_command(
     return upstream
 
 
+# Codex may enter arbitrarily nested mount/user/PID namespaces. Its MCP command
+# must only transport untrusted JSON bytes to a *parent-launched* read-only MCP
+# process. It must never load/revalidate executable program files in its own
+# namespace, where both the files and kernel mount evidence can be forged.
+_UNTRUSTED_MCP_FIFO_RELAY = r"""
+import json
+import os
+import select
+import stat
+import sys
+import threading
+import time
+
+if len(sys.argv) != 3:
+    raise RuntimeError("MCP FIFO bridge requires two bound absolute paths")
+request, response = sys.argv[1:3]
+for value in (request, response):
+    if not os.path.isabs(value) or os.path.normpath(value) != value:
+        raise RuntimeError("MCP FIFO bridge path is invalid")
+flags = os.O_NONBLOCK | os.O_NOFOLLOW
+sent = os.open(request, os.O_WRONLY | flags)
+received = os.open(response, os.O_RDONLY | flags)
+if not all(stat.S_ISFIFO(os.fstat(fd).st_mode) for fd in (sent, received)):
+    raise RuntimeError("MCP FIFO bridge is not a pipe")
+# Only the trusted parent owns the write end of the response FIFO.
+if stat.S_IMODE(os.fstat(sent).st_mode) != 0o200 or stat.S_IMODE(os.fstat(received).st_mode) != 0o400:
+    raise RuntimeError("MCP FIFO bridge permissions changed")
+failures = []
+finished = threading.Event()
+pending_lock = threading.Lock()
+pending = set()
+max_line_bytes = 16 * 1024 * 1024
+
+def key_of(line):
+    message = json.loads(line)
+    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+        raise RuntimeError("MCP FIFO bridge JSON-RPC message is invalid")
+    if "id" not in message:
+        return None
+    identity = message["id"]
+    if type(identity) not in (int, str):
+        raise RuntimeError("MCP FIFO bridge JSON-RPC ID is invalid")
+    return type(identity).__name__, identity
+
+def write_all(fd, payload):
+    view = memoryview(payload)
+    deadline = time.monotonic() + 30
+    while view:
+        if not select.select([], [fd], [], 0.25)[1]:
+            if time.monotonic() > deadline:
+                raise RuntimeError("MCP FIFO bridge write timeout")
+            continue
+        try:
+            written = os.write(fd, view)
+        except BlockingIOError:
+            continue
+        if written <= 0:
+            raise RuntimeError("MCP FIFO bridge short write")
+        view = view[written:]
+
+def forward_input():
+    partial = bytearray()
+    try:
+        while True:
+            chunk = os.read(0, 65536)
+            if not chunk:
+                if partial:
+                    raise RuntimeError("MCP FIFO bridge request is unterminated")
+                return
+            partial.extend(chunk)
+            while b"\n" in partial:
+                line, _, rest = partial.partition(b"\n")
+                partial = bytearray(rest)
+                if len(line) + 1 > max_line_bytes:
+                    raise RuntimeError("MCP FIFO bridge request too large")
+                packet = bytes(line) + b"\n"
+                key = key_of(packet)
+                if key is not None:
+                    with pending_lock:
+                        if key in pending:
+                            raise RuntimeError("MCP FIFO bridge reused a pending ID")
+                        pending.add(key)
+                write_all(sent, packet)
+            if len(partial) > max_line_bytes:
+                raise RuntimeError("MCP FIFO bridge request too large")
+    except BaseException as exc:
+        failures.append(exc)
+    finally:
+        finished.set()
+
+worker = threading.Thread(target=forward_input, daemon=True)
+worker.start()
+partial = bytearray()
+try:
+    while True:
+        if failures:
+            raise RuntimeError("MCP FIFO bridge request transport failed") from failures[0]
+        with pending_lock:
+            all_answered = not pending
+        if finished.is_set() and all_answered and not partial:
+            break
+        if not select.select([received], [], [], 0.1)[0]:
+            continue
+        try:
+            chunk = os.read(received, 65536)
+        except BlockingIOError:
+            continue
+        if not chunk:
+            raise RuntimeError("trusted MCP parent transport closed")
+        partial.extend(chunk)
+        while b"\n" in partial:
+            line, _, rest = partial.partition(b"\n")
+            partial = bytearray(rest)
+            if len(line) + 1 > max_line_bytes:
+                raise RuntimeError("MCP FIFO bridge response too large")
+            packet = bytes(line) + b"\n"
+            key = key_of(packet)
+            if key is not None:
+                with pending_lock:
+                    if key not in pending:
+                        raise RuntimeError("MCP FIFO bridge unexpected response ID")
+                    pending.remove(key)
+            write_all(1, packet)
+        if len(partial) > max_line_bytes:
+            raise RuntimeError("MCP FIFO bridge response too large")
+finally:
+    os.close(sent)
+    os.close(received)
+if failures:
+    raise RuntimeError("MCP FIFO bridge failed")
+"""
+
+_MCP_BRIDGE_REQUEST_NAME = "repobrief-requests.fifo"
+_MCP_BRIDGE_RESPONSE_NAME = "repobrief-responses.fifo"
+_MCP_BROKER_READY = b"TRUSTED_MCP_READY\n"
+
+
+def _mcp_parent_bridge_paths(codex_home: Path) -> dict[str, Path]:
+    """The provider can write only session HOME, never its parent directory."""
+    name = codex_home.name + "-"
+    return {
+        "request": codex_home.parent / (name + _MCP_BRIDGE_REQUEST_NAME),
+        "response": codex_home.parent / (name + _MCP_BRIDGE_RESPONSE_NAME),
+    }
+
+
+def _start_trusted_parent_mcp_broker(
+    request: Mapping[str, Any],
+    checkout: Path,
+    source: Path,
+    codex_home: Path,
+    proxy_path: Path,
+    manifest_path: Path,
+    authorized_files: Sequence[Mapping[str, Any]],
+    staged: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Launch authentic MCP bytes as a trusted runner child, not a Codex child.
+
+    The two FIFOs are in the parent-owned read-only directory (outside
+    writable CODEX_HOME). The parent pins both inodes and opens them before exec.
+    Its broker runs in a separate read-only bwrap PID/mount namespace, and
+    authenticates the stage *before* signalling readiness through a private FD.
+    """
+    home, home_fd = _open_private_directory(codex_home, create_final=False)
+    parent, parent_fd = _open_private_directory(codex_home.parent, create_final=False)
+    pipes: list[dict[str, Any]] = []
+    descriptors: list[int] = []
+    broker: subprocess.Popen[bytes] | None = None
+    ready_read: int | None = None
+    ready_write: int | None = None
+    try:
+        if (
+            home != codex_home
+            or parent != home.parent
+            or re.fullmatch(r"session-[0-9a-f]{24}", home.name) is None
+            or parent.name != "codex-runtime"
+        ):
+            raise RunnerError("trusted MCP bridge private home identity invalid")
+        # The real provider bwrap mounts only *home* writable. These FIFOs
+        # belong to its read-only parent, so the provider cannot replace,
+        # chmod, rename, or alias the authoritative transport in that mount.
+        for kind, path in _mcp_parent_bridge_paths(home).items():
+            name = path.name
+            os.mkfifo(name, 0o600, dir_fd=parent_fd)
+            descriptor = os.open(
+                name, os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent_fd
+            )
+            descriptors.append(descriptor)
+            # The untrusted process may send requests but never read another
+            # client's requests, and may read responses but never inject them
+            # into the authentic broker's response FIFO.
+            final_mode = 0o200 if kind == "request" else 0o400
+            os.chmod(name, final_mode, dir_fd=parent_fd, follow_symlinks=False)
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            current = os.fstat(descriptor)
+            if (
+                not stat.S_ISFIFO(info.st_mode)
+                or stat.S_IMODE(info.st_mode) != final_mode
+                or info.st_uid != os.geteuid()
+                or info.st_nlink != 1
+                or (current.st_dev, current.st_ino, current.st_mode)
+                != (info.st_dev, info.st_ino, info.st_mode)
+            ):
+                raise RunnerError("trusted MCP bridge FIFO identity is unsafe")
+            pipes.append(
+                {"path": path, "identity": (info.st_dev, info.st_ino, info.st_mode)}
+            )
+            if kind == "response":
+                # The trusted Python proxy uses buffered stdout.write/flush.
+                # A nonblocking FIFO drops large (>pipe-capacity) responses
+                # with EAGAIN despite a perfectly healthy downstream reader.
+                # Its separate provider relay has O_NONBLOCK reads and drains
+                # this blocking broker writer concurrently.
+                os.set_blocking(descriptor, True)
+        _directory_fd_matches(home, home_fd)
+        _directory_fd_matches(parent, parent_fd)
+        reference = staged.get("metadata_binding")
+        if not isinstance(reference, Mapping):
+            raise RunnerError("trusted parent MCP metadata reference unavailable")
+        logical_manifest = Path(request["repobrief"]["manifest"]).expanduser()
+        upstream = _treatment_mcp_upstream_command(
+            request, checkout, source, manifest_path
+        )
+        profile = _frozen_g1_mcp_profile(request)
+        ready_read, ready_write = os.pipe2(os.O_CLOEXEC)
+        proxy_args = [
+            _validated_mcp_proxy_python(authorized_files),
+            "-I",
+            "-B",
+            "-c",
+            _bootstrap_program_text(),
+            str(proxy_path),
+            "--codex-mcp-proxy",
+            "--trusted-broker-ready-fd",
+            str(ready_write),
+            canonical(upstream),
+            str(manifest_path),
+            str(logical_manifest),
+            str(request["repobrief"]["manifest_sha256"]),
+            canonical(list(authorized_files)),
+            canonical(_mcp_stage_wire(dict(reference))),
+        ]
+        if profile == MCP_PROFILE_FROZEN_G1:
+            proxy_args.append(profile)
+        bwrap = [
+            "/usr/bin/bwrap",
+            "--ro-bind",
+            "/",
+            "/",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--die-with-parent",
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--tmpfs",
+            "/tmp",
+            "--chmod",
+            "1777",
+            "/tmp",
+            "--",
+            *proxy_args,
+        ]
+        broker = subprocess.Popen(
+            _unix_socket_restricted_codex_argv(bwrap, block_network=True),
+            stdin=descriptors[0],
+            stdout=descriptors[1],
+            stderr=subprocess.DEVNULL,
+            env={**provider_env(codex_home=codex_home), "HOME": "/nonexistent"},
+            pass_fds=(ready_write,),
+            start_new_session=True,
+            shell=False,
+        )
+        os.close(ready_write)
+        ready_write = None
+        with selectors.DefaultSelector() as selector:
+            selector.register(ready_read, selectors.EVENT_READ)
+            events = selector.select(10)
+        signal_bytes = (
+            os.read(ready_read, len(_MCP_BROKER_READY) + 1) if events else b""
+        )
+        if signal_bytes != _MCP_BROKER_READY or broker.poll() is not None:
+            raise RunnerError(
+                "trusted parent MCP broker did not authenticate readiness"
+            )
+        return {"process": broker, "pipes": pipes, "home": home, "parent": parent}
+    except BaseException:
+        if broker is not None:
+            try:
+                os.killpg(broker.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+            try:
+                broker.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        for pipe in pipes:
+            try:
+                pipe["path"].unlink()
+            except OSError:
+                pass
+        raise
+    finally:
+        if ready_read is not None:
+            os.close(ready_read)
+        if ready_write is not None:
+            os.close(ready_write)
+        for descriptor in descriptors:
+            os.close(descriptor)
+        os.close(parent_fd)
+        os.close(home_fd)
+
+
+def _stop_trusted_parent_mcp_broker(binding: Mapping[str, Any]) -> str | None:
+    """Kill the entire trusted broker group, including orphaned descendants."""
+    errors: list[str] = []
+    process = binding["process"]
+    if not isinstance(process, subprocess.Popen):
+        raise RunnerError("trusted MCP broker process handle invalid")
+    # poll() observes only the broker leader. A dead leader can leave its
+    # child MCP server alive in the same process group; never skip killpg.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        errors.append(f"broker-kill:{type(exc).__name__}")
+    try:
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        errors.append(f"broker-reap:{type(exc).__name__}")
+    if process.stderr is not None:
+        process.stderr.close()
+    for pipe in binding["pipes"]:
+        path = pipe["path"]
+        try:
+            info = path.lstat()
+            if (
+                not stat.S_ISFIFO(info.st_mode)
+                or (info.st_dev, info.st_ino, info.st_mode) != pipe["identity"]
+                or path.parent != binding["parent"]
+            ):
+                errors.append("broker-fifo-identity-drift")
+                continue
+            path.unlink()
+        except OSError as exc:
+            errors.append(f"broker-fifo-cleanup:{type(exc).__name__}")
+    return ";".join(errors) or None
+
+
 def build_command(
     request: Mapping[str, Any],
     codex: str,
@@ -8445,6 +8885,7 @@ def build_command(
     mcp_runtime_root: Path | None = None,
     source: Path | None = None,
     prepared_mcp_stage: Mapping[str, Any] | None = None,
+    mcp_bridge: Mapping[str, Any] | None = None,
 ) -> list[str]:
     filesystem = (
         '{":minimal"="read",":workspace_roots"={"."="read"},'
@@ -8506,31 +8947,39 @@ def build_command(
         binding = request["repobrief"]
         if prepared_mcp_stage is None:
             raise RunnerError("treatment requires parent-prepared immutable MCP stage")
-        upstream = _treatment_mcp_upstream_command(
-            request, checkout, source, manifest_path
-        )
+        _treatment_mcp_upstream_command(request, checkout, source, manifest_path)
         metadata_reference = prepared_mcp_stage.get("metadata_binding")
         if not isinstance(metadata_reference, Mapping):
             raise RunnerError("treatment requires bound MCP stage metadata")
         logical_manifest = Path(str(binding.get("manifest"))).expanduser()
         if not logical_manifest.is_absolute():
             raise RunnerError("treatment logical manifest path must be absolute")
+        # The provider is untrusted even inside a syntactically read-only mount.
+        # Only the bytes of MCP JSON-RPC may cross to a trusted parent-launched
+        # broker; no executable path or source/manifest stage metadata enters
+        # the Codex MCP subprocess command line.
+        _frozen_g1_mcp_profile(request)
+        if not isinstance(mcp_bridge, Mapping) or set(mcp_bridge) != {
+            "request",
+            "response",
+        }:
+            raise RunnerError("treatment requires trusted parent-owned MCP bridge")
+        request_pipe = Path(mcp_bridge["request"])
+        response_pipe = Path(mcp_bridge["response"])
+        expected_bridge = _mcp_parent_bridge_paths(codex_home)
+        if (
+            request_pipe != expected_bridge["request"]
+            or response_pipe != expected_bridge["response"]
+        ):
+            raise RunnerError("trusted MCP bridge paths escaped bound CODEX_HOME")
         proxy_args = [
             "-I",
+            "-B",
             "-c",
-            _bootstrap_program_text(),
-            str(proxy_path),
-            "--codex-mcp-proxy",
-            canonical(upstream),
-            str(manifest_path),
-            str(logical_manifest),
-            str(binding["manifest_sha256"]),
-            canonical(list(authorized_mcp_files)),
-            canonical(_mcp_stage_wire(dict(metadata_reference))),
+            _UNTRUSTED_MCP_FIFO_RELAY,
+            str(request_pipe),
+            str(response_pipe),
         ]
-        mcp_profile = _frozen_g1_mcp_profile(request)
-        if mcp_profile == MCP_PROFILE_FROZEN_G1:
-            proxy_args.append(mcp_profile)
         command[2:2] = [
             "-c",
             f"mcp_servers.repobrief.command={_toml_string(proxy_python)}",
@@ -10199,6 +10648,7 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
             proxy_binding: dict[str, Any] | None = None
             manifest_binding: dict[str, Any] | None = None
             upstream_stage: dict[str, Any] | None = None
+            trusted_mcp_broker: dict[str, Any] | None = None
             try:
                 if request["condition"] == "treatment":
                     if (
@@ -10257,6 +10707,13 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     mcp_runtime_root=args.state_root,
                     source=source,
                     prepared_mcp_stage=upstream_stage,
+                    mcp_bridge=(
+                        None
+                        if upstream_stage is None
+                        else {
+                            **_mcp_parent_bridge_paths(codex_home),
+                        }
+                    ),
                 )
                 if dispatch_authorization is None:
                     raise RunnerError(
@@ -10319,6 +10776,22 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                     # before irreversible provider intent; the provider child
                     # independently checks its own kernel-readonly view.
                     _revalidate_staged_mcp_upstream(upstream_stage)
+                    if (
+                        proxy_binding is None
+                        or manifest_binding is None
+                        or authorized_mcp_files is None
+                    ):
+                        raise RunnerError("trusted MCP broker parent binding missing")
+                    trusted_mcp_broker = _start_trusted_parent_mcp_broker(
+                        request,
+                        checkout,
+                        source,
+                        codex_home,
+                        Path(proxy_binding["path"]),
+                        Path(manifest_binding["path"]),
+                        authorized_mcp_files,
+                        upstream_stage,
+                    )
                 provider_argv = _unix_socket_restricted_codex_argv(
                     _provider_pid_namespaced_codex_argv(command, **pid_sandbox),
                     provider_pid_namespace=True,
@@ -10349,6 +10822,11 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 )
                 provider_ended_at = utc_now()
             except BaseException as exc:
+                broker_cleanup_error = (
+                    None
+                    if trusted_mcp_broker is None
+                    else _stop_trusted_parent_mcp_broker(trusted_mcp_broker)
+                )
                 upstream_cleanup_error = (
                     None
                     if upstream_stage is None
@@ -10366,15 +10844,16 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                 )
                 cleanup_error = cleanup_codex_home(codex_home)
                 if (
-                    upstream_cleanup_error is not None
+                    broker_cleanup_error is not None
+                    or upstream_cleanup_error is not None
                     or manifest_cleanup_error is not None
                     or proxy_cleanup_error is not None
                     or cleanup_error is not None
                 ):
                     failure_exc = RunnerError(
                         "Codex failed before capture completion and private runtime cleanup failed: "
-                        f"upstream={upstream_cleanup_error} manifest={manifest_cleanup_error} "
-                        f"proxy={proxy_cleanup_error} home={cleanup_error}"
+                        f"broker={broker_cleanup_error} upstream={upstream_cleanup_error} "
+                        f"manifest={manifest_cleanup_error} proxy={proxy_cleanup_error} home={cleanup_error}"
                     )
                     if dispatch_intent_recorded and dispatch_authorization is not None:
                         try:
@@ -10405,6 +10884,22 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
                         ) from ledger_exc
                 raise
             capture = dict(capture)
+            if trusted_mcp_broker is not None:
+                if trusted_mcp_broker["process"].poll() is not None:
+                    prior = capture.get("capture_error")
+                    marker = "trusted_mcp_broker_exited_during_provider"
+                    capture["capture_error"] = (
+                        marker if prior is None else f"{prior};{marker}"
+                    )
+                broker_cleanup_error = _stop_trusted_parent_mcp_broker(
+                    trusted_mcp_broker
+                )
+                if broker_cleanup_error is not None:
+                    prior = capture.get("capture_error")
+                    marker = f"trusted_mcp_broker_cleanup_failed:{broker_cleanup_error}"
+                    capture["capture_error"] = (
+                        marker if prior is None else f"{prior};{marker}"
+                    )
             if upstream_stage is not None:
                 try:
                     _revalidate_staged_mcp_upstream(upstream_stage)
@@ -10629,6 +11124,20 @@ def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw and raw[0] == "--codex-mcp-proxy":
         try:
+            # A provider-created nested mount/PID namespace can forge every
+            # self-attestation below. Only the original trusted runner starts
+            # this broker with a private readiness pipe that IT verifies.
+            # Direct CLI invocation without that parent transport is retired.
+            if len(raw) < 3 or raw[1] != "--trusted-broker-ready-fd":
+                raise RunnerError(
+                    "direct Codex MCP proxy is disabled without parent-owned readiness"
+                )
+            if not raw[2].isascii() or not raw[2].isdecimal():
+                raise RunnerError("trusted MCP broker readiness FD is invalid")
+            trusted_ready_fd = int(raw[2])
+            if trusted_ready_fd < 3:
+                raise RunnerError("trusted MCP broker readiness FD is invalid")
+            raw = [raw[0], *raw[3:]]
             if len(raw) not in (7, 8):
                 raise RunnerError(
                     "codex MCP proxy requires exactly the authorized upstream, manifest, file identities, runtime root and optional frozen G1 profile"
@@ -10650,9 +11159,16 @@ def main(argv: list[str] | None = None) -> int:
                     authorized_files,
                     raw[6],
                     profile=raw[7],
+                    trusted_ready_fd=trusted_ready_fd,
                 )
             return run_mcp_proxy(
-                upstream, raw[2], raw[3], raw[4], authorized_files, raw[6]
+                upstream,
+                raw[2],
+                raw[3],
+                raw[4],
+                authorized_files,
+                raw[6],
+                trusted_ready_fd=trusted_ready_fd,
             )
         except Exception as exc:
             print(f"codex MCP proxy failed: {exc}", file=sys.stderr)
