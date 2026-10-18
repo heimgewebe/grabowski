@@ -3143,11 +3143,14 @@ def _continuation_preimage(
 
 def _normalize_lane_resource_keys(values: list[str]) -> list[str]:
     """Normalize a bounded whole-lane manifest; atomic resource calls stay <=64."""
-    if not isinstance(values, list) or len(values) > MAX_TERMINAL_OWNER_LEASES:
-        raise ValueError("Work Lane resource_keys must be a bounded list")
+    # Raw input stays finite, but the lease limit applies after deduplication.
+    if not isinstance(values, list) or len(values) > MAX_TERMINAL_OWNER_LEASES * 2:
+        raise ValueError("Work Lane raw resource_keys exceed bounded input")
     normalized = sorted({resources.normalize_resource_key(key) for key in values})
     if not normalized:
         raise ValueError("at least one resource key is required")
+    if len(normalized) > MAX_TERMINAL_OWNER_LEASES:
+        raise ValueError("Work Lane normalized resource_keys exceed bounded manifest")
     return normalized
 
 

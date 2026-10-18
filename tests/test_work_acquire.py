@@ -509,6 +509,23 @@ class WorkAcquireTests(unittest.TestCase):
         )
         self.assertEqual(result["decision"], "AUTO_PREPARE_AND_EXECUTE")
 
+    def test_large_scope_duplicate_keys_bound_by_normalized_manifest(self) -> None:
+        params = self.parameters()
+        paths = [f"src/part-{i:03d}.py" for i in range(256)]
+        params["write_paths"] = paths
+        params["resource_keys"] = [f"path:{self.repo / item}" for item in paths]
+        inputs = work_acquire._normalize(params)
+        self.assertEqual(len(inputs["resource_keys"]), 258)
+        plan = work_acquire._resource_acquisition_plan(inputs["resource_keys"])
+        self.assertEqual([len(g["resource_keys"]) for g in plan], [64,64,64,64,2])
+        self.assertEqual(len(work_acquire._normalize_lane_resource_keys(
+            [f"component:unique-{i:03d}" for i in range(512)])), 512)
+        with self.assertRaisesRegex(ValueError, "normalized"):
+            work_acquire._normalize_lane_resource_keys(
+                [f"component:unique-{i:03d}" for i in range(513)])
+        with self.assertRaisesRegex(ValueError, "bounded input"):
+            work_acquire._normalize_lane_resource_keys(["component:duplicate"]*1025)
+
     def test_large_scope_atomic_batches(self) -> None:
         for total in (63, 64, 65, 78):
             with self.subTest(total=total):
