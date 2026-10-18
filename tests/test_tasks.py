@@ -11434,7 +11434,18 @@ class TaskTests(unittest.TestCase):
                 tasks, "_observe",
                 return_value={
                     "state": "running",
-                    "properties": {"LoadState": "loaded", "ActiveState": "active"},
+                    "properties": {
+                        "LoadState": "loaded", "ActiveState": "active",
+                        "SubState": "running",
+                    },
+                    "probe": {
+                        "returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False,
+                    },
+                    "observer": {
+                        "kind": "bound-local-user-systemd-show-v1",
+                        "transport": "local",
+                    },
                     "observed_at_unix": tasks._now(),
                 },
             ),
@@ -11445,6 +11456,54 @@ class TaskTests(unittest.TestCase):
         self.assertEqual("running", peek["state"])
         self.assertEqual("launching", peek["persisted_state"])
         self.assertFalse(peek["reconcile_required"])
+        self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_launching_running_requires_complete_local_probe(self) -> None:
+        task = self._start()["task"]
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='launching' WHERE task_id=?", (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        good = {
+            "state": "running",
+            "properties": {
+                "LoadState": "loaded", "ActiveState": "active",
+                "SubState": "running",
+            },
+            "probe": {
+                "returncode": 0, "timed_out": False,
+                "stdout_truncated": False, "stderr_truncated": False,
+            },
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1", "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        failures = (
+            ("returncode", {**good, "probe": {**good["probe"], "returncode": 1}}),
+            ("timed_out", {**good, "probe": {**good["probe"], "timed_out": True}}),
+            ("stdout_truncated", {**good, "probe": {**good["probe"], "stdout_truncated": True}}),
+            ("stderr_truncated", {**good, "probe": {**good["probe"], "stderr_truncated": True}}),
+            ("unknown", {**good, "probe": {**good["probe"], "outcome_unknown": True}}),
+            ("missing_probe", {**good, "probe": {}}),
+            ("wrong_observer", {**good, "observer": {"kind": "fleet-dispatch-v1"}}),
+            ("stale", {**good, "observed_at_unix": tasks._now() - 120}),
+            ("missing_load", {**good, "properties": {"ActiveState": "active"}}),
+        )
+        for label, observation in failures:
+            with (
+                self.subTest(unsafe=label),
+                patch.object(tasks, "_resolve_task_dispatch_host",
+                             return_value=("local", {"transport": "local"}, False)),
+                patch.object(tasks, "_observe", return_value=observation),
+                patch.object(tasks, "_set_state",
+                             side_effect=AssertionError("READ_ONLY peek cannot persist")),
+            ):
+                peek = tasks.grabowski_task_peek(task["task_id"])
+            self.assertTrue(peek["reconcile_required"], label)
+            self.assertEqual("observation_error", peek["state"], label)
+            self.assertEqual("launching", peek["persisted_state"], label)
         self.assertEqual(before, self.database.read_bytes())
 
     def test_task_peek_terminal_outcome_conflict_is_not_masked(self) -> None:

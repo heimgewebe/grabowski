@@ -9112,7 +9112,19 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(
                 workspace.tasks, "_observe",
                 return_value={
-                    "state": "running", "properties": {},
+                    "state": "running",
+                    "properties": {
+                        "LoadState": "loaded", "ActiveState": "active",
+                        "SubState": "running",
+                    },
+                    "probe": {
+                        "returncode": 0, "timed_out": False,
+                        "stdout_truncated": False, "stderr_truncated": False,
+                    },
+                    "observer": {
+                        "kind": "bound-local-user-systemd-show-v1",
+                        "transport": "local",
+                    },
                     "observed_at_unix": workspace.tasks._now(),
                 },
             ),
@@ -9132,6 +9144,60 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertTrue(all(row["persisted_state"] == "launching" for row in seen))
         self.assertTrue(all(row["state"] == "running" for row in seen))
         self.assertTrue(all(row["reconcile_required"] is False for row in seen))
+        self.assertEqual(before_store, workspace.tasks.TASK_DB.read_bytes())
+
+    def test_collect_rejects_incomplete_launching_to_running_probe(self) -> None:
+        task_id = self._persist_sibling_for_collect_admission()
+        with workspace.tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET state='launching' WHERE task_id=?", (task_id,)
+            )
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        manifest["tasks"]["tests"] = task_id
+        workspace._write_manifest(manifest)
+        before_store = workspace.tasks.TASK_DB.read_bytes()
+        with (
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_status",
+                return_value={"task_id": "writer-task", "state": "completed", "terminal": True},
+            ),
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                return_value=("heim-pc", {"transport": "local"}, False),
+            ),
+            mock.patch.object(workspace.tasks, "_observe", return_value={
+                "state": "running",
+                "properties": {
+                    "LoadState": "loaded", "ActiveState": "active",
+                    "SubState": "running",
+                },
+                "probe": {
+                    "returncode": 0, "timed_out": False,
+                    "stdout_truncated": True, "stderr_truncated": False,
+                },
+                "observer": {
+                    "kind": "bound-local-user-systemd-show-v1", "transport": "local",
+                },
+                "observed_at_unix": workspace.tasks._now(),
+            }),
+            mock.patch.object(
+                workspace, "_role_toolchain_preflight",
+                side_effect=passing_toolchain_preflight,
+            ),
+            mock.patch.object(
+                workspace, "_start_role_task",
+                side_effect=AssertionError("uncertain unit may not admit a sibling"),
+            ) as start_sibling,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        start_sibling.assert_not_called()
+        self.assertTrue(result["reconcile_required"])
+        self.assertEqual("role_outcome_unknown", result["state"])
+        self.assertEqual("blocked", result["receipt_status"])
         self.assertEqual(before_store, workspace.tasks.TASK_DB.read_bytes())
 
     def test_collect_real_task_state_writer_waits_for_locked_live_peek_and_launch(self) -> None:

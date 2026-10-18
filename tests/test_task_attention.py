@@ -2355,7 +2355,7 @@ class TaskAttentionTests(unittest.TestCase):
                     attention._assert_no_live_task_process(record)
         for missing_field in (
             "returncode", "timed_out", "stdout_truncated",
-            "stderr_truncated", "outcome_unknown",
+            "stderr_truncated",
         ):
             with self.subTest(missing_field=missing_field):
                 incomplete_probe = dict(observation["probe"])
@@ -2364,7 +2364,27 @@ class TaskAttentionTests(unittest.TestCase):
                     **observation, "probe": incomplete_probe,
                 }), self.assertRaises(attention.TaskAttentionIntegrityError):
                     attention._assert_no_live_task_process(record)
+        # Local operator._run has no outcome_unknown field; a complete
+        # successful local systemctl show is still usable for closeout.
+        local_observation = {
+            **observation,
+            "probe": {k: v for k, v in observation["probe"].items()
+                      if k != "outcome_unknown"},
+        }
+        with patch.object(tasks, "_observe", return_value=local_observation):
+            verified = attention._assert_no_live_task_process(record)
+        self.assertFalse(verified["active_process"])
         self.assertEqual(before, self.database.read_bytes())
+
+    def test_closeout_archive_local_probe_without_optional_outcome_unknown(self) -> None:
+        record = self._completed_task()
+        observation = self._inactive_process_observation()
+        observation["probe"].pop("outcome_unknown")
+        with patch.object(tasks, "_observe", return_value=observation):
+            archived = attention.execute_closeout_archive(self._archive_parameters(record))
+        self.assertFalse(archived["already_archived"])
+        self.assertTrue(self.archive_root.exists())
+        self.assertTrue(self.projection_root.exists())
 
     def test_closeout_archive_blocks_reacquired_task_resource_lease(self) -> None:
         resource_key = "component:test-task-closeout-archive"

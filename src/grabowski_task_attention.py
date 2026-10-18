@@ -1344,7 +1344,12 @@ def _assert_no_live_task_process(record: dict[str, Any]) -> dict[str, Any]:
     if (
         type(probe.get("returncode")) is not int
         or probe["returncode"] != 0
-        or probe.get("outcome_unknown") is not False
+        # operator._run omits outcome_unknown on local user-systemd probes.
+        # The privileged root broker must explicitly attest a known result.
+        or (probe.get("outcome_unknown") is not None
+            and probe.get("outcome_unknown") is not False)
+        or (tasks._is_root_systemd_backend(record)
+            and probe.get("outcome_unknown") is not False)
         or probe.get("timed_out") is not False
         or probe.get("stdout_truncated") is not False
         or probe.get("stderr_truncated") is not False

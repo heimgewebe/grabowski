@@ -7743,6 +7743,48 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
         }
         result["reconcile_required"] = True
         return result
+    # _classify_observation reports running for an active-looking prefix
+    # before it inspects a failed systemctl probe. A launching -> running
+    # exception is safe only for one fresh, complete, bound local observation.
+    if record["state"] == "launching" and observed_state == "running":
+        props = observation.get("properties")
+        probe = observation.get("probe")
+        observer = observation.get("observer")
+        observed_at = observation.get("observed_at_unix")
+        observed_now = _now()
+        unit = _authoritative_unit(record)
+        valid_launch_observation = (
+            isinstance(props, dict)
+            and isinstance(probe, dict)
+            and isinstance(observer, dict)
+            and observer.get("kind") == "bound-local-user-systemd-show-v1"
+            and observer.get("transport") == "local"
+            and type(probe.get("returncode")) is int
+            and probe["returncode"] == 0
+            and probe.get("timed_out") is False
+            and probe.get("stdout_truncated") is False
+            and probe.get("stderr_truncated") is False
+            and (
+                probe.get("outcome_unknown") is None
+                or probe.get("outcome_unknown") is False
+            )
+            and type(observed_at) is int
+            and 0 <= observed_now - observed_at <= 30
+            and props.get("LoadState") == "loaded"
+            and props.get("ActiveState") in {"active", "activating", "reloading"}
+            and props.get("SubState") in {"running", "start", "start-post"}
+            and ("Id" not in props or props["Id"] == unit)
+            and ("Names" not in props or unit in str(props["Names"]).split())
+        )
+        if not valid_launch_observation:
+            result["state"] = "observation_error"
+            result["observation_unavailable_reason"] = "local_running_probe_unverified"
+            result["systemd_unit_health"] = {
+                "status": "unknown",
+                "reason": "local_running_probe_unverified",
+            }
+            result["reconcile_required"] = True
+            return result
     result["state"] = _effective_observed_state(record, observed_state)
     result["systemd_unit_health"] = _task_systemd_unit_health(
         result["state"], observation
