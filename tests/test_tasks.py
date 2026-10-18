@@ -5910,7 +5910,7 @@ class TaskTests(unittest.TestCase):
             tasks._task_reconcile_refresh_after_guard("")
         with tasks._task_readonly_snapshot() as reader:
             self.assertEqual(
-                "verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+                "retained_attempt_authority_unverified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
             )
 
     def test_reconcile_ready_rejects_privileged_archive_history_scan_overflow(self) -> None:
@@ -6148,7 +6148,7 @@ class TaskTests(unittest.TestCase):
                 tasks.TASK_RECONCILE_READY_PRIVILEGED_INDEX_NAME in str(row[3])
                 for row in plan
             ), plan)
-            self.assertEqual("verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
+            self.assertEqual("retained_attempt_authority_unverified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"])
 
     def test_reconcile_ready_rejects_spoofed_privileged_index(self) -> None:
         with tasks._database_connection() as writer:
@@ -6381,7 +6381,7 @@ class TaskTests(unittest.TestCase):
             tasks._task_reconcile_refresh_after_guard("")
             with tasks._task_readonly_snapshot() as reader:
                 self.assertEqual(
-                    "verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+                    "retained_attempt_authority_unverified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
                 )
 
         # An error on any earlier page must poison the cumulative proof.
@@ -6573,7 +6573,7 @@ class TaskTests(unittest.TestCase):
             tasks._task_reconcile_refresh_after_guard("")
         with tasks._task_readonly_snapshot() as connection:
             proof = tasks._task_reconcile_ready_evidence_snapshot(connection)
-        self.assertEqual("verified", proof["status"])
+        self.assertEqual("retained_attempt_authority_unverified", proof["status"])
 
         # Finishing a later page does not prove earlier pages were successful.
         later_page = {**result, "batch": {
@@ -6601,12 +6601,18 @@ class TaskTests(unittest.TestCase):
         # the two reconciliations may cross a clock-second boundary.
         with tasks._task_readonly_snapshot() as connection:
             latest_proof = tasks._task_reconcile_ready_evidence_snapshot(connection)
-        self.assertEqual("verified", latest_proof["status"])
-        self.assertIsInstance(latest_proof["reconciled_at_unix"], int)
+            # v3 freshness checks still apply; an empty TaskStore cannot
+            # certify authority over externally retained root/SSH units.
+            latest_stamp = json.loads(connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+            ).fetchone()[0])["reconciled_at_unix"]
+        self.assertEqual("retained_attempt_authority_unverified", latest_proof["status"])
+        self.assertIsInstance(latest_stamp, int)
 
         with patch.object(
             tasks, "_now",
-            return_value=latest_proof["reconciled_at_unix"] + tasks.TASK_RECONCILE_READY_MAX_AGE_SECONDS + 1,
+            return_value=latest_stamp + tasks.TASK_RECONCILE_READY_MAX_AGE_SECONDS + 1,
         ):
             with tasks._task_readonly_snapshot() as connection:
                 self.assertEqual(
@@ -7830,6 +7836,87 @@ class TaskTests(unittest.TestCase):
             {"launcher_json": '{"task_output_managed_from_attempt":2}'},
             "retained_attempt_authority_unverified",
         )
+
+    def test_v4_empty_retained_cohort_cannot_certify_orphan_root_or_ssh_units(self) -> None:
+        # An intact v4 archive/audit witness and zero-row TaskStore still do
+        # not account for out-of-band root/SSH units left by prior stores.
+        with closing(tasks.resources._database()):
+            pass
+        with patch.dict(os.environ, {
+            "GRABOWSKI_TASK_ARCHIVE_ROOT": str(self.task_archive_root),
+            "GRABOWSKI_TASK_PROJECTION_ROOT": str(self.task_projection_root),
+        }), patch.object(tasks.operator, "_require_operator_mutation"):
+            with tasks._database_connection() as writer:
+                self.assertIsNone(writer.execute("SELECT 1 FROM tasks LIMIT 1").fetchone())
+                prepared = tasks._prepare_task_reconcile_retained_evidence(writer)
+            tasks._publish_task_reconcile_ready_evidence(prepared)
+            with tasks._task_readonly_snapshot() as reader:
+                proof = json.loads(reader.execute(
+                    "SELECT value FROM metadata WHERE key=?",
+                    (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+                ).fetchone()[0])
+            self.assertEqual(4, proof["schema_version"])
+            with (
+                patch.object(tasks.fleet, "run_fleet_host",
+                             side_effect=AssertionError("no SSH observation")) as ssh,
+                patch.object(tasks.privileged, "root_task_systemd_request",
+                             side_effect=AssertionError("no root observation")) as root,
+            ):
+                result = self._retained_history_snapshot()
+        self.assertEqual("retained_attempt_authority_unverified", result["status"])
+        ssh.assert_not_called()
+        root.assert_not_called()
+
+    def test_v3_empty_taskstore_cannot_certify_orphan_root_or_ssh_units(self) -> None:
+        # A previously deleted or replaced TaskStore may have zero rows while
+        # remote user-systemd and root-systemd task units remain restartable.
+        # Local-only user-systemd probes cannot rule out either external host.
+        with tasks._database_connection() as connection:
+            self.assertIsNone(connection.execute("SELECT 1 FROM tasks LIMIT 1").fetchone())
+        with closing(tasks.resources._database()):
+            pass
+        cycle = {
+            "mode": "refresh", "task_id": "", "scanned": 0,
+            "refreshed": [], "released": [], "resumed": [], "blocked": [],
+            "batch": {
+                "cycle_completed": True, "cursor_before": None,
+                "active_refresh": {"cycle_completed": True, "cursor_before": None},
+                "terminalization_recovery": {
+                    "cycle_completed": True, "cursor_before": None, "failed": [],
+                },
+            },
+        }
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_tasks_refresh_locked", return_value=cycle),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            tasks._task_reconcile_refresh_after_guard("")
+        with tasks._task_readonly_snapshot() as reader:
+            proof = json.loads(reader.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+            ).fetchone()[0])
+        self.assertEqual(3, proof["schema_version"])
+        orphan_units = {
+            "remote:ssh": "grabowski-task-" + "a" * 24 + "-a1.service",
+            "root:system": "grabowski-task-" + "b" * 24 + "-a1.service",
+        }
+        with (
+            patch.object(tasks.fleet, "run_fleet_host",
+                         side_effect=AssertionError("READ_ONLY cannot establish SSH authority")) as ssh,
+            patch.object(tasks.privileged, "root_task_systemd_request",
+                         side_effect=AssertionError("READ_ONLY cannot establish root authority")) as root,
+            patch.object(tasks, "_dispatch",
+                         side_effect=AssertionError("READ_ONLY cannot dispatch")) as dispatch,
+        ):
+            with tasks._task_readonly_snapshot() as reader:
+                result = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        self.assertEqual(2, len(orphan_units))
+        self.assertEqual("retained_attempt_authority_unverified", result["status"])
+        ssh.assert_not_called()
+        root.assert_not_called()
+        dispatch.assert_not_called()
 
     def test_v3_legacy_local_task_cannot_certify_possible_remote_first_attempt(self) -> None:
         # v3 also trusts a current local Fleet mapping and local systemd

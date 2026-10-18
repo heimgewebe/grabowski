@@ -13410,16 +13410,15 @@ def _task_reconcile_ready_evidence_snapshot(
         # this remains a fresh read-only snapshot, not a future guarantee.
         if not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS:
             return {"status": "invalid_or_stale"}
-        # The bounded legacy v3 observer has the same provenance gap as v4:
-        # a row originally dispatched through SSH by the historic Fleet race
-        # may now resolve locally. Per-unit local observations and today's
-        # transport cannot authenticate that older attempt. Even archived
-        # records must not be silently excluded. This single-row indexed
-        # presence probe is a rejector, not an O(N) history scan.
-        if task_connection.execute("SELECT 1 FROM tasks LIMIT 1").fetchone() is not None:
-            return {"status": "retained_attempt_authority_unverified"}
-        # An empty, validated TaskStore has no retained task attempts.
-        return {"status": "verified", "reconciled_at_unix": timestamp}
+        # The legacy v3 observer has no authoritative history of launch
+        # transports or enforced root/SSH restart exclusion. A task that
+        # originally ran over SSH can now resolve locally, and an *empty*
+        # TaskStore may have been replaced while still-restartable external
+        # units from an older store remain. Local user-systemd observations
+        # cannot certify either case. Never promote this v3 evidence to
+        # operator_ready, including for the zero-row cohort. A future positive
+        # result requires independent, host-bound retirement authority.
+        return {"status": "retained_attempt_authority_unverified"}
     except TaskReconcileReadyLocalTerminalBudgetExceeded as exc:
         # Unobserved units are never ready. Repeating reconciliation cannot
         # shrink either budget. Archiving verified terminal tasks shrinks the
