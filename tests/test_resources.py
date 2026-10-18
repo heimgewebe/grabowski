@@ -3299,6 +3299,69 @@ class ResourceTests(unittest.TestCase):
             ):
                 resources.renew_resources("owner-a", [key], ttl_seconds=60)
 
+    def test_work_lane_renewed_lease_restore_is_exact_and_aba_safe(self) -> None:
+        owner = "lane:" + "f" * 32
+        keys = ["component:renew-restore-a", "component:renew-restore-b"]
+        with patch.object(resources, "_now", return_value=100):
+            original = resources.acquire_resources(
+                owner, keys, purpose="restore fixture", ttl_seconds=60,
+            )["leases"]
+            foreign = resources.acquire_resources(
+                "operator:restore-foreign", ["component:restore-foreign"],
+                purpose="foreign", ttl_seconds=600,
+            )["leases"][0]
+        original_snapshots = [
+            resources._release_lease_snapshot(row) for row in original
+        ]
+        with patch.object(resources, "_now", return_value=110):
+            renewed = resources.renew_resources(
+                owner, keys, ttl_seconds=900,
+                expected_leases=original_snapshots,
+            )["leases"]
+        renewed_snapshots = [
+            resources._release_lease_snapshot(row) for row in renewed
+        ]
+        self.assertNotEqual(original_snapshots, renewed_snapshots)
+        with patch.object(resources, "_now", return_value=111):
+            restoration = resources.restore_renewed_work_lane_leases(
+                owner, keys,
+                expected_renewed_leases=renewed_snapshots,
+                original_leases=original_snapshots,
+            )
+        self.assertTrue(restoration["snapshot_guarded"])
+        self.assertEqual(original, restoration["restored"])
+        with patch.object(resources, "_now", return_value=111):
+            self.assertEqual(original, resources.list_resources(owner_id=owner))
+            self.assertEqual(foreign, resources.inspect_resource("component:restore-foreign"))
+        with patch.object(resources, "_now", return_value=112):
+            renewed_again = resources.renew_resources(
+                owner, keys, ttl_seconds=900,
+                expected_leases=original_snapshots,
+            )["leases"]
+        with patch.object(resources, "_now", return_value=115):
+            newer = resources.renew_resources(
+                owner, keys, ttl_seconds=900,
+                expected_leases=[
+                    resources._release_lease_snapshot(row) for row in renewed_again
+                ],
+            )["leases"]
+            with self.assertRaisesRegex(RuntimeError, "generation changed"):
+                resources.restore_renewed_work_lane_leases(
+                    owner, keys,
+                    expected_renewed_leases=[
+                        resources._release_lease_snapshot(row) for row in renewed_again
+                    ],
+                    original_leases=original_snapshots,
+                )
+        with patch.object(resources, "_now", return_value=115):
+            self.assertEqual(newer, resources.list_resources(owner_id=owner))
+        with self.assertRaisesRegex(PermissionError, "lane owner"):
+            resources.restore_renewed_work_lane_leases(
+                "operator:restore-foreign", keys,
+                expected_renewed_leases=renewed_snapshots,
+                original_leases=original_snapshots,
+            )
+
     def test_work_lane_preserved_generation_is_not_renewed_across_batches(self) -> None:
         owner = "lane:" + "a" * 32
         key = "component:preserved-no-mutation"

@@ -3450,6 +3450,124 @@ def _verified_release_receipt(
     return receipt
 
 
+def _renew_preserved_multibatch_acquisitions(
+    *,
+    owner_id: str,
+    ttl_seconds: int,
+    plan: list[dict[str, Any]],
+    acquisitions: list[dict[str, Any]],
+    renew_resources_fn: Callable[..., dict[str, Any]],
+    receipt_path: Path,
+    base_record: dict[str, Any],
+) -> None:
+    """Renew preserved groups only after every native acquisition succeeded.
+
+    Every renew is bounded by the original <=64-key atomic contract, guarded
+    against the exact acquisition snapshots, and journaled before dispatch.
+    A lost renewal reply is never interpreted as a harmless pre-effect error.
+    """
+    for group_index, acquisition in enumerate(acquisitions):
+        preserved = sorted(acquisition["receipt"]["preserved"])
+        if not preserved:
+            continue
+        old_leases = {
+            row["resource_key"]: _lease_snapshot(row, owner_id=owner_id)
+            for row in acquisition["receipt"]["leases"]
+        }
+        if all(
+            old_leases[key]["expires_at_unix"] >= int(time.time()) + ttl_seconds
+            for key in preserved
+        ):
+            continue
+        # Only the inherited lease needs more lifetime. Renewing every group
+        # key also mutates freshly acquired generations without necessity.
+        keys = preserved
+        originals = [old_leases[key] for key in keys]
+        _write_state(
+            receipt_path,
+            {
+                **base_record,
+                "state": "acquiring",
+                "decision": "HARD_BLOCK",
+                "lease_receipt": _acquisition_bundle(owner_id, plan, acquisitions),
+                **_group_evidence_fields(plan, acquisitions),
+                "acquisition": {
+                    "state": "preserved_renewal_in_flight",
+                    "group_index": group_index,
+                    "contract_group": acquisition["contract_group"],
+                    "resource_keys": keys,
+                    "expected_leases": originals,
+                },
+                "next_action": "reconcile_lease_renewal_before_retry",
+            },
+        )
+        # A nonterminal error or lost response remains outcome_unknown; the
+        # durable in-flight record prohibits a blind retry of any effect.
+        renewal = renew_resources_fn(
+            owner_id, keys, ttl_seconds=ttl_seconds, expected_leases=originals,
+        )
+        if (
+            not isinstance(renewal, dict)
+            or renewal.get("owner_id") != owner_id
+            or renewal.get("snapshot_guarded") is not True
+            or not isinstance(renewal.get("leases"), list)
+        ):
+            raise LeaseAcquisitionOutcomeUnknown("preserved renewal receipt is invalid")
+        current = sorted(
+            (_lease_snapshot(row, owner_id=owner_id) for row in renewal["leases"]),
+            key=lambda row: row["resource_key"],
+        )
+        if [row["resource_key"] for row in current] != keys:
+            raise LeaseAcquisitionOutcomeUnknown("preserved renewal keys changed")
+        for before, after in zip(originals, current):
+            if (
+                before["resource_key"] != after["resource_key"]
+                or before["acquired_at_unix"] != after["acquired_at_unix"]
+                or before["metadata_sha256"] != after["metadata_sha256"]
+                or before["expires_at_unix"] > after["expires_at_unix"]
+                or before["updated_at_unix"] > after["updated_at_unix"]
+                or after["expires_at_unix"] < int(time.time()) + ttl_seconds - 3
+            ):
+                raise LeaseAcquisitionOutcomeUnknown(
+                    "preserved renewal changed generation or did not extend TTL"
+                )
+        previous_rows = {
+            row["resource_key"]: row for row in acquisition["receipt"]["leases"]
+        }
+        current_by_key = {row["resource_key"]: row for row in renewal["leases"]}
+        current_snapshots = {row["resource_key"]: row for row in current}
+        acquisition["preserved_renewal"] = {
+            "original_leases": originals,
+            "current_leases": current,
+            "renewal_receipt": renewal,
+        }
+        # Keep freshly acquired generations and their compensation snapshots
+        # unchanged. Only preserved rows have a new successful CAS snapshot.
+        acquisition["receipt"] = {
+            **acquisition["receipt"],
+            "leases": [
+                current_by_key.get(key, previous_rows[key])
+                for key in acquisition["resource_keys"]
+            ],
+        }
+        _write_state(
+            receipt_path,
+            {
+                **base_record,
+                "state": "acquiring",
+                "lease_receipt": _acquisition_bundle(owner_id, plan, acquisitions),
+                **_group_evidence_fields(plan, acquisitions),
+                "acquisition": {
+                    "state": "preserved_group_renewed",
+                    "group_index": group_index,
+                    "contract_group": acquisition["contract_group"],
+                    "resource_keys": keys,
+                },
+                "next_action": "verify_multibatch_leases_before_worktree",
+            },
+        )
+
+
 def _compensate_acquisitions(
     *,
     owner_id: str,
@@ -3461,6 +3579,7 @@ def _compensate_acquisitions(
     lease_receipt: dict[str, Any],
 ) -> tuple[dict[str, Any], bool]:
     released_groups: list[dict[str, Any]] = []
+    restored_preserved_groups: list[dict[str, Any]] = []
     preserved_keys = sorted(
         {
             key
@@ -3469,6 +3588,68 @@ def _compensate_acquisitions(
         }
     )
     for acquisition in reversed(acquisitions):
+        renewal = acquisition.get("preserved_renewal")
+        if renewal is not None:
+            before = list(renewal["original_leases"])
+            current = list(renewal["current_leases"])
+            keys = [row["resource_key"] for row in before]
+            in_flight = {
+                "state": "preserved_restore_in_flight",
+                "contract_group": acquisition["contract_group"],
+                "resource_keys": keys,
+                "original_leases": before,
+                "expected_renewed_leases": current,
+                "released_groups": released_groups,
+                "restored_preserved_groups": restored_preserved_groups,
+                "preserved_resource_keys": preserved_keys,
+            }
+            _write_state(
+                receipt_path,
+                {
+                    **base_record,
+                    "state": "compensating",
+                    "decision": "HARD_BLOCK",
+                    "lease_receipt": lease_receipt,
+                    **_group_evidence_fields(plan, acquisitions),
+                    "compensation": in_flight,
+                    "next_action": "complete_guarded_preserved_lease_restore",
+                },
+            )
+            try:
+                restored = resources.restore_renewed_work_lane_leases(
+                    owner_id, keys,
+                    expected_renewed_leases=current,
+                    original_leases=before,
+                )
+                if (
+                    not isinstance(restored, dict)
+                    or restored.get("owner_id") != owner_id
+                    or restored.get("snapshot_guarded") is not True
+                    or not isinstance(restored.get("restored"), list)
+                    or [
+                        _lease_snapshot(row, owner_id=owner_id)
+                        for row in restored["restored"]
+                    ] != before
+                ):
+                    raise LeaseCompensationOutcomeUnknown(
+                        "preserved owner lease restoration receipt is invalid"
+                    )
+            except Exception as exc:
+                return (
+                    {
+                        **in_flight,
+                        "state": "outcome_unknown",
+                        "error_class": type(exc).__name__,
+                        "error": str(exc)[:2048],
+                    },
+                    False,
+                )
+            restored_preserved_groups.append({
+                "contract_group": acquisition["contract_group"],
+                "original_leases": before,
+                "expected_renewed_leases": current,
+                "restore_receipt": restored,
+            })
         expected_leases = list(acquisition["attempt_lease_snapshots"])
         if not expected_leases:
             continue
@@ -3479,6 +3660,7 @@ def _compensate_acquisitions(
             "resource_keys": resource_keys,
             "expected_leases": expected_leases,
             "released_groups": released_groups,
+            "restored_preserved_groups": restored_preserved_groups,
             "preserved_resource_keys": preserved_keys,
         }
         _write_state(
@@ -3533,6 +3715,7 @@ def _compensate_acquisitions(
             "snapshot_guarded": True,
             "released": released,
             "released_groups": released_groups,
+            "restored_preserved_groups": restored_preserved_groups,
             "preserved_resource_keys": preserved_keys,
         },
         True,
@@ -3546,6 +3729,7 @@ def acquire_work(
     release_resources_fn: Callable[..., dict[str, Any]] = resources.release_resources,
     inspect_resource_fn: Callable[[str], dict[str, Any] | None] = resources.inspect_resource,
     lease_inventory_fn: Callable[..., list[dict[str, Any]]] | None = None,
+    renew_resources_fn: Callable[..., dict[str, Any]] = resources.renew_resources,
     ensure_worktree_fn: Callable[..., dict[str, Any]] = worktree_ensure.ensure_worktree,
     runner: Callable[[Path, list[str]], dict[str, Any]] = _git_runner,
     start_writer_fn: Callable[..., dict[str, Any]] = _start_scoped_writer,
@@ -3838,6 +4022,55 @@ def acquire_work(
                     ),
                 },
             )
+        if len(acquisition_plan) > 1:
+            try:
+                _renew_preserved_multibatch_acquisitions(
+                    owner_id=inputs["lease_owner_id"],
+                    ttl_seconds=inputs["ttl_seconds"],
+                    plan=acquisition_plan,
+                    acquisitions=acquisitions,
+                    renew_resources_fn=renew_resources_fn,
+                    receipt_path=receipt_path,
+                    base_record=base_record,
+                )
+            except Exception as exc:
+                # A native renew may have committed before a lost response.
+                # The durable in-flight record and exact snapshots are retained;
+                # never claim rollback or start a writer on an ambiguous outcome.
+                lease_receipt = _acquisition_bundle(
+                    inputs["lease_owner_id"], acquisition_plan, acquisitions
+                )
+                # The preceding durable record may be the only evidence of a
+                # committed renewal whose reply was lost. Do not overwrite
+                # that exact in-flight snapshot when fencing the lane.
+                renewal_journal = _read_state(receipt_path)
+                if (
+                    renewal_journal is None
+                    or not isinstance(renewal_journal.get("acquisition"), dict)
+                ):
+                    raise LeaseAcquisitionOutcomeUnknown(
+                        "preserved renewal journal cannot be recovered"
+                    ) from exc
+                record = _write_state(
+                    receipt_path,
+                    {
+                        **base_record,
+                        "state": "outcome_unknown",
+                        "decision": "HARD_BLOCK",
+                        "lease_receipt": lease_receipt,
+                        **_group_evidence_fields(acquisition_plan, acquisitions),
+                        "acquisition": renewal_journal["acquisition"],
+                        "error_class": "MULTIBATCH_PRESERVED_RENEWAL_UNKNOWN",
+                        "error": str(exc)[:2048],
+                        "leases_acquired": None,
+                        "next_action": "reconcile_lease_renewal_before_retry",
+                    },
+                )
+                return {
+                    **record,
+                    "durable_receipt_path": str(receipt_path),
+                    "replayed": existing is not None,
+                }
         acquired = _acquisition_bundle(
             inputs["lease_owner_id"], acquisition_plan, acquisitions
         )

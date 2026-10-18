@@ -7955,6 +7955,91 @@ def renew_resources(
     }
 
 
+def restore_renewed_work_lane_leases(
+    owner_id: str,
+    resource_keys: Iterable[str],
+    *,
+    expected_renewed_leases: list[dict[str, Any]],
+    original_leases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """CAS-restore only a Work Lane's own preserved lease renewal.
+
+    This is deliberately not a public MCP mutation surface. No new owner,
+    resource or metadata authority is granted. An ABA or any newer generation
+    invalidates the entire <=64-key rollback transaction.
+    """
+    owner = _owner(owner_id)
+    if WORK_LANE_OWNER_RE.fullmatch(owner) is None:
+        raise PermissionError("preserved renewal rollback requires a lane owner")
+    keys = normalize_resource_keys(resource_keys)
+    renewed = _normalize_mutation_lease_snapshots(
+        expected_renewed_leases, expected_owner_id=owner, resource_keys=keys,
+    )
+    original = _normalize_mutation_lease_snapshots(
+        original_leases, expected_owner_id=owner, resource_keys=keys,
+    )
+    for before, after in zip(original, renewed):
+        if (
+            before["resource_key"] != after["resource_key"]
+            or before["acquired_at_unix"] != after["acquired_at_unix"]
+            or before["metadata_sha256"] != after["metadata_sha256"]
+            or before["updated_at_unix"] > after["updated_at_unix"]
+            or before["expires_at_unix"] > after["expires_at_unix"]
+        ):
+            raise ValueError("preserved renewal rollback generations are incompatible")
+    with closing(_database()) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({','.join('?' for _ in keys)})",
+                keys,
+            ).fetchall()
+            existing = {row["resource_key"]: row for row in rows}
+            for item in renewed:
+                key = item["resource_key"]
+                row = existing.get(key)
+                if row is None:
+                    raise RuntimeError(f"renewed Work Lane lease disappeared: {key}")
+                if row["owner_id"] != owner:
+                    raise PermissionError(f"renewed Work Lane lease is foreign: {key}")
+                if _release_lease_snapshot(row) != item:
+                    raise RuntimeError(f"renewed Work Lane generation changed: {key}")
+                row_metadata = _row_metadata(row)
+                _, observed_sha256 = _metadata(row_metadata)
+                if observed_sha256 != row["metadata_sha256"]:
+                    raise RuntimeError(f"renewed Work Lane metadata changed: {key}")
+                if BRANCH_MUTATION_ATTEMPT_METADATA_KEY in row_metadata:
+                    raise RuntimeError(
+                        f"active branch mutation attempt prevents lease rollback: {key}"
+                    )
+            connection.executemany(
+                "UPDATE leases SET updated_at_unix=?, expires_at_unix=? "
+                "WHERE resource_key=? AND owner_id=?",
+                [
+                    (item["updated_at_unix"], item["expires_at_unix"],
+                     item["resource_key"], owner)
+                    for item in original
+                ],
+            )
+            restored_rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({','.join('?' for _ in keys)}) "
+                "ORDER BY resource_key", keys,
+            ).fetchall()
+            restored = [_public(row) for row in restored_rows]
+            if [_release_lease_snapshot(row) for row in restored] != original:
+                raise RuntimeError("preserved renewal rollback changed generations")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return {
+        "owner_id": owner,
+        "resource_keys": keys,
+        "snapshot_guarded": True,
+        "restored": restored,
+    }
+
+
 def release_resources(
     owner_id: str,
     resource_keys: Iterable[str],
