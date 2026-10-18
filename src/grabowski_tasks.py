@@ -7718,6 +7718,33 @@ def grabowski_task_peek(task_id: str) -> dict[str, Any]:
     observed_state = str(observation["state"])
     result["last_observation"] = observation
     result["observation_mode"] = "unpersisted_readonly_probe"
+    # A transient terminal unit can be garbage-collected by the user manager.
+    # Its synthetic successful systemctl result is not historical task truth.
+    # Only a complete, fresh, bound local unit-absent probe permits retaining
+    # the immutable stored terminal outcome without reconciliation effects.
+    props = observation.get("properties")
+    if (
+        _is_terminal_state(str(record["state"]))
+        and observed_state != "running"
+        and isinstance(props, dict)
+        and props.get("LoadState") == "not-found"
+    ):
+        if (
+            observed_state not in {"completed", "outcome_unknown"}
+            or not _task_reconcile_ready_local_terminal_observed(record, observation)
+        ):
+            result["state"] = "observation_error"
+            result["observation_unavailable_reason"] = "local_terminal_absence_unverified"
+            result["systemd_unit_health"] = {
+                "status": "unknown",
+                "reason": "local_terminal_absence_unverified",
+            }
+            result["reconcile_required"] = True
+            return result
+        result["state"] = str(record["state"])
+        result["systemd_unit_health"] = {"status": "not_applicable"}
+        result["reconcile_required"] = False
+        return result
     # A stored successful terminal result must not mask a new, contradictory
     # terminal systemd result. Preserve the stored audit truth separately but
     # expose the conflict as nonterminal until authorized reconciliation.
@@ -12776,6 +12803,31 @@ def _task_reconcile_ready_evidence_snapshot(
                     return {"status": "archived_task_unit_live_unverified"}
             except (RuntimeError, OSError, ValueError, TypeError):
                 return {"status": "archived_task_unit_observation_unavailable"}
+        # The last systemd inventory can precede the systemd-run unit when
+        # grabowski_task_start commits a launching row concurrently. Re-read
+        # BOTH store revisions after that inventory, without writing anything.
+        # A mixed pre-/post-launch snapshot must never certify operator_ready.
+        if archive_inventory_probed:
+            with _task_readonly_snapshot() as post_inventory_tasks:
+                post_task_revision = _task_reconcile_revision_contract(
+                    post_inventory_tasks
+                )
+            if post_task_revision["revision"] != proof["task_revision"]:
+                return {"status": "stale"}
+            with resources._resource_readonly_snapshot() as post_inventory_resources:
+                post_resource_revision = resources._resource_reconcile_revision_contract(
+                    post_inventory_resources
+                )
+                post_pending = post_inventory_resources.execute(
+                    "SELECT 1 FROM task_terminalizations "
+                    "WHERE phase='leases_revoked' LIMIT 1"
+                ).fetchone()
+            if (
+                post_resource_revision is None
+                or post_pending is not None
+                or post_resource_revision["revision"] != proof["resource_revision"]
+            ):
+                return {"status": "stale"}
         # Every external systemd observation may outlast the proof TTL;
         # this remains a fresh read-only snapshot, not a future guarantee.
         if not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS:

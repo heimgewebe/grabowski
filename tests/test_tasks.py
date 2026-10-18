@@ -7256,6 +7256,56 @@ class TaskTests(unittest.TestCase):
         inventory.assert_called_once()
         self.assertEqual(before, self.database.read_bytes())
 
+    def test_readiness_rechecks_revision_after_very_last_unit_inventory(self) -> None:
+        # A new launching row may commit after the prior revision reread but
+        # before its transient systemd unit appears in the third inventory.
+        self._local_terminal_readiness_store(1)
+        original_task = tasks._task_reconcile_revision_contract
+        original_resource = tasks.resources._resource_reconcile_revision_contract
+        for store in ("task", "resource"):
+            phase = {"probes": 0}
+
+            def inventory() -> bool:
+                phase["probes"] += 1
+                return False
+
+            def change_after_last_inventory(contract):
+                if phase["probes"] < 3:
+                    return contract
+                revision = str(contract["revision"])
+                return {
+                    **contract,
+                    "revision": ("a" * 64 if revision != "a" * 64 else "b" * 64),
+                }
+
+            def task_revision(conn, **kwargs):
+                value = original_task(conn, **kwargs)
+                return change_after_last_inventory(value) if store == "task" else value
+
+            def resource_revision(conn, **kwargs):
+                value = original_resource(conn, **kwargs)
+                return change_after_last_inventory(value) if store == "resource" else value
+
+            with (
+                self.subTest(store=store),
+                patch.object(
+                    tasks, "_task_reconcile_ready_local_terminal_rows",
+                    return_value=([], 0, tasks.TASK_RECONCILE_READY_PRIVILEGED_HISTORY_LIMIT - 1, 0),
+                ),
+                patch.object(
+                    tasks, "_task_reconcile_ready_archived_user_unit_live",
+                    side_effect=inventory,
+                ),
+                patch.object(tasks, "_task_reconcile_revision_contract",
+                             side_effect=task_revision),
+                patch.object(tasks.resources, "_resource_reconcile_revision_contract",
+                             side_effect=resource_revision),
+                tasks._task_readonly_snapshot() as reader,
+            ):
+                result = tasks._task_reconcile_ready_evidence_snapshot(reader)
+            self.assertEqual("stale", result["status"], (store, result))
+            self.assertEqual(3, phase["probes"])
+
     def test_archived_unit_restarted_during_final_database_rereads_is_not_ready(self) -> None:
         # The third bounded systemd snapshot detects an external restart
         # after the preceding SQLite task/resource revision reads.
@@ -11594,6 +11644,69 @@ class TaskTests(unittest.TestCase):
             self.assertEqual("observation_error", peek["state"], label)
             self.assertEqual("launching", peek["persisted_state"], label)
         self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_terminal_gc_unit_uses_complete_absence_not_synthetic_result(self) -> None:
+        # When transient systemd forgets a terminal failed/timed-out unit,
+        # the last persisted receipt retains the actual historical outcome.
+        task = self._start()["task"]
+        for terminal in ("completed", "failed", "signalled", "timed_out", "cancelled"):
+            with tasks._database_connection() as connection:
+                connection.execute(
+                    "UPDATE tasks SET state=? WHERE task_id=?",
+                    (terminal, task["task_id"]),
+                )
+            before = self.database.read_bytes()
+            complete = {
+                "state": "completed",
+                "properties": {
+                    "LoadState": "not-found", "ActiveState": "inactive",
+                    "SubState": "dead", "Result": "success",
+                },
+                "probe": {
+                    "returncode": 0, "timed_out": False,
+                    "stdout_truncated": False, "stderr_truncated": False,
+                },
+                "observer": {
+                    "kind": "bound-local-user-systemd-show-v1",
+                    "transport": "local",
+                },
+                "observed_at_unix": tasks._now(),
+            }
+            with (
+                self.subTest(terminal=terminal),
+                patch.object(
+                    tasks, "_resolve_task_dispatch_host",
+                    return_value=("local", {"transport": "local"}, False),
+                ),
+                patch.object(tasks, "_observe", return_value=complete),
+                patch.object(tasks, "_set_state",
+                             side_effect=AssertionError("READ_ONLY may not write")),
+            ):
+                result = tasks.grabowski_task_peek(task["task_id"])
+            self.assertEqual(terminal, result["state"], terminal)
+            self.assertFalse(result["reconcile_required"], terminal)
+            self.assertEqual(before, self.database.read_bytes())
+            for bad_field in ("returncode", "timed_out", "stdout_truncated",
+                              "stderr_truncated", "observer"):
+                broken = dict(complete)
+                if bad_field == "observer":
+                    broken["observer"] = {"kind": "fleet-dispatch-v1"}
+                else:
+                    probe = dict(complete["probe"])
+                    probe[bad_field] = (1 if bad_field == "returncode" else True)
+                    broken["probe"] = probe
+                with (
+                    self.subTest(terminal=terminal, incomplete=bad_field),
+                    patch.object(
+                        tasks, "_resolve_task_dispatch_host",
+                        return_value=("local", {"transport": "local"}, False),
+                    ),
+                    patch.object(tasks, "_observe", return_value=broken),
+                ):
+                    invalid = tasks.grabowski_task_peek(task["task_id"])
+                self.assertEqual("observation_error", invalid["state"])
+                self.assertTrue(invalid["reconcile_required"])
+                self.assertEqual(before, self.database.read_bytes())
 
     def test_task_peek_terminal_outcome_conflict_is_not_masked(self) -> None:
         task = self._start()["task"]
