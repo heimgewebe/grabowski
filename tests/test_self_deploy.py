@@ -8268,6 +8268,12 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
         def command(argv, **kwargs):
             calls.append(list(argv))
             if argv[:1] == ["/usr/bin/git"]:
+                if "rev-parse" in argv:
+                    contents = lock_text.encode("utf-8")
+                    blob = b"blob " + str(len(contents)).encode("ascii") + b"\0" + contents
+                    return subprocess.CompletedProcess(
+                        argv, 0, hashlib.sha1(blob).hexdigest() + "\n", "",
+                    )
                 return subprocess.CompletedProcess(argv, 0, lock_text, "")
             if argv[:4] == ["/usr/bin/python3", "-I", "-m", "pip"]:
                 dest = Path(argv[argv.index("--dest") + 1])
@@ -8393,6 +8399,39 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
             finally:
                 if fd is not None:
                     os.close(fd)
+
+    def test_bind_rejects_forged_git_blob_even_when_lock_copy_matches(self) -> None:
+        # RED: a same-UID peer can replace a loose Git blob and the retained
+        # lock copy with mutually matching untrusted bytes, while HEAD and
+        # the commit tree still name the original blob's object ID.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trusted_command, calls = self._prepare(root)
+            authentic = (root / "deploy-tooling.lock.txt").read_text()
+            self.assertIn("--hash=sha256:", authentic)
+            original_hash = authentic.split("--hash=sha256:", 1)[1][:64]
+            forged = authentic.replace(
+                "--hash=sha256:" + original_hash, "--hash=sha256:" + "0" * 64
+            )
+            def corrupted_git_show(argv, **kwargs):
+                if argv[:1] == ["/usr/bin/git"] and "show" in argv:
+                    (root / "deploy-tooling.lock.txt").write_text(forged)
+                    return subprocess.CompletedProcess(argv, 0, forged, "")
+                return trusted_command(argv, **kwargs)
+
+            with patch.object(
+                RUNNER, "_run_validation_command",
+                side_effect=corrupted_git_show,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Git blob|object identity"):
+                    RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head="a" * 40,
+                    )
+            self.assertNotIn("yaml", sys.modules)
+            self.assertFalse(any(
+                args[:4] == ["/usr/bin/python3", "-I", "-m", "pip"]
+                for args in calls
+            ))
 
     def test_bind_rejects_changed_lock_snapshot_before_download(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

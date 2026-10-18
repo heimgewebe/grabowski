@@ -1397,6 +1397,27 @@ def _bind_hashed_deploy_tooling_yaml(
     ).stdout
     if not isinstance(committed, str) or not 0 < len(committed) <= 128 * 1024:
         raise RuntimeError("committed deploy-tooling lock is missing or too large")
+    # Git show can inflate a same-UID-tampered loose object without checking
+    # its bytes against the immutable OID recorded by the verified commit.
+    # Reject a forged allowlist even if the retained lock copy matches it.
+    blob_oid = _run_validation_command(
+        [
+            "/usr/bin/git", "-C", str(repo), "rev-parse", "--verify",
+            f"{expected_head}:requirements/deploy-tooling.lock.txt",
+        ],
+        timeout=deploy_core.TIMEOUTS["python"],
+        env=committed_env,
+        cwd=validation_root,
+        capture=True,
+    ).stdout
+    committed_bytes = committed.encode("utf-8")
+    blob_data = b"blob " + str(len(committed_bytes)).encode("ascii") + b"\0" + committed_bytes
+    if (
+        not isinstance(blob_oid, str)
+        or not re.fullmatch(r"[0-9a-f]{40}\n?", blob_oid)
+        or hashlib.sha1(blob_data).hexdigest() != blob_oid.strip()
+    ):
+        raise RuntimeError("committed deploy-tooling Git blob object identity mismatch")
     lock_path = validation_root / "deploy-tooling.lock.txt"
     lock_fd = os.open(lock_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
