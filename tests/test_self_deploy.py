@@ -4200,6 +4200,9 @@ class SelfDeployToolTests(unittest.TestCase):
             SELF_DEPLOY, "_acquire_auto_deploy_source_resources",
             return_value={"leases": [f["operation_lease"]]},
         ), patch.object(
+            SELF_DEPLOY, "_live_auto_deploy_source_lease_snapshot",
+            return_value=None,
+        ), patch.object(
             SELF_DEPLOY, "_block_auto_deploy_source_obligation",
             return_value={"state": "blocked"},
         ), patch.object(

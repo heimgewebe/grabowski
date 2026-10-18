@@ -619,6 +619,44 @@ class TaskAttentionTests(unittest.TestCase):
                     with self.assertRaises(attention.TaskAttentionIntegrityError):
                         attention.record_decision(parameters)
 
+    def test_reconciliation_never_initializes_mutating_task_store(self) -> None:
+        self._failed_task()
+        with (
+            patch.object(
+                tasks, "_task_read_snapshot",
+                side_effect=AssertionError("initializing reader forbidden"),
+            ) as mutating_reader,
+            patch.object(
+                tasks, "_database",
+                side_effect=AssertionError("database initialization forbidden"),
+            ) as database,
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=PermissionError("mutation stopped"),
+            ) as gate,
+        ):
+            result = attention.reconcile_attention({"limit": 20, "view": "history"})
+        self.assertEqual("history", result["view"])
+        mutating_reader.assert_not_called()
+        database.assert_not_called()
+        gate.assert_not_called()
+
+    def test_legacy_attention_reader_requires_mutation_authority(self) -> None:
+        with (
+            patch.object(
+                tasks.operator, "_require_operator_mutation",
+                side_effect=PermissionError("mutation forbidden"),
+            ) as gate,
+            patch.object(tasks, "_task_read_snapshot") as mutating_snapshot,
+        ):
+            with self.assertRaisesRegex(PermissionError, "mutation forbidden"):
+                attention.reconcile_attention(
+                    {"limit": 20, "view": "history"},
+                    _mutating_reader=True,
+                )
+        gate.assert_called_once_with("durable_job")
+        mutating_snapshot.assert_not_called()
+
     def test_history_reconciliation_uses_no_observation_probe_and_classifies_decisions(self) -> None:
         failed = self._failed_task()
         attention.record_decision(self._parameters(failed))
@@ -2526,7 +2564,7 @@ class TaskAttentionTests(unittest.TestCase):
                 ),
             )
 
-        reconciled = attention.reconcile_attention({"limit": 20})
+        reconciled = attention.reconcile_attention({"limit": 20}, _mutating_reader=True)
         reconciled_ids = {item["task_id"] for item in reconciled["records"]}
         self.assertIn(source["task_id"], reconciled_ids)
         self.assertNotIn(successor["task_id"], reconciled_ids)
@@ -2635,6 +2673,7 @@ class TaskAttentionTests(unittest.TestCase):
         bounded_page = attention.reconcile_attention(
             {"limit": 20, "view": "current"},
             _bounded_current_projection=True,
+            _mutating_reader=True,
         )
         self.assertIn(
             source["task_id"], {item["task_id"] for item in bounded_page["records"]}
@@ -2687,6 +2726,7 @@ class TaskAttentionTests(unittest.TestCase):
                 {"limit": 1, "view": "current"},
                 _bounded_current_projection=True,
                 _current_work_task_ids=set(),
+                _mutating_reader=True,
             )
 
         self.assertEqual(
@@ -2722,6 +2762,7 @@ class TaskAttentionTests(unittest.TestCase):
                 {"limit": 1, "view": "current"},
                 _bounded_current_projection=True,
                 _current_work_task_ids={str(preserved["task_id"])},
+                _mutating_reader=True,
             )
 
         self.assertEqual(
@@ -2901,6 +2942,7 @@ class TaskAttentionTests(unittest.TestCase):
             {"limit": 20, "view": "current"},
             _bounded_current_projection=True,
             _current_work_task_ids=set(),
+            _mutating_reader=True,
         )
 
         returned = {item["task_id"] for item in page["records"]}
@@ -3005,6 +3047,7 @@ class TaskAttentionTests(unittest.TestCase):
             {"limit": 20, "view": "current"},
             _bounded_current_projection=True,
             _current_work_task_ids={middle_id},
+            _mutating_reader=True,
         )
 
         returned = {item["task_id"] for item in page["records"]}
@@ -3045,6 +3088,7 @@ class TaskAttentionTests(unittest.TestCase):
             {"limit": 20, "view": "current"},
             _bounded_current_projection=True,
             _current_work_task_ids={str(successor["task_id"])},
+            _mutating_reader=True,
         )
 
         returned = {item["task_id"] for item in page["records"]}
@@ -3086,6 +3130,7 @@ class TaskAttentionTests(unittest.TestCase):
             {"limit": 20, "view": "current"},
             _bounded_current_projection=True,
             _current_work_task_ids={str(successor["task_id"])},
+            _mutating_reader=True,
         )
 
         self.assertIn(
@@ -3477,6 +3522,7 @@ class TaskAttentionTests(unittest.TestCase):
         page = attention.reconcile_attention(
             {"limit": 20, "view": "current"},
             _bounded_current_projection=True,
+            _mutating_reader=True,
         )
 
         self.assertEqual("degraded", page["attention_convergence_status"])
@@ -3545,6 +3591,7 @@ class TaskAttentionTests(unittest.TestCase):
             page = attention.reconcile_attention(
                 {"limit": 2, "view": "current"},
                 _bounded_current_projection=True,
+                _mutating_reader=True,
             )
 
         self.assertEqual("degraded", page["attention_convergence_status"])
@@ -3600,6 +3647,7 @@ class TaskAttentionTests(unittest.TestCase):
         page = attention.reconcile_attention(
             {"limit": 20, "view": "current"},
             _bounded_current_projection=True,
+            _mutating_reader=True,
         )
 
         self.assertEqual("degraded", page["attention_convergence_status"])
@@ -3684,6 +3732,7 @@ class TaskAttentionTests(unittest.TestCase):
             page = attention.reconcile_attention(
                 {"limit": 1, "view": "current"},
                 _bounded_current_projection=True,
+                _mutating_reader=True,
             )
 
         self.assertEqual("degraded", page["attention_convergence_status"])
@@ -3718,6 +3767,7 @@ class TaskAttentionTests(unittest.TestCase):
         page = attention.reconcile_attention(
             {"limit": 20, "view": "current"},
             _bounded_current_projection=True,
+            _mutating_reader=True,
         )
 
         self.assertEqual("degraded", page["attention_convergence_status"])
@@ -3759,6 +3809,7 @@ class TaskAttentionTests(unittest.TestCase):
         page = attention.reconcile_attention(
             {"limit": 20, "view": "current"},
             _bounded_current_projection=True,
+            _mutating_reader=True,
         )
 
         self.assertEqual("degraded", page["attention_convergence_status"])

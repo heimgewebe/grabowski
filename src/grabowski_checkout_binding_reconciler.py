@@ -631,6 +631,9 @@ def collect_lifecycle_bindings_from_db(
     }
     if not native:
         read_options["temporary_prefix"] = "grabowski-checkout-binding-snapshot."
+        # Public READ_ONLY never copies moving WAL or modifies SQLite SHM.
+        # Only explicitly bound internal admission can select the native reader.
+        read_options["allow_wal_copy"] = False
     # Only a fully validated snapshot rejected on context-manager exit may
     # be retried after a real no-WAL-to-WAL transition.  A malformed schema
     # or partial read is never upgraded into a fresh positive admission.
@@ -717,13 +720,7 @@ def collect_lifecycle_bindings_from_db(
                 "bindings": bindings,
                 "retentions": retention_inventory,
                 "read_only": True,
-                "snapshot_mode": (
-                    "native-ro-wal" if native else (
-                        "immutable-file"
-                        if not Path(str(path) + "-wal").exists()
-                        else "copied-database-and-wal"
-                    )
-                ),
+                "snapshot_mode": "native-ro-wal" if native else "immutable-file",
             }
     except CheckoutBindingDatabaseError as exc:
         # A legitimate writer may open WAL after the first no-WAL probe.
