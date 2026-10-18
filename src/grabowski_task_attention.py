@@ -14,6 +14,7 @@ import uuid
 from typing import Any, Iterable, Iterator, Mapping
 
 import grabowski_consumer_surface as consumer_surface
+import grabowski_fleet_mutation as fleet_mutation
 import grabowski_private_io as private_io
 import grabowski_tasks as tasks
 import grabowski_terminal_convergence as terminal_convergence
@@ -1402,6 +1403,57 @@ def _require_safe_archive_transport(record: dict[str, Any]) -> None:
         raise TaskAttentionConflictError(
             "remote task archive retirement proof is required (#1556)"
         )
+
+
+@contextmanager
+def _archive_local_fleet_route_guard(record: dict[str, Any]) -> Iterator[None]:
+    """Serialize the irreversible switch with authorized Fleet writers.
+
+    The Fleet mutator holds LOCK_EX on this same lock file throughout its
+    registry replacement. A final transport check outside this shared lock
+    would still race with that replacement.
+    """
+    directory = (
+        fleet_mutation.STATE_ROOT
+        / fleet_mutation.MUTATION_STATE_DIRECTORY_NAME
+    )
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = directory.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o022
+    ):
+        raise TaskAttentionIntegrityError("Fleet archive lock directory is unsafe")
+    lock_path = directory / fleet_mutation.LOCK_NAME
+    descriptor = os.open(
+        lock_path,
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise TaskAttentionIntegrityError("Fleet archive lock file is unsafe")
+        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise TaskAttentionConflictError(
+                        "Fleet route mutation lock is busy"
+                    ) from exc
+                time.sleep(LOCK_POLL_SECONDS)
+        _require_safe_archive_transport(record)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def _task_archive_classification(
@@ -3062,18 +3114,16 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
                 raise TaskAttentionConflictError(
                     "task archive projection revalidation is not ready"
                 )
-            # Fleet routing is mutable outside the task record SHA/revisions.
-            # An effect-plan proof cannot bind transport after its final check.
-            # Refuse an irreversible local->SSH projection switch if routing
-            # changed while the archive effect or plan was being prepared.
-            _require_safe_archive_transport(projection_revalidated_record)
-            projection_effect = lifecycle_projection.apply_task_archive_projection_switch(
-                Path(str(archive_effect["segment_dir"])),
-                projection_root=projection_root,
-                plan=projection_plan,
-                revalidation=projection_revalidation,
-                applied_at_unix=int(time.time()),
-            )
+            # Hold the same Fleet lock as the authorized CAS registry writer
+            # from the final route check through the irreversible switch.
+            with _archive_local_fleet_route_guard(projection_revalidated_record):
+                projection_effect = lifecycle_projection.apply_task_archive_projection_switch(
+                    Path(str(archive_effect["segment_dir"])),
+                    projection_root=projection_root,
+                    plan=projection_plan,
+                    revalidation=projection_revalidation,
+                    applied_at_unix=int(time.time()),
+                )
 
         final_projection = _existing_task_projection_binding(
             task_id,

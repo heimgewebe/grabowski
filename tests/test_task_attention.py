@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -93,6 +94,7 @@ class TaskAttentionTests(unittest.TestCase):
             # Archive admission resolves the stored host outside task start.
             # Keep that local test authority explicit and hermetic.
             patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(attention.fleet_mutation, "STATE_ROOT", self.root / "state"),
             patch.object(tasks.base, "AUDIT_LOG", self.audit_log),
             patch.object(attention.alert_outbox, "enqueue_and_schedule"),
             patch.object(
@@ -2033,6 +2035,42 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertTrue(self.archive_root.exists())
         self.assertFalse(self.projection_root.exists())
         self.assertEqual(task_db_before, self.database.read_bytes())
+
+    def test_archive_projection_switch_holds_shared_fleet_mutation_lock(self) -> None:
+        import grabowski_lifecycle_projection as lifecycle_projection
+
+        record = self._completed_task()
+        original_switch = lifecycle_projection.apply_task_archive_projection_switch
+        lock_path = (
+            attention.fleet_mutation.STATE_ROOT
+            / attention.fleet_mutation.MUTATION_STATE_DIRECTORY_NAME
+            / attention.fleet_mutation.LOCK_NAME
+        )
+
+        def inspect_during_switch(*args: object, **kwargs: object) -> dict:
+            # Fleet's authorized CAS worker acquires LOCK_EX. It must not
+            # replace local routing until the irreversible switch commits.
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(descriptor)
+            return original_switch(*args, **kwargs)
+
+        with (
+            patch.object(tasks, "_observe", return_value=self._inactive_process_observation()),
+            patch.object(lifecycle_projection, "apply_task_archive_projection_switch",
+                         side_effect=inspect_during_switch) as switched,
+        ):
+            result = attention.execute_closeout_archive(self._archive_parameters(record))
+        switched.assert_called_once()
+        self.assertFalse(result["already_archived"])
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(descriptor)
 
     def test_closeout_archive_existing_projection_replays_after_transport_change(self) -> None:
         record = self._completed_task()
