@@ -1047,20 +1047,21 @@ def _run_validation_command(
     capture: bool = False,
     env: dict[str, str],
     pass_fds: tuple[int, ...] = (),
-) -> subprocess.CompletedProcess[str]:
+    binary: bool = False,
+) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
     """Run one validation-bootstrap command in a killable, reapable process group."""
     process = _spawn_validation_process(
         argv,
         cwd=cwd,
         env=env,
-        text=True,
+        text=not binary,
         stdin=None,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
         **({"pass_fds": pass_fds} if pass_fds else {}),
     )
-    stdout: str | None = None
-    stderr: str | None = None
+    stdout: str | bytes | None = None
+    stderr: str | bytes | None = None
     try:
         try:
             if capture:
@@ -1343,6 +1344,67 @@ def _raise_validation_sigterm(signum: int, _frame: Any) -> None:
     raise RuntimeError(f"validate interrupted by signal {signum} (SIGTERM)")
 
 
+def _authenticated_deploy_lock_from_git(
+    repo: Path, validation_root: Path, expected_head: str, env: dict[str, str]
+) -> bytes:
+    """Verify the *entire* SHA-1 commit/tree/blob chain, not Git path resolution.
+
+    Git cat-file supplies bytes, not authenticity: a same-UID peer can overwrite
+    loose objects under their original names. The caller's previously pinned
+    expected_head is the only trust anchor. The tree path must be derived from
+    verified parent bytes before admitting any lock hash to pip.
+    """
+    def verified_object(kind: str, oid: str, maximum: int) -> bytes:
+        if not re.fullmatch(r"[0-9a-f]{40}", oid):
+            raise RuntimeError(f"committed deploy-tooling Git {kind} object ID is invalid")
+        result = _run_validation_command(
+            ["/usr/bin/git", "-C", str(repo), "cat-file", kind, oid],
+            timeout=deploy_core.TIMEOUTS["python"],
+            env=env,
+            cwd=validation_root,
+            capture=True,
+            binary=True,
+        )
+        raw = result.stdout
+        if not isinstance(raw, bytes) or not 0 < len(raw) <= maximum:
+            raise RuntimeError(f"committed deploy-tooling Git {kind} object is unsafe")
+        header = kind.encode("ascii") + b" " + str(len(raw)).encode("ascii") + b"\0"
+        if hashlib.sha1(header + raw).hexdigest() != oid:
+            raise RuntimeError(f"committed deploy-tooling Git {kind} object identity mismatch")
+        return raw
+
+    def tree_child(tree_oid: str, name: bytes, required_mode: bytes) -> str:
+        tree = verified_object("tree", tree_oid, 2 * 1024 * 1024)
+        offset = 0
+        target: str | None = None
+        while offset < len(tree):
+            nul = tree.find(b"\0", offset)
+            if nul < 0 or nul + 21 > len(tree):
+                raise RuntimeError("committed deploy-tooling Git tree entry is invalid")
+            mode_and_name = tree[offset:nul]
+            mode, sep, entry_name = mode_and_name.partition(b" ")
+            if not sep or not mode or not entry_name:
+                raise RuntimeError("committed deploy-tooling Git tree entry is invalid")
+            child_oid = tree[nul + 1:nul + 21].hex()
+            offset = nul + 21
+            if entry_name == name:
+                if mode != required_mode or target is not None:
+                    raise RuntimeError("committed deploy-tooling Git tree path is unsafe")
+                target = child_oid
+        if target is None:
+            raise RuntimeError("committed deploy-tooling Git tree path is missing")
+        return target
+
+    commit = verified_object("commit", expected_head, 1024 * 1024)
+    first_line = commit.split(b"\n", 1)[0]
+    if not re.fullmatch(rb"tree [0-9a-f]{40}", first_line):
+        raise RuntimeError("committed deploy-tooling Git commit tree is invalid")
+    root_tree_oid = first_line[5:].decode("ascii")
+    requirements_oid = tree_child(root_tree_oid, b"requirements", b"40000")
+    lock_oid = tree_child(requirements_oid, b"deploy-tooling.lock.txt", b"100644")
+    return verified_object("blob", lock_oid, 128 * 1024)
+
+
 def _bind_hashed_deploy_tooling_yaml(
     validation_root: Path, *, repo: Path, expected_head: str
 ) -> int:
@@ -1385,39 +1447,13 @@ def _bind_hashed_deploy_tooling_yaml(
         "GIT_CONFIG_SYSTEM": "/dev/null",
         "GIT_OPTIONAL_LOCKS": "0",
     })
-    committed = _run_validation_command(
-        [
-            "/usr/bin/git", "-C", str(repo), "show",
-            f"{expected_head}:requirements/deploy-tooling.lock.txt",
-        ],
-        timeout=deploy_core.TIMEOUTS["python"],
-        env=committed_env,
-        cwd=validation_root,
-        capture=True,
-    ).stdout
-    if not isinstance(committed, str) or not 0 < len(committed) <= 128 * 1024:
-        raise RuntimeError("committed deploy-tooling lock is missing or too large")
-    # Git show can inflate a same-UID-tampered loose object without checking
-    # its bytes against the immutable OID recorded by the verified commit.
-    # Reject a forged allowlist even if the retained lock copy matches it.
-    blob_oid = _run_validation_command(
-        [
-            "/usr/bin/git", "-C", str(repo), "rev-parse", "--verify",
-            f"{expected_head}:requirements/deploy-tooling.lock.txt",
-        ],
-        timeout=deploy_core.TIMEOUTS["python"],
-        env=committed_env,
-        cwd=validation_root,
-        capture=True,
-    ).stdout
-    committed_bytes = committed.encode("utf-8")
-    blob_data = b"blob " + str(len(committed_bytes)).encode("ascii") + b"\0" + committed_bytes
-    if (
-        not isinstance(blob_oid, str)
-        or not re.fullmatch(r"[0-9a-f]{40}\n?", blob_oid)
-        or hashlib.sha1(blob_data).hexdigest() != blob_oid.strip()
-    ):
-        raise RuntimeError("committed deploy-tooling Git blob object identity mismatch")
+    committed_bytes = _authenticated_deploy_lock_from_git(
+        repo, validation_root, expected_head, committed_env,
+    )
+    try:
+        committed = committed_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("committed deploy-tooling lock is not UTF-8") from exc
     lock_path = validation_root / "deploy-tooling.lock.txt"
     lock_fd = os.open(lock_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
@@ -1432,7 +1468,7 @@ def _bind_hashed_deploy_tooling_yaml(
         lock_bytes = os.read(lock_fd, 128 * 1024 + 1)
     finally:
         os.close(lock_fd)
-    if lock_bytes != committed.encode("utf-8"):
+    if lock_bytes != committed_bytes:
         raise RuntimeError("validated deploy-tooling lock changed from committed source")
     # The checked pathname is same-UID mutable. Parse and pass only these
     # already compared bytes to pip: immutable sealed FD survives exec through

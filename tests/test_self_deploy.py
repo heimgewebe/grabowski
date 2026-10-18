@@ -8238,6 +8238,12 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
                 del sys.modules[name]
         sys.modules.update(self._saved_yaml_modules)
 
+    @staticmethod
+    def _git_oid(kind: str, raw: bytes) -> str:
+        return hashlib.sha1(
+            kind.encode("ascii") + b" " + str(len(raw)).encode("ascii") + b"\0" + raw
+        ).hexdigest()
+
     def _prepare(self, root: Path, *, tamper: bool = False,
                  version: str = "6.0.3"):
         (root / "deploy-tooling" / ".venv").mkdir(parents=True)
@@ -8263,18 +8269,45 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
             + "    --hash=sha256:" + wheel_hash + chr(10)
         )
         (root / "deploy-tooling.lock.txt").write_text(lock_text, encoding="utf-8")
+        lock_bytes = lock_text.encode("utf-8")
+        blob_oid = self._git_oid("blob", lock_bytes)
+        requirements_tree = (
+            b"100644 deploy-tooling.lock.txt\0" + bytes.fromhex(blob_oid)
+        )
+        requirements_oid = self._git_oid("tree", requirements_tree)
+        root_tree = b"40000 requirements\0" + bytes.fromhex(requirements_oid)
+        root_oid = self._git_oid("tree", root_tree)
+        commit = (
+            b"tree " + root_oid.encode("ascii") + b"\n"
+            b"author Fixture <fixture@example.invalid> 0 +0000\n"
+            b"committer Fixture <fixture@example.invalid> 0 +0000\n"
+            b"\nfixture commit\n"
+        )
+        expected_head = self._git_oid("commit", commit)
+        objects = {
+            ("commit", expected_head): commit,
+            ("tree", root_oid): root_tree,
+            ("tree", requirements_oid): requirements_tree,
+            ("blob", blob_oid): lock_bytes,
+        }
         calls: list[list[str]] = []
 
         def command(argv, **kwargs):
             calls.append(list(argv))
             if argv[:1] == ["/usr/bin/git"]:
-                if "rev-parse" in argv:
-                    contents = lock_text.encode("utf-8")
-                    blob = b"blob " + str(len(contents)).encode("ascii") + b"\0" + contents
+                if "cat-file" in argv:
+                    offset = argv.index("cat-file")
+                    kind, oid = argv[offset + 1:offset + 3]
                     return subprocess.CompletedProcess(
-                        argv, 0, hashlib.sha1(blob).hexdigest() + "\n", "",
+                        argv, 0, objects[(kind, oid)], b"",
                     )
-                return subprocess.CompletedProcess(argv, 0, lock_text, "")
+                if "rev-parse" in argv:
+                    return subprocess.CompletedProcess(
+                        argv, 0, blob_oid + "\n", "",
+                    )
+                if "show" in argv:
+                    return subprocess.CompletedProcess(argv, 0, lock_text, "")
+                raise AssertionError("unexpected git request: " + repr(argv))
             if argv[:4] == ["/usr/bin/python3", "-I", "-m", "pip"]:
                 dest = Path(argv[argv.index("--dest") + 1])
                 (dest / "PyYAML-6.0.3-py3-none-any.whl").write_bytes(
@@ -8282,7 +8315,7 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
                 )
                 return subprocess.CompletedProcess(argv, 0, None, None)
             raise AssertionError("unexpected trusted child command: " + repr(argv))
-        return command, calls
+        return command, calls, expected_head, objects
 
     def test_bind_rejects_already_loaded_untrusted_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(
@@ -8311,13 +8344,13 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
     def test_bind_imports_only_sealed_wheel_not_mutable_site(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            command, calls = self._prepare(root)
+            command, calls, head, _ = self._prepare(root)
             previous_path = sys.path[:]
             fd = None
             try:
                 with patch.object(RUNNER, "_run_validation_command", side_effect=command):
                     fd = RUNNER._bind_hashed_deploy_tooling_yaml(
-                        root, repo=root, expected_head="a" * 40
+                        root, repo=root, expected_head=head
                     )
                 yaml = sys.modules["yaml"]
                 self.assertEqual(yaml.__version__, "6.0.3")
@@ -8336,22 +8369,22 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
     def test_bind_rejects_modified_wheel_before_import(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            command, _ = self._prepare(root, tamper=True)
+            command, _, head, _ = self._prepare(root, tamper=True)
             with patch.object(RUNNER, "_run_validation_command", side_effect=command):
                 with self.assertRaisesRegex(RuntimeError, "not lock-pinned"):
                     RUNNER._bind_hashed_deploy_tooling_yaml(
-                        root, repo=root, expected_head="a" * 40
+                        root, repo=root, expected_head=head
                     )
             self.assertNotIn("yaml", sys.modules)
 
     def test_bind_rejects_invalid_module_and_evicts_yaml_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            command, _ = self._prepare(root, version="6.0.2")
+            command, _, head, _ = self._prepare(root, version="6.0.2")
             with patch.object(RUNNER, "_run_validation_command", side_effect=command):
                 with self.assertRaisesRegex(RuntimeError, "sealed locked wheel"):
                     RUNNER._bind_hashed_deploy_tooling_yaml(
-                        root, repo=root, expected_head="a" * 40
+                        root, repo=root, expected_head=head
                     )
             self.assertFalse(any(
                 name == "yaml" or name.startswith("yaml.")
@@ -8364,7 +8397,7 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
         # requirements option makes pip execute an attacker sdist backend.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            original_command, _ = self._prepare(root)
+            original_command, _, head, _ = self._prepare(root)
             trusted = (root / "deploy-tooling.lock.txt").read_bytes()
             untrusted = (
                 b"--no-binary=:all:\n--find-links=/untrusted-wheels\n"
@@ -8391,7 +8424,7 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
                     side_effect=replace_just_before_pip,
                 ):
                     fd = RUNNER._bind_hashed_deploy_tooling_yaml(
-                        root, repo=root, expected_head="a" * 40,
+                        root, repo=root, expected_head=head,
                     )
                 self.assertEqual(len(seen), 1)
                 self.assertEqual(sys.modules["yaml"].__version__, "6.0.3")
@@ -8406,7 +8439,7 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
         # the commit tree still name the original blob's object ID.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            trusted_command, calls = self._prepare(root)
+            trusted_command, calls, head, _ = self._prepare(root)
             authentic = (root / "deploy-tooling.lock.txt").read_text()
             self.assertIn("--hash=sha256:", authentic)
             original_hash = authentic.split("--hash=sha256:", 1)[1][:64]
@@ -8414,9 +8447,16 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
                 "--hash=sha256:" + original_hash, "--hash=sha256:" + "0" * 64
             )
             def corrupted_git_show(argv, **kwargs):
-                if argv[:1] == ["/usr/bin/git"] and "show" in argv:
+                if argv[:1] == ["/usr/bin/git"] and (
+                    "show" in argv or (
+                        "cat-file" in argv and argv[argv.index("cat-file") + 1] == "blob"
+                    )
+                ):
                     (root / "deploy-tooling.lock.txt").write_text(forged)
-                    return subprocess.CompletedProcess(argv, 0, forged, "")
+                    return subprocess.CompletedProcess(
+                        argv, 0, forged.encode("utf-8") if "cat-file" in argv else forged,
+                        b"" if "cat-file" in argv else "",
+                    )
                 return trusted_command(argv, **kwargs)
 
             with patch.object(
@@ -8425,7 +8465,7 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(RuntimeError, "Git blob|object identity"):
                     RUNNER._bind_hashed_deploy_tooling_yaml(
-                        root, repo=root, expected_head="a" * 40,
+                        root, repo=root, expected_head=head,
                     )
             self.assertNotIn("yaml", sys.modules)
             self.assertFalse(any(
@@ -8433,15 +8473,147 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
                 for args in calls
             ))
 
+    def test_authenticated_lock_chain_reads_real_git_objects(self) -> None:
+        # Verify Git's binary cat-file behavior, including raw tree entries.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            lock = repo / "requirements" / "deploy-tooling.lock.txt"
+            lock.parent.mkdir()
+            lock.write_text(
+                "pyyaml==6.0.3 --hash=sha256:" + "1" * 64 + "\n",
+                encoding="utf-8",
+            )
+            def git(*args: str) -> str:
+                result = subprocess.run(
+                    ["/usr/bin/git", *args],
+                    cwd=repo, check=True, text=True, capture_output=True,
+                )
+                return result.stdout.strip()
+
+            git("init", "-q")
+            git("add", "requirements/deploy-tooling.lock.txt")
+            git("-c", "user.name=Fixture", "-c", "user.email=test@example.invalid",
+                "commit", "-qm", "fixture lock")
+            expected_head = git("rev-parse", "HEAD")
+            environment = RUNNER._validation_environment(root)
+            environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+            environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+            environment["GIT_CONFIG_SYSTEM"] = "/dev/null"
+            self.assertEqual(
+                RUNNER._authenticated_deploy_lock_from_git(
+                    repo, root, expected_head, environment
+                ),
+                lock.read_bytes(),
+            )
+
+    def test_bind_rejects_forged_parent_tree_before_pip(self) -> None:
+        # Same-UID replacement of an existing requirements tree makes Git's
+        # path-oriented show/rev-parse collude on a valid *other* lock blob.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authentic_command, calls, head, objects = self._prepare(root)
+            trusted = (root / "deploy-tooling.lock.txt").read_text()
+            trusted_hash = trusted.split("--hash=sha256:", 1)[1][:64]
+            forged = trusted.replace(trusted_hash, "0" * 64)
+            forged_blob = self._git_oid("blob", forged.encode("utf-8"))
+            forged_tree = (
+                b"100644 deploy-tooling.lock.txt\0" + bytes.fromhex(forged_blob)
+            )
+            original_tree_oid = next(
+                oid for (kind, oid), data in objects.items()
+                if kind == "tree" and b"deploy-tooling.lock.txt" in data
+            )
+
+            def colluding_git(argv, **kwargs):
+                if argv[:1] == ["/usr/bin/git"]:
+                    if "cat-file" in argv:
+                        offset = argv.index("cat-file")
+                        if argv[offset + 1:offset + 3] == ["tree", original_tree_oid]:
+                            return subprocess.CompletedProcess(argv, 0, forged_tree, b"")
+                    if "show" in argv:
+                        (root / "deploy-tooling.lock.txt").write_text(forged)
+                        return subprocess.CompletedProcess(argv, 0, forged, "")
+                    if "rev-parse" in argv:
+                        return subprocess.CompletedProcess(argv, 0, forged_blob + "\n", "")
+                if argv[:4] == ["/usr/bin/python3", "-I", "-m", "pip"]:
+                    raise AssertionError("pip ran before authenticating Git parent tree")
+                return authentic_command(argv, **kwargs)
+
+            with patch.object(RUNNER, "_run_validation_command", side_effect=colluding_git):
+                with self.assertRaisesRegex(RuntimeError, "Git tree object identity mismatch"):
+                    RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head=head
+                    )
+            self.assertNotIn("yaml", sys.modules)
+            self.assertFalse(any(
+                args[:4] == ["/usr/bin/python3", "-I", "-m", "pip"] for args in calls
+            ))
+
+    def test_bind_rejects_forged_commit_before_pip(self) -> None:
+        # The original expected_head is a trusted external anchor. Never take
+        # a root-tree pointer from a commit whose content no longer hashes to it.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            authentic_command, calls, head, objects = self._prepare(root)
+            original_commit = objects[("commit", head)]
+            trusted = (root / "deploy-tooling.lock.txt").read_text()
+            trusted_hash = trusted.split("--hash=sha256:", 1)[1][:64]
+            forged = trusted.replace(trusted_hash, "0" * 64)
+            forged_blob = self._git_oid("blob", forged.encode("utf-8"))
+            forged_requirements_tree = (
+                b"100644 deploy-tooling.lock.txt\0" + bytes.fromhex(forged_blob)
+            )
+            forged_requirements_oid = self._git_oid("tree", forged_requirements_tree)
+            forged_root_tree = (
+                b"40000 requirements\0" + bytes.fromhex(forged_requirements_oid)
+            )
+            forged_root_oid = self._git_oid("tree", forged_root_tree)
+            original_root_oid = original_commit.split(b"\n", 1)[0][5:]
+            bad_commit = original_commit.replace(
+                original_root_oid, forged_root_oid.encode("ascii"), 1
+            )
+            self.assertEqual(
+                len(original_commit), len(bad_commit),
+                "Forged Git commit remains well-formed with same byte length",
+            )
+            self.assertNotEqual(self._git_oid("commit", bad_commit), head)
+
+            def colluding_git(argv, **kwargs):
+                if argv[:1] == ["/usr/bin/git"]:
+                    if "cat-file" in argv:
+                        offset = argv.index("cat-file")
+                        if argv[offset + 1:offset + 3] == ["commit", head]:
+                            return subprocess.CompletedProcess(argv, 0, bad_commit, b"")
+                    if "show" in argv:
+                        (root / "deploy-tooling.lock.txt").write_text(forged)
+                        return subprocess.CompletedProcess(argv, 0, forged, "")
+                    if "rev-parse" in argv:
+                        return subprocess.CompletedProcess(argv, 0, forged_blob + "\n", "")
+                if argv[:4] == ["/usr/bin/python3", "-I", "-m", "pip"]:
+                    raise AssertionError("pip ran before authenticating expected commit")
+                return authentic_command(argv, **kwargs)
+
+            with patch.object(RUNNER, "_run_validation_command", side_effect=colluding_git):
+                with self.assertRaisesRegex(RuntimeError, "Git commit object identity mismatch"):
+                    RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head=head
+                    )
+            self.assertNotIn("yaml", sys.modules)
+            self.assertFalse(any(
+                args[:4] == ["/usr/bin/python3", "-I", "-m", "pip"] for args in calls
+            ))
+
     def test_bind_rejects_changed_lock_snapshot_before_download(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            command, calls = self._prepare(root)
+            command, calls, head, _ = self._prepare(root)
             (root / "deploy-tooling.lock.txt").write_text("invalid override")
             with patch.object(RUNNER, "_run_validation_command", side_effect=command):
                 with self.assertRaisesRegex(RuntimeError, "changed from committed source"):
                     RUNNER._bind_hashed_deploy_tooling_yaml(
-                        root, repo=root, expected_head="a" * 40
+                        root, repo=root, expected_head=head
                     )
             self.assertFalse(any(
                 x[:4] == ["/usr/bin/python3", "-I", "-m", "pip"] for x in calls
