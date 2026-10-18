@@ -12099,8 +12099,14 @@ def _task_retained_audit_witness(
             raise RuntimeError("Retained audit witness deadline exceeded")
 
     def identity(s: os.stat_result) -> tuple[int, ...]:
-        return (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid,
-                s.st_nlink, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        stable = (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid)
+        if stat.S_ISDIR(s.st_mode):
+            # Sibling create/delete activity changes directory nlink, size,
+            # mtime and ctime without replacing an ancestor or audit record.
+            # Bind directory inode, type, owner and mode instead. The target
+            # regular file still binds the full stat identity and byte hash.
+            return stable
+        return (*stable, s.st_nlink, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
 
     budget()
     path = Path(base.AUDIT_LOG)
@@ -12308,8 +12314,18 @@ def _task_reconcile_retained_evidence_snapshot(
     if (time.monotonic() > deadline
             or not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS):
         return {"status": "invalid_or_stale"}
-    return {"status": "verified", "reconciled_at_unix": timestamp,
-            "verification_scope": TASK_RECONCILE_READY_RETAINED_SCOPE}
+    # Retained local-output marker=1 was persisted before dispatch. Before
+    # the local-only dispatcher fix, that exact row could still have started
+    # over SSH. Neither today's Fleet mapping, the final launcher JSON, nor
+    # an empty local user-systemd inventory proves the provenance of every
+    # historical attempt (including earlier attempts after a resume).
+    #
+    # The bounded origin index is only a fast rejector. Positive authority
+    # requires immutable host/transport/attempt-bound launch evidence plus
+    # enforced external restart exclusion; neither exists for this v4 scope.
+    # Preserve the observations above for diagnostics but never certify
+    # global quiescence from this historical evidence alone.
+    return {"status": "retained_attempt_authority_unverified"}
 
 
 def _task_reconcile_ready_index_present(connection: sqlite3.Connection) -> bool:
@@ -13394,6 +13410,15 @@ def _task_reconcile_ready_evidence_snapshot(
         # this remains a fresh read-only snapshot, not a future guarantee.
         if not 0 <= _now() - timestamp <= TASK_RECONCILE_READY_MAX_AGE_SECONDS:
             return {"status": "invalid_or_stale"}
+        # The bounded legacy v3 observer has the same provenance gap as v4:
+        # a row originally dispatched through SSH by the historic Fleet race
+        # may now resolve locally. Per-unit local observations and today's
+        # transport cannot authenticate that older attempt. Even archived
+        # records must not be silently excluded. This single-row indexed
+        # presence probe is a rejector, not an O(N) history scan.
+        if task_connection.execute("SELECT 1 FROM tasks LIMIT 1").fetchone() is not None:
+            return {"status": "retained_attempt_authority_unverified"}
+        # An empty, validated TaskStore has no retained task attempts.
         return {"status": "verified", "reconciled_at_unix": timestamp}
     except TaskReconcileReadyLocalTerminalBudgetExceeded as exc:
         # Unobserved units are never ready. Repeating reconciliation cannot

@@ -6334,7 +6334,7 @@ class TaskTests(unittest.TestCase):
                 with tasks._task_readonly_snapshot() as connection:
                     return tasks._task_reconcile_ready_evidence_snapshot(connection)["status"]
 
-        self.assertEqual("verified", run_pages(mutate_between=False))
+        self.assertEqual("retained_attempt_authority_unverified", run_pages(mutate_between=False))
         self.assertNotEqual("verified", run_pages(mutate_between=True))
         self.assertNotEqual(
             "verified",
@@ -6774,7 +6774,7 @@ class TaskTests(unittest.TestCase):
         ):
             with tasks._task_readonly_snapshot() as reader:
                 status = tasks._task_reconcile_ready_evidence_snapshot(reader)
-        self.assertEqual("verified", status["status"])
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
         dispatch.assert_not_called()
         broker.assert_not_called()
         persist.assert_not_called()
@@ -6843,7 +6843,7 @@ class TaskTests(unittest.TestCase):
         ):
             with tasks._task_readonly_snapshot() as reader:
                 status = tasks._task_reconcile_ready_evidence_snapshot(reader)
-        self.assertEqual("verified", status["status"])
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
         probe.assert_called_once()
         dispatch.assert_not_called()
         persist.assert_not_called()
@@ -7151,7 +7151,7 @@ class TaskTests(unittest.TestCase):
                 self.assertEqual("retained_audit_witness_changed",
                                  self._retained_history_snapshot(probe=inventory)["status"])
                 self.assertEqual(2, calls)
-                self.assertEqual("verified", self._retained_history_snapshot()["status"])
+                self.assertEqual("retained_attempt_authority_unverified", self._retained_history_snapshot()["status"])
 
     def test_retained_audit_rotation_missing_or_corrupt_after_inventory(self) -> None:
         self._retained_archive_witness()
@@ -7249,7 +7249,7 @@ class TaskTests(unittest.TestCase):
             for name in ("_audit_records_snapshot", "_verify_audit_log", "_capture_verified_audit_head",
                          "_read_audit_status_snapshot", "_audit_coordination_lock", "_audit_parent", "_state_root"):
                 guards.enter_context(patch.object(tasks.base, name, side_effect=forbidden))
-            self.assertEqual("verified", self._retained_history_snapshot()["status"])
+            self.assertEqual("retained_attempt_authority_unverified", self._retained_history_snapshot()["status"])
         self.assertFalse(lock.exists())
         self.assertEqual(before, self.audit_log.stat())
         self.assertEqual(before.st_atime_ns, self.audit_log.stat().st_atime_ns)
@@ -7260,6 +7260,36 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(2, len(audit_opens))
         required = os.O_NOATIME | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
         self.assertTrue(all(flags & required == required for flags in audit_opens))
+
+    def test_retained_audit_ignores_unrelated_ancestor_mtime_changes(self) -> None:
+        # The root and audit-parent directory can change because an unrelated
+        # process creates a sibling; it does not replace the bound directories
+        # or alter the exact audit head. READ_ONLY must not mistake the changed
+        # directory mtime/ctime for a replaced publisher audit record.
+        self._local_terminal_readiness_store(8225)
+        audit_bytes = self.audit_log.read_bytes()
+        audit_stat = self.audit_log.stat()
+        parent = self.audit_log.parent
+        before = parent.stat()
+        calls = []
+        def unrelated_directory_change(_argv, **_kwargs):
+            calls.append(True)
+            if len(calls) == 1:
+                os.utime(parent, ns=(
+                    before.st_atime_ns, before.st_mtime_ns + 1_000_000_000
+                ))
+            return _launcher()
+        try:
+            status = self._retained_history_snapshot(
+                probe=unrelated_directory_change
+            )
+        finally:
+            os.utime(parent, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(2, len(calls))
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
+        self.assertEqual(audit_bytes, self.audit_log.read_bytes())
+        self.assertEqual(audit_stat.st_ino, self.audit_log.stat().st_ino)
+        self.assertEqual(audit_stat.st_mtime_ns, self.audit_log.stat().st_mtime_ns)
 
     def _retained_archive_witness(self):
         archive_env = patch.dict(os.environ, {
@@ -7280,7 +7310,9 @@ class TaskTests(unittest.TestCase):
                 (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
             ).fetchone()[0])
         self.assertEqual(4, proof["schema_version"])
-        self.assertEqual("verified", self._retained_history_snapshot()["status"])
+        # A consistent archived witness is not per-attempt transport provenance;
+        # historical v4 can validate integrity but cannot authorize readiness.
+        self.assertEqual("retained_attempt_authority_unverified", self._retained_history_snapshot()["status"])
         return task_id, proof
 
     def _retained_archive_readonly_status(self):
@@ -7307,7 +7339,7 @@ class TaskTests(unittest.TestCase):
             patch.object(tasks, "_subtract_projected_task_counts",
                          side_effect=AssertionError("archive must not exclude retained rows")),
         ):
-            self.assertEqual("verified", self._retained_archive_readonly_status()["status"])
+            self.assertEqual("retained_attempt_authority_unverified", self._retained_archive_readonly_status()["status"])
         self.assertEqual(3, bindings.call_count)
         self.assertTrue(all(list(call.args[1]["archived_task_bindings"]) == [task_id]
                             for call in bindings.call_args_list))
@@ -7465,8 +7497,8 @@ class TaskTests(unittest.TestCase):
                          side_effect=AssertionError("no archive exclusion")),
         ):
             status = self._retained_history_snapshot()
-        self.assertEqual("verified", status["status"])
-        self.assertEqual("retained-attempt-inventory-v1", status["verification_scope"])
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
+        self.assertNotIn("verification_scope", status)
         self.assertEqual(3, archive.call_count)
         self.assertEqual(3, bindings.call_count)
         for call in archive.call_args_list:
@@ -7502,7 +7534,7 @@ class TaskTests(unittest.TestCase):
         with patch.object(tasks, "_task_current_projection",
                           wraps=tasks._task_current_projection) as projection:
             status = self._retained_history_snapshot(probe=run)
-        self.assertEqual("verified", status["status"])
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
         self.assertEqual(3, projection.call_count)
         self.assertTrue(all(call.kwargs == {"readiness_bounded": True}
                             for call in projection.call_args_list))
@@ -7566,7 +7598,7 @@ class TaskTests(unittest.TestCase):
         self._local_terminal_readiness_store(8225)
         first = "grabowski-task-000000000000000000000001-a1.service loaded inactive dead done\n"
         second = "grabowski-task-000000000000000000000001-a2.service loaded inactive dead done\n"
-        self.assertEqual("verified", self._retained_history_snapshot(first + second)["status"])
+        self.assertEqual("retained_attempt_authority_unverified", self._retained_history_snapshot(first + second)["status"])
         self.assertEqual("archived_task_unit_live_unverified", self._retained_history_snapshot(
             first.replace("inactive dead", "active running") + second)["status"])
         inventories = iter([first, first + second])
@@ -7627,6 +7659,41 @@ class TaskTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 tasks._publish_task_reconcile_ready_evidence(prepared)
         self.assertEqual("missing", self._retained_history_snapshot()["status"])
+
+    def test_retained_marker_one_cannot_certify_hidden_active_ssh_attempt(self) -> None:
+        # Old tasks recorded marker=1 at persistence, but a Fleet race could
+        # dispatch attempt 1 over SSH. A still-active remote user unit is
+        # invisible to local systemctl --user, even if Fleet now says local.
+        self._local_terminal_readiness_store(8225)
+        task_id = "000000000000000000000001"
+        # A later local launcher field does not authenticate the historical
+        # first attempt; the pre-fix Fleet race may have launched that same
+        # identity on SSH while its stored marker was already 1.
+        with tasks._database_connection() as writer:
+            writer.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (json.dumps({
+                    "task_output_managed_from_attempt": 1,
+                    "task_launch_transport": "local",
+                }), task_id),
+            )
+            prepared = tasks._prepare_task_reconcile_retained_evidence(writer)
+        tasks._publish_task_reconcile_ready_evidence(prepared)
+        remote_unit = tasks._task_unit(task_id, 1)
+        remote_running_units = {remote_unit: "active"}
+        seen = []
+        def local_inventory(argv, **_kwargs):
+            seen.append(argv)
+            self.assertEqual(["systemctl", "--user"], argv[:2])
+            return _launcher()
+        with patch.object(
+            tasks.fleet, "run_fleet_host",
+            side_effect=AssertionError("READ_ONLY must never query remote units"),
+        ):
+            status = self._retained_history_snapshot(probe=local_inventory)
+        self.assertEqual("active", remote_running_units[remote_unit])
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
+        self.assertTrue(all(argv[:2] == ["systemctl", "--user"] for argv in seen))
 
     def test_retained_history_readiness_rejects_unbound_earlier_attempt_transport(self) -> None:
         self._local_terminal_readiness_store(8225)
@@ -7764,11 +7831,25 @@ class TaskTests(unittest.TestCase):
             "retained_attempt_authority_unverified",
         )
 
+    def test_v3_legacy_local_task_cannot_certify_possible_remote_first_attempt(self) -> None:
+        # v3 also trusts a current local Fleet mapping and local systemd
+        # inventory; a pre-fix task whose first launch crossed to SSH can
+        # remain live remotely and be invisible to those observations.
+        status, local_probes = self._local_terminal_readiness_status(1)
+        with tasks._task_readonly_snapshot() as reader:
+            proof = json.loads(reader.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_READY_EVIDENCE_METADATA_KEY,),
+            ).fetchone()[0])
+        self.assertEqual(3, proof["schema_version"])
+        self.assertEqual(1, local_probes.call_count)
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
+
     def test_reconcile_ready_local_terminal_budget_admits_exactly_32(self) -> None:
         limit = tasks.TASK_RECONCILE_READY_LOCAL_TERMINAL_LIMIT
         self.assertEqual(32, limit)
         status, probe = self._local_terminal_readiness_status(limit)
-        self.assertEqual("verified", status["status"])
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
         self.assertEqual(limit, probe.call_count)
 
     def test_reconcile_ready_local_terminal_budget_has_own_state_at_33(self) -> None:
@@ -8314,7 +8395,7 @@ class TaskTests(unittest.TestCase):
         ):
             with tasks._task_readonly_snapshot() as reader:
                 status = tasks._task_reconcile_ready_evidence_snapshot(reader)
-        self.assertEqual("verified", status["status"])
+        self.assertEqual("retained_attempt_authority_unverified", status["status"])
         # The same bounded inventory is observed before terminal probes,
         # after those probes, and after the final SQLite revision rereads.
         self.assertEqual(3, probe.call_count)
@@ -8455,7 +8536,7 @@ class TaskTests(unittest.TestCase):
         ):
             with tasks._task_readonly_snapshot() as reader:
                 self.assertEqual(
-                    "verified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
+                    "retained_attempt_authority_unverified", tasks._task_reconcile_ready_evidence_snapshot(reader)["status"]
                 )
             with patch.object(
                 tasks, "_observe",
@@ -8911,9 +8992,9 @@ class TaskTests(unittest.TestCase):
                 tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
             )
 
-        # Positive control: the completed cycle only becomes VERIFIED after
-        # one fresh, bound local user-systemd quiescence observation. Merely
-        # changing the SQLite row cannot certify an externally restarted unit.
+        # A complete cycle still observes local user-systemd quiescence, but
+        # without first-attempt host provenance that observation must not
+        # certify legacy task history as globally ready.
         with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute(
                 "UPDATE tasks SET state='completed' WHERE task_id=?",
@@ -8948,7 +9029,7 @@ class TaskTests(unittest.TestCase):
         ):
             with tasks._task_readonly_snapshot() as connection:
                 self.assertEqual(
-                    "verified",
+                    "retained_attempt_authority_unverified",
                     tasks._task_reconcile_ready_evidence_snapshot(connection)["status"],
                 )
         probe.assert_called_once()
