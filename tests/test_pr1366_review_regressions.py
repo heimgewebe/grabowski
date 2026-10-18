@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from tests.test_grips import CAPTAIN_HEAD, grips
+import grabowski_self_deploy as real_deploy
 from tests.test_self_deploy import SELF_DEPLOY, _result, _source_identity
 
 
@@ -561,6 +562,9 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
         }
 
         with self.subTest(failure="source-readback"), patch.object(
+            real_deploy, "_require_release_source_admission",
+            return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "independent_review_required": False},
+        ), patch.object(
             grips, "_runtime_deploy_self_preflight", return_value=preflight
         ), patch.object(
             grips, "_runtime_deploy_self_schedule", return_value=schedule
@@ -584,6 +588,9 @@ class Pr1366CurrentHeadReviewRegressions(unittest.TestCase):
             "status_tool": "wrong-status-tool",
         }
         with self.subTest(failure="schedule-validation"), patch.object(
+            real_deploy, "_require_release_source_admission",
+            return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "independent_review_required": False},
+        ), patch.object(
             grips, "_runtime_deploy_self_preflight", return_value=preflight
         ), patch.object(
             grips, "_runtime_deploy_self_schedule", return_value=invalid_schedule

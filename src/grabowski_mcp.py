@@ -15129,15 +15129,49 @@ def _grip_run_core(
                 raw_parameters,
                 f"captain audit intent unavailable: {type(exc).__name__}",
             )
-    result = grabowski_grips.grip_run(
-        name,
-        dispatch_parameters,
-        profile=profile,
-        allow_mutation=allow_mutation,
-        transport_target_dispatcher=transport_target_dispatcher,
-        n8n_provider_dispatcher=_n8n_provider_dispatcher,
-        secret_pty_dispatcher=secret_pty_dispatcher or _secret_pty_grip_dispatcher,
-    )
+    from contextlib import nullcontext
+
+    # Only the actual server-frontdoor dispatch can supply an accepted Captain
+    # origin, after its session-policy check, short-lived actor identity and
+    # durable Captain intent audit. R3/CI or direct internal scope calls cannot.
+    captain_dispatch_scope = nullcontext()
+    mcp_ticket: object | None = None
+    if name == "captain-run" and allow_mutation:
+        if captain_actor_identity is None or captain_intent_audit is None:
+            return grabowski_grips._blocked_surface_receipt(
+                name, raw_parameters,
+                "accepted Captain action requires authenticated server intent",
+            )
+        actor = grabowski_merge_guard.verify_server_runtime_actor_identity(
+            captain_actor_identity
+        )
+        # The ticket is created only here, after the real MCP session
+        # decision and durable Captain intent audit, and never comes from the
+        # JSON request. The protected grip consumes it exactly once.
+        mcp_ticket = object()
+        grabowski_grips._CAPTAIN_MCP_INGRESS_TICKETS[mcp_ticket] = (
+            actor["identity_sha256"],
+            grabowski_merge_guard.captain_request_sha256(dispatch_parameters),
+            captain_intent_audit.get("audit_record_sha256"),
+        )
+        captain_dispatch_scope = grabowski_grips._server_captain_dispatch_scope(
+            dispatch_parameters, captain_actor_identity, captain_intent_audit,
+            mcp_ticket=mcp_ticket,
+        )
+    try:
+        with captain_dispatch_scope:
+            result = grabowski_grips.grip_run(
+                name,
+                dispatch_parameters,
+                profile=profile,
+                allow_mutation=allow_mutation,
+                transport_target_dispatcher=transport_target_dispatcher,
+                n8n_provider_dispatcher=_n8n_provider_dispatcher,
+                secret_pty_dispatcher=secret_pty_dispatcher or _secret_pty_grip_dispatcher,
+            )
+    finally:
+        if mcp_ticket is not None:
+            grabowski_grips._CAPTAIN_MCP_INGRESS_TICKETS.pop(mcp_ticket, None)
     if (
         name == "operator-obligation-close"
         and allow_mutation
