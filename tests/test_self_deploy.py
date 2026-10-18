@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager, nullcontext
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -13,6 +14,7 @@ import tempfile
 import types
 from typing import get_args
 import unittest
+import zipfile
 from unittest import mock
 from unittest.mock import Mock, call, patch
 
@@ -8204,14 +8206,71 @@ def _fake_retained_validation(*args, **kwargs):
 
 
 class HashedDeployToolingBindingTests(unittest.TestCase):
-    """Unit-bound import validation, not a substitute for pip --require-hashes."""
+    """Authenticate complete wheel bytes before any downloaded code executes."""
+
+    def setUp(self) -> None:
+        self._saved_yaml_modules = {
+            name: module for name, module in sys.modules.items()
+            if name == "_yaml" or name == "yaml" or name.startswith("yaml.")
+        }
+        for name in self._saved_yaml_modules:
+            del sys.modules[name]
+        self.addCleanup(self._restore_yaml)
+
+    def _restore_yaml(self) -> None:
+        for name in list(sys.modules):
+            if name == "_yaml" or name == "yaml" or name.startswith("yaml."):
+                del sys.modules[name]
+        sys.modules.update(self._saved_yaml_modules)
+
+    def _prepare(self, root: Path, *, tamper: bool = False,
+                 version: str = "6.0.3"):
+        (root / "deploy-tooling" / ".venv").mkdir(parents=True)
+        site = root / "deploy-tooling" / ".venv" / "site-packages"
+        site.mkdir()
+        (site / "untrusted.pth").write_text(
+            "import os; os.environ['GRABOWSKI_UNTRUSTED_PTH']='1'" + chr(10)
+        )
+        (site / "os.py").write_text("raise AssertionError('shadow stdlib')")
+        package_source = chr(10).join([
+            f'__version__ = "{version}"',
+            'def safe_load(value):',
+            '    return {"locked": True} if value == "locked: true" else {}',
+            '',
+        ])
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            archive.writestr("yaml/__init__.py", package_source)
+        wheel = output.getvalue()
+        wheel_hash = hashlib.sha256(wheel).hexdigest()
+        lock_text = (
+            "pyyaml==6.0.3 " + chr(92) + chr(10)
+            + "    --hash=sha256:" + wheel_hash + chr(10)
+        )
+        (root / "deploy-tooling.lock.txt").write_text(lock_text, encoding="utf-8")
+        calls: list[list[str]] = []
+
+        def command(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[:1] == ["/usr/bin/git"]:
+                return subprocess.CompletedProcess(argv, 0, lock_text, "")
+            if argv[:4] == ["/usr/bin/python3", "-I", "-m", "pip"]:
+                dest = Path(argv[argv.index("--dest") + 1])
+                (dest / "PyYAML-6.0.3-py3-none-any.whl").write_bytes(
+                    wheel + (b"altered" if tamper else b"")
+                )
+                return subprocess.CompletedProcess(argv, 0, None, None)
+            raise AssertionError("unexpected trusted child command: " + repr(argv))
+        return command, calls
 
     def test_bind_rejects_already_loaded_untrusted_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.dict(
             sys.modules, {"yaml": types.SimpleNamespace(__version__="6.0.3")}
         ):
             with self.assertRaisesRegex(RuntimeError, "before lock validation"):
-                RUNNER._bind_hashed_deploy_tooling_yaml(Path(temporary))
+                RUNNER._bind_hashed_deploy_tooling_yaml(
+                    Path(temporary), repo=Path(temporary), expected_head="a" * 40
+                )
 
     def test_bind_rejects_symlinked_tooling_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -8220,41 +8279,77 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
             outside.mkdir()
             (root / "deploy-tooling").symlink_to(outside, target_is_directory=True)
             with self.assertRaisesRegex(RuntimeError, "directory is unsafe"):
-                RUNNER._bind_hashed_deploy_tooling_yaml(root)
+                RUNNER._bind_hashed_deploy_tooling_yaml(
+                    root, repo=root, expected_head="a" * 40
+                )
 
-    def test_bind_loads_only_verified_private_tooling_package(self) -> None:
+    @unittest.skipUnless(
+        hasattr(os, "memfd_create") and sys.platform == "linux",
+        "sealed memfd is required on the production Linux host",
+    )
+    def test_bind_imports_only_sealed_wheel_not_mutable_site(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            site = (
-                root / "deploy-tooling" / ".venv" / "lib"
-                / f"python{sys.version_info.major}.{sys.version_info.minor}"
-                / "site-packages"
-            )
-            yaml_dir = site / "yaml"
-            yaml_dir.mkdir(parents=True)
-            (yaml_dir / "__init__.py").write_text(
-                '__version__ = "6.0.3"\n'
-                'def safe_load(value):\n'
-                '    return {"locked": True}\n',
-                encoding="utf-8",
-            )
-            saved = {
-                name: module for name, module in sys.modules.items()
-                if name == "yaml" or name.startswith("yaml.")
-            }
-            for name in saved:
-                del sys.modules[name]
+            command, calls = self._prepare(root)
+            previous_path = sys.path[:]
+            fd = None
             try:
-                RUNNER._bind_hashed_deploy_tooling_yaml(root)
-                self.assertEqual(sys.modules["yaml"].__file__, str(yaml_dir / "__init__.py"))
-                self.assertEqual(sys.path[0], str(site))
+                with patch.object(RUNNER, "_run_validation_command", side_effect=command):
+                    fd = RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head="a" * 40
+                    )
+                yaml = sys.modules["yaml"]
+                self.assertEqual(yaml.__version__, "6.0.3")
+                self.assertEqual(yaml.safe_load("locked: true"), {"locked": True})
+                self.assertEqual(yaml.__file__, f"/proc/self/fd/{fd}/yaml/__init__.py")
+                self.assertEqual(sys.path, previous_path)
+                self.assertNotIn("GRABOWSKI_UNTRUSTED_PTH", os.environ)
+                self.assertTrue(any(x[:1] == ["/usr/bin/git"] for x in calls))
+                self.assertTrue(any(
+                    x[:4] == ["/usr/bin/python3", "-I", "-m", "pip"] for x in calls
+                ))
             finally:
-                if str(site) in sys.path:
-                    sys.path.remove(str(site))
-                for name in list(sys.modules):
-                    if name == "yaml" or name.startswith("yaml."):
-                        del sys.modules[name]
-                sys.modules.update(saved)
+                if fd is not None:
+                    os.close(fd)
+
+    def test_bind_rejects_modified_wheel_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, _ = self._prepare(root, tamper=True)
+            with patch.object(RUNNER, "_run_validation_command", side_effect=command):
+                with self.assertRaisesRegex(RuntimeError, "not lock-pinned"):
+                    RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head="a" * 40
+                    )
+            self.assertNotIn("yaml", sys.modules)
+
+    def test_bind_rejects_invalid_module_and_evicts_yaml_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, _ = self._prepare(root, version="6.0.2")
+            with patch.object(RUNNER, "_run_validation_command", side_effect=command):
+                with self.assertRaisesRegex(RuntimeError, "sealed locked wheel"):
+                    RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head="a" * 40
+                    )
+            self.assertFalse(any(
+                name == "yaml" or name.startswith("yaml.")
+                for name in sys.modules
+            ))
+
+    def test_bind_rejects_changed_lock_snapshot_before_download(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command, calls = self._prepare(root)
+            (root / "deploy-tooling.lock.txt").write_text("invalid override")
+            with patch.object(RUNNER, "_run_validation_command", side_effect=command):
+                with self.assertRaisesRegex(RuntimeError, "changed from committed source"):
+                    RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head="a" * 40
+                    )
+            self.assertFalse(any(
+                x[:4] == ["/usr/bin/python3", "-I", "-m", "pip"] for x in calls
+            ))
 
 
 class ScheduledDeployRunnerTests(unittest.TestCase):
@@ -9364,6 +9459,11 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             timeout_seconds=1200,
             phase="validate",
             retain_validation=True,
+        )
+        self.yaml_binding_mock.assert_called_once()
+        self.assertEqual(
+            self.yaml_binding_mock.call_args.kwargs,
+            {"repo": repo, "expected_head": expected},
         )
         self.assertEqual(self.productive_blue_green_mock.call_count, 1)
 
