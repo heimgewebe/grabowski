@@ -12,6 +12,50 @@ SOURCE_SHA256S = {
 }
 
 
+class LifecycleEvidenceBoundedFileReadTests(unittest.TestCase):
+    def test_small_file_does_not_preallocate_large_budget(self) -> None:
+        import tempfile
+        import tracemalloc
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            file_path = Path(directory) / "archive.json"
+            file_path.write_bytes(b"x" * 1232)
+            tracemalloc.start()
+            try:
+                payload = evidence.read_regular_bytes(
+                    file_path, max_bytes=64 * 1024 * 1024
+                )
+                peak_bytes = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+            self.assertEqual(1232, len(payload))
+            self.assertLess(peak_bytes, 4 * 1024 * 1024)
+
+    def test_growth_between_stat_and_read_fails_closed(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            file_path = Path(directory) / "growing-archive.json"
+            file_path.write_bytes(b"before")
+            fdopen = evidence.os.fdopen
+
+            def grow_before_read(fd, mode, *, closefd):
+                file_path.write_bytes(b"before-and-after")
+                return fdopen(fd, mode, closefd=closefd)
+
+            with mock.patch.object(
+                evidence.os, "fdopen", side_effect=grow_before_read
+            ):
+                with self.assertRaisesRegex(
+                    evidence.LifecycleEvidenceIntegrityError,
+                    "archive file changed during bounded read",
+                ):
+                    evidence.read_regular_bytes(file_path, max_bytes=1024)
+
+
 class LifecycleEvidenceAggregationTests(unittest.TestCase):
     def bundle(self, **overrides):
         values = {

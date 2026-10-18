@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "2e158ca751ea852a8191e978d4689b4fc39fb351120f08423dbf126faf934a3c",
+  "capability_source_sha256": "ed2614ea2680d0e7bb87ebd7b5de69295fc66a0f8152a350b9121993b456c39f",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "9e0934a57620c5e970ac0aadf964c977f9c037356faa2ed48d99264850958c93",
   "integrity": {
@@ -810,11 +810,13 @@
     },
     {
       "category": "checkout-lifecycle",
-      "description": "Preview an evidence-only terminal transition for one missing or safely retained managed checkout.",
-      "effects": [],
+      "description": "Preview an evidence-bound terminal transition; SQLite WAL observation needs mutation admission.",
+      "effects": [
+        "sqlite-wal-shm-sidecar-write"
+      ],
       "id": "grabowski_checkout_binding_terminal_preview",
       "purpose": "Preview one exact evidence-bound terminal reconciliation for an absent managed checkout, a clean terminal Work Lane, or a present terminal thread_focus checkout whose only admitted local state is hash-bound .review-audits evidence and whose head is exactly retention-bound.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_checkout_binding_terminal_preview"
@@ -837,11 +839,13 @@
     },
     {
       "category": "checkout-lifecycle",
-      "description": "Preview one fail-closed identity repair for branch, path, or retention-converged lifecycle drift.",
-      "effects": [],
+      "description": "Preview identity repair through mutation admission before SQLite WAL observation.",
+      "effects": [
+        "sqlite-wal-shm-sidecar-write"
+      ],
       "id": "grabowski_checkout_binding_identity_rebind_preview",
       "purpose": "Preview one clean, coordination-free and remote-secured existing checkout for a supported identity repair: branch rename, repo-path canonicalization, or lifecycle catch-up when retention already matches current Git identity.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_checkout_binding_identity_rebind_preview"
@@ -1441,24 +1445,32 @@
     },
     {
       "category": "task",
-      "description": "Observe one persistent task and refresh its recorded state.",
+      "description": "Observe and persist one task state; lease maintenance may mutate resources.",
       "effects": [
-        "state-refresh"
+        "lease-reacquire",
+        "lease-renew",
+        "state-refresh",
+        "temporary-file-create"
       ],
       "id": "grabowski_task_status",
-      "purpose": "Observe one persistent task and refresh its recorded state.",
-      "read_only": true,
+      "purpose": "Observe one persistent task through the mutation gate and refresh its recorded state; scoping a task not yet checkpointed from the WAL and privileged observations may create private temporary files.",
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_status"
     },
     {
       "category": "task",
-      "description": "Read redacted journal output for one local or fleet task.",
-      "effects": [],
+      "description": "Read redacted task output; terminalization recovery may mutate stores.",
+      "effects": [
+        "remote-read",
+        "schema-migration",
+        "temporary-file-create",
+        "terminalization-recovery"
+      ],
       "id": "grabowski_task_logs",
-      "purpose": "Read redacted journal output for one local or fleet task.",
-      "read_only": true,
+      "purpose": "Read redacted output for one local or fleet task through the mutation gate; terminalization recovery may update task and resource stores.",
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_logs"
@@ -1495,10 +1507,13 @@
     {
       "category": "task",
       "description": "List persistent tasks or inspect store-schema compatibility read-only.",
-      "effects": [],
+      "effects": [
+        "schema-migration",
+        "terminalization-recovery"
+      ],
       "id": "grabowski_task_list",
       "purpose": "List recent persistent task records with optional state filtering.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_list"
@@ -1541,11 +1556,14 @@
     },
     {
       "category": "task",
-      "description": "Read one bounded, resumable reconcile preview for persistent tasks.",
-      "effects": [],
+      "description": "Preview tasks through the mutation gate (legacy stores may be upgraded).",
+      "effects": [
+        "schema-migration",
+        "temporary-file-create"
+      ],
       "id": "grabowski_task_reconcile_check",
-      "purpose": "Preview reconcile effects for persistent task records without mutating state.",
-      "read_only": true,
+      "purpose": "Preview persistent task reconciliation through the mutation gate; legacy SQLite stores may be initialized or migrated and privileged observations may create temporary reference files.",
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_reconcile_check"
@@ -2089,10 +2107,12 @@
     {
       "category": "resource",
       "description": "List bounded leases or inspect store-schema compatibility read-only.",
-      "effects": [],
+      "effects": [
+        "schema-migration"
+      ],
       "id": "grabowski_resource_list",
       "purpose": "List bounded typed resource leases with optional owner filtering.",
-      "read_only": true,
+      "read_only": false,
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_resource_list"

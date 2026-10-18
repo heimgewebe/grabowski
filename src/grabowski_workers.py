@@ -2422,7 +2422,7 @@ def browser_stored_form_action(
     record = _row(identifier)
     if not isinstance(record.get("port"), int):
         raise RuntimeError("browser worker has no CDP port")
-    port_lease = resources.inspect_resource(f"port:{record['port']}")
+    port_lease = resources.inspect_resource(f"port:{record['port']}", read_only=True)
     if port_lease is None or port_lease.get("owner_id") != f"worker:{identifier}":
         raise RuntimeError("browser worker no longer owns its CDP port")
 
@@ -5219,7 +5219,7 @@ def _browser_semantic_preflight(identifier: str) -> dict[str, Any]:
         raise RuntimeError("browser worker is not running")
     if not isinstance(record.get("port"), int):
         raise RuntimeError("browser worker has no CDP port")
-    port_lease = resources.inspect_resource(f"port:{record['port']}")
+    port_lease = resources.inspect_resource(f"port:{record['port']}", read_only=True)
     if port_lease is None or port_lease.get("owner_id") != f"worker:{identifier}":
         raise RuntimeError("browser worker no longer owns its CDP port")
     return record

@@ -54,6 +54,33 @@ import grabowski_work_acquire as work_acquire
 
 
 class CheckoutTerminalReconciliationTests(unittest.TestCase):
+
+    @staticmethod
+    def _closeable_database_mock(context_factory):
+        """Adapt a fault-injecting generator fixture to sqlite.Connection's API.
+
+        The real _database() returns a closeable connection, not a generator
+        context manager. Preserve the fixture's transaction/rollback hooks
+        while allowing production code to close the connection after exit.
+        """
+        class CloseableConnection:
+            def __init__(self):
+                self._manager = context_factory()
+                self._connection = self._manager.__enter__()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return self._manager.__exit__(exc_type, exc, tb)
+
+            def close(self):
+                self._connection.close()
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+        return CloseableConnection
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -541,7 +568,7 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             patch.object(checkouts, "_remote_secured_observation", return_value=self._remote_secured()),
         ):
             preview = reconciliation.preview(key)
-            with patch.object(checkouts, "_database", database_with_sql_race):
+            with patch.object(checkouts, "_database", self._closeable_database_mock(database_with_sql_race)):
                 with self.assertRaisesRegex(RuntimeError, "snapshot|before commit"):
                     reconciliation.apply(key, "owner-a", preview["preview_sha256"],
                                          preview["preview_created_at_unix"], reconciliation.CONFIRMATION)
@@ -577,7 +604,7 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             patch.object(checkouts, "_remote_secured_observation", return_value=self._remote_secured()),
         ):
             preview = reconciliation.preview(key)
-            with patch.object(checkouts, "_database", database_with_commit_race):
+            with patch.object(checkouts, "_database", self._closeable_database_mock(database_with_commit_race)):
                 result = reconciliation.apply(key, "owner-a", preview["preview_sha256"],
                                               preview["preview_created_at_unix"], reconciliation.CONFIRMATION)
         self.assertTrue(injected)
@@ -633,7 +660,7 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
             patch.object(checkouts, "_remote_secured_observation", return_value=self._remote_secured()),
         ):
             preview = reconciliation.preview(key)
-            with patch.object(checkouts, "_database", database_with_receipt_failure):
+            with patch.object(checkouts, "_database", self._closeable_database_mock(database_with_receipt_failure)):
                 with self.assertRaisesRegex(RuntimeError, "injected receipt failure"):
                     reconciliation.apply(key, "owner-a", preview["preview_sha256"],
                                          preview["preview_created_at_unix"], reconciliation.CONFIRMATION)
@@ -707,7 +734,7 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         ):
             preview = reconciliation.preview(str(binding["checkout_key"]))
             self.assertTrue(preview["safe_to_apply"])
-            with patch.object(checkouts, "_database", database_with_late_evidence):
+            with patch.object(checkouts, "_database", self._closeable_database_mock(database_with_late_evidence)):
                 with self.assertRaisesRegex(RuntimeError, "commit boundary"):
                     reconciliation.apply(
                         str(binding["checkout_key"]),
@@ -749,7 +776,7 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         ):
             preview = reconciliation.preview(str(binding["checkout_key"]))
             self.assertTrue(preview["safe_to_apply"])
-            with patch.object(checkouts, "_database", database_with_late_commit):
+            with patch.object(checkouts, "_database", self._closeable_database_mock(database_with_late_commit)):
                 with self.assertRaisesRegex(RuntimeError, "commit boundary"):
                     reconciliation.apply(
                         str(binding["checkout_key"]),
