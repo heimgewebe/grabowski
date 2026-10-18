@@ -79,6 +79,8 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         ]
         paths = {
             "workflow": f"{prefix}/actions/workflows/validate.yml",
+            "serving_workflow": f"{prefix}/contents/{admission.CANONICAL_WORKFLOW_PATH}?ref={SERVING}",
+            "target_workflow": f"{prefix}/contents/{admission.CANONICAL_WORKFLOW_PATH}?ref={TARGET}",
             "runs": f"{prefix}/actions/workflows/{workflow_id}/runs?head_sha={TARGET}&per_page=100&page=1",
             "run": f"{prefix}/actions/runs/{run_id}",
             "jobs": f"{prefix}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page=1",
@@ -89,6 +91,8 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                 "id": workflow_id, "path": admission.CANONICAL_WORKFLOW_PATH,
                 "state": "active",
             },
+            paths["serving_workflow"]: {"path": admission.CANONICAL_WORKFLOW_PATH, "type": "file", "sha": "1" * 40},
+            paths["target_workflow"]: {"path": admission.CANONICAL_WORKFLOW_PATH, "type": "file", "sha": "1" * 40},
             paths["runs"]: {"total_count": 1, "workflow_runs": [identity.copy()]},
             paths["run"]: identity.copy(),
             paths["jobs"]: {"total_count": len(jobs), "jobs": jobs},
@@ -103,6 +107,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
 
         def request(method, path, *, headers):
             self.assertEqual("GET", method)
+            self.assertEqual("Bearer test-only-credential", headers.get("Authorization"))
             self.assertTrue(path.startswith(f"/repos/{admission.REPOSITORY}/"))
             current["path"] = path
             requests.append(path)
@@ -138,8 +143,10 @@ class AuthoritativeCIReadTests(unittest.TestCase):
 
         connection.request.side_effect = request
         connection.getresponse.side_effect = response
-        with patch.object(admission.http.client, "HTTPSConnection", return_value=connection):
-            value = admission._fresh_github_checks(TARGET)
+        with (patch.object(admission, "_github_token", return_value="test-only-credential", create=True) as credentials,
+              patch.object(admission.http.client, "HTTPSConnection", return_value=connection)):
+            value = admission._fresh_github_checks(TARGET, serving_head=SERVING)
+        credentials.assert_called_once_with()
         return value, requests
 
     def test_accepts_full_canonical_green_workflow_and_jobs(self):
@@ -155,7 +162,53 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             f"/repos/{admission.REPOSITORY}/check-runs/101",
             f"/repos/{admission.REPOSITORY}/check-runs/102",
         ], requests[-2:])
-        self.assertEqual(6, len(requests))
+        self.assertEqual(8, len(requests))
+
+    def test_mutated_validate_workflow_is_not_admitted_with_green_job_names(self):
+        # A target commit may replace validation steps with no-ops while
+        # retaining the canonical workflow id and two green job names.
+        paths, pages = self.fixture()
+        pages[paths["target_workflow"]]["sha"] = "2" * 40
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "workflow.*(changed|mismatch|untrusted)"):
+            self.query(pages)
+
+    def test_workflow_blob_missing_or_wrong_path_fails_closed(self):
+        for field, value in (("type", "symlink"), ("path", "other.yml"), ("sha", "not-an-oid")):
+            with self.subTest(field=field):
+                paths, pages = self.fixture()
+                pages[paths["target_workflow"]][field] = value
+                with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "workflow"):
+                    self.query(pages)
+
+    def test_missing_authenticated_github_credential_has_no_network_fallback(self):
+        with (patch.object(admission, "_github_token", side_effect=admission.ReleaseAdmissionDenied(
+                  "authenticated GitHub credential unavailable"), create=True),
+              patch.object(admission.http.client, "HTTPSConnection") as network):
+            with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "authenticated GitHub credential"):
+                admission._fresh_github_checks(TARGET, serving_head=SERVING)
+        network.assert_not_called()
+
+    def test_malformed_credential_is_refused_before_any_network_access(self):
+        for token in ("", "bad\nsecret", "bad\rsecret"):
+            with (self.subTest(token=repr(token)),
+                  patch.object(admission, "_github_token", return_value=token),
+                  patch.object(admission.http.client, "HTTPSConnection") as network):
+                with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "credential invalid"):
+                    admission._fresh_github_checks(TARGET, serving_head=SERVING)
+                network.assert_not_called()
+
+    def test_operator_credential_failure_is_redacted(self):
+        import types
+        fake = types.ModuleType("grabowski_operator")
+        fake.TRUSTED_GITHUB_CLI_PATH = Path("/usr/bin/gh")
+        def reject(*_args):
+            raise RuntimeError("secret must not reach a receipt: secret-fixture")
+        fake._github_pr_view_auth_token = reject
+        with patch.dict(sys.modules, {"grabowski_operator": fake}):
+            with self.assertRaises(admission.ReleaseAdmissionDenied) as raised:
+                admission._github_token()
+        self.assertNotIn("secret-fixture", str(raised.exception))
+        self.assertIn("authenticated GitHub credential", str(raised.exception))
 
     def test_newer_green_foreign_workflow_cannot_override_failed_canonical(self):
         paths, pages = self.fixture()
