@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -1322,30 +1324,54 @@ def _archive_require_pinned_identity(
         os.close(fd)
 
 
-def _archive_recover_wrong_move(
-    jobs_fd: int, archive_fd: int, name: str
+def _archive_rename_noreplace(
+    source_fd: int, source_name: str, destination_fd: int, destination_name: str
 ) -> None:
-    """Preserve a wrongly moved child without occupying the canonical archive."""
+    """Linux atomic rename without silently unlinking an existing archive slot."""
     try:
-        os.stat(name, dir_fd=jobs_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        # Most swap races leave the original basename empty after renameat.
-        os.rename(name, name, src_dir_fd=archive_fd, dst_dir_fd=jobs_fd)
-    else:
-        # If a peer occupied the source name, retain the wrong directory under
-        # a distinct archive basename. Never unlink or overwrite that peer.
+        syscall = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:
+        raise RuntimeError("renameat2(NO_REPLACE) is unavailable") from exc
+    syscall.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+    ]
+    syscall.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if syscall(
+        source_fd, os.fsencode(source_name),
+        destination_fd, os.fsencode(destination_name), 1,
+    ) != 0:
+        code = ctypes.get_errno()
+        if code == errno.EEXIST:
+            raise FileExistsError(
+                code, "archive destination already exists", destination_name
+            )
+        raise OSError(code, os.strerror(code), destination_name)
+
+
+def _archive_quarantine_mismatched_move(
+    archive_fd: int, name: str, observed_identity: tuple[int, int]
+) -> None:
+    """Retain a wrong renamed child elsewhere; never overwrite jobs/<job>."""
+    for _ in range(4):
+        metadata = os.stat(name, dir_fd=archive_fd, follow_symlinks=False)
+        if (metadata.st_dev, metadata.st_ino) != observed_identity:
+            raise RuntimeError("wrong archive basename changed before quarantine")
         quarantine_name = f".{name}.unverified-{os.urandom(12).hex()}"
         try:
-            os.stat(quarantine_name, dir_fd=archive_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            os.rename(
-                name, quarantine_name,
-                src_dir_fd=archive_fd, dst_dir_fd=archive_fd,
+            _archive_rename_noreplace(
+                archive_fd, name, archive_fd, quarantine_name
             )
-        else:
-            raise RuntimeError("archive recovery quarantine name collision")
-    os.fsync(jobs_fd)
-    os.fsync(archive_fd)
+        except FileExistsError:
+            continue
+        retained = os.stat(
+            quarantine_name, dir_fd=archive_fd, follow_symlinks=False
+        )
+        if (retained.st_dev, retained.st_ino) != observed_identity:
+            raise RuntimeError("quarantined archive identity changed")
+        os.fsync(archive_fd)
+        return
+    raise RuntimeError("wrong archive quarantine name collisions exhausted")
 
 
 def _archive_move_job_pinned(
@@ -1357,7 +1383,7 @@ def _archive_move_job_pinned(
     archive_root_identity: tuple[int, int],
     expected_files: list[dict[str, Any]],
 ) -> None:
-    """Move only the scanned job into the pinned archive root, not a swapped path."""
+    """Verify the inode before moving; no overwrite, quarantine wrong children."""
     jobs_fd = _archive_open_private_root(source.parent)
     try:
         archive_fd = _archive_open_private_root(destination.parent)
@@ -1371,34 +1397,51 @@ def _archive_move_job_pinned(
                     raise RuntimeError(f"archive root identity changed: {directory}")
                 _archive_require_unchanged_root(directory, fd)
             _archive_require_pinned_identity(source, source_identity)
+            # Narrow the basename-swap window with one final openat/fstat.
+            source_fd = os.open(
+                source.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=jobs_fd,
+            )
+            try:
+                source_metadata = os.fstat(source_fd)
+                if (source_metadata.st_dev, source_metadata.st_ino) != source_identity:
+                    raise RuntimeError(f"archive source inode changed: {source}")
+            finally:
+                os.close(source_fd)
             try:
                 os.stat(destination.name, dir_fd=archive_fd, follow_symlinks=False)
             except FileNotFoundError:
                 pass
             else:
                 raise RuntimeError(f"archive destination appeared before move: {destination}")
-            os.replace(
-                source.name, destination.name,
-                src_dir_fd=jobs_fd, dst_dir_fd=archive_fd,
+            _archive_rename_noreplace(
+                jobs_fd, source.name, archive_fd, destination.name,
             )
-            try:
+            moved = os.stat(
+                destination.name, dir_fd=archive_fd, follow_symlinks=False,
+            )
+            if stat.S_ISREG(moved.st_mode) or stat.S_ISDIR(moved.st_mode):
                 moved_fd = os.open(
                     destination.name,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                     dir_fd=archive_fd,
                 )
-            except OSError as exc:
-                _archive_recover_wrong_move(jobs_fd, archive_fd, destination.name)
-                raise RuntimeError(
-                    f"archived job identity changed during move: {destination}"
-                ) from exc
-            try:
-                metadata = os.fstat(moved_fd)
-                correct_inode = (metadata.st_dev, metadata.st_ino) == source_identity
-            finally:
-                os.close(moved_fd)
-            if not correct_inode:
-                _archive_recover_wrong_move(jobs_fd, archive_fd, destination.name)
+                try:
+                    moved_fd_stat = os.fstat(moved_fd)
+                    if (
+                        moved_fd_stat.st_dev, moved_fd_stat.st_ino
+                    ) != (moved.st_dev, moved.st_ino):
+                        raise RuntimeError("archive basename changed during observation")
+                finally:
+                    os.close(moved_fd)
+            if (
+                not stat.S_ISDIR(moved.st_mode)
+                or (moved.st_dev, moved.st_ino) != source_identity
+            ):
+                _archive_quarantine_mismatched_move(
+                    archive_fd, destination.name, (moved.st_dev, moved.st_ino),
+                )
                 raise RuntimeError(
                     f"archived job identity changed during move: {destination}"
                 )
@@ -1414,6 +1457,7 @@ def _archive_move_job_pinned(
             os.close(archive_fd)
     finally:
         os.close(jobs_fd)
+
 
 
 def _write_json_atomic(
@@ -2249,7 +2293,14 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         )
 
         archived: list[dict[str, Any]] = []
-        index = self_deploy._read_deploy_index(jobs_root)
+        index_root_fd = _archive_open_private_root(jobs_root)
+        try:
+            index = self_deploy._read_deploy_index(jobs_root)
+            _archive_require_unchanged_root(jobs_root, index_root_fd)
+            index_root_stat = os.fstat(index_root_fd)
+            index_root_identity = (index_root_stat.st_dev, index_root_stat.st_ino)
+        finally:
+            os.close(index_root_fd)
         indexed_units = set(index["units"]) if index is not None else set()
         for item in prepared:
             _archive_require_pinned_identity(
@@ -2299,22 +2350,36 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
 
         for item in archived:
             indexed_units.discard(Path(item["destination"]).name)
-        if index is not None and sorted(indexed_units) != index["units"]:
-            # Only successfully moved and reverified entries may be removed
-            # from the original self-deploy job index. Keep one atomic update.
-            root_identity = prepared[0]["jobs_root_identity"]
-            _archive_require_pinned_identity(jobs_root, root_identity)
-            _write_json_atomic(
-                jobs_root / self_deploy.DEPLOY_INDEX_FILENAME,
-                {
-                    "schema_version": 1,
-                    "units": sorted(indexed_units),
-                    "pending_unit": index["pending_unit"],
-                    "updated_at_unix": int(time.time()),
-                },
-                replace_existing=True,
-                expected_parent_identity=root_identity,
-            )
+        if index is not None:
+            # Existing archive receipts already give an authorized recovery
+            # path after a crash between a verified move and index publication.
+            # Reconcile only entries missing from jobs and with a complete,
+            # authentic existing archive manifest; never infer from absence.
+            for name in sorted(indexed_units):
+                source = jobs_root / name
+                if source.exists() or source.is_symlink():
+                    continue
+                if JOB_NAME.fullmatch(name) and _archived_job_receipt(
+                    name + ".service", jobs_root, archive_root
+                ) is not None:
+                    indexed_units.discard(name)
+            if sorted(indexed_units) != index["units"]:
+                root_identity = (
+                    prepared[0]["jobs_root_identity"]
+                    if prepared else index_root_identity
+                )
+                _archive_require_pinned_identity(jobs_root, root_identity)
+                _write_json_atomic(
+                    jobs_root / self_deploy.DEPLOY_INDEX_FILENAME,
+                    {
+                        "schema_version": 1,
+                        "units": sorted(indexed_units),
+                        "pending_unit": index["pending_unit"],
+                        "updated_at_unix": int(time.time()),
+                    },
+                    replace_existing=True,
+                    expected_parent_identity=root_identity,
+                )
 
         reset_results: list[dict[str, Any]] = []
         reset_failures: list[dict[str, str]] = []
