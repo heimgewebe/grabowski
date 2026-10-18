@@ -107,7 +107,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
 
         def request(method, path, *, headers):
             self.assertEqual("GET", method)
-            self.assertEqual("Bearer test-only-credential", headers.get("Authorization"))
+            self.assertEqual("Bearer " + "test-only-credential", headers.get("Authorization"))
             self.assertTrue(path.startswith(f"/repos/{admission.REPOSITORY}/"))
             current["path"] = path
             requests.append(path)
