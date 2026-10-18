@@ -3167,15 +3167,20 @@ def _resource_acquisition_plan(resource_keys: list[str]) -> list[dict[str, Any]]
     bureau_keys = sorted(bureau_keys)
     bureau_key_set = set(bureau_keys)
     standard_keys = [key for key in keys if key not in bureau_key_set]
-    # Every native acquisition stays atomic and bounded; a writer starts only
-    # after all same-owner chunks have been receipted by the Work Lane.
+    # Bureau gate combinations are one indivisible contract.  Splitting them
+    # could separate mutually exclusive merge and worktree-admin authorities.
+    if len(bureau_keys) > MAX_RESOURCE_RELEASE_BATCH:
+        raise ValueError("Bureau partition exceeds the single atomic 64-key contract")
     plan: list[dict[str, Any]] = []
-    for contract_group, group_keys in (("bureau", bureau_keys), ("standard", standard_keys)):
-        for offset in range(0, len(group_keys), MAX_RESOURCE_RELEASE_BATCH):
-            plan.append({
-                "contract_group": contract_group,
-                "resource_keys": group_keys[offset:offset + MAX_RESOURCE_RELEASE_BATCH],
-            })
+    if bureau_keys:
+        plan.append({"contract_group": "bureau", "resource_keys": bureau_keys})
+    # Standard resources may be grouped only under the same bounded lane owner;
+    # all verified receipts are required before any worktree/writer effect.
+    for offset in range(0, len(standard_keys), MAX_RESOURCE_RELEASE_BATCH):
+        plan.append({
+            "contract_group": "standard",
+            "resource_keys": standard_keys[offset:offset + MAX_RESOURCE_RELEASE_BATCH],
+        })
     return plan
 
 

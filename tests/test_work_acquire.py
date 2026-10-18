@@ -526,6 +526,31 @@ class WorkAcquireTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bounded input"):
             work_acquire._normalize_lane_resource_keys(["component:duplicate"]*1025)
 
+    def test_oversized_bureau_partition_fails_before_acquire(self) -> None:
+        bureau = work_acquire.resources.bureau_leases
+        root = bureau.BUREAU_REPOSITORY_ROOT
+        middle = [f"path:{root}/.bureau-scopes/neutral-{i:03d}"
+                  for i in range(70)]
+        for resources in (
+            [bureau.BUREAU_MERGE_GATE_KEY, *middle,
+             bureau.BUREAU_WORKTREE_ADMIN_KEY],
+            middle,
+        ):
+            with self.subTest(count=len(resources)):
+                params = self.parameters()
+                params["resource_keys"] = resources
+                acquire = Mock(side_effect=AssertionError("unsafe Bureau grant"))
+                ensure = Mock()
+                with self.assertRaisesRegex(ValueError, "Bureau"):
+                    work_acquire.acquire_work(
+                        params, acquire_resources_fn=acquire,
+                        release_resources_fn=Mock(),
+                        inspect_resource_fn=Mock(),
+                        ensure_worktree_fn=ensure, runner=Mock(),
+                    )
+                acquire.assert_not_called()
+                ensure.assert_not_called()
+
     def test_large_scope_atomic_batches(self) -> None:
         for total in (63, 64, 65, 78):
             with self.subTest(total=total):
