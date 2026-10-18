@@ -12528,7 +12528,26 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             return_value=captain_independent_review_reconciliation(),
         )
         self._decision_review_patch.start()
-
+        # These historical tests cover downstream scheduler receipt behavior,
+        # not independent high-critical release authorization. A positive
+        # source classification is explicit only for these bounded fixtures.
+        if self._testMethodName in {
+            "test_captain_schedule_failure_does_not_trust_forged_local_mutation_evidence",
+            "test_captain_reused_schedule_preserves_known_local_reconciliation",
+            "test_captain_run_binds_scheduler_materialized_auto_source_identity",
+            "test_captain_run_marks_local_mutation_unknown_when_scheduler_receipt_is_invalid",
+            "test_captain_run_preserves_unknown_mutation_outcome_when_scheduler_raises",
+            "test_captain_run_schedules_registered_grabowski_self_deploy_without_claiming_completion",
+            "test_captain_runtime_deploy_pre_effect_refusal_is_definitely_not_scheduled",
+            "test_captain_runtime_deploy_pre_effect_refusal_preserves_known_local_reconciliation",
+            "test_captain_schedule_failure_preserves_known_local_reconciliation_and_uncertainty",
+        }:
+            self._noncritical_source_fixture = patch(
+                "grabowski_self_deploy._require_release_source_admission",
+                return_value={"status": "non-runtime-documentation", "serving_repo_head": "a" * 40, "target_repo_head": CAPTAIN_HEAD, "changed_path_count": 1, "independent_review_required": False},
+            )
+            self._noncritical_source_fixture.start()
+            self.addCleanup(self._noncritical_source_fixture.stop)
 
     def tearDown(self) -> None:
         self._decision_review_patch.stop()

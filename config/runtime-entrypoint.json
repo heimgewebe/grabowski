@@ -418,6 +418,10 @@
       "source": "src/grabowski_physical_checkout.py"
     },
     {
+      "module": "grabowski_release_admission",
+      "source": "src/grabowski_release_admission.py"
+    },
+    {
       "module": "grabowski_self_deploy",
       "source": "src/grabowski_self_deploy.py"
     },
