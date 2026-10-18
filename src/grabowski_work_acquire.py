@@ -855,7 +855,7 @@ def _terminal_lane_resource_observation(
         raise TerminalLeaseConvergenceError(
             "terminal Work Lane resource key set is invalid"
         )
-    registered_resource_keys = resources.normalize_resource_keys(raw_keys)
+    registered_resource_keys = _normalize_lane_resource_keys(raw_keys)
     leases = resources.list_resources(
         owner_id=owner_id,
         include_expired=False,
@@ -1026,7 +1026,7 @@ def _terminal_resource_closeout_evidence(
         raise TerminalLeaseConvergenceError(
             "terminal Work Lane registered resource keys are invalid"
         )
-    registered = resources.normalize_resource_keys(raw_registered)
+    registered = _normalize_lane_resource_keys(raw_registered)
     released_raw = raw.get("released_resource_keys")
     released = _terminal_resource_key_list(
         released_raw,
@@ -1124,7 +1124,7 @@ def _build_terminal_resource_closeout_evidence(
         raise TerminalLeaseConvergenceError(
             "terminal Work Lane registered resource keys are invalid"
         )
-    registered = resources.normalize_resource_keys(raw_registered)
+    registered = _normalize_lane_resource_keys(raw_registered)
     released_raw = result.get("released_resource_keys")
     released = _terminal_resource_key_list(
         released_raw,
@@ -2318,7 +2318,7 @@ def _normalize(
             "scoped_writer_runtime_seconds must be between 120 and 86400"
         )
     required = [f"path:{target}", f"repo:{repo}:branch:{branch}"]
-    resource_keys = resources.normalize_resource_keys(
+    resource_keys = _normalize_lane_resource_keys(
         [*requested, *path_resources, *required]
     )
     identity = {
@@ -3141,8 +3141,18 @@ def _continuation_preimage(
         return result
 
 
+def _normalize_lane_resource_keys(values: list[str]) -> list[str]:
+    """Normalize a bounded whole-lane manifest; atomic resource calls stay <=64."""
+    if not isinstance(values, list) or len(values) > MAX_TERMINAL_OWNER_LEASES:
+        raise ValueError("Work Lane resource_keys must be a bounded list")
+    normalized = sorted({resources.normalize_resource_key(key) for key in values})
+    if not normalized:
+        raise ValueError("at least one resource key is required")
+    return normalized
+
+
 def _resource_acquisition_plan(resource_keys: list[str]) -> list[dict[str, Any]]:
-    keys = resources.normalize_resource_keys(resource_keys)
+    keys = _normalize_lane_resource_keys(resource_keys)
     bureau_keys = resources.bureau_leases.bureau_resource_keys(keys)
     if (
         not isinstance(bureau_keys, list)
@@ -3154,14 +3164,16 @@ def _resource_acquisition_plan(resource_keys: list[str]) -> list[dict[str, Any]]
     bureau_keys = sorted(bureau_keys)
     bureau_key_set = set(bureau_keys)
     standard_keys = [key for key in keys if key not in bureau_key_set]
-    return [
-        {"contract_group": contract_group, "resource_keys": group_keys}
-        for contract_group, group_keys in (
-            ("bureau", bureau_keys),
-            ("standard", standard_keys),
-        )
-        if group_keys
-    ]
+    # Every native acquisition stays atomic and bounded; a writer starts only
+    # after all same-owner chunks have been receipted by the Work Lane.
+    plan: list[dict[str, Any]] = []
+    for contract_group, group_keys in (("bureau", bureau_keys), ("standard", standard_keys)):
+        for offset in range(0, len(group_keys), MAX_RESOURCE_RELEASE_BATCH):
+            plan.append({
+                "contract_group": contract_group,
+                "resource_keys": group_keys[offset:offset + MAX_RESOURCE_RELEASE_BATCH],
+            })
+    return plan
 
 
 def _lease_snapshot(lease: Any, *, owner_id: str) -> dict[str, Any]:
@@ -3280,8 +3292,13 @@ def _acquisition_bundle(
         ],
         "acquisitions": [acquisition["receipt"] for acquisition in acquisitions],
         "resource_classes": {
-            acquisition["contract_group"]: list(acquisition["resource_keys"])
-            for acquisition in acquisitions
+            group: sorted(
+                key for acquisition in acquisitions
+                if acquisition["contract_group"] == group
+                for key in acquisition["resource_keys"]
+            )
+            for group in ("bureau", "standard")
+            if any(acquisition["contract_group"] == group for acquisition in acquisitions)
         },
     }
 

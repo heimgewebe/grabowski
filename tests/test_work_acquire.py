@@ -509,6 +509,112 @@ class WorkAcquireTests(unittest.TestCase):
         )
         self.assertEqual(result["decision"], "AUTO_PREPARE_AND_EXECUTE")
 
+    def test_large_scope_atomic_batches(self) -> None:
+        for total in (63, 64, 65, 78):
+            with self.subTest(total=total):
+                params = self.parameters()
+                params["resource_keys"] = [
+                    f"component:scope-{i:03d}" for i in range(total - 2)
+                ]
+                params["idempotency_key"] = f"large-scope-{total}"
+                calls = []
+                def acquire(owner, keys, **_kwargs):
+                    self.assertLessEqual(len(keys), 64)
+                    calls.append((owner, list(keys)))
+                    return self.acquired(owner, keys)
+                ensure = Mock(return_value={
+                    "result_state": "CREATED", "durable_receipt_sha256": "b" * 64,
+                    "post_state": {"target_registered": True, "target_path_exists": True},
+                })
+                result = work_acquire.acquire_work(
+                    params, acquire_resources_fn=acquire,
+                    release_resources_fn=Mock(), inspect_resource_fn=Mock(),
+                    ensure_worktree_fn=ensure, runner=Mock(),
+                )
+                self.assertEqual(result["state"], "ready")
+                ensure.assert_called_once()
+                self.assertEqual(
+                    [len(keys) for _, keys in calls],
+                    [min(64, total)] + ([total - 64] if total > 64 else []),
+                )
+                self.assertEqual(
+                    sorted(key for _, keys in calls for key in keys),
+                    result["inputs"]["resource_keys"],
+                )
+                self.assertEqual({owner for owner, _ in calls},
+                                 {result["inputs"]["lease_owner_id"]})
+                if total > 64:
+                    bundle = result["lease_receipt"]
+                    self.assertEqual(bundle["kind"], "grabowski.work_lane.lease_bundle")
+                    self.assertEqual(bundle["resource_classes"]["standard"],
+                                     result["inputs"]["resource_keys"])
+                    self.assertEqual(len(bundle["acquisitions"]), 2)
+
+    def test_large_scope_later_conflict_compensates_only_owned_first_batch(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:conflict-{i:03d}" for i in range(76)]
+        first = []
+        def acquire(owner, keys, **_kwargs):
+            self.assertLessEqual(len(keys), 64)
+            if not first:
+                first.extend(self.acquired(owner, keys)["leases"])
+                return self.acquired(owner, keys)
+            raise work_acquire.resources.ResourceConflict(
+                keys[0], "foreign-owner", int(time.time()) + 1200,
+            )
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+        result = work_acquire.acquire_work(
+            params, acquire_resources_fn=acquire,
+            release_resources_fn=release, inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure, runner=Mock(),
+        )
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["compensation"]["state"], "complete")
+        self.assertEqual(result["acquisition"]["group_index"], 1)
+        ensure.assert_not_called()
+        release.assert_called_once()
+        self.assertEqual(len(release.call_args.args[1]), 64)
+        self.assertEqual(
+            [row["resource_key"] for row in release.call_args.kwargs["expected_leases"]],
+            [row["resource_key"] for row in first],
+        )
+
+    def test_large_scope_lost_second_response_never_starts_writer(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:unknown-{i:03d}" for i in range(76)]
+        acquire = Mock()
+        def acquire_group(owner, keys, **_kwargs):
+            if acquire.call_count == 1:
+                return self.acquired(owner, keys)
+            raise RuntimeError("response lost")
+        acquire.side_effect = acquire_group
+        ensure = Mock()
+        release = Mock(side_effect=self.release)
+        kwargs = dict(acquire_resources_fn=acquire, release_resources_fn=release,
+                      inspect_resource_fn=Mock(), ensure_worktree_fn=ensure, runner=Mock())
+        first = work_acquire.acquire_work(params, **kwargs)
+        second = work_acquire.acquire_work(params, **kwargs)
+        self.assertEqual(first["state"], "outcome_unknown")
+        self.assertEqual(first["decision"], "HARD_BLOCK")
+        self.assertTrue(second["replayed"])
+        self.assertEqual(acquire.call_count, 2)
+        ensure.assert_not_called()
+
+    def test_large_scope_terminal_inventory_can_exceed_atomic_batch(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:terminal-{i:03d}" for i in range(76)]
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        record = {"lane_id": inputs["lane_id"], "inputs": inputs}
+        with patch.object(work_acquire.resources, "list_resources", return_value=[]), \
+             patch.object(work_acquire.resources, "count_resources", return_value=0):
+            result = work_acquire._converge_terminal_resource_leases(
+                record, assessment={"phase": "terminal", "lease_release_ready": True},
+            )
+        self.assertEqual(result["state"], "already_absent")
+        self.assertEqual(result["registered_resource_key_count"], 78)
+
     def test_bureau_path_and_branch_use_same_owner_separate_contract_groups(self) -> None:
         calls: list[dict[str, object]] = []
         events: list[str] = []
