@@ -8463,7 +8463,7 @@ class TaskTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 tasks._task_reconcile_ready_archived_user_unit_live()
 
-    def test_archived_inactive_loaded_units_still_allow_current_readiness(self) -> None:
+    def test_archived_inactive_loaded_units_do_not_prove_retained_authority(self) -> None:
         self._local_terminal_readiness_store(1)
         unit = f"grabowski-task-{'b' * 24}-a1.service"
         with (
@@ -8482,7 +8482,10 @@ class TaskTests(unittest.TestCase):
         ):
             with tasks._task_readonly_snapshot() as reader:
                 status = tasks._task_reconcile_ready_evidence_snapshot(reader)
+        # Three quiescent local user-systemd inventories do not establish
+        # historical launch provenance or root/SSH restart exclusion.
         self.assertEqual("retained_attempt_authority_unverified", status["status"])
+        self.assertNotEqual("verified", status["status"])
         # The same bounded inventory is observed before terminal probes,
         # after those probes, and after the final SQLite revision rereads.
         self.assertEqual(3, probe.call_count)
@@ -12696,6 +12699,46 @@ class TaskTests(unittest.TestCase):
                 self.assertEqual("observation_error", invalid["state"])
                 self.assertTrue(invalid["reconcile_required"])
                 self.assertEqual(before, self.database.read_bytes())
+
+    def test_task_peek_loaded_success_cannot_certify_failed_terminal(self) -> None:
+        # A GC'd not-found unit and a still-loaded successful unit are not
+        # interchangeable. The former permits the stored historical outcome;
+        # the latter contradicts persisted failure and needs reconciliation.
+        task = self._start()["task"]
+        with tasks._database_connection() as writer:
+            writer.execute(
+                "UPDATE tasks SET state='failed' WHERE task_id=?",
+                (task["task_id"],),
+            )
+        before = self.database.read_bytes()
+        complete = {
+            "state": "completed",
+            "properties": {
+                "LoadState": "loaded", "ActiveState": "inactive",
+                "SubState": "dead", "Result": "success",
+            },
+            "probe": {
+                "returncode": 0, "timed_out": False,
+                "stdout_truncated": False, "stderr_truncated": False,
+            },
+            "observer": {
+                "kind": "bound-local-user-systemd-show-v1",
+                "transport": "local",
+            },
+            "observed_at_unix": tasks._now(),
+        }
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host",
+                         return_value=("local", {"transport": "local"}, False)),
+            patch.object(tasks, "_observe", return_value=complete),
+            patch.object(tasks, "_set_state",
+                         side_effect=AssertionError("READ_ONLY must not write")),
+        ):
+            peek = tasks.grabowski_task_peek(task["task_id"])
+        self.assertEqual("failed", peek["persisted_state"])
+        self.assertEqual("observation_error", peek["state"])
+        self.assertTrue(peek["reconcile_required"])
+        self.assertEqual(before, self.database.read_bytes())
 
     def test_task_peek_terminal_outcome_conflict_is_not_masked(self) -> None:
         task = self._start()["task"]
