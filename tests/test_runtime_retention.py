@@ -712,6 +712,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 unit_states={unit: state},
             )
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()
@@ -781,6 +782,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 unit_states={},
             )
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()
@@ -1252,6 +1254,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             manifest.unlink()
             manifest.symlink_to(outside)
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()
@@ -1350,6 +1353,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 unit_states={unit: self._state(unit)},
             )
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()
@@ -1457,6 +1461,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             marker.chmod(0o600)
             original_archive = root / "archive-original"
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()
@@ -1849,6 +1854,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 unit_states={unit: self._state(unit)},
             )
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()
@@ -1891,6 +1897,41 @@ class RuntimeRetentionTests(unittest.TestCase):
             )
             fake_base._require_capability.assert_called_once_with("durable_job")
 
+    def test_archived_job_hashes_pinned_moved_inode_not_archive_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive = root / "jobs", root / "archive"
+            name = "grabowski-job-585858585858"
+            self._job(jobs, name, 100)
+            archive.mkdir(mode=0o700)
+            source = jobs / name
+            target = archive / name
+            expected = RETENTION._archive_file_manifest(source)
+            metadata = source.stat()
+            source_identity = (metadata.st_dev, metadata.st_ino)
+            jobs_identity = (jobs.stat().st_dev, jobs.stat().st_ino)
+            archive_identity = (archive.stat().st_dev, archive.stat().st_ino)
+            real_path_manifest = RETENTION._archive_file_manifest
+
+            def forbid_archived_path_reopen(directory: Path):
+                if directory == target:
+                    raise AssertionError("post-move archive may only be read by pinned fd")
+                return real_path_manifest(directory)
+
+            with patch.object(
+                RETENTION, "_archive_file_manifest",
+                side_effect=forbid_archived_path_reopen,
+            ):
+                RETENTION._archive_move_job_pinned(
+                    source, target,
+                    source_identity=source_identity,
+                    jobs_root_identity=jobs_identity,
+                    archive_root_identity=archive_identity,
+                    expected_files=expected,
+                )
+            self.assertFalse(source.exists())
+            self.assertEqual(real_path_manifest(target), expected)
+
     def test_source_basename_swap_at_rename_rolls_back_foreign_archive(self) -> None:
         # R3 P2: source path can be replaced between the verified inode read
         # and renameat. The wrong directory must not poison archive/<job>.
@@ -1931,6 +1972,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                         raise
                 return real_stat(path, *args, **kwargs)
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()
@@ -1976,6 +2018,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 unit_states={unit: self._state(unit)},
             )
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()
@@ -2201,6 +2244,78 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertGreater(updated_index["updated_at_unix"], old_index["updated_at_unix"])
             fake_self_deploy._write_deploy_index.assert_not_called()
 
+    def test_archive_index_reader_uses_fd_not_swapped_jobs_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            name = "grabowski-job-575757575757"
+            unit = name + ".service"
+            self._job(jobs, name, 100)
+            original_index = {
+                "schema_version": 1, "units": [name],
+                "pending_unit": None, "updated_at_unix": 500,
+            }
+            index = jobs / "runtime-deploy-index.json"
+            index.write_text(json.dumps(original_index) + "\n")
+            index.chmod(0o600)
+            forged = root / "forged-index-root"
+            forged.mkdir(mode=0o700)
+            (forged / "runtime-deploy-index.json").write_text(json.dumps({
+                **original_index, "units": [],
+            }) + "\n")
+            (forged / "runtime-deploy-index.json").chmod(0o600)
+            hidden = root / "original-index-root"
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            unsafe_path_reads: list[str] = []
+
+            def forged_path_read(path: Path) -> dict:
+                # Simulate same-UID swap and restore entirely inside the
+                # path reader, so a later path/FD root-identity test passes.
+                jobs.rename(hidden)
+                jobs.symlink_to(forged, target_is_directory=True)
+                try:
+                    unsafe_path_reads.append(str(path))
+                    return json.loads(
+                        (path / "runtime-deploy-index.json").read_text()
+                    )
+                finally:
+                    jobs.unlink()
+                    hidden.rename(jobs)
+
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = forged_path_read
+            fake_self_deploy._write_deploy_index = Mock(
+                side_effect=AssertionError("path-based index writer prohibited")
+            )
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            with patch.dict(
+                "sys.modules",
+                {"grabowski_self_deploy": fake_self_deploy, "grabowski_mcp": fake_base},
+            ), patch.object(
+                RETENTION, "_run",
+                return_value=Mock(returncode=0, stderr=""),
+            ), patch.object(
+                RETENTION, "_systemd_unit_states",
+                return_value={unit: self._state(unit)},
+            ):
+                result = RETENTION.apply_plan(
+                    plan, expected_plan_sha256=plan["plan_sha256"]
+                )
+            self.assertTrue(result["completed"])
+            self.assertEqual(unsafe_path_reads, [])
+            self.assertEqual(json.loads(index.read_text())["units"], [])
+            self.assertTrue((archive / name / "archive-manifest.json").is_file())
+
     def test_archive_index_root_swap_never_redirects_index_write(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2298,6 +2413,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 unit_states={unit: self._state(unit)},
             )
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()
@@ -2306,14 +2422,13 @@ class RuntimeRetentionTests(unittest.TestCase):
             fake_base._require_mutations_enabled = Mock()
             fake_base._require_capability = Mock()
             reset = Mock(return_value=Mock(returncode=0, stderr=""))
-            original_manifest = RETENTION._archive_file_manifest
-            calls = 0
+            original_manifest_on_fd = RETENTION._archive_file_manifest_on_fd
 
-            def drifting_manifest(directory: Path) -> list[dict[str, object]]:
-                nonlocal calls
-                calls += 1
-                files = original_manifest(directory)
-                if calls == 3:
+            def drifting_manifest(
+                directory: Path, descriptor: int
+            ) -> list[dict[str, object]]:
+                files = original_manifest_on_fd(directory, descriptor)
+                if directory == archive / job_name:
                     return [*files, {"path": "late", "bytes": 1, "sha256": "0" * 64}]
                 return files
 
@@ -2329,7 +2444,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 return_value={unit: self._state(unit)},
             ), patch.object(
                 RETENTION,
-                "_archive_file_manifest",
+                "_archive_file_manifest_on_fd",
                 side_effect=drifting_manifest,
             ):
                 with self.assertRaisesRegex(RuntimeError, "changed during move"):
@@ -2373,6 +2488,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 unit_states={job_unit: job_state, worker_unit: worker_state},
             )
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()
@@ -2445,6 +2561,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 unit_states={unit: state},
             )
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()
@@ -2503,6 +2620,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 unit_states={unit: state},
             )
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()
@@ -2629,6 +2747,36 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(attempt, 2)
             self.assertEqual(previous, payload["receipt_sha256"])
             self.assertTrue(target.name.endswith(".retry-02.json"))
+
+    def test_atomic_json_create_does_not_overwrite_racing_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "receipts"
+            directory.mkdir(mode=0o700)
+            target = directory / "receipt.json"
+            authentic_move = RETENTION._archive_rename_noreplace
+            foreign = b"unrelated owner-controlled receipt\n"
+
+            def race_no_replace(
+                source_fd: int, source_name: str,
+                destination_fd: int, destination_name: str,
+            ) -> None:
+                target.write_bytes(foreign)
+                target.chmod(0o600)
+                return authentic_move(
+                    source_fd, source_name, destination_fd, destination_name,
+                )
+
+            with patch.object(
+                RETENTION, "_archive_rename_noreplace",
+                side_effect=race_no_replace,
+            ):
+                with self.assertRaises(FileExistsError):
+                    RETENTION._write_json_atomic(target, {"value": 1})
+            self.assertEqual(target.read_bytes(), foreign)
+            self.assertEqual(
+                sorted(p.name for p in directory.iterdir()), ["receipt.json"]
+            )
 
     def test_retention_receipt_is_create_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2920,6 +3068,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                 unit_states={unit: self._state(unit)},
             )
             fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
             fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
             fake_self_deploy._read_deploy_index = lambda _root: None
             fake_self_deploy._write_deploy_index = Mock()

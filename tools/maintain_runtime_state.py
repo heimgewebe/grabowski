@@ -1283,29 +1283,33 @@ def build_plan(
     return {**material, "plan_sha256": _sha256(material)}
 
 
+def _archive_file_manifest_on_fd(directory: Path, fd: int) -> list[dict[str, Any]]:
+    """Hash files below the previously opened job directory, never by a new path."""
+    files: list[dict[str, Any]] = []
+    for path in _archive_bounded_entries(directory, fd):
+        metadata = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+        if path == directory / "archive-manifest.json":
+            _archive_internal_manifest_shape_preflight(path, metadata=metadata)
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError(f"archive source contains a symlink: {path}")
+        if stat.S_ISDIR(metadata.st_mode):
+            raise RuntimeError(f"archive source contains nested directory: {path}")
+        if len(files) >= MAX_ARCHIVE_FILES:
+            raise RuntimeError("archive source exceeds the file-count bound")
+        size, digest = _archive_private_file_digest(
+            fd, path, max_bytes=MAX_ARCHIVE_FILE_BYTES
+        )
+        files.append({"path": path.name, "bytes": size, "sha256": digest})
+    return files
+
+
 def _archive_file_manifest(directory: Path) -> list[dict[str, Any]]:
     fd = _archive_open_private_root(directory)
     try:
-        files: list[dict[str, Any]] = []
-        for path in _archive_bounded_entries(directory, fd):
-            metadata = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
-            if path == directory / "archive-manifest.json":
-                _archive_internal_manifest_shape_preflight(path, metadata=metadata)
-                continue
-            if stat.S_ISLNK(metadata.st_mode):
-                raise RuntimeError(f"archive source contains a symlink: {path}")
-            if stat.S_ISDIR(metadata.st_mode):
-                raise RuntimeError(f"archive source contains nested directory: {path}")
-            if len(files) >= MAX_ARCHIVE_FILES:
-                raise RuntimeError("archive source exceeds the file-count bound")
-            size, digest = _archive_private_file_digest(
-                fd, path, max_bytes=MAX_ARCHIVE_FILE_BYTES
-            )
-            files.append(
-                {"path": path.name, "bytes": size, "sha256": digest}
-            )
+        result = _archive_file_manifest_on_fd(directory, fd)
         _archive_require_unchanged_root(directory, fd)
-        return files
+        return result
     finally:
         os.close(fd)
 
@@ -1418,41 +1422,67 @@ def _archive_move_job_pinned(
             _archive_rename_noreplace(
                 jobs_fd, source.name, archive_fd, destination.name,
             )
-            moved = os.stat(
-                destination.name, dir_fd=archive_fd, follow_symlinks=False,
-            )
-            if stat.S_ISREG(moved.st_mode) or stat.S_ISDIR(moved.st_mode):
+            # Keep the exact moved inode open until all post-move hashes and
+            # parent checks complete. No pathname-based archive remanifest.
+            try:
                 moved_fd = os.open(
                     destination.name,
-                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                     dir_fd=archive_fd,
                 )
+            except OSError as exc:
                 try:
-                    moved_fd_stat = os.fstat(moved_fd)
-                    if (
-                        moved_fd_stat.st_dev, moved_fd_stat.st_ino
-                    ) != (moved.st_dev, moved.st_ino):
-                        raise RuntimeError("archive basename changed during observation")
-                finally:
-                    os.close(moved_fd)
-            if (
-                not stat.S_ISDIR(moved.st_mode)
-                or (moved.st_dev, moved.st_ino) != source_identity
-            ):
-                _archive_quarantine_mismatched_move(
-                    archive_fd, destination.name, (moved.st_dev, moved.st_ino),
-                )
+                    wrong = os.stat(
+                        destination.name, dir_fd=archive_fd, follow_symlinks=False
+                    )
+                except OSError:
+                    raise RuntimeError(
+                        f"archive basename vanished after move: {destination}"
+                    ) from exc
+                if (wrong.st_dev, wrong.st_ino) != source_identity:
+                    _archive_quarantine_mismatched_move(
+                        archive_fd, destination.name,
+                        (wrong.st_dev, wrong.st_ino),
+                    )
                 raise RuntimeError(
-                    f"archived job identity changed during move: {destination}"
+                    f"archive destination is not the moved private job: {destination}"
+                ) from exc
+            try:
+                moved = os.fstat(moved_fd)
+                if (moved.st_dev, moved.st_ino) != source_identity:
+                    _archive_quarantine_mismatched_move(
+                        archive_fd, destination.name,
+                        (moved.st_dev, moved.st_ino),
+                    )
+                    raise RuntimeError(
+                        f"archived job identity changed during move: {destination}"
+                    )
+                os.fsync(jobs_fd)
+                os.fsync(archive_fd)
+                _archive_require_unchanged_root(source.parent, jobs_fd)
+                _archive_require_unchanged_root(destination.parent, archive_fd)
+                if _archive_file_manifest_on_fd(destination, moved_fd) != expected_files:
+                    raise RuntimeError(
+                        f"archived job files changed during move: {source.name}"
+                    )
+                _archive_require_unchanged_root(source.parent, jobs_fd)
+                _archive_require_unchanged_root(destination.parent, archive_fd)
+                # A verified, still-open inode is not sufficient if another
+                # writer detached that inode from the published archive name.
+                current = os.stat(
+                    destination.name, dir_fd=archive_fd, follow_symlinks=False
                 )
-            os.fsync(jobs_fd)
-            os.fsync(archive_fd)
-            _archive_require_unchanged_root(source.parent, jobs_fd)
-            _archive_require_unchanged_root(destination.parent, archive_fd)
-            if _archive_file_manifest(destination) != expected_files:
-                raise RuntimeError(f"archived job files changed during move: {source.name}")
-            _archive_require_unchanged_root(source.parent, jobs_fd)
-            _archive_require_unchanged_root(destination.parent, archive_fd)
+                if (current.st_dev, current.st_ino) != source_identity:
+                    _archive_quarantine_mismatched_move(
+                        archive_fd, destination.name,
+                        (current.st_dev, current.st_ino),
+                    )
+                    raise RuntimeError(
+                        f"archive basename changed after hashing: {destination}"
+                    )
+            finally:
+                os.close(moved_fd)
+
         finally:
             os.close(archive_fd)
     finally:
@@ -1514,10 +1544,16 @@ def _write_json_atomic(
         finally:
             os.close(descriptor)
         _archive_require_unchanged_root(parent, directory_fd)
-        os.replace(
-            temporary_name, path.name,
-            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
-        )
+        if replace_existing:
+            os.replace(
+                temporary_name, path.name,
+                src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+            )
+        else:
+            # Never overwrite a concurrently created receipt/manifest.
+            _archive_rename_noreplace(
+                directory_fd, temporary_name, directory_fd, path.name
+            )
         temporary_name = None
         os.fsync(directory_fd)
         _archive_require_unchanged_root(parent, directory_fd)
@@ -2264,6 +2300,80 @@ def _select_receipt_target(
         )
     raise RuntimeError("retention receipt retry bound exhausted")
 
+def _archive_read_deploy_index_pinned(
+    jobs_root: Path, root_fd: int, self_deploy: Any
+) -> dict[str, Any] | None:
+    """Read the canonical index from the pinned jobs-root inode, not its path."""
+    name = self_deploy.DEPLOY_INDEX_FILENAME
+    if name != "runtime-deploy-index.json":
+        raise RuntimeError("unexpected runtime deploy index name")
+    try:
+        index_fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=root_fd,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeError("runtime deploy index is unreadable") from exc
+    try:
+        before = os.fstat(index_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or before.st_size > MAX_JSON_BYTES
+        ):
+            raise RuntimeError("runtime deploy index must be one private regular file")
+        data = bytearray()
+        while len(data) <= MAX_JSON_BYTES:
+            chunk = os.read(
+                index_fd, min(64 * 1024, MAX_JSON_BYTES + 1 - len(data))
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > MAX_JSON_BYTES:
+            raise RuntimeError("runtime deploy index exceeds its size bound")
+        after = os.fstat(index_fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+        ):
+            raise RuntimeError("runtime deploy index changed during pinned read")
+    finally:
+        os.close(index_fd)
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("runtime deploy index is unreadable") from exc
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version", "units", "pending_unit", "updated_at_unix"
+    }:
+        raise RuntimeError("runtime deploy index shape is invalid")
+    if value["schema_version"] != 1:
+        raise RuntimeError("runtime deploy index schema is unsupported")
+    units = value["units"]
+    max_entries = getattr(self_deploy, "MAX_DEPLOY_INDEX_ENTRIES", 512)
+    if not isinstance(units, list) or len(units) > max_entries:
+        raise RuntimeError("runtime deploy index entry count is invalid")
+    validate = getattr(self_deploy, "_validate_index_unit", None)
+    for entry in [*units, value["pending_unit"]]:
+        if entry is None:
+            continue
+        if callable(validate):
+            validate(entry)
+        elif not isinstance(entry, str) or JOB_NAME.fullmatch(entry) is None:
+            raise RuntimeError("runtime deploy index contains invalid unit")
+    if len(units) != len(set(units)):
+        raise RuntimeError("runtime deploy index has duplicate units")
+    stamp = value["updated_at_unix"]
+    if type(stamp) is not int or stamp < 0:
+        raise RuntimeError("runtime deploy index timestamp is invalid")
+    _archive_require_unchanged_root(jobs_root, root_fd)
+    return {**value, "units": sorted(units)}
+
+
 def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, Any]:
     plan = _validated_plan(plan, expected_plan_sha256)
     source = str(SRC)
@@ -2295,7 +2405,9 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         archived: list[dict[str, Any]] = []
         index_root_fd = _archive_open_private_root(jobs_root)
         try:
-            index = self_deploy._read_deploy_index(jobs_root)
+            index = _archive_read_deploy_index_pinned(
+                jobs_root, index_root_fd, self_deploy
+            )
             _archive_require_unchanged_root(jobs_root, index_root_fd)
             index_root_stat = os.fstat(index_root_fd)
             index_root_identity = (index_root_stat.st_dev, index_root_stat.st_ino)
