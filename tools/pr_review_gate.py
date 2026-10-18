@@ -234,6 +234,9 @@ RISK_PATH_PREFIXES = (
     "src/grabowski_agent_role.py",
     "src/grabowski_operations.py",
     "src/grabowski_artifacts.py",
+    "src/grabowski_merge_guard.py",
+    "src/grabowski_decision_reviews.py",
+    "src/grabowski_release_admission.py",
     "tools/pr_review_gate.py",
 )
 DOCUMENTATION_PATH_PREFIXES = ("docs/", "documentation/")
