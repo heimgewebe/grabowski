@@ -69,6 +69,8 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 BRANCH_MUTATION_ATTEMPT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}\Z")
 BRANCH_MUTATION_ATTEMPT_SCHEMA_VERSION = 1
 BRANCH_MUTATION_ATTEMPT_METADATA_KEY = "branch_mutation_attempt"
+WORK_LANE_OWNER_RE = re.compile(r"lane:[0-9a-f]{32}\Z")
+SERVER_LEASE_GENERATION_NONCE_KEY = "_server_lease_generation_nonce_v1"
 TASK_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
 MIN_TTL_SECONDS = 30
 MAX_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -1445,7 +1447,7 @@ def _row_metadata(row: sqlite3.Row) -> dict[str, Any]:
 def _lease_identity_metadata(
     metadata: dict[str, Any], *, preserve_task_attempt: bool
 ) -> dict[str, Any]:
-    ignored = {"work_admission"}
+    ignored = {"work_admission", SERVER_LEASE_GENERATION_NONCE_KEY}
     if preserve_task_attempt:
         ignored.update({"attempt", "recovered_after_expiry"})
     return {key: value for key, value in metadata.items() if key not in ignored}
@@ -6084,6 +6086,8 @@ def acquire_resources(
             )
     if "lease_mode" in normalized_metadata:
         raise ValueError("metadata.lease_mode is not an authority surface")
+    if SERVER_LEASE_GENERATION_NONCE_KEY in normalized_metadata:
+        raise ValueError("metadata lease generation nonce is server-owned")
     if "work_admission" in normalized_metadata:
         raise ValueError("metadata.work_admission is not a public authority surface")
     if "scope_manifest" in normalized_metadata:
@@ -6437,6 +6441,14 @@ def acquire_resources(
                     acquired = now
                     updated = now
                     lease_expires = expires
+                    # Detect same-owner release/reacquire within one clock second.
+                    # Keep the generation in server metadata, never caller input.
+                    # A live same-owner reentry preserves its exact prior hash.
+                    if WORK_LANE_OWNER_RE.fullmatch(owner) is not None:
+                        stored_metadata_json, stored_metadata_sha256 = _metadata({
+                            **persisted_metadata,
+                            SERVER_LEASE_GENERATION_NONCE_KEY: os.urandom(16).hex(),
+                        })
                     if row is not None:
                         previous_owner = row["owner_id"]
                         reclaimed_from_owner = previous_owner

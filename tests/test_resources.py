@@ -3327,6 +3327,36 @@ class ResourceTests(unittest.TestCase):
                 _work_lane_no_renew_preserved=1,
             )
 
+    def test_work_lane_same_second_lease_aba_requires_new_generation(self) -> None:
+        owner = "lane:" + "c" * 32
+        key = "component:same-second-aba"
+        with patch.object(resources, "_now", return_value=100):
+            first = resources.acquire_resources(
+                owner, [key], purpose="same-second generation", ttl_seconds=120,
+            )
+            first_lease = first["leases"][0]
+            released = resources.release_resources(
+                owner, [key],
+                expected_leases=[resources._release_lease_snapshot(first_lease)],
+            )
+            self.assertEqual([key], [lease["resource_key"] for lease in released["released"]])
+            second = resources.acquire_resources(
+                owner, [key], purpose="same-second generation", ttl_seconds=120,
+            )
+            second_lease = second["leases"][0]
+            self.assertEqual(first_lease["acquired_at_unix"], second_lease["acquired_at_unix"])
+            self.assertEqual(first_lease["expires_at_unix"], second_lease["expires_at_unix"])
+            self.assertNotEqual(
+                first_lease["metadata_sha256"], second_lease["metadata_sha256"],
+                "same owner/second re-acquisition must have a fresh immutable generation",
+            )
+            preserved = resources.acquire_resources(
+                owner, [key], purpose="same-second generation", ttl_seconds=300,
+                _work_lane_no_renew_preserved=True,
+            )
+            self.assertEqual([key], preserved["preserved"])
+            self.assertEqual(second["leases"], preserved["leases"])
+
     def test_owner_resource_keyset_inventory_is_complete_beyond_one_page(self) -> None:
         owner = "lane:" + "b" * 32
         keys = [f"component:keyset-{i:03d}" for i in range(70)]
