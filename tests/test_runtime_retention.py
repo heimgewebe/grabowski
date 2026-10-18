@@ -1337,9 +1337,10 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertFalse((saved / "archive-manifest.json").exists())
             self.assertTrue(source.is_symlink())
 
-    def test_archive_apply_rejects_private_directory_replacement_before_manifest_write(self) -> None:
-        # An attacker can substitute another owner-private directory, not just
-        # a symlink. Bind the manifest writer to the inode scanned at preflight.
+    def test_archive_apply_rejects_private_destination_swap_before_manifest_write(self) -> None:
+        # After verification and move a peer can replace the destination with
+        # another owner-private dir. The post-move writer must bind the
+        # manifest to the already verified moved inode, never that peer dir.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
@@ -1364,13 +1365,14 @@ class RuntimeRetentionTests(unittest.TestCase):
             reset = Mock(return_value=Mock(returncode=0, stderr=""))
             atomic_write = RETENTION._write_json_atomic
             swaps: list[bool] = []
-            original_dir = jobs / (job_name + "-original")
+            original_dir = archive / (job_name + "-original")
+            destination = archive / job_name
 
             def replace_source_on_manifest(path: Path, payload: dict, **kwargs):
-                if path == source / "archive-manifest.json" and not swaps:
-                    source.rename(original_dir)
-                    source.mkdir(mode=0o700)
-                    marker = source / "do-not-touch"
+                if path == destination / "archive-manifest.json" and not swaps:
+                    destination.rename(original_dir)
+                    destination.mkdir(mode=0o700)
+                    marker = destination / "do-not-touch"
                     marker.write_bytes(b"foreign evidence\n")
                     marker.chmod(0o600)
                     swaps.append(True)
@@ -1390,9 +1392,9 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(swaps, [True])
             self.assertEqual((original_dir / "stderr.log").read_bytes(), b"")
             self.assertFalse((original_dir / "archive-manifest.json").exists())
-            self.assertEqual((source / "do-not-touch").read_bytes(), b"foreign evidence\n")
-            self.assertFalse((source / "archive-manifest.json").exists())
-            self.assertFalse((archive / job_name).exists())
+            self.assertEqual((destination / "do-not-touch").read_bytes(), b"foreign evidence\n")
+            self.assertFalse((destination / "archive-manifest.json").exists())
+            self.assertFalse(source.exists())
             self.assertFalse(list(receipts.glob("*.json")))
             reset.assert_not_called()
             fake_base._append_audit.assert_called_once()
@@ -2005,9 +2007,10 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertFalse(source.exists())
             self.assertEqual(real_path_manifest(target), expected)
 
-    def test_source_basename_swap_at_rename_rolls_back_foreign_archive(self) -> None:
-        # R3 P2: source path can be replaced between the verified inode read
-        # and renameat. The wrong directory must not poison archive/<job>.
+    def test_source_basename_swap_at_rename_preserves_foreign_archive_evidence(self) -> None:
+        # A same-UID peer can substitute the job basename just before rename.
+        # Inode-conditional quarantine cannot be implemented via renameat2;
+        # fail closed without renaming or deleting another inode.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
@@ -2062,18 +2065,107 @@ class RuntimeRetentionTests(unittest.TestCase):
             ), patch.object(
                 RETENTION.os, "stat", side_effect=swap_source_after_empty_archive_probe
             ):
-                with self.assertRaisesRegex(RuntimeError, "identity changed during move"):
+                with self.assertRaisesRegex(RuntimeError, "manual recovery required"):
                     RETENTION.apply_plan(plan, expected_plan_sha256=plan["plan_sha256"])
             self.assertEqual(swaps, [True])
-            self.assertFalse((archive / job_name).exists())
-            self.assertFalse(source.exists())
-            quarantined = list(archive.glob(f".{job_name}.unverified-*"))
-            self.assertEqual(len(quarantined), 1)
-            self.assertEqual((quarantined[0] / "peer-evidence").read_bytes(),
+            self.assertEqual((archive / job_name / "peer-evidence").read_bytes(),
                              b"never archive peer\n")
+            self.assertFalse(source.exists())
+            self.assertFalse(list(archive.glob(f".{job_name}.unverified-*")))
             self.assertEqual((saved / "stdout.log").read_bytes(), b"done\n")
             self.assertFalse(list(receipts.glob("*.json")))
             reset.assert_not_called()
+
+
+    def test_post_move_hash_failure_never_publishes_complete_archive_manifest(self) -> None:
+        # Move publication must not precede the hash of the moved inode.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            name = "grabowski-job-373737373737"
+            unit = name + ".service"
+            self._job(jobs, name, 100)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            actual_manifest = RETENTION._archive_file_manifest_on_fd
+
+            def tampered_moved_manifest(directory: Path, fd: int):
+                if directory == archive / name:
+                    return []  # post-move payload no longer matches preimage
+                return actual_manifest(directory, fd)
+
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_self_deploy,
+                "grabowski_mcp": fake_base,
+            }), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION, "_systemd_unit_states",
+                return_value={unit: self._state(unit)},
+            ), patch.object(
+                RETENTION, "_archive_file_manifest_on_fd",
+                side_effect=tampered_moved_manifest,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "archived job files changed during move"
+                ):
+                    RETENTION.apply_plan(plan, expected_plan_sha256=plan["plan_sha256"])
+            self.assertTrue((archive / name / "stdout.log").is_file())
+            self.assertFalse((archive / name / "archive-manifest.json").exists())
+            self.assertFalse(list(receipts.glob("*.json")))
+            reset.assert_not_called()
+
+    def test_quarantine_cannot_rename_unverified_inodes_under_basename_swap(self) -> None:
+        # Linux renameat2 lacks an atomic "rename iff this inode" predicate.
+        # The safe response to a concurrent peer is to preserve BOTH trees.
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "archive"
+            archive.mkdir(mode=0o700)
+            name = "grabowski-job-383838383838"
+            peer = archive / name
+            peer.mkdir(mode=0o700)
+            (peer / "peer-marker").write_bytes(b"peer")
+            authentic = archive / "authentic"
+            authentic.mkdir(mode=0o700)
+            (authentic / "trusted-marker").write_bytes(b"trusted")
+            observed = peer.stat()
+            actual_rename = RETENTION._archive_rename_noreplace
+            swaps: list[bool] = []
+
+            def swap_just_before_rename(source_fd, source_name, dest_fd, dest_name):
+                if source_name == name:
+                    peer.rename(archive / "peer-preimage")
+                    authentic.rename(peer)
+                    swaps.append(True)
+                return actual_rename(source_fd, source_name, dest_fd, dest_name)
+
+            archive_fd = os.open(archive, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with patch.object(
+                    RETENTION, "_archive_rename_noreplace",
+                    side_effect=swap_just_before_rename,
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "manual|quarantine|identity changed"
+                    ):
+                        RETENTION._archive_quarantine_mismatched_move(
+                            archive_fd, name, (observed.st_dev, observed.st_ino)
+                        )
+            finally:
+                os.close(archive_fd)
+            self.assertEqual(swaps, [], "never trust check-then-rename on peer pathname")
+            self.assertEqual((peer / "peer-marker").read_bytes(), b"peer")
+            self.assertEqual((authentic / "trusted-marker").read_bytes(), b"trusted")
 
     def test_archive_move_noreplace_preserves_racing_destination(self) -> None:
         # A peer can introduce an empty archive directory after the absent
@@ -2135,10 +2227,10 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertFalse(list(receipts.glob("*.json")))
             reset.assert_not_called()
 
-    def test_valid_archived_job_recovers_index_after_post_move_failure(self) -> None:
-        # A verified archive may be committed before an index write fails.
-        # The next plan must use the authentic archive manifest to recover,
-        # never delete the directory or permanently strand the failed unit.
+    def test_post_move_archive_without_trusted_proof_preserves_index_and_failed_unit(self) -> None:
+        # Same-UID can forge a self-consistent archive manifest. After an
+        # interrupted index publication the new pass must fail closed,
+        # rather than deleting a registry unit on path-based evidence.
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
@@ -2206,15 +2298,19 @@ class RuntimeRetentionTests(unittest.TestCase):
                 )
                 self.assertEqual(retry["archive_jobs"], [])
                 self.assertEqual(retry["reset_failed_units"], [unit])
-                recovery = RETENTION.apply_plan(
-                    retry, expected_plan_sha256=retry["plan_sha256"]
-                )
+                with self.assertRaisesRegex(
+                    RuntimeError, "retention reset phase did not complete"
+                ):
+                    RETENTION.apply_plan(
+                        retry, expected_plan_sha256=retry["plan_sha256"]
+                    )
 
-            self.assertTrue(recovery["completed"])
-            self.assertEqual(json.loads(index_file.read_text())["units"], [])
+            # An archive receipt is data, not independent authorization
+            # to drop a live deployment-index member or reset the failed unit.
+            self.assertEqual(json.loads(index_file.read_text())["units"], [name])
             self.assertEqual((archive / name / "stdout.log").read_bytes(), b"done\n")
             self.assertFalse((jobs / name).exists())
-            self.assertEqual(reset.call_count, 1)
+            reset.assert_not_called()
 
     def test_index_remains_unchanged_if_archive_move_fails(self) -> None:
         # R3 P3: index forget must occur only after verified archive effects.

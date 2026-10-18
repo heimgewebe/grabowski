@@ -1356,27 +1356,26 @@ def _archive_rename_noreplace(
 def _archive_quarantine_mismatched_move(
     archive_fd: int, name: str, observed_identity: tuple[int, int]
 ) -> None:
-    """Retain a wrong renamed child elsewhere; never overwrite jobs/<job>."""
-    for _ in range(4):
-        metadata = os.stat(name, dir_fd=archive_fd, follow_symlinks=False)
-        if (metadata.st_dev, metadata.st_ino) != observed_identity:
-            raise RuntimeError("wrong archive basename changed before quarantine")
-        quarantine_name = f".{name}.unverified-{os.urandom(12).hex()}"
-        try:
-            _archive_rename_noreplace(
-                archive_fd, name, archive_fd, quarantine_name
-            )
-        except FileExistsError:
-            continue
-        retained = os.stat(
-            quarantine_name, dir_fd=archive_fd, follow_symlinks=False
-        )
-        if (retained.st_dev, retained.st_ino) != observed_identity:
-            raise RuntimeError("quarantined archive identity changed")
-        os.fsync(archive_fd)
-        return
-    raise RuntimeError("wrong archive quarantine name collisions exhausted")
+    """Fail closed: Linux has no atomic rename-if-inode primitive.
 
+    Quarantining a same-UID-controlled basename by check-then-rename can move
+    genuine evidence if a peer swaps the entry between stat and renameat2.
+    Preserve all directory entries and require an explicit recovery decision.
+    """
+    try:
+        current = os.stat(name, dir_fd=archive_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(
+            "unverified archive basename disappeared; manual recovery required"
+        ) from exc
+    if (current.st_dev, current.st_ino) != observed_identity:
+        raise RuntimeError(
+            "unverified archive basename changed; manual recovery required"
+        )
+    raise RuntimeError(
+        "unverified archive basename cannot be quarantined atomically; "
+        "manual recovery required"
+    )
 
 def _archive_move_job_pinned(
     source: Path,
@@ -1587,7 +1586,7 @@ def _reset_failed(unit: str) -> dict[str, Any]:
 def _redacted_reset_failure(
     *, unit: str, stage: str, error: BaseException
 ) -> dict[str, str]:
-    if stage not in {"worker_revalidation", "reset_command"}:
+    if stage not in {"worker_revalidation", "reset_command", "deployment_index_recovery"}:
         raise RuntimeError("retention reset failure stage is invalid")
     return {
         "unit": unit,
@@ -2450,12 +2449,8 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 "files": item["files"],
             }
             archive_manifest["manifest_sha256"] = _sha256(archive_manifest)
-            _write_json_atomic(
-                source_dir / "archive-manifest.json",
-                archive_manifest,
-                replace_existing=True,
-                expected_parent_identity=item["source_identity"],
-            )
+            # The archive manifest is only authoritative after the moved
+            # inode's contents passed the post-move verification.
             _archive_move_job_pinned(
                 source_dir,
                 destination,
@@ -2463,6 +2458,17 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 jobs_root_identity=item["jobs_root_identity"],
                 archive_root_identity=item["archive_root_identity"],
                 expected_files=item["files"],
+            )
+            # Fail closed if a peer retargets the destination after the move.
+            # No complete receipt may be published for unverified contents.
+            _archive_require_pinned_identity(
+                destination, item["source_identity"]
+            )
+            _write_json_atomic(
+                destination / "archive-manifest.json",
+                archive_manifest,
+                replace_existing=True,
+                expected_parent_identity=item["source_identity"],
             )
             archived.append(
                 {
@@ -2475,18 +2481,11 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         for item in archived:
             indexed_units.discard(Path(item["destination"]).name)
         if index is not None:
-            # Existing archive receipts already give an authorized recovery
-            # path after a crash between a verified move and index publication.
-            # Reconcile only entries missing from jobs and with a complete,
-            # authentic existing archive manifest; never infer from absence.
-            for name in sorted(indexed_units):
-                source = jobs_root / name
-                if source.exists() or source.is_symlink():
-                    continue
-                if JOB_NAME.fullmatch(name) and _archived_job_receipt(
-                    name + ".service", jobs_root, archive_root
-                ) is not None:
-                    indexed_units.discard(name)
+            # Only a move verified in THIS apply may authorize index deletion.
+            # A same-UID peer can forge a self-consistent historical archive
+            # tree or temporarily hide a live job. Keep older index entries
+            # for explicit recovery; never infer authority from pathname
+            # absence and an unsigned archive manifest.
             if sorted(indexed_units) != index["units"]:
                 root_identity = (
                     prepared[0]["jobs_root_identity"]
@@ -2508,6 +2507,23 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         reset_results: list[dict[str, Any]] = []
         reset_failures: list[dict[str, str]] = []
         for unit in plan["reset_failed_units"]:
+            if (
+                JOB_UNIT.fullmatch(unit)
+                and unit.removesuffix(".service") in indexed_units
+            ):
+                # A stale indexed deployment cannot be cleared by an
+                # untrusted archive receipt during retry after a partial
+                # move. Do not reset-failed until the index is authentically
+                # reconciled, and preserve an actionable failure receipt.
+                reset_failures.append(
+                    _redacted_reset_failure(
+                        unit=unit, stage="deployment_index_recovery",
+                        error=RuntimeError(
+                            "deployment index member lacks verified archive move"
+                        ),
+                    )
+                )
+                continue
             if WORKER_UNIT.fullmatch(unit):
                 try:
                     _prepare_worker_resets(plan, units=[unit])
