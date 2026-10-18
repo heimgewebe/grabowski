@@ -8196,8 +8196,74 @@ class SelfDeployToolTests(unittest.TestCase):
                         pass
 
 
+def _fake_retained_validation(*args, **kwargs):
+    # Synthetic successful validation only; production never uses this mock.
+    if kwargs.get("retain_validation") is True:
+        return tempfile.TemporaryDirectory(prefix="grabowski-hashed-tooling-test-")
+    return None
+
+
+class HashedDeployToolingBindingTests(unittest.TestCase):
+    """Unit-bound import validation, not a substitute for pip --require-hashes."""
+
+    def test_bind_rejects_already_loaded_untrusted_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            sys.modules, {"yaml": types.SimpleNamespace(__version__="6.0.3")}
+        ):
+            with self.assertRaisesRegex(RuntimeError, "before lock validation"):
+                RUNNER._bind_hashed_deploy_tooling_yaml(Path(temporary))
+
+    def test_bind_rejects_symlinked_tooling_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "other"
+            outside.mkdir()
+            (root / "deploy-tooling").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "directory is unsafe"):
+                RUNNER._bind_hashed_deploy_tooling_yaml(root)
+
+    def test_bind_loads_only_verified_private_tooling_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            site = (
+                root / "deploy-tooling" / ".venv" / "lib"
+                / f"python{sys.version_info.major}.{sys.version_info.minor}"
+                / "site-packages"
+            )
+            yaml_dir = site / "yaml"
+            yaml_dir.mkdir(parents=True)
+            (yaml_dir / "__init__.py").write_text(
+                '__version__ = "6.0.3"\n'
+                'def safe_load(value):\n'
+                '    return {"locked": True}\n',
+                encoding="utf-8",
+            )
+            saved = {
+                name: module for name, module in sys.modules.items()
+                if name == "yaml" or name.startswith("yaml.")
+            }
+            for name in saved:
+                del sys.modules[name]
+            try:
+                RUNNER._bind_hashed_deploy_tooling_yaml(root)
+                self.assertEqual(sys.modules["yaml"].__file__, str(yaml_dir / "__init__.py"))
+                self.assertEqual(sys.path[0], str(site))
+            finally:
+                if str(site) in sys.path:
+                    sys.path.remove(str(site))
+                for name in list(sys.modules):
+                    if name == "yaml" or name.startswith("yaml."):
+                        del sys.modules[name]
+                sys.modules.update(saved)
+
+
 class ScheduledDeployRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._yaml_binding_patch = patch.object(
+            RUNNER, "_bind_hashed_deploy_tooling_yaml", return_value=None
+        )
+        self.yaml_binding_mock = self._yaml_binding_patch.start()
+        self.addCleanup(self._yaml_binding_patch.stop)
         self.productive_blue_green = patch.object(
             RUNNER,
             "run_productive_blue_green",
@@ -8980,7 +9046,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                 RUNNER, "load_finalization_binding", return_value=None
             ), patch.object(RUNNER.time, "sleep") as sleep, patch.object(
                 RUNNER, "verify_repository"
-            ) as verify, patch.object(RUNNER, "run_streamed") as streamed:
+            ) as verify, patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed:
                 self.assertEqual(RUNNER.main(), 1)
             sleep.assert_not_called()
             verify.assert_not_called()
@@ -9234,6 +9300,30 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             "5",
         ]
 
+    def test_main_source_drift_after_validation_blocks_tooling_yaml_import(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
+            RUNNER, "load_finalization_binding", return_value=None
+        ), patch.object(
+            RUNNER.time, "sleep"
+        ), patch.object(
+            RUNNER, "verify_repository",
+            side_effect=[None, RuntimeError("source drift after validate")],
+        ) as verify, patch.object(
+            RUNNER, "deployment_contention_preflight",
+            return_value=_contention_result(),
+        ), patch.object(
+            RUNNER, "run_streamed", side_effect=_fake_retained_validation
+        ) as streamed:
+            self.assertEqual(RUNNER.main(), 1)
+        self.assertEqual(verify.call_count, 2)
+        streamed.assert_called_once()
+        self.yaml_binding_mock.assert_not_called()
+        self.productive_blue_green_mock.assert_not_called()
+
     def test_main_retries_only_contention_and_then_succeeds(self) -> None:
         repo = Path("/tmp/repository")
         expected = "f" * 40
@@ -9251,9 +9341,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                 _contention_result(decision="defer"),
                 _contention_result(),
             ],
-        ) as preflight, patch.object(
-            RUNNER, "run_streamed"
-        ) as streamed, patch.object(
+        ) as preflight, patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed, patch.object(
             RUNNER,
             "verify_live_manifest",
             return_value={
@@ -9275,6 +9363,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             cwd=repo,
             timeout_seconds=1200,
             phase="validate",
+            retain_validation=True,
         )
         self.assertEqual(self.productive_blue_green_mock.call_count, 1)
 
@@ -9291,7 +9380,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(decision="defer"),
-        ) as preflight, patch.object(RUNNER, "run_streamed") as streamed:
+        ) as preflight, patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed:
             self.assertEqual(RUNNER.main(), 1)
         self.assertEqual(
             preflight.call_count, RUNNER.DEPLOYMENT_CONTENTION_MAX_ATTEMPTS
@@ -9319,7 +9408,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(decision="defer"),
-        ) as preflight, patch.object(RUNNER, "run_streamed") as streamed:
+        ) as preflight, patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed:
             self.assertEqual(RUNNER.main(), 1)
         self.assertEqual(verify.call_count, 2)
         preflight.assert_called_once()
@@ -9339,7 +9428,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             side_effect=RuntimeError("metrics probe failed"),
-        ) as preflight, patch.object(RUNNER, "run_streamed") as streamed:
+        ) as preflight, patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed:
             self.assertEqual(RUNNER.main(), 1)
         verify.assert_called_once()
         preflight.assert_called_once()
@@ -9359,7 +9448,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(decision="unknown"),
-        ) as preflight, patch.object(RUNNER, "run_streamed") as streamed:
+        ) as preflight, patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed:
             self.assertEqual(RUNNER.main(), 1)
         verify.assert_called_once()
         preflight.assert_called_once()
@@ -9369,7 +9458,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
     def test_main_validates_before_deploying(self) -> None:
         repo = Path("/tmp/repository")
         expected = "f" * 40
-        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=None), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository") as verify, patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed") as streamed, patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "r", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "reconcile_coding_agent_sidecars", return_value=_sidecar_reconciliation(expected)):
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=None), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository") as verify, patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed, patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "r", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "reconcile_coding_agent_sidecars", return_value=_sidecar_reconciliation(expected)):
             self.assertEqual(RUNNER.main(), 0)
         self.assertEqual(verify.call_count, 4)
         self.assertEqual(streamed.call_args_list[0].args[0], ["make", "validate"])
@@ -9398,7 +9487,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(),
-        ), patch.object(RUNNER, "run_streamed") as streamed, patch.object(
+        ), patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation) as streamed, patch.object(
             RUNNER,
             "verify_live_manifest",
             return_value={
@@ -9416,6 +9505,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             cwd=repo,
             timeout_seconds=1200,
             phase="validate",
+            retain_validation=True,
         )
         self.productive_blue_green_mock.assert_called_once()
         reconcile.assert_not_called()
@@ -9544,7 +9634,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         repo = Path("/tmp/repository")
         expected = "f" * 40
         binding = {"expected_head": expected}
-        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository"), patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed"), patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "release", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "reconcile_coding_agent_sidecars", return_value=_sidecar_reconciliation(expected)), patch.object(RUNNER, "write_finalization_receipt") as write:
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository"), patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation), patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "release", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "reconcile_coding_agent_sidecars", return_value=_sidecar_reconciliation(expected)), patch.object(RUNNER, "write_finalization_receipt") as write:
             self.assertEqual(RUNNER.main(), 0)
         write.assert_called_once_with(
             binding,
@@ -9570,7 +9660,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(),
-        ), patch.object(RUNNER, "run_streamed"), patch.object(
+        ), patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation), patch.object(
             RUNNER, "run_productive_blue_green", return_value=blue_green
         ), patch.object(
             RUNNER,
@@ -9612,7 +9702,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(),
-        ), patch.object(RUNNER, "run_streamed"), patch.object(
+        ), patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation), patch.object(
             RUNNER, "run_productive_blue_green", return_value=blue_green
         ), patch.object(
             RUNNER, "verify_live_manifest"
@@ -9647,7 +9737,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(),
-        ), patch.object(RUNNER, "run_streamed"), patch.object(
+        ), patch.object(RUNNER, "run_streamed", side_effect=_fake_retained_validation), patch.object(
             RUNNER,
             "verify_live_manifest",
             return_value={

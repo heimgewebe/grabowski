@@ -8361,18 +8361,18 @@ def _start_job(
         "GRABOWSKI_JOB_FINALIZATION_PATH": finalization_contract["receipt_paths"]["finalization"],
     }
     if allow_reserved_runtime_deploy:
-        # The fixed system Python can import the lock-pinned serving venv
-        # packages via one explicit path; Python does not execute .pth files
-        # from PYTHONPATH. Reject the ambient user site *before startup*.
+        # Never import from the mutable serving venv in the reserved worker.
+        # The target's hashed deploy-tooling lock is validated before the
+        # runner admits PyYAML from that isolated child environment.
         assert pinned_deploy_site is not None
         environment.update({
             "PYTHONPYCACHEPREFIX": "/dev/null/grabowski-runtime-deploy",
-            "PYTHONPATH": pinned_deploy_site,
+            "PYTHONPATH": "",
             "PYTHONHOME": "",
             "PYTHONNOUSERSITE": "1",
             "PYTHONUSERBASE": "",
             "PYTHONWARNINGS": "",
-            "PYTHONSAFEPATH": "",
+            "PYTHONSAFEPATH": "1",
             "PYTHONPLATLIBDIR": "",
             "PYTHONINSPECT": "",
             "PYTHONSTARTUP": "",

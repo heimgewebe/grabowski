@@ -76,14 +76,14 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
                 "--setenv=PYTHONPYCACHEPREFIX=/dev/null/grabowski-runtime-deploy",
                 before_command,
             )
-            self.assertIn(f"--setenv=PYTHONPATH={trusted_site}", before_command)
+            self.assertIn("--setenv=PYTHONPATH=", before_command)
             self.assertIn("--setenv=PYTHONHOME=", before_command)
             # Explicitly override hostile user-manager Python environment,
             # but do not claim that the mutable user site is authenticated.
             for item in (
                 "--setenv=PYTHONNOUSERSITE=1",
                 "--setenv=PYTHONWARNINGS=",
-                "--setenv=PYTHONSAFEPATH=",
+                "--setenv=PYTHONSAFEPATH=1",
                 "--setenv=PYTHONPLATLIBDIR=",
                 "--setenv=PYTHONINSPECT=",
                 "--setenv=PYTHONSTARTUP=",
@@ -244,6 +244,32 @@ class ReservedWorkerPythonSiteTests(unittest.TestCase):
             )
             self.assertEqual(0, safe.returncode, safe.stderr)
             self.assertEqual("locked absent absent", safe.stdout.strip(), safe.stderr)
+
+    @unittest.skipUnless(Path("/usr/bin/python3").is_file(), "system Python absent")
+    def test_reserved_worker_bootstrap_does_not_import_yaml_before_lock_validation(self):
+        # The reserved system Python must start with no serving/user site and
+        # must not import PyYAML before the later hashed-lock make validate.
+        root = Path(__file__).resolve().parents[1]
+        runner = root / "tools" / "run_scheduled_deploy.py"
+        code = (
+            "import importlib.util,sys; "
+            f"s=importlib.util.spec_from_file_location('bootstrap_probe',{str(runner)!r});"
+            "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+            "print(any(n=='yaml' or n.startswith('yaml.') for n in sys.modules))"
+        )
+        with tempfile.TemporaryDirectory(prefix="reserved-worker-prevalidate-") as tmp:
+            result = subprocess.run(
+                ["/usr/bin/python3", "-c", code],
+                env={
+                    "HOME": tmp, "PATH": "/usr/bin:/bin",
+                    "PYTHONPATH": "", "PYTHONNOUSERSITE": "1",
+                    "PYTHONUSERBASE": "", "PYTHONSAFEPATH": "1",
+                },
+                cwd=root, capture_output=True, text=True, timeout=15,
+            )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("False", result.stdout.strip())
+
 
     @unittest.skipUnless(sys.prefix != sys.base_prefix, "serving Python is not a venv")
     def test_pinned_serving_site_preflight_rejects_forged_package_version(self):

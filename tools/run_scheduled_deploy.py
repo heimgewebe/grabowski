@@ -1336,7 +1336,61 @@ def _raise_validation_sigterm(signum: int, _frame: Any) -> None:
     raise RuntimeError(f"validate interrupted by signal {signum} (SIGTERM)")
 
 
-def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str) -> None:
+def _bind_hashed_deploy_tooling_yaml(validation_root: Path) -> None:
+    """Admit PyYAML only after the isolated hashed-lock make validate succeeded.
+
+    sys.path insertion never executes .pth files. The private validation tree
+    must remain alive for the entire deployment; a prior yaml import is a
+    fail-closed violation of the pre-validation trust boundary.
+    """
+    if any(name == "yaml" or name.startswith("yaml.") for name in sys.modules):
+        raise RuntimeError("deploy worker imported PyYAML before lock validation")
+    site = (
+        validation_root / "deploy-tooling" / ".venv" / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    package = site / "yaml"
+    for directory in (
+        validation_root, validation_root / "deploy-tooling",
+        validation_root / "deploy-tooling" / ".venv",
+        validation_root / "deploy-tooling" / ".venv" / "lib",
+        site.parent, site, package,
+    ):
+        metadata = directory.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise RuntimeError("validated deploy-tooling site directory is unsafe")
+    package_init = package / "__init__.py"
+    metadata = package_init.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+        or metadata.st_mode & 0o022
+    ):
+        raise RuntimeError("validated deploy-tooling PyYAML source is unsafe")
+    sys.path.insert(0, str(site))
+    try:
+        import yaml
+        if (
+            getattr(yaml, "__version__", None) != deploy_core.TOOLING_PYYAML_VERSION
+            or Path(yaml.__file__) != package_init
+            or yaml.safe_load("locked: true") != {"locked": True}
+        ):
+            raise RuntimeError("worker PyYAML import is not from validated tooling lock")
+    except BaseException:
+        sys.path.remove(str(site))
+        raise
+
+
+def run_streamed(
+    argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str,
+    retain_validation: bool = False,
+) -> tempfile.TemporaryDirectory[str] | None:
     emit(f"{phase}-start", argv=argv)
     environment = child_environment()
     effective_argv = list(argv)
@@ -1403,6 +1457,13 @@ def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str
         emit(f"{phase}-complete", returncode=returncode)
         if returncode != 0:
             raise RuntimeError(f"{phase} failed with return code {returncode}")
+        if retain_validation:
+            if validation_tmp is None:
+                raise RuntimeError("only hashed-lock validation may retain tooling")
+            retained = validation_tmp
+            validation_tmp = None
+            return retained
+        return None
     finally:
         try:
             if (
@@ -1799,6 +1860,7 @@ def main() -> int:
     binding: dict[str, Any] | None = None
     blue_green_result: dict[str, Any] | None = None
     live: dict[str, Any] | None = None
+    retained_validation: tempfile.TemporaryDirectory[str] | None = None
     try:
         binding = load_finalization_binding()
         if binding is not None and binding["expected_head"] != args.expected_head:
@@ -1821,13 +1883,21 @@ def main() -> int:
             expected_head=args.expected_head,
             source_identity_sha256=args.source_identity_sha256,
         )
-        run_streamed(["make", "validate"], cwd=repo, timeout_seconds=1_200, phase="validate")
+        retained_validation = run_streamed(
+            ["make", "validate"], cwd=repo, timeout_seconds=1_200,
+            phase="validate", retain_validation=True,
+        )
+        if not isinstance(retained_validation, tempfile.TemporaryDirectory):
+            raise RuntimeError("hashed-lock deploy tooling was not retained")
+        # Do not import any dependency until the validated target source
+        # identity has been checked again after the validation subprocess.
         verify_repository(
             repo,
             args.canonical_repo,
             args.source_kind,
             args.expected_head,
         )
+        _bind_hashed_deploy_tooling_yaml(Path(retained_validation.name))
         recovery_decision = classify_recovery_before_deploy(
             repo=repo, execution_head=args.expected_head
         )
@@ -1957,6 +2027,11 @@ def main() -> int:
                 emit("finalization-receipt-failed", error_type=type(receipt_exc).__name__)
         emit("failed", error_type=type(exc).__name__, error=str(exc))
         return 1
+    finally:
+        if retained_validation is not None and isinstance(
+            retained_validation, tempfile.TemporaryDirectory
+        ):
+            retained_validation.cleanup()
 
 
 if __name__ == "__main__":
