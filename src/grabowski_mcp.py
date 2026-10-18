@@ -6567,12 +6567,12 @@ def _operator_system_overview(
     elif reconciliation_evidence.get("status") == "privileged_live_unverified":
         # READ_ONLY cannot certify a live rootbroker unit from a persisted
         # terminal observation. Repeating reconciliation alone cannot make
-        # the cached proof current. Verified terminal tasks require an
-        # authorized archival closeout before this cohort can be quiescent.
+        # the cached proof current. Archival never excludes restartable units.
         next_action = (
             "inspect current privileged tasks with authorized live observation; "
-            "archive independently verified terminal tasks through the "
-            "authorized task-closeout-archive workflow"
+            "require an authorized task-and-attempt-bound restart-exclusion "
+            "contract before certifying retirement; archival, stop/show and "
+            "reconciliation alone cannot establish that guarantee"
         )
     elif (
         reconciliation_evidence.get("status") == "local_terminal_budget_exceeded"
@@ -6613,6 +6613,32 @@ def _operator_system_overview(
             "authorized task-closeout-archive workflow, no more, so the local "
             "terminal readiness budget fits within the archive history budget"
         )
+    elif reconciliation_evidence.get("status") == "archived_task_unit_live_unverified":
+        next_action = (
+            "inspect unexpectedly active user-systemd task units through "
+            "authorized live observation; stop only after applicable task "
+            "and service scope gates, then verify complete fresh inventory "
+            "and store revisions before trusting readiness"
+        )
+    elif reconciliation_evidence.get("status") in {
+        "archived_terminal_transport_unverified",
+        "archived_task_unit_observation_unavailable",
+    }:
+        next_action = (
+            "restore bounded authorized live observation of archived privileged "
+            "or remote terminal units and inspect unavailable local systemd "
+            "inventory before trusting readiness; repeated reconciliation "
+            "or archival alone cannot establish quiescence; privileged or remote "
+            "retirement requires a task-and-attempt-bound restart-exclusion contract"
+        )
+    elif reconciliation_evidence.get("status") == "retained_inventory_changed":
+        next_action = "inspect changing task attempt units before trusting a fresh bounded inventory"
+    elif reconciliation_evidence.get("status") == "retained_attempt_authority_unverified":
+        next_action = (
+            "recover original host, transport and scope authority for every retained "
+            "attempt through an authorized evidence workflow; missing history stays "
+            "blocked and must not be backfilled from the current fleet mapping"
+        )
     elif reconciliation_evidence.get("status") == "local_terminal_transport_unverified":
         # A remote unit cannot be certified by the local read-only observer.
         # Only recommend archive when a complete bounded cohort fits within
@@ -6644,6 +6670,11 @@ def _operator_system_overview(
                 "are available, so do not archive until a bounded budget check "
                 "proves complete closeout is possible"
             )
+        next_action += (
+            "; archival and reconciliation alone cannot establish readiness; "
+            "remote retirement requires an authorized task-and-attempt-bound "
+            "restart-exclusion contract, which stop/show does not provide"
+        )
     elif reconciliation_evidence.get("status") != "verified":
         next_action = "reconcile live task outcomes through an authorized mutation-capable path"
     elif obligations.get("integrity_error_count"):
