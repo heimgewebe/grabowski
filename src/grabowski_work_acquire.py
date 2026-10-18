@@ -3167,6 +3167,10 @@ def _resource_acquisition_plan(resource_keys: list[str]) -> list[dict[str, Any]]
     bureau_keys = sorted(bureau_keys)
     bureau_key_set = set(bureau_keys)
     standard_keys = [key for key in keys if key not in bureau_key_set]
+    # Repository cardinality is global to the Work Lane. Without this
+    # guard separate 64-key groups could each grant one repository authority.
+    if sum(key.startswith("repo:") for key in standard_keys) > 1:
+        raise ValueError("repository leases must be acquired one repository at a time")
     # Bureau gate combinations are one indivisible contract.  Splitting them
     # could separate mutually exclusive merge and worktree-admin authorities.
     if len(bureau_keys) > MAX_RESOURCE_RELEASE_BATCH:

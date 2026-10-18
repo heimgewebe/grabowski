@@ -551,6 +551,25 @@ class WorkAcquireTests(unittest.TestCase):
                 acquire.assert_not_called()
                 ensure.assert_not_called()
 
+    def test_multi_repository_across_atomic_groups_is_denied(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [
+            *(f"component:two-repos-{i:03d}" for i in range(62)),
+            f"repo:{self.repo}:branch:foreign-scope",
+        ]
+        inputs = work_acquire._normalize(params)
+        self.assertEqual(len(inputs["resource_keys"]), 65)
+        acquire = Mock(side_effect=AssertionError("multi-repo lease granted"))
+        ensure = Mock()
+        with self.assertRaisesRegex(ValueError, "one repository at a time"):
+            work_acquire.acquire_work(
+                params, acquire_resources_fn=acquire,
+                release_resources_fn=Mock(), inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure, runner=Mock(),
+            )
+        acquire.assert_not_called()
+        ensure.assert_not_called()
+
     def test_large_scope_atomic_batches(self) -> None:
         for total in (63, 64, 65, 78):
             with self.subTest(total=total):
