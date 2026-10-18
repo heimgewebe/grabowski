@@ -1885,6 +1885,111 @@ class RuntimeRetentionTests(unittest.TestCase):
             )
             fake_base._require_capability.assert_called_once_with("durable_job")
 
+    def test_source_basename_swap_at_rename_rolls_back_foreign_archive(self) -> None:
+        # R3 P2: source path can be replaced between the verified inode read
+        # and renameat. The wrong directory must not poison archive/<job>.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            job_name = "grabowski-job-989898989898"
+            unit = job_name + ".service"
+            source = self._job(jobs, job_name, 100)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1_000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            saved = jobs / (job_name + "-original")
+            real_replace = os.replace
+            swaps: list[bool] = []
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            def swap_source_before_rename(old, new, *args, **kwargs):
+                if (Path(old).name == job_name and
+                        Path(new).name == job_name and not swaps):
+                    source.rename(saved)
+                    source.mkdir(mode=0o700)
+                    replacement = source / "peer-evidence"
+                    replacement.write_bytes(b"never archive peer\n")
+                    replacement.chmod(0o600)
+                    swaps.append(True)
+                return real_replace(old, new, *args, **kwargs)
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: None
+            fake_self_deploy._write_deploy_index = Mock()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_self_deploy,
+                "grabowski_mcp": fake_base,
+            }), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION, "_systemd_unit_states",
+                return_value={unit: self._state(unit)}
+            ), patch.object(
+                RETENTION.os, "replace", side_effect=swap_source_before_rename
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity changed during move"):
+                    RETENTION.apply_plan(plan, expected_plan_sha256=plan["plan_sha256"])
+            self.assertEqual(swaps, [True])
+            self.assertFalse((archive / job_name).exists())
+            self.assertEqual((source / "peer-evidence").read_bytes(),
+                             b"never archive peer\n")
+            self.assertEqual((saved / "stdout.log").read_bytes(), b"done\n")
+            self.assertFalse(list(receipts.glob("*.json")))
+            reset.assert_not_called()
+
+    def test_index_remains_unchanged_if_archive_move_fails(self) -> None:
+        # R3 P3: index forget must occur only after verified archive effects.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            job_name = "grabowski-job-565656565656"
+            unit = job_name + ".service"
+            self._job(jobs, job_name, 100)
+            index_path = jobs / "runtime-deploy-index.json"
+            old_index = {
+                "schema_version": 1, "units": [job_name],
+                "pending_unit": None, "updated_at_unix": 500,
+            }
+            initial = json.dumps(old_index, sort_keys=True).encode() + b"\n"
+            index_path.write_bytes(initial)
+            index_path.chmod(0o600)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1_000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: old_index
+            fake_self_deploy._write_deploy_index = Mock()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_self_deploy,
+                "grabowski_mcp": fake_base,
+            }), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION, "_systemd_unit_states",
+                return_value={unit: self._state(unit)}
+            ), patch.object(
+                RETENTION, "_archive_move_job_pinned",
+                side_effect=RuntimeError("simulated verified move failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "verified move failure"):
+                    RETENTION.apply_plan(plan, expected_plan_sha256=plan["plan_sha256"])
+            self.assertEqual(index_path.read_bytes(), initial)
+            self.assertTrue((jobs / job_name / "metadata.json").is_file())
+            self.assertFalse((archive / job_name).exists())
+            reset.assert_not_called()
+
     def test_archive_index_update_uses_pinned_jobs_root_not_path_writer(self) -> None:
         # The ordinary self-deploy writer addresses jobs_root by path and
         # cannot attest that it still names the root scanned by retention.
@@ -2001,8 +2106,16 @@ class RuntimeRetentionTests(unittest.TestCase):
                     )
             self.assertEqual(switched, [True])
             self.assertEqual(outside_index.read_bytes(), b"foreign index, never replace\n")
-            self.assertTrue((old_jobs / job_name / "metadata.json").is_file())
-            self.assertFalse((archive / job_name).exists())
+            # The source was already safely moved before the index write.
+            # On the subsequently swapped root, preserve the old index and
+            # the archived evidence, but perform no reset or final receipt.
+            self.assertFalse((old_jobs / job_name).exists())
+            self.assertTrue((archive / job_name / "metadata.json").is_file())
+            self.assertEqual(
+                json.loads((old_jobs / "runtime-deploy-index.json").read_text()),
+                old_index,
+            )
+            self.assertEqual(list(receipts.glob("*.json")), [])
             reset.assert_not_called()
             fake_base._append_audit.assert_called_once()
 

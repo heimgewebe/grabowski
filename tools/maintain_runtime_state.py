@@ -1322,6 +1322,32 @@ def _archive_require_pinned_identity(
         os.close(fd)
 
 
+def _archive_recover_wrong_move(
+    jobs_fd: int, archive_fd: int, name: str
+) -> None:
+    """Preserve a wrongly moved child without occupying the canonical archive."""
+    try:
+        os.stat(name, dir_fd=jobs_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        # Most swap races leave the original basename empty after renameat.
+        os.rename(name, name, src_dir_fd=archive_fd, dst_dir_fd=jobs_fd)
+    else:
+        # If a peer occupied the source name, retain the wrong directory under
+        # a distinct archive basename. Never unlink or overwrite that peer.
+        quarantine_name = f".{name}.unverified-{os.urandom(12).hex()}"
+        try:
+            os.stat(quarantine_name, dir_fd=archive_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.rename(
+                name, quarantine_name,
+                src_dir_fd=archive_fd, dst_dir_fd=archive_fd,
+            )
+        else:
+            raise RuntimeError("archive recovery quarantine name collision")
+    os.fsync(jobs_fd)
+    os.fsync(archive_fd)
+
+
 def _archive_move_job_pinned(
     source: Path,
     destination: Path,
@@ -1355,17 +1381,27 @@ def _archive_move_job_pinned(
                 source.name, destination.name,
                 src_dir_fd=jobs_fd, dst_dir_fd=archive_fd,
             )
-            moved_fd = os.open(
-                destination.name,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=archive_fd,
-            )
+            try:
+                moved_fd = os.open(
+                    destination.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=archive_fd,
+                )
+            except OSError as exc:
+                _archive_recover_wrong_move(jobs_fd, archive_fd, destination.name)
+                raise RuntimeError(
+                    f"archived job identity changed during move: {destination}"
+                ) from exc
             try:
                 metadata = os.fstat(moved_fd)
-                if (metadata.st_dev, metadata.st_ino) != source_identity:
-                    raise RuntimeError(f"archived job identity changed during move: {destination}")
+                correct_inode = (metadata.st_dev, metadata.st_ino) == source_identity
             finally:
                 os.close(moved_fd)
+            if not correct_inode:
+                _archive_recover_wrong_move(jobs_fd, archive_fd, destination.name)
+                raise RuntimeError(
+                    f"archived job identity changed during move: {destination}"
+                )
             os.fsync(jobs_fd)
             os.fsync(archive_fd)
             _archive_require_unchanged_root(source.parent, jobs_fd)
@@ -2225,27 +2261,6 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                     f"job files drifted before archive: {item['record']['job_name']}"
                 )
         for item in prepared:
-            indexed_units.discard(item["record"]["job_name"])
-        if index is not None and sorted(indexed_units) != index["units"]:
-            # The retention index is an evidence file under the same scanned
-            # jobs root. Do not pass that mutable path to the older unpinned
-            # self-deploy writer. Retain the original schema and ordering.
-            if not prepared:
-                raise RuntimeError("deploy index update lacks pinned jobs root")
-            root_identity = prepared[0]["jobs_root_identity"]
-            _archive_require_pinned_identity(jobs_root, root_identity)
-            _write_json_atomic(
-                jobs_root / self_deploy.DEPLOY_INDEX_FILENAME,
-                {
-                    "schema_version": 1,
-                    "units": sorted(indexed_units),
-                    "pending_unit": index["pending_unit"],
-                    "updated_at_unix": int(time.time()),
-                },
-                replace_existing=True,
-                expected_parent_identity=root_identity,
-            )
-        for item in prepared:
             record = item["record"]
             source_dir = item["source_dir"]
             destination = item["destination"]
@@ -2280,6 +2295,25 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                     "destination": str(destination),
                     "manifest_sha256": archive_manifest["manifest_sha256"],
                 }
+            )
+
+        for item in archived:
+            indexed_units.discard(Path(item["destination"]).name)
+        if index is not None and sorted(indexed_units) != index["units"]:
+            # Only successfully moved and reverified entries may be removed
+            # from the original self-deploy job index. Keep one atomic update.
+            root_identity = prepared[0]["jobs_root_identity"]
+            _archive_require_pinned_identity(jobs_root, root_identity)
+            _write_json_atomic(
+                jobs_root / self_deploy.DEPLOY_INDEX_FILENAME,
+                {
+                    "schema_version": 1,
+                    "units": sorted(indexed_units),
+                    "pending_unit": index["pending_unit"],
+                    "updated_at_unix": int(time.time()),
+                },
+                replace_existing=True,
+                expected_parent_identity=root_identity,
             )
 
         reset_results: list[dict[str, Any]] = []
