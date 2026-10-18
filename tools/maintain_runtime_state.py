@@ -1558,11 +1558,11 @@ def _write_json_atomic(
         os.fsync(directory_fd)
         _archive_require_unchanged_root(parent, directory_fd)
     finally:
-        if temporary_name is not None:
-            try:
-                os.unlink(temporary_name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
+        # Never unlink a temporary pathname after a failed publication. A
+        # same-UID peer could have renamed our inode away and substituted a
+        # foreign file at that basename. There is no atomic conditional
+        # unlink-by-inode here; retain the private 0600 orphan rather than
+        # risk deleting foreign evidence. On success rename consumes the temp.
         os.close(directory_fd)
     return path
 
@@ -2405,6 +2405,18 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         archived: list[dict[str, Any]] = []
         index_root_fd = _archive_open_private_root(jobs_root)
         try:
+            if prepared:
+                # The index reader's FD must be the SAME jobs-root inode
+                # authenticated while preparing the archive sources. A
+                # private-directory swap can otherwise inject an index even
+                # though every individual FD/path consistency check passes.
+                root_stat = os.fstat(index_root_fd)
+                if (root_stat.st_dev, root_stat.st_ino) != prepared[0][
+                    "jobs_root_identity"
+                ]:
+                    raise RuntimeError(
+                        "jobs root identity changed before index read"
+                    )
             index = _archive_read_deploy_index_pinned(
                 jobs_root, index_root_fd, self_deploy
             )

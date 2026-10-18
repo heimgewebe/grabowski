@@ -1397,6 +1397,79 @@ class RuntimeRetentionTests(unittest.TestCase):
             reset.assert_not_called()
             fake_base._append_audit.assert_called_once()
 
+    def test_atomic_temp_replaced_after_failed_noreplace_is_not_deleted(self) -> None:
+        # Concurrent same-UID writer moves our temp away and places a foreign
+        # private file at the original name after publication failed.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "job"
+            directory.mkdir(mode=0o700)
+            original_open = RETENTION._archive_open_private_root
+            captured: list[int] = []
+            swapped: list[str] = []
+
+            def capture_root(path):
+                fd = original_open(path)
+                captured.append(fd)
+                return fd
+
+            def swap_at_rename(source_fd, name, dest_fd, dest_name):
+                os.rename(name, ".retained-writer-temp", src_dir_fd=source_fd,
+                          dst_dir_fd=source_fd)
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                             0o600, dir_fd=source_fd)
+                try:
+                    os.write(fd, b"foreign evidence\n")
+                finally:
+                    os.close(fd)
+                swapped.append(name)
+                raise FileExistsError("simulated no-clobber refusal")
+
+            with patch.object(
+                RETENTION, "_archive_open_private_root", side_effect=capture_root,
+            ), patch.object(
+                RETENTION, "_archive_rename_noreplace", side_effect=swap_at_rename,
+            ):
+                with self.assertRaisesRegex(FileExistsError, "no-clobber refusal"):
+                    RETENTION._write_json_atomic(
+                        directory / "retention-receipt.json", {"schema_version": 3}
+                    )
+            self.assertEqual(len(swapped), 1)
+            self.assertEqual((directory / swapped[0]).read_bytes(), b"foreign evidence\n")
+            self.assertTrue((directory / ".retained-writer-temp").is_file())
+            self.assertFalse((directory / "retention-receipt.json").exists())
+            self.assertEqual(len(captured), 1)
+            with self.assertRaises(OSError):
+                os.fstat(captured[0])
+
+    def test_atomic_failed_publication_closes_root_even_if_unlink_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "job"
+            directory.mkdir(mode=0o700)
+            original_open = RETENTION._archive_open_private_root
+            captured: list[int] = []
+
+            def capture_root(path):
+                fd = original_open(path)
+                captured.append(fd)
+                return fd
+
+            with patch.object(
+                RETENTION, "_archive_open_private_root", side_effect=capture_root,
+            ), patch.object(
+                RETENTION, "_archive_rename_noreplace",
+                side_effect=FileExistsError("simulated publication collision"),
+            ), patch.object(
+                RETENTION.os, "unlink",
+                side_effect=PermissionError("cannot safely remove untrusted temp"),
+            ):
+                with self.assertRaisesRegex(FileExistsError, "publication collision"):
+                    RETENTION._write_json_atomic(
+                        directory / "retention-receipt.json", {"schema_version": 3}
+                    )
+            self.assertEqual(len(captured), 1)
+            with self.assertRaises(OSError):
+                os.fstat(captured[0])
+
     def test_atomic_manifest_temp_collision_preserves_existing_private_file(self) -> None:
         # O_EXCL can fail after a same-UID peer wins the temp name. Cleanup
         # must not remove the peer's already-existing file.
@@ -2316,6 +2389,105 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(json.loads(index.read_text())["units"], [])
             self.assertTrue((archive / name / "archive-manifest.json").is_file())
 
+    def test_archive_index_prepared_root_replacement_cannot_spoof_fd_read(self) -> None:
+        # A foreign owner-private jobs directory supplies a syntactically
+        # valid forged index ONLY between preparing the plan and opening the
+        # index root FD. The attacker restores the real directory immediately
+        # after the two path/FD identity checks, before the archive move.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            name = "grabowski-job-454545454545"
+            unit = name + ".service"
+            self._job(jobs, name, 100)
+            index = {
+                "schema_version": 1, "units": [name],
+                "pending_unit": None, "updated_at_unix": 500,
+            }
+            index_path = jobs / "runtime-deploy-index.json"
+            index_path.write_text(json.dumps(index) + "\n")
+            index_path.chmod(0o600)
+            attacker = root / "attacker-private-jobs"
+            attacker.mkdir(mode=0o700)
+            forged_index = attacker / "runtime-deploy-index.json"
+            forged_index.write_text(json.dumps({**index, "units": []}) + "\n")
+            forged_index.chmod(0o600)
+            attacker_ino = attacker.stat().st_ino
+            hidden = root / "original-private-jobs"
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            fake_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            actual_prepare = RETENTION._prepare_archives
+            actual_open = RETENTION._archive_open_private_root
+            actual_check = RETENTION._archive_require_unchanged_root
+            armed, switched, restored = [False], [False], [False]
+            foreign_checks = [0]
+
+            def prepare_then_arm(arg):
+                result = actual_prepare(arg)
+                armed[0] = True
+                return result
+
+            def swap_before_open(path):
+                if armed[0] and path == jobs and not switched[0]:
+                    jobs.rename(hidden)
+                    attacker.rename(jobs)
+                    switched[0] = True
+                return actual_open(path)
+
+            def restore_after_reader(path, fd):
+                actual_check(path, fd)
+                if (path == jobs and switched[0] and not restored[0]
+                        and os.fstat(fd).st_ino == attacker_ino):
+                    foreign_checks[0] += 1
+                    if foreign_checks[0] == 2:
+                        jobs.rename(attacker)
+                        hidden.rename(jobs)
+                        restored[0] = True
+
+            try:
+                with patch.dict("sys.modules", {
+                    "grabowski_self_deploy": fake_deploy, "grabowski_mcp": fake_base,
+                }), patch.object(
+                    RETENTION, "_prepare_archives", side_effect=prepare_then_arm,
+                ), patch.object(
+                    RETENTION, "_archive_open_private_root", side_effect=swap_before_open,
+                ), patch.object(
+                    RETENTION, "_archive_require_unchanged_root",
+                    side_effect=restore_after_reader,
+                ), patch.object(
+                    RETENTION, "_run", reset,
+                ), patch.object(
+                    RETENTION, "_systemd_unit_states",
+                    return_value={unit: self._state(unit)},
+                ):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "jobs root identity changed before index read",
+                    ):
+                        RETENTION.apply_plan(
+                            plan, expected_plan_sha256=plan["plan_sha256"],
+                        )
+            finally:
+                if switched[0] and not restored[0]:
+                    jobs.rename(attacker)
+                    hidden.rename(jobs)
+            self.assertEqual(switched, [True])
+            self.assertEqual(json.loads(index_path.read_text()), index)
+            self.assertTrue((jobs / name / "metadata.json").is_file())
+            self.assertFalse((archive / name).exists())
+            reset.assert_not_called()
+
     def test_archive_index_root_swap_never_redirects_index_write(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2774,9 +2946,15 @@ class RuntimeRetentionTests(unittest.TestCase):
                 with self.assertRaises(FileExistsError):
                     RETENTION._write_json_atomic(target, {"value": 1})
             self.assertEqual(target.read_bytes(), foreign)
-            self.assertEqual(
-                sorted(p.name for p in directory.iterdir()), ["receipt.json"]
-            )
+            # The immutable destination is preserved; never unlink a mutable
+            # temporary pathname after a failed RENAME_NOREPLACE. Keep only
+            # the writer's private orphan for later controlled maintenance.
+            private_orphans = [p for p in directory.iterdir() if p != target]
+            self.assertEqual(len(private_orphans), 1)
+            self.assertTrue(private_orphans[0].name.startswith(".receipt.json."))
+            self.assertEqual(private_orphans[0].suffix, ".tmp")
+            self.assertEqual(private_orphans[0].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(private_orphans[0].read_text()), {"value": 1})
 
     def test_retention_receipt_is_create_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
