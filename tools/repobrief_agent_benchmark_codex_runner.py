@@ -8726,13 +8726,11 @@ def _start_trusted_parent_mcp_broker(
             pipes.append(
                 {"path": path, "identity": (info.st_dev, info.st_ino, info.st_mode)}
             )
-            if kind == "response":
-                # The trusted Python proxy uses buffered stdout.write/flush.
-                # A nonblocking FIFO drops large (>pipe-capacity) responses
-                # with EAGAIN despite a perfectly healthy downstream reader.
-                # Its separate provider relay has O_NONBLOCK reads and drains
-                # this blocking broker writer concurrently.
-                os.set_blocking(descriptor, True)
+            # Broker stdio starts in blocking mode. Its request reader
+            # deliberately switches to O_NONBLOCK only after registering the
+            # FD with a selector, while response writes stay blocking so a
+            # large valid JSON-RPC frame cannot fail with EAGAIN.
+            os.set_blocking(descriptor, True)
         _directory_fd_matches(home, home_fd)
         _directory_fd_matches(parent, parent_fd)
         reference = staged.get("metadata_binding")

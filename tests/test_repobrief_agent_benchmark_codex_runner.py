@@ -7464,11 +7464,92 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             )
         metadata.assert_not_called()
 
+    def test_bwrap_preserves_explicitly_inherited_parent_readiness_fd(self) -> None:
+        # Actual bwrap on the target host forwards Popen(pass_fds) to the
+        # sandboxed Python process. --keep-fd is not a portable bwrap option.
+        # Unlike child-supplied FD numbers this tests parent pipe possession.
+        if sys.platform != "linux" or not Path("/usr/bin/bwrap").is_file():
+            self.skipTest("Linux bwrap is required")
+        ready_read, ready_write = os.pipe2(os.O_CLOEXEC)
+        try:
+            program = "import os,sys; os.write(int(sys.argv[1]), b'PARENT_READY')"
+            completed = subprocess.run(
+                [
+                    "/usr/bin/bwrap",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--unshare-pid",
+                    "--proc",
+                    "/proc",
+                    "--",
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    program,
+                    str(ready_write),
+                ],
+                pass_fds=(ready_write,),
+                capture_output=True,
+                timeout=12,
+                check=False,
+            )
+            os.close(ready_write)
+            ready_write = -1
+            marker = os.read(ready_read, 64)
+            if (
+                completed.returncode != 0
+                and b"No permissions to create new namespace" in completed.stderr
+            ):
+                self.skipTest("distribution policy forbids bwrap PID namespace")
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(marker, b"PARENT_READY")
+        finally:
+            if ready_write >= 0:
+                os.close(ready_write)
+            os.close(ready_read)
+
     def test_trusted_parent_broker_delayed_sequential_mcp_responses(self) -> None:
         # Live bwrap, frozen source, authenticated parent-side MCP and an
         # untrusted Codex-style relay. Nothing invokes the model or uses USD.
-        if sys.platform != "linux" or not Path("/usr/bin/bwrap").is_file():
-            self.skipTest("Linux bwrap required for parent-owned MCP kernel test")
+        if (
+            sys.platform != "linux"
+            or not Path("/usr/bin/bwrap").is_file()
+            or not Path("/usr/bin/unshare").is_file()
+        ):
+            self.skipTest("Linux bwrap and unshare are required")
+        # CI can run ordinary bwrap but deny a second user namespace. This
+        # kernel-only test must remain real on hosts supporting the attack.
+        probe = subprocess.run(
+            [
+                "/usr/bin/bwrap",
+                "--ro-bind",
+                "/",
+                "/",
+                "--unshare-pid",
+                "--unshare-ipc",
+                "--die-with-parent",
+                "--proc",
+                "/proc",
+                "--",
+                "/usr/bin/unshare",
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--pid",
+                "--fork",
+                "/bin/true",
+            ],
+            capture_output=True,
+            check=False,
+            timeout=12,
+        )
+        if probe.returncode != 0 and (
+            b"No permissions to create new namespace" in probe.stderr
+            or b"unshare failed: Operation not permitted" in probe.stderr
+        ):
+            self.skipTest("kernel policy denies required nested namespaces")
+        self.assertEqual(probe.returncode, 0, probe.stderr)
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
             root = Path(temporary)
             state = root / "state"
@@ -7494,6 +7575,10 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
             )
             python = Path(sys.executable).resolve(strict=True)
             proxy_python = runner.MCP_PROXY_PYTHON_LINK.resolve(strict=True)
+            # The program stage contains exactly executable + script. A
+            # different CI sys.executable vs /usr/bin/python3 proxy helper
+            # must not be mistaken for a third upstream executable.
+            upstream_authorized = [file_identity(python), file_identity(upstream)]
             authorized = [
                 file_identity(path)
                 for path in dict.fromkeys((python, upstream, proxy_python))
@@ -7511,7 +7596,7 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 state,
                 [str(python), str(upstream), "--bundle-root", str(staged_manifest)],
                 staged_manifest,
-                authorized,
+                upstream_authorized,
             )
             home = runner.stage_codex_home(state, b"{}")
             bound = request(condition="treatment")
@@ -7915,6 +8000,11 @@ print("PROVIDER_READONLY_STAGE_FORGED")
         ):
             self.skipTest("distribution policy denies required bwrap namespace")
         self.assertEqual(completed.returncode, 0, completed.stderr)
+        if (
+            b"NESTED_BWRAP_FAILED" in completed.stdout
+            and b"No permissions to create new namespace" in completed.stdout
+        ):
+            self.skipTest("kernel policy denies the nested bwrap adversary")
         self.assertIn(b"FORGED_BIND_READONLY", completed.stdout)
         self.assertIn(b"NESTED_BWRAP_ACCEPTED", completed.stdout)
 
