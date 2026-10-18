@@ -1308,56 +1308,146 @@ def _archive_file_manifest(directory: Path) -> list[dict[str, Any]]:
         os.close(fd)
 
 
+def _archive_require_pinned_identity(
+    directory: Path, expected_identity: tuple[int, int]
+) -> None:
+    """Reject same-UID source replacement even with identical file bytes."""
+    fd = _archive_open_private_root(directory)
+    try:
+        metadata = os.fstat(fd)
+        if (metadata.st_dev, metadata.st_ino) != expected_identity:
+            raise RuntimeError(f"archive source identity changed: {directory}")
+        _archive_require_unchanged_root(directory, fd)
+    finally:
+        os.close(fd)
+
+
+def _archive_move_job_pinned(
+    source: Path,
+    destination: Path,
+    *,
+    source_identity: tuple[int, int],
+    jobs_root_identity: tuple[int, int],
+    archive_root_identity: tuple[int, int],
+    expected_files: list[dict[str, Any]],
+) -> None:
+    """Move only the scanned job into the pinned archive root, not a swapped path."""
+    jobs_fd = _archive_open_private_root(source.parent)
+    try:
+        archive_fd = _archive_open_private_root(destination.parent)
+        try:
+            for directory, fd, identity in (
+                (source.parent, jobs_fd, jobs_root_identity),
+                (destination.parent, archive_fd, archive_root_identity),
+            ):
+                metadata = os.fstat(fd)
+                if (metadata.st_dev, metadata.st_ino) != identity:
+                    raise RuntimeError(f"archive root identity changed: {directory}")
+                _archive_require_unchanged_root(directory, fd)
+            _archive_require_pinned_identity(source, source_identity)
+            try:
+                os.stat(destination.name, dir_fd=archive_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise RuntimeError(f"archive destination appeared before move: {destination}")
+            os.replace(
+                source.name, destination.name,
+                src_dir_fd=jobs_fd, dst_dir_fd=archive_fd,
+            )
+            moved_fd = os.open(
+                destination.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=archive_fd,
+            )
+            try:
+                metadata = os.fstat(moved_fd)
+                if (metadata.st_dev, metadata.st_ino) != source_identity:
+                    raise RuntimeError(f"archived job identity changed during move: {destination}")
+            finally:
+                os.close(moved_fd)
+            os.fsync(jobs_fd)
+            os.fsync(archive_fd)
+            _archive_require_unchanged_root(source.parent, jobs_fd)
+            _archive_require_unchanged_root(destination.parent, archive_fd)
+            if _archive_file_manifest(destination) != expected_files:
+                raise RuntimeError(f"archived job files changed during move: {source.name}")
+            _archive_require_unchanged_root(source.parent, jobs_fd)
+            _archive_require_unchanged_root(destination.parent, archive_fd)
+        finally:
+            os.close(archive_fd)
+    finally:
+        os.close(jobs_fd)
+
+
 def _write_json_atomic(
     path: Path,
     payload: dict[str, Any],
     *,
     replace_existing: bool = False,
+    expected_parent_identity: tuple[int, int] | None = None,
 ) -> Path:
     parent = _private_directory(path.parent, create=True)
     path = parent / path.name
-    if path.is_symlink():
-        raise RuntimeError(f"receipt path may not be a symlink: {path}")
-    if path.exists():
-        metadata = path.lstat()
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_uid != os.getuid()
-            or stat.S_IMODE(metadata.st_mode) & 0o077
-            or (replace_existing and metadata.st_size > MAX_JSON_BYTES)
-        ):
-            raise RuntimeError(f"existing evidence is not owner-controlled: {path}")
-        if not replace_existing:
-            raise FileExistsError(f"retention evidence already exists: {path}")
-    temporary = parent / f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
-    data = (
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
-        + b"\n"
-    )
-    descriptor = os.open(
-        temporary,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-        0o600,
-    )
+    # Pin the verified parent inode for stat/open/replace/unlink/fsync. A
+    # symlink swap after private-directory validation cannot redirect writes.
+    directory_fd = _archive_open_private_root(parent)
+    temporary_name: str | None = None
     try:
-        _write_all(descriptor, data)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    try:
-        os.replace(temporary, path)
-        directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        if expected_parent_identity is not None:
+            metadata = os.fstat(directory_fd)
+            if (metadata.st_dev, metadata.st_ino) != expected_parent_identity:
+                raise RuntimeError(f"archive source identity changed: {parent}")
+        _archive_require_unchanged_root(parent, directory_fd)
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except BaseException:
-        try:
-            temporary.unlink()
+            existing = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
-            pass
-        raise
+            existing = None
+        if existing is not None:
+            if (
+                not stat.S_ISREG(existing.st_mode)
+                or existing.st_nlink != 1
+                or existing.st_uid != os.getuid()
+                or stat.S_IMODE(existing.st_mode) & 0o077
+                or (replace_existing and existing.st_size > MAX_JSON_BYTES)
+            ):
+                raise RuntimeError(f"existing evidence is not owner-controlled: {path}")
+            if not replace_existing:
+                raise FileExistsError(f"retention evidence already exists: {path}")
+        data = (
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
+            + b"\n"
+        )
+        candidate_name = f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        descriptor = os.open(
+            candidate_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        # Only unlink an actually created temp. O_EXCL failure must preserve
+        # an existing private file, even if an attacker predicts the name.
+        temporary_name = candidate_name
+        try:
+            _write_all(descriptor, data)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _archive_require_unchanged_root(parent, directory_fd)
+        os.replace(
+            temporary_name, path.name,
+            src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+        )
+        temporary_name = None
+        os.fsync(directory_fd)
+        _archive_require_unchanged_root(parent, directory_fd)
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        os.close(directory_fd)
     return path
 
 
@@ -1564,15 +1654,43 @@ def _prepare_archives(plan: dict[str, Any]) -> tuple[Path, Path, Path, list[dict
         destination = archive_root / job_name
         if destination.exists() or destination.is_symlink():
             raise RuntimeError(f"archive destination appeared before apply: {job_name}")
-        files = _archive_file_manifest(source_dir)
+        # Keep the source inode bound across the independent manifest scan.
+        # A same-UID rename or replacement must not retarget later writes.
+        source_fd = _archive_open_private_root(source_dir)
+        try:
+            files = _archive_file_manifest(source_dir)
+            _archive_require_unchanged_root(source_dir, source_fd)
+            source_stat = os.fstat(source_fd)
+            source_identity = (source_stat.st_dev, source_stat.st_ino)
+        finally:
+            os.close(source_fd)
         prepared.append(
             {
                 "record": record,
                 "source_dir": source_dir,
+                "source_identity": source_identity,
                 "destination": destination,
                 "files": files,
             }
         )
+    # Capture the two root inodes before releasing preflight. The subsequent
+    # move must use verified dir_fds, never path-based source/destination roots.
+    jobs_fd = _archive_open_private_root(jobs_root)
+    try:
+        archive_fd = _archive_open_private_root(archive_root)
+        try:
+            _archive_require_unchanged_root(jobs_root, jobs_fd)
+            _archive_require_unchanged_root(archive_root, archive_fd)
+            jobs_stat, archive_stat = os.fstat(jobs_fd), os.fstat(archive_fd)
+            jobs_identity = (jobs_stat.st_dev, jobs_stat.st_ino)
+            archive_identity = (archive_stat.st_dev, archive_stat.st_ino)
+        finally:
+            os.close(archive_fd)
+    finally:
+        os.close(jobs_fd)
+    for item in prepared:
+        item["jobs_root_identity"] = jobs_identity
+        item["archive_root_identity"] = archive_identity
     return jobs_root, archive_root, receipt_root, prepared
 
 
@@ -2098,6 +2216,9 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
         index = self_deploy._read_deploy_index(jobs_root)
         indexed_units = set(index["units"]) if index is not None else set()
         for item in prepared:
+            _archive_require_pinned_identity(
+                item["source_dir"], item["source_identity"]
+            )
             current_files = _archive_file_manifest(item["source_dir"])
             if current_files != item["files"]:
                 raise RuntimeError(
@@ -2105,11 +2226,24 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 )
         for item in prepared:
             indexed_units.discard(item["record"]["job_name"])
-        if index is not None:
-            self_deploy._write_deploy_index(
-                jobs_root,
-                units=sorted(indexed_units),
-                pending_unit=index["pending_unit"],
+        if index is not None and sorted(indexed_units) != index["units"]:
+            # The retention index is an evidence file under the same scanned
+            # jobs root. Do not pass that mutable path to the older unpinned
+            # self-deploy writer. Retain the original schema and ordering.
+            if not prepared:
+                raise RuntimeError("deploy index update lacks pinned jobs root")
+            root_identity = prepared[0]["jobs_root_identity"]
+            _archive_require_pinned_identity(jobs_root, root_identity)
+            _write_json_atomic(
+                jobs_root / self_deploy.DEPLOY_INDEX_FILENAME,
+                {
+                    "schema_version": 1,
+                    "units": sorted(indexed_units),
+                    "pending_unit": index["pending_unit"],
+                    "updated_at_unix": int(time.time()),
+                },
+                replace_existing=True,
+                expected_parent_identity=root_identity,
             )
         for item in prepared:
             record = item["record"]
@@ -2130,14 +2264,16 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                 source_dir / "archive-manifest.json",
                 archive_manifest,
                 replace_existing=True,
+                expected_parent_identity=item["source_identity"],
             )
-            os.replace(source_dir, destination)
-            _fsync_directory(jobs_root)
-            _fsync_directory(archive_root)
-            if _archive_file_manifest(destination) != item["files"]:
-                raise RuntimeError(
-                    f"archived job files changed during move: {record['job_name']}"
-                )
+            _archive_move_job_pinned(
+                source_dir,
+                destination,
+                source_identity=item["source_identity"],
+                jobs_root_identity=item["jobs_root_identity"],
+                archive_root_identity=item["archive_root_identity"],
+                expected_files=item["files"],
+            )
             archived.append(
                 {
                     "unit": record["unit"],

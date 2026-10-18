@@ -1291,6 +1291,215 @@ class RuntimeRetentionTests(unittest.TestCase):
                     )
             self.assertEqual(previous.read_bytes(), data)
 
+    def test_atomic_manifest_directory_swap_after_preflight_never_writes_foreign(self) -> None:
+        # RED on path-based os.open/os.replace: verified source is renamed
+        # and replaced by a symlink immediately after directory validation.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "job"
+            source.mkdir(mode=0o700)
+            original = source / "stderr.log"
+            original.write_bytes(b"must be retained\n")
+            original.chmod(0o600)
+            outside = root / "outside"
+            outside.mkdir(mode=0o700)
+            foreign = outside / "sentinel"
+            foreign.write_bytes(b"untouched\n")
+            foreign.chmod(0o600)
+            saved = root / "original-job"
+            checked_private = RETENTION._private_directory
+            swaps: list[bool] = []
+
+            def swap_after_check(path: Path, *, create: bool = False) -> Path:
+                checked = checked_private(path, create=create)
+                if create and path == source and not swaps:
+                    source.rename(saved)
+                    source.symlink_to(outside, target_is_directory=True)
+                    swaps.append(True)
+                return checked
+
+            with patch.object(RETENTION, "_private_directory", side_effect=swap_after_check):
+                with self.assertRaisesRegex(
+                    RuntimeError, "changed|unsafe|symlink|unavailable"
+                ):
+                    RETENTION._write_json_atomic(
+                        source / "archive-manifest.json",
+                        {"schema_version": 1},
+                        replace_existing=True,
+                    )
+            self.assertEqual(swaps, [True])
+            self.assertFalse((outside / "archive-manifest.json").exists())
+            self.assertEqual(foreign.read_bytes(), b"untouched\n")
+            self.assertEqual((saved / "stderr.log").read_bytes(), b"must be retained\n")
+            self.assertFalse((saved / "archive-manifest.json").exists())
+            self.assertTrue(source.is_symlink())
+
+    def test_archive_apply_rejects_private_directory_replacement_before_manifest_write(self) -> None:
+        # An attacker can substitute another owner-private directory, not just
+        # a symlink. Bind the manifest writer to the inode scanned at preflight.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            job_name = "grabowski-job-999999999999"
+            unit = job_name + ".service"
+            source = self._job(jobs, job_name, 100)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1_000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: None
+            fake_self_deploy._write_deploy_index = Mock()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            atomic_write = RETENTION._write_json_atomic
+            swaps: list[bool] = []
+            original_dir = jobs / (job_name + "-original")
+
+            def replace_source_on_manifest(path: Path, payload: dict, **kwargs):
+                if path == source / "archive-manifest.json" and not swaps:
+                    source.rename(original_dir)
+                    source.mkdir(mode=0o700)
+                    marker = source / "do-not-touch"
+                    marker.write_bytes(b"foreign evidence\n")
+                    marker.chmod(0o600)
+                    swaps.append(True)
+                return atomic_write(path, payload, **kwargs)
+
+            with patch.dict(
+                "sys.modules",
+                {"grabowski_self_deploy": fake_self_deploy, "grabowski_mcp": fake_base},
+            ), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION, "_systemd_unit_states", return_value={unit: self._state(unit)}
+            ), patch.object(
+                RETENTION, "_write_json_atomic", side_effect=replace_source_on_manifest,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                    RETENTION.apply_plan(plan, expected_plan_sha256=plan["plan_sha256"])
+
+            self.assertEqual(swaps, [True])
+            self.assertEqual((original_dir / "stderr.log").read_bytes(), b"")
+            self.assertFalse((original_dir / "archive-manifest.json").exists())
+            self.assertEqual((source / "do-not-touch").read_bytes(), b"foreign evidence\n")
+            self.assertFalse((source / "archive-manifest.json").exists())
+            self.assertFalse((archive / job_name).exists())
+            self.assertFalse(list(receipts.glob("*.json")))
+            reset.assert_not_called()
+            fake_base._append_audit.assert_called_once()
+
+    def test_atomic_manifest_temp_collision_preserves_existing_private_file(self) -> None:
+        # O_EXCL can fail after a same-UID peer wins the temp name. Cleanup
+        # must not remove the peer's already-existing file.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job = root / "job"
+            job.mkdir(mode=0o700)
+            real_open = os.open
+            collided: list[str] = []
+
+            def colliding_open(path, flags, mode=0o777, *, dir_fd=None):
+                if (
+                    isinstance(path, str)
+                    and path.startswith(".archive-manifest.json.")
+                    and (flags & os.O_EXCL)
+                    and not collided
+                ):
+                    descriptor = real_open(
+                        path,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                        0o600,
+                        dir_fd=dir_fd,
+                    )
+                    try:
+                        os.write(descriptor, b"peer-owned temp evidence\n")
+                    finally:
+                        os.close(descriptor)
+                    collided.append(path)
+                    raise FileExistsError("simulated exclusive-temp collision")
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with patch.object(RETENTION.os, "open", side_effect=colliding_open):
+                with self.assertRaises(FileExistsError):
+                    RETENTION._write_json_atomic(
+                        job / "archive-manifest.json", {"schema_version": 1}
+                    )
+            self.assertEqual(len(collided), 1)
+            self.assertEqual(
+                (job / collided[0]).read_bytes(), b"peer-owned temp evidence\n"
+            )
+            self.assertFalse((job / "archive-manifest.json").exists())
+
+    def test_archive_move_stays_in_pinned_root_during_parent_symlink_swap(self) -> None:
+        # Swapping the archive root at the last os.replace must never move a
+        # verified job into the peer's directory or reset its systemd unit.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            job_name = "grabowski-job-eeeeeeeeeeee"
+            unit = job_name + ".service"
+            self._job(jobs, job_name, 100)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1_000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            outside = root / "outside-private-archive"
+            outside.mkdir(mode=0o700)
+            marker = outside / "do-not-touch"
+            marker.write_bytes(b"foreign archive root\n")
+            marker.chmod(0o600)
+            original_archive = root / "archive-original"
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: None
+            fake_self_deploy._write_deploy_index = Mock()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            real_replace = os.replace
+            swaps: list[bool] = []
+
+            def swap_root_before_move(source, destination, *args, **kwargs):
+                if (
+                    Path(source).name == job_name
+                    and Path(destination).name == job_name
+                    and not swaps
+                ):
+                    archive.rename(original_archive)
+                    archive.symlink_to(outside, target_is_directory=True)
+                    swaps.append(True)
+                return real_replace(source, destination, *args, **kwargs)
+
+            with patch.dict(
+                "sys.modules",
+                {"grabowski_self_deploy": fake_self_deploy, "grabowski_mcp": fake_base},
+            ), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION, "_systemd_unit_states", return_value={unit: self._state(unit)}
+            ), patch.object(
+                RETENTION.os, "replace", side_effect=swap_root_before_move
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed during inspection"):
+                    RETENTION.apply_plan(plan, expected_plan_sha256=plan["plan_sha256"])
+
+            self.assertEqual(swaps, [True])
+            self.assertEqual(marker.read_bytes(), b"foreign archive root\n")
+            self.assertFalse((outside / job_name).exists())
+            self.assertEqual(
+                (original_archive / job_name / "stdout.log").read_bytes(), b"done\n"
+            )
+            self.assertFalse(list(receipts.glob("*.json")))
+            reset.assert_not_called()
+            fake_base._append_audit.assert_called_once()
+
     def test_oversized_stale_archive_manifest_cannot_be_replaced_at_effect_time(self) -> None:
         # The last atomic writer boundary must reject unsafe original evidence.
         with tempfile.TemporaryDirectory() as tmp:
@@ -1675,6 +1884,127 @@ class RuntimeRetentionTests(unittest.TestCase):
                 "user_service_control"
             )
             fake_base._require_capability.assert_called_once_with("durable_job")
+
+    def test_archive_index_update_uses_pinned_jobs_root_not_path_writer(self) -> None:
+        # The ordinary self-deploy writer addresses jobs_root by path and
+        # cannot attest that it still names the root scanned by retention.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            job_name = "grabowski-job-121212121212"
+            unit = job_name + ".service"
+            self._job(jobs, job_name, 100)
+            index_path = jobs / "runtime-deploy-index.json"
+            old_index = {
+                "schema_version": 1, "units": [job_name],
+                "pending_unit": None, "updated_at_unix": 500,
+            }
+            index_path.write_text(json.dumps(old_index) + "\n", encoding="utf-8")
+            index_path.chmod(0o600)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1_000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: old_index
+            fake_self_deploy._write_deploy_index = Mock(
+                side_effect=AssertionError("unsafe unpinned deploy-index writer")
+            )
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict(
+                "sys.modules",
+                {"grabowski_self_deploy": fake_self_deploy, "grabowski_mcp": fake_base},
+            ), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION, "_systemd_unit_states", return_value={unit: self._state(unit)}
+            ):
+                receipt = RETENTION.apply_plan(
+                    plan, expected_plan_sha256=plan["plan_sha256"]
+                )
+            self.assertTrue(receipt["completed"])
+            self.assertTrue((archive / job_name / "archive-manifest.json").is_file())
+            updated_index = json.loads(index_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_index["schema_version"], 1)
+            self.assertEqual(updated_index["units"], [])
+            self.assertIsNone(updated_index["pending_unit"])
+            self.assertGreater(updated_index["updated_at_unix"], old_index["updated_at_unix"])
+            fake_self_deploy._write_deploy_index.assert_not_called()
+
+    def test_archive_index_root_swap_never_redirects_index_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            job_name = "grabowski-job-343434343434"
+            unit = job_name + ".service"
+            self._job(jobs, job_name, 100)
+            old_index = {
+                "schema_version": 1, "units": [job_name],
+                "pending_unit": None, "updated_at_unix": 500,
+            }
+            index_path = jobs / "runtime-deploy-index.json"
+            index_path.write_text(json.dumps(old_index) + "\n", encoding="utf-8")
+            index_path.chmod(0o600)
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1_000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states={unit: self._state(unit)},
+            )
+            outside = root / "foreign-private"
+            outside.mkdir(mode=0o700)
+            outside_index = outside / "runtime-deploy-index.json"
+            outside_index.write_bytes(b"foreign index, never replace\n")
+            outside_index.chmod(0o600)
+            old_jobs = root / "original-jobs"
+            actual_atomic = RETENTION._write_json_atomic
+            switched: list[bool] = []
+
+            def swap_before_index_write(path: Path, payload: dict, **kwargs):
+                if path == index_path and not switched:
+                    jobs.rename(old_jobs)
+                    jobs.symlink_to(outside, target_is_directory=True)
+                    switched.append(True)
+                return actual_atomic(path, payload, **kwargs)
+
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_self_deploy._read_deploy_index = lambda _root: old_index
+            fake_self_deploy._write_deploy_index = Mock(
+                side_effect=AssertionError("unsafe unpinned deploy-index writer")
+            )
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict(
+                "sys.modules",
+                {"grabowski_self_deploy": fake_self_deploy, "grabowski_mcp": fake_base},
+            ), patch.object(RETENTION, "_run", reset), patch.object(
+                RETENTION, "_systemd_unit_states", return_value={unit: self._state(unit)}
+            ), patch.object(
+                RETENTION, "_write_json_atomic", side_effect=swap_before_index_write
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "identity changed|unavailable|symlink"
+                ):
+                    RETENTION.apply_plan(
+                        plan, expected_plan_sha256=plan["plan_sha256"]
+                    )
+            self.assertEqual(switched, [True])
+            self.assertEqual(outside_index.read_bytes(), b"foreign index, never replace\n")
+            self.assertTrue((old_jobs / job_name / "metadata.json").is_file())
+            self.assertFalse((archive / job_name).exists())
+            reset.assert_not_called()
+            fake_base._append_audit.assert_called_once()
 
     def test_apply_detects_file_drift_during_archive_move_before_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
