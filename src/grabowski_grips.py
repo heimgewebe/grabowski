@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from collections import Counter
@@ -13,8 +14,9 @@ import re
 import stat as statmod
 import subprocess
 import sys
+import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 from urllib.parse import quote, urlsplit
 
 import grabowski_repobrief
@@ -229,18 +231,20 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "checkout-binding-terminal-preview": GripSpec(
         name="checkout-binding-terminal-preview",
-        version="1.0",
+        version="1.1",
         summary="Preview one evidence-bound terminal transition for a missing or safely retained managed checkout.",
-        effect=READ_ONLY,
+        effect=MUTATING,
         required_parameters=("checkout_key",),
         acceptance_ids=(
             "checkout-key-bound",
-            "preview-read-only",
+            "preview-effect-gated",
             "terminal-evidence-visible",
             "coordination-visible",
             "preview-digest-bound",
         ),
         runner="checkout_binding_terminal_preview",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
     ),
     "checkout-binding-terminal-apply": GripSpec(
         name="checkout-binding-terminal-apply",
@@ -268,9 +272,9 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "checkout-binding-identity-rebind-preview": GripSpec(
         name="checkout-binding-identity-rebind-preview",
-        version="1.1",
+        version="1.2",
         summary="Preview one clean remote-secured managed checkout bounded identity rebind.",
-        effect=READ_ONLY,
+        effect=MUTATING,
         required_parameters=("checkout_key",),
         acceptance_ids=(
             "checkout-key-bound",
@@ -280,6 +284,8 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "snapshot-bound",
         ),
         runner="checkout_binding_identity_rebind_preview",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
     ),
     "checkout-binding-identity-rebind-apply": GripSpec(
         name="checkout-binding-identity-rebind-apply",
@@ -306,9 +312,9 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "checkout-owner-handoff-preview": GripSpec(
         name="checkout-owner-handoff-preview",
-        version="1.0",
+        version="1.1",
         summary="Preview exact owner alignment for one clean managed checkout with only owner drift.",
-        effect=READ_ONLY,
+        effect=MUTATING,
         required_parameters=(
             "repo", "checkout_path", "source_lifecycle_owner_id",
             "source_retention_owner_id", "target_owner_id", "expected_head",
@@ -318,6 +324,8 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "snapshot-bound",
         ),
         runner="checkout_owner_handoff_preview",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
     ),
     "checkout-owner-handoff-apply": GripSpec(
         name="checkout-owner-handoff-apply",
@@ -6194,7 +6202,7 @@ def _run_checkout_binding_terminal_preview(
     _check(receipt, "checkout-key-bound", "pass", checkout_key)
     _check(
         receipt,
-        "preview-read-only",
+        "preview-effect-gated",
         "pass",
         f"status={output.get('status')} safe_to_apply={output.get('safe_to_apply')}",
     )
@@ -12580,7 +12588,7 @@ def _run_saga_external_merge_closeout(
         return value
 
     branch_command = [
-        "api", f"repos/{repo_slug}/branches/{quote(base, safe='/')}",
+        "api", f"repos/{repo_slug}/branches/{quote(base, safe='')}",
         "--jq", "{name:.name,sha:.commit.sha,protected:.protected}",
     ]
     branch = github_json(branch_command, "base_branch")
@@ -12650,6 +12658,10 @@ def _run_saga_external_merge_closeout(
             persisted, audit_sha = _saga_external_merge_verified_prior(existing, settlement)
             reused = True
         else:
+            if github_json(branch_command, "base_branch_postlookup_recheck") != branch:
+                raise GripPreflightError(
+                    "external merge protected base branch changed during audit lookup"
+                )
             try:
                 work_acquire = __import__("grabowski_work_acquire")
                 audit_sha = work_acquire.operator.base._append_audit_with_digest(record)
@@ -13807,15 +13819,15 @@ def _captain_independent_review_gate(
             import grabowski_self_deploy as release_deploy
 
             expected_head = parameters.get("expected_head")
-            # A missing object or unproven ancestry is never an independent
-            # release-review PASS. Do not probe an unleased canonical ODB or
-            # let a delayed worker infer authority from provisional metadata.
-            # Exact object import remains a separate protected scheduler
-            # operation, not an authorized runtime deployment.
-            release = release_deploy._require_release_source_admission(expected_head)
+            # Never infer R3 from an absent Git object. This preview is a
+            # policy check, not scheduling or effect-time authorization.
+            release = release_deploy._require_release_source_admission(
+                expected_head,
+                release_review_pr=parameters.get("release_review_pr"),
+                captain_preview=True,
+            )
         except Exception as exc:
-            # Missing source dependencies, schema drift and unexpected policy
-            # errors must fail closed just like an explicit release refusal.
+            # Unexpected dependency or Git errors must also fail closed.
             return _captain_gate(
                 "independent-review-policy",
                 "blocked",
@@ -13823,6 +13835,46 @@ def _captain_independent_review_gate(
                 [f"release_admission_blocked:{type(exc).__name__}: {str(exc)[:256]}"],
             )
         status = release.get("status") if isinstance(release, dict) else None
+        if status == "authenticated-post-merge-r3-ci":
+            review_pr = parameters.get("release_review_pr")
+            valid_release = (
+                isinstance(expected_head, str)
+                and _is_hex_sha(expected_head, lengths=(40,))
+                and isinstance(release, dict)
+                and release.get("target_head") == expected_head
+                and _is_hex_sha(release.get("serving_head"), lengths=(40,))
+                and release.get("serving_head") != expected_head
+                and isinstance(release.get("serving_release_id"), str)
+                and bool(release["serving_release_id"])
+                and release.get("independent_review_required") is True
+                and _is_hex_sha(
+                    release.get("release_review_identity_sha256"), lengths=(64,)
+                )
+                and type(review_pr) is int
+                and review_pr > 0
+                and isinstance(release.get("review"), dict)
+                and release["review"].get("review_pr") == review_pr
+            )
+            if not valid_release:
+                return _captain_gate(
+                    "independent-review-policy",
+                    "blocked",
+                    "authenticated runtime release review identity is incomplete or unbound",
+                    ["runtime_deploy_release_admission_result_invalid"],
+                )
+            return _captain_gate(
+                "independent-review-policy",
+                "pass",
+                "post-merge whole-release R3 and target CI provenance authenticated; "
+                "Captain authorization still separately required",
+                {
+                    "required": True,
+                    "release_source_status": status,
+                    "release_review_identity_sha256": release[
+                        "release_review_identity_sha256"
+                    ],
+                },
+            )
         bound_target = (
             isinstance(expected_head, str)
             and _is_hex_sha(expected_head, lengths=(40,))
@@ -16640,6 +16692,50 @@ def _run_captain_runtime_deploy(
         execution_result["preflight_errors"] = target_errors
         execution_result["verification_error"] = "; ".join(target_errors)
         return execution_result
+    review_pr = parameters.get("release_review_pr")
+    from grabowski_self_deploy import (
+        DeploySchedulePreEffectRefusal,
+        _accepted_captain_origin_matches,
+        _require_release_source_admission,
+    )
+    if review_pr is not None and (type(review_pr) is not int or review_pr <= 0):
+        execution_result["preflight_errors"] = ["release_review_pr_invalid"]
+        execution_result["verification_error"] = (
+            "runtime deploy refused: release_review_pr must be a positive integer"
+        )
+        return execution_result
+    if review_pr is None:
+        # A missing review id is valid only for a server-proven non-critical
+        # documentation/already-serving delta. Unknown/critical releases block
+        # before any deployment preflight or local effect.
+        try:
+            noncritical = _require_release_source_admission(
+                expected_head, captain_preview=True,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            execution_result["preflight_errors"] = [
+                f"release_review_pr_required:{type(exc).__name__}"
+            ]
+            execution_result["verification_error"] = (
+                "runtime deploy refused: critical or unknown source requires an "
+                "authenticated review PR and Captain action"
+            )
+            return execution_result
+        if not isinstance(noncritical, dict) or noncritical.get(
+            "independent_review_required"
+        ) is not False:
+            execution_result["preflight_errors"] = ["release_review_pr_required"]
+            execution_result["verification_error"] = (
+                "runtime deploy refused: no proven noncritical source exemption"
+            )
+            return execution_result
+    elif not _accepted_captain_origin_matches(expected_head, review_pr):
+        execution_result["preflight_errors"] = ["accepted_captain_action_origin_missing"]
+        execution_result["verification_error"] = (
+            "runtime deploy refused before scheduling: no authenticated "
+            "accepted Captain action origin"
+        )
+        return execution_result
     try:
         preflight = (
             _runtime_deploy_self_preflight(expected_head)
@@ -16659,21 +16755,36 @@ def _run_captain_runtime_deploy(
         return execution_result
     execution_result["preflight"] = preflight
     execution_result["preflight_passed"] = True
-    execution_result["execution_invoked"] = True
-    execution_result["execution_attempted"] = True
     try:
-        schedule = (
-            _runtime_deploy_self_schedule(expected_head, delay_seconds)
-            if source_repository is None
-            else _runtime_deploy_self_schedule(
-                expected_head,
-                delay_seconds,
-                source_repository,
-                source_lease_owner_id,
+        # A positive release-review record is not a direct scheduler
+        # capability. Only this Captain-dispatched call may hold the short
+        # in-process scope after all Captain authority gates have passed.
+        review_pr = parameters.get("release_review_pr")
+        if type(review_pr) is int and review_pr > 0:
+            from grabowski_self_deploy import _captain_release_scope
+
+            release_scope = _captain_release_scope(expected_head, review_pr)
+        else:
+            from contextlib import nullcontext
+
+            release_scope = nullcontext()
+        with release_scope:
+            # Scope enter revalidates R3/CI/identity and may refuse before
+            # any schedule invocation. Do not classify that as an unknown job.
+            execution_result["execution_invoked"] = True
+            execution_result["execution_attempted"] = True
+            schedule = (
+                _runtime_deploy_self_schedule(expected_head, delay_seconds)
+                if source_repository is None
+                else _runtime_deploy_self_schedule(
+                    expected_head,
+                    delay_seconds,
+                    source_repository,
+                    source_lease_owner_id,
+                )
             )
-        )
         execution_result["command_returned"] = True
-    except RuntimeDeployPreEffectRefusal as exc:
+    except (RuntimeDeployPreEffectRefusal, DeploySchedulePreEffectRefusal) as exc:
         local_mutation_evidence = getattr(exc, "local_mutation_evidence", None)
         if local_mutation_evidence is None:
             execution_result["execution_invoked"] = False
@@ -17977,6 +18088,130 @@ def _run_captain_preflight(
     return grabowski_grip_orchestration.run_captain_preflight(sys.modules[__name__], spec, parameters, receipt, runner)
 
 
+# The authenticated Captain-run path, not a caller-supplied digest or the
+# general operator actor, owns issuance after *all* action gates pass.
+# Tickets are Python object identities and can be consumed exactly once.
+_CAPTAIN_ACCEPTED_RUNTIME_TICKETS: dict[object, tuple[str, int, str]] = {}
+
+# The MCP admission frontdoor issues this origin *after* session policy and
+# durable Captain intent audit succeed. A generic server-signed operator actor,
+# a caller-hashable PR payload or valid R3 alone never constitutes acceptance.
+_SERVER_CAPTAIN_INGRESS: ContextVar[tuple[object, str, str, str] | None] = ContextVar(
+    "grabowski_server_captain_ingress", default=None
+)
+_SERVER_CAPTAIN_INGRESS_ACTIVE: set[object] = set()
+# Consuming an MCP dispatch must be atomic across copied ContextVars, sibling
+# threads and nested Captain calls. The server ingress authorizes one ticket,
+# not an arbitrary number of later Captain origins from that same context.
+_SERVER_CAPTAIN_INGRESS_CLAIM_LOCK = threading.Lock()
+# A non-serializable, single-use ticket is minted by the accepted MCP dispatch,
+# not by this contextmanager from hashable actor/audit metadata.
+_CAPTAIN_MCP_INGRESS_TICKETS: dict[object, tuple[str, str, str]] = {}
+
+
+@contextmanager
+def _server_captain_dispatch_scope(
+    parameters: dict[str, Any],
+    server_actor_identity: dict[str, Any],
+    intent_audit: dict[str, Any],
+    *,
+    mcp_ticket: object | None = None,
+) -> Iterator[None]:
+    """Server-only ingress, never serialized as user-controlled parameters."""
+    actor = grabowski_merge_guard.verify_server_runtime_actor_identity(
+        server_actor_identity
+    )
+    audit_digest = (
+        intent_audit.get("audit_record_sha256")
+        if isinstance(intent_audit, dict)
+        and intent_audit.get("audit_chain_valid") is True
+        else None
+    )
+    if not _is_hex_sha(audit_digest, lengths=(64,)):
+        raise GripPreflightError(
+            "accepted Captain dispatch requires server intent audit"
+        )
+    request_digest = grabowski_merge_guard.captain_request_sha256(parameters)
+    # An internal caller can invent an audit-looking mapping and request its
+    # own generic signed actor identity. Only the actual server-frontdoor
+    # accepted action may mint a ticket, once, for this exact request.
+    if type(mcp_ticket) is not object:
+        raise GripPreflightError(
+            "accepted Captain MCP ingress ticket is missing"
+        )
+    issued = _CAPTAIN_MCP_INGRESS_TICKETS.pop(mcp_ticket, None)
+    if issued != (
+        actor["identity_sha256"], request_digest, audit_digest
+    ):
+        raise GripPreflightError(
+            "accepted Captain MCP ingress ticket is invalid or already consumed"
+        )
+    marker = object()
+    with _SERVER_CAPTAIN_INGRESS_CLAIM_LOCK:
+        _SERVER_CAPTAIN_INGRESS_ACTIVE.add(marker)
+    reset = _SERVER_CAPTAIN_INGRESS.set((
+        marker, actor["identity_sha256"], request_digest, audit_digest
+    ))
+    try:
+        yield
+    finally:
+        _SERVER_CAPTAIN_INGRESS.reset(reset)
+        with _SERVER_CAPTAIN_INGRESS_CLAIM_LOCK:
+            _SERVER_CAPTAIN_INGRESS_ACTIVE.discard(marker)
+
+
+def _server_captain_dispatch_admitted(parameters: dict[str, Any]) -> bool:
+    scope = _SERVER_CAPTAIN_INGRESS.get()
+    if not isinstance(scope, tuple) or len(scope) != 4:
+        return False
+    try:
+        if scope[0] not in _SERVER_CAPTAIN_INGRESS_ACTIVE:
+            return False
+        actor = grabowski_merge_guard.verify_server_runtime_actor_identity(
+            parameters.get("_server_runtime_actor_identity")
+        )
+        request_digest = grabowski_merge_guard.captain_request_sha256(parameters)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        scope[1] == actor["identity_sha256"]
+        and scope[2] == request_digest
+        and _is_hex_sha(scope[3], lengths=(64,))
+    )
+
+
+def _claim_server_captain_ingress_once(parameters: dict[str, Any]) -> bool:
+    """Consume the authenticated ingress before issuing a runtime origin.
+
+    ContextVar snapshots carry the marker, but cannot claim it twice. This
+    check and the shared-set removal are performed under a single lock.
+    """
+    with _SERVER_CAPTAIN_INGRESS_CLAIM_LOCK:
+        if not _server_captain_dispatch_admitted(parameters):
+            return False
+        scope = _SERVER_CAPTAIN_INGRESS.get()
+        assert scope is not None
+        _SERVER_CAPTAIN_INGRESS_ACTIVE.remove(scope[0])
+        return True
+
+
+def _consume_accepted_runtime_ticket(
+    ticket: object | None,
+    expected_head: str,
+    release_review_pr: int,
+    execution_intent_sha256: str,
+) -> bool:
+    if ticket is None:
+        return False
+    try:
+        recorded = _CAPTAIN_ACCEPTED_RUNTIME_TICKETS.pop(ticket, None)
+    except TypeError:
+        return False
+    return recorded == (
+        expected_head, release_review_pr, execution_intent_sha256
+    )
+
+
 def _run_captain_run(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -17985,16 +18220,69 @@ def _run_captain_run(
     github_runner: GithubRunner,
 ) -> dict[str, Any]:
     import grabowski_resources as resources
+    from contextlib import nullcontext
 
-    return grabowski_grip_orchestration.run_captain_run(
-        sys.modules[__name__],
-        spec,
-        parameters,
-        receipt,
-        runner,
-        github_runner,
-        resources,
-    )
+    # Only an authenticated accepted Captain invocation can mint an ephemeral
+    # release origin. The real Captain executor independently repeats every
+    # gate before it dispatches; a preview, CI, R3 record, or ordinary
+    # operator action is never a release capability.
+    origin = nullcontext()
+    ticket: object | None = None
+    try:
+        actions = _captain_actions(parameters)
+        if (
+            len(actions) == 1
+            and actions[0]["action"] == "runtime-deploy"
+            and parameters.get("allow_execution") is True
+            and type(parameters.get("release_review_pr")) is int
+            and parameters["release_review_pr"] > 0
+        ):
+            gates, _projection = _captain_authority_gates(parameters, actions)
+            intent, errors = _captain_execution_intent_review(parameters, actions)
+            if (
+                not _captain_blocked_reasons(gates)
+                and not errors
+                and _claim_server_captain_ingress_once(parameters)
+            ):
+                from grabowski_self_deploy import _accepted_captain_runtime_action
+
+                target_head = _runtime_deploy_expected_head(parameters)
+                ticket = object()
+                _CAPTAIN_ACCEPTED_RUNTIME_TICKETS[ticket] = (
+                    target_head,
+                    parameters["release_review_pr"],
+                    intent["intent_sha256"],
+                )
+                origin = _accepted_captain_runtime_action(
+                    target_head,
+                    parameters["release_review_pr"],
+                    server_actor_identity=parameters.get(
+                        "_server_runtime_actor_identity"
+                    ),
+                    execution_intent_sha256=intent["intent_sha256"],
+                    accepted_dispatch_ticket=ticket,
+                )
+    except (GripPreflightError, RuntimeError, TypeError, ValueError):
+        # No origin is issued on uncertainty. The canonical Captain runner
+        # remains responsible for reporting its authoritative gate verdict.
+        origin = nullcontext()
+
+    try:
+        with origin:
+            return grabowski_grip_orchestration.run_captain_run(
+                sys.modules[__name__],
+                spec,
+                parameters,
+                receipt,
+                runner,
+                github_runner,
+                resources,
+            )
+    finally:
+        # A blocked/rejected/unknown run can never leave a reusable Captain
+        # capability for a later unrelated operator action.
+        if ticket is not None:
+            _CAPTAIN_ACCEPTED_RUNTIME_TICKETS.pop(ticket, None)
 
 
 def _run_forrest_server_exit_apply(

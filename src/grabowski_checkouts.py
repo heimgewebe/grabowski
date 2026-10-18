@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, closing, contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -15,12 +16,13 @@ import subprocess
 import time
 import urllib.parse
 import uuid
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 import grabowski_audit_query as audit_query
 import grabowski_mcp as base
 import grabowski_physical_checkout as physical_checkout
 import grabowski_resources as resources
+import grabowski_sqlite_store as sqlite_store
 import grabowski_tasks as tasks
 import grabowski_transport_roundtrip as transport_roundtrip
 try:
@@ -467,6 +469,17 @@ def _database() -> sqlite3.Connection:
     if CHECKOUT_DB.is_symlink():
         raise PermissionError(f"Checkout database may not be a symlink: {CHECKOUT_DB}")
     connection = sqlite3.connect(CHECKOUT_DB, timeout=10)
+    try:
+        return _initialize_checkout_database_connection(connection)
+    except BaseException:
+        # _database() has not returned: caller-side closing() cannot run.
+        connection.close()
+        raise
+
+
+def _initialize_checkout_database_connection(
+    connection: sqlite3.Connection,
+) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
@@ -620,22 +633,49 @@ def _database() -> sqlite3.Connection:
             "INSERT INTO metadata(key, value) VALUES('schema_version', '1')"
         )
     elif current["value"] != "1":
-        connection.close()
         raise RuntimeError("Unsupported checkout database schema")
     connection.commit()
-    try:
-        os.chmod(CHECKOUT_DB, 0o600)
-    except FileNotFoundError:
-        connection.close()
-        raise
+    os.chmod(CHECKOUT_DB, 0o600)
     return connection
 
 
+# Only public checkout inventory enters this strict mode.  Lifecycle writers
+# and separately governed internal status readers retain WAL-aware semantics.
+_INVENTORY_READ_ONLY_STACK: ContextVar[ExitStack | None] = ContextVar(
+    "checkout_inventory_read_only_sqlite", default=None
+)
+
+
+@contextmanager
+def _strict_inventory_readonly_scope() -> Iterator[None]:
+    with ExitStack() as stack:
+        token = _INVENTORY_READ_ONLY_STACK.set(stack)
+        try:
+            yield
+        finally:
+            _INVENTORY_READ_ONLY_STACK.reset(token)
+
+
 def _readonly_connection(path: Path) -> sqlite3.Connection | None:
+    stack = _INVENTORY_READ_ONLY_STACK.get()
     if not path.exists():
+        if stack is not None:
+            raise RuntimeError("Strict read-only snapshot unavailable: SQLite database is absent")
         return None
     if path.is_symlink():
         raise PermissionError(f"SQLite database may not be a symlink: {path}")
+    if stack is not None:
+        # Even mode=ro creates SHM for live WAL; the already existing strict
+        # reader fails closed and keeps preimage checks until inventory returns.
+        return stack.enter_context(
+            sqlite_store.inventory_readonly_sqlite(
+                path,
+                temporary_prefix="unused-checkout-inventory-readonly.",
+                error_type=RuntimeError,
+                message="Strict read-only checkout inventory changed",
+                allow_wal_copy=False,
+            )
+        )
     resolved = path.resolve(strict=True)
     uri = "file:" + urllib.parse.quote(str(resolved)) + "?mode=ro"
     connection = sqlite3.connect(uri, uri=True, timeout=5)
@@ -1037,7 +1077,7 @@ def _reserve_checkout_lifecycle(
     branch = _expected_branch(expected_branch)
     checkout_key = _checkout_key(common_dir, checkout)
     now = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         existing = connection.execute(
             "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
@@ -1155,7 +1195,7 @@ def _release_checkout_lifecycle_exact(binding: dict[str, Any]) -> bool:
         return False
     if not all(isinstance(value, int) and not isinstance(value, bool) for value in required[2:]):
         return False
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         deleted = connection.execute(
             """
             DELETE FROM lifecycle_bindings
@@ -1179,7 +1219,7 @@ def _mark_checkout_completed_retained(
     head = _validate_git_object_id(expected_head, "expected_head")
     branch = _expected_branch(expected_branch)
     now = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
@@ -1294,7 +1334,7 @@ def _mark_checkout_archived(
     expected_head: str,
     expected_branch: str | None,
 ) -> dict[str, Any] | None:
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         lifecycle = _mark_checkout_archived_in_connection(
             connection,
@@ -1340,7 +1380,7 @@ def _release_retention_exact(retention: dict[str, Any]) -> bool:
         for value in required[2:]
     ):
         return False
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         deleted = connection.execute(
             """
             DELETE FROM retention
@@ -1399,7 +1439,7 @@ def _latest_archives(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
 
 def _load_archive(archive_id: str) -> dict[str, Any]:
     identifier = _validate_archive_id(archive_id)
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         row = connection.execute(
             "SELECT * FROM archives WHERE archive_id=?",
             (identifier,),
@@ -1410,7 +1450,7 @@ def _load_archive(archive_id: str) -> dict[str, Any]:
 
 
 def _latest_archive_for_key(checkout_key: str) -> dict[str, Any] | None:
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         rows = connection.execute(
             """
             SELECT * FROM archives
@@ -1505,7 +1545,7 @@ def _upsert_retention(
     expected_head: str | None,
     expected_branch: str | None,
 ) -> dict[str, Any]:
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         retention = _upsert_retention_in_connection(
             connection,
             checkout_key=checkout_key,
@@ -1680,7 +1720,7 @@ def _persist_checkout_operation_uncertainty(
     evidence_sha256 = _sha256_json(evidence_value)
     fence_id = uuid.uuid4().hex
     created = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         active_rows = connection.execute(
             "SELECT * FROM operation_uncertainty WHERE cleared_at_unix IS NULL"
@@ -1740,7 +1780,7 @@ def _clear_checkout_operation_uncertainty(
         "cleared_at_unix": _now(),
     }
     clearance_sha256 = _sha256_json(clearance)
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             "SELECT * FROM operation_uncertainty WHERE fence_id=?",
@@ -3054,7 +3094,7 @@ def _complete_partial_archive(
         completed = _now()
         checkout_key = str(evidence["checkout_key"])
         with _operation_lock():
-            with _database() as connection:
+            with closing(_database()) as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
                 current_fence = connection.execute(
                     "SELECT * FROM operation_uncertainty WHERE fence_id=?",
@@ -3472,7 +3512,7 @@ def _persist_checkout_operation_intent(
     }
     intent_sha256 = _sha256_json(intent)
     created_at_unix = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         fence_row = connection.execute(
             "SELECT * FROM operation_uncertainty WHERE fence_id=?",
@@ -4447,7 +4487,7 @@ def _cleanup_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
     ):
         applied = _now()
         with _operation_lock():
-            with _database() as connection:
+            with closing(_database()) as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
                 current_dry = connection.execute(
                     "SELECT * FROM dry_runs WHERE plan_id=?", (plan_id,)
@@ -4491,10 +4531,51 @@ def _cleanup_uncertainty_readback(fence: dict[str, Any]) -> dict[str, Any]:
 @mcp.tool(name="grabowski_checkout_uncertainty_status", annotations=READ_ONLY)
 def grabowski_checkout_uncertainty_status(fence_id: str = "") -> dict[str, Any]:
     """Read durable unknown-outcome fences for checkout lifecycle effects."""
+    if not isinstance(fence_id, str) or (
+        fence_id and re.fullmatch(r"[0-9a-f]{32}", fence_id) is None
+    ):
+        raise ValueError("fence_id must be a 32-character lowercase hex identifier")
+    if CHECKOUT_DB.is_symlink() or not CHECKOUT_DB.is_file():
+        raise RuntimeError("Checkout uncertainty store is unavailable")
+    # The shared inventory reader rejects live WAL/SHM, reads immutable
+    # quiescent content, and checks file identity before and after the read.
+    with sqlite_store.inventory_readonly_sqlite(
+        CHECKOUT_DB,
+        temporary_prefix="unused-checkout-uncertainty.",
+        error_type=RuntimeError,
+        message="Checkout uncertainty snapshot changed",
+        allow_wal_copy=False,
+    ) as connection:
+        try:
+            version = connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()
+            if version is None or version[0] != "1":
+                raise RuntimeError("Checkout uncertainty schema requires explicit migration")
+            present = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='operation_uncertainty'"
+            ).fetchone()
+            if present is None:
+                raise RuntimeError("Checkout uncertainty schema is not observable")
+            if fence_id:
+                rows = connection.execute(
+                    "SELECT * FROM operation_uncertainty WHERE fence_id=?",
+                    (fence_id,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM operation_uncertainty "
+                    "WHERE cleared_at_unix IS NULL "
+                    "ORDER BY created_at_unix ASC, fence_id ASC"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise RuntimeError("Checkout uncertainty snapshot is unavailable") from exc
+    fences = [_operation_uncertainty_public(row) for row in rows]
     if fence_id:
-        fence = _load_checkout_operation_uncertainty(fence_id)
-        return {"fences": [fence], "count": 1}
-    fences = _active_checkout_operation_uncertainties()
+        if not fences:
+            raise ValueError(f"Unknown checkout uncertainty fence: {fence_id}")
+        return {"fences": fences, "count": 1}
     return {"fences": fences[:256], "count": len(fences), "truncated": len(fences) > 256}
 
 
@@ -6192,9 +6273,10 @@ def _verify_recovery_refs(repo: Path, recovery_refs: list[dict[str, str]]) -> li
     return verified
 
 
-@mcp.tool(name="grabowski_checkout_binding_terminal_preview", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_checkout_binding_terminal_preview", annotations=MUTATING)
 def grabowski_checkout_binding_terminal_preview(checkout_key: str) -> dict[str, Any]:
-    """Preview an evidence-only terminal transition for one missing or safely retained managed checkout."""
+    """Preview an evidence-bound terminal transition; SQLite WAL observation needs mutation admission."""
+    operator._require_operator_mutation("resource_lease")
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
     from grabowski_checkout_terminal_reconciliation import preview
@@ -6522,11 +6604,12 @@ def _binding_identity_rebind_state_for_key(
     )
 
 
-@mcp.tool(name="grabowski_checkout_binding_identity_rebind_preview", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_checkout_binding_identity_rebind_preview", annotations=MUTATING)
 def grabowski_checkout_binding_identity_rebind_preview(
     checkout_key: str,
 ) -> dict[str, Any]:
-    """Preview one fail-closed identity repair for branch, path, or retention-converged lifecycle drift."""
+    """Preview identity repair through mutation admission before SQLite WAL observation."""
+    operator._require_operator_mutation("resource_lease")
     operator._require_operator_capability("git_cli")
     operator._require_operator_capability("github_cli")
     return _binding_identity_rebind_state_for_key(
@@ -6610,7 +6693,7 @@ def _binding_identity_rebind_apply(
         target_repo_path = planned["target_identity"]["repo_path"]
         target_head = planned["target_identity"]["expected_head"]
         target_branch = planned["target_identity"]["expected_branch"]
-        with _operation_lock(), _database() as connection:
+        with _operation_lock(), closing(_database()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             lifecycle_row = connection.execute(
                 "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
@@ -6963,6 +7046,7 @@ def checkout_owner_handoff_preview(
     expected_head: str,
     expected_branch: str | None = None,
 ) -> dict[str, Any]:
+    operator._require_operator_mutation("resource_lease")
     operator._require_operator_capability("git_cli")
     return _owner_handoff_state(
         repo=repo,
@@ -7043,7 +7127,7 @@ def checkout_owner_handoff_apply(
         if current["snapshot_sha256"] != snapshot_sha256:
             raise RuntimeError("Checkout owner handoff snapshot changed after lease acquisition")
         applied_at = _now()
-        with _operation_lock(), _database() as connection:
+        with _operation_lock(), closing(_database()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             lifecycle_row = connection.execute(
                 "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
@@ -7126,12 +7210,13 @@ def grabowski_checkout_inventory(
 ) -> dict[str, Any]:
     """Return a deterministic inventory of linked Git checkouts and lifecycle state."""
     operator._require_operator_capability("git_cli")
-    return checkout_inventory(
-        repo,
-        include_processes=include_processes,
-        include_tasks=include_tasks,
-        include_resources=include_resources,
-    )
+    with _strict_inventory_readonly_scope():
+        return checkout_inventory(
+            repo,
+            include_processes=include_processes,
+            include_tasks=include_tasks,
+            include_resources=include_resources,
+        )
 
 
 @mcp.tool(name="grabowski_checkout_retain", annotations=MUTATING)
@@ -7603,7 +7688,7 @@ def grabowski_checkout_archive(
         manifest_path = manifest_dir / "manifest.json"
         _write_json_evidence(manifest_path, manifest)
         created = _now()
-        with _database() as connection:
+        with closing(_database()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             lifecycle_row = connection.execute(
                 "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
@@ -7857,7 +7942,7 @@ def _persist_dry_run(plan: dict[str, Any]) -> dict[str, Any]:
     plan_id = uuid.uuid4().hex[:24]
     created = _now()
     expires = created + DRY_RUN_TTL_SECONDS
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute(
             """
             INSERT INTO dry_runs(
@@ -7882,7 +7967,7 @@ def _persist_dry_run(plan: dict[str, Any]) -> dict[str, Any]:
 
 def _load_dry_run(plan_id: str) -> dict[str, Any]:
     identifier = _validate_plan_id(plan_id)
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         row = connection.execute(
             "SELECT * FROM dry_runs WHERE plan_id=?",
             (identifier,),
@@ -8053,7 +8138,7 @@ def grabowski_checkout_cleanup(
         _release_checkout_resources(lease)
         raise
     applied = _now()
-    with _database() as connection:
+    with closing(_database()) as connection, connection:
         connection.execute(
             "UPDATE dry_runs SET applied_at_unix=? WHERE plan_id=?",
             (applied, plan_id),

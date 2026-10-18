@@ -846,6 +846,7 @@ def verify_task_archive_segment(
         "manifest": manifest,
         "records": records,
         "records_bytes": len(payload),
+        "manifest_bytes": len(manifest_payload),
         "record_hash_sequence_sha256": manifest_evidence[
             "record_hash_sequence_sha256"
         ],

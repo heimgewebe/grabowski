@@ -9,6 +9,7 @@ import sqlite3
 from pathlib import Path, PurePosixPath
 import stat
 import subprocess
+import threading
 import sys
 import tempfile
 import time
@@ -1500,7 +1501,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         inspect_resource = workspace.resources.inspect_resource
         lifecycle_bindings = workspace.checkouts._lifecycle_bindings
 
-        def lease_at_deadline(resource_key: str) -> dict:
+        def lease_at_deadline(resource_key: str, *, read_only: bool = False) -> dict:
             return {
                 **inspect_resource(resource_key),
                 "expires_at_unix": deadline,
@@ -1527,7 +1528,19 @@ class AgentWorkspaceTests(unittest.TestCase):
         ):
             plan = self.normalize_lane(lane)
 
+        # This verifies the retained runtime horizon, not WAL availability.
+        # Use a checkpointed copy so strict READ_ONLY checkout observation
+        # does not depend on the lifetime of setup-time writer connections.
+        checkout_snapshot = self.root / "horizon-checkout-snapshot.sqlite3"
+        source = sqlite3.connect(workspace.checkouts.CHECKOUT_DB)
+        target = sqlite3.connect(checkout_snapshot)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
         with (
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot),
             mock.patch.object(workspace, "_now", return_value=observed_at + 300),
             mock.patch.object(
                 workspace.resources,
@@ -1550,14 +1563,183 @@ class AgentWorkspaceTests(unittest.TestCase):
         }
         (self.state / plan["workspace_id"]).mkdir(mode=0o700)
         workspace._write_manifest(stored_manifest)
-        self.assertEqual(
-            workspace._existing_lane_runtime_deadline(
-                lane_id=lane["lane_id"],
-                binding_id="thread-1",
-                repository=str(self.git.repo),
-            ),
-            deadline,
-        )
+        with mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot):
+            self.assertEqual(
+                workspace._existing_lane_runtime_deadline(
+                    lane_id=lane["lane_id"],
+                    binding_id="thread-1",
+                    repository=str(self.git.repo),
+                ),
+                deadline,
+            )
+
+    def test_lane_backed_readonly_reuses_existing_lock_without_mutation(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-existing-readonly-lock")
+        lock = self.lane_state / f"{lane['lane_id']}.lock"
+        self.assertTrue(lock.is_file())
+        original = lock.read_bytes()
+        before = lock.stat()
+        with mock.patch.object(
+            workspace.work_acquire,
+            "_lane_lock",
+            side_effect=AssertionError("READ_ONLY may not create or chmod a lane lock"),
+        ) as mutating_lock:
+            receipt = workspace._lane_receipt(
+                lane["lane_id"], lane["receipt_sha256"], read_only=True
+            )
+        self.assertEqual(receipt["lane_id"], lane["lane_id"])
+        self.assertEqual(lock.read_bytes(), original)
+        self.assertEqual(lock.stat().st_ctime_ns, before.st_ctime_ns)
+        mutating_lock.assert_not_called()
+
+        # An absent lock fails closed rather than being created by a status call.
+        lock.unlink()
+        with self.assertRaisesRegex(
+            workspace.AgentWorkspaceError, "work lane receipt is not safely readable"
+        ):
+            workspace._lane_receipt(
+                lane["lane_id"], lane["receipt_sha256"], read_only=True
+            )
+        self.assertFalse(lock.exists())
+
+    def test_readonly_workspace_root_is_not_created_when_absent(self) -> None:
+        root = self.root / "absent-workspace-state"
+        with mock.patch.object(workspace, "WORKSPACE_ROOT", root):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError, "agent workspace root is unavailable"
+            ):
+                workspace._workspace_dir("gaw-absent-workspace")
+        self.assertFalse(root.exists())
+
+    def test_lane_backed_status_rejects_checkout_wal_without_sidecar_writes(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-strict-checkout-wal")
+        plan = self.normalize_lane(lane)
+        database = workspace.checkouts.CHECKOUT_DB
+        keeper = workspace.checkouts._database()
+        try:
+            keeper.execute("BEGIN IMMEDIATE")
+            keeper.execute("UPDATE metadata SET value=value WHERE key='schema_version'")
+            keeper.commit()
+            wal = Path(str(database) + "-wal")
+            shm = Path(str(database) + "-shm")
+            self.assertTrue(wal.is_file())
+            self.assertTrue(shm.is_file())
+            before = {path: path.read_bytes() for path in (database, wal, shm)}
+            with mock.patch.object(
+                workspace.operator,
+                "_require_operator_mutation",
+                side_effect=AssertionError("READ_ONLY workspace status requested mutation"),
+            ) as gate:
+                observed = workspace._lane_binding_status(plan)
+            self.assertFalse(observed["valid"])
+            self.assertIn("Strict read-only snapshot unavailable", observed["error"])
+            gate.assert_not_called()
+            self.assertEqual(
+                before, {path: path.read_bytes() for path in (database, wal, shm)}
+            )
+        finally:
+            keeper.close()
+
+    def test_lane_backed_writer_validation_survives_live_resource_wal(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-writer-live-resource-wal")
+        plan = self.normalize_lane(lane)
+        keeper = workspace.resources._database()
+        try:
+            keeper.execute("BEGIN IMMEDIATE")
+            keeper.execute("UPDATE metadata SET value=value WHERE key='schema_version'")
+            keeper.commit()
+            self.assertTrue(Path(str(workspace.resources.RESOURCE_DB) + "-wal").is_file())
+            self.assertTrue(Path(str(workspace.resources.RESOURCE_DB) + "-shm").is_file())
+            self.assertFalse(workspace._lane_binding_status(plan)["valid"])
+            with mock.patch.object(
+                workspace.operator, "_require_operator_mutation"
+            ) as mutation_gate:
+                result = workspace._require_live_lane_binding(plan)
+            self.assertTrue(result["valid"])
+            # Every nested SQLite/lease read rechecks mutation admission.
+            self.assertGreaterEqual(mutation_gate.call_count, 1)
+            self.assertEqual([mock.call("resource_lease")] * mutation_gate.call_count, mutation_gate.call_args_list)
+        finally:
+            keeper.close()
+        # SQLite fixture connections may survive keeper.close() on Python 3.12.
+        # Strict public READ_ONLY must reject any remaining WAL/SHM sidecars.
+        wal = Path(str(workspace.resources.RESOURCE_DB) + "-wal")
+        shm = Path(str(workspace.resources.RESOURCE_DB) + "-shm")
+        checkout_wal = Path(str(workspace.checkouts.CHECKOUT_DB) + "-wal")
+        checkout_shm = Path(str(workspace.checkouts.CHECKOUT_DB) + "-shm")
+        observed = workspace._lane_binding_status(plan)
+        if any(path.exists() for path in (wal, shm, checkout_wal, checkout_shm)):
+            self.assertFalse(observed["valid"])
+            self.assertIn("Strict read-only snapshot unavailable", observed["error"])
+        else:
+            self.assertTrue(observed["valid"])
+        # The exact lease must remain readable from a genuinely quiescent
+        # SQLite backup, independent of other fixture writers' lifetimes.
+        snapshot = self.root / "quiescent-resource-snapshot.sqlite3"
+        source = sqlite3.connect(workspace.resources.RESOURCE_DB)
+        target = sqlite3.connect(snapshot)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        self.assertFalse(Path(str(snapshot) + "-wal").exists())
+        self.assertFalse(Path(str(snapshot) + "-shm").exists())
+        checkout_snapshot = self.root / "quiescent-checkout-snapshot.sqlite3"
+        checkout_source = sqlite3.connect(workspace.checkouts.CHECKOUT_DB)
+        checkout_target = sqlite3.connect(checkout_snapshot)
+        try:
+            checkout_source.backup(checkout_target)
+        finally:
+            checkout_target.close()
+            checkout_source.close()
+        self.assertFalse(Path(str(checkout_snapshot) + "-wal").exists())
+        self.assertFalse(Path(str(checkout_snapshot) + "-shm").exists())
+        with (
+            mock.patch.object(workspace.resources, "RESOURCE_DB", snapshot),
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot),
+        ):
+            self.assertTrue(workspace._lane_binding_status(plan)["valid"])
+
+    def test_lane_backed_writer_denial_precedes_resource_store_inspection(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-writer-denied-before-sqlite")
+        plan = self.normalize_lane(lane)
+        with (
+            mock.patch.object(
+                workspace.operator,
+                "_require_operator_mutation",
+                side_effect=PermissionError("resource mutation denied"),
+            ) as gate,
+            mock.patch.object(workspace.resources, "inspect_resource") as inspect,
+        ):
+            with self.assertRaisesRegex(PermissionError, "resource mutation denied"):
+                workspace._require_live_lane_binding(plan)
+        gate.assert_called_once_with("resource_lease")
+        inspect.assert_not_called()
+
+    def test_legacy_lane_validation_does_not_acquire_new_resource_authority(self) -> None:
+        legacy = self.manifest(with_writer=False)
+        with mock.patch.object(
+            workspace.operator, "_require_operator_mutation",
+            side_effect=AssertionError("legacy workspace must not request a lane resource gate"),
+        ) as gate:
+            result = workspace._require_live_lane_binding(legacy)
+        self.assertTrue(result["valid"])
+        gate.assert_not_called()
+
+    def test_lane_backed_status_fails_closed_when_strict_resource_snapshot_unavailable(self) -> None:
+        lane = self.lane_receipt(idempotency_key="lane-strict-resource-readonly")
+        plan = self.normalize_lane(lane)
+        with mock.patch.object(
+            workspace.resources,
+            "inspect_resource",
+            side_effect=RuntimeError("strict resource WAL unavailable"),
+        ) as reader:
+            status = workspace._lane_binding_status(plan)
+        self.assertFalse(status["valid"])
+        self.assertIn("lease is not observable", status["error"])
+        reader.assert_called()
+        self.assertIs(reader.call_args.kwargs["read_only"], True)
 
     def test_lane_backed_create_failure_preserves_lane_resources(self) -> None:
         lane = self.lane_receipt()
@@ -1698,11 +1880,158 @@ class AgentWorkspaceTests(unittest.TestCase):
             manifest["checkout_lifecycle"]["checkout_key"],
             lane["worktree_receipt"]["lifecycle"]["checkout_key"],
         )
-        self.assertTrue(workspace._lane_binding_status(manifest)["valid"])
+        # Creation may leave resource and checkout WAL sidecars from setup
+        # writers. READ_ONLY must fail closed there; test a quiescent backup
+        # of *both* stores rather than relaxing the runtime security gate.
+        checkout_snapshot = self.root / "reuse-checkout-snapshot.sqlite3"
+        resource_snapshot = self.root / "reuse-resource-snapshot.sqlite3"
+        for original, snapshot in (
+            (workspace.checkouts.CHECKOUT_DB, checkout_snapshot),
+            (workspace.resources.RESOURCE_DB, resource_snapshot),
+        ):
+            source = sqlite3.connect(original)
+            target = sqlite3.connect(snapshot)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+            self.assertFalse(Path(str(snapshot) + "-wal").exists())
+            self.assertFalse(Path(str(snapshot) + "-shm").exists())
+        with (
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot),
+            mock.patch.object(workspace.resources, "RESOURCE_DB", resource_snapshot),
+        ):
+            status = workspace._lane_binding_status(manifest)
+            self.assertTrue(status["valid"], status)
         for key in lane["inputs"]["resource_keys"]:
             lease = workspace.resources.inspect_resource(key)
             self.assertEqual(lease["owner_id"], f"lane:{lane['lane_id']}")
         self.assertTrue(self.git.writer.exists())
+
+        # The same already-admitted create/reuse path must work when both
+        # resource and checkout stores have live WAL/SHM from active writers.
+        keepers = (workspace.resources._database(), workspace.checkouts._database())
+        try:
+            for keeper in keepers:
+                keeper.execute("BEGIN IMMEDIATE")
+                keeper.execute("UPDATE metadata SET value=value WHERE key='schema_version'")
+                keeper.commit()
+            for database in (workspace.resources.RESOURCE_DB, workspace.checkouts.CHECKOUT_DB):
+                self.assertTrue(Path(str(database) + "-wal").is_file())
+                self.assertTrue(Path(str(database) + "-shm").is_file())
+            with (
+                mock.patch.object(workspace.operator, "_require_operator_mutation") as mutation_gate,
+                mock.patch.object(workspace, "_tmux_has_session", return_value=False),
+                mock.patch.object(
+                    workspace, "_task_public",
+                    return_value={"task_id": manifest["tasks"]["writer"], "state": "running"},
+                ),
+                mock.patch.object(
+                    workspace, "_writer_create_identity",
+                    return_value={"writer_head": manifest["expected_base_head"], "writer_branch_matches": True},
+                ),
+            ):
+                reuse = workspace._existing_workspace_response(
+                    directory=self.state / manifest["workspace_id"],
+                    plan=workspace._plan_from_manifest(manifest),
+                    plan_sha256=manifest["plan_sha256"],
+                )
+            self.assertEqual(reuse["state"], "creation_runtime_incomplete", reuse)
+            self.assertTrue(reuse["lane_binding_status"]["valid"], reuse)
+            self.assertNotIn("work_lane_binding_invalid", reuse["runtime_errors"])
+            mutation_gate.assert_any_call("resource_lease")
+        finally:
+            for keeper in keepers:
+                keeper.close()
+
+    def test_writer_handoff_eligibility_retains_authorized_wal_aware_lane_validation(self) -> None:
+        lane = self.lane_receipt(idempotency_key="writer-handoff-live-wal")
+        manifest = self.lane_manifest(lane)
+        writer = {"state": "failed", "terminal": True}
+        snapshot = {
+            "writer_branch_matches": True,
+            "writer_head": manifest["expected_base_head"],
+            "dirty": False,
+            "scope_passed": True,
+        }
+        keepers = (workspace.resources._database(), workspace.checkouts._database())
+        try:
+            databases = (workspace.resources.RESOURCE_DB, workspace.checkouts.CHECKOUT_DB)
+            for connection in keepers:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("UPDATE metadata SET value=value WHERE key='schema_version'")
+                connection.commit()
+            sidecars = [
+                Path(str(database) + suffix)
+                for database in databases for suffix in ("-wal", "-shm")
+            ]
+            self.assertTrue(all(path.is_file() for path in sidecars))
+            before = {
+                str(path): path.read_bytes()
+                for database in databases
+                for path in (database, Path(str(database) + "-wal"), Path(str(database) + "-shm"))
+            }
+            with (
+                mock.patch.object(workspace, "_writer_attempts", return_value=[{"actor": "initial_writer"}]),
+                mock.patch.object(workspace, "_writer_task_binding_reasons", return_value=[]),
+                mock.patch.object(workspace, "_route_gate", return_value=({}, True, False)),
+            ):
+                with mock.patch.object(
+                    workspace.operator, "_require_operator_mutation"
+                ) as mutation_gate:
+                    result = workspace._writer_handoff_eligibility(
+                        manifest, writer, snapshot, read_only=False
+                    )
+                self.assertNotIn("work_lane_binding_invalid", result["reasons"], result)
+                self.assertNotIn("checkout_lifecycle_unobservable", result["reasons"], result)
+                self.assertNotIn("workspace_lease_unobservable", result["reasons"], result)
+                mutation_gate.assert_any_call("resource_lease")
+
+                with mock.patch.object(
+                    workspace.operator,
+                    "_require_operator_mutation",
+                    side_effect=PermissionError("resource mutation denied"),
+                ):
+                    with self.assertRaisesRegex(PermissionError, "resource mutation denied"):
+                        workspace._writer_handoff_eligibility(
+                            manifest, writer, snapshot, read_only=False
+                        )
+
+                with mock.patch.object(
+                    workspace.operator,
+                    "_require_operator_mutation",
+                    side_effect=AssertionError("READ_ONLY must not enter mutation"),
+                ) as gate:
+                    strict = workspace._writer_handoff_eligibility(
+                        manifest, writer, snapshot, read_only=True
+                    )
+                gate.assert_not_called()
+                self.assertIn("work_lane_binding_invalid", strict["reasons"])
+                self.assertIn("checkout_lifecycle_unobservable", strict["reasons"])
+                self.assertIn("workspace_lease_unobservable", strict["reasons"])
+                for filename, payload in before.items():
+                    self.assertEqual(Path(filename).read_bytes(), payload)
+        finally:
+            for connection in keepers:
+                connection.close()
+
+    def test_workspace_lifecycle_classification_rechecks_git_capability_before_inventory(self) -> None:
+        manifest = self.manifest(with_writer=False)
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace.operator, "_require_operator_capability",
+                side_effect=PermissionError("git_cli denied"),
+            ) as git_gate,
+            mock.patch.object(workspace.checkouts, "checkout_inventory") as inventory,
+        ):
+            with self.assertRaisesRegex(PermissionError, "git_cli denied"):
+                workspace._workspace_lifecycle_classification(
+                    manifest, {}, observed_at_unix=workspace._now()
+                )
+        git_gate.assert_called_once_with("git_cli")
+        inventory.assert_not_called()
 
     def test_lane_backed_close_preserves_lane_ownership_and_satisfies_close(self) -> None:
         lane = self.lane_receipt()
@@ -3355,7 +3684,8 @@ class AgentWorkspaceTests(unittest.TestCase):
             "review": {"status": "passed", "verdict": "PASS", "findings": []},
         })
 
-        def task_state(task_id):
+        def task_state(task_id, *, read_only=False):
+            self.assertTrue(read_only)
             state = "failed" if task_id == "writer-task" else "completed"
             return {"task_id": task_id, "state": state, "terminal": True}
 
@@ -6034,7 +6364,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 workspace._role_receipt_path(manifest, role_name),
                 signed_role_receipt(role_name, manifest, snapshot),
             )
-        def completed(task_id):
+        def completed(task_id, *, read_only=False):
             return {"task_id": task_id, "state": "completed", "terminal": True}
         with (
             mock.patch.object(workspace, "_task_public", side_effect=completed),
@@ -8290,6 +8620,1073 @@ class AgentWorkspaceTests(unittest.TestCase):
         if isinstance(head, str) and head and isinstance(branch, str) and branch:
             self.git.publish_remote_head(head, branch)
 
+    def test_unknown_role_outcome_requires_reconcile_before_retry(self) -> None:
+        manifest = self.manifest()
+        manifest["tasks"]["tests"] = "tests-task"
+        frozen = {"writer_head": self.git.base, "diff_sha256": "a" * 64, "dirty": False}
+        for unknown_state in ("outcome_unknown", "observation_error", "interrupted"):
+            with self.subTest(state=unknown_state):
+                with mock.patch.object(
+                    workspace,
+                    "_task_public",
+                    return_value={
+                        "task_id": "tests-task",
+                        "state": unknown_state,
+                        "terminal": False,
+                        "reconcile_required": True,
+                    },
+                ) as task_status:
+                    classification, detail = workspace._role_retry_classification(
+                        manifest, "tests", frozen, read_only=True
+                    )
+                self.assertEqual("unknown_prior_outcome", classification)
+                self.assertTrue(detail["reconcile_required"])
+                task_status.assert_called_once_with("tests-task", read_only=True)
+
+    def test_unknown_role_outcome_has_reconcile_next_action(self) -> None:
+        selected = workspace._recommended_next_action(
+            creation_ready=True,
+            closed=False,
+            route_gate_passed=True,
+            closeable=False,
+            success_ready=False,
+            role_retry={
+                "tests": {
+                    "classification": "unknown_prior_outcome",
+                    "eligible": False,
+                    "reconcile_required": True,
+                }
+            },
+            failed_roles=[],
+            incomplete_roles=[],
+        )
+        self.assertEqual("reconcile_role_task_outcome", selected)
+
+    def test_collect_quickly_completed_tests_refreshes_and_starts_review(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        manifest["tasks"]["tests"] = "tests-task"
+        workspace._write_manifest(manifest)
+        refreshed = False
+        calls = []
+        started = []
+
+        def role_status(task_id: str, *, read_only: bool = False) -> dict:
+            nonlocal refreshed
+            calls.append((task_id, read_only))
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            if task_id == "tests-task":
+                if not read_only:
+                    refreshed = True
+                    return {"task_id": task_id, "state": "completed", "terminal": True}
+                return {
+                    "task_id": task_id, "state": "completed", "terminal": True,
+                    "persisted_state": "completed" if refreshed else "running",
+                    "observation_mode": "unpersisted_readonly_probe",
+                    "reconcile_required": not refreshed,
+                }
+            if task_id == "review-task":
+                return {"task_id": task_id, "state": "running", "terminal": False}
+            raise AssertionError(f"unexpected task {task_id}")
+
+        def role_start(_manifest: dict, role: str, _snapshot: dict) -> dict:
+            started.append(role)
+            return {"task_id": "review-task"}
+
+        with (
+            mock.patch.object(workspace, "_task_public", side_effect=role_status),
+            mock.patch.object(workspace, "_start_role_task", side_effect=role_start),
+            mock.patch.object(
+                workspace, "_role_toolchain_preflight",
+                side_effect=passing_toolchain_preflight,
+            ),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            first = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+            second = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("collecting", first["state"])
+        self.assertEqual(["review"], first["started_roles"])
+        self.assertEqual("collecting", second["state"])
+        self.assertEqual(["review"], started)
+        self.assertTrue(refreshed)
+        self.assertIn(("tests-task", False), calls)
+        self.assertIn(("tests-task", True), calls)
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual("review-task", persisted["tasks"]["review"])
+        self.assertEqual({}, persisted["task_start_intents"])
+
+    def test_collect_failed_terminal_refresh_still_blocks_review(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\n", encoding="utf-8")
+        manifest["tasks"]["tests"] = "tests-task"
+        workspace._write_manifest(manifest)
+        attempts = []
+
+        def role_status(task_id: str, *, read_only: bool = False) -> dict:
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            if task_id != "tests-task":
+                raise AssertionError("unexpected task")
+            attempts.append(read_only)
+            if not read_only:
+                return {
+                    "task_id": task_id, "state": "observation_error",
+                    "terminal": False, "reconcile_required": True,
+                }
+            return {
+                "task_id": task_id, "state": "completed", "terminal": True,
+                "persisted_state": "running",
+                "observation_mode": "unpersisted_readonly_probe",
+                "reconcile_required": True,
+            }
+
+        with (
+            mock.patch.object(workspace, "_task_public", side_effect=role_status),
+            mock.patch.object(workspace, "_start_role_task") as start,
+            mock.patch.object(workspace, "_role_toolchain_preflight") as preflight,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("role_outcome_unknown", result["state"])
+        self.assertEqual(["tests"], result["reconcile_roles"])
+        self.assertIn(False, attempts)
+        start.assert_not_called()
+        preflight.assert_not_called()
+
+    def test_collect_existing_uncertain_role_blocks_missing_sibling(self) -> None:
+        cases = (
+            ("tests", "outcome_unknown", False),
+            ("tests", "observation_error", False),
+            ("tests", "interrupted", False),
+            ("tests", "unknown", False),
+            ("tests", "running", True),
+            ("review", "outcome_unknown", False),
+            ("review", "observation_error", False),
+            ("review", "interrupted", False),
+            ("review", "unknown", False),
+            ("review", "running", True),
+        )
+        for existing, state, reconciliation in cases:
+            with self.subTest(existing=existing, state=state, reconciliation=reconciliation):
+                manifest = self.manifest()
+                (self.git.writer / "src" / "app.py").write_text(
+                    "dirty = True\n", encoding="utf-8"
+                )
+                task_id = f"{existing}-task"
+                missing = "review" if existing == "tests" else "tests"
+                manifest["tasks"][existing] = task_id
+                workspace._write_manifest(manifest)
+                readonly_calls = []
+
+                def task_state(current: str, *, read_only: bool = False) -> dict:
+                    if current == "writer-task":
+                        return {"task_id": current, "state": "completed", "terminal": True}
+                    if current == task_id:
+                        readonly_calls.append(read_only)
+                        return {"task_id": current, "state": state, "terminal": False,
+                                "reconcile_required": reconciliation}
+                    return {"task_id": current, "state": "running", "terminal": False}
+
+                with (
+                    mock.patch.object(workspace, "_task_public", side_effect=task_state),
+                    mock.patch.object(
+                        workspace, "_start_role_task",
+                        return_value={"task_id": f"{missing}-task"},
+                    ) as start,
+                    mock.patch.object(workspace.operator, "_require_operator_mutation"),
+                    mock.patch.object(
+                        workspace, "_role_toolchain_preflight",
+                        side_effect=passing_toolchain_preflight,
+                    ) as preflight,
+                    mock.patch.object(
+                        workspace.resources, "acquire_resources",
+                        side_effect=AssertionError("unexpected lease acquisition"),
+                    ) as acquire,
+                ):
+                    result = workspace.grabowski_agent_workspace_collect(
+                        manifest["workspace_id"]
+                    )
+                self.assertEqual("role_outcome_unknown", result["state"])
+                self.assertEqual("blocked", result["receipt_status"])
+                self.assertTrue(result["reconcile_required"])
+                self.assertEqual([existing], result["reconcile_roles"])
+                self.assertEqual(task_id, result["tasks"][existing]["task_id"])
+                self.assertTrue(readonly_calls)
+                self.assertTrue(all(readonly_calls))
+                start.assert_not_called()
+                preflight.assert_not_called()
+                acquire.assert_not_called()
+                persisted = workspace._manifest(manifest["workspace_id"])
+                self.assertIsNone(persisted["tasks"][missing])
+                self.assertEqual({}, persisted["task_start_intents"])
+
+    def test_collect_rechecks_newly_started_role_before_sibling(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        starts = []
+        read_only_calls = []
+
+        def role_start(_manifest: dict, role: str, _snapshot: dict) -> dict:
+            starts.append(role)
+            return {"task_id": f"{role}-task"}
+
+        def task_state(task_id: str, *, read_only: bool = False) -> dict:
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            if task_id == "tests-task":
+                read_only_calls.append(read_only)
+                return {"task_id": task_id, "state": "outcome_unknown",
+                        "terminal": False, "reconcile_required": True}
+            return {"task_id": task_id, "state": "running", "terminal": False}
+
+        with (
+            mock.patch.object(workspace, "_task_public", side_effect=task_state),
+            mock.patch.object(workspace, "_start_role_task", side_effect=role_start),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("role_outcome_unknown", result["state"])
+        self.assertEqual(["tests"], result["reconcile_roles"])
+        self.assertEqual(["tests"], starts)
+        self.assertTrue(read_only_calls)
+        self.assertTrue(all(read_only_calls))
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual("tests-task", persisted["tasks"]["tests"])
+        self.assertIsNone(persisted["tasks"]["review"])
+        self.assertEqual({}, persisted["task_start_intents"])
+
+    def test_collect_reconciles_role_that_becomes_unknown_during_preflight(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        manifest["tasks"]["tests"] = "tests-task"
+        workspace._write_manifest(manifest)
+        outcome_changed = False
+        observations = []
+
+        def role_status(task_id: str, *, read_only: bool = False) -> dict:
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            if task_id == "tests-task":
+                observations.append(read_only)
+                return {
+                    "task_id": task_id,
+                    "state": "outcome_unknown" if outcome_changed else "running",
+                    "terminal": False,
+                    "reconcile_required": outcome_changed,
+                }
+            raise AssertionError("unexpected task read")
+
+        def preflight_after_transition(value: dict, role: str, command: list[str]) -> dict:
+            nonlocal outcome_changed
+            self.assertEqual("review", role)
+            outcome_changed = True
+            return passing_toolchain_preflight(value, role, command)
+
+        with (
+            mock.patch.object(workspace, "_task_public", side_effect=role_status),
+            mock.patch.object(
+                workspace, "_role_toolchain_preflight",
+                side_effect=preflight_after_transition,
+            ) as preflight,
+            mock.patch.object(workspace, "_start_role_task") as start,
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("role_outcome_unknown", result["state"])
+        self.assertEqual(["tests"], result["reconcile_roles"])
+        self.assertTrue(result["reconcile_required"])
+        self.assertTrue(outcome_changed)
+        preflight.assert_called_once()
+        self.assertGreaterEqual(len(observations), 2)
+        self.assertTrue(all(observations))
+        start.assert_not_called()
+        persisted = workspace._manifest(manifest["workspace_id"])
+        self.assertEqual("tests-task", persisted["tasks"]["tests"])
+        self.assertIsNone(persisted["tasks"]["review"])
+        self.assertEqual({}, persisted["task_start_intents"])
+
+    def test_collect_admission_excludes_real_concurrent_state_mutation(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        manifest["tasks"]["tests"] = "tests-task"
+        workspace._write_manifest(manifest)
+        worker_attempted = threading.Event()
+        competing_mutation_entered = threading.Event()
+        writer_done = threading.Event()
+        child_threads = []
+
+        completed_mutation_result = []
+
+        def competing_writer():
+            worker_attempted.set()
+            try:
+                # Real @_serialize_task_mutation entry point: it must not reach
+                # even the missing-task validation while the launch holds lock.
+                workspace.tasks._set_state("0" * 24, "outcome_unknown")
+                completed_mutation_result.append("unexpected_success")
+            except ValueError:
+                completed_mutation_result.append("missing_task")
+            finally:
+                competing_mutation_entered.set()
+                writer_done.set()
+
+        def role_task_state(task_id: str, *, read_only: bool = False) -> dict:
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            return {"task_id": task_id, "state": "running", "terminal": False}
+
+        def launch_review(_manifest: dict, role: str, _snapshot: dict) -> dict:
+            self.assertEqual("review", role)
+            # The actual task-start path re-enters the same global lock.
+            with workspace.tasks._task_mutation_lock():
+                self.assertFalse(competing_mutation_entered.is_set())
+            thread = threading.Thread(target=competing_writer, daemon=True)
+            child_threads.append(thread)
+            thread.start()
+            self.assertTrue(worker_attempted.wait(2.0))
+            self.assertFalse(
+                competing_mutation_entered.wait(0.075),
+                "another task-state writer entered between sibling check and launch",
+            )
+            return {"task_id": "review-task"}
+
+        try:
+            with (
+                mock.patch.object(workspace, "_task_public", side_effect=role_task_state),
+                mock.patch.object(workspace, "_start_role_task", side_effect=launch_review),
+                mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            ):
+                result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+            self.assertEqual("collecting", result["state"])
+            self.assertEqual(["review"], result["started_roles"])
+        finally:
+            for thread in child_threads:
+                thread.join(timeout=2.0)
+        self.assertTrue(writer_done.is_set())
+        self.assertTrue(competing_mutation_entered.is_set())
+        self.assertEqual(["missing_task"], completed_mutation_result)
+
+    def _persist_sibling_for_collect_admission(self) -> str:
+        """Create one real schema-v5 task row; do not start a systemd unit."""
+        task_id = "a" * 24
+        unit = f"grabowski-task-{task_id}-a1.service"
+        with workspace.tasks._database_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO tasks(
+                    task_id, host, unit, attempt, state, resume_policy,
+                    argv_json, argv_sha256, cwd, runtime_seconds,
+                    cpu_weight, io_weight, memory_max_bytes,
+                    created_at_unix, updated_at_unix, launcher_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (task_id, "heim-pc", unit, 1, "running", "never",
+                 '["/bin/true"]', "b" * 64, str(self.git.writer),
+                 600, 100, 100, None, 1, 1, "{}"),
+            )
+        return task_id
+
+    def test_collect_real_sibling_peek_blocks_live_unpersisted_unknown(self) -> None:
+        task_id = self._persist_sibling_for_collect_admission()
+        for existing in workspace.READ_ONLY_ROLES:
+            for rootbroker in (False, True):
+                with self.subTest(existing=existing, rootbroker=rootbroker):
+                    # Test both role-order permutations and the fail-closed rootbroker.
+                    with workspace.tasks._database_connection() as connection:
+                        connection.execute(
+                            "UPDATE tasks SET execution_backend=?, systemd_scope=?, "
+                            "state='running' WHERE task_id=?",
+                            ("systemd-root-broker" if rootbroker else "systemd-user",
+                             "system" if rootbroker else "user", task_id),
+                        )
+                    manifest = self.manifest()
+                    (self.git.writer / "src" / "app.py").write_text(
+                        "dirty = True\n", encoding="utf-8"
+                    )
+                    missing = "review" if existing == "tests" else "tests"
+                    manifest["tasks"][existing] = task_id
+                    workspace._write_manifest(manifest)
+                    before_store = workspace.tasks.TASK_DB.read_bytes()
+                    observed = {
+                        "state": "outcome_unknown",
+                        "properties": {},
+                        "observed_at_unix": workspace.tasks._now(),
+                    }
+
+                    with (
+                        mock.patch.object(
+                            workspace.tasks, "grabowski_task_status",
+                            return_value={"task_id": "writer-task",
+                                          "state": "completed", "terminal": True},
+                        ) as refresh,
+                        mock.patch.object(
+                            workspace.tasks, "_resolve_task_dispatch_host",
+                            return_value=("heim-pc", {"transport": "local"}, False),
+                        ),
+                        mock.patch.object(
+                            workspace.tasks, "_observe", return_value=observed
+                        ) as observer,
+                        mock.patch.object(
+                            workspace.tasks, "grabowski_task_peek",
+                            wraps=workspace.tasks.grabowski_task_peek,
+                        ) as peek,
+                        mock.patch.object(workspace, "_start_role_task") as start,
+                        mock.patch.object(
+                            workspace, "_role_toolchain_preflight",
+                            side_effect=AssertionError("blocked sibling must not preflight"),
+                        ) as preflight,
+                        mock.patch.object(workspace.operator, "_require_operator_mutation"),
+                    ):
+                        result = workspace.grabowski_agent_workspace_collect(
+                            manifest["workspace_id"]
+                        )
+                    self.assertEqual("role_outcome_unknown", result["state"])
+                    self.assertEqual("blocked", result["receipt_status"])
+                    self.assertEqual([existing], result["reconcile_roles"])
+                    self.assertEqual(task_id, result["tasks"][existing]["task_id"])
+                    self.assertEqual("running", result["tasks"][existing]["persisted_state"])
+                    self.assertEqual(
+                        "observation_error" if rootbroker else "outcome_unknown",
+                        result["tasks"][existing]["state"],
+                    )
+                    self.assertTrue(result["tasks"][existing]["reconcile_required"])
+                    peek.assert_called()
+                    if rootbroker:
+                        observer.assert_not_called()
+                    else:
+                        observer.assert_called()
+                    refresh.assert_called_once_with("writer-task")
+                    preflight.assert_not_called()
+                    start.assert_not_called()
+                    self.assertEqual(before_store, workspace.tasks.TASK_DB.read_bytes())
+                    persisted = workspace._manifest(manifest["workspace_id"])
+                    self.assertIsNone(persisted["tasks"][missing])
+                    self.assertEqual({}, persisted["task_start_intents"])
+
+    def test_collect_real_task_state_writer_waits_for_locked_live_peek_and_launch(self) -> None:
+        task_id = self._persist_sibling_for_collect_admission()
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        manifest["tasks"]["tests"] = task_id
+        workspace._write_manifest(manifest)
+        real_peek = workspace.tasks.grabowski_task_peek
+        live_peeks = []
+        writer_attempted = threading.Event()
+        writer_done = threading.Event()
+        worker_errors = []
+        worker_threads = []
+        role_started = []
+        finished_before_launch = []
+        class ReachedRoleLaunch(Exception):
+            pass
+
+        def competing_writer():
+            writer_attempted.set()
+            try:
+                workspace.tasks._set_state(task_id, "outcome_unknown")
+            except Exception as exc:
+                worker_errors.append(type(exc).__name__)
+            finally:
+                writer_done.set()
+
+        def synchronized_peek(identifier: str) -> dict:
+            value = real_peek(identifier)
+            live_peeks.append(value)
+            if identifier == task_id and len(live_peeks) == 2:
+                thread = threading.Thread(target=competing_writer, daemon=True)
+                worker_threads.append(thread)
+                thread.start()
+                self.assertTrue(writer_attempted.wait(2.0))
+                # If the final observation was moved outside the lock, the
+                # real _set_state writer could commit before role launch.
+                finished_before_launch.append(writer_done.wait(0.1))
+            return value
+
+        def record_launch(_manifest: dict, role: str, _snapshot: dict) -> dict:
+            role_started.append(role)
+            self.assertEqual("review", role)
+            self.assertEqual(2, len(live_peeks))
+            self.assertFalse(writer_done.is_set())
+            with workspace.tasks._task_mutation_lock():
+                pass  # real nested acquisition must be reentrant
+            raise ReachedRoleLaunch()
+
+        try:
+            with (
+                mock.patch.object(
+                    workspace.tasks, "grabowski_task_status",
+                    return_value={"task_id": "writer-task", "state": "completed"},
+                ),
+                mock.patch.object(
+                    workspace.tasks, "_resolve_task_dispatch_host",
+                    return_value=("heim-pc", {"transport": "local"}, False),
+                ),
+                mock.patch.object(
+                    workspace.tasks, "_observe",
+                    return_value={"state": "running", "properties": {},
+                                  "observed_at_unix": workspace.tasks._now()},
+                ),
+                mock.patch.object(
+                    workspace.tasks, "grabowski_task_peek", side_effect=synchronized_peek,
+                ),
+                mock.patch.object(workspace, "_start_role_task", side_effect=record_launch),
+                mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            ):
+                with self.assertRaises(ReachedRoleLaunch):
+                    workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        finally:
+            for thread in worker_threads:
+                thread.join(timeout=2.0)
+        self.assertEqual(["review"], role_started)
+        self.assertEqual([False], finished_before_launch)
+        self.assertTrue(writer_done.is_set())
+        self.assertFalse(worker_errors, worker_errors)
+        self.assertEqual(
+            "outcome_unknown",
+            workspace.tasks._row_raw(task_id)["state"],
+        )
+
+    def test_collect_role_launch_serializes_reconciliation_and_start(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        held = False
+        observations = []
+        starts = []
+
+        @contextmanager
+        def task_mutation_guard():
+            nonlocal held
+            self.assertFalse(held)
+            held = True
+            try:
+                yield
+            finally:
+                held = False
+
+        def task_state(task_id: str, *, read_only: bool = False) -> dict:
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            if read_only:
+                observations.append((task_id, held))
+            return {"task_id": task_id, "state": "running", "terminal": False}
+
+        def role_start(_manifest: dict, role: str, _snapshot: dict) -> dict:
+            starts.append((role, held, list(observations)))
+            return {"task_id": f"{role}-task"}
+
+        with (
+            mock.patch.object(
+                workspace.tasks, "_task_mutation_lock", side_effect=task_mutation_guard
+            ),
+            mock.patch.object(workspace, "_task_public", side_effect=task_state),
+            mock.patch.object(workspace, "_start_role_task", side_effect=role_start),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("collecting", result["state"])
+        self.assertEqual(["tests", "review"], [role for role, _, _ in starts])
+        self.assertTrue(all(under_lock for _, under_lock, _ in starts))
+        self.assertTrue(
+            any(task_id == "tests-task" and under_lock
+                for task_id, under_lock in starts[-1][2])
+        )
+
+    def test_collect_starts_both_roles_when_no_uncertain_outcome(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text(
+            "dirty = True\n", encoding="utf-8"
+        )
+        started = []
+
+        def role_start(_manifest: dict, role: str, _snapshot: dict) -> dict:
+            started.append(role)
+            return {"task_id": f"{role}-task"}
+
+        def task_state(task_id: str, *, read_only: bool = False) -> dict:
+            if task_id == "writer-task":
+                return {"task_id": task_id, "state": "completed", "terminal": True}
+            return {"task_id": task_id, "state": "running", "terminal": False}
+
+        with (
+            mock.patch.object(workspace, "_task_public", side_effect=task_state),
+            mock.patch.object(workspace, "_start_role_task", side_effect=role_start),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            result = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("collecting", result["state"])
+        self.assertEqual(["tests", "review"], started)
+        self.assertEqual(["tests", "review"], result["started_roles"])
+
+    def test_collect_unknown_role_outcome_blocks_instead_of_polling(self) -> None:
+        manifest = self.manifest()
+        (self.git.writer / "src" / "app.py").write_text("dirty = True\\n", encoding="utf-8")
+        role_ids = iter([{"task_id": "tests-task"}, {"task_id": "review-task"}])
+        with (
+            mock.patch.object(
+                workspace,
+                "_task_public",
+                return_value={"task_id": "writer-task", "state": "completed", "terminal": True},
+            ),
+            mock.patch.object(
+                workspace, "_start_role_task", side_effect=lambda *_: next(role_ids)
+            ),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            first = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("collecting", first["state"])
+
+        def task_state(task_id: str) -> dict:
+            if task_id == "tests-task":
+                return {
+                    "task_id": task_id,
+                    "state": "outcome_unknown",
+                    "terminal": False,
+                    "reconcile_required": True,
+                }
+            return {
+                "task_id": task_id,
+                "state": "completed" if task_id == "writer-task" else "running",
+                "terminal": task_id == "writer-task",
+            }
+
+        with (
+            mock.patch.object(workspace, "_task_public", side_effect=task_state),
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+        ):
+            second = workspace.grabowski_agent_workspace_collect(manifest["workspace_id"])
+        self.assertEqual("role_outcome_unknown", second["state"])
+        self.assertEqual("blocked", second["receipt_status"])
+        self.assertTrue(second["reconcile_required"])
+        self.assertEqual(["tests"], second["reconcile_roles"])
+        self.assertFalse(second["tasks"]["tests"]["terminal"])
+
+    def test_unobserved_rootbroker_task_remains_nonterminal_in_workspace(self) -> None:
+        task_id = "root-task"
+        peek = {
+            "task_id": task_id,
+            "host": "heim-pc",
+            "unit": "root.service",
+            "state": "outcome_unknown",
+            "persisted_state": "running",
+            "observation_mode": "persisted_only_rootbroker_not_probed",
+            "observation_unavailable_reason": "privileged_broker_requires_mutation_gate",
+            "reconcile_required": True,
+        }
+        with (
+            mock.patch.object(workspace.tasks, "grabowski_task_peek", return_value=peek) as reader,
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                side_effect=AssertionError("read-only status may not refresh a rootbroker task"),
+            ) as mutating_reader,
+        ):
+            public = workspace._task_public(task_id, read_only=True)
+        reader.assert_called_once_with(task_id)
+        mutating_reader.assert_not_called()
+        self.assertEqual("outcome_unknown", public["state"])
+        self.assertFalse(public["terminal"])
+        self.assertEqual("running", public["persisted_state"])
+        self.assertEqual("persisted_only_rootbroker_not_probed", public["observation_mode"])
+        self.assertEqual(
+            "privileged_broker_requires_mutation_gate",
+            public["observation_unavailable_reason"],
+        )
+        self.assertTrue(public["reconcile_required"])
+
+    def test_unknown_mutating_task_result_cannot_finish_role(self) -> None:
+        with mock.patch.object(
+            workspace.tasks,
+            "grabowski_task_status",
+            return_value={"state": "outcome_unknown"},
+        ) as task_status:
+            public = workspace._task_public("unknown-task")
+        task_status.assert_called_once_with("unknown-task")
+        self.assertEqual("outcome_unknown", public["state"])
+        self.assertFalse(public["terminal"])
+        self.assertTrue(public["reconcile_required"])
+
+    def test_cleanup_persisted_unknown_task_is_nonterminal_without_probe(self) -> None:
+        task_id = "root-task"
+        row = {
+            "task_id": task_id,
+            "host": "heim-pc",
+            "unit": "root.service",
+            "state": "outcome_unknown",
+            "attempt": 1,
+            "resume_policy": "never",
+            "argv_sha256": "a" * 64,
+            "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection", return_value=connection
+            ) as reader,
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                side_effect=AssertionError("cleanup must not refresh status"),
+            ) as mutating_reader,
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        reader.assert_called_once_with(workspace.tasks.TASK_DB)
+        mutating_reader.assert_not_called()
+        connection.close.assert_called_once_with()
+        self.assertEqual("outcome_unknown", public["state"])
+        self.assertFalse(public["terminal"])
+        self.assertTrue(public["reconcile_required"])
+
+    def test_cleanup_persisted_rootbroker_terminal_is_not_live_truth(self) -> None:
+        task_id = "persisted-rootbroker-terminal"
+        row = {
+            "task_id": task_id, "host": "heim-pc", "unit": "root.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-root-broker", "systemd_scope": "system",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection", return_value=connection
+            ) as reader,
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_status",
+                side_effect=AssertionError("cleanup read cannot mutate"),
+            ) as status,
+            mock.patch.object(
+                workspace.tasks, "_observe",
+                side_effect=AssertionError("cleanup read cannot probe privileged unit"),
+            ) as observe,
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        reader.assert_called_once_with(workspace.tasks.TASK_DB)
+        connection.close.assert_called_once_with()
+        status.assert_not_called()
+        observe.assert_not_called()
+        self.assertEqual("completed", public["persisted_state"])
+        self.assertEqual("observation_error", public["state"])
+        self.assertFalse(public["terminal"])
+        self.assertTrue(public["reconcile_required"])
+
+    def test_cleanup_remote_and_unresolved_terminal_task_fail_closed(self) -> None:
+        row = {
+            "task_id": "ssh-task", "host": "remote", "unit": "remote.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        for case, observer in (
+            ("ssh", ("remote", {"transport": "ssh"}, False)),
+            ("unknown", ValueError("Unknown fleet host")),
+        ):
+            with (
+                self.subTest(case=case),
+                mock.patch.object(
+                    workspace.checkouts, "_readonly_connection", return_value=connection
+                ),
+                mock.patch.object(
+                    workspace.tasks, "_resolve_task_dispatch_host",
+                    side_effect=observer if isinstance(observer, Exception) else None,
+                    return_value=None if isinstance(observer, Exception) else observer,
+                ),
+                mock.patch.object(
+                    workspace.tasks, "grabowski_task_status",
+                    side_effect=AssertionError("cleanup read cannot refresh"),
+                ),
+                mock.patch.object(
+                    workspace.tasks, "_observe",
+                    side_effect=AssertionError("cleanup read cannot probe"),
+                ),
+            ):
+                public = workspace._workspace_cleanup_task_public("ssh-task")
+            self.assertEqual("completed", public["persisted_state"])
+            self.assertEqual("observation_error", public["state"])
+            self.assertFalse(public["terminal"])
+            self.assertTrue(public["reconcile_required"])
+
+    def test_cleanup_local_terminal_transport_flip_cannot_launch_ssh(self) -> None:
+        task_id = "3" * 24
+        row = {
+            "task_id": task_id, "host": "local", "unit": f"grabowski-task-{task_id}-a1.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection", return_value=connection
+            ),
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                side_effect=[
+                    ("local", {"transport": "local", "target": "local", "enabled": True}, False),
+                    ("remote", {"transport": "ssh", "target": "remote", "enabled": True}, False),
+                ],
+            ) as resolve,
+            mock.patch.object(
+                workspace.tasks.operator, "_run",
+                return_value={"returncode": 0, "stdout": "", "stderr": ""},
+            ) as local,
+            mock.patch.object(
+                workspace.tasks.fleet, "run_fleet_host",
+                side_effect=AssertionError("cleanup reached SSH process"),
+            ) as ssh,
+            mock.patch.object(
+                workspace.tasks.fleet, "run_fleet_task_unit_show",
+                side_effect=AssertionError("cleanup reached SSH fallback"),
+            ) as fallback,
+            mock.patch.object(
+                workspace.tasks, "_classify_observation", return_value="completed"
+            ),
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        self.assertEqual("completed", public["state"])
+        self.assertTrue(public["terminal"])
+        self.assertFalse(public["reconcile_required"])
+        resolve.assert_called_once()
+        local.assert_called_once()
+        ssh.assert_not_called()
+        fallback.assert_not_called()
+
+    def test_cleanup_cancelled_task_requires_quiescent_bound_local_unit(self) -> None:
+        task_id = "c" * 24
+        row = {
+            "task_id": task_id, "host": "local",
+            "unit": f"grabowski-task-{task_id}-a1.service",
+            "state": "cancelled", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        quiescent = {
+            "state": "completed",
+            "properties": {"LoadState": "loaded", "ActiveState": "inactive", "Result": "success"},
+            "probe": {"returncode": 0, "timed_out": False},
+            "observer": {"kind": "bound-local-user-systemd-show-v1", "transport": "local"},
+        }
+        cases = [
+            ("completed_quiescent", {}, True),
+            ("failed_quiescent", {
+                "state": "failed",
+                "properties": {"LoadState": "loaded", "ActiveState": "failed", "Result": "exit-code"},
+            }, True),
+            ("still_running", {
+                "state": "running",
+                "properties": {"LoadState": "loaded", "ActiveState": "active", "Result": "success"},
+            }, False),
+            ("spoofed_terminal_while_active", {
+                "properties": {"LoadState": "loaded", "ActiveState": "active", "Result": "success"},
+            }, False),
+            ("unknown_live_outcome", {"state": "outcome_unknown"}, False),
+            ("unloaded_unit", {
+                "properties": {"LoadState": "not-found", "ActiveState": "inactive", "Result": "success"},
+            }, False),
+            ("failed_probe", {"probe": {"returncode": 1, "timed_out": False}}, False),
+            ("unbound_observer", {
+                "observer": {"kind": "fleet-dispatch-v1", "transport": "local"},
+            }, False),
+            ("incomplete_observation", {"properties": {}}, False),
+        ]
+        for name, changes, terminal in cases:
+            with self.subTest(case=name):
+                observation = {**quiescent, **changes}
+                first = mock.Mock()
+                second = mock.Mock()
+                first.execute.return_value.fetchone.return_value = row
+                second.execute.return_value.fetchone.return_value = row
+                with (
+                    mock.patch.object(
+                        workspace.checkouts, "_readonly_connection",
+                        side_effect=[first, second]
+                    ) as reads,
+                    mock.patch.object(
+                        workspace.tasks, "_resolve_task_dispatch_host",
+                        return_value=(
+                            "local", {"transport": "local", "target": "local", "enabled": True}, False
+                        ),
+                    ),
+                    mock.patch.object(
+                        workspace.tasks, "_observe", return_value=observation
+                    ) as observed,
+                    mock.patch.object(
+                        workspace.tasks, "grabowski_task_status",
+                        side_effect=AssertionError("cleanup may not mutate task state"),
+                    ) as mutate,
+                ):
+                    public = workspace._workspace_cleanup_task_public(task_id)
+                observed.assert_called_once_with(row, bound_local_user=True)
+                first.close.assert_called_once()
+                if terminal:
+                    second.close.assert_called_once()
+                    self.assertEqual(2, reads.call_count)
+                else:
+                    second.close.assert_not_called()
+                    self.assertEqual(1, reads.call_count)
+                mutate.assert_not_called()
+                self.assertEqual("cancelled", public["persisted_state"])
+                self.assertEqual(terminal, public["terminal"])
+                self.assertEqual(not terminal, public["reconcile_required"])
+                self.assertEqual(
+                    "cancelled" if terminal else "observation_error", public["state"]
+                )
+
+    def test_cleanup_cancelled_remote_task_never_launches_probe(self) -> None:
+        task_id = "d" * 24
+        row = {
+            "task_id": task_id, "host": "remote", "unit": "remote.service",
+            "state": "cancelled", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        with (
+            mock.patch.object(workspace.checkouts, "_readonly_connection", return_value=connection),
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                return_value=("remote", {"transport": "ssh", "target": "remote", "enabled": True}, False),
+            ),
+            mock.patch.object(
+                workspace.tasks, "_observe",
+                side_effect=AssertionError("cleanup cannot launch remote task probe"),
+            ) as remote,
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        remote.assert_not_called()
+        self.assertEqual("observation_error", public["state"])
+        self.assertFalse(public["terminal"])
+        self.assertTrue(public["reconcile_required"])
+
+    def test_cleanup_rejects_concurrent_task_attempt_after_live_terminal_probe(self) -> None:
+        task_id = "4" * 24
+        old_row = {
+            "task_id": task_id, "host": "local",
+            "unit": f"grabowski-task-{task_id}-a1.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        new_row = {
+            **old_row,
+            "unit": f"grabowski-task-{task_id}-a2.service",
+            "state": "running",
+            "attempt": 2,
+        }
+        first, second = mock.Mock(), mock.Mock()
+        first.execute.return_value.fetchone.return_value = old_row
+        second.execute.return_value.fetchone.return_value = new_row
+        local_host = (
+            "local", {"transport": "local", "target": "local", "enabled": True},
+            False,
+        )
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection",
+                side_effect=[first, second],
+            ) as reads,
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                return_value=local_host,
+            ),
+            mock.patch.object(
+                workspace.tasks, "_observe", return_value={"state": "completed"}
+            ) as probe,
+            mock.patch.object(
+                workspace.tasks, "_set_state",
+                side_effect=AssertionError("cleanup must never mutate task state"),
+            ) as persist,
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        probe.assert_called_once()
+        self.assertFalse(public["terminal"])
+        self.assertEqual("observation_error", public["state"])
+        self.assertTrue(public["reconcile_required"])
+        self.assertEqual("completed", public["persisted_state"])
+        self.assertEqual(2, reads.call_count)
+        first.close.assert_called_once()
+        second.close.assert_called_once()
+        persist.assert_not_called()
+
+    def test_cleanup_local_terminal_cannot_use_persisted_state_without_live_confirmation(self) -> None:
+        task_id = "1" * 24
+        row = {
+            "task_id": task_id, "host": "local", "unit": "local-task.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        local_host = ("local",
+                      {"transport": "local", "target": "local", "enabled": True},
+                      False)
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection", return_value=connection
+            ),
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host", return_value=local_host
+            ),
+            mock.patch.object(
+                workspace.tasks, "_observe", return_value={"state": "running"}
+            ) as live_probe,
+            mock.patch.object(
+                workspace.tasks, "grabowski_task_status",
+                side_effect=AssertionError("cleanup cannot persist task state"),
+            ),
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        live_probe.assert_called_once()
+        self.assertEqual("completed", public["persisted_state"])
+        self.assertEqual("observation_error", public["state"])
+        self.assertFalse(public["terminal"])
+        self.assertTrue(public["reconcile_required"])
+
+    def test_cleanup_local_terminal_probe_error_blocks_cleanup(self) -> None:
+        task_id = "2" * 24
+        row = {
+            "task_id": task_id, "host": "local", "unit": "local-task.service",
+            "state": "completed", "attempt": 1, "resume_policy": "never",
+            "execution_backend": "systemd-user", "systemd_scope": "user",
+            "argv_sha256": "a" * 64, "cwd": str(self.git.writer),
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        with (
+            mock.patch.object(
+                workspace.checkouts, "_readonly_connection", return_value=connection
+            ),
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                return_value=("local", {"transport": "local", "target": "local", "enabled": True}, False),
+            ),
+            mock.patch.object(
+                workspace.tasks, "_observe", side_effect=RuntimeError("systemd unavailable")
+            ) as probe,
+        ):
+            public = workspace._workspace_cleanup_task_public(task_id)
+        probe.assert_called_once()
+        self.assertEqual("observation_error", public["state"])
+        self.assertEqual("completed", public["persisted_state"])
+        self.assertFalse(public["terminal"])
+        self.assertTrue(public["reconcile_required"])
+
     def test_task_public_reads_persisted_state_without_status_refresh(self) -> None:
         task_db = workspace.tasks.TASK_DB
         task_db.parent.mkdir(parents=True, exist_ok=True)
@@ -8304,12 +9701,14 @@ class AgentWorkspaceTests(unittest.TestCase):
                     attempt INTEGER NOT NULL,
                     resume_policy TEXT NOT NULL,
                     argv_sha256 TEXT NOT NULL,
-                    cwd TEXT NOT NULL
+                    cwd TEXT NOT NULL,
+                    execution_backend TEXT NOT NULL,
+                    systemd_scope TEXT NOT NULL
                 )
                 """
             )
             connection.execute(
-                "INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     "writer-task",
                     "heim-pc",
@@ -8319,15 +9718,30 @@ class AgentWorkspaceTests(unittest.TestCase):
                     "never",
                     "a" * 64,
                     str(self.git.writer),
+                    "systemd-user",
+                    "user",
                 ),
             )
-        with mock.patch.object(
-            workspace.tasks,
-            "grabowski_task_status",
-            side_effect=AssertionError("cleanup planning must not refresh task state"),
-        ) as task_status:
+        with (
+            mock.patch.object(
+                workspace.tasks,
+                "grabowski_task_status",
+                side_effect=AssertionError("cleanup planning must not refresh task state"),
+            ) as task_status,
+            mock.patch.object(
+                workspace.tasks, "_resolve_task_dispatch_host",
+                return_value=("heim-pc",
+                              {"transport": "local", "target": "local", "enabled": True},
+                              False),
+            ) as resolver,
+            mock.patch.object(
+                workspace.tasks, "_observe", return_value={"state": "completed"}
+            ) as observe,
+        ):
             public = workspace._workspace_cleanup_task_public("writer-task")
         task_status.assert_not_called()
+        resolver.assert_called_once_with("heim-pc")
+        observe.assert_called_once()
         self.assertEqual(public["state"], "completed")
         self.assertTrue(public["terminal"])
         self.assertEqual(public["unit"], "writer.service")
@@ -11464,7 +12878,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         with (
             mock.patch.object(workspace.operator, "_require_operator_capability"),
             mock.patch.object(
-                workspace.tasks, "grabowski_task_status", side_effect=task_status
+                workspace.tasks, "grabowski_task_peek", side_effect=task_status
             ),
             mock.patch.object(workspace, "_tmux_has_session", return_value=False),
             mock.patch.object(
@@ -11479,17 +12893,20 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(
                 workspace,
                 "_require_live_lane_binding",
-                return_value={
-                    "valid": True,
-                    "lane_id": lane["lane_id"],
-                    "receipt_sha256": lane["receipt_sha256"],
-                },
-            ),
+                side_effect=AssertionError("READ_ONLY candidate requested writer lane"),
+            ) as writer_lane,
+            mock.patch.object(
+                workspace.operator,
+                "_require_operator_mutation",
+                side_effect=AssertionError("READ_ONLY candidate requested mutation"),
+            ) as mutation_gate,
         ):
             status = workspace.grabowski_agent_workspace_status(
                 manifest["workspace_id"]
             )
 
+        writer_lane.assert_not_called()
+        mutation_gate.assert_not_called()
         self.assertTrue(status["candidate_revision"]["eligible"])
         self.assertEqual(
             status["candidate_revision"]["candidate_id"], candidate["candidate_id"]
@@ -12121,8 +13538,34 @@ class AgentWorkspaceTests(unittest.TestCase):
 
 
 
+    def _use_quiescent_handoff_checkout_snapshot(self, label: str) -> None:
+        # Positive READ_ONLY status checks both stores through immutable
+        # snapshots. Setup-time writer connections can retain WAL/SHM under
+        # Python 3.12; keep live-WAL rejection covered by separate tests.
+        for module, stem in (
+            (workspace.checkouts, "checkout"),
+            (workspace.resources, "resource"),
+        ):
+            original = module.CHECKOUT_DB if stem == "checkout" else module.RESOURCE_DB
+            snapshot = self.root / f"handoff-{label}-{stem}.sqlite3"
+            source = sqlite3.connect(original)
+            target = sqlite3.connect(snapshot)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+            for suffix in ("-wal", "-shm"):
+                self.assertFalse(Path(str(snapshot) + suffix).exists())
+            scope = mock.patch.object(
+                module, "CHECKOUT_DB" if stem == "checkout" else "RESOURCE_DB", snapshot
+            )
+            scope.start()
+            self.addCleanup(scope.stop)
+
     def test_writer_handoff_eligibility_reports_each_authority_blocker(self) -> None:
         manifest, leases = self._handoff_ready_manifest()
+        self._use_quiescent_handoff_checkout_snapshot("authority-blockers")
         writer = self._handoff_writer_task(manifest)
         snapshot = workspace._git_snapshot(manifest, workspace._run)
         with mock.patch.object(workspace.resources, "list_resources", return_value=leases):
@@ -12188,6 +13631,7 @@ class AgentWorkspaceTests(unittest.TestCase):
 
     def test_writer_handoff_eligibility_accepts_current_lane_retained_active_projection(self) -> None:
         manifest, leases = self._handoff_ready_manifest()
+        self._use_quiescent_handoff_checkout_snapshot("retained-projection")
         lifecycle = dict(manifest["checkout_lifecycle"])
         lifecycle.pop("phase", None)
         lifecycle["state"] = "retained"
@@ -12424,10 +13868,29 @@ class AgentWorkspaceTests(unittest.TestCase):
 
     def test_status_exposes_eligible_redacted_writer_handoff(self) -> None:
         manifest, leases = self._handoff_ready_manifest()
+        # Positive READ_ONLY status needs quiescent copies of both stores.
+        # Python 3.12 can retain setup-time resource or checkout WAL sidecars.
+        checkout_snapshot = self.root / "handoff-status-snapshot.sqlite3"
+        resource_snapshot = self.root / "handoff-resource-snapshot.sqlite3"
+        for original, snapshot in (
+            (workspace.checkouts.CHECKOUT_DB, checkout_snapshot),
+            (workspace.resources.RESOURCE_DB, resource_snapshot),
+        ):
+            source = sqlite3.connect(original)
+            target = sqlite3.connect(snapshot)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+                source.close()
+            for suffix in ("-wal", "-shm"):
+                self.assertFalse(Path(str(snapshot) + suffix).exists())
         with (
+            mock.patch.object(workspace.checkouts, "CHECKOUT_DB", checkout_snapshot),
+            mock.patch.object(workspace.resources, "RESOURCE_DB", resource_snapshot),
             mock.patch.object(
                 workspace.tasks,
-                "grabowski_task_status",
+                "grabowski_task_peek",
                 return_value=self._handoff_writer_task(manifest),
             ),
             mock.patch.object(workspace.resources, "list_resources", return_value=leases),
@@ -12440,6 +13903,9 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(status["tasks"]["writer"]["task_id"], "writer-task")
         self.assertEqual(status["original_writer_task"]["task_id"], "writer-task")
         self.assertNotIn("command", status["writer_attempts"][0])
+        for snapshot in (checkout_snapshot, resource_snapshot):
+            for suffix in ("-wal", "-shm"):
+                self.assertFalse(Path(str(snapshot) + suffix).exists())
 
     def test_collect_uses_attempt_two_task_and_receipt(self) -> None:
         manifest = self.manifest()
