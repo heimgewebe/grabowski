@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import os
 import re
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -34,14 +35,33 @@ def _sha256_json(value: Any) -> str:
     ).hexdigest()
 
 
-def _github_json(path: str) -> tuple[dict[str, Any], str]:
-    """Bounded HTTPS read; responses, including pagination, are untrusted until checked."""
+def _github_token() -> str:
+    """Resolve the existing trusted operator GitHub credential; never fall back to anonymous."""
+    try:
+        import grabowski_operator as operator
+
+        # Reuse the operator's isolated, bounded gh-auth/keyring lookup. The
+        # token remains process-local and never enters a receipt or URL.
+        return operator._github_pr_view_auth_token(
+            str(operator.TRUSTED_GITHUB_CLI_PATH), dict(os.environ), "github.com"
+        )
+    except (ImportError, AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        raise ReleaseAdmissionDenied(
+            "authenticated GitHub credential unavailable"
+        ) from None
+
+
+def _github_json(path: str, *, token: str) -> tuple[dict[str, Any], str]:
+    """Bounded authenticated HTTPS read; responses remain untrusted until checked."""
+    if not isinstance(token, str) or not token or any(ord(char) < 33 or ord(char) == 127 for char in token):
+        raise ReleaseAdmissionDenied("authenticated GitHub credential invalid")
     conn = http.client.HTTPSConnection(GITHUB_HOST, timeout=15)
     try:
         conn.request(
             "GET", path,
             headers={
                 "Accept": "application/vnd.github+json",
+                "Authorization": "Bearer " + token,
                 "User-Agent": "grabowski-release-admission/2",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
@@ -66,7 +86,7 @@ def _github_json(path: str) -> tuple[dict[str, Any], str]:
     return data, link
 
 
-def _github_inventory(path: str, key: str) -> list[dict[str, Any]]:
+def _github_inventory(path: str, key: str, *, token: str) -> list[dict[str, Any]]:
     """Read all pages, fail closed on changed counts, missing pages and unsafe links."""
     collected: list[dict[str, Any]] = []
     observed_ids: set[int] = set()
@@ -74,7 +94,7 @@ def _github_inventory(path: str, key: str) -> list[dict[str, Any]]:
     for page in range(1, MAX_GITHUB_ITEMS // GITHUB_PAGE_SIZE + 1):
         suffix = "&" if "?" in path else "?"
         page_path = f"{path}{suffix}per_page={GITHUB_PAGE_SIZE}&page={page}"
-        data, link = _github_json(page_path)
+        data, link = _github_json(page_path, token=token)
         items = data.get(key)
         count = data.get("total_count")
         if (
@@ -114,12 +134,48 @@ def _github_inventory(path: str, key: str) -> list[dict[str, Any]]:
     raise ReleaseAdmissionDenied("authoritative CI pagination exceeds bound")
 
 
-def _fresh_github_checks(target_head: str) -> dict[str, Any]:
-    """Bind green checks to the actual canonical workflow, run, job and suite."""
-    if not isinstance(target_head, str) or not _SHA40.fullmatch(target_head):
-        raise ReleaseAdmissionDenied("release target commit is invalid")
+def _trusted_validate_workflow_blob(
+    *, serving_head: str, target_head: str, token: str,
+) -> str:
+    """The target cannot redefine its own validation policy and grade itself.
+
+    The actually serving source is our immutable CI-policy trust anchor. A
+    changed workflow requires a separate authorization path, never green job
+    names produced by that changed workflow.
+    """
+    prefix = f"/repos/{REPOSITORY}/contents/{CANONICAL_WORKFLOW_PATH}"
+    blobs: list[str] = []
+    for head in (serving_head, target_head):
+        value, link = _github_json(f"{prefix}?ref={head}", token=token)
+        blob = value.get("sha")
+        if (
+            link or value.get("path") != CANONICAL_WORKFLOW_PATH
+            or value.get("type") != "file"
+            or not isinstance(blob, str)
+            or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", blob) is None
+        ):
+            raise ReleaseAdmissionDenied("trusted Validate workflow identity is unproved")
+        blobs.append(blob)
+    if blobs[0] != blobs[1]:
+        raise ReleaseAdmissionDenied("trusted Validate workflow definition changed")
+    return blobs[0]
+
+
+def _fresh_github_checks(target_head: str, *, serving_head: str) -> dict[str, Any]:
+    """Bind green checks to the trusted immutable workflow, run, job and suite."""
+    if (
+        not isinstance(target_head, str) or not _SHA40.fullmatch(target_head)
+        or not isinstance(serving_head, str) or not _SHA40.fullmatch(serving_head)
+    ):
+        raise ReleaseAdmissionDenied("release target or serving commit is invalid")
+    token = _github_token()
+    trusted_blob = _trusted_validate_workflow_blob(
+        serving_head=serving_head, target_head=target_head, token=token,
+    )
     prefix = f"/repos/{REPOSITORY}"
-    workflow, link = _github_json(f"{prefix}/actions/workflows/validate.yml")
+    workflow, link = _github_json(
+        f"{prefix}/actions/workflows/validate.yml", token=token
+    )
     workflow_id = workflow.get("id")
     if (
         link or type(workflow_id) is not int or workflow_id <= 0
@@ -130,7 +186,7 @@ def _fresh_github_checks(target_head: str) -> dict[str, Any]:
 
     runs = _github_inventory(
         f"{prefix}/actions/workflows/{workflow_id}/runs?head_sha={target_head}",
-        "workflow_runs",
+        "workflow_runs", token=token,
     )
     matching: list[dict[str, Any]] = []
     for run in runs:
@@ -158,7 +214,7 @@ def _fresh_github_checks(target_head: str) -> dict[str, Any]:
         return number, run_id
     latest = max(matching, key=order)
     run_id = latest["id"]
-    run, link = _github_json(f"{prefix}/actions/runs/{run_id}")
+    run, link = _github_json(f"{prefix}/actions/runs/{run_id}", token=token)
     attempt, suite_id = run.get("run_attempt"), run.get("check_suite_id")
     if (
         link or run.get("id") != run_id
@@ -181,7 +237,7 @@ def _fresh_github_checks(target_head: str) -> dict[str, Any]:
     ):
         raise ReleaseAdmissionDenied("current canonical Validate run is not authenticated green")
 
-    jobs = _github_inventory(f"{prefix}/actions/runs/{run_id}/jobs?filter=all", "jobs")
+    jobs = _github_inventory(f"{prefix}/actions/runs/{run_id}/jobs?filter=all", "jobs", token=token)
     selected: dict[str, dict[str, Any]] = {}
     for job in jobs:
         name = job.get("name")
@@ -208,7 +264,7 @@ def _fresh_github_checks(target_head: str) -> dict[str, Any]:
         check_id = job["id"]
         # The job ID is the Check-Run ID. Fetch it directly rather than
         # enumerating unrelated checks on a busy commit (possibly >1,000).
-        check, link = _github_json(f"{prefix}/check-runs/{check_id}")
+        check, link = _github_json(f"{prefix}/check-runs/{check_id}", token=token)
         suite = check.get("check_suite") if isinstance(check, dict) else None
         app = check.get("app") if isinstance(check, dict) else None
         if (
@@ -231,6 +287,7 @@ def _fresh_github_checks(target_head: str) -> dict[str, Any]:
         })
     workflow_identity = {
         "id": workflow_id, "path": CANONICAL_WORKFLOW_PATH,
+        "trusted_blob_oid": trusted_blob,
         "run_id": run_id, "run_attempt": attempt,
         "check_suite_id": suite_id, "event": "push", "head_branch": "main",
         "head_repository": REPOSITORY, "head_sha": target_head,
@@ -318,7 +375,7 @@ def validate_release(
         serving_head=serving_head, target_head=target_head,
         diff_sha256=diff_sha256, review_pr=review_pr,
     )
-    checks = _fresh_github_checks(target_head)
+    checks = _fresh_github_checks(target_head, serving_head=serving_head)
     material = {
         "schema_version": 1,
         "kind": "grabowski_post_merge_release_review",
