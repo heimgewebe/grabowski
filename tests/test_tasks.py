@@ -7334,6 +7334,64 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(before, snapshot(), "READ_ONLY must preserve databases, archives and sidecars")
         return status
 
+    def test_retained_archived_ssh_attempt_survives_current_local_fleet_drift(self) -> None:
+        # Regression for already-existing historical archive switches. The
+        # pre-fix Fleet race could dispatch over SSH even with both
+        # marker=1 and a later launcher transport='local'. An archive of that
+        # row must never erase its physical historical attempt or let today's
+        # local-only inventory prove global readiness.
+        # This does NOT authorize creating new archives on an unproven route.
+        with patch.dict(os.environ, {
+            "GRABOWSKI_TASK_ARCHIVE_ROOT": str(self.task_archive_root),
+            "GRABOWSKI_TASK_PROJECTION_ROOT": str(self.task_projection_root),
+        }):
+            task_id = self._start()["task"]["task_id"]
+            unit = tasks._task_unit(task_id, 1)
+            with tasks._database_connection() as writer:
+                writer.execute(
+                    "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                    (json.dumps({
+                        "task_output_managed_from_attempt": 1,
+                        "task_launch_transport": "local",
+                    }), task_id),
+                )
+            self._archive_and_project_tasks([task_id])
+            with patch.object(tasks.operator, "_require_operator_mutation"):
+                with tasks._database_connection() as writer:
+                    prepared = tasks._prepare_task_reconcile_retained_evidence(writer)
+                tasks._publish_task_reconcile_ready_evidence(prepared)
+            projection = tasks._task_current_projection(readiness_bounded=True)
+            self.assertIn(task_id, projection["archived_task_bindings"])
+            with tasks._task_readonly_snapshot() as reader:
+                row = reader.execute(
+                    "SELECT attempt, launcher_json, state FROM tasks WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
+                cohorts = tasks._task_retained_cohorts(reader)
+            self.assertIsNotNone(row)
+            self.assertEqual(1, row["attempt"])
+            self.assertEqual("local", json.loads(row["launcher_json"])["task_launch_transport"])
+            self.assertIn(["local", "systemd-user", "user", "completed"], cohorts)
+            self.assertEqual("completed", row["state"])
+
+            remote_active = {unit: "active"}
+            with (
+                patch.object(tasks.fleet, "run_fleet_host",
+                             side_effect=AssertionError("READ_ONLY cannot SSH")),
+                patch.object(tasks.privileged, "root_task_systemd_request",
+                             side_effect=AssertionError("READ_ONLY cannot probe root")),
+            ):
+                status = self._retained_archive_readonly_status()
+            self.assertEqual("active", remote_active[unit])
+            self.assertEqual("retained_attempt_authority_unverified", status["status"])
+            self.assertNotEqual("verified", status["status"])
+            self.assertEqual(
+                tasks.lifecycle_projection.lifecycle.sha256_json(
+                    tasks._task_archive_record(tasks._row_raw(task_id))
+                ),
+                projection["archived_task_bindings"][task_id]["record_sha256"],
+            )
+
     def test_retained_archive_minimal_witness_binds_validated_projection(self) -> None:
         task_id, proof = self._retained_archive_witness()
         projection = tasks._task_current_projection(readiness_bounded=True)
