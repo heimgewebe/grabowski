@@ -5884,6 +5884,10 @@ def _dispatch(
 
 
 def _task_output_managed_from_attempt(record: dict[str, Any]) -> int | None:
+    # This prelaunch marker constrains future routing; it is not historical
+    # transport evidence. Legacy marker=1 rows could have crossed to SSH after
+    # persistence. This fix neither backfills nor verifies their old attempts;
+    # v4 readiness's marker-only index cannot establish that provenance.
     raw = record.get("launcher_json")
     if not isinstance(raw, str):
         return None
@@ -6743,6 +6747,49 @@ def _root_task_payload(record: dict[str, Any], operation: str, **extra: Any) -> 
     return {"operation": operation, "unit": _authoritative_unit(record), **extra}
 
 
+def _task_launch_error(
+    exc: Exception, *, outcome_unknown: bool = False
+) -> dict[str, Any]:
+    return {
+        "returncode": 1,
+        "stdout": "",
+        "stderr": _redact_reason(f"{type(exc).__name__}: {exc}"),
+        "timed_out": False,
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+        "root_truth_observable": False,
+        "outcome_unknown": outcome_unknown,
+        "launch_not_dispatched": not outcome_unknown,
+        "privileged_broker": None,
+    }
+
+
+def _dispatch_managed_local_task(host: str, argv: list[str]) -> dict[str, Any]:
+    """Revalidate authority, then physically dispatch only to local user systemd."""
+    try:
+        if fleet.fleet_host(host)["transport"] != "local":
+            raise RuntimeError("Managed local task launch requires current local transport")
+    except (OSError, RuntimeError, ValueError) as exc:
+        return _task_launch_error(exc)
+    # Do not pass this launch through _dispatch/run_fleet_host: another Fleet
+    # lookup could switch to SSH after validation and export local privileges.
+    # Once _run begins, an exception cannot prove that the unit was not started.
+    try:
+        result = operator._run(
+            argv,
+            cwd=operator.HOME,
+            timeout_seconds=60,
+            max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+        )
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        result = _task_launch_error(exc, outcome_unknown=True)
+    if result.get("timed_out"):
+        result = {**result, "outcome_unknown": True}
+    # Evidence for this dispatch attempt only, including ambiguous outcomes.
+    # It does not upgrade the provenance of earlier attempts on the same row.
+    return {**result, "task_launch_transport": "local"}
+
+
 def _launch(record: dict[str, Any]) -> dict[str, Any]:
     if _is_root_systemd_backend(record):
         try:
@@ -6769,33 +6816,30 @@ def _launch(record: dict[str, Any]) -> dict[str, Any]:
                 "launch_not_dispatched": True,
                 "privileged_broker": None,
             }
-    target = fleet.fleet_host(record["host"])
     try:
+        target = fleet.fleet_host(record["host"])
+        managed_local = (
+            _task_output_contract_version(record) == TASK_OUTPUT_CONTRACT_VERSION
+        )
+        if managed_local and target["transport"] != "local":
+            raise RuntimeError("Managed local task launch requires current local transport")
         _stage_task_output_capture_script(
             record["host"], transport=target["transport"]
+        )
+        argv = _launch_argv(
+            record,
+            include_managed_runtime=target["transport"] == "local",
         )
     except (OSError, PermissionError, RuntimeError, ValueError) as exc:
         # The row is already committed as launching and its leases are held.
         # Raising here would strand it, so report the same undispatched shape
         # the root launch path uses and let the caller release the attempt.
-        return {
-            "returncode": 1,
-            "stdout": "",
-            "stderr": _redact_reason(f"{type(exc).__name__}: {exc}"),
-            "timed_out": False,
-            "stdout_truncated": False,
-            "stderr_truncated": False,
-            "root_truth_observable": False,
-            "outcome_unknown": False,
-            "launch_not_dispatched": True,
-            "privileged_broker": None,
-        }
+        return _task_launch_error(exc)
+    if managed_local:
+        return _dispatch_managed_local_task(record["host"], argv)
     return _dispatch(
         record["host"],
-        _launch_argv(
-            record,
-            include_managed_runtime=target["transport"] == "local",
-        ),
+        argv,
         timeout_seconds=60,
     )
 
@@ -10134,6 +10178,7 @@ def grabowski_task_start(
         "unit": unit,
         "launcher_returncode": launcher["returncode"],
         "launcher_outcome_unknown": bool(launcher.get("outcome_unknown")),
+        "task_launch_transport": launcher.get("task_launch_transport"),
         "task_output_managed_from_attempt": task_output_managed_from_attempt,
         "recovery_required": recovery_gate.get("required", False),
         "recovery_checked_at_unix": recovery_gate.get("checked_at_unix"),
@@ -10657,6 +10702,7 @@ def grabowski_task_resume(
         "systemd_scope": _systemd_scope(record),
         "launcher_returncode": launcher["returncode"],
         "launcher_outcome_unknown": bool(launcher.get("outcome_unknown")),
+        "task_launch_transport": launcher.get("task_launch_transport"),
         "task_output_managed_from_attempt": task_output_managed_from_attempt,
         "recovery_required": recovery_gate.get("required", False),
         "recovery_checked_at_unix": recovery_gate.get("checked_at_unix"),

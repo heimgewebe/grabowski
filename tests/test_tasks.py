@@ -212,8 +212,18 @@ class TaskTests(unittest.TestCase):
             tasks.operator, "_run", side_effect=isolated_unit_inventory,
         )
         self.unit_inventory_patch.start()
+        # Store/lifecycle tests already replace _dispatch to simulate launches.
+        # Keep that same mock boundary for the new private local path. The
+        # ManagedLocalLaunchTests below disable this adapter and test the real
+        # dispatcher with inert _run and Fleet transports.
+        self.managed_local_dispatch_patch = patch.object(
+            tasks, "_dispatch_managed_local_task",
+            side_effect=lambda host, argv: tasks._dispatch(host, argv, timeout_seconds=60),
+        )
+        self.managed_local_dispatch_patch.start()
 
     def tearDown(self) -> None:
+        self.managed_local_dispatch_patch.stop()
         self.unit_inventory_patch.stop()
         self.admission_patch.stop()
         self.resource_patch.stop()
@@ -18374,6 +18384,209 @@ class TaskTests(unittest.TestCase):
             [tasks.resources.inspect_resource(key) for key in fixture["resource_keys"]],
         )
 
+
+
+class ManagedLocalLaunchTests(unittest.TestCase):
+    """Exercise the real launch dispatch with inert execution and isolated stores."""
+
+    def setUp(self) -> None:
+        TaskTests.setUp(self)
+        # Other task-store tests mock the common dispatch seam. These tests
+        # explicitly exercise the physical managed-local dispatcher instead.
+        adapter = getattr(self, "managed_local_dispatch_patch", None)
+        if adapter is not None:
+            adapter.stop()
+        self.no_fleet = patch.object(
+            tasks.fleet, "load_fleet", side_effect=AssertionError("live Fleet forbidden")
+        )
+        self.no_fleet.start()
+        self.addCleanup(self.no_fleet.stop)
+
+    tearDown = TaskTests.tearDown
+
+    @contextmanager
+    def _inert(self, routes: list, *, run_error: Exception | None = None):
+        remaining = iter(routes[1:] or routes)
+        remote_dispatches = []
+        launch_resolutions = []
+        launching = False
+        original_launch = tasks._launch
+
+        def resolve(host):
+            target = next(remaining, routes[-1]) if launching else routes[0]
+            if launching:
+                launch_resolutions.append(target)
+            if isinstance(target, Exception):
+                raise target
+            return target
+
+        def launch(record):
+            nonlocal launching
+            # Admission/cwd/workspace checks retain the initial route. Flip
+            # only at the real launch boundary, after start persisted its row
+            # or resume revalidated authority and selected the next attempt.
+            launching = True
+            return original_launch(record)
+
+        def remote(host, argv, **kwargs):
+            # Model run_fleet_host's additional authority resolution, without
+            # ever running SSH, systemd, a user command or a privileged broker.
+            target = tasks.fleet.fleet_host(host)
+            if target["transport"] == "ssh":
+                remote_dispatches.append(list(argv))
+            return {"result": _launcher()}
+
+        def run(argv, **kwargs):
+            if argv[0] == "systemd-run" and run_error is not None:
+                raise run_error
+            return _launcher()
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", side_effect=resolve) as authority,
+            patch.object(tasks, "_launch", side_effect=launch),
+            patch.object(tasks.fleet, "run_fleet_host", side_effect=remote) as fleet_run,
+            patch.object(tasks.fleet, "run_fleet_task_capture_stage", return_value={"result": _launcher()}) as remote_stage,
+            patch.object(tasks, "_stage_task_output_capture_script", wraps=tasks._stage_task_output_capture_script) as stage,
+            patch.object(tasks.operator, "_run", side_effect=run) as local_run,
+            patch.object(tasks.operator, "_managed_runtime_environment", return_value={"XDG_RUNTIME_DIR": "/run/user/1000"}),
+            patch.object(tasks.privileged, "root_task_systemd_request", side_effect=AssertionError("root execution forbidden")),
+            patch.object(tasks.base, "_append_audit") as audit,
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+        ):
+            yield types.SimpleNamespace(
+                authority=authority, fleet_run=fleet_run, remote_stage=remote_stage,
+                stage=stage, local_run=local_run, remote_dispatches=remote_dispatches,
+                audit=audit, launch_resolutions=launch_resolutions,
+            )
+
+    def _start(self, *, host: str = "local") -> dict:
+        return tasks.grabowski_task_start(
+            host, ["/bin/echo", "route-bound"], cwd=str(self.root),
+            runtime_seconds=60, resume_policy="verify-then-retry",
+            resource_keys=["component:managed-local-launch-test"],
+        )
+
+    def _assert_rejected(self, result: dict, probes) -> None:
+        task = result["task"]
+        launcher = task["launcher"]
+        self.assertEqual(task["state"], "failed")
+        self.assertTrue(launcher["launch_not_dispatched"])
+        self.assertFalse(launcher["outcome_unknown"])
+        self.assertIn("local", launcher["stderr"])
+        self.assertEqual(probes.remote_dispatches, [])
+        probes.fleet_run.assert_not_called()
+        probes.remote_stage.assert_not_called()
+        self.assertFalse(any(c.args[0][0] == "systemd-run" for c in probes.local_run.call_args_list))
+        row = tasks._row_raw(str(task["task_id"]))
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(json.loads(row["launcher_json"]), launcher)
+        self.assertIsNone(tasks.resources.inspect_resource("component:managed-local-launch-test"))
+        outcome = tasks.TASK_OUTCOMES_DIR / f"{task['task_id']}.json"
+        self.assertEqual(json.loads(outcome.read_text())["state"], "failed")
+        self.assertEqual(result["audit"]["launcher_returncode"], 1)
+        self.assertFalse(result["audit"]["launcher_outcome_unknown"])
+        self.assertIsNone(result["audit"]["task_launch_transport"])
+        self.assertIn(result["audit"], [c.args[0] for c in probes.audit.call_args_list])
+
+    def test_persisted_local_marker_rejects_ssh_before_staging(self) -> None:
+        with self._inert([LOCAL_HOST, REMOTE_HOST]) as probes:
+            result = self._start()
+            self._assert_rejected(result, probes)
+        probes.stage.assert_not_called()
+        self.assertEqual(result["task"]["launcher"][tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY], 1)
+
+    def test_local_staging_then_ssh_at_dispatch_is_undispatched(self) -> None:
+        with self._inert([LOCAL_HOST, LOCAL_HOST, REMOTE_HOST]) as probes:
+            result = self._start()
+            self._assert_rejected(result, probes)
+        probes.stage.assert_called_once_with("local", transport="local")
+
+    def test_local_dispatch_never_calls_fleet_runner_that_could_resolve_ssh(self) -> None:
+        with self._inert([LOCAL_HOST, LOCAL_HOST, LOCAL_HOST, REMOTE_HOST]) as probes:
+            result = self._start()
+        probes.fleet_run.assert_not_called()
+        probes.remote_stage.assert_not_called()
+        self.assertEqual(probes.launch_resolutions, [LOCAL_HOST, LOCAL_HOST])
+        self.assertEqual(result["task"]["state"], "running")
+        self.assertEqual(result["task"]["launcher"]["task_launch_transport"], "local")
+        self.assertEqual(result["audit"]["task_launch_transport"], "local")
+        runs = [c for c in probes.local_run.call_args_list if c.args[0][0] == "systemd-run"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].args[0].count("--user"), 1)
+        self.assertIn("--setenv=XDG_RUNTIME_DIR=/run/user/1000", runs[0].args[0])
+
+    def test_stable_local_executes_exactly_one_user_unit(self) -> None:
+        with self._inert([LOCAL_HOST]) as probes:
+            result = self._start()
+        self.assertEqual(result["task"]["state"], "running")
+        runs = [c.args[0] for c in probes.local_run.call_args_list if c.args[0][0] == "systemd-run"]
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0][1], "--user")
+        probes.fleet_run.assert_not_called()
+
+    def test_marked_resume_rejects_route_change_after_revalidation(self) -> None:
+        with self._inert([LOCAL_HOST]):
+            started = self._start()
+        task_id = str(started["task"]["task_id"])
+        observation = {
+            "state": "failed", "properties": {"Result": "exit-code"},
+            "probe": _launcher(1), "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with self._inert([LOCAL_HOST, REMOTE_HOST]) as probes, patch.object(
+            tasks, "_observe", return_value=observation
+        ):
+            resumed = tasks.grabowski_task_resume(task_id)
+            self._assert_rejected(resumed, probes)
+        self.assertEqual(resumed["task"]["attempt"], 2)
+        probes.stage.assert_not_called()
+
+    def test_legacy_unmarked_remote_keeps_remote_route_without_local_privileges(self) -> None:
+        with self._inert([REMOTE_HOST]) as probes:
+            result = self._start(host="remote")
+        self.assertEqual(result["task"]["state"], "running")
+        self.assertNotIn(tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY, result["task"]["launcher"])
+        self.assertEqual(len(probes.remote_dispatches), 1)
+        probes.remote_stage.assert_called_once()
+        argv = probes.remote_dispatches[0]
+        self.assertFalse(any(item.startswith("--setenv=XDG_RUNTIME_DIR=") for item in argv))
+        self.assertFalse(any(c.args[0][0] == "systemd-run" for c in probes.local_run.call_args_list))
+        self.assertNotIn("task_launch_transport", result["task"]["launcher"])
+
+    def test_rootbroker_never_receives_managed_local_dispatch(self) -> None:
+        with self._inert([LOCAL_HOST]) as probes, patch.object(
+            tasks.privileged, "root_task_systemd_request", return_value=_launcher()
+        ) as broker:
+            result = tasks.grabowski_task_start(
+                "local", ["/usr/local/bin/sleep-heimserver"], cwd=str(self.root), runtime_seconds=300
+            )
+            # Even a legacy/corrupt marker must not give the system backend
+            # user-systemd output or environment privileges.
+            row = tasks._row_raw(str(result["task"]["task_id"]))
+            marked = {**row, "launcher_json": json.dumps({tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY: 1})}
+            second = tasks._launch(marked)
+        self.assertEqual(result["task"]["execution_backend"], "systemd-root-broker")
+        self.assertNotIn(tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY, result["task"]["launcher"])
+        self.assertNotIn("task_launch_transport", second)
+        self.assertEqual(broker.call_count, 2)
+        probes.stage.assert_not_called()
+        probes.fleet_run.assert_not_called()
+        self.assertFalse(any(c.args[0][0] == "systemd-run" for c in probes.local_run.call_args_list))
+
+    def test_launch_authority_error_after_persistence_is_terminal(self) -> None:
+        with self._inert([LOCAL_HOST, ValueError("local authority unavailable")]) as probes:
+            result = self._start()
+            self._assert_rejected(result, probes)
+        probes.stage.assert_not_called()
+
+    def test_started_local_runner_error_is_unknown_and_retains_resources(self) -> None:
+        with self._inert([LOCAL_HOST], run_error=OSError("runner outcome unavailable")) as probes:
+            result = self._start()
+        self.assertEqual(result["task"]["state"], "outcome_unknown")
+        self.assertTrue(result["task"]["launcher"]["outcome_unknown"])
+        self.assertFalse(result["task"]["launcher"].get("launch_not_dispatched", False))
+        self.assertIsNotNone(tasks.resources.inspect_resource("component:managed-local-launch-test"))
+        probes.fleet_run.assert_not_called()
 
 
 class RuntimeContractTests(unittest.TestCase):
