@@ -8240,9 +8240,13 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
 
     @staticmethod
     def _git_oid(kind: str, raw: bytes) -> str:
-        return hashlib.sha1(
-            kind.encode("ascii") + b" " + str(len(raw)).encode("ascii") + b"\0" + raw
-        ).hexdigest()
+        # Let Git calculate its native object ID, rather than using an ad hoc
+        # digest implementation on test fixture content. The repository's Git
+        # object format, not this test, determines the hash algorithm.
+        return subprocess.run(
+            ["/usr/bin/git", "hash-object", "-t", kind, "--stdin"],
+            input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        ).stdout.decode("ascii").strip()
 
     def _prepare(self, root: Path, *, tamper: bool = False,
                  version: str = "6.0.3"):
