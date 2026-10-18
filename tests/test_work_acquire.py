@@ -570,6 +570,36 @@ class WorkAcquireTests(unittest.TestCase):
         acquire.assert_not_called()
         ensure.assert_not_called()
 
+    def test_multibatch_expired_owner_lease_blocks_before_worktree(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:expiry-{i:03d}" for i in range(76)]
+        receipts = []
+        def acquire(owner, keys, **_kwargs):
+            result = self.acquired(owner, keys)
+            receipts.extend(result["leases"])
+            return result
+        def expired_inventory(**_kwargs):
+            return [
+                {**lease, "expires_at_unix": int(time.time()) + 5}
+                if lease["resource_key"] == "component:expiry-000" else lease
+                for lease in receipts
+            ]
+        ensure = Mock(return_value={
+            "result_state": "CREATED", "durable_receipt_sha256": "b" * 64,
+            "post_state": {"target_registered": True, "target_path_exists": True},
+        })
+        release = Mock(side_effect=self.release)
+        with patch.object(work_acquire.resources, "list_resources",
+                          side_effect=expired_inventory):
+            result = work_acquire.acquire_work(
+                params, acquire_resources_fn=acquire,
+                release_resources_fn=release, inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure, runner=Mock(),
+            )
+        self.assertIn(result["state"], ("blocked", "outcome_unknown"))
+        self.assertEqual(result["decision"], "HARD_BLOCK")
+        ensure.assert_not_called()
+
     def test_large_scope_atomic_batches(self) -> None:
         for total in (63, 64, 65, 78):
             with self.subTest(total=total):
@@ -579,10 +609,13 @@ class WorkAcquireTests(unittest.TestCase):
                 ]
                 params["idempotency_key"] = f"large-scope-{total}"
                 calls = []
+                live_leases = []
                 def acquire(owner, keys, **_kwargs):
                     self.assertLessEqual(len(keys), 64)
                     calls.append((owner, list(keys)))
-                    return self.acquired(owner, keys)
+                    receipt = self.acquired(owner, keys)
+                    live_leases.extend(receipt['leases'])
+                    return receipt
                 ensure = Mock(return_value={
                     "result_state": "CREATED", "durable_receipt_sha256": "b" * 64,
                     "post_state": {"target_registered": True, "target_path_exists": True},
@@ -590,6 +623,7 @@ class WorkAcquireTests(unittest.TestCase):
                 result = work_acquire.acquire_work(
                     params, acquire_resources_fn=acquire,
                     release_resources_fn=Mock(), inspect_resource_fn=Mock(),
+                    lease_inventory_fn=lambda **_: live_leases,
                     ensure_worktree_fn=ensure, runner=Mock(),
                 )
                 self.assertEqual(result["state"], "ready")
@@ -641,6 +675,33 @@ class WorkAcquireTests(unittest.TestCase):
             [row["resource_key"] for row in first],
         )
 
+    def test_multibatch_preserved_same_owner_is_never_renewed_before_later_conflict(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:preserved-{i:03d}" for i in range(76)]
+        first_keys = []
+        no_renew_guards = []
+        def acquire(owner, keys, **kwargs):
+            no_renew_guards.append(kwargs.get("_work_lane_no_renew_preserved"))
+            if not first_keys:
+                first_keys.extend(keys)
+                return self.acquired(owner, keys, preserved=list(keys))
+            raise work_acquire.resources.ResourceConflict(
+                keys[0], "foreign-owner", int(time.time()) + 1200,
+            )
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+        result = work_acquire.acquire_work(
+            params, acquire_resources_fn=acquire,
+            release_resources_fn=release, inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure, runner=Mock(),
+        )
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["compensation"]["state"], "complete")
+        self.assertEqual(result["compensation"]["preserved_resource_keys"], first_keys)
+        self.assertEqual(no_renew_guards, [True, True])
+        release.assert_not_called()
+        ensure.assert_not_called()
+
     def test_large_scope_lost_second_response_never_starts_writer(self) -> None:
         params = self.parameters()
         params["resource_keys"] = [f"component:unknown-{i:03d}" for i in range(76)]
@@ -679,6 +740,7 @@ class WorkAcquireTests(unittest.TestCase):
     def test_bureau_path_and_branch_use_same_owner_separate_contract_groups(self) -> None:
         calls: list[dict[str, object]] = []
         events: list[str] = []
+        live_leases = []
 
         def acquire(
             owner: str, keys: list[str], **kwargs: object
@@ -693,7 +755,7 @@ class WorkAcquireTests(unittest.TestCase):
                     "contract_group": contract_group,
                 }
             )
-            return self.acquired(
+            receipt = self.acquired(
                 owner,
                 keys,
                 bureau_contract=(
@@ -702,6 +764,8 @@ class WorkAcquireTests(unittest.TestCase):
                     else None
                 ),
             )
+            live_leases.extend(receipt["leases"])
+            return receipt
 
         def ensure(*_args: object) -> dict[str, object]:
             events.append("ensure")
@@ -724,6 +788,7 @@ class WorkAcquireTests(unittest.TestCase):
                 acquire_resources_fn=acquire,
                 release_resources_fn=Mock(),
                 inspect_resource_fn=Mock(),
+                lease_inventory_fn=lambda **_: live_leases,
                 ensure_worktree_fn=ensure,
                 runner=Mock(),
             )
@@ -863,6 +928,10 @@ class WorkAcquireTests(unittest.TestCase):
                 acquire_resources_fn=acquire,
                 release_resources_fn=release,
                 inspect_resource_fn=Mock(),
+                lease_inventory_fn=lambda **_: [
+                    lease for receipt in acquired_receipts.values()
+                    for lease in receipt['leases']
+                ],
                 ensure_worktree_fn=ensure,
                 runner=Mock(),
             )
@@ -7218,7 +7287,10 @@ class WorkAcquireTests(unittest.TestCase):
             patch.object(
                 work_acquire.resources,
                 "list_resources",
-                side_effect=[[own_lease, late_lease], []],
+                side_effect=[
+                    sorted([own_lease, late_lease], key=lambda item: item["resource_key"]),
+                    [],
+                ],
             ) as listing,
             patch.object(
                 work_acquire.resources,
@@ -7311,6 +7383,97 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertFalse(release.call_args_list[1].kwargs["force"])
         self.assertEqual(first, release.call_args_list[0].kwargs["expected_leases"])
         self.assertEqual(second, release.call_args_list[1].kwargs["expected_leases"])
+
+    def test_terminal_513_sqlite_lease_closeout_keeps_foreign_owner(self) -> None:
+        inputs = work_acquire._normalize(self.parameters())
+        inputs.pop("_scoped_writer_argv")
+        owner = str(inputs["lease_owner_id"])
+        record = {"lane_id": inputs["lane_id"], "inputs": inputs}
+        own_keys = [f"component:sqlite-terminal-{i:04d}" for i in range(513)]
+        foreign_key = "component:sqlite-terminal-foreign"
+        native_release = work_acquire.resources.release_resources
+        with (
+            patch.object(work_acquire.resources, "RESOURCE_DB",
+                         self.state / "sqlite-terminal-resources.sqlite3"),
+            patch.object(work_acquire.resources, "grabowski_resource_release",
+                         side_effect=native_release),
+        ):
+            for start in range(0, len(own_keys), 64):
+                work_acquire.resources.acquire_resources(
+                    owner, own_keys[start:start + 64], purpose="terminal sqlite fixture",
+                )
+            foreign = work_acquire.resources.acquire_resources(
+                "operator:sqlite-foreign", [foreign_key], purpose="foreign fixture",
+            )["leases"][0]
+            self.assertEqual(513, work_acquire.resources.count_resources(owner_id=owner))
+            result = work_acquire._converge_terminal_resource_leases(
+                record, assessment={"phase": "terminal", "lease_release_ready": True},
+            )
+            self.assertEqual(0, work_acquire.resources.count_resources(owner_id=owner))
+            self.assertEqual(foreign, work_acquire.resources.inspect_resource(foreign_key))
+        self.assertEqual(513, len(result["released_resource_keys"]))
+        self.assertEqual(9, result["release_batch_count"])
+
+    def test_terminal_resource_convergence_releases_513_owner_leases(self) -> None:
+        params = self.parameters()
+        params["resource_keys"] = [f"component:registered-{i:03d}" for i in range(510)]
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        owner = str(inputs["lease_owner_id"])
+        leases = self.acquired(
+            owner, [f"operation:late-owner-{i:04d}" for i in range(513)]
+        )["leases"]
+        held = {item["resource_key"]: item for item in leases}
+        record = {"lane_id": inputs["lane_id"], "inputs": inputs}
+        def inventory(*, limit, start_after_key=None, **_kwargs):
+            return [held[k] for k in sorted(held) if start_after_key is None
+                    or k > start_after_key][:limit]
+        def release_batch(who, keys, *, force, expected_leases):
+            self.assertEqual(who, owner)
+            self.assertFalse(force)
+            for key, expected in zip(keys, expected_leases):
+                self.assertEqual(work_acquire._lease_snapshot(held[key], owner_id=owner), expected)
+            for key in keys:
+                held.pop(key)
+            return self.released(owner, expected_leases)
+        with (
+            patch.object(work_acquire.resources, "list_resources", side_effect=inventory),
+            patch.object(work_acquire.resources, "count_resources", side_effect=lambda **_: len(held)),
+            patch.object(work_acquire.resources, "grabowski_resource_release",
+                         side_effect=release_batch) as release,
+        ):
+            outcome = work_acquire._converge_terminal_resource_leases(
+                record, assessment={"phase": "terminal", "lease_release_ready": True},
+            )
+        self.assertEqual("released", outcome["state"])
+        self.assertEqual(513, len(outcome["released_resource_keys"]))
+        self.assertEqual(9, outcome["release_batch_count"])
+        self.assertEqual(9, release.call_count)
+        self.assertFalse(held)
+
+    def test_terminal_owner_inventory_keyset_paginates_1001_leases(self) -> None:
+        inputs = work_acquire._normalize(self.parameters())
+        inputs.pop("_scoped_writer_argv")
+        owner = str(inputs["lease_owner_id"])
+        leases = self.acquired(
+            owner, [f"operation:page-{i:04d}" for i in range(1001)]
+        )["leases"]
+        calls = []
+        def inventory(*, limit, start_after_key=None, **_kwargs):
+            calls.append((limit, start_after_key))
+            return [item for item in leases if start_after_key is None
+                    or item["resource_key"] > start_after_key][:limit]
+        with (
+            patch.object(work_acquire.resources, "list_resources", side_effect=inventory),
+            patch.object(work_acquire.resources, "count_resources", return_value=1001),
+        ):
+            _owner, _registered, snapshots = work_acquire._terminal_lane_resource_observation(
+                {"lane_id": inputs["lane_id"], "inputs": inputs},
+            )
+        self.assertEqual(1001, len(snapshots))
+        self.assertEqual(2, len(calls))
+        self.assertEqual((1000, None), calls[0])
+        self.assertEqual((1000, leases[999]["resource_key"]), calls[1])
 
     def test_terminal_resource_convergence_stops_between_batches_on_owner_drift(self) -> None:
         params = self.parameters()

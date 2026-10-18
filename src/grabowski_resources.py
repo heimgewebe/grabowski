@@ -6038,6 +6038,7 @@ def acquire_resources(
     admission_assessor: Any | None = None,
     _work_admission_mode: str = "normal",
     _preserve_live_same_owner: bool = False,
+    _work_lane_no_renew_preserved: bool = False,
     _commit_precondition: Any | None = None,
     _user_systemd_stop_recovery_fence_id: str | None = None,
 ) -> dict[str, Any]:
@@ -6056,6 +6057,10 @@ def acquire_resources(
         raise ValueError("_commit_precondition must be callable")
     if _preserve_live_same_owner and task_owner_match is None:
         raise PermissionError("live lease preservation requires a task owner")
+    if not isinstance(_work_lane_no_renew_preserved, bool):
+        raise ValueError("_work_lane_no_renew_preserved must be boolean")
+    if _work_lane_no_renew_preserved and re.fullmatch(r"lane:[0-9a-f]{32}", owner) is None:
+        raise PermissionError("non-renewing Work Lane acquisition requires a lane owner")
     normalized_metadata: dict[str, Any] = {} if metadata is None else dict(metadata)
     if _user_systemd_stop_recovery_fence_id is not None:
         if (
@@ -6410,7 +6415,14 @@ def acquire_resources(
                         )
                     acquired = int(row["acquired_at_unix"])
                     current_expires = int(row["expires_at_unix"])
-                    lease_expires = max(current_expires, expires)
+                    # Across multiple atomic Work Lane batches, a preserved
+                    # same-owner lease cannot be extended and left behind by
+                    # compensation when a subsequent batch conflicts.
+                    lease_expires = (
+                        current_expires
+                        if _work_lane_no_renew_preserved
+                        else max(current_expires, expires)
+                    )
                     updated = (
                         now
                         if lease_expires > current_expires
@@ -8099,9 +8111,17 @@ def list_resources(
     include_expired: bool = False,
     limit: int = 200,
     read_only: bool = False,
+    start_after_key: str | None = None,
 ) -> list[dict[str, Any]]:
     if not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError("limit must be between 1 and 1000")
+    if start_after_key is not None and (
+        not isinstance(start_after_key, str)
+        or not start_after_key
+        or "\x00" in start_after_key
+        or len(start_after_key.encode("utf-8")) > 4096
+    ):
+        raise ValueError("start_after_key must be a bounded opaque resource key")
     parameters: list[Any] = []
     clauses: list[str] = []
     if owner_id is not None:
@@ -8111,6 +8131,9 @@ def list_resources(
         now = _now()
         clauses.append("typeof(expires_at_unix)='integer' AND expires_at_unix>?")
         parameters.append(now)
+    if start_after_key is not None:
+        clauses.append("resource_key>?")
+        parameters.append(start_after_key)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     parameters.append(limit)
     if not isinstance(read_only, bool):

@@ -3299,6 +3299,60 @@ class ResourceTests(unittest.TestCase):
             ):
                 resources.renew_resources("owner-a", [key], ttl_seconds=60)
 
+    def test_work_lane_preserved_generation_is_not_renewed_across_batches(self) -> None:
+        owner = "lane:" + "a" * 32
+        key = "component:preserved-no-mutation"
+        with patch.object(resources, "_now", return_value=100):
+            original = resources.acquire_resources(
+                owner, [key], purpose="stable lane", ttl_seconds=60,
+            )
+        with patch.object(resources, "_now", return_value=110):
+            preserved = resources.acquire_resources(
+                owner, [key], purpose="stable lane", ttl_seconds=900,
+                _work_lane_no_renew_preserved=True,
+            )
+            observed = resources.inspect_resource(key)
+        self.assertEqual([key], preserved["preserved"])
+        self.assertEqual(original["leases"], preserved["leases"])
+        self.assertEqual(original["leases"][0], observed)
+        self.assertEqual(160, preserved["leases"][0]["expires_at_unix"])
+        with self.assertRaisesRegex(PermissionError, "requires a lane owner"):
+            resources.acquire_resources(
+                "operator:not-a-lane", [key], purpose="stable lane",
+                _work_lane_no_renew_preserved=True,
+            )
+        with self.assertRaisesRegex(ValueError, "must be boolean"):
+            resources.acquire_resources(
+                owner, [key], purpose="stable lane",
+                _work_lane_no_renew_preserved=1,
+            )
+
+    def test_owner_resource_keyset_inventory_is_complete_beyond_one_page(self) -> None:
+        owner = "lane:" + "b" * 32
+        keys = [f"component:keyset-{i:03d}" for i in range(70)]
+        resources.acquire_resources(owner, keys[:64], purpose="owner keyset")
+        resources.acquire_resources(owner, keys[64:], purpose="owner keyset")
+        resources.acquire_resources(
+            "operator:foreign-keyset", ["component:keyset-foreign"],
+            purpose="foreign",
+        )
+        found = []
+        cursor = None
+        for expected_count in (32, 32, 6):
+            kwargs = {"owner_id": owner, "limit": 32}
+            if cursor is not None:
+                kwargs["start_after_key"] = cursor
+            page = resources.list_resources(**kwargs)
+            self.assertEqual(expected_count, len(page))
+            found.extend(item["resource_key"] for item in page)
+            cursor = page[-1]["resource_key"]
+        self.assertEqual(keys, found)
+        self.assertEqual([], resources.list_resources(
+            owner_id=owner, limit=32, start_after_key=cursor,
+        ))
+        with self.assertRaisesRegex(ValueError, "start_after_key"):
+            resources.list_resources(owner_id=owner, start_after_key="bad\x00key")
+
     def test_live_same_owner_reentry_is_identity_bound_and_never_shortens(self) -> None:
         key = "component:same-owner-reentry"
         with patch.object(resources, "_now", return_value=100):
