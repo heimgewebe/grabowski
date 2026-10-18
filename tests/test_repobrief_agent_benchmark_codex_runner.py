@@ -2667,6 +2667,60 @@ class RepoBriefCodexRunnerTests(unittest.TestCase):
             )
             self.assertFalse(workspace.exists())
 
+    def test_future_pair_clone_budget_uses_order_when_treatment_runs_first(
+        self,
+    ) -> None:
+        # A treatment-first pair has a future baseline clone, not a third
+        # phantom treatment clone. The first one-shot cannot start unless
+        # headroom is reserved, while the final condition needs no reserve.
+        for condition, order, expected_headroom in (
+            ("treatment", 1, 25_018),
+            ("baseline", 2, 0),
+        ):
+            with self.subTest(condition=condition, order=order):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    source, commit = repository(root)
+                    state = root / "state"
+                    state.mkdir(mode=0o700)
+                    candidate = request(condition=condition, commit=commit)
+                    candidate["order"] = order
+                    candidate["setup"] = {
+                        "working_tree": "clean",
+                        "fixture": "fresh-matching-snapshot",
+                    }
+                    observed: list[int] = []
+
+                    def check_headroom(future_entries: int) -> None:
+                        observed.append(future_entries)
+                        raise runner.RunnerError("bounded before provider intent")
+
+                    with patch.object(
+                        runner, "_assert_private_output_tree_scan", return_value=25_000
+                    ) as count_staged:
+                        with self.assertRaisesRegex(
+                            runner.RunnerError, "bounded before provider intent"
+                        ):
+                            runner.create_checkout(
+                                candidate,
+                                source,
+                                state,
+                                preallocate_check=check_headroom,
+                            )
+                    self.assertEqual(observed, [expected_headroom])
+                    if order == 1:
+                        count_staged.assert_called_once()
+                    else:
+                        count_staged.assert_not_called()
+                    workspace = (
+                        state
+                        / "codex-workspaces"
+                        / hashlib.sha256(
+                            candidate["workspace_id"].encode("utf-8")
+                        ).hexdigest()
+                    )
+                    self.assertFalse(workspace.exists())
+
     def test_private_output_scan_reserves_preintent_artifact_entries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -5530,6 +5584,117 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
     @patch.object(
         runner, "_require_in_process_pair_condition", new=lambda _request: None
     )
+    def test_preintent_mcp_output_reservation_follows_first_pair_condition(
+        self,
+    ) -> None:
+        # Cost and provider calls are mocked. Prove that even a treatment-first
+        # pair reserves the future baseline outputs, but baseline-last does
+        # not reserve a phantom third treatment stage.
+        for condition, order, expected in (
+            ("treatment", 1, ["treatment", "baseline"]),
+            ("baseline", 2, ["baseline"]),
+        ):
+            with self.subTest(condition=condition, order=order):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    value = request(condition=condition)
+                    value["order"] = order
+                    if condition == "treatment":
+                        bind_manifest(value, root)
+                    planned_request_root(root, value)
+                    args = Namespace(
+                        request_root=root / "requests",
+                        repository_map=root / "repositories.json",
+                        state_root=root / "state",
+                        transcript_root=root / "transcripts",
+                        provider_evidence_root=root / "provider-evidence",
+                        codex_command="/opt/codex",
+                        codex_command_sha256="1" * 64,
+                        allow_live_provider=True,
+                        stream_fixture=None,
+                        stderr_fixture=None,
+                        fixture_returncode=0,
+                    )
+                    future_manifest = {
+                        "path": "/bundle/manifest.json",
+                        "sha256": "a" * 64,
+                    }
+                    dispatch = {
+                        "authorization": {"contract": "test-only"},
+                        "provider_codex": {},
+                        "provider_authentication": {},
+                        "repository_map_bytes": b"{}",
+                        "mcp_files": synthetic_paired_mcp_files(),
+                        "proxy_code": {},
+                        "proxy_base_code": {},
+                        "manifest": future_manifest,
+                        "binding": {
+                            "mcp_command_files": synthetic_paired_mcp_files(),
+                            "manifest": future_manifest,
+                        },
+                    }
+                    reserved: list[str] = []
+
+                    def reserve(
+                        which: str, _manifest: object, **_kwargs: object
+                    ) -> int:
+                        reserved.append(which)
+                        return 4 if which == "baseline" else 11
+
+                    with ExitStack() as stack:
+                        for name, result in (
+                            ("validate_executable", "/opt/codex"),
+                            ("validate_toolchain", None),
+                            ("_repository_root_from_authorized_map_bytes", root),
+                            ("_load_preflight_dispatch_authorization", dispatch),
+                        ):
+                            stack.enter_context(
+                                patch.object(runner, name, return_value=result)
+                            )
+                        for name in (
+                            "_assert_authorized_codex_executable",
+                            "_require_external_provider_one_shot",
+                            "_assert_authorized_runtime_binding",
+                        ):
+                            stack.enter_context(patch.object(runner, name))
+                        stage = stack.enter_context(
+                            patch.object(
+                                runner,
+                                "_preintent_output_entry_reservation",
+                                side_effect=reserve,
+                            )
+                        )
+                        stack.enter_context(
+                            patch.object(
+                                runner,
+                                "validate_live_immutable_mounts",
+                                side_effect=runner.RunnerError(
+                                    "observed preintent reservation before provider"
+                                ),
+                            )
+                        )
+                        login = stack.enter_context(
+                            patch.object(runner, "validate_chatgpt_subscription")
+                        )
+                        checkout = stack.enter_context(
+                            patch.object(runner, "create_checkout")
+                        )
+                        provider = stack.enter_context(
+                            patch.object(runner, "run_bounded")
+                        )
+                        with self.assertRaisesRegex(
+                            runner.RunnerError,
+                            "observed preintent reservation before provider",
+                        ):
+                            runner.execute(value, args)
+                    self.assertEqual(reserved, expected)
+                    self.assertEqual(stage.call_count, len(expected))
+                    for forbidden in (login, checkout, provider):
+                        forbidden.assert_not_called()
+
+    @patch.object(
+        runner, "_require_in_process_pair_condition", new=lambda _request: None
+    )
     def test_live_mount_drift_blocks_before_workspace_and_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -7474,21 +7639,33 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
         try:
             program = "import os,sys; os.write(int(sys.argv[1]), b'PARENT_READY')"
             completed = subprocess.run(
-                [
-                    "/usr/bin/bwrap",
-                    "--ro-bind",
-                    "/",
-                    "/",
-                    "--unshare-pid",
-                    "--proc",
-                    "/proc",
-                    "--",
-                    sys.executable,
-                    "-I",
-                    "-c",
-                    program,
-                    str(ready_write),
-                ],
+                runner._unix_socket_restricted_codex_argv(
+                    [
+                        "/usr/bin/bwrap",
+                        "--ro-bind",
+                        "/",
+                        "/",
+                        "--unshare-pid",
+                        "--unshare-ipc",
+                        "--die-with-parent",
+                        "--proc",
+                        "/proc",
+                        "--dev",
+                        "/dev",
+                        "--tmpfs",
+                        "/tmp",
+                        "--chmod",
+                        "1777",
+                        "/tmp",
+                        "--",
+                        sys.executable,
+                        "-I",
+                        "-c",
+                        program,
+                        str(ready_write),
+                    ],
+                    block_network=True,
+                ),
                 pass_fds=(ready_write,),
                 capture_output=True,
                 timeout=12,
@@ -7512,44 +7689,12 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
     def test_trusted_parent_broker_delayed_sequential_mcp_responses(self) -> None:
         # Live bwrap, frozen source, authenticated parent-side MCP and an
         # untrusted Codex-style relay. Nothing invokes the model or uses USD.
-        if (
-            sys.platform != "linux"
-            or not Path("/usr/bin/bwrap").is_file()
-            or not Path("/usr/bin/unshare").is_file()
-        ):
-            self.skipTest("Linux bwrap and unshare are required")
-        # CI can run ordinary bwrap but deny a second user namespace. This
-        # kernel-only test must remain real on hosts supporting the attack.
-        probe = subprocess.run(
-            [
-                "/usr/bin/bwrap",
-                "--ro-bind",
-                "/",
-                "/",
-                "--unshare-pid",
-                "--unshare-ipc",
-                "--die-with-parent",
-                "--proc",
-                "/proc",
-                "--",
-                "/usr/bin/unshare",
-                "--user",
-                "--map-root-user",
-                "--mount",
-                "--pid",
-                "--fork",
-                "/bin/true",
-            ],
-            capture_output=True,
-            check=False,
-            timeout=12,
-        )
-        if probe.returncode != 0 and (
-            b"No permissions to create new namespace" in probe.stderr
-            or b"unshare failed: Operation not permitted" in probe.stderr
-        ):
-            self.skipTest("kernel policy denies required nested namespaces")
-        self.assertEqual(probe.returncode, 0, probe.stderr)
+        if sys.platform != "linux" or not Path("/usr/bin/bwrap").is_file():
+            self.skipTest("Linux bwrap required for parent-broker/FIFO proof")
+        # No nested-userns preflight here: GitHub's AppArmor permits the
+        # outer bwrap while denying an additional user namespace. The
+        # parent-owned broker, RO FIFO, delayed replies and large frame must
+        # still be exercised in CI. Nested forgery has separate kernel tests.
         with tempfile.TemporaryDirectory(dir=Path.home()) as temporary:
             root = Path(temporary)
             state = root / "state"
@@ -7695,55 +7840,9 @@ print("PARENT_FIFO_UNMODIFIABLE")
                 self.assertEqual(adversary.returncode, 0, adversary.stderr)
                 self.assertIn(b"PARENT_FIFO_UNMODIFIABLE", adversary.stdout)
 
-                # Nested user/mount/PID namespaces can still forge a read-only
-                # *view* of the genuine stage; only the separate trusted parent
-                # is allowed to execute source bytes from its own mount view.
-                namespace_attack = """
-import ctypes, os, pathlib, sys
-root = pathlib.Path(sys.argv[1])
-libc = ctypes.CDLL(None, use_errno=True)
-libc.mount.argtypes = [
-    ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
-    ctypes.c_ulong, ctypes.c_char_p,
-]
-if libc.mount(b'tmpfs', os.fsencode(root), b'tmpfs', 0, b'size=1048576'):
-    raise OSError(ctypes.get_errno(), "nested mount unavailable")
-fake = root / 'script' / 'stdio.py'
-fake.parent.mkdir()
-fake.write_text("FAKE_EXECUTABLE_FROM_PROVIDER_NAMESPACE")
-if libc.mount(None, os.fsencode(root), None, 33, None):
-    raise OSError(ctypes.get_errno(), "nested read-only remount failed")
-if not os.statvfs(root).f_flag & os.ST_RDONLY:
-    raise RuntimeError("forged mount is not read-only")
-if fake.read_text() != "FAKE_EXECUTABLE_FROM_PROVIDER_NAMESPACE":
-    raise RuntimeError("forged source is not visible to attacker")
-print("PROVIDER_READONLY_STAGE_FORGED")
-"""
-                nested_argv = [
-                    *argv[: argv.index("--") + 1],
-                    "/usr/bin/unshare",
-                    "--user",
-                    "--map-root-user",
-                    "--mount",
-                    "--pid",
-                    "--fork",
-                    str(python),
-                    "-I",
-                    "-c",
-                    namespace_attack,
-                    str(upstream_stage["runtime_dir"]),
-                ]
-                nested = subprocess.run(
-                    runner._unix_socket_restricted_codex_argv(
-                        nested_argv, provider_pid_namespace=True
-                    ),
-                    cwd=ROOT,
-                    capture_output=True,
-                    timeout=15,
-                    check=False,
-                )
-                self.assertEqual(nested.returncode, 0, nested.stderr)
-                self.assertIn(b"PROVIDER_READONLY_STAGE_FORGED", nested.stdout)
+                # The actual mount-forgery counterexample belongs to its
+                # separate nested-userns test; the normal broker test must
+                # never depend on permission to create a second userns.
                 self.assertIsNone(broker["process"].poll())
 
                 relay = subprocess.Popen(

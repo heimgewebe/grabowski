@@ -3969,13 +3969,12 @@ def create_checkout(
                 _assert_private_output_tree_scan((state_root,), reserved_entries=1)
             else:
                 future_pair_entries = 0
-                if request["condition"] == "baseline":
-                    # Fail before a non-retryable baseline one-shot if the
-                    # future treatment clone might exceed the output cap.
-                    # Count generated .git as well as tracked entries and
-                    # The state-root preflight already scans this baseline
-                    # staging checkout. Reserve only the future treatment clone
-                    # plus its metadata and ledger entries, not two more copies.
+                if request["order"] == 1:
+                    # The first condition can be treatment or baseline. Before
+                    # spending its one-shot, reserve only the remaining
+                    # condition's clone. The current staged checkout is
+                    # already included in the state-root scan, and no third
+                    # clone exists for the final condition.
                     staged_entries = _assert_private_output_tree_scan(
                         (staged_checkout,)
                     )
@@ -10559,11 +10558,10 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
     preallocate_check: Callable[[], None] | None = None
     if dispatch_authorization is not None:
         assert codex is not None
-        # A baseline's own authorization contains the future Treatment
-        # MCP executable/script/manifest closure, even though no MCP tool
-        # is called in baseline. Validate and reserve that *before* spending
-        # the baseline one-shot. Benchmark source and MCP source need not
-        # be the same repository.
+        # Every admitted pair has an immutable ordered condition list. The
+        # first condition (whether baseline or treatment) must reserve the
+        # remaining condition's outputs *before* spending its one-shot.
+        # Benchmark and MCP source need not be the same repository.
         future_mcp_files = _normalized_authorized_mcp_files(
             dispatch_authorization["binding"].get("mcp_command_files")
         )
@@ -10582,11 +10580,13 @@ def execute(request: Mapping[str, Any], args: argparse.Namespace) -> dict[str, A
             legacy_g1=legacy_g1,
             state_root=args.state_root,
         )
-        if request["condition"] == "baseline":
-            # Reserve entire future Treatment executable closure, including
-            # the second immutable MCP stage, before baseline provider intent.
+        if request["order"] == 1:
+            # Reserve only the condition that remains, independent of order.
+            future_condition = (
+                "treatment" if request["condition"] == "baseline" else "baseline"
+            )
             pending_output_entries += _preintent_output_entry_reservation(
-                "treatment",
+                future_condition,
                 dispatch_authorization["binding"].get("manifest"),
                 mcp_script=mcp_script,
                 legacy_g1=legacy_g1,
