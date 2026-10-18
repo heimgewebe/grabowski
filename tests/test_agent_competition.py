@@ -1222,7 +1222,7 @@ class AgentCompetitionTests(unittest.TestCase):
         cancel.assert_called_once_with("task-manifest")
         with mock.patch.object(
             competition.tasks,
-            "grabowski_task_status",
+            "grabowski_task_peek",
             return_value={"task_id": "task-manifest", "unit": "u", "state": "cancelled"},
         ):
             status = competition.grabowski_agent_competition_status(identifier)
@@ -1299,7 +1299,7 @@ class AgentCompetitionTests(unittest.TestCase):
         self._write_receipt(started["competition_id"], changed_paths=["src/sample.py"], risks=["race"], tests=["unit test"])
         with mock.patch.object(
             competition.tasks,
-            "grabowski_task_status",
+            "grabowski_task_peek",
             return_value={"task_id": started["task_id"], "unit": "u", "attempt": 1, "state": "completed", "updated_at_unix": 1},
         ):
             status = competition.grabowski_agent_competition_status(started["competition_id"])
@@ -1938,8 +1938,9 @@ class AgentCompetitionTests(unittest.TestCase):
     def test_task_start_exception_reconciles_one_exact_persistent_task(self) -> None:
         request_id = "reconcile-exact"
 
-        def task_list(*, limit=20, state=None, view="minimal", cursor=None, fields=None):
+        def task_list(*, limit=20, state=None, view="minimal", cursor=None, fields=None, read_only=False):
             del state, fields
+            self.assertTrue(read_only)
             self.assertEqual(limit, competition.START_RECONCILE_PAGE_LIMIT)
             self.assertEqual(view, "standard")
             self.assertIsNone(cursor)
@@ -1987,8 +1988,9 @@ class AgentCompetitionTests(unittest.TestCase):
         request_id = "reconcile-ambiguous"
         task = "Improve sample"
 
-        def task_list(*, limit=20, state=None, view="minimal", cursor=None, fields=None):
+        def task_list(*, limit=20, state=None, view="minimal", cursor=None, fields=None, read_only=False):
             del state, fields
+            self.assertTrue(read_only)
             self.assertEqual(limit, competition.START_RECONCILE_PAGE_LIMIT)
             self.assertEqual(view, "standard")
             self.assertIsNone(cursor)
@@ -2053,9 +2055,9 @@ class AgentCompetitionTests(unittest.TestCase):
         }
         calls: list[dict[str, object]] = []
 
-        def task_list(*, limit=20, state=None, view="minimal", cursor=None, fields=None):
+        def task_list(*, limit=20, state=None, view="minimal", cursor=None, fields=None, read_only=False):
             del state, fields
-            calls.append({"limit": limit, "view": view, "cursor": cursor})
+            calls.append({"limit": limit, "view": view, "cursor": cursor, "read_only": read_only})
             if cursor is None:
                 return {
                     "tasks": [{
@@ -2079,10 +2081,26 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                {"limit": competition.START_RECONCILE_PAGE_LIMIT, "view": "standard", "cursor": None},
-                {"limit": competition.START_RECONCILE_PAGE_LIMIT, "view": "standard", "cursor": "page-two"},
+                {"limit": competition.START_RECONCILE_PAGE_LIMIT, "view": "standard", "cursor": None, "read_only": True},
+                {"limit": competition.START_RECONCILE_PAGE_LIMIT, "view": "standard", "cursor": "page-two", "read_only": True},
             ],
         )
+
+    def test_start_reconciliation_strict_read_failure_is_unavailable_not_success(self) -> None:
+        started = self._start()
+        identifier = started["competition_id"]
+        intent = competition._validated_start_intent(identifier)
+        with mock.patch.object(
+            competition.tasks,
+            "grabowski_task_list",
+            side_effect=RuntimeError("strict task WAL snapshot unavailable"),
+        ) as reader:
+            result = competition._start_reconciliation(identifier, intent)
+        self.assertEqual("task_registry_unavailable", result["state"])
+        self.assertEqual([], result["matches"])
+        self.assertIsNone(result["task"])
+        reader.assert_called_once()
+        self.assertIs(reader.call_args.kwargs["read_only"], True)
 
     def test_path_policy_blocks_keys_and_generated_trees_without_tokenizer_false_positive(self) -> None:
         self.assertFalse(competition._path_is_sensitive("src/tokenizer.py"))
@@ -2159,12 +2177,57 @@ class AgentCompetitionTests(unittest.TestCase):
         started = self._start()
         with mock.patch.object(
             competition.tasks,
-            "grabowski_task_status",
+            "grabowski_task_peek",
             return_value={"task_id": started["task_id"], "state": "running", "unit": "u"},
         ):
             status = competition.grabowski_agent_competition_status(started["competition_id"])
         self.assertEqual(status["lifecycle_state"], "provider_running")
         self.assertEqual(status["phase"], "provider_execution")
+
+
+    def test_unobserved_rootbroker_task_is_not_provider_terminal(self) -> None:
+        started = self._start()
+        for persisted_state, observed_state in (
+            ("running", "outcome_unknown"),
+            ("running", "observation_error"),
+            ("outcome_unknown", "outcome_unknown"),
+            ("outcome_unknown", "observation_error"),
+        ):
+            with self.subTest(persisted_state=persisted_state, observed_state=observed_state):
+                projection = {
+                    "task_id": started["task_id"],
+                    "unit": "root-unit",
+                    "state": observed_state,
+                    "persisted_state": persisted_state,
+                    "observation_mode": "persisted_only_rootbroker_not_probed",
+                    "reconcile_required": True,
+                }
+                with (
+                    mock.patch.object(
+                        competition.tasks, "grabowski_task_peek", return_value=projection
+                    ) as peek,
+                    mock.patch.object(
+                        competition.tasks,
+                        "grabowski_task_status",
+                        side_effect=AssertionError("READ_ONLY may not refresh a task"),
+                    ) as refresh,
+                    mock.patch.object(
+                        competition.operator,
+                        "_require_operator_mutation",
+                        side_effect=AssertionError("READ_ONLY may not mutate"),
+                    ) as mutation,
+                ):
+                    status = competition.grabowski_agent_competition_status(
+                        started["competition_id"]
+                    )
+                self.assertEqual("provider_outcome_unknown", status["lifecycle_state"])
+                self.assertEqual("task_observation", status["phase"])
+                self.assertFalse(status["candidate_ready"])
+                self.assertTrue(status["retry_blocked"])
+                self.assertFalse(status["receipt_present"])
+                peek.assert_called_once_with(started["task_id"])
+                refresh.assert_not_called()
+                mutation.assert_not_called()
 
     def test_high_novelty_security_alone_does_not_force_external_competition(self) -> None:
         result = competition.grabowski_agent_execution_route(
@@ -2349,7 +2412,7 @@ class AgentCompetitionTests(unittest.TestCase):
         os.utime(stale, (0, 0))
         with mock.patch.object(
             competition.tasks,
-            "grabowski_task_status",
+            "grabowski_task_peek",
             return_value={"task_id": started["task_id"], "state": "running", "unit": "u"},
         ):
             status = competition.grabowski_agent_competition_status(started["competition_id"])

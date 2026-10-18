@@ -231,18 +231,20 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "checkout-binding-terminal-preview": GripSpec(
         name="checkout-binding-terminal-preview",
-        version="1.0",
+        version="1.1",
         summary="Preview one evidence-bound terminal transition for a missing or safely retained managed checkout.",
-        effect=READ_ONLY,
+        effect=MUTATING,
         required_parameters=("checkout_key",),
         acceptance_ids=(
             "checkout-key-bound",
-            "preview-read-only",
+            "preview-effect-gated",
             "terminal-evidence-visible",
             "coordination-visible",
             "preview-digest-bound",
         ),
         runner="checkout_binding_terminal_preview",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
     ),
     "checkout-binding-terminal-apply": GripSpec(
         name="checkout-binding-terminal-apply",
@@ -270,9 +272,9 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "checkout-binding-identity-rebind-preview": GripSpec(
         name="checkout-binding-identity-rebind-preview",
-        version="1.1",
+        version="1.2",
         summary="Preview one clean remote-secured managed checkout bounded identity rebind.",
-        effect=READ_ONLY,
+        effect=MUTATING,
         required_parameters=("checkout_key",),
         acceptance_ids=(
             "checkout-key-bound",
@@ -282,6 +284,8 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "snapshot-bound",
         ),
         runner="checkout_binding_identity_rebind_preview",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
     ),
     "checkout-binding-identity-rebind-apply": GripSpec(
         name="checkout-binding-identity-rebind-apply",
@@ -308,9 +312,9 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "checkout-owner-handoff-preview": GripSpec(
         name="checkout-owner-handoff-preview",
-        version="1.0",
+        version="1.1",
         summary="Preview exact owner alignment for one clean managed checkout with only owner drift.",
-        effect=READ_ONLY,
+        effect=MUTATING,
         required_parameters=(
             "repo", "checkout_path", "source_lifecycle_owner_id",
             "source_retention_owner_id", "target_owner_id", "expected_head",
@@ -320,6 +324,8 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "snapshot-bound",
         ),
         runner="checkout_owner_handoff_preview",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
     ),
     "checkout-owner-handoff-apply": GripSpec(
         name="checkout-owner-handoff-apply",
@@ -6196,7 +6202,7 @@ def _run_checkout_binding_terminal_preview(
     _check(receipt, "checkout-key-bound", "pass", checkout_key)
     _check(
         receipt,
-        "preview-read-only",
+        "preview-effect-gated",
         "pass",
         f"status={output.get('status')} safe_to_apply={output.get('safe_to_apply')}",
     )
@@ -12582,7 +12588,7 @@ def _run_saga_external_merge_closeout(
         return value
 
     branch_command = [
-        "api", f"repos/{repo_slug}/branches/{quote(base, safe='/')}",
+        "api", f"repos/{repo_slug}/branches/{quote(base, safe='')}",
         "--jq", "{name:.name,sha:.commit.sha,protected:.protected}",
     ]
     branch = github_json(branch_command, "base_branch")
@@ -12652,6 +12658,10 @@ def _run_saga_external_merge_closeout(
             persisted, audit_sha = _saga_external_merge_verified_prior(existing, settlement)
             reused = True
         else:
+            if github_json(branch_command, "base_branch_postlookup_recheck") != branch:
+                raise GripPreflightError(
+                    "external merge protected base branch changed during audit lookup"
+                )
             try:
                 work_acquire = __import__("grabowski_work_acquire")
                 audit_sha = work_acquire.operator.base._append_audit_with_digest(record)

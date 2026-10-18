@@ -1662,7 +1662,9 @@ globalThis.fetch = async () => ({
             workers.base, "_profile_values", return_value=[str(profile_root)]
         ), patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
             workers.operator, "_run", return_value=result()
-        ):
+        ), patch.object(
+            workers.resources.operator, "_require_operator_mutation"
+        ) as resource_admission:
             first = workers.browser_start(str(self.binary), port=9246, persistent_profile=str(profile), runtime_seconds=60)["worker"]
             marker = profile / "session-state-marker"
             marker.write_text("survives", encoding="utf-8")
@@ -1670,6 +1672,7 @@ globalThis.fetch = async () => ({
             self.assertEqual(stopped["worker"]["state"], "stopped")
             self.assertTrue(profile.is_dir())
             second = workers.browser_start(str(self.binary), port=9247, persistent_profile=str(profile), runtime_seconds=60)["worker"]
+        resource_admission.assert_any_call("resource_lease")
         self.assertNotEqual(first["worker_id"], second["worker_id"])
         self.assertEqual(first["profile_path"], second["profile_path"])
         self.assertEqual(marker.read_text(encoding="utf-8"), "survives")

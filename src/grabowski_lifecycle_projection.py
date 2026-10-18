@@ -14,6 +14,8 @@ import grabowski_lifecycle_effect_plan as effect_plan
 
 SCHEMA_VERSION = 1
 MAX_SWITCH_BYTES = 8 * 1024 * 1024
+MAX_ARCHIVE_MANIFEST_BYTES = 16 * 1024 * 1024
+MAX_ARCHIVE_RECORDS_BYTES = 64 * 1024 * 1024
 SWITCH_NAME = re.compile(r"switch-([0-9a-f]{64})\.json\Z")
 SWITCH_KEYS = frozenset(
     {
@@ -260,7 +262,9 @@ def _validate_switch_payload(
     value: Mapping[str, Any],
     *,
     archive_root: Path,
-) -> dict[str, Any]:
+    max_archive_manifest_bytes: int | None = None,
+    max_archive_records_bytes: int | None = None,
+) -> tuple[dict[str, Any], int, int]:
     switch = dict(value)
     if set(switch) != SWITCH_KEYS:
         raise LifecycleProjectionIntegrityError("projection switch fields are not exact")
@@ -320,7 +324,11 @@ def _validate_switch_payload(
             "projection effect plan identities do not match switch task bindings"
         )
     try:
-        verified_archive = lifecycle.verify_task_archive_segment(archive_root / segment_id)
+        verified_archive = lifecycle.verify_task_archive_segment(
+            archive_root / segment_id,
+            max_manifest_bytes=max_archive_manifest_bytes,
+            max_records_bytes=max_archive_records_bytes,
+        )
     except lifecycle.LifecycleArchiveIntegrityError as exc:
         raise LifecycleProjectionIntegrityError(str(exc)) from exc
     manifest = verified_archive["manifest"]
@@ -338,20 +346,35 @@ def _validate_switch_payload(
             )
     if task_bindings != _task_bindings_from_archive(verified_archive):
         raise LifecycleProjectionIntegrityError("projection task bindings drift from archive segment")
-    return switch
+    return (
+        switch,
+        int(verified_archive["manifest_bytes"]),
+        int(verified_archive["records_bytes"]),
+    )
 
 
 def verify_task_archive_projection_switch(
     switch_path: Path,
     *,
     archive_root: Path,
+    max_switch_bytes: int | None = None,
+    max_archive_manifest_bytes: int | None = None,
+    max_archive_records_bytes: int | None = None,
+    include_verified_bytes: bool = False,
 ) -> dict[str, Any]:
     if switch_path.parent.is_symlink():
         raise LifecycleProjectionIntegrityError(
             "projection switch parent may not be a symlink"
         )
     try:
-        payload = lifecycle._read_regular_bytes(switch_path, max_bytes=MAX_SWITCH_BYTES)
+        payload = lifecycle._read_regular_bytes(
+            switch_path,
+            max_bytes=(
+                MAX_SWITCH_BYTES
+                if max_switch_bytes is None
+                else min(MAX_SWITCH_BYTES, max_switch_bytes)
+            ),
+        )
     except lifecycle.LifecycleArchiveIntegrityError as exc:
         raise LifecycleProjectionIntegrityError(str(exc)) from exc
     try:
@@ -360,7 +383,12 @@ def verify_task_archive_projection_switch(
         raise LifecycleProjectionIntegrityError("projection switch JSON is invalid") from exc
     if not isinstance(value, Mapping):
         raise LifecycleProjectionIntegrityError("projection switch must be a JSON object")
-    switch = _validate_switch_payload(value, archive_root=archive_root)
+    switch, manifest_bytes, records_bytes = _validate_switch_payload(
+        value,
+        archive_root=archive_root,
+        max_archive_manifest_bytes=max_archive_manifest_bytes,
+        max_archive_records_bytes=max_archive_records_bytes,
+    )
     _require_projection_resource(
         switch["effect_plan"],
         projection_root=switch_path.parent,
@@ -370,19 +398,46 @@ def verify_task_archive_projection_switch(
         raise LifecycleProjectionIntegrityError(
             "projection switch filename does not match segment identity"
         )
-    return {
+    result = {
         "schema_version": SCHEMA_VERSION,
         "status": "verified",
         "switch_path": str(switch_path),
         "switch": switch,
     }
+    if include_verified_bytes:
+        result["verified_bytes"] = {
+            "switch": len(payload),
+            "manifest": manifest_bytes,
+            "records": records_bytes,
+        }
+    return result
 
 
 def load_task_archive_projection(
     *,
     projection_root: Path,
     archive_root: Path,
+    max_switches: int | None = None,
+    max_archived_bindings: int | None = None,
+    max_total_records_bytes: int | None = None,
+    max_total_manifest_bytes: int | None = None,
+    max_total_switch_bytes: int | None = None,
 ) -> dict[str, Any]:
+    """Verify immutable archive bindings, optionally with strict read budgets.
+
+    A readiness caller must not materialize an unbounded directory or load
+    archive segment bytes before applying its own safety limit. The default
+    archive effect/verification API remains compatible with prior callers.
+    """
+    for label, budget in (
+        ("max_switches", max_switches),
+        ("max_archived_bindings", max_archived_bindings),
+        ("max_total_records_bytes", max_total_records_bytes),
+        ("max_total_manifest_bytes", max_total_manifest_bytes),
+        ("max_total_switch_bytes", max_total_switch_bytes),
+    ):
+        if budget is not None and (type(budget) is not int or budget < 0):
+            raise ValueError(f"{label} must be a nonnegative integer")
     if projection_root.is_symlink():
         raise LifecycleProjectionIntegrityError("projection root may not be a symlink")
     if not projection_root.exists():
@@ -394,14 +449,60 @@ def load_task_archive_projection(
         }
     if not projection_root.is_dir():
         raise LifecycleProjectionIntegrityError("projection root must be a directory")
+    if max_switches is None:
+        paths = sorted(projection_root.iterdir(), key=lambda item: item.name)
+    else:
+        # os.scandir streams names; pathlib.Path.iterdir on older Pythons
+        # can eagerly materialize the entire directory before our count.
+        paths = []
+        with os.scandir(projection_root) as entries:
+            for entry in entries:
+                if len(paths) >= max_switches:
+                    raise LifecycleProjectionIntegrityError(
+                        "projection switch enumeration exceeds readiness budget"
+                    )
+                paths.append(projection_root / entry.name)
+        paths.sort(key=lambda item: item.name)
+    remaining_records = max_total_records_bytes
+    remaining_manifests = max_total_manifest_bytes
+    remaining_switches = max_total_switch_bytes
     switches: list[dict[str, Any]] = []
     archived_task_bindings: dict[str, dict[str, str]] = {}
-    for path in sorted(projection_root.iterdir(), key=lambda item: item.name):
+    for path in paths:
         if SWITCH_NAME.fullmatch(path.name) is None:
             raise LifecycleProjectionIntegrityError(
                 f"unexpected projection root entry: {path.name}"
             )
-        verified = verify_task_archive_projection_switch(path, archive_root=archive_root)
+        verified = verify_task_archive_projection_switch(
+            path,
+            archive_root=archive_root,
+            max_switch_bytes=remaining_switches,
+            max_archive_manifest_bytes=(
+                None if remaining_manifests is None
+                else min(MAX_ARCHIVE_MANIFEST_BYTES, remaining_manifests)
+            ),
+            max_archive_records_bytes=(
+                None if remaining_records is None
+                else min(MAX_ARCHIVE_RECORDS_BYTES, remaining_records)
+            ),
+            include_verified_bytes=True,
+        )
+        measured = verified["verified_bytes"]
+        for key, remaining in (
+            ("switch", remaining_switches),
+            ("manifest", remaining_manifests),
+            ("records", remaining_records),
+        ):
+            if remaining is not None and measured[key] > remaining:
+                raise LifecycleProjectionIntegrityError(
+                    f"projection {key} bytes exceed readiness budget"
+                )
+        if remaining_switches is not None:
+            remaining_switches -= measured["switch"]
+        if remaining_manifests is not None:
+            remaining_manifests -= measured["manifest"]
+        if remaining_records is not None:
+            remaining_records -= measured["records"]
         switch = verified["switch"]
         switches.append(switch)
         for binding in switch["task_bindings"]:
@@ -418,6 +519,13 @@ def load_task_archive_projection(
                         f"task appears with conflicting archive hashes: {task_id}"
                     )
                 continue
+            if (
+                max_archived_bindings is not None
+                and len(archived_task_bindings) >= max_archived_bindings
+            ):
+                raise LifecycleProjectionIntegrityError(
+                    "projection archive binding count exceeds readiness budget"
+                )
             archived_task_bindings[task_id] = candidate
     switch_digests = sorted(switch["switch_sha256"] for switch in switches)
     return {
