@@ -8337,6 +8337,48 @@ class HashedDeployToolingBindingTests(unittest.TestCase):
                 for name in sys.modules
             ))
 
+    def test_bind_pip_uses_immutable_authenticated_lock_after_path_swap(self) -> None:
+        # RED: a peer can replace the checked lock file just before pip
+        # parses -r. Hashing the returned wheel is too late if a malicious
+        # requirements option makes pip execute an attacker sdist backend.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original_command, _ = self._prepare(root)
+            trusted = (root / "deploy-tooling.lock.txt").read_bytes()
+            untrusted = (
+                b"--no-binary=:all:\n--find-links=/untrusted-wheels\n"
+                b"pyyaml==6.0.3 --hash=sha256:" + b"0" * 64 + b"\n"
+            )
+            seen: list[str] = []
+
+            def replace_just_before_pip(argv, **kwargs):
+                if argv[:4] == ["/usr/bin/python3", "-I", "-m", "pip"]:
+                    (root / "deploy-tooling.lock.txt").write_bytes(untrusted)
+                    requirement = argv[argv.index("-r") + 1]
+                    seen.append(requirement)
+                    self.assertTrue(requirement.startswith("/proc/self/fd/"))
+                    self.assertEqual(Path(requirement).read_bytes(), trusted)
+                    self.assertEqual(len(kwargs.get("pass_fds", ())), 1)
+                    self.assertIn("require-hashes", " ".join(argv))
+                return original_command(argv, **kwargs)
+
+            previous = sys.path[:]
+            fd = None
+            try:
+                with patch.object(
+                    RUNNER, "_run_validation_command",
+                    side_effect=replace_just_before_pip,
+                ):
+                    fd = RUNNER._bind_hashed_deploy_tooling_yaml(
+                        root, repo=root, expected_head="a" * 40,
+                    )
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(sys.modules["yaml"].__version__, "6.0.3")
+                self.assertEqual(sys.path, previous)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+
     def test_bind_rejects_changed_lock_snapshot_before_download(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

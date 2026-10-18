@@ -1008,6 +1008,7 @@ def _spawn_validation_process(
     stdin: Any,
     stdout: Any,
     stderr: Any,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.Popen[Any]:
     """Spawn one validation process without leaking the parent's SIGTERM guard."""
     process: subprocess.Popen[Any] | None = None
@@ -1023,6 +1024,7 @@ def _spawn_validation_process(
             stdout=stdout,
             stderr=stderr,
             start_new_session=True,
+            **({"pass_fds": pass_fds} if pass_fds else {}),
         )
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         restored = True
@@ -1044,6 +1046,7 @@ def _run_validation_command(
     check: bool = True,
     capture: bool = False,
     env: dict[str, str],
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     """Run one validation-bootstrap command in a killable, reapable process group."""
     process = _spawn_validation_process(
@@ -1054,6 +1057,7 @@ def _run_validation_command(
         stdin=None,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
+        **({"pass_fds": pass_fds} if pass_fds else {}),
     )
     stdout: str | None = None
     stderr: str | None = None
@@ -1409,60 +1413,86 @@ def _bind_hashed_deploy_tooling_yaml(
         os.close(lock_fd)
     if lock_bytes != committed.encode("utf-8"):
         raise RuntimeError("validated deploy-tooling lock changed from committed source")
-    pinned = deploy_core.parse_pinned_lock_file(
-        lock_path, label="Deploy-Tooling-Lockfile"
+    # The checked pathname is same-UID mutable. Parse and pass only these
+    # already compared bytes to pip: immutable sealed FD survives exec through
+    # the existing isolated validation child, not an attacker-swappable file.
+    lock_memfd = os.memfd_create(
+        "grabowski-committed-tooling-lock",
+        os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
     )
-    if pinned != {"pyyaml": deploy_core.TOOLING_PYYAML_VERSION}:
-        raise RuntimeError("validated tooling lock does not pin only PyYAML")
-    allowed_hashes = set(re.findall(r"--hash=sha256:([0-9a-f]{64})", committed))
-    if not allowed_hashes:
-        raise RuntimeError("validated tooling lock lacks wheel hashes")
-    with tempfile.TemporaryDirectory(prefix="gdw-", dir=validation_root) as wheel_dir:
-        _run_validation_command(
-            [
-                "/usr/bin/python3", "-I", "-m", "pip", "download",
-                "--isolated", "--disable-pip-version-check", "--no-input",
-                "--no-cache-dir", "--require-hashes", "--no-deps",
-                "--only-binary=:all:", "--index-url", "https://pypi.org/simple",
-                "--dest", wheel_dir, "-r", str(lock_path),
-            ],
-            timeout=deploy_core.TIMEOUTS["package_install"],
-            env=_validation_environment(validation_root),
-            cwd=validation_root,
+    try:
+        pending = memoryview(lock_bytes)
+        while pending:
+            written = os.write(lock_memfd, pending)
+            if written <= 0:
+                raise RuntimeError("could not copy committed lock into memfd")
+            pending = pending[written:]
+        seal_bits = (
+            fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW
+            | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
         )
-        wheels = list(Path(wheel_dir).iterdir())
-        if len(wheels) != 1 or wheels[0].suffix != ".whl":
-            raise RuntimeError("hashed tooling download did not produce exactly one wheel")
-        wheel_fd = os.open(
-            wheels[0], os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        fcntl.fcntl(lock_memfd, fcntl.F_ADD_SEALS, seal_bits)
+        if fcntl.fcntl(lock_memfd, fcntl.F_GET_SEALS) & seal_bits != seal_bits:
+            raise RuntimeError("committed lock fd is not sealed")
+        immutable_lock = f"/proc/self/fd/{lock_memfd}"
+        pinned = deploy_core.parse_pinned_lock_file(
+            Path(immutable_lock), label="Deploy-Tooling-Lockfile"
         )
-        try:
-            before = os.fstat(wheel_fd)
-            if (
-                not stat.S_ISREG(before.st_mode)
-                or before.st_uid != os.getuid()
-                or before.st_nlink != 1
-                or not 0 < before.st_size <= 16 * 1024 * 1024
-            ):
-                raise RuntimeError("hashed tooling wheel is unsafe")
-            chunks: list[bytes] = []
-            remaining = before.st_size
-            while remaining:
-                chunk = os.read(wheel_fd, min(1024 * 1024, remaining))
-                if not chunk:
-                    raise RuntimeError("hashed tooling wheel is incomplete")
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            wheel_bytes = b"".join(chunks)
-            after = os.fstat(wheel_fd)
-            if (
-                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-                != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-                or hashlib.sha256(wheel_bytes).hexdigest() not in allowed_hashes
-            ):
-                raise RuntimeError("downloaded PyYAML wheel bytes are not lock-pinned")
-        finally:
-            os.close(wheel_fd)
+        if pinned != {"pyyaml": deploy_core.TOOLING_PYYAML_VERSION}:
+            raise RuntimeError("validated tooling lock does not pin only PyYAML")
+        allowed_hashes = set(re.findall(r"--hash=sha256:([0-9a-f]{64})", committed))
+        if not allowed_hashes:
+            raise RuntimeError("validated tooling lock lacks wheel hashes")
+        with tempfile.TemporaryDirectory(prefix="gdw-", dir=validation_root) as wheel_dir:
+            _run_validation_command(
+                [
+                    "/usr/bin/python3", "-I", "-m", "pip", "download",
+                    "--isolated", "--disable-pip-version-check", "--no-input",
+                    "--no-cache-dir", "--dest", wheel_dir,
+                    "-r", immutable_lock,
+                    "--require-hashes", "--no-deps", "--only-binary=:all:",
+                    "--index-url", "https://pypi.org/simple",
+                ],
+                timeout=deploy_core.TIMEOUTS["package_install"],
+                env=_validation_environment(validation_root),
+                cwd=validation_root,
+                pass_fds=(lock_memfd,),
+            )
+            wheels = list(Path(wheel_dir).iterdir())
+            if len(wheels) != 1 or wheels[0].suffix != ".whl":
+                raise RuntimeError("hashed tooling download did not produce exactly one wheel")
+            wheel_fd = os.open(
+                wheels[0], os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            )
+            try:
+                before = os.fstat(wheel_fd)
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or before.st_uid != os.getuid()
+                    or before.st_nlink != 1
+                    or not 0 < before.st_size <= 16 * 1024 * 1024
+                ):
+                    raise RuntimeError("hashed tooling wheel is unsafe")
+                chunks: list[bytes] = []
+                remaining = before.st_size
+                while remaining:
+                    chunk = os.read(wheel_fd, min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise RuntimeError("hashed tooling wheel is incomplete")
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                wheel_bytes = b"".join(chunks)
+                after = os.fstat(wheel_fd)
+                if (
+                    (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                    != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                    or hashlib.sha256(wheel_bytes).hexdigest() not in allowed_hashes
+                ):
+                    raise RuntimeError("downloaded PyYAML wheel bytes are not lock-pinned")
+            finally:
+                os.close(wheel_fd)
+    finally:
+        os.close(lock_memfd)
     sealed_fd = os.memfd_create(
         "grabowski-locked-pyyaml",
         os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
