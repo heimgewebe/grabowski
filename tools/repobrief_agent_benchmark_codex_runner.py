@@ -2391,6 +2391,29 @@ def _assert_private_output_tree_scan(
     return entries_seen
 
 
+def _assert_empty_mcp_stage_parent(state_root: Path) -> None:
+    """Reject leftover stages before baseline can spend pair one-shot."""
+    parent = state_root / "repoground-mcp-upstream-runtime"
+    try:
+        entry = parent.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RunnerError("pre-intent MCP stage parent is unavailable") from exc
+    if not stat.S_ISDIR(entry.st_mode):
+        raise RunnerError("pre-intent MCP stage parent is not a real directory")
+    verified, fd = _open_private_directory(parent, create_final=False)
+    try:
+        _directory_fd_matches(verified, fd)
+        if os.listdir(fd):
+            raise RunnerError(
+                "pre-intent MCP stage parent already contains a sibling stage"
+            )
+        _directory_fd_matches(verified, fd)
+    finally:
+        os.close(fd)
+
+
 def _preintent_output_entry_reservation(
     condition: str,
     expected_manifest: Mapping[str, Any] | None,
@@ -2414,6 +2437,8 @@ def _preintent_output_entry_reservation(
         raise RunnerError("pre-intent MCP script binding is missing")
     if type(legacy_g1) is not bool:
         raise RunnerError("pre-intent MCP profile is invalid")
+    if state_root is not None:
+        _assert_empty_mcp_stage_parent(state_root)
     manifest = Path(str(expected_manifest.get("path"))).expanduser()
     current, raw = _runtime_file_snapshot(
         manifest, label="RepoGround manifest", max_bytes=MAX_MANIFEST_BYTES
@@ -5941,11 +5966,17 @@ def _revalidate_mcp_file(binding: Mapping[str, Any], *, label: str) -> None:
         raise RunnerError(f"{label} changed during execution")
 
 
-def _create_private_stage_directory(parent: Path, *, prefix: str) -> tuple[Path, int]:
+def _create_private_stage_directory(
+    parent: Path, *, prefix: str, require_empty: bool = False
+) -> tuple[Path, int]:
     parent_path, parent_fd = _open_private_directory(parent)
     child_fd: int | None = None
     runtime_name: str | None = None
     try:
+        if require_empty and os.listdir(parent_fd):
+            raise RunnerError(
+                "MCP upstream stage parent already contains a sibling stage"
+            )
         for _attempt in range(4):
             candidate = prefix + sha_bytes(os.urandom(32))[:24]
             try:
@@ -7020,7 +7051,9 @@ def stage_mcp_upstream(
     stage_fd: int | None = None
     try:
         stage_root, stage_fd = _create_private_stage_directory(
-            state_root / "repoground-mcp-upstream-runtime", prefix="upstream-"
+            state_root / "repoground-mcp-upstream-runtime",
+            prefix="upstream-",
+            require_empty=True,
         )
         staged_argv = list(bound_argv)
         staged_bindings: list[dict[str, Any]] = []
@@ -7243,6 +7276,7 @@ def stage_mcp_upstream(
             raise RunnerError("MCP stage metadata changed during preparation")
         stage["metadata_binding"] = metadata_binding
         _directory_fd_matches(stage_root, stage_fd)
+        _require_unique_mcp_stage(stage_root)
         return stage
     except BaseException:
         if stage_fd is not None:
@@ -7314,7 +7348,33 @@ def _read_bound_mcp_stage_metadata(binding: Mapping[str, Any]) -> bytes:
     return raw
 
 
+def _require_unique_mcp_stage(stage_root: Path) -> None:
+    """Reject a valid but stale sibling selected through untrusted Codex argv."""
+    if (
+        not stage_root.is_absolute()
+        or os.path.normpath(str(stage_root)) != str(stage_root)
+        or stage_root.parent.name != "repoground-mcp-upstream-runtime"
+        or re.fullmatch(r"upstream-[0-9a-f]{24}", stage_root.name) is None
+    ):
+        raise RunnerError("MCP upstream stage path is invalid")
+    parent, fd = _open_private_directory(stage_root.parent, create_final=False)
+    try:
+        _directory_fd_matches(parent, fd)
+        try:
+            names = os.listdir(fd)
+        except OSError as exc:
+            raise RunnerError("MCP upstream sibling enumeration failed") from exc
+        if names != [stage_root.name]:
+            raise RunnerError(
+                "MCP upstream runtime contains a sibling or unexpected stage"
+            )
+        _directory_fd_matches(parent, fd)
+    finally:
+        os.close(fd)
+
+
 def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
+    _require_unique_mcp_stage(Path(binding["runtime_dir"]))
     bindings = binding.get("bindings")
     manifest_binding = binding.get("manifest_binding")
     manifest_artifact_bindings = binding.get("manifest_artifact_bindings")
@@ -7393,6 +7453,7 @@ def _revalidate_staged_mcp_upstream(binding: Mapping[str, Any]) -> None:
             metadata_binding,
         ],
     )
+    _require_unique_mcp_stage(Path(binding["runtime_dir"]))
 
 
 def cleanup_staged_mcp_upstream(binding: Mapping[str, Any]) -> str | None:
@@ -7523,10 +7584,13 @@ def _prepared_mcp_upstream_from_parent(
         not manifest.is_absolute()
         or metadata_path.name != MCP_STAGE_METADATA_NAME
         or metadata_path.parent.parent != expected_parent
-        or not metadata_path.parent.name.startswith("upstream-")
+        or re.fullmatch(r"upstream-[0-9a-f]{24}", metadata_path.parent.name) is None
         or not hasattr(os, "ST_RDONLY")
     ):
         raise RunnerError("MCP stage metadata is outside its authorized root")
+    # Never let a hostile provider substitute an old valid stage from a
+    # persistent StateDirectory through its own metadata-pointer argument.
+    _require_unique_mcp_stage(metadata_path.parent)
     for path in (metadata_path.parent, metadata_path, manifest):
         try:
             if not os.statvfs(path).f_flag & os.ST_RDONLY:

@@ -7147,6 +7147,114 @@ print("PARENT_NONLEADER_PID_NAMESPACE_KERNEL_PASS")
                 ):
                     runner._pin_treatment_arguments(conflicting, manifest)
 
+    def test_mcp_stage_rejects_valid_stale_sibling_before_new_stage(self) -> None:
+        # A previous interrupted run can leave a still-valid staged closure.
+        # Admission of a second one would let hostile Codex switch the
+        # signed metadata pointer between stages in the same protected state.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            manifest = root / "manifest.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            script = root / "stdio.py"
+            script.write_text("pass\n", encoding="utf-8")
+            argv = [
+                str(Path(sys.executable).resolve()),
+                str(script),
+                "--bundle-root",
+                str(manifest),
+            ]
+            auth = [
+                file_identity(Path(sys.executable)),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            first = runner.stage_mcp_upstream(state, argv, manifest, auth)
+            original_metadata = Path(first["metadata_binding"]["path"]).read_bytes()
+            try:
+                with self.assertRaisesRegex(
+                    runner.RunnerError,
+                    "sibling|already contains",
+                ):
+                    runner.stage_mcp_upstream(state, argv, manifest, auth)
+                self.assertEqual(
+                    Path(first["metadata_binding"]["path"]).read_bytes(),
+                    original_metadata,
+                )
+            finally:
+                self.assertIsNone(runner.cleanup_staged_mcp_upstream(first))
+
+    def test_mcp_proxy_rejects_both_valid_stages_when_state_has_siblings(self) -> None:
+        # Construct the otherwise-forbidden crash/sibling fixture by disabling
+        # ONLY the two new uniqueness guards during second-stage preparation.
+        # Each snapshot remains a legitimate hashed parent-staged program tree.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            manifest = root / "bundle.manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            script = root / "stdio.py"
+            script.write_text("pass", encoding="utf-8")
+            python = Path(sys.executable).resolve()
+            files = [
+                file_identity(python),
+                file_identity(script),
+                file_identity(manifest),
+            ]
+            manifest_stage = runner.stage_repoground_manifest(state, files[-1])
+            bound_manifest = Path(manifest_stage["path"])
+            bound_files = runner._rebind_staged_manifest_authorization(
+                files, manifest_stage
+            )
+            upstream = [str(python), str(script), "--bundle-root", str(bound_manifest)]
+            first = runner.stage_mcp_upstream(
+                state, upstream, bound_manifest, bound_files
+            )
+            original_creator = runner._create_private_stage_directory
+
+            def allow_test_only_sibling(parent, *, prefix, require_empty=False):
+                return original_creator(parent, prefix=prefix, require_empty=False)
+
+            with (
+                patch.object(
+                    runner,
+                    "_create_private_stage_directory",
+                    side_effect=allow_test_only_sibling,
+                ),
+                patch.object(runner, "_require_unique_mcp_stage"),
+            ):
+                second = runner.stage_mcp_upstream(
+                    state, upstream, bound_manifest, bound_files
+                )
+                runner._revalidate_staged_mcp_upstream(first)
+                runner._revalidate_staged_mcp_upstream(second)
+
+            for selected in (first, second):
+                reference = runner.canonical(
+                    runner._mcp_stage_wire(selected["metadata_binding"])
+                )
+                with self.subTest(selected=Path(selected["runtime_dir"]).name):
+                    with self.assertRaisesRegex(runner.RunnerError, "sibling"):
+                        runner._prepared_mcp_upstream_from_parent(
+                            reference, bound_manifest
+                        )
+                    with self.assertRaisesRegex(runner.RunnerError, "sibling"):
+                        runner._revalidate_staged_mcp_upstream(selected)
+
+            with self.assertRaisesRegex(
+                runner.RunnerError, "pre-intent MCP stage parent already contains"
+            ):
+                runner._assert_empty_mcp_stage_parent(state)
+
+            # Test-only bypass allows deleting EXACT known staged fixture B,
+            # never an arbitrary leftover; A then cleans up without bypass.
+            with patch.object(runner, "_require_unique_mcp_stage"):
+                self.assertIsNone(runner.cleanup_staged_mcp_upstream(second))
+            self.assertIsNone(runner.cleanup_staged_mcp_upstream(first))
+            self.assertIsNone(runner.cleanup_staged_repoground_manifest(manifest_stage))
+
     def test_mcp_stage_metadata_integrity_alias_and_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
