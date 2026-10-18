@@ -1499,6 +1499,58 @@ def _critical_inventory_broker_call(
     }
 
 
+def _critical_inventory_proven_pre_effect_refusal(
+    invoked: dict[str, Any],
+) -> str | None:
+    """Trust only a root-broker, exact-request, pre-claim no-dispatch receipt.
+
+    A generic {"error": ...}, an incomplete transport, or a post-claim
+    failure is never evidence that the action did not execute.
+    """
+    if (
+        invoked.get("broker_client_timed_out") is not False
+        or "broker_client_transport_error" not in invoked
+        or invoked["broker_client_transport_error"] is not None
+        or invoked.get("stdout_truncated") is not False
+        or invoked.get("stderr_truncated") is not False
+    ):
+        return None
+    def _canonical_lower_hex(value: object, length: int) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == length
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    if (
+        not _canonical_lower_hex(invoked.get("request_id"), 32)
+        or not _canonical_lower_hex(invoked.get("reference_sha256"), 64)
+    ):
+        return None
+    response = invoked.get("broker_response")
+    if not isinstance(response, dict) or set(response) != {
+        "schema_version", "kind", "request_id", "reference_sha256",
+        "action", "phase", "claim_started", "dispatch_started", "reason_code",
+    }:
+        return None
+    if (
+        type(response["schema_version"]) is not int
+        or response["schema_version"] != 1
+        or response["kind"]
+        != "grabowski.critical_user_data_inventory_pre_effect_refusal.v1"
+        or response["request_id"] != invoked.get("request_id")
+        or response["reference_sha256"] != invoked.get("reference_sha256")
+        or response["action"] != CRITICAL_USER_DATA_INVENTORY_ACTION
+        or response["phase"] != "pre_claim"
+        or response["claim_started"] is not False
+        or response["dispatch_started"] is not False
+        or not isinstance(response["reason_code"], str)
+        or response["reason_code"] not in {"action_resolution", "peer_authority"}
+    ):
+        return None
+    return str(response["reason_code"])
+
+
 def _critical_inventory_response(
     operation: str,
     scanner: str,
@@ -1752,6 +1804,10 @@ def grabowski_critical_user_data_inventory(
         action=CRITICAL_USER_DATA_INVENTORY_ACTION,
         ambiguous_on_invalid=True,
     )
+    pre_effect_refusal = (
+        _critical_inventory_proven_pre_effect_refusal(invoked)
+        if parsed is None else None
+    )
     if parsed is not None and parsed["result"]["status"] != "blocked":
         direct_result = parsed["result"]
         if (
@@ -1781,6 +1837,45 @@ def grabowski_critical_user_data_inventory(
     )
     if status_parsed is None:
         return _critical_inventory_unknown_start(scanner, contract, invoked)
+    # The root-owned reply establishes that THIS request never reached claim
+    # or execution, while two independent fixed-action status reads establish
+    # that no earlier attempt is active. No generic denial, timeout, or
+    # result-level error is allowed into this narrower retry classification.
+    current_status = status_parsed["result"]
+    previous_status = pre_parsed["result"]
+    def _pristine(value: dict[str, Any]) -> bool:
+        unit_state = value.get("unit_state")
+        return (
+            value.get("status") == "not-started"
+            and value.get("result_sha256") is None
+            and isinstance(unit_state, dict)
+            and unit_state.get("load") == "not-found"
+            and unit_state.get("active") == "inactive"
+            and unit_state.get("sub") == "dead"
+            and unit_state.get("result") == "success"
+        )
+    if (
+        pre_effect_refusal is not None
+        and status_parsed["broker_returncode"] == 0
+        and pre_parsed["broker_returncode"] == 0
+        and _pristine(previous_status)
+        and _pristine(current_status)
+    ):
+        return {
+            "success": False,
+            "operation": "start",
+            "scanner_sha256": scanner,
+            "contract_sha256": contract,
+            "request_id": invoked["request_id"],
+            "reference_sha256": invoked["reference_sha256"],
+            "broker_returncode": None,
+            "outcome": "pre_effect_refused",
+            "reason_code": pre_effect_refusal,
+            "readback_required": False,
+            "retry_safe": True,
+            "readback_request_id": status_invoked["request_id"],
+            "readback_reference_sha256": status_invoked["reference_sha256"],
+        }
     return _critical_inventory_terminal_readback(
         scanner,
         contract,

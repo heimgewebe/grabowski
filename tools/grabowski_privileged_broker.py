@@ -1863,17 +1863,39 @@ def _run_non_secret_reference_request(data: bytes) -> int:
     reference = parse_reference(data)
     config = load_root_config(CONFIG)
     operator_peer: dict[str, object] | None = None
-    execution = resolve_regular_execution(config, reference)
-    if (
-        reference.get("action") in {
-            POWER_ACTION,
-            BLOCKADE_LIFECYCLE_ACTION,
-            ROOTBROKER_CUTOVER_ACTION,
-        }
-        or execution.get("allowed_peer_uid") is not None
-        or execution.get("allowed_peer_unit") is not None
-    ):
-        operator_peer = _validate_blockade_lifecycle_peer(execution)
+    # A denial during action/peer admission is BEFORE claim_once and before
+    # any process dispatch.  Only the fixed critical-data inventory start
+    # receives an explicit, reference-bound no-effect receipt.  Generic
+    # broker failures after claim remain ambiguous and cannot be retried.
+    preclaim_stage = "action_resolution"
+    try:
+        execution = resolve_regular_execution(config, reference)
+        if (
+            reference.get("action") in {
+                POWER_ACTION,
+                BLOCKADE_LIFECYCLE_ACTION,
+                ROOTBROKER_CUTOVER_ACTION,
+            }
+            or execution.get("allowed_peer_uid") is not None
+            or execution.get("allowed_peer_unit") is not None
+        ):
+            preclaim_stage = "peer_authority"
+            operator_peer = _validate_blockade_lifecycle_peer(execution)
+    except (PermissionError, ValueError, FileNotFoundError):
+        if reference.get("action") != "critical_user_data_inventory":
+            raise
+        print(json.dumps({
+            "schema_version": 1,
+            "kind": "grabowski.critical_user_data_inventory_pre_effect_refusal.v1",
+            "request_id": reference["request_id"],
+            "reference_sha256": reference["reference_sha256"],
+            "action": reference["action"],
+            "phase": "pre_claim",
+            "claim_started": False,
+            "dispatch_started": False,
+            "reason_code": preclaim_stage,
+        }, ensure_ascii=False, sort_keys=True))
+        return 0
     if execution.get("mode") == "recovery-marker-publish":
         return _run_recovery_publication(reference, execution)
     if execution.get("mode") == "blockade-marker-lifecycle":

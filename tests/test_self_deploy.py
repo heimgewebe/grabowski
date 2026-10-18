@@ -343,7 +343,19 @@ class SelfDeployToolTests(unittest.TestCase):
         admission_patch = patch.object(
             SELF_DEPLOY,
             "_require_release_source_admission",
-            return_value={"status": "synthetic-test-fixture-only"},
+            # This class exercises downstream scheduler effects. Represent a
+            # source-bound, noncritical docs delta rather than the obsolete
+            # status-only stub; critical R3/Captain denial is tested separately
+            # with unmocked admission.
+            side_effect=lambda head, **_kwargs: {
+                "status": "non-runtime-documentation",
+                "serving_repo_head": (
+                    "a" * 40 if head != "a" * 40 else "b" * 40
+                ),
+                "target_repo_head": head,
+                "changed_path_count": 1,
+                "independent_review_required": False,
+            },
         )
         admission_patch.start()
         self.addCleanup(admission_patch.stop)
@@ -4187,6 +4199,9 @@ class SelfDeployToolTests(unittest.TestCase):
         ), patch.object(
             SELF_DEPLOY, "_acquire_auto_deploy_source_resources",
             return_value={"leases": [f["operation_lease"]]},
+        ), patch.object(
+            SELF_DEPLOY, "_live_auto_deploy_source_lease_snapshot",
+            return_value=None,
         ), patch.object(
             SELF_DEPLOY, "_block_auto_deploy_source_obligation",
             return_value={"state": "blocked"},

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
@@ -785,7 +786,7 @@ def prepare(inputs: dict[str, Any]) -> dict[str, Any]:
     }
     intent_key = _intent_key(prepared_inputs, identity)
     now = _now()
-    with _checkouts()._database() as connection:
+    with closing(_checkouts()._database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         _ensure_schema(connection)
         existing_reservation = _row_dict(
@@ -1024,7 +1025,7 @@ def prepare(inputs: dict[str, Any]) -> dict[str, Any]:
 def finalize(reservation: dict[str, Any]) -> dict[str, Any]:
     intent_key = _required_text(reservation.get("intent_key"), "identity reservation intent")
     now = _now()
-    with _checkouts()._database() as connection:
+    with closing(_checkouts()._database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         _ensure_schema(connection)
         row = _row_dict(
@@ -1069,7 +1070,7 @@ def mark_blocking(reservation: dict[str, Any], *, reason: str) -> dict[str, Any]
     intent_key = _required_text(reservation.get("intent_key"), "identity reservation intent")
     error = _required_text(reason, "identity blocking reason", maximum=2000)
     now = _now()
-    with _checkouts()._database() as connection:
+    with closing(_checkouts()._database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         _ensure_schema(connection)
         row = _row_dict(
@@ -1128,7 +1129,7 @@ def abort(reservation: dict[str, Any], *, reason: str) -> dict[str, Any]:
     intent_key = _required_text(reservation.get("intent_key"), "identity reservation intent")
     error = _required_text(reason, "identity abort reason", maximum=2000)
     now = _now()
-    with _checkouts()._database() as connection:
+    with closing(_checkouts()._database()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
         _ensure_schema(connection)
         row = _row_dict(
