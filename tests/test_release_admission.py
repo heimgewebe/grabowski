@@ -81,11 +81,34 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             "workflow": f"{prefix}/actions/workflows/validate.yml",
             "serving_workflow": f"{prefix}/contents/{admission.CANONICAL_WORKFLOW_PATH}?ref={SERVING}",
             "target_workflow": f"{prefix}/contents/{admission.CANONICAL_WORKFLOW_PATH}?ref={TARGET}",
+            "serving_tree": f"{prefix}/git/trees/{SERVING}",
+            "target_tree": f"{prefix}/git/trees/{TARGET}",
             "runs": f"{prefix}/actions/workflows/{workflow_id}/runs?head_sha={TARGET}&per_page=100&page=1",
             "run": f"{prefix}/actions/runs/{run_id}",
             "jobs": f"{prefix}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page=1",
             "checks": f"{prefix}/commits/{TARGET}/check-runs?filter=all&per_page=100&page=1",
         }
+        root_entries = [
+            {"path": path, "type": kind, "mode": mode, "sha": "1" * 40}
+            for path, kind, mode in (
+                (".github", "tree", "040000"),
+                (".gitignore", "blob", "100644"),
+                ("AGENTS.md", "blob", "100644"),
+                ("Makefile", "blob", "100644"),
+                ("pyproject.toml", "blob", "100644"),
+                ("README.md", "blob", "100644"),
+                ("src", "tree", "040000"),
+                ("docs", "tree", "040000"),
+                ("config", "tree", "040000"),
+                ("contracts", "tree", "040000"),
+                ("deploy", "tree", "040000"),
+                ("requirements", "tree", "040000"),
+                ("systemd", "tree", "040000"),
+                ("tests", "tree", "040000"),
+                ("tmpfiles", "tree", "040000"),
+                ("tools", "tree", "040000"),
+            )
+        ]
         pages = {
             paths["workflow"]: {
                 "id": workflow_id, "path": admission.CANONICAL_WORKFLOW_PATH,
@@ -93,6 +116,8 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             },
             paths["serving_workflow"]: {"path": admission.CANONICAL_WORKFLOW_PATH, "type": "file", "sha": "1" * 40},
             paths["target_workflow"]: {"path": admission.CANONICAL_WORKFLOW_PATH, "type": "file", "sha": "1" * 40},
+            paths["serving_tree"]: {"sha": SERVING, "truncated": False, "tree": [e.copy() for e in root_entries]},
+            paths["target_tree"]: {"sha": TARGET, "truncated": False, "tree": [e.copy() for e in root_entries]},
             paths["runs"]: {"total_count": 1, "workflow_runs": [identity.copy()]},
             paths["run"]: identity.copy(),
             paths["jobs"]: {"total_count": len(jobs), "jobs": jobs},
@@ -162,7 +187,56 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             f"/repos/{admission.REPOSITORY}/check-runs/101",
             f"/repos/{admission.REPOSITORY}/check-runs/102",
         ], requests[-2:])
-        self.assertEqual(8, len(requests))
+        self.assertEqual(10, len(requests))
+
+    def test_target_control_changes_cannot_self_grade_with_green_validate(self):
+        # The YAML can stay byte-identical while target-controlled policy
+        # sources become no-op validators or scripts.
+        for changed in ("Makefile", "tests", "tools", "requirements",
+                        "config", "contracts", "deploy", "systemd",
+                        ".github", "pyproject.toml", ".gitignore"):
+            with self.subTest(changed=changed):
+                paths, pages = self.fixture()
+                target_entries = pages[paths["target_tree"]]["tree"]
+                next(e for e in target_entries if e["path"] == changed)["sha"] = "2" * 40
+                with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "trusted Validate.*(policy|control|input).*changed"):
+                    self.query(pages)
+
+    def test_runtime_source_and_docs_are_data_not_validation_policy(self):
+        paths, pages = self.fixture()
+        for path in ("src", "docs", "README.md"):
+            next(e for e in pages[paths["target_tree"]]["tree"]
+                 if e["path"] == path)["sha"] = "2" * 40
+        accepted, requests = self.query(pages)
+        self.assertEqual(2, len(accepted["checks"]))
+        self.assertEqual(64, len(accepted["workflow"]["trusted_control_sources_sha256"]))
+        self.assertEqual(10, len(requests))
+
+    def test_new_root_execution_input_cannot_evade_tree_pin(self):
+        paths, pages = self.fixture()
+        pages[paths["target_tree"]]["tree"].append(
+            {"path": "sitecustomize.py", "type": "blob", "mode": "100644", "sha": "2" * 40}
+        )
+        with self.assertRaisesRegex(admission.ReleaseAdmissionDenied, "trusted Validate"):
+            self.query(pages)
+
+    def test_invalid_root_tree_evidence_denied_before_accepting_ci(self):
+        for defect in ("truncated", "missing", "duplicate", "wrong_type", "drift"):
+            with self.subTest(defect=defect):
+                paths, pages = self.fixture()
+                tree = pages[paths["target_tree"]]
+                if defect == "truncated":
+                    tree["truncated"] = True
+                elif defect == "missing":
+                    tree["tree"] = [entry for entry in tree["tree"] if entry["path"] != "tools"]
+                elif defect == "duplicate":
+                    tree["tree"].append(tree["tree"][0].copy())
+                elif defect == "wrong_type":
+                    next(e for e in tree["tree"] if e["path"] == "Makefile")["type"] = "tree"
+                else:
+                    tree["sha"] = SERVING
+                with self.assertRaises(admission.ReleaseAdmissionDenied):
+                    self.query(pages)
 
     def test_mutated_validate_workflow_is_not_admitted_with_green_job_names(self):
         # A target commit may replace validation steps with no-ops while

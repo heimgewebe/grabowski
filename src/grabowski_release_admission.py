@@ -21,6 +21,20 @@ REQUIRED_CI_CHECKS = ("validate (3.10)", "validate (3.12)")
 CANONICAL_WORKFLOW_PATH = ".github/workflows/validate.yml"
 MAX_GITHUB_ITEMS = 1_000
 GITHUB_PAGE_SIZE = 100
+# Only target application code and inert documentation can vary under
+# ordinary post-merge CI admission. All other root files/trees can control
+# make, Python test discovery, validation scripts or deployment checks.
+# A change to those validation inputs needs a separate CI-policy transition.
+VALIDATION_POLICY_REQUIRED_ROOTS = frozenset({
+    ".github", ".gitignore", "AGENTS.md", "Makefile", "pyproject.toml",
+    "config", "contracts", "deploy", "requirements", "systemd",
+    "tests", "tmpfiles", "tools",
+})
+VALIDATION_POLICY_MUTABLE_ROOTS = frozenset({
+    "src", "docs", "README.md", "CHANGELOG.md", "SECURITY.md",
+    "GRABOWSKI.md", "OPERATOR_V2_REPORT.md",
+})
+MAX_VALIDATION_ROOT_ENTRIES = 256
 _SHA40 = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -173,6 +187,72 @@ def _trusted_validate_workflow_blob(
     return blobs[0]
 
 
+def _trusted_validate_control_sources(
+    *, serving_head: str, target_head: str, token: str,
+) -> str:
+    """Pin transitive Validate control inputs by Git tree identities.
+
+    The workflow executes target-side Makefile, scripts, tests and their
+    configuration. Comparing only the YAML leaves a target-self-grading P1.
+    Every unexempted root blob/tree is therefore immutable relative to
+    the actually serving commit; Git subtree OIDs cover all nested content.
+    Application sources still require an independent whole-release review.
+    """
+    prefix = f"/repos/{REPOSITORY}/git/trees"
+    observed: list[dict[str, tuple[str, str, str]]] = []
+    for head in (serving_head, target_head):
+        result, link = _github_json(f"{prefix}/{head}", token=token)
+        rows = result.get("tree")
+        if (
+            link or result.get("sha") != head
+            or result.get("truncated") is not False
+            or not isinstance(rows, list)
+            or not 0 < len(rows) <= MAX_VALIDATION_ROOT_ENTRIES
+        ):
+            raise ReleaseAdmissionDenied("trusted Validate control inventory is unproved")
+        entries: dict[str, tuple[str, str, str]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ReleaseAdmissionDenied("trusted Validate control entry is invalid")
+            path, kind, mode, oid = (
+                row.get("path"), row.get("type"),
+                row.get("mode"), row.get("sha"),
+            )
+            if (
+                not isinstance(path, str)
+                or path in {"", ".", ".."} or "/" in path or "\\" in path
+                or path in entries
+                or kind not in {"blob", "tree"}
+                or mode not in (
+                    {"100644", "100755"} if kind == "blob" else {"040000"}
+                )
+                or not isinstance(oid, str)
+                or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid) is None
+            ):
+                raise ReleaseAdmissionDenied("trusted Validate control entry is invalid")
+            entries[path] = kind, mode, oid
+        if not VALIDATION_POLICY_REQUIRED_ROOTS.issubset(entries):
+            raise ReleaseAdmissionDenied("trusted Validate control roots are missing")
+        observed.append(entries)
+    serving, target = observed
+    if set(serving) != set(target):
+        # A newly introduced root sitecustomize.py or script is itself an
+        # untrusted validation input even if every known policy file matches.
+        raise ReleaseAdmissionDenied("trusted Validate control paths changed")
+    for path, old in serving.items():
+        new = target[path]
+        if path in VALIDATION_POLICY_MUTABLE_ROOTS:
+            if old[:2] != new[:2]:
+                raise ReleaseAdmissionDenied("trusted Validate control type changed")
+        elif old != new:
+            raise ReleaseAdmissionDenied("trusted Validate control sources changed")
+    return _sha256_json({
+        "policy_roots": {p: serving[p] for p in sorted(serving)
+                         if p not in VALIDATION_POLICY_MUTABLE_ROOTS},
+        "mutable_roots": sorted(VALIDATION_POLICY_MUTABLE_ROOTS),
+    })
+
+
 def _fresh_github_checks(target_head: str, *, serving_head: str) -> dict[str, Any]:
     """Bind green checks to the trusted immutable workflow, run, job and suite."""
     if (
@@ -182,6 +262,9 @@ def _fresh_github_checks(target_head: str, *, serving_head: str) -> dict[str, An
         raise ReleaseAdmissionDenied("release target or serving commit is invalid")
     token = _github_token()
     trusted_blob = _trusted_validate_workflow_blob(
+        serving_head=serving_head, target_head=target_head, token=token,
+    )
+    trusted_control_sources_sha256 = _trusted_validate_control_sources(
         serving_head=serving_head, target_head=target_head, token=token,
     )
     prefix = f"/repos/{REPOSITORY}"
@@ -300,6 +383,7 @@ def _fresh_github_checks(target_head: str, *, serving_head: str) -> dict[str, An
     workflow_identity = {
         "id": workflow_id, "path": CANONICAL_WORKFLOW_PATH,
         "trusted_blob_oid": trusted_blob,
+        "trusted_control_sources_sha256": trusted_control_sources_sha256,
         "run_id": run_id, "run_attempt": attempt,
         "check_suite_id": suite_id, "event": "push", "head_branch": "main",
         "head_repository": REPOSITORY, "head_sha": target_head,
