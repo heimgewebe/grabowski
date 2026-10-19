@@ -5680,8 +5680,12 @@ def _recovered_auto_deploy_source_binding(
 
 
 
-def _release_documentation_raw_paths(raw_records: str) -> list[str]:
-    """Accept only complete NUL-delimited raw Git changes to plain documents."""
+def _release_documentation_raw_paths(raw_records: str) -> tuple[list[str], bool]:
+    """Validate regular-file Git changes and identify executable-mode review scope.
+
+    A regular executable belongs to the mandatory source-review path, never
+    to the 100644-only plain-document exemption. Unsupported types fail closed.
+    """
     if raw_records and not raw_records.endswith("\x00"):
         raise DeploySchedulePreEffectRefusal(
             "release admission blocked: source path boundary is incomplete"
@@ -5692,6 +5696,7 @@ def _release_documentation_raw_paths(raw_records: str) -> list[str]:
             "release admission blocked: source raw diff boundary is incomplete"
         )
     changed_paths: list[str] = []
+    executable_mode_requires_review = False
     for header, path in zip(frames[::2], frames[1::2], strict=True):
         if (
             not path or path.startswith("/") or "\ufffd" in path
@@ -5712,17 +5717,25 @@ def _release_documentation_raw_paths(raw_records: str) -> list[str]:
                 "release admission blocked: source raw modes are unproved"
             )
         old_mode, new_mode, old_oid, new_oid, change = record.groups()
-        safe_transition = {
-            "A": ("000000", "100644"),
-            "D": ("100644", "000000"),
-            "M": ("100644", "100644"),
+        regular_file_transitions = {
+            "A": {("000000", "100644"), ("000000", "100755")},
+            "D": {("100644", "000000"), ("100755", "000000")},
+            "M": {
+                ("100644", "100644"), ("100644", "100755"),
+                ("100755", "100644"), ("100755", "100755"),
+            },
         }
-        if len(old_oid) != len(new_oid) or (old_mode, new_mode) != safe_transition[change]:
+        if (
+            len(old_oid) != len(new_oid)
+            or (old_mode, new_mode) not in regular_file_transitions[change]
+        ):
             raise DeploySchedulePreEffectRefusal(
                 "release admission blocked: source modes are not plain documents"
             )
+        if "100755" in (old_mode, new_mode):
+            executable_mode_requires_review = True
         changed_paths.append(path)
-    return changed_paths
+    return changed_paths, executable_mode_requires_review
 
 
 
@@ -6065,13 +6078,15 @@ def _require_release_source_admission(
         raise DeploySchedulePreEffectRefusal(
             "release admission blocked: complete source diff is unavailable"
         )
-    changed_paths = _release_documentation_raw_paths(observed["stdout"])
+    changed_paths, executable_mode_requires_review = _release_documentation_raw_paths(
+        observed["stdout"]
+    )
     # Only pure documentation delta is exempt; unknown files, test or CI
     # policy, executables, tools and runtime sources all fail closed.
     # Even inside docs/, executable or configuration files are not inherently
     # review-free; the exemption covers only plain documentation formats.
     safe_document_extensions = (".md", ".markdown", ".rst", ".txt", ".adoc")
-    if any(
+    if executable_mode_requires_review or any(
         not path.startswith("docs/") or not path.endswith(safe_document_extensions)
         for path in changed_paths
     ):

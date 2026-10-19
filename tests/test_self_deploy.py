@@ -337,6 +337,121 @@ def _unpersisted_outcome_unknown_blue_green_result(
     }
 
 
+class ReleaseSourceRawModeAdmissionTests(unittest.TestCase):
+    """Source Git mode evidence must route executables through genuine R3."""
+
+    @staticmethod
+    def _raw(change: str, old_mode: str, new_mode: str, path: str) -> str:
+        return (
+            f":{old_mode} {new_mode} {'a' * 40} {'b' * 40} {change}"
+            f"\x00{path}\x00"
+        )
+
+    def _admit_preview(self, raw: str) -> dict[str, object]:
+        serving, target, release_id = "a" * 40, "b" * 40, "release-a"
+
+        def read_git(_repository, *args, **_kwargs):
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                return _result()
+            if args and args[0] == "diff" and "--no-abbrev" in args:
+                return _result(raw)
+            self.fail(f"unexpected Git request: {args!r}")
+
+        with (
+            patch.object(
+                SELF_DEPLOY.base, "_deployment_metadata",
+                return_value={
+                    "completion_status": "complete", "runtime_binding_valid": True,
+                    "artifact_integrity_valid": True, "provenance_valid": True,
+                    "repo_head": serving, "release_id": release_id,
+                },
+                create=True,
+            ),
+            patch.object(
+                SELF_DEPLOY.serving_process, "identity",
+                return_value={
+                    "matches_deployed_manifest": True,
+                    "process_release_id": release_id,
+                    "process_repo_head": serving,
+                },
+            ),
+            patch.object(SELF_DEPLOY, "_git_result", side_effect=read_git),
+        ):
+            return SELF_DEPLOY._require_release_source_admission(
+                target, captain_preview=True,
+            )
+
+    def _assert_review_required(self, raw: str) -> None:
+        with self.assertRaises(
+            SELF_DEPLOY.DeploySchedulePreEffectRefusal
+        ) as failure:
+            self._admit_preview(raw)
+        self.assertIn(
+            "release review admission missing: exact independent R3 job namespace",
+            str(failure.exception),
+        )
+
+    def test_executable_modify_uses_review_required_path(self) -> None:
+        self._assert_review_required(
+            self._raw("M", "100755", "100755", "tools/release_probe.py")
+        )
+
+    def test_regular_to_executable_mode_change_requires_review(self) -> None:
+        self._assert_review_required(
+            self._raw("M", "100644", "100755", "docs/release.md")
+        )
+
+    def test_executable_doc_is_never_exempt(self) -> None:
+        self._assert_review_required(
+            self._raw("M", "100755", "100755", "docs/release.md")
+        )
+
+    def test_added_and_deleted_executables_require_review(self) -> None:
+        self._assert_review_required(
+            self._raw("A", "000000", "100755", "tools/new.py")
+        )
+        self._assert_review_required(
+            self._raw("D", "100755", "000000", "tools/old.py")
+        )
+
+    def test_plain_document_still_exempt(self) -> None:
+        admission = self._admit_preview(
+            self._raw("M", "100644", "100644", "docs/release.md")
+        )
+        self.assertEqual("non-runtime-documentation", admission["status"])
+        self.assertIs(admission["independent_review_required"], False)
+
+    def test_executable_source_with_plain_document_requires_review(self) -> None:
+        self._assert_review_required(
+            self._raw("M", "100644", "100644", "docs/release.md")
+            + self._raw("M", "100755", "100755", "tools/verify.py")
+        )
+
+    def test_symlinks_submodules_and_ambiguous_modes_stay_denied(self) -> None:
+        for old_mode, new_mode in (
+            ("120000", "120000"),
+            ("160000", "160000"),
+            ("100755", "120000"),
+            ("100664", "100664"),
+        ):
+            with self.subTest(old_mode=old_mode, new_mode=new_mode):
+                with self.assertRaises(
+                    SELF_DEPLOY.DeploySchedulePreEffectRefusal
+                ) as failure:
+                    self._admit_preview(
+                        self._raw("M", old_mode, new_mode, "docs/release.md")
+                    )
+                self.assertIn("source modes are not plain documents", str(failure.exception))
+
+    def test_invalid_path_and_incomplete_raw_record_still_denied(self) -> None:
+        for raw in (
+            self._raw("M", "100755", "100755", "../escape.py"),
+            self._raw("M", "100755", "100755", "tools/release.py")[:-1],
+        ):
+            with self.assertRaises(SELF_DEPLOY.DeploySchedulePreEffectRefusal):
+                self._admit_preview(raw)
+
+
 class SelfDeployToolTests(unittest.TestCase):
     def setUp(self) -> None:
         # These legacy tests exercise scheduler effects under synthetic task
