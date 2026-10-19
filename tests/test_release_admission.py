@@ -14,6 +14,8 @@ import grabowski_release_admission as admission  # noqa: E402
 SERVING = "a" * 40
 TARGET = "b" * 40
 DIFF = "d" * 64
+SERVING_TREE = "c" * 40
+TARGET_TREE = "e" * 40
 
 
 def _ci_result(name: str, run_id: int, *, sha: str = TARGET,
@@ -81,8 +83,10 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             "workflow": f"{prefix}/actions/workflows/validate.yml",
             "serving_workflow": f"{prefix}/contents/{admission.CANONICAL_WORKFLOW_PATH}?ref={SERVING}",
             "target_workflow": f"{prefix}/contents/{admission.CANONICAL_WORKFLOW_PATH}?ref={TARGET}",
-            "serving_tree": f"{prefix}/git/trees/{SERVING}",
-            "target_tree": f"{prefix}/git/trees/{TARGET}",
+            "serving_commit": f"{prefix}/git/commits/{SERVING}",
+            "target_commit": f"{prefix}/git/commits/{TARGET}",
+            "serving_tree": f"{prefix}/git/trees/{SERVING_TREE}",
+            "target_tree": f"{prefix}/git/trees/{TARGET_TREE}",
             "runs": f"{prefix}/actions/workflows/{workflow_id}/runs?head_sha={TARGET}&per_page=100&page=1",
             "run": f"{prefix}/actions/runs/{run_id}",
             "jobs": f"{prefix}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page=1",
@@ -116,8 +120,10 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             },
             paths["serving_workflow"]: {"path": admission.CANONICAL_WORKFLOW_PATH, "type": "file", "sha": "1" * 40},
             paths["target_workflow"]: {"path": admission.CANONICAL_WORKFLOW_PATH, "type": "file", "sha": "1" * 40},
-            paths["serving_tree"]: {"sha": SERVING, "truncated": False, "tree": [e.copy() for e in root_entries]},
-            paths["target_tree"]: {"sha": TARGET, "truncated": False, "tree": [e.copy() for e in root_entries]},
+            paths["serving_commit"]: {"sha": SERVING, "tree": {"sha": SERVING_TREE}},
+            paths["target_commit"]: {"sha": TARGET, "tree": {"sha": TARGET_TREE}},
+            paths["serving_tree"]: {"sha": SERVING_TREE, "truncated": False, "tree": [e.copy() for e in root_entries]},
+            paths["target_tree"]: {"sha": TARGET_TREE, "truncated": False, "tree": [e.copy() for e in root_entries]},
             paths["runs"]: {"total_count": 1, "workflow_runs": [identity.copy()]},
             paths["run"]: identity.copy(),
             paths["jobs"]: {"total_count": len(jobs), "jobs": jobs},
@@ -187,7 +193,39 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             f"/repos/{admission.REPOSITORY}/check-runs/101",
             f"/repos/{admission.REPOSITORY}/check-runs/102",
         ], requests[-2:])
-        self.assertEqual(10, len(requests))
+        self.assertEqual(12, len(requests))
+
+    def test_verified_git_commit_tree_oid_is_used_for_validation_policy(self):
+        paths, pages = self.fixture()
+        result, requests = self.query(pages)
+        self.assertEqual(2, len(result["checks"]))
+        self.assertIn(paths["serving_commit"], requests)
+        self.assertIn(paths["target_commit"], requests)
+        self.assertIn(paths["serving_tree"], requests)
+        self.assertIn(paths["target_tree"], requests)
+        self.assertNotEqual(SERVING, SERVING_TREE)
+        self.assertNotEqual(TARGET, TARGET_TREE)
+
+    def test_commit_to_root_tree_mismatch_fails_closed(self):
+        for defect in ("commit_sha", "tree_oid", "tree_missing", "tree_not_dict",
+                       "tree_response", "commit_link"):
+            with self.subTest(defect=defect):
+                paths, pages = self.fixture()
+                links = {}
+                if defect == "commit_sha":
+                    pages[paths["target_commit"]]["sha"] = SERVING
+                elif defect == "tree_oid":
+                    pages[paths["target_commit"]]["tree"]["sha"] = "f" * 40
+                elif defect == "tree_missing":
+                    pages[paths["target_commit"]].pop("tree")
+                elif defect == "tree_not_dict":
+                    pages[paths["target_commit"]]["tree"] = TARGET_TREE
+                elif defect == "tree_response":
+                    pages[paths["target_tree"]]["sha"] = SERVING_TREE
+                else:
+                    links[paths["target_commit"]] = '<https://api.github.com/other>; rel="next"'
+                with self.assertRaises(admission.ReleaseAdmissionDenied):
+                    self.query(pages, links=links)
 
     def test_target_control_changes_cannot_self_grade_with_green_validate(self):
         # The YAML can stay byte-identical while target-controlled policy
@@ -210,7 +248,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         accepted, requests = self.query(pages)
         self.assertEqual(2, len(accepted["checks"]))
         self.assertEqual(64, len(accepted["workflow"]["trusted_control_sources_sha256"]))
-        self.assertEqual(10, len(requests))
+        self.assertEqual(12, len(requests))
 
     def test_new_root_execution_input_cannot_evade_tree_pin(self):
         paths, pages = self.fixture()

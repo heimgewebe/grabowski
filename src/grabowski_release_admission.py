@@ -198,13 +198,26 @@ def _trusted_validate_control_sources(
     the actually serving commit; Git subtree OIDs cover all nested content.
     Application sources still require an independent whole-release review.
     """
-    prefix = f"/repos/{REPOSITORY}/git/trees"
+    prefix = f"/repos/{REPOSITORY}/git"
     observed: list[dict[str, tuple[str, str, str]]] = []
     for head in (serving_head, target_head):
-        result, link = _github_json(f"{prefix}/{head}", token=token)
+        # Commit and root tree are different Git objects. Bind the actual
+        # immutable root-tree SHA from the authenticated exact commit first.
+        commit, commit_link = _github_json(
+            f"{prefix}/commits/{head}", token=token,
+        )
+        bound_tree = commit.get("tree")
+        tree_oid = bound_tree.get("sha") if isinstance(bound_tree, dict) else None
+        if (
+            commit_link or commit.get("sha") != head
+            or not isinstance(tree_oid, str)
+            or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tree_oid) is None
+        ):
+            raise ReleaseAdmissionDenied("trusted Validate commit tree identity is unproved")
+        result, link = _github_json(f"{prefix}/trees/{tree_oid}", token=token)
         rows = result.get("tree")
         if (
-            link or result.get("sha") != head
+            link or result.get("sha") != tree_oid
             or result.get("truncated") is not False
             or not isinstance(rows, list)
             or not 0 < len(rows) <= MAX_VALIDATION_ROOT_ENTRIES
