@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -16,6 +18,25 @@ TARGET = "b" * 40
 DIFF = "d" * 64
 SERVING_TREE = "c" * 40
 TARGET_TREE = "e" * 40
+
+
+def _policy_content(required_roots: set[str] | frozenset[str]) -> str:
+    return "VALIDATION_POLICY_REQUIRED_ROOTS = frozenset({" + ", ".join(
+        repr(path) for path in sorted(required_roots)
+    ) + "})\n"
+
+
+def _policy_response(source: str) -> dict:
+    raw = source.encode("utf-8")
+    git_blob = b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw
+    return {
+        "path": "src/grabowski_release_admission.py",
+        "type": "file",
+        "encoding": "base64",
+        "content": base64.b64encode(raw).decode("ascii"),
+        "size": len(raw),
+        "sha": hashlib.sha1(git_blob).hexdigest(),
+    }
 
 
 def _ci_result(name: str, run_id: int, *, sha: str = TARGET,
@@ -87,6 +108,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             "target_commit": f"{prefix}/git/commits/{TARGET}",
             "serving_tree": f"{prefix}/git/trees/{SERVING_TREE}",
             "target_tree": f"{prefix}/git/trees/{TARGET_TREE}",
+            "target_policy": f"{prefix}/contents/src/grabowski_release_admission.py?ref={TARGET}",
             "runs": f"{prefix}/actions/workflows/{workflow_id}/runs?head_sha={TARGET}&per_page=100&page=1",
             "run": f"{prefix}/actions/runs/{run_id}",
             "jobs": f"{prefix}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page=1",
@@ -124,6 +146,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             paths["target_commit"]: {"sha": TARGET, "tree": {"sha": TARGET_TREE}},
             paths["serving_tree"]: {"sha": SERVING_TREE, "truncated": False, "tree": [e.copy() for e in root_entries]},
             paths["target_tree"]: {"sha": TARGET_TREE, "truncated": False, "tree": [e.copy() for e in root_entries]},
+            paths["target_policy"]: _policy_response(_policy_content(admission.VALIDATION_POLICY_REQUIRED_ROOTS)),
             paths["runs"]: {"total_count": 1, "workflow_runs": [identity.copy()]},
             paths["run"]: identity.copy(),
             paths["jobs"]: {"total_count": len(jobs), "jobs": jobs},
@@ -441,6 +464,96 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                 )
                 self.assertEqual(2, len(result["checks"]))
                 self.assertTrue(result["workflow"]["ci_policy_transition_required"])
+
+    @staticmethod
+    def _target_policy(pages, paths, required_roots):
+        pages[paths["target_policy"]] = _policy_response(_policy_content(required_roots))
+        next(row for row in pages[paths["target_tree"]]["tree"]
+             if row["path"] == "src")["sha"] = "2" * 40
+
+    def test_new_required_root_not_present_is_denied_before_reviewer(self):
+        # The serving policy does not yet require this root; target tries to
+        # require it, but has not committed it. A full R3 alone must not make
+        # the future serving trust anchor impossible to update.
+        paths, pages = self.fixture()
+        self._target_policy(pages, paths, admission.VALIDATION_POLICY_REQUIRED_ROOTS | {"new-validator"})
+        with patch.object(admission, "validate_independent_release_review") as reviewer:
+            with self.assertRaisesRegex(
+                admission.ReleaseAdmissionDenied, "target.*required root",
+            ):
+                self.query(pages, transition_review_pr=1452, transition_diff_sha256=DIFF)
+        reviewer.assert_not_called()
+
+    def test_new_required_root_present_is_reviewed_and_admitted(self):
+        paths, pages = self.fixture()
+        self._target_policy(pages, paths, admission.VALIDATION_POLICY_REQUIRED_ROOTS | {"new-validator"})
+        pages[paths["target_tree"]]["tree"].append({
+            "path": "new-validator", "type": "tree", "mode": "040000", "sha": "4" * 40,
+        })
+        proof = {
+            "review_pr": 1452,
+            "review_binding_sha256": "a" * 64,
+            "review_attempts_sha256": "b" * 64,
+            "independent_pass_count": 1,
+            "admissible_slots": ["independent-grok-4.6"],
+        }
+        with patch.object(
+            admission, "validate_independent_release_review", return_value=proof,
+        ) as reviewer:
+            result, requests = self.query(
+                pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+            )
+        self.assertIn(paths["target_policy"], requests)
+        reviewer.assert_called_once_with(
+            serving_head=SERVING, target_head=TARGET,
+            diff_sha256=DIFF, review_pr=1452,
+        )
+        self.assertTrue(result["workflow"]["ci_policy_transition_required"])
+
+    def test_target_policy_document_must_be_authenticated_and_static(self):
+        for corruption in (
+            "wrong_path", "wrong_type", "wrong_encoding", "missing_content",
+            "wrong_git_sha", "wrong_size", "bad_base64", "dynamic_required",
+            "non_string_root", "multiple_required_assignments",
+        ):
+            with self.subTest(corruption=corruption):
+                paths, pages = self.fixture()
+                self._target_policy(pages, paths, admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+                value = pages[paths["target_policy"]]
+                if corruption == "wrong_path":
+                    value["path"] = "src/other.py"
+                elif corruption == "wrong_type":
+                    value["type"] = "dir"
+                elif corruption == "wrong_encoding":
+                    value["encoding"] = "raw"
+                elif corruption == "missing_content":
+                    value.pop("content")
+                elif corruption == "wrong_git_sha":
+                    value["sha"] = "0" * 40
+                elif corruption == "wrong_size":
+                    value["size"] += 1
+                elif corruption == "bad_base64":
+                    value["content"] = "@!"
+                elif corruption == "dynamic_required":
+                    pages[paths["target_policy"]] = _policy_response(
+                        "VALIDATION_POLICY_REQUIRED_ROOTS = get_roots()\n"
+                    )
+                elif corruption == "non_string_root":
+                    pages[paths["target_policy"]] = _policy_response(
+                        "VALIDATION_POLICY_REQUIRED_ROOTS = frozenset({1})\n"
+                    )
+                else:
+                    pages[paths["target_policy"]] = _policy_response(
+                        _policy_content(admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+                        + "VALIDATION_POLICY_REQUIRED_ROOTS = frozenset({})\n"
+                    )
+                with patch.object(admission, "validate_independent_release_review") as reviewer:
+                    with self.assertRaises(admission.ReleaseAdmissionDenied):
+                        self.query(
+                            pages, transition_review_pr=1452,
+                            transition_diff_sha256=DIFF,
+                        )
+                reviewer.assert_not_called()
 
     def test_prior_baseline_retirement_cannot_remove_unrelated_required_root(self):
         paths, pages = self.fixture()

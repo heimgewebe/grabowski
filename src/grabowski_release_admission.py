@@ -6,6 +6,9 @@ cannot supply release review identifiers or PASS attestations.
 """
 from __future__ import annotations
 
+import ast
+import base64
+import binascii
 import hashlib
 import http.client
 import json
@@ -190,6 +193,75 @@ def _trusted_validate_workflow_blob(
     return blobs[0], blobs[1]
 
 
+
+def _target_required_roots(*, target_head: str, token: str) -> frozenset[str]:
+    """Read, but never execute, target-side required-root policy from GitHub.
+
+    A full-delta R3 may authorize a CI-policy transition, but must not make
+    the next serving commit unable to admit any later release. The contents
+    API is pinned to the exact target commit; verify its Git blob bytes and
+    accept only a single literal frozenset declaration.
+    """
+    path = "src/grabowski_release_admission.py"
+    value, link = _github_json(
+        f"/repos/{REPOSITORY}/contents/{path}?ref={target_head}", token=token,
+    )
+    content, oid = value.get("content"), value.get("sha")
+    if (
+        link or value.get("path") != path or value.get("type") != "file"
+        or value.get("encoding") != "base64"
+        or not isinstance(content, str) or len(content) > CHECK_BYTES_LIMIT
+        or not isinstance(oid, str)
+        or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid) is None
+    ):
+        raise ReleaseAdmissionDenied("target Validate required-root source is unproved")
+    try:
+        # GitHub wraps base64 lines; nothing but those line breaks is allowed.
+        raw = base64.b64decode(content.replace("\n", ""), validate=True)
+        if (
+            len(raw) > CHECK_BYTES_LIMIT // 2
+            or type(value.get("size")) is not int
+            or value["size"] != len(raw)
+        ):
+            raise ValueError("size mismatch")
+        blob = b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw
+        digest = hashlib.sha1(blob) if len(oid) == 40 else hashlib.sha256(blob)
+        if digest.hexdigest() != oid:
+            raise ValueError("Git blob identity mismatch")
+        module = ast.parse(raw.decode("utf-8"), filename=path)
+    except (ValueError, UnicodeError, SyntaxError, binascii.Error):
+        raise ReleaseAdmissionDenied("target Validate required-root source is invalid") from None
+
+    assignments = [
+        statement for statement in module.body
+        if isinstance(statement, ast.Assign)
+        and any(isinstance(target, ast.Name)
+                and target.id == "VALIDATION_POLICY_REQUIRED_ROOTS"
+                for target in statement.targets)
+    ]
+    if len(assignments) != 1 or len(assignments[0].targets) != 1:
+        raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+    definition = assignments[0].value
+    if not (
+        isinstance(definition, ast.Call)
+        and isinstance(definition.func, ast.Name)
+        and definition.func.id == "frozenset"
+        and len(definition.args) == 1 and not definition.keywords
+        and isinstance(definition.args[0], ast.Set)
+    ):
+        raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+    roots = [item.value if isinstance(item, ast.Constant) else None
+             for item in definition.args[0].elts]
+    if (
+        not roots or len(roots) > MAX_VALIDATION_ROOT_ENTRIES
+        or any(not isinstance(root, str) or root in {"", ".", ".."}
+               or "/" in root or "\\" in root for root in roots)
+        or len(set(roots)) != len(roots)
+    ):
+        raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+    return frozenset(roots)
+
+
 def _trusted_validate_control_sources(
     *, serving_head: str, target_head: str, token: str,
     authorize_transition: Callable[[str], dict[str, Any]] | None = None,
@@ -258,6 +330,13 @@ def _trusted_validate_control_sources(
             raise ReleaseAdmissionDenied("trusted Validate control roots are missing")
         observed.append(entries)
     serving, target = observed
+    # The target may add required paths to its Python constant. Inspect the
+    # authenticated target source as inert text, never run target Python, and
+    # reject a future serving baseline that requires absent root entries.
+    if serving["src"] != target["src"]:
+        declared = _target_required_roots(target_head=target_head, token=token)
+        if not declared.issubset(target):
+            raise ReleaseAdmissionDenied("target Validate required roots are missing")
     changed_controls: list[str] = []
     for path in sorted(set(serving) | set(target)):
         old, new = serving.get(path), target.get(path)
