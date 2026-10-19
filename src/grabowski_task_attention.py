@@ -1393,6 +1393,28 @@ def _require_safe_archive_transport(record: dict[str, Any]) -> None:
         raise TaskAttentionConflictError(
             "privileged task archive retirement proof is required (#1556)"
         )
+    # Recorded negative transport evidence survives Fleet remapping. Before
+    # the local-only dispatch fix a launch could cross to SSH, even when a
+    # pre-dispatch local marker was already persisted. Do not archive an
+    # explicitly nonlocal historic attempt merely because the CURRENT host
+    # now resolves locally. This is a rejector, NOT positive provenance for
+    # unmarked rows or for legacy records marked local.
+    launcher_text = record.get("launcher_json")
+    try:
+        launcher = json.loads(launcher_text) if isinstance(launcher_text, str) else None
+    except (ValueError, TypeError):
+        launcher = None
+    if not isinstance(launcher, dict):
+        raise TaskAttentionIntegrityError(
+            "task archive persisted launch history is invalid"
+        )
+    if (
+        "task_launch_transport" in launcher
+        and launcher["task_launch_transport"] != "local"
+    ):
+        raise TaskAttentionConflictError(
+            "historical remote task launch retirement proof is required (#1556)"
+        )
     try:
         _, target, _ = tasks._resolve_task_dispatch_host(str(record["host"]))
     except (RuntimeError, ValueError, TypeError, KeyError, OSError) as exc:
