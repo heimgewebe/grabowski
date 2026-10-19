@@ -1415,6 +1415,28 @@ def _require_safe_archive_transport(record: dict[str, Any]) -> None:
         raise TaskAttentionConflictError(
             "historical remote task launch retirement proof is required (#1556)"
         )
+    # The TaskStore retains only the latest launcher. A local retry can replace
+    # an earlier SSH launch without retiring its independently restartable unit.
+    # Until #1556 can authenticate the full attempt history, only one-attempt
+    # tasks admitted by the prospective physically local dispatcher are safe
+    # for a NEW immutable archive switch. This is NOT external retirement proof
+    # and must never upgrade legacy readiness to verified.
+    attempt = record.get("attempt")
+    if isinstance(attempt, bool) or attempt != 1:
+        raise TaskAttentionConflictError(
+            "historical earlier attempts require retirement proof (#1556)"
+        )
+    managed_from = launcher.get(tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY)
+    if (
+        launcher.get("task_launch_transport") != "local"
+        or launcher.get("task_launch_provenance")
+        != tasks.TASK_LOCAL_DISPATCH_PROVENANCE
+        or isinstance(managed_from, bool)
+        or managed_from != 1
+    ):
+        raise TaskAttentionConflictError(
+            "task archive local dispatch provenance is unverified (#1556)"
+        )
     try:
         _, target, _ = tasks._resolve_task_dispatch_host(str(record["host"]))
     except (RuntimeError, ValueError, TypeError, KeyError, OSError) as exc:

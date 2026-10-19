@@ -6764,6 +6764,11 @@ def _task_launch_error(
     }
 
 
+# This is emitted only by the direct managed-local systemd code path. It
+# does not certify any earlier attempt or provide independent root authority.
+TASK_LOCAL_DISPATCH_PROVENANCE = "direct-user-systemd-invocation-v1"
+
+
 def _dispatch_managed_local_task(host: str, argv: list[str]) -> dict[str, Any]:
     """Revalidate authority, then physically dispatch only to local user systemd."""
     try:
@@ -6787,7 +6792,7 @@ def _dispatch_managed_local_task(host: str, argv: list[str]) -> dict[str, Any]:
         result = {**result, "outcome_unknown": True}
     # Evidence for this dispatch attempt only, including ambiguous outcomes.
     # It does not upgrade the provenance of earlier attempts on the same row.
-    return {**result, "task_launch_transport": "local"}
+    return {**result, "task_launch_transport": "local", "task_launch_provenance": TASK_LOCAL_DISPATCH_PROVENANCE}
 
 
 def _launch(record: dict[str, Any]) -> dict[str, Any]:

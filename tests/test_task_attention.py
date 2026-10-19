@@ -69,6 +69,8 @@ def _launcher(returncode: int = 0) -> dict[str, object]:
         "timed_out": False,
         "stdout_truncated": False,
         "stderr_truncated": False,
+        "task_launch_transport": "local",
+        "task_launch_provenance": tasks.TASK_LOCAL_DISPATCH_PROVENANCE,
     }
 
 
@@ -2066,6 +2068,69 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(before, self.database.read_bytes())
         self.assertFalse(self.archive_root.exists())
         self.assertFalse(self.projection_root.exists())
+
+    def test_closeout_archive_rejects_earlier_ssh_attempt_hidden_by_local_resume(self) -> None:
+        # A historic SSH launch must not be forgotten when a later local
+        # resume replaces the same persisted task row's launcher_json.
+        with patch.object(
+            tasks, "_dispatch_managed_local_task",
+            return_value={**_launcher(), "task_launch_transport": "ssh"},
+        ):
+            started = self._start()["task"]
+        task_id = str(started["task_id"])
+        with (
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+            patch.object(tasks, "_observe", return_value={"state": "failed"}),
+            patch.object(tasks, "_dispatch_managed_local_task",
+                         return_value={**_launcher(), "task_launch_transport": "local"}),
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            resumed = tasks.grabowski_task_resume(task_id)["task"]
+        self.assertEqual(2, resumed["attempt"])
+        self.assertEqual(
+            "local", json.loads(tasks._row_raw(task_id)["launcher_json"])["task_launch_transport"],
+        )
+        tasks._set_state(task_id, "completed", observation={"state": "completed"})
+        record = tasks._row(task_id)
+        before = self.database.read_bytes()
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host",
+                         return_value=("local", {"transport": "local"}, False)) as route,
+            patch.object(tasks, "_observe",
+                         side_effect=AssertionError("historic SSH may still restart")) as probe,
+            self.assertRaisesRegex(attention.TaskAttentionConflictError,
+                                   "earlier attempts.*retirement proof"),
+        ):
+            attention.execute_closeout_archive(self._archive_parameters(record))
+        route.assert_not_called()
+        probe.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+
+    def test_archive_guard_rejects_legacy_marker_one_without_direct_dispatch_proof(self) -> None:
+        record = self._completed_task()
+        raw = tasks._row_raw(str(record["task_id"]))
+        original = json.loads(raw["launcher_json"])
+        original.pop("task_launch_provenance", None)
+        historical = {
+            **raw,
+            "launcher_json": json.dumps({
+                **original,
+                "task_launch_transport": "local",
+                # A pre-fix local marker and launcher transport report are
+                # not a trustworthy proof of physical local execution.
+            }),
+        }
+        with (
+            patch.object(tasks, "_resolve_task_dispatch_host",
+                         return_value=("local", {"transport": "local"}, False)) as route,
+            self.assertRaisesRegex(attention.TaskAttentionConflictError,
+                                   "local dispatch provenance.*unverified"),
+        ):
+            attention._require_safe_archive_transport(historical)
+        route.assert_not_called()
 
     def test_archive_classification_rejects_persisted_ssh_launch_before_external_sources(self) -> None:
         record = self._completed_task()
