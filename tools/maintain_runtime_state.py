@@ -53,6 +53,7 @@ JOB_RUNTIME_GRACE_SECONDS = 300
 SYSTEMD_SHOW_CHUNK_SIZE = 100
 MAX_ARCHIVE_FILES = 32
 MAX_ARCHIVE_ENTRIES = 256
+MAX_RETAINED_JSON_TEMPS = 64
 MAX_ARCHIVE_FILE_BYTES = 128 * 1024 * 1024
 MAX_JSON_BYTES = 128 * 1024
 MAX_WORKER_LEASE_KEYS = 32
@@ -1530,12 +1531,59 @@ def _archive_move_job_pinned(
 
 
 
+def _archive_pinned_json_preimage(
+    directory_fd: int, name: str
+) -> tuple[bytes, tuple[int, int, int, int, str]]:
+    """Read private JSON bytes and their inode/digest through a pinned root."""
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+        dir_fd=directory_fd,
+    )
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or before.st_size > MAX_JSON_BYTES
+        ):
+            raise RuntimeError("pinned JSON index must be one private regular file")
+        data = bytearray()
+        while len(data) <= MAX_JSON_BYTES:
+            chunk = os.read(
+                descriptor, min(64 * 1024, MAX_JSON_BYTES + 1 - len(data))
+            )
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > MAX_JSON_BYTES:
+            raise RuntimeError("pinned JSON index exceeds its size bound")
+        after = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+        ):
+            raise RuntimeError("pinned JSON index changed during read")
+        on_path = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (on_path.st_dev, on_path.st_ino) != (before.st_dev, before.st_ino):
+            raise RuntimeError("pinned JSON index basename changed during read")
+        contents = bytes(data)
+        return contents, (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns, hashlib.sha256(contents).hexdigest(),
+        )
+    finally:
+        os.close(descriptor)
+
+
 def _write_json_atomic(
     path: Path,
     payload: dict[str, Any],
     *,
     replace_existing: bool = False,
     expected_parent_identity: tuple[int, int] | None = None,
+    expected_existing_preimage: tuple[int, int, int, int, str] | None = None,
 ) -> Path:
     parent = _private_directory(path.parent, create=True)
     path = parent / path.name
@@ -1564,10 +1612,40 @@ def _write_json_atomic(
                 raise RuntimeError(f"existing evidence is not owner-controlled: {path}")
             if not replace_existing:
                 raise FileExistsError(f"retention evidence already exists: {path}")
+        if expected_existing_preimage is not None:
+            if not replace_existing or existing is None:
+                raise RuntimeError("runtime deploy index snapshot changed before update")
+            try:
+                _, verified = _archive_pinned_json_preimage(
+                    directory_fd, path.name
+                )
+            except OSError as exc:
+                raise RuntimeError("runtime deploy index identity changed before update") from exc
+            if verified != expected_existing_preimage:
+                raise RuntimeError("runtime deploy index snapshot changed before update")
         data = (
             json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
             + b"\n"
         )
+        # Evidence from failed publications and RENAME_EXCHANGE must never be
+        # unlinked by pathname: a same-UID peer could have replaced it.
+        # Account for ALL retained JSON temps in this pinned directory, not
+        # just ones for this target (receipts use distinct filenames).
+        retained_temps = 0
+        scanned_entries = 0
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                scanned_entries += 1
+                if scanned_entries > MAX_JOB_REGISTRY_ENTRIES:
+                    raise RuntimeError("retained atomic temp scan bound exceeded")
+                if re.fullmatch(
+                    r"\..+\.[1-9][0-9]{0,11}\.[1-9][0-9]{0,19}\.tmp",
+                    entry.name,
+                ):
+                    retained_temps += 1
+                    if retained_temps >= MAX_RETAINED_JSON_TEMPS:
+                        raise RuntimeError("retained atomic temp bound exceeded")
+        _archive_require_unchanged_root(parent, directory_fd)
         candidate_name = f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
         descriptor = os.open(
             candidate_name,
@@ -1586,6 +1664,22 @@ def _write_json_atomic(
             os.close(descriptor)
         _archive_require_unchanged_root(parent, directory_fd)
         if replace_existing and existing is not None:
+            if expected_existing_preimage is not None:
+                # A peer can replace the index AFTER the initial validated
+                # read and before publication. Revalidate against that exact
+                # authenticated inode+content, not merely a new private inode.
+                try:
+                    _, verified = _archive_pinned_json_preimage(
+                        directory_fd, path.name
+                    )
+                except OSError as exc:
+                    raise RuntimeError(
+                        "runtime deploy index identity changed before exchange"
+                    ) from exc
+                if verified != expected_existing_preimage:
+                    raise RuntimeError(
+                        "runtime deploy index snapshot changed before exchange"
+                    )
             # os.replace would silently delete a foreign index/manifest
             # swapped into this pathname after the earlier stat. Linux offers
             # no rename-if-inode; exchange the two entries atomically instead.
@@ -1614,6 +1708,16 @@ def _write_json_atomic(
                 raise RuntimeError(
                     "atomic replacement target identity changed; displaced evidence retained"
                 )
+            if expected_existing_preimage is not None:
+                # The displaced history must be exactly the index initially
+                # read; a same-UID in-place rewrite cannot silently succeed.
+                _, displaced_preimage = _archive_pinned_json_preimage(
+                    directory_fd, temporary_name
+                )
+                if displaced_preimage != expected_existing_preimage:
+                    raise RuntimeError(
+                        "runtime deploy index changed during exchange; evidence retained"
+                    )
         else:
             # Even replace_existing=True may NOT clobber a target that was
             # absent during the earlier pinned-dirfd observation.
@@ -2375,41 +2479,11 @@ def _archive_read_deploy_index_pinned(
     if name != "runtime-deploy-index.json":
         raise RuntimeError("unexpected runtime deploy index name")
     try:
-        index_fd = os.open(
-            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-            dir_fd=root_fd,
-        )
+        data, preimage = _archive_pinned_json_preimage(root_fd, name)
     except FileNotFoundError:
         return None
     except OSError as exc:
         raise RuntimeError("runtime deploy index is unreadable") from exc
-    try:
-        before = os.fstat(index_fd)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or before.st_uid != os.getuid()
-            or stat.S_IMODE(before.st_mode) & 0o077
-            or before.st_size > MAX_JSON_BYTES
-        ):
-            raise RuntimeError("runtime deploy index must be one private regular file")
-        data = bytearray()
-        while len(data) <= MAX_JSON_BYTES:
-            chunk = os.read(
-                index_fd, min(64 * 1024, MAX_JSON_BYTES + 1 - len(data))
-            )
-            if not chunk:
-                break
-            data.extend(chunk)
-        if len(data) > MAX_JSON_BYTES:
-            raise RuntimeError("runtime deploy index exceeds its size bound")
-        after = os.fstat(index_fd)
-        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
-        ):
-            raise RuntimeError("runtime deploy index changed during pinned read")
-    finally:
-        os.close(index_fd)
     try:
         value = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -2438,7 +2512,7 @@ def _archive_read_deploy_index_pinned(
     if type(stamp) is not int or stamp < 0:
         raise RuntimeError("runtime deploy index timestamp is invalid")
     _archive_require_unchanged_root(jobs_root, root_fd)
-    return {**value, "units": sorted(units)}
+    return {**value, "units": sorted(units), "_source_preimage": preimage}
 
 
 def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, Any]:
@@ -2570,25 +2644,49 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                     },
                     replace_existing=True,
                     expected_parent_identity=root_identity,
+                    expected_existing_preimage=index["_source_preimage"],
                 )
 
-        # A plan SHA is not an authority MAC. A caller can remove recovered
-        # archive entries and rehash the plan, or hide the index pathname.
-        # Require POSITIVE live-registry evidence for still-indexed jobs and
-        # whenever the index is missing. The sole other authority is an
-        # authenticated archive move completed in THIS apply.
+        # Index membership is not trustworthy authority, even when a
+        # one-shot pinned read showed non-membership: a same-UID peer may
+        # present a different valid index and then restore the original.
+        # Recovered historical archives cannot authorize reset by plan hash
+        # or unsigned manifest. Only a verified move in THIS apply or a
+        # positive pinned live registry can authorize reset of a job unit.
         just_archived_units = {item["unit"] for item in archived}
         reset_results: list[dict[str, Any]] = []
         reset_failures: list[dict[str, str]] = []
         for unit in plan["reset_failed_units"]:
-            if (
-                JOB_UNIT.fullmatch(unit)
-                and unit not in just_archived_units
-                and (
-                    index is None
-                    or unit.removesuffix(".service") in indexed_units
-                )
-            ):
+            if JOB_UNIT.fullmatch(unit) and unit in just_archived_units:
+                # A same-UID peer may hide the deployment index during the
+                # first read. Even a verified move cannot justify resetting
+                # a unit whose CURRENT pinned index still lists that job.
+                root_fd = None
+                try:
+                    root_fd = _archive_open_private_root(jobs_root)
+                    _archive_require_pinned_identity(jobs_root, index_root_identity)
+                    current_index = _archive_read_deploy_index_pinned(
+                        jobs_root, root_fd, self_deploy
+                    )
+                    _archive_require_unchanged_root(jobs_root, root_fd)
+                    if (
+                        current_index is not None
+                        and unit.removesuffix(".service") in current_index["units"]
+                    ):
+                        raise RuntimeError(
+                            "verified archived job remains in deployment index"
+                        )
+                except (RuntimeError, OSError, KeyError, ValueError) as exc:
+                    reset_failures.append(
+                        _redacted_reset_failure(
+                            unit=unit, stage="deployment_index_recovery", error=exc
+                        )
+                    )
+                    continue
+                finally:
+                    if root_fd is not None:
+                        os.close(root_fd)
+            if JOB_UNIT.fullmatch(unit) and unit not in just_archived_units:
                 job_dir = jobs_root / unit.removesuffix(".service")
                 try:
                     _archive_require_pinned_identity(jobs_root, index_root_identity)
@@ -2597,7 +2695,12 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                         state = _systemd_unit_states([unit])[unit]
                         current = _job_record(
                             unit, jobs_root, now=int(time.time()),
-                            minimum_age_seconds=plan["minimum_job_age_seconds"],
+                            # The caller controls its self-hashed plan.
+                            # It may narrow archive age, never widen the
+                            # intrinsic one-day maximum for an indexed reset.
+                            minimum_age_seconds=min(
+                                plan["minimum_job_age_seconds"], 86_400
+                            ),
                             systemd_state=state,
                         )
                         # A same-UID peer can swap A -> B -> A while the
@@ -2611,7 +2714,7 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                             raise RuntimeError("indexed job live registry inode/metadata mismatch")
                         if not current["terminal"] or current["archive"]:
                             raise RuntimeError(
-                                "indexed job is not a live, terminal, non-archive-eligible registry entry"
+                                "job is not a live, terminal, non-archive-eligible registry entry"
                             )
                     finally:
                         os.close(live_fd)
