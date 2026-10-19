@@ -89,7 +89,18 @@ class TaskAttentionTests(unittest.TestCase):
         self.archive_root = self.root / "state" / "task-archives"
         self.archive_effect_root = self.root / "state" / "task-archive-effects"
         self.projection_root = self.root / "state" / "task-projection"
+        # Existing artifact/closeout tests model an externally authorized
+        # retirement witness in this hermetic fixture only. Production has
+        # no such authority and MUST fail closed; a separate integration
+        # negative test below restores and exercises the actual gate.
+        self.production_archive_retirement_gate = (
+            attention._require_host_authenticated_archive_retirement
+        )
         self.patches = [
+            patch.object(
+                attention, "_require_host_authenticated_archive_retirement",
+                return_value=None,
+            ),
             patch.object(tasks, "TASK_DB", self.database),
             patch.object(tasks, "TASK_OUTCOMES_DIR", self.outcomes),
             patch.object(tasks.resources, "RESOURCE_DB", self.resource_database),
@@ -2131,6 +2142,35 @@ class TaskAttentionTests(unittest.TestCase):
         ):
             attention._require_safe_archive_transport(historical)
         route.assert_not_called()
+
+    def test_unverified_single_local_marker_cannot_create_archive(self) -> None:
+        # Old and forged same-UID launchers can contain all three local
+        # markers. Without independently authenticated host retirement they
+        # may never authorize a NEW immutable archive projection switch.
+        record = self._completed_task()
+        raw = tasks._row_raw(str(record["task_id"]))
+        launcher = json.loads(raw["launcher_json"])
+        self.assertEqual(1, raw["attempt"])
+        self.assertEqual("local", launcher["task_launch_transport"])
+        self.assertEqual(tasks.TASK_LOCAL_DISPATCH_PROVENANCE,
+                         launcher["task_launch_provenance"])
+        self.assertEqual(1, launcher[tasks.TASK_OUTPUT_LAUNCHER_BINDING_KEY])
+        before = self.database.read_bytes()
+        with (
+            patch.object(
+                attention, "_require_host_authenticated_archive_retirement",
+                self.production_archive_retirement_gate,
+            ),
+            patch.object(tasks, "_observe",
+                         side_effect=AssertionError("unsafe archive must not probe")) as probe,
+            self.assertRaisesRegex(attention.TaskAttentionConflictError,
+                                   "authenticated.*retirement proof"),
+        ):
+            attention.execute_closeout_archive(self._archive_parameters(record))
+        probe.assert_not_called()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
 
     def test_archive_classification_rejects_persisted_ssh_launch_before_external_sources(self) -> None:
         record = self._completed_task()

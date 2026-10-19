@@ -1376,14 +1376,31 @@ def _assert_no_live_task_process(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _require_host_authenticated_archive_retirement(_record: dict[str, Any]) -> None:
+    """Fail closed until #1556 provides independent, durable restart exclusion.
+
+    Mutable TaskStore launch fields, today's Fleet mapping and inactive unit
+    observations cannot attest the earlier host/attempt/scope/epoch or prevent
+    the original manager restarting a supposedly archived task. No root/SSH
+    effects are permitted on the READ_ONLY path or at archive admission merely
+    to manufacture a positive certificate. Existing archived replay remains
+    separate; new irreversible switches require externally authenticated
+    retirement authority, which is not yet installed.
+    """
+    raise TaskAttentionConflictError(
+        "independently authenticated task retirement proof is required (#1556)"
+    )
+
+
 def _require_safe_archive_transport(record: dict[str, Any]) -> None:
     """Do not create an archive that READ_ONLY can never certify.
 
     Until #1556 supplies an authorized retirement/compaction protocol,
     Rootbroker or SSH terminal task archival can permanently strand global
     readiness. Their live process checks would also require external effects.
-    Preserve idempotent replay of pre-existing archives, but reject new
-    irreversible projection switches for unsupported task authorities.
+    Preserve idempotent replay of pre-existing archives. Until the actual
+    external retirement authority is installed, reject ALL new irreversible
+    archive projection switches, including apparently local launch records.
     """
     if (
         tasks._is_root_systemd_backend(record)
@@ -1417,10 +1434,9 @@ def _require_safe_archive_transport(record: dict[str, Any]) -> None:
         )
     # The TaskStore retains only the latest launcher. A local retry can replace
     # an earlier SSH launch without retiring its independently restartable unit.
-    # Until #1556 can authenticate the full attempt history, only one-attempt
-    # tasks admitted by the prospective physically local dispatcher are safe
-    # for a NEW immutable archive switch. This is NOT external retirement proof
-    # and must never upgrade legacy readiness to verified.
+    # Single-attempt/prospective direct-local markers are useful negative
+    # filters but can be forged by the same UID and never by themselves grant
+    # a NEW immutable archive switch. Only independent host retirement can.
     attempt = record.get("attempt")
     if isinstance(attempt, bool) or attempt != 1:
         raise TaskAttentionConflictError(
@@ -1447,6 +1463,8 @@ def _require_safe_archive_transport(record: dict[str, Any]) -> None:
         raise TaskAttentionConflictError(
             "remote task archive retirement proof is required (#1556)"
         )
+    # Negative local-transport filters are not permission to archive.
+    _require_host_authenticated_archive_retirement(record)
 
 
 @contextmanager
