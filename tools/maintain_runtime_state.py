@@ -215,6 +215,26 @@ def _archive_internal_manifest_shape_preflight(
         )
 
 
+def _archive_internal_manifest_entry(
+    path: Path, *, metadata: os.stat_result
+) -> bool:
+    """Recognize bounded private internal metadata, not archive payload.
+
+    An atomic EXCHANGE retaining a prior archive-manifest.json leaves its
+    displaced inode at .archive-manifest.json.<pid>.<time_ns>.tmp. It is
+    preserved as untrusted history, never treated as a verified archive
+    receipt or silently deleted. Limit names and sizes; entry-count bounds
+    still include this metadata.
+    """
+    if path.name != "archive-manifest.json" and re.fullmatch(
+        r"\.archive-manifest\.json\.[1-9][0-9]{0,11}\.[1-9][0-9]{0,19}\.tmp",
+        path.name,
+    ) is None:
+        return False
+    _archive_internal_manifest_shape_preflight(path, metadata=metadata)
+    return True
+
+
 def _archive_open_private_root(directory: Path) -> int:
     """Pin a private job-directory inode; never follow its final symlink."""
     try:
@@ -313,8 +333,7 @@ def _archive_file_shape_preflight(directory: Path) -> None:
         files = 0
         for path in _archive_bounded_entries(directory, fd):
             metadata = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
-            if path == directory / "archive-manifest.json":
-                _archive_internal_manifest_shape_preflight(path, metadata=metadata)
+            if _archive_internal_manifest_entry(path, metadata=metadata):
                 continue
             files += 1
             if files > MAX_ARCHIVE_FILES:
@@ -1288,8 +1307,7 @@ def _archive_file_manifest_on_fd(directory: Path, fd: int) -> list[dict[str, Any
     files: list[dict[str, Any]] = []
     for path in _archive_bounded_entries(directory, fd):
         metadata = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
-        if path == directory / "archive-manifest.json":
-            _archive_internal_manifest_shape_preflight(path, metadata=metadata)
+        if _archive_internal_manifest_entry(path, metadata=metadata):
             continue
         if stat.S_ISLNK(metadata.st_mode):
             raise RuntimeError(f"archive source contains a symlink: {path}")
@@ -1351,6 +1369,29 @@ def _archive_rename_noreplace(
                 code, "archive destination already exists", destination_name
             )
         raise OSError(code, os.strerror(code), destination_name)
+
+
+def _archive_rename_exchange(
+    directory_fd: int, incoming_name: str, target_name: str
+) -> None:
+    """Atomically exchange two entries without deleting the displaced inode."""
+    try:
+        syscall = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:
+        raise RuntimeError("renameat2(EXCHANGE) is unavailable") from exc
+    syscall.argtypes = [
+        ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint,
+    ]
+    syscall.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    if syscall(
+        directory_fd, os.fsencode(incoming_name),
+        directory_fd, os.fsencode(target_name), 2,
+    ) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), target_name)
+
+
 
 
 def _archive_quarantine_mismatched_move(
@@ -1538,30 +1579,54 @@ def _write_json_atomic(
         # an existing private file, even if an attacker predicts the name.
         temporary_name = candidate_name
         try:
+            incoming = os.fstat(descriptor)
             _write_all(descriptor, data)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
         _archive_require_unchanged_root(parent, directory_fd)
-        if replace_existing:
-            os.replace(
-                temporary_name, path.name,
-                src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
-            )
+        if replace_existing and existing is not None:
+            # os.replace would silently delete a foreign index/manifest
+            # swapped into this pathname after the earlier stat. Linux offers
+            # no rename-if-inode; exchange the two entries atomically instead.
+            # Even on success retain the displaced private prior revision:
+            # unlink(temp_name) is itself vulnerable to same-UID replacement.
+            _archive_rename_exchange(directory_fd, temporary_name, path.name)
+            try:
+                published = os.stat(
+                    path.name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                displaced = os.stat(
+                    temporary_name, dir_fd=directory_fd, follow_symlinks=False
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    "atomic replacement identity unavailable; displaced evidence retained"
+                ) from exc
+            if (
+                (published.st_dev, published.st_ino) !=
+                (incoming.st_dev, incoming.st_ino)
+                or (displaced.st_dev, displaced.st_ino) !=
+                (existing.st_dev, existing.st_ino)
+                or displaced.st_size != existing.st_size
+                or displaced.st_mtime_ns != existing.st_mtime_ns
+            ):
+                raise RuntimeError(
+                    "atomic replacement target identity changed; displaced evidence retained"
+                )
         else:
-            # Never overwrite a concurrently created receipt/manifest.
+            # Even replace_existing=True may NOT clobber a target that was
+            # absent during the earlier pinned-dirfd observation.
             _archive_rename_noreplace(
                 directory_fd, temporary_name, directory_fd, path.name
             )
-        temporary_name = None
+            temporary_name = None
         os.fsync(directory_fd)
         _archive_require_unchanged_root(parent, directory_fd)
     finally:
-        # Never unlink a temporary pathname after a failed publication. A
-        # same-UID peer could have renamed our inode away and substituted a
-        # foreign file at that basename. There is no atomic conditional
-        # unlink-by-inode here; retain the private 0600 orphan rather than
-        # risk deleting foreign evidence. On success rename consumes the temp.
+        # Never unlink a temporary pathname: after failed publication it may
+        # belong to a racing same-UID peer, and after a successful exchange it
+        # intentionally retains the prior target inode for exact recovery.
         os.close(directory_fd)
     return path
 

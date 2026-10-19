@@ -1118,6 +1118,93 @@ class RuntimeRetentionTests(unittest.TestCase):
                     else:
                         self.assertTrue((bad / "subdir-00").is_dir())
 
+    def test_exchange_retains_stale_manifest_without_breaking_archive_receipt(self) -> None:
+        # RENAME_EXCHANGE preserves prior private archive metadata. The
+        # recovered archive receipt must still validate the payload files.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            name = "grabowski-job-353535353535"
+            unit = name + ".service"
+            source = self._job(jobs, name, 100)
+            stale = source / "archive-manifest.json"
+            previous = b'{"retry":true}\n'
+            stale.write_bytes(previous)
+            stale.chmod(0o600)
+            states = {unit: self._state(unit)}
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=50, now=1_000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states=states,
+            )
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_self_deploy,
+                "grabowski_mcp": fake_base,
+            }), patch.object(
+                RETENTION, "_systemd_unit_states", return_value=states
+            ), patch.object(
+                RETENTION, "_run", return_value=Mock(returncode=0, stderr="")
+            ):
+                result = RETENTION.apply_plan(
+                    plan, expected_plan_sha256=plan["plan_sha256"]
+                )
+                verified = RETENTION._archived_job_receipt(unit, jobs, archive)
+            self.assertTrue(result["completed"])
+            self.assertEqual(verified["unit"], unit)
+            archived = archive / name
+            prior = list(archived.glob(".archive-manifest.json.*.tmp"))
+            self.assertEqual(len(prior), 1)
+            self.assertEqual(prior[0].read_bytes(), previous)
+            self.assertEqual((archived / "stdout.log").read_bytes(), b"done\n")
+            self.assertFalse(source.exists())
+
+    def test_unsafe_retained_internal_manifest_is_never_ignored(self) -> None:
+        # Reserved auxiliary metadata cannot make a symlink or oversize
+        # private artifact invisible to the archive safety preflight.
+        for kind in ("symlink", "oversized"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                jobs = root / "jobs"
+                bad_name = "grabowski-job-353535353536"
+                good_name = "grabowski-job-353535353537"
+                bad = self._job(jobs, bad_name, 100)
+                self._job(jobs, good_name, 101)
+                ghost = bad / ".archive-manifest.json.123.456.tmp"
+                if kind == "symlink":
+                    foreign = root / "foreign"
+                    foreign.write_bytes(b"preserve foreign")
+                    foreign.chmod(0o600)
+                    ghost.symlink_to(foreign)
+                else:
+                    ghost.write_bytes(b"X" * (RETENTION.MAX_JSON_BYTES + 1))
+                    ghost.chmod(0o600)
+                states = {
+                    name + ".service": self._state(name + ".service")
+                    for name in (bad_name, good_name)
+                }
+                plan = RETENTION.build_plan(
+                    minimum_job_age_seconds=50, now=1_000,
+                    jobs_root=jobs, archive_root=root / "archive",
+                    receipt_root=root / "receipts",
+                    task_db=root / "missing.sqlite3",
+                    failed_units=list(states), unit_states=states,
+                )
+                selected = [row["job_name"] for row in plan["archive_jobs"]]
+                self.assertEqual(selected, [good_name])
+                self.assertTrue(any(
+                    row["unit"] == bad_name + ".service"
+                    for row in plan["blocked"]
+                ))
+                self.assertTrue(ghost.is_symlink() if kind == "symlink" else ghost.is_file())
+
     def test_stale_internal_archive_manifest_does_not_exhaust_file_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1398,6 +1485,88 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertFalse(list(receipts.glob("*.json")))
             reset.assert_not_called()
             fake_base._append_audit.assert_called_once()
+
+
+    def test_atomic_replace_preserves_raced_foreign_target(self) -> None:
+        # P1: a same-UID peer can swap a valid private target after stat.
+        # An atomic exchange must preserve the foreign object, then fail closed.
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "jobs"
+            parent.mkdir(mode=0o700)
+            target = parent / "runtime-deploy-index.json"
+            old = b"original-index-bytes\\n"
+            foreign = b"foreign-index-evidence\\n"
+            target.write_bytes(old)
+            target.chmod(0o600)
+            saved = parent / ".original-index-preserved"
+            real_check = RETENTION._archive_require_unchanged_root
+            checks = []
+
+            def substitute_after_stat(directory: Path, descriptor: int) -> None:
+                checks.append(True)
+                if directory == parent and len(checks) == 2:
+                    target.rename(saved)
+                    target.write_bytes(foreign)
+                    target.chmod(0o600)
+                return real_check(directory, descriptor)
+
+            with patch.object(
+                RETENTION, "_archive_require_unchanged_root",
+                side_effect=substitute_after_stat,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed|identity|raced"):
+                    RETENTION._write_json_atomic(
+                        target, {"schema_version": 1}, replace_existing=True
+                    )
+            self.assertGreaterEqual(len(checks), 2)
+            self.assertEqual(saved.read_bytes(), old)
+            self.assertIn(foreign, [p.read_bytes() for p in parent.iterdir() if p.is_file()])
+
+    def test_atomic_replace_retains_prior_evidence_on_success(self) -> None:
+        # No unconditional unlink of the former target after publication.
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "jobs"
+            parent.mkdir(mode=0o700)
+            target = parent / "runtime-deploy-index.json"
+            previous = b"previous-authentic-evidence\\n"
+            target.write_bytes(previous)
+            target.chmod(0o600)
+            RETENTION._write_json_atomic(
+                target, {"schema_version": 1}, replace_existing=True
+            )
+            self.assertEqual(json.loads(target.read_text())["schema_version"], 1)
+            saved = [p for p in parent.iterdir() if p != target]
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0].read_bytes(), previous)
+            self.assertEqual(saved[0].stat().st_mode & 0o077, 0)
+
+    def test_atomic_replace_does_not_clobber_new_target_after_absent_probe(self) -> None:
+        # replace_existing=True must not imply unconditional replacement when
+        # the target did not exist at the initial pinned-root inspection.
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary) / "jobs"
+            parent.mkdir(mode=0o700)
+            target = parent / "runtime-deploy-index.json"
+            peer_data = b"raced-new-entry\\n"
+            real_check = RETENTION._archive_require_unchanged_root
+            checks = []
+
+            def create_after_absent_probe(directory: Path, descriptor: int) -> None:
+                checks.append(True)
+                if directory == parent and len(checks) == 2:
+                    target.write_bytes(peer_data)
+                    target.chmod(0o600)
+                return real_check(directory, descriptor)
+
+            with patch.object(
+                RETENTION, "_archive_require_unchanged_root",
+                side_effect=create_after_absent_probe,
+            ):
+                with self.assertRaises(FileExistsError):
+                    RETENTION._write_json_atomic(
+                        target, {"schema_version": 1}, replace_existing=True
+                    )
+            self.assertEqual(target.read_bytes(), peer_data)
 
     def test_atomic_temp_replaced_after_failed_noreplace_is_not_deleted(self) -> None:
         # Concurrent same-UID writer moves our temp away and places a foreign
