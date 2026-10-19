@@ -864,7 +864,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertIn("archiv", next_action)
         self.assertNotIn("reconcile live task outcomes", next_action)
 
-    def test_overview_local_terminal_budget_recommends_verified_archival_not_reconcile_loop(self) -> None:
+    def test_overview_local_terminal_budget_requires_retirement_before_archive(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
                 "state_counts": {"completed": 33},
@@ -913,10 +913,12 @@ class ConsumerSurfaceTests(unittest.TestCase):
         next_action = result["recommended_next_action"].lower()
         self.assertIn("local terminal", next_action)
         self.assertIn("authorized live observation", next_action)
-        self.assertIn("task-closeout-archive", next_action)
+        self.assertNotIn("task-closeout-archive", next_action)
         self.assertNotIn("reconcile live task outcomes", next_action)
         self.assertIn("only the excess", next_action)
         self.assertIn("no more", next_action)
+        self.assertIn("do not archive", next_action)
+        self.assertIn("restart-exclusion", next_action)
 
         # Archived rows stay in the task table and still count toward the
         # scan budget, so archival must not be recommended for it.
@@ -954,7 +956,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertNotIn("task-closeout-archive", scan_action)
         self.assertNotIn("reconcile live task outcomes", scan_action)
 
-    def test_overview_local_terminal_observation_names_exact_archive_excess(self) -> None:
+    def test_overview_local_terminal_observation_counts_excess_without_archive_admission(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
                 "state_counts": {"completed": 40},
@@ -998,8 +1000,11 @@ class ConsumerSurfaceTests(unittest.TestCase):
                 },
             )
         next_action = result["recommended_next_action"].lower()
-        self.assertIn("archive exactly 8 independently verified", next_action)
+        self.assertIn("exactly 8", next_action)
         self.assertIn("no more", next_action)
+        self.assertIn("do not archive", next_action)
+        self.assertIn("restart-exclusion", next_action)
+        self.assertNotIn("task-closeout-archive", next_action)
         self.assertFalse(result["operator_ready"])
 
         # An excess beyond the archive headroom cannot be archived away.
@@ -1081,7 +1086,9 @@ class ConsumerSurfaceTests(unittest.TestCase):
         next_action = result["recommended_next_action"].lower()
         self.assertIn("remote", next_action)
         self.assertIn("live", next_action)
-        self.assertIn("task-closeout-archive", next_action)
+        self.assertIn("restart-exclusion", next_action)
+        self.assertIn("do not archive", next_action)
+        self.assertNotIn("task-closeout-archive", next_action)
         self.assertNotIn("reconcile live task outcomes", next_action)
 
     def test_overview_remote_archival_requires_verified_sufficient_headroom(self) -> None:

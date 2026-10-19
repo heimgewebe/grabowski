@@ -6600,18 +6600,20 @@ def _operator_system_overview(
             "archive projection before relying on readiness"
         )
     elif reconciliation_evidence.get("status") == "local_terminal_budget_exceeded":
-        # READ_ONLY observes at most a bounded local terminal cohort; another
-        # reconciliation leaves it unchanged. Archiving exactly the excess fits
-        # the archive history budget; archiving more can exceed it.
+        # An observed excess is a budget, not an archive or retirement
+        # authorization. Historic SSH/root attempts can still restart without
+        # changing the current TaskStore, even if they currently map local.
         excess = reconciliation_evidence.get("archive_excess")
         count = (
             f"exactly {excess} " if type(excess) is int and excess > 0 else "only the excess "
         )
         next_action = (
             "verify current local terminal tasks with authorized live observation; "
-            f"archive {count}independently verified terminal tasks through the "
-            "authorized task-closeout-archive workflow, no more, so the local "
-            "terminal readiness budget fits within the archive history budget"
+            f"the local terminal excess is {count}tasks, no more; "
+            "do not archive unproven attempts to recover readiness until "
+            "independently enforced task-and-attempt-bound restart-exclusion "
+            "is evidenced (#1556); a current terminal observation alone is "
+            "not archive admission or operator_ready"
         )
     elif reconciliation_evidence.get("status") == "archived_task_unit_live_unverified":
         next_action = (
@@ -6641,8 +6643,7 @@ def _operator_system_overview(
         )
     elif reconciliation_evidence.get("status") == "local_terminal_transport_unverified":
         # A remote unit cannot be certified by the local read-only observer.
-        # Only recommend archive when a complete bounded cohort fits within
-        # the remaining archive history; otherwise fail closed.
+        # Budget headroom never proves external retirement or restart exclusion.
         remote_count = reconciliation_evidence.get("non_local_terminal_count")
         headroom = reconciliation_evidence.get("archive_headroom")
         if (
@@ -6651,9 +6652,9 @@ def _operator_system_overview(
         ):
             next_action = (
                 "inspect current remote-host terminal tasks with authorized live "
-                f"observation; archive exactly {remote_count} independently verified "
-                "terminal tasks through the authorized task-closeout-archive workflow, "
-                "no more, within the remaining archive-history budget"
+                f"observation; {remote_count} non-local tasks fit the archive-history "
+                "budget, but do not archive them for readiness without an "
+                "authenticated external retirement and restart-exclusion proof"
             )
         elif type(remote_count) is int and remote_count > 0 and type(headroom) is int:
             next_action = (
@@ -6667,13 +6668,13 @@ def _operator_system_overview(
             next_action = (
                 "inspect current remote-host terminal tasks with authorized live "
                 "observation; no verified non-local cohort size and archive headroom "
-                "are available, so do not archive until a bounded budget check "
-                "proves complete closeout is possible"
+                "are available, so do not archive; a budget check alone cannot "
+                "authorize closeout"
             )
         next_action += (
             "; archival and reconciliation alone cannot establish readiness; "
             "remote retirement requires an authorized task-and-attempt-bound "
-            "restart-exclusion contract, which stop/show does not provide"
+            "restart-exclusion contract (#1556), which stop/show does not provide"
         )
     elif reconciliation_evidence.get("status") != "verified":
         next_action = "reconcile live task outcomes through an authorized mutation-capable path"
