@@ -1055,20 +1055,32 @@ def _canonical_repo_slug(value: Any) -> str | None:
     return "/".join(parts).lower()
 
 
+def _normalized_review_policy_path(path: str) -> str:
+    """Remove only literal './' segments; retain GitHub dot-directory identity.
+
+    str.lstrip("./") silently converts '.github/workflows' into
+    'github/workflows', bypassing the explicitly high-critical path list.
+    """
+    normalized = path.lower()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
 def _is_risk_path(path: str) -> bool:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     return any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in RISK_PATH_PREFIXES) or any(marker in normalized for marker in RISK_PATH_MARKERS)
 
 
 def _is_policy_critical_path(path: str) -> bool:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     if normalized in POLICY_CRITICAL_PATHS:
         return True
     return any(normalized.startswith(prefix) for prefix in POLICY_CRITICAL_PREFIXES)
 
 
 def _is_documentation_path(path: str) -> bool:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     path_obj = Path(normalized)
     name = path_obj.name
     suffix = path_obj.suffix
@@ -1082,7 +1094,7 @@ def _is_documentation_path(path: str) -> bool:
 
 
 def _trivial_exempt_deny_reason(path: str, changed_lines: int) -> str | None:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     name = Path(normalized).name
     suffix = Path(normalized).suffix
     if changed_lines <= 0:
@@ -1098,7 +1110,7 @@ def _trivial_exempt_deny_reason(path: str, changed_lines: int) -> str | None:
 
 
 def _high_critical_path_reason(path: str) -> str | None:
-    normalized = path.lower().lstrip("./")
+    normalized = _normalized_review_policy_path(path)
     if _is_policy_critical_path(normalized):
         return f"high-critical policy path touched: {path}"
     if any(normalized == prefix.rstrip("/") or normalized.startswith(prefix) for prefix in HIGH_CRITICAL_PATH_PREFIXES):
