@@ -366,6 +366,61 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                             pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
                         )
 
+    def test_removed_required_target_root_requires_independent_full_r3(self):
+        for root in ("tmpfiles", "contracts"):
+            with self.subTest(root=root):
+                paths, pages = self.fixture()
+                pages[paths["target_tree"]]["tree"] = [
+                    entry for entry in pages[paths["target_tree"]]["tree"]
+                    if entry["path"] != root
+                ]
+                with patch.object(admission, "validate_independent_release_review") as reviewer:
+                    with self.assertRaisesRegex(
+                        admission.ReleaseAdmissionDenied, "control sources changed.*R3",
+                    ):
+                        self.query(pages)
+                reviewer.assert_not_called()
+
+    def test_independently_reviewed_target_root_removal_can_transition(self):
+        for root in ("tmpfiles", "contracts"):
+            with self.subTest(root=root):
+                paths, pages = self.fixture()
+                pages[paths["target_tree"]]["tree"] = [
+                    entry for entry in pages[paths["target_tree"]]["tree"]
+                    if entry["path"] != root
+                ]
+                proof = {
+                    "review_pr": 1452,
+                    "review_binding_sha256": "a" * 64,
+                    "review_attempts_sha256": "b" * 64,
+                    "independent_pass_count": 1,
+                    "admissible_slots": ["independent-grok-4.6"],
+                }
+                with patch.object(
+                    admission, "validate_independent_release_review", return_value=proof,
+                ) as reviewer:
+                    result, _ = self.query(
+                        pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+                    )
+                reviewer.assert_called_once_with(
+                    serving_head=SERVING, target_head=TARGET, diff_sha256=DIFF, review_pr=1452,
+                )
+                self.assertEqual(2, len(result["checks"]))
+                self.assertTrue(result["workflow"]["ci_policy_transition_required"])
+
+    def test_missing_serving_root_is_not_approved_as_valid_trust_anchor(self):
+        paths, pages = self.fixture()
+        pages[paths["serving_tree"]]["tree"] = [
+            entry for entry in pages[paths["serving_tree"]]["tree"]
+            if entry["path"] != "tools"
+        ]
+        with patch.object(admission, "validate_independent_release_review") as reviewer:
+            with self.assertRaisesRegex(
+                admission.ReleaseAdmissionDenied, "trusted Validate control roots are missing",
+            ):
+                self.query(pages, transition_review_pr=1452, transition_diff_sha256=DIFF)
+        reviewer.assert_not_called()
+
     def test_malformed_policy_tree_never_consults_review_authorizer(self):
         paths, pages = self.fixture()
         pages[paths["target_tree"]]["truncated"] = True

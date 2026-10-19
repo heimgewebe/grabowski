@@ -205,7 +205,7 @@ def _trusted_validate_control_sources(
     """
     prefix = f"/repos/{REPOSITORY}/git"
     observed: list[dict[str, tuple[str, str, str]]] = []
-    for head in (serving_head, target_head):
+    for revision_index, head in enumerate((serving_head, target_head)):
         # Commit and root tree are different Git objects. Bind the actual
         # immutable root-tree SHA from the authenticated exact commit first.
         commit, commit_link = _github_json(
@@ -249,7 +249,10 @@ def _trusted_validate_control_sources(
             ):
                 raise ReleaseAdmissionDenied("trusted Validate control entry is invalid")
             entries[path] = kind, mode, oid
-        if not VALIDATION_POLICY_REQUIRED_ROOTS.issubset(entries):
+        # The serving revision is our immutable policy trust anchor and must
+        # contain its expected baseline. A reviewed target may remove or rename
+        # a root; the missing path is classified as a policy transition below.
+        if revision_index == 0 and not VALIDATION_POLICY_REQUIRED_ROOTS.issubset(entries):
             raise ReleaseAdmissionDenied("trusted Validate control roots are missing")
         observed.append(entries)
     serving, target = observed
