@@ -366,7 +366,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                             pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
                         )
 
-    def test_removed_required_target_root_requires_independent_full_r3(self):
+    def test_removed_required_target_root_is_denied_before_full_r3(self):
         for root in ("tmpfiles", "contracts"):
             with self.subTest(root=root):
                 paths, pages = self.fixture()
@@ -376,12 +376,42 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                 ]
                 with patch.object(admission, "validate_independent_release_review") as reviewer:
                     with self.assertRaisesRegex(
-                        admission.ReleaseAdmissionDenied, "control sources changed.*R3",
+                        admission.ReleaseAdmissionDenied, "trusted Validate control roots are missing",
                     ):
                         self.query(pages)
                 reviewer.assert_not_called()
 
-    def test_independently_reviewed_target_root_removal_can_transition(self):
+    def test_required_target_root_removal_denied_even_after_full_r3(self):
+        # P1: a reviewed release may not become an unbootable serving trust
+        # anchor by deleting roots its still-shipped policy requires.
+        paths, pages = self.fixture()
+        pages[paths["target_tree"]]["tree"] = [
+            row for row in pages[paths["target_tree"]]["tree"]
+            if row["path"] != "contracts"
+        ]
+        proof = {
+            "review_pr": 1452,
+            "review_binding_sha256": "a" * 64,
+            "review_attempts_sha256": "b" * 64,
+            "independent_pass_count": 1,
+            "admissible_slots": ["independent-grok-4.6"],
+        }
+        with patch.object(
+            admission, "validate_independent_release_review",
+            return_value=proof,
+        ) as reviewer:
+            with self.assertRaisesRegex(
+                admission.ReleaseAdmissionDenied, "trusted Validate control roots are missing",
+            ):
+                self.query(
+                    pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+                )
+        reviewer.assert_not_called()
+
+    def test_staged_required_root_retirement_after_trusted_baseline_update(self):
+        # Step 1: previously deployed R3-reviewed policy removed this root
+        # from the serving constant while the root still existed. Step 2:
+        # a new R3 may remove the no-longer-required root from target Git.
         for root in ("tmpfiles", "contracts"):
             with self.subTest(root=root):
                 paths, pages = self.fixture()
@@ -397,16 +427,38 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                     "admissible_slots": ["independent-grok-4.6"],
                 }
                 with patch.object(
+                    admission, "VALIDATION_POLICY_REQUIRED_ROOTS",
+                    admission.VALIDATION_POLICY_REQUIRED_ROOTS - {root},
+                ), patch.object(
                     admission, "validate_independent_release_review", return_value=proof,
                 ) as reviewer:
                     result, _ = self.query(
                         pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
                     )
                 reviewer.assert_called_once_with(
-                    serving_head=SERVING, target_head=TARGET, diff_sha256=DIFF, review_pr=1452,
+                    serving_head=SERVING, target_head=TARGET,
+                    diff_sha256=DIFF, review_pr=1452,
                 )
                 self.assertEqual(2, len(result["checks"]))
                 self.assertTrue(result["workflow"]["ci_policy_transition_required"])
+
+    def test_prior_baseline_retirement_cannot_remove_unrelated_required_root(self):
+        paths, pages = self.fixture()
+        pages[paths["target_tree"]]["tree"] = [
+            entry for entry in pages[paths["target_tree"]]["tree"]
+            if entry["path"] != "contracts"
+        ]
+        with patch.object(
+            admission, "VALIDATION_POLICY_REQUIRED_ROOTS",
+            admission.VALIDATION_POLICY_REQUIRED_ROOTS - {"tmpfiles"},
+        ), patch.object(
+            admission, "validate_independent_release_review",
+        ) as reviewer:
+            with self.assertRaisesRegex(
+                admission.ReleaseAdmissionDenied, "trusted Validate control roots are missing",
+            ):
+                self.query(pages, transition_review_pr=1452, transition_diff_sha256=DIFF)
+        reviewer.assert_not_called()
 
     def test_missing_serving_root_is_not_approved_as_valid_trust_anchor(self):
         paths, pages = self.fixture()
