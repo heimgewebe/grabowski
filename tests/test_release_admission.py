@@ -542,6 +542,39 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                         )
                 reviewer.assert_not_called()
 
+    def test_shadowed_frozenset_constructor_is_denied_before_reviewer(self):
+        # The target module executes before it becomes the next serving trust
+        # anchor. A shadowed name changes the runtime roots while the AST
+        # parser still sees the original frozenset({...}) argument.
+        shadowing = {
+            "assignment": 'frozenset = lambda _: {"missing-root"}\n',
+            "augassign": 'frozenset |= {"missing-root"}\n',
+            "annassign": 'frozenset: object = lambda _: {"missing-root"}\n',
+            "walrus": '(frozenset := lambda _: {"missing-root"})\n',
+            "nested": 'if True:\n    frozenset = lambda _: {"missing-root"}\n',
+            "function": 'def frozenset(_):\n    return {"missing-root"}\n',
+            "class": 'class frozenset:\n    pass\n',
+            "import": 'import math as frozenset\n',
+            "exception": 'try:\n    raise RuntimeError()\nexcept RuntimeError as frozenset:\n    pass\n',
+            "match": 'match 1:\n    case frozenset:\n        pass\n',
+        }
+        for case, prefix in shadowing.items():
+            with self.subTest(case=case):
+                paths, pages = self.fixture()
+                self._target_policy(pages, paths, admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+                pages[paths["target_policy"]] = _policy_response(
+                    prefix + _policy_content(admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+                )
+                with patch.object(admission, "validate_independent_release_review") as reviewer:
+                    with self.assertRaisesRegex(
+                        admission.ReleaseAdmissionDenied, "required-root declaration is invalid",
+                    ):
+                        self.query(
+                            pages, transition_review_pr=1452,
+                            transition_diff_sha256=DIFF,
+                        )
+                reviewer.assert_not_called()
+
     def test_target_policy_document_must_be_authenticated_and_static(self):
         for corruption in (
             "wrong_path", "wrong_type", "wrong_encoding", "missing_content",

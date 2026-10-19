@@ -241,34 +241,35 @@ def _target_required_roots(*, target_head: str, token: str) -> frozenset[str]:
     ]
     if len(assignments) != 1 or len(assignments[0].targets) != 1:
         raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
-    # The accepted literal must be the *only* binding of this name. Looking
-    # only at top-level Assign nodes misses |=, annotations, deletes, nested
-    # stores and non-Name binders (imports, definitions and match captures).
-    name = "VALIDATION_POLICY_REQUIRED_ROOTS"
+    # The literal roots and the built-in constructor must keep their
+    # meanings when the target module is imported. A second binding of
+    # either name (including nested stores, imports and match captures) can
+    # otherwise make an accepted release an unusable serving trust anchor.
+    protected_names = {"VALIDATION_POLICY_REQUIRED_ROOTS", "frozenset"}
     declared_target = assignments[0].targets[0]
     for node in ast.walk(module):
         if (
-            isinstance(node, ast.Name) and node.id == name
+            isinstance(node, ast.Name) and node.id in protected_names
             and isinstance(node.ctx, (ast.Store, ast.Del))
             and node is not declared_target
         ):
             raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node.name == name:
+            if node.name in protected_names:
                 raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
         if isinstance(node, ast.Import):
-            if any((alias.asname or alias.name.partition(".")[0]) == name
+            if any((alias.asname or alias.name.partition(".")[0]) in protected_names
                    for alias in node.names):
                 raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
         if isinstance(node, ast.ImportFrom):
-            if any((alias.asname or alias.name) in {name, "*"} for alias in node.names):
+            if any((alias.asname or alias.name) in protected_names | {"*"} for alias in node.names):
                 raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
         if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
-            if node.name == name:
+            if node.name in protected_names:
                 raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
-        if isinstance(node, ast.MatchMapping) and node.rest == name:
+        if isinstance(node, ast.MatchMapping) and node.rest in protected_names:
             raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
-        if isinstance(node, ast.arg) and node.arg == name:
+        if isinstance(node, ast.arg) and node.arg in protected_names:
             raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
     definition = assignments[0].value
     if not (
