@@ -194,17 +194,16 @@ def _trusted_validate_workflow_blob(
 
 
 
-def _target_required_roots(*, target_head: str, token: str) -> frozenset[str]:
-    """Read, but never execute, target-side required-root policy from GitHub.
+def _policy_roots_from_commit(*, head: str, token: str) -> tuple[set[str], set[str]]:
+    """Read both required and mutable root policies as inert GitHub commit bytes.
 
-    A full-delta R3 may authorize a CI-policy transition, but must not make
-    the next serving commit unable to admit any later release. The contents
-    API is pinned to the exact target commit; verify its Git blob bytes and
-    accept only a single literal frozenset declaration.
+    Authenticated R3 cannot establish what imported Python globals will hold.
+    Read and verify the static declarations from the exact serving and target
+    Git commits, never execute the source or trust its runtime global values.
     """
     path = "src/grabowski_release_admission.py"
     value, link = _github_json(
-        f"/repos/{REPOSITORY}/contents/{path}?ref={target_head}", token=token,
+        f"/repos/{REPOSITORY}/contents/{path}?ref={head}", token=token,
     )
     content, oid = value.get("content"), value.get("sha")
     if (
@@ -232,64 +231,78 @@ def _target_required_roots(*, target_head: str, token: str) -> frozenset[str]:
     except (ValueError, UnicodeError, SyntaxError, binascii.Error):
         raise ReleaseAdmissionDenied("target Validate required-root source is invalid") from None
 
-    assignments = [
-        statement for statement in module.body
-        if isinstance(statement, ast.Assign)
-        and any(isinstance(target, ast.Name)
-                and target.id == "VALIDATION_POLICY_REQUIRED_ROOTS"
-                for target in statement.targets)
-    ]
-    if len(assignments) != 1 or len(assignments[0].targets) != 1:
-        raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
-    # The literal roots and the built-in constructor must keep their
-    # meanings when the target module is imported. A second binding of
-    # either name (including nested stores, imports and match captures) can
-    # otherwise make an accepted release an unusable serving trust anchor.
-    protected_names = {"VALIDATION_POLICY_REQUIRED_ROOTS", "frozenset"}
-    declared_target = assignments[0].targets[0]
+    policy_names = ("VALIDATION_POLICY_REQUIRED_ROOTS", "VALIDATION_POLICY_MUTABLE_ROOTS")
+    definitions: dict[str, ast.Assign] = {}
+    declared_targets: set[ast.Name] = set()
+    for name in policy_names:
+        assignments = [
+            statement for statement in module.body
+            if isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == name
+                    for target in statement.targets)
+        ]
+        if len(assignments) != 1 or len(assignments[0].targets) != 1:
+            raise ReleaseAdmissionDenied("committed Validate policy declaration is invalid")
+        definitions[name] = assignments[0]
+        declared_targets.add(assignments[0].targets[0])
+
+    # Static Git declarations, not imported module globals, drive admission.
+    # AST cannot prove arbitrary Python import-time code free of indirect
+    # namespace writes. Reject direct rebinding as additional protection.
+    protected_names = {*policy_names, "frozenset"}
     for node in ast.walk(module):
         if (
             isinstance(node, ast.Name) and node.id in protected_names
             and isinstance(node.ctx, (ast.Store, ast.Del))
-            and node is not declared_target
+            and node not in declared_targets
         ):
-            raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+            raise ReleaseAdmissionDenied("committed Validate policy declaration is invalid")
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if node.name in protected_names:
-                raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+                raise ReleaseAdmissionDenied("committed Validate policy declaration is invalid")
         if isinstance(node, ast.Import):
             if any((alias.asname or alias.name.partition(".")[0]) in protected_names
                    for alias in node.names):
-                raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+                raise ReleaseAdmissionDenied("committed Validate policy declaration is invalid")
         if isinstance(node, ast.ImportFrom):
-            if any((alias.asname or alias.name) in protected_names | {"*"} for alias in node.names):
-                raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+            if any((alias.asname or alias.name) in protected_names | {"*"}
+                   for alias in node.names):
+                raise ReleaseAdmissionDenied("committed Validate policy declaration is invalid")
         if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
             if node.name in protected_names:
-                raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+                raise ReleaseAdmissionDenied("committed Validate policy declaration is invalid")
         if isinstance(node, ast.MatchMapping) and node.rest in protected_names:
-            raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+            raise ReleaseAdmissionDenied("committed Validate policy declaration is invalid")
         if isinstance(node, ast.arg) and node.arg in protected_names:
-            raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
-    definition = assignments[0].value
-    if not (
-        isinstance(definition, ast.Call)
-        and isinstance(definition.func, ast.Name)
-        and definition.func.id == "frozenset"
-        and len(definition.args) == 1 and not definition.keywords
-        and isinstance(definition.args[0], ast.Set)
-    ):
-        raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
-    roots = [item.value if isinstance(item, ast.Constant) else None
-             for item in definition.args[0].elts]
-    if (
-        not roots or len(roots) > MAX_VALIDATION_ROOT_ENTRIES
-        or any(not isinstance(root, str) or root in {"", ".", ".."}
-               or "/" in root or "\\" in root for root in roots)
-        or len(set(roots)) != len(roots)
-    ):
-        raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
-    return frozenset(roots)
+            raise ReleaseAdmissionDenied("committed Validate policy declaration is invalid")
+
+    def read_literal(name: str) -> set[str]:
+        definition = definitions[name].value
+        if not (
+            isinstance(definition, ast.Call)
+            and isinstance(definition.func, ast.Name)
+            and definition.func.id == "frozenset"
+            and len(definition.args) == 1 and not definition.keywords
+            and isinstance(definition.args[0], ast.Set)
+        ):
+            raise ReleaseAdmissionDenied("committed Validate policy declaration is invalid")
+        roots = [item.value if isinstance(item, ast.Constant) else None
+                 for item in definition.args[0].elts]
+        if (
+            not roots or len(roots) > MAX_VALIDATION_ROOT_ENTRIES
+            or any(not isinstance(root, str) or root in {"", ".", ".."}
+                   or "/" in root or "\\" in root for root in roots)
+            or len(set(roots)) != len(roots)
+        ):
+            raise ReleaseAdmissionDenied("committed Validate policy declaration is invalid")
+        # A set comprehension uses the interpreter's intrinsic BUILD_SET,
+        # not the target-imported module's shadowable frozenset name.
+        return {root for root in roots}
+
+    return (
+        read_literal("VALIDATION_POLICY_REQUIRED_ROOTS"),
+        read_literal("VALIDATION_POLICY_MUTABLE_ROOTS"),
+    )
 
 
 def _trusted_validate_control_sources(
@@ -351,22 +364,48 @@ def _trusted_validate_control_sources(
             ):
                 raise ReleaseAdmissionDenied("trusted Validate control entry is invalid")
             entries[path] = kind, mode, oid
-        # Both serving and target must meet the *serving* trusted baseline.
-        # Otherwise a reviewed target can drop a still-required root and become
-        # an unusable trust anchor for the next release. Retire roots in two
-        # separately reviewed steps: first update the serving required-root
-        # policy while keeping the old path, then remove that path later.
-        if not VALIDATION_POLICY_REQUIRED_ROOTS.issubset(entries):
-            raise ReleaseAdmissionDenied("trusted Validate control roots are missing")
         observed.append(entries)
     serving, target = observed
-    # The target may add required paths to its Python constant. Inspect the
-    # authenticated target source as inert text, never run target Python, and
-    # reject a future serving baseline that requires absent root entries.
+    # Imported Python globals are mutable (even through globals()/exec). Read
+    # the actual serving policy from its authenticated commit on EVERY
+    # admission, not from constants target code may have rebound at import.
+    # The exact currently deployed legacy release predates this policy module.
+    # Give only that proven SHA a conservative migration floor, never a
+    # generic missing-file fallback. This requires an independent full-delta
+    # review below even if the only differences appear to be documentation.
+    legacy_serving = serving_head == "dd6dc690285b6a8a0cdbb3c18d84a1681e604923"
+    if legacy_serving:
+        serving_required = {
+            ".github", ".gitignore", "AGENTS.md", "Makefile", "pyproject.toml",
+            "config", "contracts", "deploy", "requirements", "systemd",
+            "src", "tests", "tmpfiles", "tools",
+        }
+        serving_mutable = {
+            "docs", "README.md", "CHANGELOG.md", "SECURITY.md",
+            "GRABOWSKI.md", "OPERATOR_V2_REPORT.md",
+        }
+    else:
+        serving_required, serving_mutable = _policy_roots_from_commit(
+            head=serving_head, token=token,
+        )
+    if (not serving_required.issubset(serving)
+            or not serving_required.issubset(target)):
+        raise ReleaseAdmissionDenied("trusted Validate control roots are missing")
+    if serving_required & serving_mutable:
+        raise ReleaseAdmissionDenied("committed Validate mutable roots overlap required roots")
     if serving["src"] != target["src"]:
-        declared = _target_required_roots(target_head=target_head, token=token)
-        if not declared.issubset(target):
+        target_required, target_mutable = _policy_roots_from_commit(
+            head=target_head, token=token,
+        )
+        if not target_required.issubset(target):
             raise ReleaseAdmissionDenied("target Validate required roots are missing")
+        # Only existing inert-document exemptions can stay mutable. Widening
+        # the exemption would allow future target-controlled executable roots
+        # to self-grade despite an R3 approving this individual transition.
+        if not target_mutable.issubset(serving_mutable) or (
+            target_mutable & target_required
+        ):
+            raise ReleaseAdmissionDenied("target Validate mutable roots are unsafe")
     changed_controls: list[str] = []
     for path in sorted(set(serving) | set(target)):
         old, new = serving.get(path), target.get(path)
@@ -374,7 +413,7 @@ def _trusted_validate_control_sources(
             # A new root script (including sitecustomize.py) or the removal
             # of a trusted entry changes the executed validation boundary.
             changed_controls.append(path)
-        elif path in VALIDATION_POLICY_MUTABLE_ROOTS:
+        elif path in serving_mutable:
             if old[:2] != new[:2]:
                 raise ReleaseAdmissionDenied("trusted Validate control type changed")
         elif old != new:
@@ -385,11 +424,19 @@ def _trusted_validate_control_sources(
         # Only a fresh role/commit/diff-bound independent full-release R3 may
         # establish this transition. Target-generated green CI is not enough.
         authorize_transition("trusted Validate control sources changed")
+    if legacy_serving:
+        if authorize_transition is None:
+            raise ReleaseAdmissionDenied(
+                "legacy serving policy transition requires authentic independent full-delta R3"
+            )
+        authorize_transition(
+            "legacy serving policy transition requires authentic independent full-delta R3"
+        )
     return _sha256_json({
         "serving_policy_roots": {p: serving[p] for p in sorted(serving)
-                                 if p not in VALIDATION_POLICY_MUTABLE_ROOTS},
+                                 if p not in serving_mutable},
         "target_policy_roots": {p: target[p] for p in sorted(target)
-                                if p not in VALIDATION_POLICY_MUTABLE_ROOTS},
+                                if p not in serving_mutable},
         "changed_policy_paths": changed_controls,
     })
 

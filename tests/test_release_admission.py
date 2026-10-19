@@ -20,10 +20,18 @@ SERVING_TREE = "c" * 40
 TARGET_TREE = "e" * 40
 
 
-def _policy_content(required_roots: set[str] | frozenset[str]) -> str:
-    return "VALIDATION_POLICY_REQUIRED_ROOTS = frozenset({" + ", ".join(
-        repr(path) for path in sorted(required_roots)
-    ) + "})\n"
+def _policy_content(required_roots: set[str] | frozenset[str], *,
+                    mutable_roots: set[str] | frozenset[str] | None = None) -> str:
+    mutable = (admission.VALIDATION_POLICY_MUTABLE_ROOTS
+               if mutable_roots is None else mutable_roots)
+    return (
+        "VALIDATION_POLICY_REQUIRED_ROOTS = frozenset({" + ", ".join(
+            repr(path) for path in sorted(required_roots)
+        ) + "})\n"
+        + "VALIDATION_POLICY_MUTABLE_ROOTS = frozenset({" + ", ".join(
+            repr(path) for path in sorted(mutable)
+        ) + "})\n"
+    )
 
 
 def _policy_response(source: str) -> dict:
@@ -71,7 +79,7 @@ def _reconciliation(*, proven: int = 1, status: str = "settled",
 class AuthoritativeCIReadTests(unittest.TestCase):
     """GitHub-owned, actual workflow/run/job/check provenance, not just names."""
 
-    def fixture(self):
+    def fixture(self, *, serving_head=SERVING):
         prefix = f"/repos/{admission.REPOSITORY}"
         workflow_id, run_id, suite_id = 301891383, 800, 900
         identity = {
@@ -102,12 +110,13 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         ]
         paths = {
             "workflow": f"{prefix}/actions/workflows/validate.yml",
-            "serving_workflow": f"{prefix}/contents/{admission.CANONICAL_WORKFLOW_PATH}?ref={SERVING}",
+            "serving_workflow": f"{prefix}/contents/{admission.CANONICAL_WORKFLOW_PATH}?ref={serving_head}",
             "target_workflow": f"{prefix}/contents/{admission.CANONICAL_WORKFLOW_PATH}?ref={TARGET}",
-            "serving_commit": f"{prefix}/git/commits/{SERVING}",
+            "serving_commit": f"{prefix}/git/commits/{serving_head}",
             "target_commit": f"{prefix}/git/commits/{TARGET}",
             "serving_tree": f"{prefix}/git/trees/{SERVING_TREE}",
             "target_tree": f"{prefix}/git/trees/{TARGET_TREE}",
+            "serving_policy": f"{prefix}/contents/src/grabowski_release_admission.py?ref={serving_head}",
             "target_policy": f"{prefix}/contents/src/grabowski_release_admission.py?ref={TARGET}",
             "runs": f"{prefix}/actions/workflows/{workflow_id}/runs?head_sha={TARGET}&per_page=100&page=1",
             "run": f"{prefix}/actions/runs/{run_id}",
@@ -142,10 +151,11 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             },
             paths["serving_workflow"]: {"path": admission.CANONICAL_WORKFLOW_PATH, "type": "file", "sha": "1" * 40},
             paths["target_workflow"]: {"path": admission.CANONICAL_WORKFLOW_PATH, "type": "file", "sha": "1" * 40},
-            paths["serving_commit"]: {"sha": SERVING, "tree": {"sha": SERVING_TREE}},
+            paths["serving_commit"]: {"sha": serving_head, "tree": {"sha": SERVING_TREE}},
             paths["target_commit"]: {"sha": TARGET, "tree": {"sha": TARGET_TREE}},
             paths["serving_tree"]: {"sha": SERVING_TREE, "truncated": False, "tree": [e.copy() for e in root_entries]},
             paths["target_tree"]: {"sha": TARGET_TREE, "truncated": False, "tree": [e.copy() for e in root_entries]},
+            paths["serving_policy"]: _policy_response(_policy_content(admission.VALIDATION_POLICY_REQUIRED_ROOTS)),
             paths["target_policy"]: _policy_response(_policy_content(admission.VALIDATION_POLICY_REQUIRED_ROOTS)),
             paths["runs"]: {"total_count": 1, "workflow_runs": [identity.copy()]},
             paths["run"]: identity.copy(),
@@ -155,7 +165,8 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         return paths, pages
 
     def query(self, pages, *, http_codes=None, links=None,
-              transition_review_pr=None, transition_diff_sha256=None):
+              transition_review_pr=None, transition_diff_sha256=None,
+              serving_head=SERVING):
         current = {"path": None}
         requests = []
         connection = Mock()
@@ -201,7 +212,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         with (patch.object(admission, "_github_token", return_value="test-only-credential", create=True) as credentials,
               patch.object(admission.http.client, "HTTPSConnection", return_value=connection)):
             value = admission._fresh_github_checks(
-                TARGET, serving_head=SERVING, review_pr=transition_review_pr,
+                TARGET, serving_head=serving_head, review_pr=transition_review_pr,
                 diff_sha256=transition_diff_sha256,
             )
         credentials.assert_called_once_with()
@@ -220,7 +231,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             f"/repos/{admission.REPOSITORY}/check-runs/101",
             f"/repos/{admission.REPOSITORY}/check-runs/102",
         ], requests[-2:])
-        self.assertEqual(12, len(requests))
+        self.assertEqual(13, len(requests))
 
     def test_verified_git_commit_tree_oid_is_used_for_validation_policy(self):
         paths, pages = self.fixture()
@@ -275,7 +286,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         accepted, requests = self.query(pages)
         self.assertEqual(2, len(accepted["checks"]))
         self.assertEqual(64, len(accepted["workflow"]["trusted_control_sources_sha256"]))
-        self.assertEqual(12, len(requests))
+        self.assertEqual(13, len(requests))
 
     def test_executable_src_tree_requires_independent_r3_even_with_green_ci(self):
         # Makefile calls PYTHONPATH=src python -m ...; src/sitecustomize.py
@@ -449,10 +460,12 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                     "independent_pass_count": 1,
                     "admissible_slots": ["independent-grok-4.6"],
                 }
+                next_required = admission.VALIDATION_POLICY_REQUIRED_ROOTS - {root}
+                pages[paths["serving_policy"]] = _policy_response(
+                    _policy_content(next_required)
+                )
+                self._target_policy(pages, paths, next_required)
                 with patch.object(
-                    admission, "VALIDATION_POLICY_REQUIRED_ROOTS",
-                    admission.VALIDATION_POLICY_REQUIRED_ROOTS - {root},
-                ), patch.object(
                     admission, "validate_independent_release_review", return_value=proof,
                 ) as reviewer:
                     result, _ = self.query(
@@ -510,6 +523,185 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         )
         self.assertTrue(result["workflow"]["ci_policy_transition_required"])
 
+    def test_legacy_serving_without_policy_needs_real_full_delta_r3(self):
+        # The genuinely deployed dd6dc690... commit has no admission module.
+        # Its first upgrade must be bound to a separately authenticated R3.
+        legacy = "dd6dc690285b6a8a0cdbb3c18d84a1681e604923"
+        paths, pages = self.fixture(serving_head=legacy)
+        pages.pop(paths["serving_policy"])
+        self._target_policy(pages, paths, admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+        with patch.object(admission, "validate_independent_release_review") as reviewer:
+            with self.assertRaisesRegex(
+                admission.ReleaseAdmissionDenied, "transition.*R3",
+            ):
+                self.query(pages, serving_head=legacy)
+        reviewer.assert_not_called()
+
+        proof = {
+            "review_pr": 1452,
+            "review_binding_sha256": "a" * 64,
+            "review_attempts_sha256": "b" * 64,
+            "independent_pass_count": 1,
+            "admissible_slots": ["independent-grok-4.6"],
+        }
+        with patch.object(
+            admission, "validate_independent_release_review", return_value=proof,
+        ) as reviewer:
+            result, requests = self.query(
+                pages, serving_head=legacy,
+                transition_review_pr=1452, transition_diff_sha256=DIFF,
+            )
+        reviewer.assert_called_once_with(
+            serving_head=legacy, target_head=TARGET,
+            diff_sha256=DIFF, review_pr=1452,
+        )
+        self.assertEqual(2, len(result["checks"]))
+        self.assertTrue(result["workflow"]["ci_policy_transition_required"])
+        self.assertNotIn(paths["serving_policy"], requests)
+
+    def test_unrecognized_missing_serving_policy_cannot_use_legacy_transition(self):
+        paths, pages = self.fixture()
+        pages.pop(paths["serving_policy"])
+        with patch.object(admission, "validate_independent_release_review") as reviewer:
+            with self.assertRaises(admission.ReleaseAdmissionDenied):
+                self.query(pages, transition_review_pr=1452, transition_diff_sha256=DIFF)
+        reviewer.assert_not_called()
+
+    def test_runtime_shadowed_constructor_cannot_change_committed_policy(self):
+        # Import-time globals()["frozenset"] rebinding must not change the
+        # immutable serving/target Git source interpretation after transition.
+        paths, pages = self.fixture()
+        self._target_policy(pages, paths, admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+        proof = {
+            "review_pr": 1452,
+            "review_binding_sha256": "a" * 64,
+            "review_attempts_sha256": "b" * 64,
+            "independent_pass_count": 1,
+            "admissible_slots": ["independent-grok-4.6"],
+        }
+        with patch.object(
+            admission, "frozenset", lambda _: {"missing-root"}, create=True,
+        ), patch.object(
+            admission, "validate_independent_release_review", return_value=proof,
+        ) as reviewer:
+            result, _ = self.query(
+                pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+            )
+        reviewer.assert_called_once()
+        self.assertEqual(2, len(result["checks"]))
+
+    def test_runtime_shadowed_tuple_cannot_replace_static_policy_pair(self):
+        # A shadowed global tuple constructor must not replace either
+        # Git-authenticated declaration with a forged next-serving policy.
+        paths, pages = self.fixture()
+        self._target_policy(pages, paths, admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+        proof = {
+            "review_pr": 1452,
+            "review_binding_sha256": "a" * 64,
+            "review_attempts_sha256": "b" * 64,
+            "independent_pass_count": 1,
+            "admissible_slots": ["independent-grok-4.6"],
+        }
+        with patch.object(
+            admission, "tuple", lambda _: ({"missing-root"}, {"docs"}), create=True,
+        ), patch.object(
+            admission, "validate_independent_release_review", return_value=proof,
+        ) as reviewer:
+            result, _ = self.query(
+                pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+            )
+        reviewer.assert_called_once()
+        self.assertEqual(2, len(result["checks"]))
+
+    def test_target_cannot_make_executable_root_mutable(self):
+        # Reviewed target code must not exempt executable src or tests from
+        # later serving CI policy validation by widening the mutable roots.
+        paths, pages = self.fixture()
+        self._target_policy(pages, paths, admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+        pages[paths["target_policy"]] = _policy_response(
+            _policy_content(
+                admission.VALIDATION_POLICY_REQUIRED_ROOTS,
+                mutable_roots={"docs", "src"},
+            )
+        )
+        with patch.object(admission, "validate_independent_release_review") as reviewer:
+            with self.assertRaisesRegex(
+                admission.ReleaseAdmissionDenied, "mutable.*root|root.*mutable",
+            ):
+                self.query(pages, transition_review_pr=1452, transition_diff_sha256=DIFF)
+        reviewer.assert_not_called()
+
+    def test_serving_policy_is_not_corrupted_by_indirect_runtime_rebinding(self):
+        # A target may execute globals()["VALIDATION_POLICY_REQUIRED_ROOTS"]
+        # during import. The NEXT serving validator must instead use the
+        # authenticated serving commit's static policy, not that global.
+        paths, pages = self.fixture()
+        self._target_policy(pages, paths, admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+        pages[paths["target_policy"]] = _policy_response(
+            _policy_content(admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+            + 'globals()["VALIDATION_POLICY_REQUIRED_ROOTS"] |= {"missing-root"}\n'
+        )
+        proof = {
+            "review_pr": 1452, "review_binding_sha256": "a" * 64,
+            "review_attempts_sha256": "b" * 64,
+            "independent_pass_count": 1,
+            "admissible_slots": ["independent-grok-4.6"],
+        }
+        with patch.object(
+            admission, "VALIDATION_POLICY_REQUIRED_ROOTS",
+            admission.VALIDATION_POLICY_REQUIRED_ROOTS | {"missing-root"},
+        ), patch.object(
+            admission, "validate_independent_release_review", return_value=proof,
+        ) as reviewer:
+            result, requests = self.query(
+                pages, transition_review_pr=1452, transition_diff_sha256=DIFF,
+            )
+        reviewer.assert_called_once()
+        self.assertEqual(2, len(result["checks"]))
+        self.assertIn(paths["target_policy"], requests)
+
+    def test_runtime_mutable_root_rebinding_cannot_exempt_executable_src(self):
+        # Even after target-side globals() mutates the running module, the
+        # serving Git commit determines the exemptions for the next release.
+        paths, pages = self.fixture()
+        self._target_policy(pages, paths, admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+        pages[paths["target_policy"]] = _policy_response(
+            _policy_content(admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+            + 'globals()["VALIDATION_POLICY_MUTABLE_ROOTS"] |= {"src"}\n'
+        )
+        with patch.object(
+            admission, "VALIDATION_POLICY_MUTABLE_ROOTS",
+            admission.VALIDATION_POLICY_MUTABLE_ROOTS | {"src"},
+        ), patch.object(
+            admission, "validate_independent_release_review",
+        ) as reviewer:
+            with self.assertRaisesRegex(
+                admission.ReleaseAdmissionDenied, "control sources changed.*R3",
+            ):
+                self.query(pages)
+        reviewer.assert_not_called()
+
+    def test_corrupt_serving_policy_blob_cannot_define_root_baseline(self):
+        # A serving source with incorrect authenticated blob bytes is not a
+        # valid starting trust anchor even when target CI is green.
+        for case in ("wrong_blob_oid", "wrong_content_type", "wrong_encoding"):
+            with self.subTest(case=case):
+                paths, pages = self.fixture()
+                source = pages[paths["serving_policy"]]
+                if case == "wrong_blob_oid":
+                    source["sha"] = "0" * 40
+                elif case == "wrong_content_type":
+                    source["type"] = "dir"
+                else:
+                    source["encoding"] = "raw"
+                with patch.object(
+                    admission, "validate_independent_release_review",
+                ) as reviewer:
+                    with self.assertRaises(admission.ReleaseAdmissionDenied):
+                        self.query(pages, transition_review_pr=1452,
+                                   transition_diff_sha256=DIFF)
+                reviewer.assert_not_called()
+
     def test_secondary_required_root_bindings_fail_before_reviewer(self):
         # A static initial frozenset must not conceal later rebindings which
         # would turn an admitted commit into an unusable serving trust anchor.
@@ -534,7 +726,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                 )
                 with patch.object(admission, "validate_independent_release_review") as reviewer:
                     with self.assertRaisesRegex(
-                        admission.ReleaseAdmissionDenied, "required-root declaration is invalid",
+                        admission.ReleaseAdmissionDenied, "policy declaration is invalid",
                     ):
                         self.query(
                             pages, transition_review_pr=1452,
@@ -567,7 +759,7 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                 )
                 with patch.object(admission, "validate_independent_release_review") as reviewer:
                     with self.assertRaisesRegex(
-                        admission.ReleaseAdmissionDenied, "required-root declaration is invalid",
+                        admission.ReleaseAdmissionDenied, "policy declaration is invalid",
                     ):
                         self.query(
                             pages, transition_review_pr=1452,
@@ -626,12 +818,10 @@ class AuthoritativeCIReadTests(unittest.TestCase):
             entry for entry in pages[paths["target_tree"]]["tree"]
             if entry["path"] != "contracts"
         ]
-        with patch.object(
-            admission, "VALIDATION_POLICY_REQUIRED_ROOTS",
-            admission.VALIDATION_POLICY_REQUIRED_ROOTS - {"tmpfiles"},
-        ), patch.object(
-            admission, "validate_independent_release_review",
-        ) as reviewer:
+        pages[paths["serving_policy"]] = _policy_response(
+            _policy_content(admission.VALIDATION_POLICY_REQUIRED_ROOTS - {"tmpfiles"})
+        )
+        with patch.object(admission, "validate_independent_release_review") as reviewer:
             with self.assertRaisesRegex(
                 admission.ReleaseAdmissionDenied, "trusted Validate control roots are missing",
             ):
