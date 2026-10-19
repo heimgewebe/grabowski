@@ -1994,7 +1994,7 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertEqual(plan["blocked"][0]["unit"], legacy.name)
             self.assertIn("legacy", plan["blocked"][0]["reason"])
 
-    def test_archived_failed_job_can_resume_reset_after_interrupted_apply(self) -> None:
+    def test_archived_failed_job_is_recorded_for_manual_recovery_not_auto_reset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             jobs = root / "jobs"
@@ -2036,7 +2036,11 @@ class RuntimeRetentionTests(unittest.TestCase):
                 unit_states={},
             )
 
-            self.assertEqual(plan["reset_failed_units"], [unit])
+            self.assertEqual(plan["reset_failed_units"], [])
+            self.assertTrue(any(
+                row["unit"] == unit and "manual" in row["reason"]
+                for row in plan["blocked"]
+            ))
             self.assertEqual(
                 plan["recovered_archived_failed_units"][0]["unit"],
                 unit,
@@ -2581,6 +2585,12 @@ class RuntimeRetentionTests(unittest.TestCase):
                     task_db=root / "missing.sqlite3",
                     failed_units=[unit], unit_states={},
                 )
+                self.assertEqual(retry["reset_failed_units"], [])
+                injected = json.loads(json.dumps(retry))
+                injected["reset_failed_units"] = [unit]
+                injected["plan_sha256"] = RETENTION._sha256({
+                    key: val for key, val in injected.items() if key != "plan_sha256"
+                })
                 real_index_read = RETENTION._archive_read_deploy_index_pinned
                 def substituted_read(*args, **kwargs):
                     seen = real_index_read(*args, **kwargs)
@@ -2593,7 +2603,9 @@ class RuntimeRetentionTests(unittest.TestCase):
                     with self.assertRaisesRegex(
                         RuntimeError, "retention reset phase did not complete"
                     ):
-                        RETENTION.apply_plan(retry, expected_plan_sha256=retry["plan_sha256"])
+                        RETENTION.apply_plan(
+                            injected, expected_plan_sha256=injected["plan_sha256"]
+                        )
             reset.assert_not_called()
             self.assertEqual(json.loads(index_file.read_text())["units"], [name])
 
@@ -2820,8 +2832,12 @@ class RuntimeRetentionTests(unittest.TestCase):
                     [row["unit"] for row in retry["recovered_archived_failed_units"]],
                     [unit],
                 )
-                self.assertEqual(retry["reset_failed_units"], [unit])
+                self.assertEqual(retry["reset_failed_units"], [])
+                self.assertTrue(any(row["unit"] == unit for row in retry["blocked"]))
                 forged = json.loads(json.dumps(retry))
+                # An attacker can still rehash an untrusted plan to inject a
+                # reset action. apply_plan must reject it without live proof.
+                forged["reset_failed_units"] = [unit]
                 forged["recovered_archived_failed_units"] = []
                 forged["plan_sha256"] = RETENTION._sha256({
                     key: val for key, val in forged.items() if key != "plan_sha256"
@@ -2842,7 +2858,7 @@ class RuntimeRetentionTests(unittest.TestCase):
                         RuntimeError, "retention reset phase did not complete"
                     ):
                         RETENTION.apply_plan(
-                            retry, expected_plan_sha256=retry["plan_sha256"]
+                            forged, expected_plan_sha256=forged["plan_sha256"]
                         )
                 finally:
                     hidden_index.rename(index_path)
@@ -2973,13 +2989,17 @@ class RuntimeRetentionTests(unittest.TestCase):
                     unit_states={},
                 )
                 self.assertEqual(retry["archive_jobs"], [])
-                self.assertEqual(retry["reset_failed_units"], [unit])
-                with self.assertRaisesRegex(
-                    RuntimeError, "retention reset phase did not complete"
-                ):
-                    RETENTION.apply_plan(
-                        retry, expected_plan_sha256=retry["plan_sha256"]
-                    )
+                self.assertEqual(retry["reset_failed_units"], [])
+                self.assertTrue(any(
+                    row["unit"] == unit and "manual" in row["reason"]
+                    for row in retry["blocked"]
+                ))
+                followup = RETENTION.apply_plan(
+                    retry, expected_plan_sha256=retry["plan_sha256"]
+                )
+                self.assertTrue(followup["completed"])
+                self.assertEqual(followup["reset_failed"], [])
+                self.assertFalse(followup["retry"]["required"])
 
             # An archive receipt is data, not independent authorization
             # to drop a live deployment-index member or reset the failed unit.

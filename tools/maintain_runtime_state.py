@@ -1224,7 +1224,12 @@ def build_plan(
                     block(unit, "failed job has no valid registry or archive record")
                     continue
                 recovered_archived_failed_units.append(recovered)
-                reset_units.append(unit)
+                # A historical self-hashed manifest is diagnostic evidence,
+                # not authority for a reset after an interrupted move. Never
+                # enqueue this unit as a retryable automatic reset: it has
+                # no live source to revalidate and would exhaust the finite
+                # partial-receipt chain on every periodic invocation.
+                block(unit, "archived failed job requires manual recovery before reset")
                 continue
             if not record["terminal"]:
                 block(unit, "failed job terminality is not proven")
