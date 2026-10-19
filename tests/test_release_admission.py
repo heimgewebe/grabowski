@@ -237,6 +237,57 @@ class AuthoritativeCIReadTests(unittest.TestCase):
                 self.assertIsNone(raised.exception.__cause__)
                 self.assertIsNone(raised.exception.__context__)
 
+    def test_authenticated_network_errors_do_not_expose_bearer_in_exception_chain(self):
+        import traceback
+
+        bearer = "secret-credential-canary"
+        request_path = f"/repos/{admission.REPOSITORY}/actions/workflows/validate.yml"
+        for failure_type in (OSError, admission.http.client.HTTPException, RuntimeError):
+            with self.subTest(failure_type=failure_type.__name__):
+                connection = Mock()
+                connection.request.side_effect = failure_type(
+                    "Authorization: Bearer " + bearer
+                )
+                with patch.object(
+                    admission.http.client, "HTTPSConnection", return_value=connection
+                ):
+                    with self.assertRaises(admission.ReleaseAdmissionDenied) as raised:
+                        admission._github_json(request_path, token=bearer)
+                self.assertEqual("authoritative CI lookup failed", str(raised.exception))
+                self.assertIsNone(raised.exception.__cause__)
+                self.assertIsNone(raised.exception.__context__)
+                self.assertNotIn(
+                    bearer, "".join(traceback.format_exception(raised.exception))
+                )
+                connection.close.assert_called_once_with()
+
+    def test_authenticated_connection_close_errors_fail_closed_and_redacted(self):
+        import traceback
+
+        bearer = "secret-credential-canary"
+        connection = Mock()
+        response = Mock()
+        response.status = 200
+        response.getheader.return_value = ""
+        response.read.return_value = b"{}"
+        connection.getresponse.return_value = response
+        connection.close.side_effect = RuntimeError(
+            "Authorization: Bearer " + bearer
+        )
+        with patch.object(
+            admission.http.client, "HTTPSConnection", return_value=connection
+        ):
+            with self.assertRaises(admission.ReleaseAdmissionDenied) as raised:
+                admission._github_json(
+                    f"/repos/{admission.REPOSITORY}/actions/workflows/validate.yml",
+                    token=bearer,
+                )
+        self.assertEqual("authoritative CI lookup failed", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertNotIn(bearer, "".join(traceback.format_exception(raised.exception)))
+        connection.close.assert_called_once_with()
+
     def test_non_ascii_credential_is_denied_before_any_network_access(self):
         for token in ("secret-\u2603", "secret-\u00e9", "secret-\u00a0"):
             with self.subTest(token=ascii(token)):

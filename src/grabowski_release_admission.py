@@ -57,6 +57,7 @@ def _github_json(path: str, *, token: str) -> tuple[dict[str, Any], str]:
     if not isinstance(token, str) or not token or any(not 33 <= ord(char) <= 126 for char in token):
         raise ReleaseAdmissionDenied("authenticated GitHub credential invalid")
     conn = http.client.HTTPSConnection(GITHUB_HOST, timeout=15)
+    transport_failed = False
     try:
         conn.request(
             "GET", path,
@@ -68,14 +69,24 @@ def _github_json(path: str, *, token: str) -> tuple[dict[str, Any], str]:
             },
         )
         response = conn.getresponse()
-        if response.status != 200:
-            raise ReleaseAdmissionDenied(f"authoritative CI lookup HTTP {response.status}")
-        link = response.getheader("Link", "") or ""
-        payload = response.read(CHECK_BYTES_LIMIT + 1)
-    except (OSError, TimeoutError, http.client.HTTPException) as exc:
-        raise ReleaseAdmissionDenied("authoritative CI lookup failed") from exc
+        status = response.status
+        if status == 200:
+            link = response.getheader("Link", "") or ""
+            payload = response.read(CHECK_BYTES_LIMIT + 1)
+    except Exception:
+        # Transport implementations can include an Authorization header in an
+        # exception. Never retain that exception as a cause or context.
+        transport_failed = True
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            # Cleanup failures may themselves disclose the bearer. Fail closed.
+            transport_failed = True
+    if transport_failed:
+        raise ReleaseAdmissionDenied("authoritative CI lookup failed")
+    if status != 200:
+        raise ReleaseAdmissionDenied(f"authoritative CI lookup HTTP {status}")
     if len(payload) > CHECK_BYTES_LIMIT:
         raise ReleaseAdmissionDenied("authoritative CI payload exceeded bound")
     try:
