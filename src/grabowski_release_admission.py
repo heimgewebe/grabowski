@@ -241,6 +241,35 @@ def _target_required_roots(*, target_head: str, token: str) -> frozenset[str]:
     ]
     if len(assignments) != 1 or len(assignments[0].targets) != 1:
         raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+    # The accepted literal must be the *only* binding of this name. Looking
+    # only at top-level Assign nodes misses |=, annotations, deletes, nested
+    # stores and non-Name binders (imports, definitions and match captures).
+    name = "VALIDATION_POLICY_REQUIRED_ROOTS"
+    declared_target = assignments[0].targets[0]
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.Name) and node.id == name
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and node is not declared_target
+        ):
+            raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == name:
+                raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+        if isinstance(node, ast.Import):
+            if any((alias.asname or alias.name.partition(".")[0]) == name
+                   for alias in node.names):
+                raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+        if isinstance(node, ast.ImportFrom):
+            if any((alias.asname or alias.name) in {name, "*"} for alias in node.names):
+                raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+        if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            if node.name == name:
+                raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+        if isinstance(node, ast.MatchMapping) and node.rest == name:
+            raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
+        if isinstance(node, ast.arg) and node.arg == name:
+            raise ReleaseAdmissionDenied("target Validate required-root declaration is invalid")
     definition = assignments[0].value
     if not (
         isinstance(definition, ast.Call)

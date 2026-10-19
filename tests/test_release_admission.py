@@ -510,6 +510,38 @@ class AuthoritativeCIReadTests(unittest.TestCase):
         )
         self.assertTrue(result["workflow"]["ci_policy_transition_required"])
 
+    def test_secondary_required_root_bindings_fail_before_reviewer(self):
+        # A static initial frozenset must not conceal later rebindings which
+        # would turn an admitted commit into an unusable serving trust anchor.
+        secondary_bindings = {
+            "augassign": 'VALIDATION_POLICY_REQUIRED_ROOTS |= {"missing-root"}\n',
+            "annassign": 'VALIDATION_POLICY_REQUIRED_ROOTS: frozenset[str] = frozenset({"missing-root"})\n',
+            "delete": "del VALIDATION_POLICY_REQUIRED_ROOTS\n",
+            "walrus": '(VALIDATION_POLICY_REQUIRED_ROOTS := frozenset({"missing-root"}))\n',
+            "nested_assign": 'if True:\n    VALIDATION_POLICY_REQUIRED_ROOTS = frozenset({"missing-root"})\n',
+            "function": "def VALIDATION_POLICY_REQUIRED_ROOTS():\n    pass\n",
+            "class": "class VALIDATION_POLICY_REQUIRED_ROOTS:\n    pass\n",
+            "import": "import math as VALIDATION_POLICY_REQUIRED_ROOTS\n",
+            "exception": "try:\n    raise RuntimeError()\nexcept RuntimeError as VALIDATION_POLICY_REQUIRED_ROOTS:\n    pass\n",
+            "match": "match 1:\n    case VALIDATION_POLICY_REQUIRED_ROOTS:\n        pass\n",
+        }
+        for case, suffix in secondary_bindings.items():
+            with self.subTest(case=case):
+                paths, pages = self.fixture()
+                self._target_policy(pages, paths, admission.VALIDATION_POLICY_REQUIRED_ROOTS)
+                pages[paths["target_policy"]] = _policy_response(
+                    _policy_content(admission.VALIDATION_POLICY_REQUIRED_ROOTS) + suffix
+                )
+                with patch.object(admission, "validate_independent_release_review") as reviewer:
+                    with self.assertRaisesRegex(
+                        admission.ReleaseAdmissionDenied, "required-root declaration is invalid",
+                    ):
+                        self.query(
+                            pages, transition_review_pr=1452,
+                            transition_diff_sha256=DIFF,
+                        )
+                reviewer.assert_not_called()
+
     def test_target_policy_document_must_be_authenticated_and_static(self):
         for corruption in (
             "wrong_path", "wrong_type", "wrong_encoding", "missing_content",
