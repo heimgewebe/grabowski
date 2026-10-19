@@ -2396,6 +2396,58 @@ class RuntimeRetentionTests(unittest.TestCase):
             self.assertFalse(list(receipts.glob("*.json")))
             reset.assert_not_called()
 
+    def test_recent_indexed_failed_job_can_reset_without_archive_recovery(self) -> None:
+        # Codex P1: a live terminal job younger than the retention age
+        # remains in the deploy index. Its verified local failed-state reset
+        # does not use an untrusted historical archive receipt.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs, archive, receipts = root / "jobs", root / "archive", root / "receipts"
+            name = "grabowski-job-414141414141"
+            unit = name + ".service"
+            source = self._job(jobs, name, 600)
+            index_file = jobs / "runtime-deploy-index.json"
+            index_file.write_text(json.dumps({
+                "schema_version": 1, "units": [name], "pending_unit": None,
+                "updated_at_unix": 500,
+            }) + "\n", encoding="utf-8")
+            index_file.chmod(0o600)
+            states = {unit: self._state(unit)}
+            plan = RETENTION.build_plan(
+                minimum_job_age_seconds=500, now=1_000,
+                jobs_root=jobs, archive_root=archive, receipt_root=receipts,
+                task_db=root / "missing.sqlite3", failed_units=[unit],
+                unit_states=states,
+            )
+            self.assertEqual(plan["archive_jobs"], [])
+            self.assertEqual(plan["recovered_archived_failed_units"], [])
+            self.assertEqual(plan["reset_failed_units"], [unit])
+            fake_self_deploy = types.ModuleType("grabowski_self_deploy")
+            fake_self_deploy.DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
+            fake_self_deploy._deploy_schedule_lock = lambda: nullcontext()
+            fake_base = types.ModuleType("grabowski_mcp")
+            fake_base._append_audit = Mock()
+            fake_base._require_mutations_enabled = Mock()
+            fake_base._require_capability = Mock()
+            reset = Mock(return_value=Mock(returncode=0, stderr=""))
+            with patch.dict("sys.modules", {
+                "grabowski_self_deploy": fake_self_deploy,
+                "grabowski_mcp": fake_base,
+            }), patch.object(
+                RETENTION, "_systemd_unit_states", return_value=states
+            ), patch.object(RETENTION, "_run", reset):
+                result = RETENTION.apply_plan(
+                    plan, expected_plan_sha256=plan["plan_sha256"]
+                )
+            self.assertTrue(result["completed"])
+            self.assertEqual([r["unit"] for r in result["reset_failed"]], [unit])
+            reset.assert_called_once_with(
+                ["systemctl", "--user", "reset-failed", unit]
+            )
+            self.assertTrue((source / "metadata.json").is_file())
+            self.assertFalse((archive / name).exists())
+            self.assertEqual(json.loads(index_file.read_text())["units"], [name])
+
     def test_post_move_archive_without_trusted_proof_preserves_index_and_failed_unit(self) -> None:
         # Same-UID can forge a self-consistent archive manifest. After an
         # interrupted index publication the new pass must fail closed,

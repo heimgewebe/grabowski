@@ -2569,13 +2569,19 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
                     expected_parent_identity=root_identity,
                 )
 
+        # Only a unit that build_plan recovered from an already-moved
+        # archive is affected by the untrusted-history index fence. A live,
+        # terminal but not-yet-archive-eligible failed job may legitimately
+        # remain in the index and must still be reset-failed.
+        indexed_archive_recovery_units = {
+            evidence["unit"]
+            for evidence in plan["recovered_archived_failed_units"]
+            if evidence["job_name"] in indexed_units
+        }
         reset_results: list[dict[str, Any]] = []
         reset_failures: list[dict[str, str]] = []
         for unit in plan["reset_failed_units"]:
-            if (
-                JOB_UNIT.fullmatch(unit)
-                and unit.removesuffix(".service") in indexed_units
-            ):
+            if unit in indexed_archive_recovery_units:
                 # A stale indexed deployment cannot be cleared by an
                 # untrusted archive receipt during retry after a partial
                 # move. Do not reset-failed until the index is authentically
