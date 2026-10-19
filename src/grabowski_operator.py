@@ -8079,6 +8079,57 @@ def _reserved_runtime_deploy_command(
     return False
 
 
+def _reserved_runtime_deploy_pinned_python_path() -> str:
+    """Reuse only the serving release venv's PyYAML, never the mutable user site.
+
+    This bounds interpreter startup imports; it is not an independent
+    attestation against a compromised same-UID serving-release installation.
+    """
+    import importlib.metadata
+    import sysconfig
+
+    prefix = Path(sys.prefix)
+    if sys.prefix == sys.base_prefix or not prefix.is_absolute():
+        raise RuntimeError("reserved runtime deploy requires an isolated serving Python")
+    if Path(sys.executable).parent.parent != prefix:
+        raise RuntimeError("reserved runtime deploy interpreter is not bound to its venv")
+    expected_python = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    try:
+        system_python = Path("/usr/bin/python3").resolve(strict=True)
+        if system_python.name != expected_python:
+            raise RuntimeError("reserved runtime worker Python ABI differs from serving runtime")
+        site = Path(sysconfig.get_path("purelib") or "")
+        expected_site = prefix / "lib" / expected_python / "site-packages"
+        if site != expected_site:
+            raise RuntimeError("reserved runtime pinned site is outside the serving venv")
+        distribution = importlib.metadata.distribution("PyYAML")
+        yaml_file = Path(distribution.locate_file("yaml/__init__.py"))
+        if distribution.version != "6.0.3" or yaml_file != site / "yaml" / "__init__.py":
+            raise RuntimeError("reserved runtime PyYAML is not the pinned serving version")
+        for directory in (
+            prefix, prefix / "lib", prefix / "lib" / expected_python,
+            site, site / "yaml",
+        ):
+            metadata = directory.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o022
+            ):
+                raise RuntimeError("reserved runtime Python dependency directory is unsafe")
+        metadata = yaml_file.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o022
+        ):
+            raise RuntimeError("reserved runtime Python dependency file is unsafe")
+    except (OSError, ImportError, ValueError) as exc:
+        raise RuntimeError("reserved runtime pinned Python site is unavailable") from exc
+    return str(site)
+
+
 def _start_job(
     argv: list[str],
     cwd: str | None = None,
@@ -8105,6 +8156,12 @@ def _start_job(
         raise PermissionError(
             "runtime deploy runner is reserved for the typed self-deploy scheduler"
         )
+    # Source trust must be established before allocating durable job metadata.
+    pinned_deploy_site = (
+        _reserved_runtime_deploy_pinned_python_path()
+        if allow_reserved_runtime_deploy
+        else None
+    )
     runtime = _job_runtime(runtime_seconds)
     notify_metadata = _normalize_notify_on_done(notify_on_done)
     unit = (
@@ -8303,6 +8360,51 @@ def _start_job(
         "GRABOWSKI_JOB_STDERR_PATH": finalization_contract["receipt_paths"]["stderr"],
         "GRABOWSKI_JOB_FINALIZATION_PATH": finalization_contract["receipt_paths"]["finalization"],
     }
+    if allow_reserved_runtime_deploy:
+        # Never import from the mutable serving venv in the reserved worker.
+        # The target's hashed deploy-tooling lock is validated before the
+        # runner admits PyYAML from that isolated child environment.
+        assert pinned_deploy_site is not None
+        environment.update({
+            "PYTHONPYCACHEPREFIX": "/dev/null/grabowski-runtime-deploy",
+            "PYTHONPATH": "",
+            "PYTHONHOME": "",
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONUSERBASE": "",
+            "PYTHONWARNINGS": "",
+            "PYTHONSAFEPATH": "1",
+            "PYTHONPLATLIBDIR": "",
+            "PYTHONINSPECT": "",
+            "PYTHONSTARTUP": "",
+            "PYTHONBREAKPOINT": "0",
+            # systemd manager environment is inherited before this Python
+            # process starts. Mask CPython's preinitialization controls,
+            # not just import-path variables: malformed values can be fatal.
+            # Keep hash randomization rather than selecting a fixed seed.
+            "PYTHONHASHSEED": "random",
+            "PYTHONMALLOC": "",
+            "PYTHONUTF8": "",
+            "PYTHONCOERCECLOCALE": "",
+            "PYTHONIOENCODING": "",
+            "PYTHONINTMAXSTRDIGITS": "",
+            "PYTHONDEBUG": "",
+            "PYTHONOPTIMIZE": "",
+            "PYTHONUNBUFFERED": "",
+            "PYTHONVERBOSE": "",
+            "PYTHONFAULTHANDLER": "",
+            "PYTHONDEVMODE": "",
+            "PYTHONWARNDEFAULTENCODING": "",
+            "PYTHONTRACEMALLOC": "",
+            "PYTHONPROFILEIMPORTTIME": "",
+            "PYTHONASYNCIODEBUG": "",
+            "PYTHONDONTWRITEBYTECODE": "",
+            "PYTHONPERFSUPPORT": "0",
+        })
+        # CPython treats NODEBUGRANGES as a presence-only switch: NAME= is
+        # still enabled. UnsetEnvironment runs *last* in systemd.exec, after
+        # all user-manager inheritance and transient unit Environment=.
+        environment.pop("PYTHONNODEBUGRANGES", None)
+        systemd_argv.append("--property=UnsetEnvironment=PYTHONNODEBUGRANGES")
     if (
         decision_review_binding is not None
         and scope.get("decision_review_provenance", {}).get("schema_version") == 2
